@@ -27,6 +27,7 @@ pub(crate) enum CliCommand {
     Plugin,
     Mcp,
     Session,
+    Subject,
     Login,
 }
 
@@ -46,6 +47,7 @@ impl CliCommand {
             CliCommand::Plugin => "yoi plugin",
             CliCommand::Mcp => "yoi mcp",
             CliCommand::Session => "yoi session",
+            CliCommand::Subject => "yoi subject",
             CliCommand::Login => "yoi login",
         }
     }
@@ -65,7 +67,8 @@ impl CliCommand {
             | CliCommand::WorkerCleanup
             | CliCommand::Plugin
             | CliCommand::Mcp
-            | CliCommand::Session => CliConnectionRequirement::LocalOnly,
+            | CliCommand::Session
+            | CliCommand::Subject => CliConnectionRequirement::LocalOnly,
         }
     }
 }

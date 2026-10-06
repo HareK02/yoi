@@ -4,8 +4,10 @@
 //! authority. In that case model-visible Memory tools must go through the
 //! workspace backend instead of resolving `.yoi/memory` from a Worker workdir.
 
+use crate::subjektiv::{SubjektivHostConnection, SubjektivHostError};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
 use std::time::Duration;
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
@@ -158,6 +160,7 @@ impl dyn WorkspaceClient + '_ {
     }
 }
 
+#[cfg(test)]
 const RESIDENT_SUMMARY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn execute_subjektiv_memory_operation(
@@ -327,9 +330,7 @@ pub fn workspace_http_memory_tools(client: Arc<dyn WorkspaceClient>) -> Vec<Tool
     ]
 }
 
-pub fn workspace_http_subjektiv_consolidation_tools(
-    client: Arc<dyn WorkspaceClient>,
-) -> Vec<ToolDefinition> {
+fn subjektiv_consolidation_tools(host: SubjektivHostConnection) -> Vec<ToolDefinition> {
     use SubjectConsolidationOperation as Operation;
     [
         (
@@ -371,14 +372,14 @@ pub fn workspace_http_subjektiv_consolidation_tools(
     ]
     .into_iter()
     .map(|(name, description, schema, operation)| {
-        let client = Arc::clone(&client);
+        let host = host.clone();
         Arc::new(move || {
             (
                 ToolMeta::new(name)
                     .description(description)
                     .input_schema(schema.clone()),
                 Arc::new(SubjectConsolidationTool {
-                    client: Arc::clone(&client),
+                    host: host.clone(),
                     operation,
                 }) as Arc<dyn Tool>,
             )
@@ -398,7 +399,7 @@ enum SubjectConsolidationOperation {
 }
 
 struct SubjectConsolidationTool {
-    client: Arc<dyn WorkspaceClient>,
+    host: SubjektivHostConnection,
     operation: SubjectConsolidationOperation,
 }
 
@@ -434,59 +435,17 @@ impl Tool for SubjectConsolidationTool {
                 )?)
             }
         };
-        let workspace_id = self.client.workspace_id().ok_or_else(|| {
-            ToolError::ExecutionFailed(
-                "subjektiv consolidation requires Workspace authority".into(),
-            )
-        })?;
-        let response = self
-            .client
-            .execute(WorkspaceRequest::json(
-                WorkspaceRequestMethod::Post,
-                format!("/api/w/{workspace_id}/subjektiv/memory"),
-                serde_json::to_string(&server_api::SubjektivMemoryBackendRequest { operation })
-                    .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?,
-            ))
-            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-        if !response.is_success() {
-            let parsed =
-                serde_json::from_str::<server_api::RepositoryApiError>(&response.body).ok();
-            if let Some((code, message)) = parsed.as_ref().and_then(|error| {
-                error
-                    .diagnostics
-                    .iter()
-                    .find(|diagnostic| {
-                        matches!(
-                            diagnostic.code.as_str(),
-                            "revision_conflict"
-                                | "candidate_decision_conflict"
-                                | "subject_scope_mismatch"
-                        )
-                    })
-                    .map(|diagnostic| (diagnostic.code.clone(), error.message.clone()))
-            }) {
+        let response = match self.host.memory(operation) {
+            Ok(response) => response,
+            Err(SubjektivHostError::Conflict { code, message }) => {
                 return Ok(ToolOutput {
                     summary: format!("Candidate decision requires reread: {code}."),
-                    content: Some(
-                        serde_json::json!({
-                            "status": "error",
-                            "error": { "code": code, "message": message }
-                        })
-                        .to_string(),
-                    ),
+                    content: Some(serde_json::json!({"status":"error", "error":{"code":code,"message":message}}).to_string()),
                     attachments: Vec::new(),
                 });
             }
-            let detail = parsed.map(|error| error.message).unwrap_or(response.body);
-            return Err(if matches!(response.status, 400 | 404 | 409 | 422) {
-                ToolError::InvalidArgument(detail)
-            } else {
-                ToolError::ExecutionFailed(detail)
-            });
-        }
-        let response: server_api::SubjektivMemoryBackendResponse =
-            serde_json::from_str(&response.body)
-                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+            Err(error) => return Err(error.into()),
+        };
         let summary = match &response {
             server_api::SubjektivMemoryBackendResponse::Query(value) => {
                 format!("Found {} subject Memory item(s).", value.items.len())
@@ -686,7 +645,7 @@ struct SubjectBehaviorRefreshState {
 }
 
 struct WorkspaceSubjektivResidentSummarySource {
-    client: Arc<dyn WorkspaceClient>,
+    host: SubjektivHostConnection,
     prompts: Arc<ArcSwap<PromptCatalog>>,
     behavior_state: Mutex<SubjectBehaviorRefreshState>,
 }
@@ -730,16 +689,12 @@ impl SystemPromptContributionSource for WorkspaceResidentSummarySource {
 impl WorkspaceSubjektivResidentSummarySource {
     async fn fetch(
         &self,
-    ) -> Result<server_api::SubjektivResidentContextOutput, WorkspaceMemoryBackendError> {
-        match execute_subjektiv_memory_operation_with(
-            self.client.as_ref(),
+    ) -> Result<server_api::SubjektivResidentContextOutput, SubjektivHostError> {
+        match self.host.memory(
             server_api::SubjektivMemoryBackendOperation::ResidentContext(Default::default()),
-            |client, request| {
-                client.execute_with_timeout(request, RESIDENT_SUMMARY_REQUEST_TIMEOUT)
-            },
         )? {
             server_api::SubjektivMemoryBackendResponse::ResidentContext(output) => Ok(output),
-            other => Err(WorkspaceMemoryBackendError::InvalidResponse(format!(
+            other => Err(SubjektivHostError::Unavailable(format!(
                 "unexpected subject resident context response: {other:?}"
             ))),
         }
@@ -862,10 +817,11 @@ const SUBJEKTIV_BEHAVIOR_REWRITE_HOOK: &str = "invalidate-subject-behavior-befor
 pub(crate) struct SubjektivResidentRestoreRefreshFeature {
     source: Arc<dyn SystemPromptContributionSource>,
     prompts: Arc<ArcSwap<PromptCatalog>>,
-    workspace_id: String,
+    workspace_id: Option<String>,
 }
 
 impl SubjektivResidentRestoreRefreshFeature {
+    #[cfg(test)]
     pub(crate) fn for_host(
         lifecycle_enabled: bool,
         source: Arc<dyn SystemPromptContributionSource>,
@@ -875,6 +831,20 @@ impl SubjektivResidentRestoreRefreshFeature {
         lifecycle_enabled.then(|| Self::new(source, prompts, workspace_id))
     }
 
+    pub(crate) fn for_connection(
+        lifecycle_enabled: bool,
+        source: Arc<dyn SystemPromptContributionSource>,
+        prompts: Arc<ArcSwap<PromptCatalog>>,
+        workspace_id: Option<String>,
+    ) -> Option<Self> {
+        lifecycle_enabled.then_some(Self {
+            source,
+            prompts,
+            workspace_id,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(
         source: Arc<dyn SystemPromptContributionSource>,
         prompts: Arc<ArcSwap<PromptCatalog>>,
@@ -883,7 +853,7 @@ impl SubjektivResidentRestoreRefreshFeature {
         Self {
             source,
             prompts,
-            workspace_id: workspace_id.into(),
+            workspace_id: Some(workspace_id.into()),
         }
     }
 }
@@ -981,7 +951,7 @@ impl Hook<PreLlmRequest> for SubjektivBehaviorRefreshHook {
 struct SubjektivResidentRestoreRefreshHook {
     source: Arc<dyn SystemPromptContributionSource>,
     prompts: Arc<ArcSwap<PromptCatalog>>,
-    workspace_id: String,
+    workspace_id: Option<String>,
 }
 
 #[async_trait]
@@ -1000,7 +970,7 @@ impl Hook<WorkerRestored> for SubjektivResidentRestoreRefreshHook {
         context.system_items().append_resident_summary_refresh(
             body,
             session_store::PromptRenderProvenance {
-                workspace_id: Some(self.workspace_id.clone()),
+                workspace_id: self.workspace_id.clone(),
                 config_revision: projection.config_revision,
                 source_digest: projection.source_digest.clone(),
                 projection_digest: projection.catalog_digest.clone(),
@@ -1114,51 +1084,25 @@ pub(crate) fn is_builtin_subjektiv_consolidation_profile(
 }
 
 pub(crate) fn ordinary_subjektiv_features_enabled(manifest: &manifest::WorkerManifest) -> bool {
-    manifest.feature.subjektiv.execution_enabled()
+    manifest.feature.subjektiv.profile.enabled
         && !manifest.feature.subjektiv.profile.consolidation_tools
 }
 
 pub(crate) fn ordinary_subjektiv_resident_summary_source(
     manifest: &manifest::WorkerManifest,
-    client: Arc<dyn WorkspaceClient>,
+    host: Option<SubjektivHostConnection>,
     prompts: Arc<ArcSwap<PromptCatalog>>,
 ) -> std::io::Result<Option<Arc<dyn SystemPromptContributionSource>>> {
-    if !ordinary_subjektiv_features_enabled(manifest) {
+    if !ordinary_subjektiv_features_enabled(manifest) || host.is_none() {
         return Ok(None);
     }
     manifest
         .feature
         .subjektiv
         .validate_execution()
-        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
-    if !client.is_available() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "subjektiv resident Memory requires Backend Workspace API authority",
-        ));
-    }
-    let workspace_id = client.workspace_id().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "subjektiv resident Memory requires Backend Workspace API authority",
-        )
-    })?;
-    let settings = manifest
-        .feature
-        .subjektiv
-        .workspace_settings()
-        .expect("validated enabled subjektiv config has Workspace settings");
-    if settings.workspace_id != workspace_id {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "subjektiv Workspace settings belong to {} instead of {}",
-                settings.workspace_id, workspace_id
-            ),
-        ));
-    }
+        .map_err(std::io::Error::other)?;
     Ok(Some(Arc::new(WorkspaceSubjektivResidentSummarySource {
-        client,
+        host: host.expect("checked explicit connection"),
         prompts,
         behavior_state: Mutex::new(SubjectBehaviorRefreshState::default()),
     })))
@@ -1172,55 +1116,49 @@ pub(crate) struct SubjektivConsolidationFeatureInstallPlan {
 impl SubjektivConsolidationFeatureInstallPlan {
     pub(crate) fn prepare(
         manifest: &manifest::WorkerManifest,
-        client: Arc<dyn WorkspaceClient>,
+        host: Option<SubjektivHostConnection>,
         prompts: Arc<crate::prompt::catalog::PromptCatalog>,
     ) -> std::io::Result<Option<Self>> {
-        if !manifest.feature.subjektiv.profile.consolidation_tools {
+        let config = &manifest.feature.subjektiv;
+        if !config.profile.enabled || !config.profile.consolidation_tools || host.is_none() {
             return Ok(None);
         }
-        let config = &manifest.feature.subjektiv;
-        config
-            .validate_execution()
-            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
-        if !config.execution_enabled() || config.profile.extraction.enabled {
+        config.validate_execution().map_err(std::io::Error::other)?;
+        let host = host.expect("checked explicit connection");
+        if config.profile.extraction.enabled || !host.host.consolidation_granted() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "subjektiv consolidation profile requires trusted subject settings without automatic extraction",
-            ));
-        }
-        let workspace_id = client.workspace_id().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "subjektiv consolidation tools require Backend Workspace API authority",
-            )
-        })?;
-        let settings = config
-            .workspace_settings()
-            .expect("validated enabled subjektiv config has Workspace settings");
-        if settings.workspace_id != workspace_id {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "subjektiv settings belong to {} instead of {}",
-                    settings.workspace_id, workspace_id
-                ),
+                "subjektiv consolidation requires explicit Host grant without automatic extraction",
             ));
         }
         let system_prompt_override = prompts
-            .subjektiv_memory_consolidation_system(&settings.language)
+            .subjektiv_memory_consolidation_system(&host.host.settings().language)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         Ok(Some(Self {
-            module: SubjektivConsolidationToolsFeature {
-                tools: workspace_http_subjektiv_consolidation_tools(client),
-            },
+            module: SubjektivConsolidationToolsFeature::new(host)?,
             system_prompt_override,
         }))
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct SubjektivConsolidationToolsFeature {
+pub struct SubjektivConsolidationToolsFeature {
     tools: Vec<ToolDefinition>,
+}
+
+impl SubjektivConsolidationToolsFeature {
+    /// Reusable installation for a generic Job with an explicit attenuated Host.
+    pub fn new(host: SubjektivHostConnection) -> std::io::Result<Self> {
+        if !host.host.consolidation_granted() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Host did not grant consolidation",
+            ));
+        }
+        Ok(Self {
+            tools: subjektiv_consolidation_tools(host),
+        })
+    }
 }
 
 impl FeatureModule for SubjektivConsolidationToolsFeature {
@@ -1292,6 +1230,29 @@ mod tests {
     use crate::WorkspaceResponse;
     use agen::tool::ToolDefinition;
     use std::sync::Mutex;
+
+    fn backend_resident_source(
+        manifest: &manifest::WorkerManifest,
+        client: Arc<dyn WorkspaceClient>,
+        prompts: Arc<ArcSwap<PromptCatalog>>,
+    ) -> std::io::Result<Option<Arc<dyn SystemPromptContributionSource>>> {
+        let host = crate::subjektiv::BackendSubjektivHost::from_resolved_config(
+            &manifest.feature.subjektiv,
+            client,
+        )?;
+        let host = host
+            .map(|host| {
+                SubjektivHostConnection::new(
+                    host,
+                    crate::subjektiv::SubjektivHostContext {
+                        worker_id: manifest.worker.name.clone(),
+                        session_id: "session-1".into(),
+                    },
+                )
+            })
+            .transpose()?;
+        ordinary_subjektiv_resident_summary_source(manifest, host, prompts)
+    }
 
     fn test_prompts() -> Arc<ArcSwap<PromptCatalog>> {
         Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap()))
@@ -1601,7 +1562,7 @@ mod tests {
 
         let plan = SubjektivConsolidationFeatureInstallPlan::prepare(
             &manifest,
-            test_client(),
+            Some(crate::subjektiv::test_connection(test_client())),
             crate::prompt::catalog::PromptCatalog::builtins_only().unwrap(),
         )
         .unwrap()
@@ -1696,13 +1657,9 @@ permission = "write"
             memory::backend::MemoryResidentSummaryAvailability::Ready,
             Some("current subject surface"),
         ));
-        let ready = ordinary_subjektiv_resident_summary_source(
-            &manifest,
-            ready_client.clone(),
-            test_prompts(),
-        )
-        .unwrap()
-        .unwrap();
+        let ready = backend_resident_source(&manifest, ready_client.clone(), test_prompts())
+            .unwrap()
+            .unwrap();
         let loaded = ready.load().await;
         let SystemPromptContribution::Ready(loaded) = loaded else {
             panic!("subject resident context must be present");
@@ -1722,13 +1679,9 @@ permission = "write"
             memory::backend::MemoryResidentSummaryAvailability::Ready,
             None,
         ));
-        let ready_empty = ordinary_subjektiv_resident_summary_source(
-            &manifest,
-            ready_empty_client,
-            test_prompts(),
-        )
-        .unwrap()
-        .unwrap();
+        let ready_empty = backend_resident_source(&manifest, ready_empty_client, test_prompts())
+            .unwrap()
+            .unwrap();
         let SystemPromptContribution::Ready(ready_empty) = ready_empty.load().await else {
             panic!("empty surface must retain Subject behavior");
         };
@@ -1740,7 +1693,7 @@ permission = "write"
             memory::backend::MemoryResidentSummaryAvailability::Stale,
             memory::backend::MemoryResidentSummaryAvailability::Failed,
         ] {
-            let source = ordinary_subjektiv_resident_summary_source(
+            let source = backend_resident_source(
                 &manifest,
                 Arc::new(SubjectResidentClient::new(
                     availability,
@@ -1765,10 +1718,9 @@ permission = "write"
             memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
             None,
         ));
-        let source =
-            ordinary_subjektiv_resident_summary_source(&manifest, client.clone(), test_prompts())
-                .unwrap()
-                .unwrap();
+        let source = backend_resident_source(&manifest, client.clone(), test_prompts())
+            .unwrap()
+            .unwrap();
 
         let initial = source.load().await;
         assert!(matches!(initial, SystemPromptContribution::Ready(_)));
@@ -1838,10 +1790,9 @@ permission = "write"
     async fn subject_resident_source_fails_closed_without_trusted_subject_scope() {
         let manifest = subject_manifest("workspace");
         let client = Arc::new(SubjectResidentClient::denied());
-        let source =
-            ordinary_subjektiv_resident_summary_source(&manifest, client.clone(), test_prompts())
-                .unwrap()
-                .unwrap();
+        let source = backend_resident_source(&manifest, client.clone(), test_prompts())
+            .unwrap()
+            .unwrap();
 
         let SystemPromptContribution::Ready(failure) = source.load().await else {
             panic!("fetch failure must be explicit in resident context");
@@ -1874,7 +1825,7 @@ permission = "write"
         )
         .unwrap();
         assert!(
-            ordinary_subjektiv_resident_summary_source(&disabled, test_client(), test_prompts())
+            backend_resident_source(&disabled, test_client(), test_prompts())
                 .unwrap()
                 .is_none()
         );
@@ -1886,30 +1837,22 @@ permission = "write"
             Some("policy-only surface must not load"),
         ));
         assert!(
-            ordinary_subjektiv_resident_summary_source(
-                &policy_only,
-                unattached_client.clone(),
-                test_prompts()
-            )
-            .unwrap()
-            .is_none()
+            backend_resident_source(&policy_only, unattached_client.clone(), test_prompts())
+                .unwrap()
+                .is_none()
         );
         assert!(unattached_client.paths.lock().unwrap().is_empty());
 
         let foreign = subject_manifest("other-workspace");
-        assert!(
-            ordinary_subjektiv_resident_summary_source(&foreign, test_client(), test_prompts())
-                .is_err()
-        );
+        assert!(backend_resident_source(&foreign, test_client(), test_prompts()).is_err());
     }
 
     #[test]
     fn subject_restore_refresh_is_suppressed_for_internal_hosts() {
         let manifest = subject_manifest("workspace");
-        let source =
-            ordinary_subjektiv_resident_summary_source(&manifest, test_client(), test_prompts())
-                .unwrap()
-                .unwrap();
+        let source = backend_resident_source(&manifest, test_client(), test_prompts())
+            .unwrap()
+            .unwrap();
         let prompts = Arc::new(ArcSwap::from(
             crate::prompt::catalog::PromptCatalog::builtins_only().unwrap(),
         ));
@@ -1923,10 +1866,9 @@ permission = "write"
     #[test]
     fn subject_restore_refresh_feature_declares_only_restore_lifecycle() {
         let manifest = subject_manifest("workspace");
-        let source =
-            ordinary_subjektiv_resident_summary_source(&manifest, test_client(), test_prompts())
-                .unwrap()
-                .unwrap();
+        let source = backend_resident_source(&manifest, test_client(), test_prompts())
+            .unwrap()
+            .unwrap();
         let feature = SubjektivResidentRestoreRefreshFeature::new(
             source,
             Arc::new(ArcSwap::from(
@@ -2034,7 +1976,7 @@ permission = "write"
             (403, "subject_scope_mismatch"),
         ] {
             let tool = SubjectConsolidationTool {
-                client: repository_error_client(status, code),
+                host: crate::subjektiv::test_connection(repository_error_client(status, code)),
                 operation: SubjectConsolidationOperation::DecideCandidate,
             };
             let output = tool
@@ -2051,7 +1993,7 @@ permission = "write"
 
     #[test]
     fn subjektiv_consolidation_has_atomic_decision_without_host_scope_fields() {
-        let tools = workspace_http_subjektiv_consolidation_tools(test_client());
+        let tools = subjektiv_consolidation_tools(crate::subjektiv::test_connection(test_client()));
         let names = tool_names(tools.clone());
         assert_eq!(
             names,

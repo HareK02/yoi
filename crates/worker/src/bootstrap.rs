@@ -52,6 +52,7 @@ pub struct WorkerBootstrap<St> {
     transport: WorkerControllerTransport,
     model_client: Option<Box<dyn LlmClient>>,
     workdir_session: Option<WorkdirSessionHandle>,
+    subjektiv_host: Option<std::sync::Arc<dyn crate::subjektiv::SubjektivHost>>,
 }
 
 /// A constructed Worker whose host-owned live bindings can still be installed
@@ -106,6 +107,7 @@ where
             transport,
             model_client: None,
             workdir_session: None,
+            subjektiv_host: None,
         }
     }
 
@@ -124,6 +126,16 @@ where
     /// Worker to derive one from filesystem authority.
     pub fn with_workdir_session(mut self, workdir_session: WorkdirSessionHandle) -> Self {
         self.workdir_session = Some(workdir_session);
+        self
+    }
+
+    /// Bind an explicit, process-owned subject capability. Profile policy alone
+    /// is inert; the connection is never persisted into the Worker manifest.
+    pub fn with_subjektiv_host(
+        mut self,
+        host: std::sync::Arc<dyn crate::subjektiv::SubjektivHost>,
+    ) -> Self {
+        self.subjektiv_host = Some(host);
         self
     }
 
@@ -147,6 +159,24 @@ where
         if let Some(workdir_session) = self.workdir_session {
             worker.bind_single_workdir_session(Some(workdir_session));
         }
+        let explicit_subjektiv_host = self.subjektiv_host.is_some();
+        worker.bind_subjektiv_host(self.subjektiv_host);
+        if explicit_subjektiv_host
+            && worker.manifest().feature.subjektiv.profile.enabled
+            && !worker
+                .manifest()
+                .feature
+                .subjektiv
+                .profile
+                .consolidation_tools
+        {
+            worker
+                .finalize_subjektiv_session_attribution(
+                    true,
+                    crate::SubjektivSessionAttributionLifecycle::NewSession,
+                )
+                .map_err(WorkerBootstrapError::Worker)?;
+        }
         Ok(PreparedWorker::new(worker, self.layout, self.transport))
     }
 
@@ -169,6 +199,24 @@ where
 
         if let Some(workdir_session) = self.workdir_session {
             worker.bind_single_workdir_session(Some(workdir_session));
+        }
+        let explicit_subjektiv_host = self.subjektiv_host.is_some();
+        worker.bind_subjektiv_host(self.subjektiv_host);
+        if explicit_subjektiv_host
+            && worker.manifest().feature.subjektiv.profile.enabled
+            && !worker
+                .manifest()
+                .feature
+                .subjektiv
+                .profile
+                .consolidation_tools
+        {
+            worker
+                .finalize_subjektiv_session_attribution(
+                    true,
+                    crate::SubjektivSessionAttributionLifecycle::RestoredSession,
+                )
+                .map_err(WorkerBootstrapError::Worker)?;
         }
         Ok(PreparedWorker::new(worker, self.layout, self.transport))
     }

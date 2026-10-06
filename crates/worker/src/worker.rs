@@ -357,6 +357,9 @@ pub(crate) fn authenticated_input_provenance(
 ) -> WorkerHistoryProvenance {
     match source {
         protocol::AuthenticatedInputSource::UntrustedWire => WorkerHistoryProvenance::LegacyUnknown,
+        protocol::AuthenticatedInputSource::LocalOperator => {
+            WorkerHistoryProvenance::LocalHumanInput
+        }
         protocol::AuthenticatedInputSource::Account { account_id } => {
             WorkerHistoryProvenance::HumanInput {
                 account_id: account_id.clone(),
@@ -2752,6 +2755,7 @@ pub struct Worker<C: LlmClient, St: Store> {
     inject_resident_summary: bool,
     /// Deferred resident prompt source installed by an enabled Feature.
     feature_resident_summary_source: Option<Arc<dyn SystemPromptContributionSource>>,
+    subjektiv_host: Option<Arc<dyn crate::subjektiv::SubjektivHost>>,
     /// One-shot generic Feature lifecycle notification required after restore.
     restore_feature_lifecycle_pending: bool,
     /// Complete system prompt replacement installed by an enabled Feature.
@@ -3014,6 +3018,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
+            subjektiv_host: None,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
             user_segments: Vec::new(),
@@ -3231,6 +3236,49 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
 
     pub fn workspace_client_handle(&self) -> Arc<dyn WorkspaceClient> {
         self.workspace_context.client_handle()
+    }
+
+    /// Bind a live capability before Feature installation. This is deliberately
+    /// separate from Workspace authority and is not inherited by SubWorkers.
+    pub fn bind_subjektiv_host(&mut self, host: Option<Arc<dyn crate::subjektiv::SubjektivHost>>) {
+        self.subjektiv_host = host;
+    }
+
+    pub fn subjektiv_host_connection(
+        &self,
+    ) -> std::io::Result<Option<crate::subjektiv::SubjektivHostConnection>> {
+        use crate::subjektiv::{
+            BackendSubjektivHost, SubjektivHostConnection, SubjektivHostContext,
+        };
+        let config = &self.manifest.feature.subjektiv;
+        config.validate_execution().map_err(std::io::Error::other)?;
+        if !config.profile.enabled {
+            return Ok(None);
+        }
+        let host = if let Some(host) = &self.subjektiv_host {
+            if config.workspace_settings.is_some()
+                || self.workspace_id().is_some()
+                || self.workspace_client().workspace_id().is_some()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "explicit local subjektiv Host cannot replace trusted Backend Workspace authority",
+                ));
+            }
+            Some(host.clone())
+        } else {
+            BackendSubjektivHost::from_resolved_config(config, self.workspace_client_handle())?
+        };
+        host.map(|host| {
+            SubjektivHostConnection::new(
+                host,
+                SubjektivHostContext {
+                    worker_id: self.manifest.worker.name.clone(),
+                    session_id: self.session_id().to_string(),
+                },
+            )
+        })
+        .transpose()
     }
 
     /// Bind the host-owned Worker-session observation projection. The provider
@@ -7324,6 +7372,7 @@ where
             prompts: common.prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
+            subjektiv_host: None,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
             user_segments: Vec::new(),
@@ -7433,64 +7482,62 @@ where
             create_if_missing,
             initial_diagnostic.to_string(),
         ))?;
-        let response = match self.workspace_client().execute_server_operation(
-            WorkspaceServerOperation::SubjektivRecordSession(
-                server_api::SubjektivRecordSessionRequest {
-                    session_id: session_id.to_string(),
-                    create_if_missing,
-                },
-            ),
-        ) {
-            Ok(response) => response,
-            Err(error) => {
-                let message = bounded_attribution_diagnostic(format!(
-                    "Session attribution transport outcome is unknown: {error}"
-                ));
-                self.persist_subjektiv_session_attribution(
-                    incomplete_subjektiv_attribution_state(
-                        session_id,
-                        create_if_missing,
-                        message.clone(),
-                    ),
-                )?;
-                return Err(WorkerError::SubjektivSessionAttribution {
-                    state: incomplete_subjektiv_attribution_label(create_if_missing),
-                    message,
-                });
-            }
-        };
-        if !response.is_success() {
-            let message = bounded_attribution_diagnostic(format!(
-                "Session attribution was rejected with HTTP {}: {}",
-                response.status, response.body
-            ));
-            let state = if create_if_missing {
-                SubjektivSessionAttributionState::Failed {
-                    session_id,
-                    diagnostic: message.clone(),
-                }
-            } else {
-                SubjektivSessionAttributionState::LegacyUnknown {
-                    session_id,
-                    diagnostic: message.clone(),
-                }
-            };
-            self.persist_subjektiv_session_attribution(state)?;
-            return Err(WorkerError::SubjektivSessionAttribution {
-                state: if create_if_missing {
-                    "failed"
-                } else {
-                    "legacy_unknown"
-                },
-                message,
-            });
-        }
-        let output: server_api::SubjektivRecordSessionResponse =
-            match serde_json::from_str(&response.body) {
+        let output = if self.subjektiv_host.is_some() {
+            let connection = self
+                .subjektiv_host_connection()
+                .map_err(|error| WorkerError::SubjektivSessionAttribution {
+                    state: "failed",
+                    message: error.to_string(),
+                })?
+                .ok_or_else(|| WorkerError::SubjektivSessionAttribution {
+                    state: "failed",
+                    message: "Session attribution requires enabled explicit Host capability".into(),
+                })?;
+            match connection
+                .host
+                .record_session(&connection.context, create_if_missing)
+            {
                 Ok(output) => output,
                 Err(error) => {
+                    let message = bounded_attribution_diagnostic(error.to_string());
+                    let rejected =
+                        !matches!(error, crate::subjektiv::SubjektivHostError::Unavailable(_));
+                    let state = if create_if_missing && rejected {
+                        SubjektivSessionAttributionState::Failed {
+                            session_id,
+                            diagnostic: message.clone(),
+                        }
+                    } else {
+                        incomplete_subjektiv_attribution_state(
+                            session_id,
+                            create_if_missing,
+                            message.clone(),
+                        )
+                    };
+                    self.persist_subjektiv_session_attribution(state)?;
+                    return Err(WorkerError::SubjektivSessionAttribution {
+                        state: if create_if_missing && rejected {
+                            "failed"
+                        } else {
+                            incomplete_subjektiv_attribution_label(create_if_missing)
+                        },
+                        message,
+                    });
+                }
+            }
+        } else {
+            let response = match self.workspace_client().execute_server_operation(
+                WorkspaceServerOperation::SubjektivRecordSession(
+                    server_api::SubjektivRecordSessionRequest {
+                        session_id: session_id.to_string(),
+                        create_if_missing,
+                    },
+                ),
+            ) {
+                Ok(response) => response,
+                Err(error) => {
                     let message = bounded_attribution_diagnostic(format!(
-                        "Session attribution response outcome is unknown: {error}"
+                        "Session attribution transport outcome is unknown: {error}"
                     ));
                     self.persist_subjektiv_session_attribution(
                         incomplete_subjektiv_attribution_state(
@@ -7505,6 +7552,54 @@ where
                     });
                 }
             };
+            if !response.is_success() {
+                let message = bounded_attribution_diagnostic(format!(
+                    "Session attribution was rejected with HTTP {}: {}",
+                    response.status, response.body
+                ));
+                let state = if create_if_missing {
+                    SubjektivSessionAttributionState::Failed {
+                        session_id,
+                        diagnostic: message.clone(),
+                    }
+                } else {
+                    SubjektivSessionAttributionState::LegacyUnknown {
+                        session_id,
+                        diagnostic: message.clone(),
+                    }
+                };
+                self.persist_subjektiv_session_attribution(state)?;
+                return Err(WorkerError::SubjektivSessionAttribution {
+                    state: if create_if_missing {
+                        "failed"
+                    } else {
+                        "legacy_unknown"
+                    },
+                    message,
+                });
+            }
+            let output: server_api::SubjektivRecordSessionResponse =
+                match serde_json::from_str(&response.body) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        let message = bounded_attribution_diagnostic(format!(
+                            "Session attribution response outcome is unknown: {error}"
+                        ));
+                        self.persist_subjektiv_session_attribution(
+                            incomplete_subjektiv_attribution_state(
+                                session_id,
+                                create_if_missing,
+                                message.clone(),
+                            ),
+                        )?;
+                        return Err(WorkerError::SubjektivSessionAttribution {
+                            state: incomplete_subjektiv_attribution_label(create_if_missing),
+                            message,
+                        });
+                    }
+                };
+            output
+        };
         if output.session_id != session_id.to_string()
             || output.subject_id.trim().is_empty()
             || output.subject_id.chars().any(char::is_control)
@@ -7616,6 +7711,7 @@ where
             prompts: common.prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
+            subjektiv_host: None,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
             user_segments: Vec::new(),
@@ -7744,6 +7840,7 @@ where
             prompts: common.prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
+            subjektiv_host: None,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
             user_segments: Vec::new(),
@@ -8130,6 +8227,7 @@ where
             prompts: common.prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
+            subjektiv_host: None,
             restore_feature_lifecycle_pending: true,
             feature_system_prompt_override: None,
             user_segments: state.user_segments,
@@ -9852,7 +9950,7 @@ mod build_summary_prompt_tests {
         });
         let source = crate::feature::builtin::memory::ordinary_subjektiv_resident_summary_source(
             manifest,
-            client,
+            Some(crate::subjektiv::test_connection(client)),
             Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),
         )
         .unwrap()
@@ -14731,12 +14829,14 @@ permission = "write"
         let resident_source = || {
             crate::feature::builtin::memory::ordinary_subjektiv_resident_summary_source(
                 &manifest,
-                Arc::new(RestoreSubjectResidentClient {
-                    availability: memory::backend::MemoryResidentSummaryAvailability::Ready,
-                    content: Some("literal /prepare()".into()),
-                    load_count: Arc::default(),
-                    behavior_revision: Some(behavior_revision.clone()),
-                }),
+                Some(crate::subjektiv::test_connection(Arc::new(
+                    RestoreSubjectResidentClient {
+                        availability: memory::backend::MemoryResidentSummaryAvailability::Ready,
+                        content: Some("literal /prepare()".into()),
+                        load_count: Arc::default(),
+                        behavior_revision: Some(behavior_revision.clone()),
+                    },
+                ))),
                 Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),
             )
             .unwrap()

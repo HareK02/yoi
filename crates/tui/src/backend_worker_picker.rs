@@ -957,6 +957,7 @@ mod tests {
                     language: "English".into(),
                 }),
                 subjektiv_attached: false,
+                backend_job: None,
             })
             .unwrap();
         runtime.stop_worker(&worker.worker_ref, None).unwrap();

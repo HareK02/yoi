@@ -211,7 +211,7 @@ impl FsStore {
         }
     }
 
-    fn parse_jsonl(
+    pub(crate) fn parse_jsonl(
         content: &[u8],
         session_id: SessionId,
         segment_id: SegmentId,

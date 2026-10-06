@@ -8,7 +8,7 @@
 //! cannot be preempted by dropping its tool future and must itself be bounded.
 
 mod result;
-pub use result::{JobResultFeature, JobResultSink, SUBMIT_JOB_RESULT_TOOL};
+pub use result::{JobResultFeature, JobResultFinalizer, JobResultSink, SUBMIT_JOB_RESULT_TOOL};
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -72,6 +72,28 @@ pub struct PreparedInternalJob {
     manifest: WorkerManifest,
     client: Box<dyn LlmClient>,
     system_prompt: String,
+    features: FeatureRegistryBuilder,
+    finalizer: Option<Arc<dyn JobResultFinalizer>>,
+}
+
+/// Explicit Host-supplied domain modules and the Profile requirements they satisfy.
+/// Profile names never issue this grant. The Host must bind all module operations to
+/// the immutable request/attempt and fence them on cancellation, timeout and shutdown.
+#[derive(Default)]
+pub struct JobFeatureGrant {
+    pub features: FeatureRegistryBuilder,
+    pub satisfied_requirements: Vec<&'static str>,
+    pub finalizer: Option<Arc<dyn JobResultFinalizer>>,
+}
+
+pub fn prepare_job_with_grant(
+    request: &::job::JobRequest,
+    cwd: &Path,
+    client: Option<Box<dyn LlmClient>>,
+    grant: JobFeatureGrant,
+) -> Result<PreparedInternalJob, JobExecutionError> {
+    let registry = ProfileDiscovery::user_settings().discover()?;
+    prepare_job_from_registry_with_grant(request, cwd, client, &registry, grant)
 }
 
 /// Resolve exactly the requested registry Profile using the existing user settings registry.
@@ -92,6 +114,16 @@ fn prepare_job_from_registry(
     client: Option<Box<dyn LlmClient>>,
     registry: &manifest::ProfileRegistry,
 ) -> Result<PreparedInternalJob, JobExecutionError> {
+    prepare_job_from_registry_with_grant(request, cwd, client, registry, JobFeatureGrant::default())
+}
+
+fn prepare_job_from_registry_with_grant(
+    request: &::job::JobRequest,
+    cwd: &Path,
+    client: Option<Box<dyn LlmClient>>,
+    registry: &manifest::ProfileRegistry,
+    grant: JobFeatureGrant,
+) -> Result<PreparedInternalJob, JobExecutionError> {
     request.validate()?;
     let resolved = ProfileResolver::new()
         .with_workspace_base(cwd)
@@ -101,7 +133,16 @@ fn prepare_job_from_registry(
             ProfileResolveOptions::with_worker_name("internal-job"),
         )?;
     let mut manifest = resolved.manifest;
-    validate_result_only_profile(&manifest)?;
+    validate_profile_with_grant(&manifest, &grant.satisfied_requirements)?;
+    if let Some(finalizer) = &grant.finalizer {
+        finalizer
+            .validate_profile(&manifest)
+            .map_err(JobExecutionError::UnsupportedProfile)?;
+    }
+    let mut tool_names = vec![SUBMIT_JOB_RESULT_TOOL.to_string()];
+    for descriptor in grant.features.descriptors() {
+        tool_names.extend(descriptor.tools.iter().map(|tool| tool.name.clone()));
+    }
     let scope = Scope::empty();
     let prompts = PromptCatalog::builtins_only()?;
     let template = SystemPromptTemplate::parse(
@@ -113,7 +154,7 @@ fn prepare_job_from_registry(
         cwd: Cow::Borrowed("(no filesystem)"),
         language: &manifest.engine.language,
         scope: &scope,
-        tool_names: vec![SUBMIT_JOB_RESULT_TOOL.into()],
+        tool_names,
         feature_instructions: &[],
         agents_md: None,
         resident_summary: None,
@@ -148,6 +189,8 @@ fn prepare_job_from_registry(
         manifest,
         client,
         system_prompt,
+        features: grant.features,
+        finalizer: grant.finalizer,
     })
 }
 
@@ -165,7 +208,11 @@ impl PreparedInternalJob {
     where
         F: FnOnce(tokio::sync::mpsc::Sender<()>),
     {
-        let feature = JobResultFeature::new(&self.request, attempt_id.clone(), submit)?;
+        let mut feature = JobResultFeature::new(&self.request, attempt_id.clone(), submit)?;
+        if let Some(finalizer) = self.finalizer {
+            feature =
+                feature.with_finalizer(finalizer, self.manifest.clone(), self.client.clone_boxed());
+        }
         let accepted = feature.accepted();
         let engine_policy = self.manifest.engine.clone();
         let spec = InternalWorkerSpec {
@@ -182,7 +229,7 @@ impl PreparedInternalJob {
             system_prompt: self.system_prompt,
             input: self.request.worker_input(&attempt_id)?,
             cache_key: None,
-            features: FeatureRegistryBuilder::new().with_module(feature.clone()),
+            features: self.features.with_module(feature.clone()),
             required_tools: &[SUBMIT_JOB_RESULT_TOOL],
             authority: InternalWorkerAuthority {
                 workspace: WorkerWorkspaceContext::no_workspace(),
@@ -218,7 +265,11 @@ impl PreparedInternalJob {
 }
 
 /// Validate requirements, not Profile names. Nothing configured as active is silently stripped.
-fn validate_result_only_profile(manifest: &WorkerManifest) -> Result<(), JobExecutionError> {
+
+fn validate_profile_with_grant(
+    manifest: &WorkerManifest,
+    satisfied: &[&str],
+) -> Result<(), JobExecutionError> {
     let manifest::FeatureConfig {
         task,
         memory,
@@ -306,7 +357,7 @@ fn validate_result_only_profile(manifest: &WorkerManifest) -> Result<(), JobExec
             manifest.session.record_event_trace,
         ),
     ] {
-        if enabled {
+        if enabled && !satisfied.contains(&name) {
             unavailable.push(name);
         }
     }

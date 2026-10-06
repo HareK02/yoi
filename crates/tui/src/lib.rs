@@ -65,6 +65,7 @@ pub enum LaunchMode {
     Spawn {
         worker_name: Option<String>,
         profile: Option<String>,
+        subject_id: Option<String>,
     },
     /// Restore one client-owned standalone Worker. The current cwd is the default scope;
     /// `include_all` opts into all standalone Workers under the same client data root.
@@ -202,7 +203,8 @@ async fn launch_mode(
         LaunchMode::Spawn {
             worker_name,
             profile,
-        } => match standalone_spawn::select(&workspace_root, worker_name, profile) {
+            subject_id,
+        } => match standalone_spawn::select(&workspace_root, worker_name, profile, subject_id) {
             Ok(Some(selection)) => match target.spawn_worker() {
                 Ok(spawn) => {
                     console::run_standalone(
@@ -210,6 +212,7 @@ async fn launch_mode(
                         spawn.state_dir,
                         Some(selection.worker_name),
                         Some(selection.profile),
+                        selection.subject_id,
                     )
                     .await
                 }

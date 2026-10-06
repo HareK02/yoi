@@ -712,7 +712,9 @@ impl SessionCapture {
 
 fn public_provenance(origin: &WorkerHistoryProvenance) -> SessionEntryProvenance {
     match origin {
-        WorkerHistoryProvenance::HumanInput { .. } => SessionEntryProvenance::HumanInput,
+        WorkerHistoryProvenance::HumanInput { .. } | WorkerHistoryProvenance::LocalHumanInput => {
+            SessionEntryProvenance::HumanInput
+        }
         WorkerHistoryProvenance::WorkerInput { .. } => SessionEntryProvenance::WorkerInput,
         WorkerHistoryProvenance::FlowInstruction { .. } => SessionEntryProvenance::FlowInstruction,
         WorkerHistoryProvenance::BackendInstruction { .. } => {

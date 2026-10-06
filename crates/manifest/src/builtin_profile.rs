@@ -60,6 +60,26 @@ pub const BUILTIN_PROFILE_RESOURCES: &[BuiltinProfileResource] = &[
         imports: DEFAULT_IMPORT,
     },
     BuiltinProfileResource {
+        selector: Some("builtin:standalone-subjektiv"),
+        path: "profiles/standalone-subjektiv.dcdl",
+        source: include_str!("../../../resources/profiles/standalone-subjektiv.dcdl"),
+        description: "Standalone with an explicitly connected local Subject.",
+        imports: &[BuiltinProfileImport {
+            specifier: "./standalone.dcdl",
+            resolved_path: "profiles/standalone.dcdl",
+        }],
+    },
+    BuiltinProfileResource {
+        selector: Some("builtin:standalone-subjektiv-consolidation"),
+        path: "profiles/standalone-subjektiv-consolidation.dcdl",
+        source: include_str!("../../../resources/profiles/standalone-subjektiv-consolidation.dcdl"),
+        description: "Delegated local Subject Job policy.",
+        imports: &[BuiltinProfileImport {
+            specifier: "./job.dcdl",
+            resolved_path: "profiles/job.dcdl",
+        }],
+    },
+    BuiltinProfileResource {
         selector: Some("builtin:coder"),
         path: "profiles/coder.dcdl",
         source: include_str!("../../../resources/profiles/coder.dcdl"),

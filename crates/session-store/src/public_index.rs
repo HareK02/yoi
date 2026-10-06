@@ -208,6 +208,172 @@ pub fn read_session_public_index(
     let segment_ids = store
         .list_segments_read_only(session_id)
         .map_err(map_store_error)?;
+    project_public_index_records(session_id, segment_ids, limits, |segment_id, remaining| {
+        store
+            .read_all_read_only_bounded(session_id, segment_id, remaining)
+            .map_err(map_store_error)
+    })
+}
+
+/// Strict committed public projection for the standalone FsStore layout.
+/// Uses the same lineage, commit filtering and entry projection as retained
+/// WorkerSessionStore observation. No writes, migrations, trace/artifact reads,
+/// access-time updates or directory creation occur here.
+pub fn read_fs_session_public_index(
+    sessions_root: &Path,
+    session_id: SessionId,
+    limits: SessionPublicIndexLimits,
+) -> Result<SessionPublicIndex, SessionPublicIndexReadError> {
+    read_fs_session_evidence_index(sessions_root, session_id, limits).map(|value| value.index)
+}
+
+/// Producer-compatible numeric hints for stable public evidence references.
+/// Both committed annotated-history and filtered public-snapshot capture are
+/// valid producers. No hidden history content is exposed by this metadata.
+pub struct FsSessionEvidenceIndex {
+    pub index: SessionPublicIndex,
+    pub ranges: HashMap<(String, String), Vec<[u64; 2]>>,
+    pub has_open_run: bool,
+}
+pub fn read_fs_session_evidence_index(
+    sessions_root: &Path,
+    session_id: SessionId,
+    limits: SessionPublicIndexLimits,
+) -> Result<FsSessionEvidenceIndex, SessionPublicIndexReadError> {
+    if limits.max_bytes == 0 || limits.max_segments == 0 || limits.max_entries == 0 {
+        return Err(SessionPublicIndexReadError::ResourceLimit);
+    }
+    let session_dir = sessions_root.join(session_id.to_string());
+    // IDs are typed and every storage component is observationally validated;
+    // a known Session ID never authorizes following arbitrary local symlinks.
+    let mut prefix = std::path::PathBuf::new();
+    for part in session_dir.components() {
+        prefix.push(part);
+        let metadata =
+            std::fs::symlink_metadata(&prefix).map_err(|_| SessionPublicIndexReadError::Missing)?;
+        if metadata.file_type().is_symlink() {
+            return Err(SessionPublicIndexReadError::Storage);
+        }
+    }
+    let mut segment_ids = Vec::new();
+    for entry in
+        std::fs::read_dir(&session_dir).map_err(|_| SessionPublicIndexReadError::Missing)?
+    {
+        let entry = entry.map_err(|_| SessionPublicIndexReadError::Storage)?;
+        let path = entry.path();
+        if path.extension().and_then(|v| v.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(id) = path
+            .file_stem()
+            .and_then(|v| v.to_str())
+            .and_then(|v| v.parse::<SegmentId>().ok())
+        else {
+            continue;
+        };
+        if !entry
+            .file_type()
+            .map_err(|_| SessionPublicIndexReadError::Storage)?
+            .is_file()
+        {
+            return Err(SessionPublicIndexReadError::Storage);
+        }
+        segment_ids.push(id);
+        if segment_ids.len() > limits.max_segments {
+            return Err(SessionPublicIndexReadError::ResourceLimit);
+        }
+    }
+    segment_ids.sort();
+    if segment_ids.is_empty() {
+        return Err(SessionPublicIndexReadError::Missing);
+    }
+    let mut ranges = HashMap::<(String, String), Vec<[u64; 2]>>::new();
+    let mut has_open_run = false;
+    let index =
+        project_public_index_records(session_id, segment_ids, limits, |segment_id, remaining| {
+            let path = session_dir.join(format!("{segment_id}.jsonl"));
+            let bytes = crate::read_without_atime_bounded(&path, remaining)
+                .map_err(|_| SessionPublicIndexReadError::Storage)?;
+            if bytes.len() as u64 > remaining {
+                return Err(SessionPublicIndexReadError::ResourceLimit);
+            }
+            let entries = crate::FsStore::parse_jsonl(&bytes, session_id, segment_id)
+                .map_err(map_store_error)?;
+            let mut open = false;
+            for entry in &entries {
+                match entry {
+                    LogEntry::Invoke { .. } | LogEntry::RunResumed { .. } => open = true,
+                    LogEntry::RunCompleted { .. }
+                    | LogEntry::RunYielded { .. }
+                    | LogEntry::RunCancelled { .. }
+                    | LogEntry::RunErrored { .. }
+                    | LogEntry::PausedTurnAbandoned { .. } => open = false,
+                    _ => {}
+                }
+            }
+            has_open_run |= open;
+            let committed = committed_conversation_records(&entries);
+            let state = crate::segment_log::collect_state(&committed);
+            for (position, entry) in state.annotated_history.iter().enumerate() {
+                ranges
+                    .entry((
+                        segment_id.to_string(),
+                        format!("E{}", entry.metadata.entry_id.0),
+                    ))
+                    .or_default()
+                    .push([position as u64, position as u64]);
+            }
+            let snapshot = crate::public_snapshot::project_session_snapshot_for_segment(
+                session_id,
+                Some(segment_id),
+                &committed,
+            );
+            let mut position = 0_u64;
+            for entry in snapshot.entries {
+                if matches!(
+                    entry.data,
+                    SessionSnapshotEntryData::UserInput { .. }
+                        | SessionSnapshotEntryData::Message { .. }
+                        | SessionSnapshotEntryData::ToolCall { .. }
+                        | SessionSnapshotEntryData::ToolResult { .. }
+                ) {
+                    ranges
+                        .entry((segment_id.to_string(), format!("E{}", entry.entry_id)))
+                        .or_default()
+                        .push([position, position]);
+                    position += 1;
+                }
+            }
+            Ok((entries, bytes.len() as u64))
+        })?;
+    // Intersect with the strict public projection, never turn knowledge of a
+    // hidden/reasoning history identity into a public evidence reference.
+    let public = index
+        .segments
+        .iter()
+        .flat_map(|seg| {
+            seg.entries
+                .iter()
+                .map(|entry| (seg.segment_id.clone(), entry.entry_ref.clone()))
+        })
+        .collect::<HashSet<_>>();
+    ranges.retain(|key, _| public.contains(key));
+    Ok(FsSessionEvidenceIndex {
+        index,
+        ranges,
+        has_open_run,
+    })
+}
+
+fn project_public_index_records(
+    session_id: SessionId,
+    segment_ids: Vec<SegmentId>,
+    limits: SessionPublicIndexLimits,
+    mut read_segment: impl FnMut(
+        SegmentId,
+        u64,
+    ) -> Result<(Vec<LogEntry>, u64), SessionPublicIndexReadError>,
+) -> Result<SessionPublicIndex, SessionPublicIndexReadError> {
     if segment_ids.len() > limits.max_segments {
         return Err(SessionPublicIndexReadError::ResourceLimit);
     }
@@ -224,9 +390,7 @@ pub fn read_session_public_index(
             .max_bytes
             .checked_sub(scanned_bytes)
             .ok_or(SessionPublicIndexReadError::ResourceLimit)?;
-        let (entries, bytes) = store
-            .read_all_read_only_bounded(session_id, segment_id, remaining)
-            .map_err(map_store_error)?;
+        let (entries, bytes) = read_segment(segment_id, remaining)?;
         scanned_bytes = scanned_bytes
             .checked_add(bytes)
             .ok_or(SessionPublicIndexReadError::ResourceLimit)?;

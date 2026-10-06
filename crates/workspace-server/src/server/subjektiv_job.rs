@@ -151,23 +151,7 @@ fn bounded_candidate_batch(
     ids: impl IntoIterator<Item = String>,
     max_result_bytes: u32,
 ) -> Result<Vec<String>> {
-    // Reserve the bounded subject and Host surface envelope. Each candidate ID
-    // appears twice (input claims and verified outcome); account for JSON escaping,
-    // not raw UTF-8 bytes. The fixed per-item allowance covers action and framing.
-    let mut estimated_bytes = 2_048_usize;
-    let mut selected = Vec::new();
-    for id in ids.into_iter().take(CANDIDATE_BATCH_LIMIT) {
-        let id_bytes = serde_json::to_vec(&id)
-            .map_err(|e| Error::InvalidInput(e.to_string()))?
-            .len();
-        let additional = 2 * id_bytes + 128;
-        if estimated_bytes + additional > max_result_bytes as usize {
-            break;
-        }
-        estimated_bytes += additional;
-        selected.push(id);
-    }
-    Ok(selected)
+    subjektiv::job::bounded_candidate_batch(ids, max_result_bytes).map_err(Error::from)
 }
 
 pub(super) fn dispatch(
@@ -234,25 +218,6 @@ pub(super) fn dispatch(
     })
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ConsolidationResult {
-    subject_id: String,
-    candidate_ids: Vec<String>,
-    surface: SurfaceResult,
-}
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SurfaceResult {
-    availability: String,
-    generation_id: String,
-    store_revision: u64,
-    #[serde(default)]
-    snapshot_id: Option<String>,
-    #[serde(default)]
-    reason_code: Option<String>,
-}
-
 pub(super) fn validate_result(
     api: &WorkspaceApi,
     request: &BackendJobRequest,
@@ -262,39 +227,18 @@ pub(super) fn validate_result(
     let Some(grant) = &request.grants.subjektiv_consolidation else {
         return Ok(());
     };
-    let result: ConsolidationResult = serde_json::from_value(value.clone())
-        .map_err(|e| Error::InvalidInput(format!("invalid consolidation result: {e}")))?;
-    if result.subject_id != grant.subject_id || result.candidate_ids != grant.candidate_ids {
-        return Err(Error::InvalidInput(
-            "consolidation result does not match the immutable Subject/batch grant".into(),
-        ));
-    }
     let store =
         crate::subjektiv::SubjektivStore::open(&api.feature_storage, &api.subjektiv_registration)
             .map_err(|e| Error::Store(e.to_string()))?;
-    for candidate_id in &grant.candidate_ids {
-        if store
-            .staging_resolution(&grant.subject_id, candidate_id)
-            .map_err(|e| Error::Store(e.to_string()))?
-            .is_none()
-        {
-            return Err(Error::InvalidInput(format!(
-                "consolidation candidate `{candidate_id}` is unresolved"
-            )));
-        }
-    }
-    store
-        .validate_job_surface_outcome(
-            &grant.subject_id,
-            &result.surface.generation_id,
-            result.surface.store_revision,
-            &result.surface.availability,
-            result.surface.snapshot_id.as_deref(),
-            result.surface.reason_code.as_deref(),
-            &request.job_id,
-            &attempt.attempt_id,
-        )
-        .map_err(|e| Error::InvalidInput(format!("consolidation surface result mismatch: {e}")))
+    subjektiv::job::validate_result(
+        &store,
+        &grant.subject_id,
+        &grant.candidate_ids,
+        &request.job_id,
+        &attempt.attempt_id,
+        value,
+    )
+    .map_err(Error::from)
 }
 
 /// Persist actual candidate dispositions alongside the separate surface outcome.
@@ -313,28 +257,8 @@ pub(super) fn with_dispositions(
     let store =
         crate::subjektiv::SubjektivStore::open(&api.feature_storage, &api.subjektiv_registration)
             .map_err(|e| Error::Store(e.to_string()))?;
-    let mut dispositions = Vec::new();
-    for id in &grant.candidate_ids {
-        let resolution = store
-            .staging_resolution(&grant.subject_id, id)
-            .map_err(|e| Error::Store(e.to_string()))?
-            .ok_or_else(|| {
-                Error::InvalidInput(format!("candidate `{id}` has no durable disposition"))
-            })?;
-        // Full reasons, affected revisions and source edges remain in the existing
-        // immutable receipt store. Duplicating them makes a valid bounded batch's
-        // completion unbounded; this result is its verified compact projection.
-        dispositions.push(serde_json::json!({ "candidate_id": id, "action": resolution.action }));
-    }
-    let mut enriched = value.clone();
-    enriched
-        .as_object_mut()
-        .ok_or_else(|| Error::InvalidInput("consolidation result must be an object".into()))?
-        .insert(
-            "candidate_dispositions".into(),
-            serde_json::Value::Array(dispositions),
-        );
-    Ok(enriched)
+    subjektiv::job::with_dispositions(&store, &grant.subject_id, &grant.candidate_ids, value)
+        .map_err(Error::from)
 }
 
 #[cfg(test)]

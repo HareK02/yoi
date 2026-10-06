@@ -1654,7 +1654,8 @@ fn legacy_entry_id(
 
 fn provenance(origin: &LoggedSessionHistoryOrigin) -> SessionEntryProvenance {
     match origin {
-        LoggedSessionHistoryOrigin::HumanInput { .. } => SessionEntryProvenance::HumanInput,
+        LoggedSessionHistoryOrigin::HumanInput { .. }
+        | LoggedSessionHistoryOrigin::LocalHumanInput => SessionEntryProvenance::HumanInput,
         LoggedSessionHistoryOrigin::WorkerInput { .. } => SessionEntryProvenance::WorkerInput,
         LoggedSessionHistoryOrigin::FlowInstruction { .. } => {
             SessionEntryProvenance::FlowInstruction

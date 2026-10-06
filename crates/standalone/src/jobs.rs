@@ -27,6 +27,17 @@ pub enum JobServiceError {
     Cleanup(String),
 }
 
+pub(crate) trait JobAttemptFence: Send + Sync {
+    fn ensure_live(&self) -> Result<(), String>;
+}
+pub(crate) trait JobDomainProvider: Send + Sync {
+    fn grant(
+        &self,
+        snapshot: &JobSnapshot,
+        fence: Arc<dyn JobAttemptFence>,
+    ) -> Result<worker::job::JobFeatureGrant, String>;
+}
+
 struct Execution {
     cancel: watch::Sender<bool>,
     complete: watch::Receiver<Option<Result<(), String>>>,
@@ -48,6 +59,8 @@ pub struct StandaloneJobs {
     executions: Arc<Mutex<Executions>>,
     cwd: PathBuf,
     capacity: u16,
+    domain: Arc<Mutex<Option<Arc<dyn JobDomainProvider>>>>,
+    model_client: Arc<Mutex<Option<Box<dyn LlmClient>>>>,
 }
 
 impl StandaloneJobs {
@@ -60,7 +73,41 @@ impl StandaloneJobs {
             })),
             cwd,
             capacity: job::DEFAULT_MAX_CONCURRENT_JOBS,
+            domain: Arc::default(),
+            model_client: Arc::default(),
         })
+    }
+
+    pub(crate) fn bind_model_client(&self, client: Box<dyn LlmClient>) {
+        *self
+            .model_client
+            .lock()
+            .expect("Job model transport poisoned") = Some(client);
+    }
+    pub(crate) fn bind_domain(
+        &self,
+        provider: Arc<dyn JobDomainProvider>,
+    ) -> Result<(), JobServiceError> {
+        let mut domain = self.domain.lock().expect("Job domain poisoned");
+        if domain.is_some() {
+            return Err(JobServiceError::Configuration(
+                "Job domain already bound".into(),
+            ));
+        }
+        *domain = Some(provider);
+        Ok(())
+    }
+
+    pub(crate) fn request_granted(
+        &self,
+        request: JobRequest,
+        grant: serde_json::Value,
+    ) -> Result<JobSnapshot, JobServiceError> {
+        let executions = self.executions.lock().expect("Job executions poisoned");
+        if executions.closed {
+            return Err(JobServiceError::Closed);
+        }
+        self.with_store(|store| store.reserve_granted(request, Some(grant)))
     }
 
     fn with_store<T>(
@@ -89,6 +136,10 @@ impl StandaloneJobs {
     /// them; opening a Host never implicitly replays unknown side effects.
     pub fn pending(&self) -> Result<Vec<JobSnapshot>, JobServiceError> {
         Ok(self.with_store(|store| store.pending())?)
+    }
+
+    pub fn unacknowledged_results(&self) -> Result<Vec<JobSnapshot>, JobServiceError> {
+        self.with_store(|store| store.unacknowledged())
     }
 
     /// Explicit new attempt, bounded by immutable intent limits. Unknown
@@ -154,9 +205,40 @@ impl StandaloneJobs {
         job_id: &str,
         client: Option<Box<dyn LlmClient>>,
     ) -> Result<(), JobServiceError> {
+        let client = client.or_else(|| {
+            self.model_client
+                .lock()
+                .expect("Job model transport poisoned")
+                .as_ref()
+                .map(|c| c.clone_boxed())
+        });
         let snapshot = self.get(job_id)?;
-        let prepared = worker::job::prepare_job(&snapshot.request, &self.cwd, client)
-            .map_err(|error| JobServiceError::Configuration(error.to_string()))?;
+        let timeout = Duration::from_secs(u64::from(snapshot.request.limits.timeout_seconds));
+        let deadline = tokio::time::Instant::now() + timeout;
+        let fence: Arc<dyn JobAttemptFence> = Arc::new(BoundAttemptFence {
+            store: self.store.clone(),
+            job_id: job_id.into(),
+            attempt_id: snapshot.attempt.attempt_id.clone(),
+            input_revision: snapshot.request.input_revision.clone(),
+            deadline,
+        });
+        let grant = match (
+            &snapshot.domain_grant,
+            self.domain.lock().expect("Job domain poisoned").as_ref(),
+        ) {
+            (Some(_), Some(provider)) => provider
+                .grant(&snapshot, fence)
+                .map_err(JobServiceError::Configuration)?,
+            (Some(_), None) => {
+                return Err(JobServiceError::Configuration(
+                    "persisted Job requires an unavailable explicit domain capability".into(),
+                ));
+            }
+            (None, _) => worker::job::JobFeatureGrant::default(),
+        };
+        let prepared =
+            worker::job::prepare_job_with_grant(&snapshot.request, &self.cwd, client, grant)
+                .map_err(|error| JobServiceError::Configuration(error.to_string()))?;
         let mut executions = self.executions.lock().expect("Job executions poisoned");
         if executions.closed {
             return Err(JobServiceError::Closed);
@@ -209,13 +291,12 @@ impl StandaloneJobs {
         let store = self.store.clone();
         let id = job_id.to_string();
         let attempt_id = snapshot.attempt.attempt_id.clone();
-        let timeout = Duration::from_secs(u64::from(snapshot.request.limits.timeout_seconds));
         let sink = Arc::new(BoundResultSink {
             store: store.clone(),
             job_id: id.clone(),
             attempt_id: attempt_id.clone(),
             input_revision: snapshot.request.input_revision.clone(),
-            deadline: tokio::time::Instant::now() + timeout,
+            deadline,
         });
         let (cancel, mut cancellation) = watch::channel(false);
         let (complete_tx, complete) = watch::channel(None);
@@ -341,6 +422,11 @@ impl StandaloneJobs {
         // Close SQLite before the Host releases its lease. Cloned handles may
         // outlive the Host but cannot mutate or retain the live connection.
         self.store.lock().expect("Job store poisoned").take();
+        self.domain.lock().expect("Job domain poisoned").take();
+        self.model_client
+            .lock()
+            .expect("Job model transport poisoned")
+            .take();
         error.map_or(Ok(()), Err)
     }
 }
@@ -389,5 +475,34 @@ impl worker::job::JobResultSink for BoundResultSink {
             .accept(&submission)
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+}
+
+struct BoundAttemptFence {
+    store: Arc<Mutex<Option<JobStore>>>,
+    job_id: String,
+    attempt_id: String,
+    input_revision: String,
+    deadline: tokio::time::Instant,
+}
+impl JobAttemptFence for BoundAttemptFence {
+    fn ensure_live(&self) -> Result<(), String> {
+        if tokio::time::Instant::now() >= self.deadline {
+            return Err("Job domain deadline expired".into());
+        }
+        let slot = self.store.lock().map_err(|_| "Job store poisoned")?;
+        let snapshot = slot
+            .as_ref()
+            .ok_or("Job Host closed")?
+            .get(&self.job_id)
+            .map_err(|e| e.to_string())?;
+        if snapshot.state != JobState::Pending
+            || snapshot.attempt.state != JobAttemptState::Dispatched
+            || snapshot.attempt.attempt_id != self.attempt_id
+            || snapshot.request.input_revision != self.input_revision
+        {
+            return Err("Job domain grant is not bound to the current live attempt".into());
+        }
+        Ok(())
     }
 }

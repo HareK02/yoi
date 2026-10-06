@@ -14,9 +14,7 @@ use crate::feature::background::{
     BackgroundTaskCancellation, BackgroundTaskContext, BackgroundTaskSpec, BackgroundTaskTrigger,
     FeatureBackgroundTask,
 };
-use crate::feature::builtin::memory::{
-    WorkspaceMemoryBackendError, is_builtin_subjektiv_consolidation_profile,
-};
+use crate::feature::builtin::memory::is_builtin_subjektiv_consolidation_profile;
 use crate::feature::builtin::memory_surface_output::{
     MemorySurfaceOutputFeature, MemorySurfaceOutputState, submit_llm_tool_definition,
 };
@@ -29,7 +27,10 @@ use crate::internal_worker::{
     InternalWorkerAuthority, InternalWorkerIdentity, InternalWorkerSpec,
     run_internal_worker_with_cancel_sender,
 };
-use crate::worker::{WorkerFilesystemAuthority, WorkerWorkspaceContext, WorkspaceClient};
+use crate::subjektiv::{SubjektivHostConnection, SubjektivHostError};
+#[cfg(test)]
+use crate::worker::WorkspaceClient;
+use crate::worker::{WorkerFilesystemAuthority, WorkerWorkspaceContext};
 use manifest::WorkerManifest;
 
 const TASK_NAME: &str = "subjektiv-memory-surface";
@@ -39,13 +40,13 @@ const EDITOR_MAX_TURNS: u32 = 3;
 const EDITOR_QUESTION: &str = "この主体が次の作業を始める際、毎回思い出しておくべきことは何か。継続的な制約、判断の前提、未解決事項、再発を避けたい教訓を、指定予算内でまとめる。";
 
 #[derive(Clone)]
-pub(crate) struct SubjektivSurfaceLifecycleFeature {
+pub struct SubjektivSurfaceLifecycleFeature {
     task: SubjektivSurfaceLifecycleTask,
 }
 
 #[derive(Clone)]
 struct SubjektivSurfaceLifecycleTask {
-    workspace_client: Arc<dyn WorkspaceClient>,
+    host: SubjektivHostConnection,
     manifest: WorkerManifest,
     client: Box<dyn LlmClient>,
     prompts: Arc<ArcSwap<PromptCatalog>>,
@@ -94,18 +95,20 @@ impl LlmClient for InputBudgetLlmClient {
 impl SubjektivSurfaceLifecycleFeature {
     pub(crate) fn from_manifest(
         lifecycle_enabled: bool,
-        workspace_client: Arc<dyn WorkspaceClient>,
+        host: Option<SubjektivHostConnection>,
         manifest: WorkerManifest,
         client: Box<dyn LlmClient>,
         prompts: Arc<ArcSwap<PromptCatalog>>,
         workspace_context: WorkerWorkspaceContext,
     ) -> std::io::Result<Option<Self>> {
-        let dedicated = is_builtin_subjektiv_consolidation_profile(&manifest);
-        if !lifecycle_enabled || !dedicated {
+        if !lifecycle_enabled
+            || !is_builtin_subjektiv_consolidation_profile(&manifest)
+            || host.is_none()
+        {
             return Ok(None);
         }
-        Self::for_job(
-            workspace_client,
+        Self::for_host(
+            host.expect("checked connection"),
             manifest,
             client,
             prompts,
@@ -114,8 +117,9 @@ impl SubjektivSurfaceLifecycleFeature {
         .map(Some)
     }
 
-    pub(crate) fn for_job(
-        workspace_client: Arc<dyn WorkspaceClient>,
+    /// Install the reusable surface Feature for an explicitly granted Host.
+    pub fn for_host(
+        host: SubjektivHostConnection,
         manifest: WorkerManifest,
         client: Box<dyn LlmClient>,
         prompts: Arc<ArcSwap<PromptCatalog>>,
@@ -125,22 +129,16 @@ impl SubjektivSurfaceLifecycleFeature {
             .feature
             .subjektiv
             .validate_execution()
-            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
-        if !manifest.feature.subjektiv.execution_enabled() {
+            .map_err(std::io::Error::other)?;
+        if !manifest.feature.subjektiv.profile.enabled || !host.host.consolidation_granted() {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "subjektiv surface generation requires trusted subject attachment",
-            ));
-        }
-        if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "subjektiv surface generation requires Backend Workspace API authority",
+                std::io::ErrorKind::PermissionDenied,
+                "surface generation requires explicit Host consolidation grant",
             ));
         }
         Ok(Self {
             task: SubjektivSurfaceLifecycleTask {
-                workspace_client,
+                host,
                 manifest,
                 client,
                 prompts,
@@ -150,7 +148,7 @@ impl SubjektivSurfaceLifecycleFeature {
     }
 
     /// The Job tool awaits this clean-context lifecycle before submitting its result.
-    pub(crate) async fn complete_for_job(
+    pub async fn complete_for_job(
         &self,
         cancellation: BackgroundTaskCancellation,
         reusable_surface: Option<&serde_json::Value>,
@@ -234,7 +232,7 @@ impl SubjektivSurfaceLifecycleTask {
                 ));
             }
             let generation = self
-                .workspace_client
+                .host
                 .prepare_subjektiv_memory_surface()
                 .await
                 .map_err(surface_hook_error)?;
@@ -299,7 +297,7 @@ impl SubjektivSurfaceLifecycleTask {
                 ));
             }
             match self
-                .workspace_client
+                .host
                 .publish_subjektiv_memory_surface(server_api::SubjektivSurfacePublishRequest {
                     generation_id: generation.generation_id.clone(),
                     points,
@@ -312,9 +310,8 @@ impl SubjektivSurfaceLifecycleTask {
                         "store_revision": output.built_from_store_revision, "snapshot_id": output.snapshot_id,
                     }));
                 }
-                Err(WorkspaceMemoryBackendError::Http { status, .. })
-                    if status == reqwest::StatusCode::CONFLICT
-                        && attempt + 1 < MAX_GENERATION_ATTEMPTS =>
+                Err(SubjektivHostError::Conflict { .. })
+                    if attempt + 1 < MAX_GENERATION_ATTEMPTS =>
                 {
                     continue;
                 }
@@ -334,18 +331,7 @@ impl SubjektivSurfaceLifecycleTask {
         generation: &server_api::SubjektivSurfacePrepareResponse,
         cancellation: BackgroundTaskCancellation,
     ) -> Result<Vec<server_api::SubjektivSurfacePoint>, SurfaceEditorFailure> {
-        let language = self
-            .manifest
-            .feature
-            .subjektiv
-            .workspace_settings()
-            .map(|settings| settings.language)
-            .ok_or_else(|| {
-                SurfaceEditorFailure::editor(HookError::new(
-                    HookErrorCategory::Internal,
-                    "surface editor requires bound subjektiv Workspace settings",
-                ))
-            })?;
+        let language = self.host.host.settings().language;
         let system_prompt = self
             .prompts
             .load_full()
@@ -424,7 +410,7 @@ impl SubjektivSurfaceLifecycleTask {
         job_confirmation_required: bool,
     ) -> Result<serde_json::Value, HookError> {
         let failure = self
-            .workspace_client
+            .host
             .fail_subjektiv_memory_surface(server_api::SubjektivSurfaceFailureRequest {
                 generation_id: generation.generation_id.clone(),
                 reason_code: reason_code.to_string(),
@@ -586,7 +572,7 @@ fn estimated_editor_request_tokens(request: &Request) -> Result<usize, HookError
     Ok(request.len().saturating_add(3) / 4)
 }
 
-fn surface_hook_error(error: WorkspaceMemoryBackendError) -> HookError {
+fn surface_hook_error(error: SubjektivHostError) -> HookError {
     HookError::new(HookErrorCategory::Internal, error.to_string())
 }
 
@@ -889,7 +875,7 @@ permission = "write"
         calls: Arc<AtomicUsize>,
     ) -> SubjektivSurfaceLifecycleTask {
         SubjektivSurfaceLifecycleTask {
-            workspace_client,
+            host: crate::subjektiv::test_connection(workspace_client),
             manifest: test_manifest(),
             client: Box::new(SurfaceEditorClient { calls }),
             prompts: Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),

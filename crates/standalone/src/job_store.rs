@@ -6,7 +6,6 @@
 //! authority. The service owns the connection mutex and live-resource cleanup.
 
 use std::path::Path;
-use std::time::Duration;
 
 use job::{JobRequest, JobResultSubmission};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -14,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -57,6 +56,8 @@ impl JobAttemptState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobSnapshot {
     pub request: JobRequest,
+    /// Durable Host-issued domain delegation, not model input or Profile identity.
+    pub domain_grant: Option<Value>,
     pub state: JobState,
     pub attempt: JobAttempt,
     pub result: Option<Value>,
@@ -112,6 +113,8 @@ pub struct JobAttempt {
 pub enum JobStoreError {
     #[error("Job database: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Storage(#[from] feature_storage::FeatureStorageError),
     #[error("Job JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -151,16 +154,30 @@ impl JobStore {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)?;
+        }
         let mut conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "FULL")?;
+        feature_storage::configure_connection(&conn)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
         match version {
             0 => {
                 tx.execute_batch(SCHEMA)?;
+                tx.execute_batch(GRANT_SCHEMA)?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
+            1 => {
+                tx.execute_batch(GRANT_SCHEMA)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             SCHEMA_VERSION => {}
@@ -186,7 +203,17 @@ impl JobStore {
     }
 
     pub(crate) fn reserve(&mut self, request: JobRequest) -> Result<JobSnapshot, JobStoreError> {
+        self.reserve_granted(request, None)
+    }
+    pub(crate) fn reserve_granted(
+        &mut self,
+        request: JobRequest,
+        grant: Option<Value>,
+    ) -> Result<JobSnapshot, JobStoreError> {
         request.validate()?;
+        if let Some(value) = &grant {
+            job::result_digest(value, job::ABSOLUTE_MAX_RESULT_BYTES)?;
+        }
         let fingerprint = request.fingerprint()?;
         let request_json = serde_json::to_string(&request)?;
         let tx = self
@@ -198,7 +225,10 @@ impl JobStore {
                 [&request.job_id],
                 |row| row.get(0),
             )?;
-            if stored != fingerprint || snapshot.request != request {
+            if stored != fingerprint
+                || snapshot.request != request
+                || snapshot.domain_grant != grant
+            {
                 return Err(JobStoreError::IntentConflict(request.job_id));
             }
             tx.commit()?;
@@ -219,6 +249,12 @@ impl JobStore {
             ],
         )?;
         insert_attempt(&tx, &request, 1)?;
+        if let Some(grant) = grant {
+            tx.execute(
+                "INSERT INTO job_domain_grants(job_id, grant_json) VALUES (?1, ?2)",
+                params![request.job_id, serde_json::to_string(&grant)?],
+            )?;
+        }
         let snapshot = require_snapshot(&tx, &request.job_id)?;
         tx.commit()?;
         Ok(snapshot)
@@ -253,6 +289,16 @@ impl JobStore {
 
     pub(crate) fn get(&self, job_id: &str) -> Result<JobSnapshot, JobStoreError> {
         require_snapshot(&self.conn, job_id)
+    }
+
+    pub(crate) fn unacknowledged(&self) -> Result<Vec<JobSnapshot>, JobStoreError> {
+        let mut statement = self.conn.prepare("SELECT job_id FROM job_intents WHERE state = 'completed' AND acknowledged = 0 ORDER BY rowid")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.into_iter()
+            .map(|id| require_snapshot(&self.conn, &id))
+            .collect()
     }
 
     /// Only unstarted current attempts are eligible for service startup/resume.
@@ -570,6 +616,15 @@ fn read_snapshot(conn: &Connection, job_id: &str) -> Result<Option<JobSnapshot>,
             };
             Ok(JobSnapshot {
                 request: serde_json::from_str(&request)?,
+                domain_grant: conn
+                    .query_row(
+                        "SELECT grant_json FROM job_domain_grants WHERE job_id = ?1",
+                        [job_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .map(|s| serde_json::from_str(&s))
+                    .transpose()?,
                 state,
                 acknowledged,
                 attempt: JobAttempt {
@@ -584,6 +639,17 @@ fn read_snapshot(conn: &Connection, job_id: &str) -> Result<Option<JobSnapshot>,
     )
     .transpose()
 }
+
+const GRANT_SCHEMA: &str = "
+CREATE TABLE job_domain_grants (
+    job_id TEXT PRIMARY KEY NOT NULL REFERENCES job_intents(job_id),
+    grant_json TEXT NOT NULL
+);
+CREATE TRIGGER job_grant_immutable BEFORE UPDATE ON job_domain_grants
+BEGIN SELECT RAISE(ABORT, 'immutable Job domain grant'); END;
+CREATE TRIGGER job_grant_retained BEFORE DELETE ON job_domain_grants
+BEGIN SELECT RAISE(ABORT, 'retained Job domain grant'); END;
+";
 
 const SCHEMA: &str = "
 CREATE TABLE job_intents (

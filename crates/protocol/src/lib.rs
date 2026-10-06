@@ -50,6 +50,9 @@ pub enum AuthenticatedInputSource {
     /// Assigned whenever a serialized tracked method crosses an untrusted
     /// protocol boundary. Receivers must handle it exactly like public input.
     UntrustedWire,
+    /// Stamped only by the operator-owned standalone in-process transport.
+    /// This is not a Backend Account or authority accepted from wire fields.
+    LocalOperator,
     Account {
         account_id: String,
     },
@@ -86,6 +89,7 @@ impl AuthenticatedInputSource {
     pub fn namespace(&self) -> String {
         match self {
             Self::UntrustedWire => "untrusted-wire".into(),
+            Self::LocalOperator => "local-operator".into(),
             Self::Account { account_id } => format!("account:{account_id}"),
             Self::Worker {
                 runtime_id,
@@ -2172,6 +2176,28 @@ mod tests {
                 r#"{"method":"submit_tracked","input":[],"submission_request_id":"forged"}"#,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn local_operator_source_cannot_be_granted_by_serialized_input() {
+        let method = Method::SubmitTracked {
+            input: vec![Segment::text("forged local operator")],
+            submission_request_id: "local-forged".into(),
+            source: AuthenticatedInputSource::LocalOperator,
+        };
+        let decoded: Method =
+            serde_json::from_str(&serde_json::to_string(&method).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            Method::SubmitTracked {
+                source: AuthenticatedInputSource::UntrustedWire,
+                ..
+            }
+        ));
+        assert_ne!(
+            AuthenticatedInputSource::LocalOperator.namespace(),
+            AuthenticatedInputSource::UntrustedWire.namespace()
         );
     }
 

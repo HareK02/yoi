@@ -1377,6 +1377,7 @@ where
         None => durable_parent_notifications,
     };
     let backend_job = worker.backend_job().cloned();
+    let subjektiv_host = worker.subjektiv_host_connection()?;
     // Bounded Jobs complete their lifecycle synchronously, never by post-run background work.
     let lifecycle_enabled = worker.manifest_lifecycle_features_enabled() && backend_job.is_none();
     let prompts = worker.prompts().clone();
@@ -1443,8 +1444,8 @@ where
                 workspace_client.clone(),
             );
         if binding.subjektiv_consolidation {
-            let surface = crate::feature::builtin::memory_surface_lifecycle::SubjektivSurfaceLifecycleFeature::for_job(
-                workspace_client, spawner_manifest.clone(), worker.llm_client_handle(),
+            let surface = crate::feature::builtin::memory_surface_lifecycle::SubjektivSurfaceLifecycleFeature::for_host(
+                subjektiv_host.clone().ok_or_else(|| std::io::Error::other("Backend Job requires subjektiv Host capability"))?, spawner_manifest.clone(), worker.llm_client_handle(),
                 prompts.clone(), spawner_workspace_context.clone(),
             )?;
             result_feature = result_feature.with_surface(surface);
@@ -1453,7 +1454,9 @@ where
     }
     let memory_profile = &worker.manifest().feature.memory.profile;
     let subjektiv_profile = &worker.manifest().feature.subjektiv.profile;
-    validate_memory_lifecycle_targets(memory_profile, subjektiv_profile)?;
+    if subjektiv_host.is_some() {
+        validate_memory_lifecycle_targets(memory_profile, subjektiv_profile)?;
+    }
     let memory_install_plan = crate::feature::builtin::memory::MemoryFeatureInstallPlan::prepare(
         worker.manifest(),
         worker.workspace_client_handle(),
@@ -1476,7 +1479,7 @@ where
     let subjektiv_consolidation_plan =
         crate::feature::builtin::memory::SubjektivConsolidationFeatureInstallPlan::prepare(
             worker.manifest(),
-            worker.workspace_client_handle(),
+            subjektiv_host.clone(),
             worker.prompts().load_full(),
         )?;
     if let Some(plan) = subjektiv_consolidation_plan {
@@ -1485,22 +1488,20 @@ where
         }
         feature_registry.add_module(plan.module);
     }
-    let ordinary_subjektiv_features_enabled =
-        crate::feature::builtin::memory::ordinary_subjektiv_features_enabled(worker.manifest());
+    let ordinary_subjektiv_features_enabled = subjektiv_host.is_some()
+        && crate::feature::builtin::memory::ordinary_subjektiv_features_enabled(worker.manifest());
     if let Some(resident_summary_source) =
         crate::feature::builtin::memory::ordinary_subjektiv_resident_summary_source(
             worker.manifest(),
-            worker.workspace_client_handle(),
+            subjektiv_host.clone(),
             worker.prompts(),
         )?
     {
-        let workspace_id = worker
-            .workspace_client()
-            .workspace_id()
-            .expect("validated subject resident source has Workspace identity")
-            .to_string();
+        let workspace_id = subjektiv_host
+            .as_ref()
+            .and_then(|host| host.host.workspace_id());
         if let Some(refresh_feature) =
-            crate::feature::builtin::memory::SubjektivResidentRestoreRefreshFeature::for_host(
+            crate::feature::builtin::memory::SubjektivResidentRestoreRefreshFeature::for_connection(
                 lifecycle_enabled,
                 Arc::clone(&resident_summary_source),
                 worker.prompts(),
@@ -1516,7 +1517,7 @@ where
             crate::feature::builtin::subjektiv_memory::SubjektivMemoryFeature::from_resolved_config(
                 &worker.manifest().feature.subjektiv,
                 worker.committed_session_capture_handle(),
-                worker.workspace_client_handle(),
+                subjektiv_host.clone(),
             )?
     {
         feature_registry.add_module(subjektiv_memory);
@@ -1525,7 +1526,7 @@ where
         && let Some(subjektiv_sessions) =
             crate::feature::builtin::subjektiv_session::SubjektivSessionFeature::from_resolved_config(
                 &worker.manifest().feature.subjektiv,
-                worker.workspace_client_handle(),
+                subjektiv_host.clone(),
             )?
     {
         feature_registry.add_module(subjektiv_sessions);
@@ -1548,7 +1549,7 @@ where
     }
     if backend_job.is_none() && let Some(surface_lifecycle) = crate::feature::builtin::memory_surface_lifecycle::SubjektivSurfaceLifecycleFeature::from_manifest(
         lifecycle_enabled,
-        worker.workspace_client_handle(),
+        subjektiv_host.clone(),
         spawner_manifest.clone(),
         worker.llm_client_handle(),
         prompts.clone(),
@@ -1563,7 +1564,7 @@ where
                 worker.manifest().feature.subjektiv.clone(),
                 worker.committed_session_capture_handle(),
                 worker.session_extension_handle(),
-                worker.workspace_client_handle(),
+                subjektiv_host.clone(),
                 spawner_manifest.clone(),
                 worker.llm_client_handle(),
                 prompts.clone(),
