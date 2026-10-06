@@ -2426,7 +2426,7 @@ fn one() -> u32 {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct WipInspectInput {
-    /// Opaque interface reference returned by WipDiscover.
+    /// Opaque interface reference returned by Discover.
     interface: String,
     /// Explicitly supersede the cached descriptor observation.
     #[serde(default)]
@@ -2435,11 +2435,11 @@ struct WipInspectInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct WipCallInput {
-    /// Exact object path returned by WipDiscover.
+    /// Exact object path returned by Discover.
     path: String,
     /// Exact interface reference selected from that object.
     interface: String,
-    /// Exact operation name from WipInspect.
+    /// Exact operation name from Inspect.
     operation: String,
     /// Original operation arguments. Compatibility operations accept the original tool object here.
     arguments: Json,
@@ -2521,7 +2521,7 @@ fn wip_tool_definitions(runtime: Arc<WipRuntime>) -> Vec<ToolDefinition> {
         Arc::new(move || {
             let schema = schemars::schema_for!(WipDiscoverInput);
             (
-                ToolMeta::new("WipDiscover")
+                ToolMeta::new("Discover")
                     .description("Explore the authorized WIP Worldspace and stateful Known Space. Start at `/`; use reset after reconnect or authority changes.")
                     .input_schema(serde_json::to_value(schema).expect("WIP discover schema serializes")),
                 Arc::new(WipDiscoverTool {
@@ -2532,8 +2532,8 @@ fn wip_tool_definitions(runtime: Arc<WipRuntime>) -> Vec<ToolDefinition> {
         Arc::new(move || {
             let schema = schemars::schema_for!(WipInspectInput);
             (
-                ToolMeta::new("WipInspect")
-                    .description("Fetch and validate one descriptor returned by WipDiscover. Inspect before calling an operation.")
+                ToolMeta::new("Inspect")
+                    .description("Fetch and validate one descriptor returned by Discover. Inspect before calling an operation.")
                     .input_schema(serde_json::to_value(schema).expect("WIP inspect schema serializes")),
                 Arc::new(WipInspectTool {
                     runtime: Arc::clone(&inspect_runtime),
@@ -2543,7 +2543,7 @@ fn wip_tool_definitions(runtime: Arc<WipRuntime>) -> Vec<ToolDefinition> {
         Arc::new(move || {
             let schema = schemars::schema_for!(WipCallInput);
             (
-                ToolMeta::new("WipCall")
+                ToolMeta::new("Call")
                     .description("Invoke an operation only from fresh object/interface observations. Stale validators and invalid original JSON Schema inputs fail closed; unknown write outcomes must not be retried automatically.")
                     .input_schema(serde_json::to_value(schema).expect("WIP call schema serializes")),
                 Arc::new(WipCallTool {
@@ -3093,10 +3093,72 @@ mod tests {
                 .into_iter()
                 .map(|definition| definition.name)
                 .collect::<Vec<_>>(),
-            ["WipCall", "WipDiscover", "WipInspect"]
+            ["Call", "Discover", "Inspect"]
         );
         let metrics = runtime.metrics();
         assert!(metrics.ordinary_schema_bytes > metrics.wip_schema_bytes);
+    }
+
+    #[tokio::test]
+    async fn renamed_gateway_tools_discover_inspect_and_call_through_registered_surface() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
+        engine.register_tool(echo_definition("Echo".into(), Arc::clone(&calls)));
+        install_wip_mode(&mut engine, None, "worker-a".into()).unwrap();
+        let tools = engine.tool_server_handle();
+        tools.flush_pending();
+
+        let discovered = transport_output_json(
+            tools
+                .call_tool(
+                    "Discover",
+                    r#"{"path":"/","depth":2}"#,
+                    ToolExecutionContext::direct(),
+                )
+                .await
+                .unwrap(),
+        );
+        let object = discovered["known_space"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["path"] == "/tools/Echo")
+            .unwrap();
+        assert_eq!(object["state"], "fresh");
+        let interface = object["object"]["interfaces"][0].as_str().unwrap();
+        let inspected = transport_output_json(
+            tools
+                .call_tool(
+                    "Inspect",
+                    &json!({"interface": interface}).to_string(),
+                    ToolExecutionContext::direct(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(inspected["interface"], interface);
+        assert_eq!(inspected["state"], "fresh");
+        assert_eq!(inspected["descriptor"]["operations"][0]["name"], "call");
+
+        let arguments = json!({"message": "hello"});
+        let output = tools
+            .call_tool(
+                "Call",
+                &json!({
+                    "path": object["path"],
+                    "interface": interface,
+                    "operation": "call",
+                    "arguments": arguments,
+                })
+                .to_string(),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.summary, arguments.to_string());
+        assert!(output.content.is_none());
+        assert!(output.attachments.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
