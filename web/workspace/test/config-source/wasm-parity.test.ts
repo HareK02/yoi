@@ -299,6 +299,150 @@ Deno.test("generated WASM returns completion items for the editor adapter", () =
   assertEquals(result.items[0].kind, "file");
 });
 
+Deno.test("generated WASM exposes read-only builtin completions without editable builtin entries", () => {
+  const tree = schemaSnapshot("{}");
+  set_snapshot(tree);
+  set_schema_bundle(emptySchemaBundle);
+  const source = 'let 名 = 1; import "$builtin/profiles/comp"';
+  const result = complete_current(
+    "main.dcdl",
+    source,
+    source.length - 1,
+    true,
+  ) as {
+    from: number;
+    items: Array<{ label: string; kind: string; detail: string }>;
+  };
+  const companion = result.items.find((item) =>
+    item.label === "$builtin/profiles/companion.dcdl"
+  );
+  assertEquals(result.from, 'let 名 = 1; import "'.length);
+  assertEquals(companion?.kind, "file");
+  assertEquals(companion?.detail, "read-only builtin Decodal source");
+  assertEquals(Object.keys(tree.entries), ["main.dcdl"]);
+  const evaluated = evaluate_snapshot(
+    schemaSnapshot('import "$builtin/profiles/companion.dcdl"'),
+    mainEntrypointContract,
+  ) as {
+    projections: Array<{ data_json: { slug: string } }>;
+  };
+  assertEquals(evaluated.projections[0].data_json.slug, "companion");
+});
+
+Deno.test("generated WASM rejects unknown builtin imports without same-suffix workspace fallback", () => {
+  const tree = schemaSnapshot('import "$builtin/profiles/missing.dcdl"');
+  tree.entries["profiles/missing.dcdl"] = {
+    path: "profiles/missing.dcdl",
+    content_type: "decodal",
+    content: "{}",
+    content_digest: "sha256:workspace-fallback",
+  };
+  set_schema_bundle(emptySchemaBundle);
+  const diagnostics = analyze_snapshot(tree, "main.dcdl", undefined) as Array<{
+    path: string;
+    revision: number;
+    tree_digest: string;
+    message: string;
+  }>;
+  assertEquals(diagnostics.length > 0, true);
+  assertEquals(diagnostics[0].path, "main.dcdl");
+  assertEquals(diagnostics[0].revision, tree.revision);
+  assertEquals(diagnostics[0].tree_digest, tree.digest);
+  assertEquals(
+    diagnostics[0].message.includes(
+      "unknown or non-public read-only builtin source",
+    ),
+    true,
+  );
+  assertEquals(
+    diagnostics[0].message.includes("$builtin/profiles/missing.dcdl"),
+    true,
+  );
+  let failed = false;
+  try {
+    evaluate_snapshot(tree, mainEntrypointContract);
+  } catch (error) {
+    failed = true;
+    assertEquals(
+      (error as Array<{ message: string }>)[0].message.includes(
+        "unknown or non-public read-only builtin source",
+      ),
+      true,
+    );
+  }
+  assertEquals(failed, true);
+  assertEquals(
+    analyze_snapshot(tree, "main.dcdl", 'import "./profiles/missing.dcdl"'),
+    [],
+  );
+});
+
+function importFailure(tree: ConfigTreeSnapshot): ProjectedDiagnostic[] {
+  try {
+    evaluate_snapshot(tree, mainEntrypointContract);
+  } catch (error) {
+    // A WASM trap/stack overflow must not count as a structured import failure.
+    assertEquals(Array.isArray(error), true);
+    const diagnostics = error as Array<
+      ProjectedDiagnostic & {
+        revision: number;
+        tree_digest: string;
+      }
+    >;
+    assertEquals(diagnostics.length > 0, true);
+    assertEquals(diagnostics[0].revision, tree.revision);
+    assertEquals(diagnostics[0].tree_digest, tree.digest);
+    return diagnostics;
+  }
+  throw new Error("expected a structured import diagnostic");
+}
+
+Deno.test("generated WASM rejects nested lazy-object import cycles without a stack overflow", () => {
+  const tree = schemaSnapshot('{ nested = import "./b.dcdl"; }');
+  tree.entries["b.dcdl"] = {
+    path: "b.dcdl",
+    content_type: "decodal",
+    content: '{ nested = import "./main.dcdl"; }',
+    content_digest: "sha256:nested-cycle-b",
+  };
+  const diagnostics = importFailure(tree);
+  assertEquals(diagnostics[0].kind, "cycle");
+  assertEquals(diagnostics[0].message.includes("import cycle"), true);
+});
+
+Deno.test("generated WASM enforces the import depth budget on a real 33-deep chain", () => {
+  function chain(depth: number): ConfigTreeSnapshot {
+    const tree = schemaSnapshot('import "./chain/1.dcdl"');
+    for (let index = 1; index <= depth; index++) {
+      const path = `chain/${index}.dcdl`;
+      tree.entries[path] = {
+        path,
+        content_type: "decodal",
+        content: index === depth
+          ? "{ answer = 42; }"
+          : `import "./${index + 1}.dcdl"`,
+        content_digest: `sha256:chain-${depth}-${index}`,
+      };
+    }
+    return tree;
+  }
+  // The synthetic evaluation-wrapper import consumes one of the 32 edges.
+  const accepted = evaluate_snapshot(chain(31), mainEntrypointContract) as {
+    projections: Array<{ data_json: { answer: number } }>;
+  };
+  assertEquals(accepted.projections[0].data_json, { answer: 42 });
+  for (const depth of [32, 33]) {
+    const diagnostics = importFailure(chain(depth));
+    assertEquals(diagnostics[0].kind, "import");
+    assertEquals(
+      diagnostics.some((diagnostic) =>
+        diagnostic.message.includes("import depth")
+      ),
+      true,
+    );
+  }
+});
+
 Deno.test("generated WASM completes blank nested schema positions after Unicode", () => {
   const source =
     '{ description = "日本語"; profile = {  }\n} as WorkspaceConfigSchema';

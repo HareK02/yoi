@@ -45,6 +45,287 @@ fn source(value: &str) -> String {
 }
 
 #[tokio::test]
+async fn value_profiles_builtin_http_config_tree_is_read_only_and_never_falls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = test_api(dir.path()).await;
+    let token = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+    let app = build_router(api.clone());
+    let tree = format!("/api/w/{TEST_WORKSPACE_ID}/config/source-tree");
+    let commit = format!("{tree}/commit");
+    let initial = get_json_authenticated(app.clone(), &tree, &token).await;
+    let saved = request_json_authenticated(
+        app.clone(),
+        "POST",
+        &commit,
+        Some(
+            serde_json::to_value(request(
+                &api,
+                &source(r#"import "$builtin/profiles/companion.dcdl""#),
+                vec![config_source::ConfigTreeChange::Create {
+                    // An ordinary Workspace file at the matching suffix must not rescue
+                    // an unknown builtin import.
+                    path: config_source::VirtualPath::parse("profiles/private.dcdl").unwrap(),
+                    content_type: config_source::ConfigContentType::Decodal,
+                    content: PROFILE.into(),
+                }],
+            ))
+            .unwrap(),
+        ),
+        &token,
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(
+        saved["snapshot"]["revision"].as_u64().unwrap(),
+        initial["snapshot"]["revision"].as_u64().unwrap() + 1
+    );
+    let listed = get_json_authenticated(app.clone(), &tree, &token).await;
+    assert_eq!(listed, saved);
+    let entries = listed["snapshot"]["entries"].as_object().unwrap();
+    assert!(entries.contains_key("profiles/private.dcdl"));
+    assert!(
+        entries
+            .keys()
+            .all(|key| key != "$builtin" && !key.starts_with("$builtin/"))
+    );
+    let shadow = get_json_authenticated(
+        app.clone(),
+        &format!("{tree}/entries/profiles%2Fprivate.dcdl"),
+        &token,
+    )
+    .await;
+    assert_eq!(shadow, entries["profiles/private.dcdl"]);
+    assert!(
+        shadow["content"]
+            .as_str()
+            .unwrap()
+            .contains("slug = \"alpha\"")
+    );
+    let active = api
+        .config_store
+        .load_workspace_config(TEST_WORKSPACE_ID)
+        .unwrap()
+        .unwrap();
+    let main_digest = entries["main.dcdl"]["content_digest"].as_str().unwrap();
+    let base = json!({
+        "base_revision": listed["snapshot"]["revision"],
+        "base_digest": listed["snapshot"]["digest"],
+        "entrypoints": listed["contract"]["entrypoints"],
+    });
+    let reserved = "$builtin/profiles/companion.dcdl";
+    for change in [
+        json!({ "kind": "create", "path": reserved, "content_type": "decodal", "content": PROFILE }),
+        json!({ "kind": "create", "path": "$builtin", "content_type": "text", "content": "shadow" }),
+        json!({ "kind": "update", "path": reserved, "expected_digest": "not-a-workspace-entry", "content": PROFILE }),
+        json!({ "kind": "delete", "path": reserved, "expected_digest": "not-a-workspace-entry" }),
+        json!({ "kind": "rename", "from": "profiles/private.dcdl", "to": reserved, "expected_digest": shadow["content_digest"] }),
+        json!({ "kind": "rename", "from": reserved, "to": "profiles/copy.dcdl", "expected_digest": "not-a-workspace-entry" }),
+    ] {
+        let mut body = base.clone();
+        body["changes"] = json!([change]);
+        let error = request_json_authenticated(
+            app.clone(),
+            "POST",
+            &commit,
+            Some(body),
+            &token,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("builtin namespace is read-only"),
+            "{error}"
+        );
+        assert_eq!(
+            get_json_authenticated(app.clone(), &tree, &token).await,
+            listed
+        );
+    }
+    let mut body = base;
+    body["changes"] = json!([{
+        "kind": "update", "path": "main.dcdl", "expected_digest": main_digest,
+        "content": source(r#"import "$builtin/profiles/private.dcdl""#),
+    }]);
+    let error = request_json_authenticated(
+        app.clone(),
+        "POST",
+        &commit,
+        Some(body),
+        &token,
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message.contains(
+            "unknown or non-public read-only builtin source: $builtin/profiles/private.dcdl"
+        ),
+        "{error}"
+    );
+    assert!(message.contains("\"kind\":\"import\""), "{error}");
+    assert_eq!(get_json_authenticated(app, &tree, &token).await, listed);
+    assert_eq!(
+        api.config_store
+            .load_workspace_config(TEST_WORKSPACE_ID)
+            .unwrap()
+            .unwrap(),
+        active
+    );
+}
+
+#[tokio::test]
+async fn value_profiles_builtin_companion_composition_seals_observed_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = test_api(dir.path()).await;
+    let recipe = r#"(import "$builtin/profiles/companion.dcdl") // {
+        worker = { mode = "wip"; };
+        feature = {
+            task = { enabled = true; };
+            ticket = { enabled = false; };
+            workspace_config = { enabled = true; };
+        };
+    }"#;
+    let state = commit_workspace_config_tree(
+        &api,
+        TEST_WORKSPACE_ID,
+        &request(
+            &api,
+            &source(r#"import "./recipes/custom.dcdl""#),
+            vec![
+                config_source::ConfigTreeChange::Create {
+                    path: config_source::VirtualPath::parse("recipes/custom.dcdl").unwrap(),
+                    content_type: config_source::ConfigContentType::Decodal,
+                    content: recipe.into(),
+                },
+                // Builtin relative imports must not be shadowed by Workspace files.
+                config_source::ConfigTreeChange::Create {
+                    path: config_source::VirtualPath::parse("profiles/base.dcdl").unwrap(),
+                    content_type: config_source::ConfigContentType::Decodal,
+                    content: "{ slug = \"workspace-shadow\"; }".into(),
+                },
+            ],
+        ),
+    )
+    .unwrap();
+    let projection = project_profiles_from_workspace_config(TEST_WORKSPACE_ID, &state).unwrap();
+    let bundle = build_virtual_profile_config_bundle(
+        &projection,
+        &state,
+        TEST_WORKSPACE_ID,
+        "created",
+        "project:alpha",
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(bundle.metadata.digest, bundle.computed_digest());
+    let archive = bundle.profile_source_archive.as_ref().unwrap();
+    let verified = archive.verify().unwrap();
+    let environment = config_source::SnapshotEnvironment::new(state.snapshot.clone());
+    let builtin_sources = environment.builtin_import_sources(&state.contract).unwrap();
+    assert_eq!(
+        builtin_sources
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec![
+            "$builtin/profiles/base.dcdl",
+            "$builtin/profiles/companion.dcdl",
+        ]
+    );
+    assert_eq!(
+        archive.reference.source_graph.source_count,
+        builtin_sources.len() + 1
+    );
+    assert_eq!(archive.reference.source_graph.import_count, 0);
+    assert_eq!(
+        verified.manifest().entrypoints["project:alpha"],
+        "profiles/evaluated.json"
+    );
+    for (key, bytes) in &builtin_sources {
+        let source = verified
+            .manifest()
+            .sources
+            .iter()
+            .find(|source| &source.source_key == key)
+            .unwrap();
+        assert_eq!(source.path, *key);
+        assert_eq!(source.kind, "decodal");
+        assert_eq!(
+            source.digest,
+            worker_runtime::profile_archive::sha256_hex(bytes.as_bytes())
+        );
+        assert_eq!(source.size_bytes, bytes.len() as u64);
+    }
+    assert!(
+        verified
+            .manifest()
+            .sources
+            .iter()
+            .any(|source| source.path == "profiles/evaluated.json" && source.kind == "json")
+    );
+    // Resolve using the Runtime archive consumer, without access to the config tree.
+    let resolved = verified
+        .resolve_profile(
+            "project:alpha",
+            Path::new("/runtime-worker"),
+            "builtin-value-worker",
+        )
+        .unwrap();
+    assert_eq!(resolved.worker.mode, manifest::WorkerMode::Wip);
+    assert!(resolved.feature.task.enabled);
+    assert!(!resolved.feature.ticket.enabled);
+    assert!(resolved.feature.workspace_config.enabled);
+    let evaluation = environment.evaluate_contract(&state.contract).unwrap();
+    assert_eq!(
+        resolved.model.ref_.as_deref(),
+        evaluation.projections[0]
+            .data_json
+            .pointer("/profile/entries/0/profile/model/ref")
+            .and_then(serde_json::Value::as_str)
+    );
+    let persisted = manifest::write_persisted_worker_manifest_snapshot(&resolved).unwrap();
+    let old_bundle_digest = bundle.metadata.digest.clone();
+
+    let updated = commit_workspace_config_tree(
+        &api,
+        TEST_WORKSPACE_ID,
+        &request(&api, &source(PROFILE), vec![]),
+    )
+    .unwrap();
+    let projection = project_profiles_from_workspace_config(TEST_WORKSPACE_ID, &updated).unwrap();
+    let updated_bundle = build_virtual_profile_config_bundle(
+        &projection,
+        &updated,
+        TEST_WORKSPACE_ID,
+        "created",
+        "project:alpha",
+    )
+    .unwrap()
+    .unwrap();
+    assert_ne!(old_bundle_digest, updated_bundle.metadata.digest);
+    assert_eq!(
+        updated_bundle
+            .profile_source_archive
+            .as_ref()
+            .unwrap()
+            .reference
+            .source_graph
+            .source_count,
+        1
+    );
+    // Editing config changes future snapshots, not a sealed bundle or persisted Worker.
+    assert_eq!(bundle.metadata.digest, old_bundle_digest);
+    assert_eq!(
+        serde_json::to_value(manifest::read_persisted_worker_manifest_snapshot(persisted).unwrap())
+            .unwrap(),
+        serde_json::to_value(resolved).unwrap()
+    );
+}
+
+#[tokio::test]
 async fn value_profiles_save_project_and_runtime_consume_the_same_revision() {
     let dir = tempfile::tempdir().unwrap();
     let api = test_api(dir.path()).await;

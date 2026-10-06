@@ -89,6 +89,31 @@ Deno.test("completion starts only after non-whitespace typing", () => {
   );
 });
 
+Deno.test("toolchain preserves read-only builtin import completion detail", () => {
+  const result = toCodeMirrorCompletion({
+    from: 8,
+    items: [{
+      label: "$builtin/profiles/companion.dcdl",
+      kind: "file",
+      detail: "read-only builtin Decodal source",
+      priority: 0,
+    }],
+  });
+  assert(result !== null, "builtin completion should be available");
+  assert(
+    result.options[0].label === "$builtin/profiles/companion.dcdl",
+    "builtin namespace must not become a workspace path",
+  );
+  assert(
+    result.options[0].detail === "read-only builtin Decodal source",
+    "CodeMirror must display the read-only completion detail",
+  );
+  assert(
+    result.options[0].type === "file",
+    "builtin imports remain file completions",
+  );
+});
+
 Deno.test("toolchain preserves WASM UTF-16 completion ranges for CodeMirror", () => {
   const result = toCodeMirrorCompletion({
     from: "let 名 = ".length,

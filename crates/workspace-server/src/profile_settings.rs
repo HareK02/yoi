@@ -464,10 +464,20 @@ fn build_virtual_profile_archive(
     entry: &VirtualProfileEntry,
     state: &WorkspaceConfigState,
 ) -> Result<ProfileSourceArchive> {
-    ProfileSourceArchive::build_evaluated_profile(
+    let builtin_sources = config_source::SnapshotEnvironment::new(state.snapshot.clone())
+        .builtin_import_sources(&state.contract)
+        .map_err(|diagnostics| {
+            profile_validation_error(
+                "profile_builtin_snapshot_invalid",
+                &serde_json::to_string(&diagnostics)
+                    .unwrap_or_else(|_| "builtin import snapshot failed".to_string()),
+            )
+        })?;
+    ProfileSourceArchive::build_evaluated_profile_with_builtin_sources(
         format!("workspace-config-profile-r{}", state.snapshot.revision),
         selector.to_string(),
         entry.profile.clone(),
+        builtin_sources,
     )
     .map_err(|error| profile_validation_error("profile_value_archive_invalid", &error.to_string()))
 }

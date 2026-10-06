@@ -134,15 +134,31 @@ impl ProfileSourceArchive {
         selector: String,
         value: serde_json::Value,
     ) -> Result<Self, ProfileArchiveError> {
+        Self::build_evaluated_profile_with_builtin_sources(id, selector, value, BTreeMap::new())
+    }
+
+    /// Seal the observed builtin import closure as provenance alongside the evaluated JSON.
+    /// Builtin sources are verified, but never evaluated to resolve this entrypoint.
+    pub fn build_evaluated_profile_with_builtin_sources(
+        id: String,
+        selector: String,
+        value: serde_json::Value,
+        sources: BTreeMap<String, String>,
+    ) -> Result<Self, ProfileArchiveError> {
+        for key in sources.keys() {
+            validate_builtin_source_key(key)?;
+        }
         let path = "profiles/evaluated.json".to_string();
         let source = serde_json::to_string(&value)
             .map_err(|err| ProfileArchiveError::Json(err.to_string()))?;
+        let mut sources = sources;
+        sources.insert(path.clone(), source);
         Self::build_with_source_format(
             ProfileSourceArchiveInput {
                 id,
-                entrypoints: BTreeMap::from([(selector, path.clone())]),
+                entrypoints: BTreeMap::from([(selector, path)]),
                 imports: BTreeMap::new(),
-                sources: BTreeMap::from([(path, source)]),
+                sources,
             },
             "json",
             "application/json",
@@ -171,6 +187,12 @@ impl ProfileSourceArchive {
             if total_source_bytes > MAX_TOTAL_BYTES {
                 return Err(ProfileArchiveError::LimitExceeded("total source bytes"));
             }
+            let (kind, content_type) = if path.starts_with("$builtin/") {
+                validate_builtin_source_key(path)?;
+                ("decodal", "text/x-decodal")
+            } else {
+                (kind, content_type)
+            };
             source_meta.push(ProfileSourceArchiveSource {
                 path: path.clone(),
                 source_key: path.clone(),
@@ -310,7 +332,18 @@ impl VerifiedProfileSourceArchive {
         let mut manifest_paths = BTreeSet::new();
         for source in &manifest.sources {
             validate_archive_path(&source.path)?;
-            if !source.source_key.is_empty() && source.source_key != source.path {
+            if source.path.starts_with("$builtin/") {
+                validate_builtin_source_key(&source.path)?;
+                if source.kind != "decodal" {
+                    return Err(ProfileArchiveError::UnsupportedSource {
+                        path: source.path.clone(),
+                        kind: source.kind.clone(),
+                    });
+                }
+            }
+            if (source.path.starts_with("$builtin/") || !source.source_key.is_empty())
+                && source.source_key != source.path
+            {
                 return Err(ProfileArchiveError::ImportMapMismatch {
                     specifier: source.path.clone(),
                     expected: source.path.clone(),
@@ -662,6 +695,26 @@ fn append_bytes<W: Write>(
         .map_err(|err| ProfileArchiveError::Io(err.to_string()))
 }
 
+fn validate_builtin_source_key(key: &str) -> Result<(), ProfileArchiveError> {
+    validate_archive_path(key)?;
+    let Some(relative) = key.strip_prefix("$builtin/profiles/") else {
+        return Err(ProfileArchiveError::UnsafePath(key.to_string()));
+    };
+    if !relative.ends_with(".dcdl")
+        || relative.split('/').any(|part| {
+            part.is_empty()
+                || part == "."
+                || part == ".."
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        })
+    {
+        return Err(ProfileArchiveError::UnsafePath(key.to_string()));
+    }
+    Ok(())
+}
+
 fn validate_archive_path(path: &str) -> Result<(), ProfileArchiveError> {
     if path.is_empty() || path == MANIFEST_PATH {
         return if path == MANIFEST_PATH {
@@ -797,6 +850,155 @@ mod tests {
         archive.reference.digest = sha256_hex(&content);
         archive.reference.size_bytes = content.len() as u64;
         archive.content = content;
+    }
+
+    fn builtin_provenance_archive() -> ProfileSourceArchive {
+        ProfileSourceArchive::build_evaluated_profile_with_builtin_sources(
+            "builtin-provenance".into(),
+            "project:evaluated".into(),
+            evaluated_profile(),
+            BTreeMap::from([
+                (
+                    "$builtin/profiles/companion.dcdl".into(),
+                    "import \"./base.dcdl\"".into(),
+                ),
+                // Intentionally invalid Decodal: provenance must not be reevaluated.
+                (
+                    "$builtin/profiles/base.dcdl".into(),
+                    "not valid Decodal !".into(),
+                ),
+            ]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn evaluated_json_seals_builtin_closure_without_runtime_evaluation() {
+        let archive = builtin_provenance_archive();
+        let verified = archive.verify().unwrap();
+        assert_eq!(
+            archive,
+            builtin_provenance_archive(),
+            "archive must be deterministic"
+        );
+        assert_eq!(archive.reference.source_graph.source_count, 3);
+        assert!(verified.manifest.imports.is_empty());
+        assert_eq!(
+            verified.manifest.entrypoints["project:evaluated"],
+            "profiles/evaluated.json"
+        );
+        for source in &verified.manifest.sources {
+            assert_eq!(source.source_key, source.path);
+            assert_eq!(
+                source.digest,
+                sha256_hex(verified.sources[&source.path].as_bytes())
+            );
+            if source.path.starts_with("$builtin/") {
+                assert_eq!(source.kind, "decodal");
+                assert_eq!(source.content_type, "text/x-decodal");
+            } else {
+                assert_eq!(source.kind, "json");
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let resolved = verified
+            .resolve_profile("project:evaluated", root.path(), "sealed-worker")
+            .unwrap();
+        assert_eq!(resolved.worker.mode, manifest::WorkerMode::Wip);
+        assert!(resolved.feature.task.enabled);
+        assert!(matches!(
+            verified.resolve_profile("builtin:companion", root.path(), "sealed-worker"),
+            Err(ProfileArchiveError::MissingEntrypoint(_))
+        ));
+    }
+
+    #[test]
+    fn evaluated_json_rejects_missing_or_corrupt_builtin_dependency() {
+        for missing in [true, false] {
+            let mut archive = builtin_provenance_archive();
+            let mut verified = archive.verify().unwrap();
+            let path = "$builtin/profiles/base.dcdl";
+            if missing {
+                verified.sources.remove(path);
+            } else {
+                verified
+                    .sources
+                    .insert(path.into(), "corrupt dependency".into());
+            }
+            repack_archive(&mut archive, &verified.manifest, &verified.sources);
+            match archive.verify().unwrap_err() {
+                ProfileArchiveError::MissingSource(actual) if missing => assert_eq!(actual, path),
+                ProfileArchiveError::SourceDigestMismatch { path: actual, .. } if !missing => {
+                    assert_eq!(actual, path)
+                }
+                other => panic!("unexpected error: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn evaluated_json_builtin_provenance_rejects_unsafe_keys_and_reuses_limits() {
+        for key in [
+            "profiles/companion.dcdl",
+            "builtin:profiles/companion.dcdl",
+            "$builtin/prompts/companion.dcdl",
+            "$builtin/profiles/../escape.dcdl",
+            "$builtin/profiles/./base.dcdl",
+            "$builtin/profiles//base.dcdl",
+            "$builtin/profiles/base\\other.dcdl",
+            "$builtin/profiles/base\0.dcdl",
+            "/$builtin/profiles/base.dcdl",
+            "$builtin/profiles/base.json",
+            "profiles/evaluated.json",
+        ] {
+            assert!(
+                matches!(
+                    ProfileSourceArchive::build_evaluated_profile_with_builtin_sources(
+                        "unsafe".into(),
+                        "project:evaluated".into(),
+                        evaluated_profile(),
+                        BTreeMap::from([(key.into(), "{}".into())]),
+                    ),
+                    Err(ProfileArchiveError::UnsafePath(_))
+                ),
+                "{key:?}"
+            );
+        }
+        assert!(matches!(
+            ProfileSourceArchive::build_evaluated_profile_with_builtin_sources(
+                "oversized".into(),
+                "project:evaluated".into(),
+                evaluated_profile(),
+                BTreeMap::from([(
+                    "$builtin/profiles/base.dcdl".into(),
+                    "x".repeat(MAX_SOURCE_BYTES as usize + 1)
+                )]),
+            ),
+            Err(ProfileArchiveError::LimitExceeded("source bytes"))
+        ));
+    }
+
+    #[test]
+    fn evaluated_json_builtin_provenance_requires_canonical_key_and_source_format() {
+        for key in ["", "profiles/base.dcdl", "$builtin/profiles/other.dcdl"] {
+            let mut archive = builtin_provenance_archive();
+            let mut verified = archive.verify().unwrap();
+            verified.manifest.sources[0].source_key = key.into();
+            repack_archive(&mut archive, &verified.manifest, &verified.sources);
+            assert!(matches!(
+                archive.verify(),
+                Err(ProfileArchiveError::ImportMapMismatch { .. })
+            ));
+        }
+        let mut archive = builtin_provenance_archive();
+        let mut verified = archive.verify().unwrap();
+        verified.manifest.sources[0].kind = "json".into();
+        verified.manifest.sources[0].content_type = "application/json".into();
+        repack_archive(&mut archive, &verified.manifest, &verified.sources);
+        assert!(matches!(
+            archive.verify(),
+            Err(ProfileArchiveError::UnsupportedSource { .. })
+        ));
     }
 
     #[test]
