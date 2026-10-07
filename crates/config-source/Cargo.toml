@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+builtin-source.workspace = true
 decodal.workspace = true
 decodal-language-service.workspace = true
 decodal-language-tools.workspace = true

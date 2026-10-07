@@ -299,6 +299,150 @@ Deno.test("generated WASM returns completion items for the editor adapter", () =
   assertEquals(result.items[0].kind, "file");
 });
 
+Deno.test("generated WASM exposes read-only builtin completions without editable builtin entries", () => {
+  const tree = schemaSnapshot("{}");
+  set_snapshot(tree);
+  set_schema_bundle(emptySchemaBundle);
+  const source = 'let 名 = 1; import "$builtin/profiles/comp"';
+  const result = complete_current(
+    "main.dcdl",
+    source,
+    source.length - 1,
+    true,
+  ) as {
+    from: number;
+    items: Array<{ label: string; kind: string; detail: string }>;
+  };
+  const companion = result.items.find((item) =>
+    item.label === "$builtin/profiles/companion.dcdl"
+  );
+  assertEquals(result.from, 'let 名 = 1; import "'.length);
+  assertEquals(companion?.kind, "file");
+  assertEquals(companion?.detail, "read-only builtin Decodal source");
+  assertEquals(Object.keys(tree.entries), ["main.dcdl"]);
+  const evaluated = evaluate_snapshot(
+    schemaSnapshot('import "$builtin/profiles/companion.dcdl"'),
+    mainEntrypointContract,
+  ) as {
+    projections: Array<{ data_json: { slug: string } }>;
+  };
+  assertEquals(evaluated.projections[0].data_json.slug, "companion");
+});
+
+Deno.test("generated WASM rejects unknown builtin imports without same-suffix workspace fallback", () => {
+  const tree = schemaSnapshot('import "$builtin/profiles/missing.dcdl"');
+  tree.entries["profiles/missing.dcdl"] = {
+    path: "profiles/missing.dcdl",
+    content_type: "decodal",
+    content: "{}",
+    content_digest: "sha256:workspace-fallback",
+  };
+  set_schema_bundle(emptySchemaBundle);
+  const diagnostics = analyze_snapshot(tree, "main.dcdl", undefined) as Array<{
+    path: string;
+    revision: number;
+    tree_digest: string;
+    message: string;
+  }>;
+  assertEquals(diagnostics.length > 0, true);
+  assertEquals(diagnostics[0].path, "main.dcdl");
+  assertEquals(diagnostics[0].revision, tree.revision);
+  assertEquals(diagnostics[0].tree_digest, tree.digest);
+  assertEquals(
+    diagnostics[0].message.includes(
+      "unknown or non-public read-only builtin source",
+    ),
+    true,
+  );
+  assertEquals(
+    diagnostics[0].message.includes("$builtin/profiles/missing.dcdl"),
+    true,
+  );
+  let failed = false;
+  try {
+    evaluate_snapshot(tree, mainEntrypointContract);
+  } catch (error) {
+    failed = true;
+    assertEquals(
+      (error as Array<{ message: string }>)[0].message.includes(
+        "unknown or non-public read-only builtin source",
+      ),
+      true,
+    );
+  }
+  assertEquals(failed, true);
+  assertEquals(
+    analyze_snapshot(tree, "main.dcdl", 'import "./profiles/missing.dcdl"'),
+    [],
+  );
+});
+
+function importFailure(tree: ConfigTreeSnapshot): ProjectedDiagnostic[] {
+  try {
+    evaluate_snapshot(tree, mainEntrypointContract);
+  } catch (error) {
+    // A WASM trap/stack overflow must not count as a structured import failure.
+    assertEquals(Array.isArray(error), true);
+    const diagnostics = error as Array<
+      ProjectedDiagnostic & {
+        revision: number;
+        tree_digest: string;
+      }
+    >;
+    assertEquals(diagnostics.length > 0, true);
+    assertEquals(diagnostics[0].revision, tree.revision);
+    assertEquals(diagnostics[0].tree_digest, tree.digest);
+    return diagnostics;
+  }
+  throw new Error("expected a structured import diagnostic");
+}
+
+Deno.test("generated WASM rejects nested lazy-object import cycles without a stack overflow", () => {
+  const tree = schemaSnapshot('{ nested = import "./b.dcdl"; }');
+  tree.entries["b.dcdl"] = {
+    path: "b.dcdl",
+    content_type: "decodal",
+    content: '{ nested = import "./main.dcdl"; }',
+    content_digest: "sha256:nested-cycle-b",
+  };
+  const diagnostics = importFailure(tree);
+  assertEquals(diagnostics[0].kind, "cycle");
+  assertEquals(diagnostics[0].message.includes("import cycle"), true);
+});
+
+Deno.test("generated WASM enforces the import depth budget on a real 33-deep chain", () => {
+  function chain(depth: number): ConfigTreeSnapshot {
+    const tree = schemaSnapshot('import "./chain/1.dcdl"');
+    for (let index = 1; index <= depth; index++) {
+      const path = `chain/${index}.dcdl`;
+      tree.entries[path] = {
+        path,
+        content_type: "decodal",
+        content: index === depth
+          ? "{ answer = 42; }"
+          : `import "./${index + 1}.dcdl"`,
+        content_digest: `sha256:chain-${depth}-${index}`,
+      };
+    }
+    return tree;
+  }
+  // The synthetic evaluation-wrapper import consumes one of the 32 edges.
+  const accepted = evaluate_snapshot(chain(31), mainEntrypointContract) as {
+    projections: Array<{ data_json: { answer: number } }>;
+  };
+  assertEquals(accepted.projections[0].data_json, { answer: 42 });
+  for (const depth of [32, 33]) {
+    const diagnostics = importFailure(chain(depth));
+    assertEquals(diagnostics[0].kind, "import");
+    assertEquals(
+      diagnostics.some((diagnostic) =>
+        diagnostic.message.includes("import depth")
+      ),
+      true,
+    );
+  }
+});
+
 Deno.test("generated WASM completes blank nested schema positions after Unicode", () => {
   const source =
     '{ description = "日本語"; profile = {  }\n} as WorkspaceConfigSchema';
@@ -380,4 +524,377 @@ Deno.test("generated WASM completes asserted WorkspaceConfigSchema keys", () => 
 
   assertEquals(result.from, 2);
   assertEquals(result.items.some((item) => item.label === "profile"), true);
+});
+
+function fixtureDecodal(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(fixtureDecodal).join(", ")}]`;
+  if (value !== null && typeof value === "object") {
+    return `{ ${
+      Object.entries(value).map(([key, value]) =>
+        `${key} = ${fixtureDecodal(value)};`
+      ).join(" ")
+    } }`;
+  }
+  if (
+    typeof value === "string" || typeof value === "number" ||
+    typeof value === "boolean"
+  ) return JSON.stringify(value);
+  throw new Error("fixture omission must not be represented as null/undefined");
+}
+
+Deno.test("generated WASM authors value-based Profiles using the Backend schema without materializing authoring fields", async () => {
+  const source = await Deno.readTextFile(
+    new URL(
+      "../../../../resources/config-schema/profile.dcdl",
+      import.meta.url,
+    ),
+  );
+  const authoring_source = await Deno.readTextFile(
+    new URL(
+      "../../../../resources/config-schema/profile-authoring.dcdl",
+      import.meta.url,
+    ),
+  );
+  const schema = compose_schema_bundle([{
+    provider_id: "builtin:profile",
+    namespace: "profile",
+    version: "2",
+    source,
+    source_digest: await digestText(source),
+    authoring_source,
+  }]) as WorkspaceConfigSchemaBundle;
+  const content =
+    '{ profile = { entries = [{ selector = "project:alpha"; profile = {}; }]; }; } as WorkspaceConfigSchema';
+  const tree: ConfigTreeSnapshot = {
+    revision: 8,
+    digest: "sha256:value-profile-tree",
+    entries: {
+      "main.dcdl": {
+        path: "main.dcdl",
+        content_type: "decodal",
+        content,
+        content_digest: await digestText(content),
+      },
+    },
+  };
+  const valueContract = {
+    ...contract,
+    entrypoints: ["main.dcdl"],
+    schema_bundle: schema,
+    fingerprint: await toolchainFingerprint(["main.dcdl"], schema),
+  };
+  set_snapshot(tree);
+  set_schema_bundle(schema);
+  const evaluated = evaluate_snapshot(tree, valueContract) as {
+    projections: Array<
+      { data_json: { profile: { entries: Array<{ profile: unknown }> } } }
+    >;
+  };
+  assertEquals(
+    evaluated.projections[0].data_json.profile.entries[0].profile,
+    {},
+  );
+  for (
+    const [body, token, label] of [
+      [
+        "{ profile = { entries = [{ sel }] } } as WorkspaceConfigSchema",
+        "sel",
+        "selector",
+      ],
+      [
+        "{ profile = { entries = [{ pro }] } } as WorkspaceConfigSchema",
+        "pro",
+        "profile",
+      ],
+      [
+        "{ profile = { entries = [{ profile = { wor } }] } } as WorkspaceConfigSchema",
+        "wor",
+        "worker",
+      ],
+      [
+        "{ profile = { entries = [{ profile = { worker = { mo } } }] } } as WorkspaceConfigSchema",
+        "mo",
+        "mode",
+      ],
+      [
+        "{ profile = { entries = [{ profile = { feature = { ta } } }] } } as WorkspaceConfigSchema",
+        "ta",
+        "task",
+      ],
+    ]
+  ) {
+    const cursor = body.lastIndexOf(token) + token.length;
+    const result = complete_current("main.dcdl", body, cursor, true) as {
+      from: number;
+      items: Array<{ label: string }>;
+    };
+    assertEquals(
+      result.items.some((item) => item.label === label),
+      true,
+      label,
+    );
+    assertEquals(result.from, cursor - token.length);
+  }
+  for (
+    const value of [
+      "{}",
+      "{ worker = {}; }",
+      '{ worker = { mode = "wip"; }; }',
+      "{ feature = { task = {}; }; }",
+    ]
+  ) {
+    const partialContent = content.replace(
+      "profile = {};",
+      `profile = ${value};`,
+    );
+    assertEquals(
+      analyze_snapshot(tree, "main.dcdl", partialContent),
+      [],
+      value,
+    );
+  }
+  const recipe = "{ worker = { mode = 42; }; }";
+  const analysisTree = {
+    ...tree,
+    entries: {
+      ...tree.entries,
+      "recipe.dcdl": {
+        path: "recipe.dcdl",
+        content_type: "decodal",
+        content: recipe,
+        content_digest: await digestText(recipe),
+      },
+    },
+  };
+  for (
+    const [value, field, expectedPath] of [
+      ["42", "profile", "main.dcdl"],
+      ["{ worker = 42; }", "worker", "main.dcdl"],
+      ["{ worker = { mode = 42; }; }", "mode", "main.dcdl"],
+      ["{ feature = { task = { enabled = 42; }; }; }", "enabled", "main.dcdl"],
+      ['{ worker = { typo = "wip"; }; }', "typo", "main.dcdl"],
+      ['import "./recipe.dcdl"', "mode", "recipe.dcdl"],
+      [
+        '(import "./recipe.dcdl") // { worker = { mode = 42; }; }',
+        "mode",
+        "main.dcdl",
+      ],
+    ]
+  ) {
+    const invalidContent = content.replace(
+      "profile = {};",
+      `profile = ${value};`,
+    );
+    const diagnostics = analyze_snapshot(
+      analysisTree,
+      "main.dcdl",
+      invalidContent,
+    ) as Array<{
+      path: string;
+      revision: number;
+      kind: string;
+      span: { start_byte: number; end_byte: number };
+      message: string;
+      labels: Array<
+        { span: { start_byte: number; end_byte: number }; message: string }
+      >;
+    }>;
+    assertEquals(diagnostics.length > 0, true, value);
+    const diagnostic = diagnostics[0];
+    assertEquals(diagnostic.path, expectedPath);
+    assertEquals(diagnostic.revision, tree.revision);
+    assertEquals(
+      ["constraint_violation", "type_mismatch"].includes(diagnostic.kind),
+      true,
+    );
+    assertEquals(
+      diagnostic.message.includes(field) ||
+        diagnostic.labels.some((label) => label.message.includes(field)),
+      true,
+    );
+    // New authoring failures must be anchored in the supplied value, not the
+    // much longer schema source, including relative imported recipes.
+    if (value !== "42") {
+      const length = new TextEncoder().encode(
+        expectedPath === "main.dcdl" ? invalidContent : recipe,
+      ).length;
+      assertEquals(
+        diagnostic.span.end_byte > diagnostic.span.start_byte &&
+          diagnostic.span.end_byte <= length,
+        true,
+      );
+      assertEquals(
+        diagnostic.labels.every((label) => label.span.end_byte <= length),
+        true,
+      );
+    }
+  }
+  for (const field of ["scope", "delegation_scope"]) {
+    for (
+      const [prefix, label] of [["int", "intent"], ["deny", "deny_write"], [
+        "sym",
+        "symlink_policy",
+      ]]
+    ) {
+      const body =
+        `{ profile.entries = [{ profile.${field} = { ${prefix} } }]; } as WorkspaceConfigSchema`;
+      const cursor = body.lastIndexOf(prefix) + prefix.length;
+      const result = complete_current("main.dcdl", body, cursor, true) as {
+        items: Array<{ label: string }>;
+      };
+      assertEquals(
+        result.items.some((item) => item.label === label),
+        true,
+        `${field}.${label}`,
+      );
+    }
+  }
+  for (
+    const [recipe, expected] of [
+      ['{ scope = "workspace_read"; delegation_scope = "workspace_write"; }', {
+        scope: "workspace_read",
+        delegation_scope: "workspace_write",
+      }],
+      ['{ scope = "workspace_write"; delegation_scope = "workspace_read"; }', {
+        scope: "workspace_write",
+        delegation_scope: "workspace_read",
+      }],
+      [
+        '{ scope = { intent = "workspace_read"; }; delegation_scope = { intent = "workspace_write"; deny_write = ["private"]; symlink_policy = "resolved"; }; }',
+        {
+          scope: { intent: "workspace_read" },
+          delegation_scope: {
+            intent: "workspace_write",
+            deny_write: ["private"],
+            symlink_policy: "resolved",
+          },
+        },
+      ],
+    ] as const
+  ) {
+    for (
+      const form of [
+        recipe,
+        'import "./scoped.dcdl"',
+        '(import "./scoped.dcdl") // { description = "patched"; }',
+      ]
+    ) {
+      const scopedContent = content.replace(
+        "profile = {};",
+        `profile = ${form};`,
+      );
+      const scopedTree = {
+        ...tree,
+        entries: {
+          "main.dcdl": {
+            ...tree.entries["main.dcdl"],
+            content: scopedContent,
+            content_digest: await digestText(scopedContent),
+          },
+          "scoped.dcdl": {
+            path: "scoped.dcdl",
+            content_type: "decodal",
+            content: recipe,
+            content_digest: await digestText(recipe),
+          },
+        },
+      };
+      assertEquals(
+        analyze_snapshot(scopedTree, "main.dcdl", undefined),
+        [],
+        form,
+      );
+      const result = evaluate_snapshot(
+        scopedTree,
+        valueContract,
+      ) as typeof evaluated;
+      assertEquals(
+        result.projections[0].data_json.profile.entries[0].profile,
+        form.includes("patched")
+          ? { ...expected, description: "patched" }
+          : expected,
+      );
+    }
+  }
+  const cases = JSON.parse(
+    await Deno.readTextFile(
+      new URL(
+        "../../../../resources/config-schema/profile-authoring-values.json",
+        import.meta.url,
+      ),
+    ),
+  ) as Array<{ name: string; profile: Record<string, unknown> }>;
+  for (const fixture of cases) {
+    const recipe = fixtureDecodal(fixture.profile);
+    for (
+      const [form, patched] of [[recipe, false], [
+        'import "./recipe.dcdl"',
+        false,
+      ], [
+        '(import "./recipe.dcdl") // { description = "patched"; }',
+        true,
+      ]] as const
+    ) {
+      const fixtureContent = content.replace(
+        "profile = {};",
+        `profile = ${form};`,
+      );
+      const fixtureTree = {
+        ...tree,
+        entries: {
+          "main.dcdl": {
+            ...tree.entries["main.dcdl"],
+            content: fixtureContent,
+            content_digest: await digestText(fixtureContent),
+          },
+          "recipe.dcdl": {
+            path: "recipe.dcdl",
+            content_type: "decodal",
+            content: recipe,
+            content_digest: await digestText(recipe),
+          },
+        },
+      };
+      assertEquals(
+        analyze_snapshot(fixtureTree, "main.dcdl", undefined),
+        [],
+        `${fixture.name}: ${form}`,
+      );
+      const result = evaluate_snapshot(
+        fixtureTree,
+        valueContract,
+      ) as typeof evaluated;
+      assertEquals(
+        result.projections[0].data_json.profile.entries[0].profile,
+        patched
+          ? { ...fixture.profile, description: "patched" }
+          : fixture.profile,
+      );
+    }
+  }
+  for (
+    const [path, prefix, label] of [
+      ["compaction", "reta", "retained_tokens"],
+      ["compaction", "prune_min", "prune_min_savings"],
+      ["compaction", "req", "request"],
+      ["compaction", "wor", "worker"],
+      ["compaction", "compact_ret", "compact_retained_tokens"],
+      ["feature.memory.extraction", "reas", "reasoning"],
+      ["feature.subjektiv.extraction", "reas", "reasoning"],
+    ]
+  ) {
+    const body =
+      `{ profile.entries = [{ profile.${path} = { ${prefix} } }]; } as WorkspaceConfigSchema`;
+    const cursor = body.lastIndexOf(prefix) + prefix.length;
+    const result = complete_current("main.dcdl", body, cursor, true) as {
+      items: Array<{ label: string }>;
+    };
+    assertEquals(
+      result.items.some((item) => item.label === label),
+      true,
+      `${path}.${label}`,
+    );
+  }
+  // Neither completion nor diagnostic shape checking changes the saved value.
+  assertEquals(evaluate_snapshot(tree, valueContract), evaluated);
 });

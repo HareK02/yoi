@@ -1,0 +1,27 @@
+slug = "job";
+description = "Result-only Job policy; the Host grants attempt/result authority independently.";
+model = { ref = "codex-oauth/gpt-5.6-luna"; };
+engine = {
+    instruction = "internal.job_system";
+    reasoning = "medium";
+    max_tokens = 8192;
+    max_turns = 32;
+};
+session = { record_event_trace = false; };
+feature = {
+    task = { enabled = false; };
+    memory = { enabled = false; staging_tools = false; };
+    subjektiv = { enabled = false; consolidation_tools = false; extraction = { enabled = false; }; };
+    web = { enabled = false; };
+    image = { enabled = false; };
+    sub_worker = { enabled = false; };
+    flow = { enabled = false; };
+    worker = { enabled = false; direct_spawn = false; };
+    workspace_worker_discovery = { enabled = false; };
+    objective = { enabled = false; };
+    manage_workdir = { enabled = false; };
+    workspace_config = { enabled = false; };
+    ticket = { enabled = false; authoring = false; thread = false; intake = false; workflow = false; };
+    merge_request = { show = false; open = false; review = false; readiness_check = false; complete = false; };
+    orchestration = { enabled = false; };
+};

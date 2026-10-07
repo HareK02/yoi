@@ -1,0 +1,7 @@
+import "./standalone.dcdl" // {
+    slug = "standalone-subjektiv";
+    description = "Standalone coding with an explicitly selected local Subject.";
+    feature = {
+        subjektiv = { enabled = true; extraction = { enabled = true; }; };
+    };
+}

@@ -13,7 +13,7 @@ use memory::extract::CandidateKind;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use server_api::{
-    SubjektivMemoryBackendOperation, SubjektivMemoryBackendRequest, SubjektivMemoryBackendResponse,
+    SubjektivMemoryBackendOperation, SubjektivMemoryBackendResponse,
     SubjektivMemoryListRevisionsRequest, SubjektivMemoryQueryRequest, SubjektivMemoryReadRequest,
     SubjektivMemoryReceiptStatus, SubjektivMemoryReceiptStatusRequest,
     SubjektivMemoryRevisionIntent, SubjektivMemoryRevisionProposal,
@@ -33,7 +33,11 @@ use crate::hook::{
     PreRequestContext, RunCommitted, RunCommittedContext,
 };
 use crate::session_capture::{SessionCapture, SessionEntryEvidence};
-use crate::worker::{WorkspaceClient, WorkspaceServerOperation};
+use crate::subjektiv::SubjektivHostConnection;
+#[cfg(test)]
+use crate::worker::WorkspaceClient;
+#[cfg(test)]
+use server_api::SubjektivMemoryBackendRequest;
 
 const QUERY_TOOL: &str = "SubjektivMemoryQuery";
 const READ_TOOL: &str = "SubjektivMemoryRead";
@@ -58,7 +62,7 @@ pub(crate) struct SubjektivMemoryFeature {
 
 #[derive(Clone)]
 struct SubjektivMemoryState {
-    client: Arc<dyn WorkspaceClient>,
+    host: SubjektivHostConnection,
     capture: CommittedSessionCaptureHandle,
 }
 
@@ -76,22 +80,17 @@ impl SubjektivMemoryFeature {
     pub(crate) fn from_resolved_config(
         config: &manifest::ResolvedSubjektivFeatureConfig,
         capture: CommittedSessionCaptureHandle,
-        client: Arc<dyn WorkspaceClient>,
+        host: Option<SubjektivHostConnection>,
     ) -> std::io::Result<Option<Self>> {
-        if !config.execution_enabled() {
+        if !config.profile.enabled || host.is_none() {
             return Ok(None);
         }
         config
             .validate_execution()
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
-        if !client.is_available() || client.workspace_id().is_none() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "subjektiv Memory tools require Backend Workspace API authority",
-            ));
-        }
+        let host = host.expect("checked explicit connection");
         Ok(Some(Self {
-            state: SubjektivMemoryState { client, capture },
+            state: SubjektivMemoryState { host, capture },
         }))
     }
 }
@@ -483,48 +482,7 @@ impl SubjektivMemoryState {
         &self,
         operation: SubjektivMemoryBackendOperation,
     ) -> Result<SubjektivMemoryBackendResponse, ToolError> {
-        let response = self
-            .client
-            .execute_server_operation(WorkspaceServerOperation::SubjektivMemory(
-                SubjektivMemoryBackendRequest { operation },
-            ))
-            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-        if !response.is_success() {
-            let parsed =
-                serde_json::from_str::<server_api::RepositoryApiError>(&response.body).ok();
-            if let Some((code, message)) = parsed.as_ref().and_then(|error| {
-                error
-                    .diagnostics
-                    .iter()
-                    .find(|diagnostic| {
-                        matches!(
-                            diagnostic.code.as_str(),
-                            "revision_conflict" | "stale_cursor"
-                        )
-                    })
-                    .map(|diagnostic| (diagnostic.code.as_str(), error.message.as_str()))
-            }) {
-                return Err(ToolError::StructuredConflict {
-                    code: code.to_string(),
-                    message: message.to_string(),
-                });
-            }
-            let detail = parsed
-                .map(|error| error.message)
-                .unwrap_or_else(|| response.body.clone());
-            let message = format!(
-                "subjektiv Memory backend returned HTTP {}: {detail}",
-                response.status
-            );
-            return if matches!(response.status, 400 | 404 | 409 | 422) {
-                Err(ToolError::InvalidArgument(message))
-            } else {
-                Err(ToolError::ExecutionFailed(message))
-            };
-        }
-        serde_json::from_str(&response.body).map_err(|error| {
-            ToolError::ExecutionFailed(format!("decode subjektiv response: {error}"))
-        })
+        self.host.memory(operation).map_err(Into::into)
     }
 
     fn backend_receipt_status(
@@ -628,7 +586,7 @@ struct PendingRetryHook {
 #[async_trait]
 impl Hook<PreLlmRequest> for PendingRetryHook {
     async fn call(&self, _input: &PreRequestContext) -> Result<HookPreRequestAction, HookError> {
-        replay_pending_committed_memory(&self.state)?;
+        replay_pending_committed_memory_with_policy(&self.state, true)?;
         Ok(HookPreRequestAction::Continue)
     }
 }
@@ -649,6 +607,12 @@ impl Hook<BeforeSessionRewrite> for PendingRewriteHook {
 }
 
 fn replay_pending_committed_memory(state: &SubjektivMemoryState) -> Result<(), HookError> {
+    replay_pending_committed_memory_with_policy(state, false)
+}
+fn replay_pending_committed_memory_with_policy(
+    state: &SubjektivMemoryState,
+    allow_pending: bool,
+) -> Result<(), HookError> {
     let capture = state
         .capture
         .capture()
@@ -691,7 +655,11 @@ fn replay_pending_committed_memory(state: &SubjektivMemoryState) -> Result<(), H
             vec![call.evidence],
             item.proposal,
         ) {
-            failures.push(format!("{receipt_id}: {error}"));
+            if !allow_pending
+                || !matches!(&error,ToolError::StructuredConflict {code,..} if code=="pending_commit")
+            {
+                failures.push(format!("{receipt_id}: {error}"));
+            }
         }
     }
     if failures.is_empty() {
@@ -1109,7 +1077,7 @@ mod tests {
         });
         SubjektivMemoryFeature {
             state: SubjektivMemoryState {
-                client: Arc::new(TestWorkspaceClient),
+                host: crate::subjektiv::test_connection(Arc::new(TestWorkspaceClient)),
                 capture,
             },
         }
@@ -1245,7 +1213,7 @@ mod tests {
             "\\\u{0000}".repeat(server_api::SUBJEKTIV_MEMORY_READ_MAX_TOOL_CONTENT_BYTES);
         let tool = SubjektivReadTool {
             state: SubjektivMemoryState {
-                client: Arc::new(ReadWorkspaceClient(response)),
+                host: crate::subjektiv::test_connection(Arc::new(ReadWorkspaceClient(response))),
                 capture: feature().state.capture,
             },
             operation: ReadOperation::Read,
@@ -1265,7 +1233,9 @@ mod tests {
 
         let oversized_tool = SubjektivReadTool {
             state: SubjektivMemoryState {
-                client: Arc::new(ReadWorkspaceClient(oversized_response)),
+                host: crate::subjektiv::test_connection(Arc::new(ReadWorkspaceClient(
+                    oversized_response,
+                ))),
                 capture: feature().state.capture,
             },
             operation: ReadOperation::Read,
@@ -1285,7 +1255,9 @@ mod tests {
         for code in ["revision_conflict", "stale_cursor"] {
             let tool = SubjektivReadTool {
                 state: SubjektivMemoryState {
-                    client: Arc::new(ConflictWorkspaceClient(code)),
+                    host: crate::subjektiv::test_connection(Arc::new(ConflictWorkspaceClient(
+                        code,
+                    ))),
                     capture: feature().state.capture,
                 },
                 operation: ReadOperation::Query,
@@ -1386,7 +1358,7 @@ mod tests {
         });
         PendingCommitHook {
             state: SubjektivMemoryState {
-                client: client.clone(),
+                host: crate::subjektiv::test_connection(client.clone()),
                 capture,
             },
         }
@@ -1439,7 +1411,7 @@ mod tests {
         });
         let hook = PendingCommitHook {
             state: SubjektivMemoryState {
-                client: client.clone(),
+                host: crate::subjektiv::test_connection(client.clone()),
                 capture,
             },
         };
@@ -1515,7 +1487,7 @@ mod tests {
             })
         });
         let state = SubjektivMemoryState {
-            client: client.clone(),
+            host: crate::subjektiv::test_connection(client.clone()),
             capture,
         };
         assert_eq!(

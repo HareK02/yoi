@@ -377,7 +377,7 @@
           <li>
             <strong>{diagnostic.kind}</strong>
             <span>{diagnostic.message}</span>
-            <small>bytes {diagnostic.span.start_byte}–{diagnostic.span.end_byte}</small>
+            <small>{diagnostic.path}{diagnostic.path.startsWith("$builtin/") ? " (read-only builtin source)" : ""} · bytes {diagnostic.span.start_byte}–{diagnostic.span.end_byte}</small>
           </li>
         {/each}
       </ol>

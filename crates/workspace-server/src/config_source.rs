@@ -140,7 +140,11 @@ pub(crate) fn validate_workspace_config_candidate_projections(
     };
     crate::prompt_settings::validate_evaluated_prompt_catalog(&candidate.evaluation)?;
     if has_provider("builtin:profile") {
-        crate::profile_settings::project_profiles_from_workspace_config(workspace_id, &state)?;
+        crate::profile_settings::project_profiles_from_evaluation(
+            workspace_id,
+            &state,
+            &candidate.evaluation,
+        )?;
     }
     if has_provider("builtin:runtime") {
         crate::runtime_settings::project_runtime_from_workspace_config(workspace_id, &state)?;

@@ -165,7 +165,7 @@ Ticket/Objective/Merge Request routes retain their T-698 contracts.
 
 ## First-Workspace example
 
-1. `WipDiscover(path="/", depth=1)` finds `repositories`, `workdirs` and
+1. `Discover(path="/", depth=1)` finds `repositories`, `workdirs` and
    `workdir-attachments` when permitted.
 2. Inspect the returned Repository collection Interface and call `list` with a
    bounded limit. An empty registered/visible catalog explicitly returns an empty

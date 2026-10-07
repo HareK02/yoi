@@ -216,6 +216,51 @@ test("unmount during schema setup closes the toolchain", async () => {
   expect(toolchain.close).toHaveBeenCalledOnce();
 });
 
+test("builtin diagnostics show read-only paths without adding editable workspace files", async () => {
+  toolchain.analyze.mockResolvedValue([{
+    path: "$builtin/profiles/companion.dcdl",
+    revision: 7,
+    tree_digest: "sha256:tree",
+    kind: "constraint_violation",
+    span: { start_byte: 1, end_byte: 4 },
+    message: "Imported value does not match the requested schema",
+    labels: [],
+    notes: [],
+  }]);
+  const view = renderEditor();
+  await expectReady(view);
+  await waitFor(() => {
+    const diagnostic = view.container.querySelector(".config-source-diagnostics");
+    expect(diagnostic?.textContent).toContain("$builtin/profiles/companion.dcdl (read-only builtin source)");
+    expect(diagnostic?.textContent).toContain("bytes 1–4");
+  });
+  const paths = view.getByRole("navigation", { name: "Virtual configuration paths" });
+  expect(paths.textContent).not.toContain("$builtin/");
+  expect(paths.querySelectorAll("button")).toHaveLength(1);
+  expect(view.container.querySelector('.cm-content[contenteditable="true"]')).not.toBeNull();
+});
+
+test("unknown builtin diagnostics retain the workspace importer path", async () => {
+  toolchain.analyze.mockResolvedValue([{
+    path: "main.dcdl",
+    revision: 7,
+    tree_digest: "sha256:tree",
+    kind: "import",
+    span: { start_byte: 8, end_byte: 40 },
+    message: "unknown or non-public read-only builtin source: $builtin/profiles/missing.dcdl",
+    labels: [],
+    notes: [],
+  }]);
+  const view = renderEditor();
+  await expectReady(view);
+  await waitFor(() => {
+    const diagnostic = view.container.querySelector(".config-source-diagnostics");
+    expect(diagnostic?.textContent).toContain("main.dcdl · bytes 8–40");
+    expect(diagnostic?.textContent).toContain("unknown or non-public read-only builtin source");
+  });
+  expect(view.getByRole("navigation", { name: "Virtual configuration paths" }).textContent).not.toContain("$builtin/");
+});
+
 test("unmount during fetch does not start a toolchain", async () => {
   let finishFetch!: (response: Response) => void;
   fetcher.mockReturnValueOnce(

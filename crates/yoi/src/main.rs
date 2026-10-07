@@ -3,6 +3,7 @@ mod mcp_cli;
 mod objective_cli;
 mod plugin_cli;
 mod session_cli;
+mod subject_cli;
 mod ticket_cli;
 mod worker_cleanup_cli;
 mod workspace_bootstrap;
@@ -41,6 +42,10 @@ enum Mode {
         target: client::ResolvedTarget,
     },
     Session(session_cli::SessionCli),
+    Subject {
+        cli: subject_cli::SubjectCli,
+        target: Box<dyn Target>,
+    },
     WorkerCleanup(worker_cleanup_cli::WorkerCleanupCli),
     Ticket {
         cli: ticket_cli::TicketCli,
@@ -167,6 +172,26 @@ async fn run(mode: Mode) -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("yoi objective: execution task failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Mode::Subject { cli, target } => {
+            let result = if cli == subject_cli::SubjectCli::Help {
+                Ok(subject_cli::HELP.to_owned())
+            } else {
+                match target.spawn_worker() {
+                    Ok(spawn) => subject_cli::run(cli, &spawn.state_dir),
+                    Err(error) => Err(Box::new(error) as Box<dyn std::error::Error>),
+                }
+            };
+            match result {
+                Ok(output) => {
+                    print!("{output}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("yoi subject: {error}");
                     ExitCode::FAILURE
                 }
             }
@@ -406,6 +431,7 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             LaunchMode::Spawn {
                 worker_name: None,
                 profile: None,
+                subject_id: None,
             }
         };
         return Ok(Mode::Tui {
@@ -453,6 +479,21 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             .resolve()
             .map_err(|error| ParseError(error.to_string()))?;
             return Ok(Mode::Objective { cli, target });
+        }
+        "subject" => {
+            if target_selection.backend_url.is_some() || target_selection.workspace_id.is_some() {
+                return Err(ParseError(
+                    "yoi subject is local-only and does not accept Backend selectors".to_owned(),
+                ));
+            }
+            if !target_selection.explicit_local {
+                return Err(ParseError(
+                    "yoi subject requires explicit --local selection".to_owned(),
+                ));
+            }
+            let cli = subject_cli::parse(&args[1..])?;
+            let target = resolve_local_cli_connection(connection_resolver, CliCommand::Subject)?;
+            return Ok(Mode::Subject { cli, target });
         }
         "session" => {
             let _target = resolve_local_cli_connection(connection_resolver, CliCommand::Session)?;
@@ -828,6 +869,19 @@ fn required_option_value<'a>(
     Ok(value)
 }
 
+fn set_subject_selector(selector: &mut Option<String>, value: &str) -> Result<(), ParseError> {
+    if selector.is_some() {
+        return Err(ParseError(
+            "--subject must not be provided more than once".to_owned(),
+        ));
+    }
+    if value.trim().is_empty() || value.starts_with('-') {
+        return Err(ParseError("--subject requires a nonempty ID".to_owned()));
+    }
+    *selector = Some(value.to_owned());
+    Ok(())
+}
+
 fn parse_console_options<R: CliConnectionResolver + ?Sized>(
     args: &[String],
     target_selection: &TargetSelection,
@@ -837,6 +891,7 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
     let mut worker_name = None;
     let mut session = None;
     let mut profile = None;
+    let mut subject_id = None;
     let mut socket_override = None;
     let mut runtime_id = None;
     let mut worker_id = None;
@@ -883,6 +938,15 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
                 }
                 socket_override = Some(PathBuf::from(value));
                 i += 2;
+            }
+            "--subject" => {
+                let value = required_option_value(args, i, "--subject")?;
+                set_subject_selector(&mut subject_id, value)?;
+                i += 2;
+            }
+            arg if arg.starts_with("--subject=") => {
+                set_subject_selector(&mut subject_id, &arg["--subject=".len()..])?;
+                i += 1;
             }
             "--profile" => {
                 let value = args
@@ -989,6 +1053,24 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
         }
     }
 
+    if subject_id.is_some() {
+        if session.is_some()
+            || socket_override.is_some()
+            || runtime_id.is_some()
+            || worker_id.is_some()
+        {
+            return Err(ParseError(
+                "--subject can only be used for fresh local spawn, not attach or restore"
+                    .to_owned(),
+            ));
+        }
+        if target_selection.backend_url.is_some() || target_selection.workspace_id.is_some() {
+            return Err(ParseError(
+                "--subject is local-only and does not accept Backend selectors".to_owned(),
+            ));
+        }
+    }
+
     if worker_id.is_some() && runtime_id.is_none() {
         return Err(ParseError(
             "--worker-id requires --runtime-id for Runtime API attach".to_string(),
@@ -1018,12 +1100,29 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
         return Err(ParseError("--socket requires --worker".to_string()));
     }
 
-    let target = resolve_tui_target(
-        connection_resolver,
-        CliCommand::DefaultTui,
-        target_selection,
-        &workspace_root,
-    )?;
+    let target = if subject_id.is_some() {
+        // A local Subject selector must never trigger Backend Workspace discovery.
+        let target = resolve_connection_aware_cli_connection(
+            connection_resolver,
+            CliCommand::DefaultTui,
+            target_selection.explicit_local,
+            None,
+            None,
+        )?;
+        if target.kind() != TargetKind::Standalone {
+            return Err(ParseError(
+                "--subject requires a local target; use --local".to_owned(),
+            ));
+        }
+        target
+    } else {
+        resolve_tui_target(
+            connection_resolver,
+            CliCommand::DefaultTui,
+            target_selection,
+            &workspace_root,
+        )?
+    };
 
     if target.kind() == TargetKind::Standalone {
         if runtime_id.is_some() || worker_id.is_some() {
@@ -1081,6 +1180,7 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
         LaunchMode::Spawn {
             worker_name,
             profile,
+            subject_id,
         }
     } else {
         if worker_name.is_some()
@@ -1912,6 +2012,7 @@ Connection-aware commands:
 Console options:
       --workspace <PATH>   Standalone cwd or client display scope (defaults to cwd)
       --profile <REF>      Select the Standalone Profile recipe
+      --subject <ID>       Select an existing local Subject for fresh spawn only
       --runtime-id <ID>    Backend Runtime id
       --worker-id <ID>     Backend Worker id; requires --runtime-id
 
@@ -1926,6 +2027,7 @@ Host commands:
   plugin <COMMAND>             Author/check/pack explicit Plugin packages
   mcp <COMMAND>                Inspect configured MCP servers
   session <COMMAND>            Inspect/prune Standalone session logs
+  --local subject <COMMAND>    Explicitly create/list local Subjects (create <ROLE>, list)
 
 Standalone binaries:
   yoi-server         Workspace Backend server/admin CLI
@@ -2618,9 +2720,113 @@ backend = "shared"
             LaunchMode::Spawn {
                 worker_name: Some(ref name),
                 profile: None,
+                subject_id: None,
             } if name == "my-local-worker"
         ));
         assert!(target.spawn_worker().unwrap().state_dir.is_absolute());
+    }
+
+    #[test]
+    fn subject_selection_is_carried_only_to_local_fresh_spawn() {
+        let resolver = DefaultBackendCliConnectionResolver {
+            backend_url: "http://default-backend.example",
+        };
+        for selector in [
+            vec!["--subject", "subject-id"],
+            vec!["--subject=subject-id"],
+        ] {
+            let args = [
+                vec!["--local", "--profile", "builtin:standalone-subjektiv"],
+                selector,
+            ]
+            .concat()
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+            let Mode::Tui {
+                target,
+                mode: LaunchMode::Spawn { subject_id, .. },
+                ..
+            } = parse_args_slice_with_connection_resolver(&args, &resolver).unwrap()
+            else {
+                panic!("expected local spawn");
+            };
+            assert_eq!(target.kind(), TargetKind::Standalone);
+            assert_eq!(subject_id.as_deref(), Some("subject-id"));
+        }
+        for input in [
+            vec!["--subject", "subject-id"],
+            vec![
+                "--backend",
+                "http://backend.example",
+                "--subject",
+                "subject-id",
+            ],
+            vec!["--local", "--workspace-id", "ws", "--subject=id"],
+            vec!["--local", "--subject", ""],
+            vec!["--local", "--subject", " "],
+            vec!["--local", "--subject="],
+            vec!["--local", "--subject=id", "--subject=other"],
+            vec!["--local", "--subject=id", "--subject", "other"],
+            vec!["--local", "--subject=id", "--session", "session"],
+            vec![
+                "--local",
+                "--subject=id",
+                "--socket",
+                "socket",
+                "--worker",
+                "worker",
+            ],
+            vec!["--local", "--subject=id", "--runtime-id", "runtime"],
+            vec!["--local", "--subject=id", "--worker-id", "worker"],
+            vec!["--local", "resume", "--subject=id"],
+            vec!["--local", "resume", "--subject", "id"],
+        ] {
+            let args = input
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect::<Vec<_>>();
+            assert!(
+                parse_args_slice_with_connection_resolver(&args, &resolver).is_err(),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn subject_commands_require_explicit_local_target() {
+        let resolver = DefaultBackendCliConnectionResolver {
+            backend_url: "http://default-backend.example",
+        };
+        for command in [vec!["create", "assistant"], vec!["list"], vec!["--help"]] {
+            let args = [vec!["--local", "subject"], command]
+                .concat()
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>();
+            let Mode::Subject { target, .. } =
+                parse_args_slice_with_connection_resolver(&args, &resolver).unwrap()
+            else {
+                panic!("expected Subject mode");
+            };
+            assert_eq!(target.kind(), TargetKind::Standalone);
+            assert!(target.spawn_worker().unwrap().state_dir.is_absolute());
+        }
+        for input in [
+            vec!["subject", "list"],
+            vec!["--backend", "http://backend.example", "subject", "list"],
+            vec!["--local", "--workspace-id=ws", "subject", "list"],
+            vec!["--local", "subject", "list", "--backend=url"],
+        ] {
+            let args = input
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect::<Vec<_>>();
+            assert!(
+                parse_args_slice_with_connection_resolver(&args, &resolver).is_err(),
+                "{input:?}"
+            );
+        }
     }
 
     #[test]
@@ -3346,6 +3552,7 @@ backend = "shared"
                     LaunchMode::Spawn {
                         worker_name,
                         profile,
+                        subject_id: None,
                     },
                 workspace_root,
                 ..

@@ -16,6 +16,7 @@ agen = { workspace = true, features = ["codex"] }
 session-store = { workspace = true }
 secrets = { workspace = true }
 manifest = { workspace = true }
+job = { workspace = true }
 mcp = { workspace = true }
 protocol = { workspace = true, features = ["json-schema"] }
 client = { workspace = true }

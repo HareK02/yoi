@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 
-use config_source::{ConfigContentType, ConfigSchemaContribution, VirtualPath};
+use config_source::ConfigSchemaContribution;
 use manifest::{ProfileSource, builtin_profile_catalog_snapshot, resolve_profile_artifact_value};
 use serde::Deserialize;
 use server_api::{
@@ -21,24 +21,19 @@ use crate::config_source::{
 use crate::store::WorkspaceRecord;
 use crate::{Error, Result};
 
-const PROFILE_SCHEMA_SOURCE: &str = r#"{
-    profile = {
-        default_profile = String default "builtin:companion";
-        entries = [...{
-            selector = String;
-            source = String;
-            label = String default "";
-            description = String default "";
-        }] default [];
-    };
-}"#;
+const PROFILE_SCHEMA_SOURCE: &str = include_str!("../../../resources/config-schema/profile.dcdl");
 
 #[derive(Debug, Default)]
 pub struct ProfileConfigSchemaProvider;
 
 impl WorkspaceConfigSchemaProvider for ProfileConfigSchemaProvider {
     fn contribution(&self) -> Result<ConfigSchemaContribution> {
-        ConfigSchemaContribution::new("builtin:profile", "profile", "1", PROFILE_SCHEMA_SOURCE)
+        ConfigSchemaContribution::new("builtin:profile", "profile", "2", PROFILE_SCHEMA_SOURCE)
+            .map(|schema| {
+                schema.with_authoring_source(include_str!(
+                    "../../../resources/config-schema/profile-authoring.dcdl"
+                ))
+            })
             .map_err(|error| Error::Config(error.to_string()))
     }
 }
@@ -59,7 +54,7 @@ struct VirtualProfileSection {
 #[serde(deny_unknown_fields)]
 struct VirtualProfileEntry {
     selector: String,
-    source: String,
+    profile: serde_json::Value,
     label: String,
     description: String,
 }
@@ -68,7 +63,6 @@ struct VirtualProfileEntry {
 pub struct ProfileConfigProjection {
     pub settings: ProfileSettingsResponse,
     entries: BTreeMap<String, VirtualProfileEntry>,
-    sources: BTreeMap<String, String>,
 }
 
 pub fn project_profiles_from_workspace_config(
@@ -96,23 +90,42 @@ pub fn project_profiles_from_workspace_config(
             "Profile projection digest mismatch for Workspace {workspace_id}"
         )));
     }
+    project_profiles_from_evaluation(workspace_id, state, &evaluation)
+}
+
+pub(crate) fn project_profiles_from_evaluation(
+    workspace_id: &str,
+    state: &WorkspaceConfigState,
+    evaluation: &config_source::EvaluationResult,
+) -> Result<ProfileConfigProjection> {
+    if evaluation.projection_digest != state.projection_digest {
+        return Err(Error::Config(
+            "Profile evaluation does not match Workspace config state".into(),
+        ));
+    }
     let projected = evaluation.projections.first().ok_or_else(|| {
         Error::RegistryInconsistency("Workspace config has no active projection".to_string())
     })?;
+    if projected
+        .data_json
+        .pointer("/profile/entries")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|entries| entries.iter().any(|entry| entry.get("source").is_some()))
+    {
+        return Err(profile_validation_error(
+            "profile_source_registration_removed",
+            "profile.entries.source is no longer supported: replace source = \"profiles/name.dcdl\" with profile = import \"./profiles/name.dcdl\" (relative to the containing config file). Saved config is not rewritten.",
+        ));
+    }
     let config: VirtualProfileConfig = serde_json::from_value(projected.data_json.clone())
         .map_err(|error| Error::RegistryInconsistency(error.to_string()))?;
     let mut profiles = builtin_profile_summaries(Some(&config.profile.default_profile));
     let mut entries = BTreeMap::new();
-    let sources = state
-        .snapshot
-        .entries
-        .iter()
-        .filter(|(_, entry)| entry.content_type == ConfigContentType::Decodal)
-        .map(|(path, entry)| (path.as_str().to_string(), entry.content.clone()))
-        .collect::<BTreeMap<_, _>>();
     let mut source_summaries = Vec::new();
     for entry in config.profile.entries {
-        if !entry.selector.starts_with("project:") {
+        if !entry.selector.starts_with("project:")
+            || entry.selector.trim_start_matches("project:").is_empty()
+        {
             return Err(profile_validation_error(
                 "profile_selector_invalid",
                 "Workspace Profile selectors must use project:*",
@@ -124,61 +137,43 @@ pub fn project_profiles_from_workspace_config(
                 "Workspace Profile selectors must be unique",
             ));
         }
-        let source_path = VirtualPath::parse(&entry.source).map_err(|error| {
-            profile_validation_error("profile_source_path_invalid", &error.to_string())
-        })?;
-        let source_entry = state.snapshot.get(&source_path).ok_or_else(|| {
-            profile_validation_error(
-                "profile_source_missing",
-                &format!(
-                    "Profile source {:?} is missing from the active config revision",
-                    entry.source
-                ),
-            )
-        })?;
-        if source_entry.content_type != ConfigContentType::Decodal {
-            return Err(profile_validation_error(
-                "profile_source_type_invalid",
-                "Profile sources must use Decodal content",
-            ));
-        }
-        let archive_source = entry.source.clone();
         let label = if entry.label.is_empty() {
             entry.selector.trim_start_matches("project:").to_string()
         } else {
             entry.label.clone()
         };
         resolve_profile_artifact_value(
-            evaluate_profile_source(&state.snapshot, &source_path)?,
+            entry.profile.clone(),
             ProfileSource::Archive {
                 archive_id: format!("workspace-config-r{}", state.snapshot.revision),
-                source: archive_source.clone(),
+                source: entry.selector.clone(),
             },
             Path::new("/"),
             "workspace-config-validation",
         )
-        .map_err(|error| profile_validation_error("profile_source_invalid", &error.to_string()))?;
+        .map_err(|error| profile_validation_error("profile_value_invalid", &error.to_string()))?;
         profiles.push(WorkspaceProfileSummary {
             profile_id: entry.selector.clone(),
             selector: entry.selector.clone(),
             label,
             source_kind: "project".to_string(),
-            profile_source_id: Some(entry.source.clone()),
+            profile_source_id: Some(entry.selector.clone()),
             description: (!entry.description.is_empty()).then(|| entry.description.clone()),
             editable: false,
             is_default: config.profile.default_profile == entry.selector,
             diagnostics: Vec::new(),
         });
+        let value_bytes = serde_json::to_vec(&entry.profile).expect("Profile value serializes");
         source_summaries.push(WorkspaceProfileSourceSummary {
-            profile_source_id: entry.source.clone(),
-            display_path: entry.source.clone(),
-            kind: "virtual_config".to_string(),
-            content_type: "decodal".to_string(),
-            content_digest: source_entry.content_digest.clone(),
+            profile_source_id: entry.selector.clone(),
+            display_path: format!("profile.entries[{}].profile", source_summaries.len()),
+            kind: "evaluated_config".to_string(),
+            content_type: "application/json".to_string(),
+            content_digest: config_source::digest_bytes(&value_bytes),
             provenance: WorkspaceProfileSourceProvenance::ProjectProfileSourceTree,
             editable: false,
             revision: state.snapshot.revision.to_string(),
-            size_bytes: source_entry.content.len() as u64,
+            size_bytes: value_bytes.len() as u64,
             diagnostics: Vec::new(),
         });
         entries.insert(entry.selector.clone(), entry);
@@ -198,44 +193,14 @@ pub fn project_profiles_from_workspace_config(
             registry_revision: format!("config:{}", state.snapshot.revision),
             config_revision: Some(state.snapshot.revision),
             tree_digest: Some(state.snapshot.digest.clone()),
-            projection_digest: Some(evaluation.projection_digest),
+            projection_digest: Some(evaluation.projection_digest.clone()),
             default_profile: Some(config.profile.default_profile),
             profiles,
             sources: source_summaries,
             diagnostics: Vec::new(),
         },
         entries,
-        sources,
     })
-}
-
-fn evaluate_profile_source(
-    snapshot: &config_source::ConfigTreeSnapshot,
-    source_path: &VirtualPath,
-) -> Result<serde_json::Value> {
-    let contract = config_source::ToolchainContract::with_schema_bundle(
-        config_source::DEFAULT_SCHEMA_VERSION,
-        vec![source_path.clone()],
-        config_source::DEFAULT_IMPORT_POLICY_VERSION,
-        config_source::WorkspaceConfigSchemaBundle::empty(),
-    );
-    let evaluation = config_source::SnapshotEnvironment::new(snapshot.clone())
-        .evaluate_contract(&contract)
-        .map_err(|diagnostics| {
-            profile_validation_error(
-                "profile_source_invalid",
-                &serde_json::to_string(&diagnostics)
-                    .unwrap_or_else(|_| "Profile source evaluation failed".to_string()),
-            )
-        })?;
-    evaluation
-        .projections
-        .into_iter()
-        .next()
-        .map(|projection| projection.data_json)
-        .ok_or_else(|| {
-            profile_validation_error("profile_source_invalid", "Profile source has no projection")
-        })
 }
 
 pub fn selector_for_workspace_candidate(
@@ -420,6 +385,16 @@ pub fn build_virtual_profile_config_bundle_with_prompt_projection(
     selector: &str,
     prompt_projection: &worker::WorkspacePromptProjection,
 ) -> Result<Option<ConfigBundle>> {
+    if projection.settings.workspace_id != workspace_id
+        || projection.settings.config_revision != Some(state.snapshot.revision)
+        || projection.settings.tree_digest.as_deref() != Some(state.snapshot.digest.as_str())
+        || projection.settings.projection_digest.as_deref()
+            != Some(state.projection_digest.as_str())
+    {
+        return Err(Error::Config(
+            "Profile projection does not match Workspace config state".into(),
+        ));
+    }
     validate_prompt_projection_matches_state(workspace_id, state, prompt_projection)?;
     let prompt_catalog = prompt_projection.catalog().clone();
     let profile_selector =
@@ -429,12 +404,7 @@ pub fn build_virtual_profile_config_bundle_with_prompt_projection(
             ))
         })?;
     let archive = match projection.entries.get(selector) {
-        Some(entry) => Some(build_virtual_profile_archive(
-            selector,
-            entry,
-            &projection.sources,
-            state,
-        )?),
+        Some(entry) => Some(build_virtual_profile_archive(selector, entry, state)?),
         None => Some(builtin_profile_source_archive(&profile_selector).map_err(Error::Store)?),
     };
     let bundle_id = virtual_profile_bundle_id(
@@ -492,19 +462,24 @@ pub(crate) fn resolve_profile_manifest_from_config_bundle(
 fn build_virtual_profile_archive(
     selector: &str,
     entry: &VirtualProfileEntry,
-    all_sources: &BTreeMap<String, String>,
     state: &WorkspaceConfigState,
 ) -> Result<ProfileSourceArchive> {
-    let mut closure = BTreeMap::new();
-    let mut imports = BTreeMap::new();
-    collect_profile_import_closure(&entry.source, all_sources, &mut closure, &mut imports)?;
-    ProfileSourceArchive::build(ProfileSourceArchiveInput {
-        id: format!("workspace-config-profile-r{}", state.snapshot.revision),
-        entrypoints: BTreeMap::from([(selector.to_string(), entry.source.clone())]),
-        imports,
-        sources: closure,
-    })
-    .map_err(|error| profile_validation_error("profile_source_archive_invalid", &error.to_string()))
+    let builtin_sources = config_source::SnapshotEnvironment::new(state.snapshot.clone())
+        .builtin_import_sources(&state.contract)
+        .map_err(|diagnostics| {
+            profile_validation_error(
+                "profile_builtin_snapshot_invalid",
+                &serde_json::to_string(&diagnostics)
+                    .unwrap_or_else(|_| "builtin import snapshot failed".to_string()),
+            )
+        })?;
+    ProfileSourceArchive::build_evaluated_profile_with_builtin_sources(
+        format!("workspace-config-profile-r{}", state.snapshot.revision),
+        selector.to_string(),
+        entry.profile.clone(),
+        builtin_sources,
+    )
+    .map_err(|error| profile_validation_error("profile_value_archive_invalid", &error.to_string()))
 }
 
 pub fn workspace_metadata_settings(
@@ -576,124 +551,6 @@ fn profile_validation_error(code: impl Into<String>, message: impl Into<String>)
     }
 }
 
-fn collect_profile_import_closure(
-    current_path: &str,
-    all_sources: &BTreeMap<String, String>,
-    closure_sources: &mut BTreeMap<String, String>,
-    imports: &mut BTreeMap<String, String>,
-) -> Result<()> {
-    if closure_sources.contains_key(current_path) {
-        return Ok(());
-    }
-    let content = all_sources.get(current_path).ok_or_else(|| {
-        profile_validation_error(
-            "profile_source_import_missing",
-            &format!("Profile source import closure is missing {current_path}"),
-        )
-    })?;
-    closure_sources.insert(current_path.to_string(), content.clone());
-    for specifier in collect_decodal_import_specifiers(content) {
-        let target = resolve_profile_source_import(current_path, &specifier)?;
-        if !all_sources.contains_key(&target) {
-            return Err(profile_validation_error(
-                "profile_source_import_missing",
-                &format!(
-                    "Profile source import {specifier:?} from {current_path} resolves to missing {target}"
-                ),
-            ));
-        }
-        imports.insert(format!("{current_path}\0{specifier}"), target.clone());
-        collect_profile_import_closure(&target, all_sources, closure_sources, imports)?;
-    }
-    Ok(())
-}
-
-fn resolve_profile_source_import(current_path: &str, specifier: &str) -> Result<String> {
-    if specifier.is_empty() || specifier.contains("://") || Path::new(specifier).is_absolute() {
-        return Err(profile_validation_error(
-            "profile_source_import_invalid",
-            "Profile source import must be a virtual relative path",
-        ));
-    }
-    let raw = specifier
-        .strip_prefix("project:")
-        .or_else(|| specifier.strip_prefix("workspace:"))
-        .unwrap_or(specifier);
-    if specifier.contains(':') && raw == specifier {
-        return Err(profile_validation_error(
-            "profile_source_import_invalid",
-            "Unsupported profile source import namespace",
-        ));
-    }
-    let base = if raw.starts_with("profiles/") || raw.starts_with("./profiles/") {
-        PathBuf::from(raw)
-    } else {
-        Path::new(current_path)
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default()
-            .join(raw)
-    };
-    let normalized = normalize_virtual_profile_source_path(&base.to_string_lossy())?;
-    Ok(normalized)
-}
-
-fn normalize_virtual_profile_source_path(path: &str) -> Result<String> {
-    let mut normalized = PathBuf::new();
-    for component in Path::new(path).components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(value) => normalized.push(value),
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(profile_validation_error(
-                        "profile_source_import_invalid",
-                        "Profile source import escapes the virtual tree",
-                    ));
-                }
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(profile_validation_error(
-                    "profile_source_import_invalid",
-                    "Profile source import must be relative",
-                ));
-            }
-        }
-    }
-    Ok(normalized.to_string_lossy().replace('\\', "/"))
-}
-
-fn collect_decodal_import_specifiers(content: &str) -> Vec<String> {
-    let mut specifiers = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("//") || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some(index) = trimmed.find("import") else {
-            continue;
-        };
-        let after = trimmed[index + "import".len()..].trim_start();
-        let Some(first) = after.chars().next() else {
-            continue;
-        };
-        if first == '"' || first == '\'' {
-            if let Some(end) = after[1..].find(first) {
-                specifiers.push(after[1..1 + end].to_string());
-            }
-        } else {
-            let ident: String = after
-                .chars()
-                .take_while(|ch| !ch.is_whitespace() && *ch != ';' && *ch != ',' && *ch != '{')
-                .collect();
-            if !ident.is_empty() {
-                specifiers.push(ident);
-            }
-        }
-    }
-    specifiers
-}
-
 pub fn selector_for_builtin_candidate(
     id: &str,
 ) -> Option<worker_runtime::catalog::ProfileSelector> {
@@ -711,6 +568,7 @@ pub fn selector_for_builtin_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use config_source::{ConfigContentType, VirtualPath};
 
     #[test]
     fn workspace_metadata_projects_server_database_record_without_filesystem_diagnostics() {
@@ -779,7 +637,7 @@ mod tests {
             config_source::ConfigEntry::new(
                 VirtualPath::parse("main.dcdl").unwrap(),
                 ConfigContentType::Decodal,
-                r#"{ profile = { default_profile = "project:alpha"; entries = [{ selector = "project:alpha"; source = "profiles/alpha.dcdl"; label = "Alpha"; }]; }; }"#,
+                r#"{ profile = { default_profile = "project:alpha"; entries = [{ selector = "project:alpha"; profile = import "./profiles/alpha.dcdl"; label = "Alpha"; }]; }; }"#,
             )
             .unwrap(),
             config_source::ConfigEntry::new(
@@ -819,18 +677,18 @@ mod tests {
                 .entrypoints
                 .get("project:alpha")
                 .map(String::as_str),
-            Some("profiles/alpha.dcdl")
+            Some("profiles/evaluated.json")
         );
         assert_eq!(archive.reference.source_graph.source_count, 1);
     }
 
     #[test]
-    fn virtual_config_projection_preserves_import_closure() {
+    fn virtual_config_projection_materializes_import_closure() {
         let state = virtual_state(vec![
             config_source::ConfigEntry::new(
                 VirtualPath::parse("main.dcdl").unwrap(),
                 ConfigContentType::Decodal,
-                r#"{ profile = { entries = [{ selector = "project:alpha"; source = "profiles/alpha.dcdl"; }]; }; }"#,
+                r#"{ profile = { entries = [{ selector = "project:alpha"; profile = import "./profiles/alpha.dcdl"; }]; }; }"#,
             )
             .unwrap(),
             config_source::ConfigEntry::new(
@@ -857,8 +715,8 @@ mod tests {
         .unwrap()
         .unwrap();
         let archive = bundle.profile_source_archive.unwrap();
-        assert_eq!(archive.reference.source_graph.source_count, 2);
-        assert_eq!(archive.reference.source_graph.import_count, 1);
+        assert_eq!(archive.reference.source_graph.source_count, 1);
+        assert_eq!(archive.reference.source_graph.import_count, 0);
     }
 
     #[test]
@@ -955,8 +813,8 @@ mod tests {
                 VirtualPath::parse("main.dcdl").unwrap(),
                 ConfigContentType::Decodal,
                 r#"{ profile = { entries = [
-                    { selector = "project:alpha"; source = "profiles/alpha.dcdl"; },
-                    { selector = "project:beta"; source = "profiles/beta.dcdl"; },
+                    { selector = "project:alpha"; profile = import "./profiles/alpha.dcdl"; },
+                    { selector = "project:beta"; profile = import "./profiles/beta.dcdl"; },
                 ]; }; }"#,
             )
             .unwrap(),
@@ -1002,20 +860,83 @@ mod tests {
     }
 
     #[test]
-    fn virtual_config_projection_rejects_missing_profile_source() {
-        let state = virtual_state(vec![
-            config_source::ConfigEntry::new(
-                VirtualPath::parse("main.dcdl").unwrap(),
-                ConfigContentType::Decodal,
-                r#"{ profile = { entries = [{ selector = "project:alpha"; source = "profiles/missing.dcdl"; }]; }; }"#,
-            )
-            .unwrap(),
-        ]);
-        let error = project_profiles_from_workspace_config("workspace-test", &state).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("missing from the active config revision")
+    fn value_profile_authoring_uses_current_provider_schema_without_inserting_defaults() {
+        let bundle =
+            config_source::WorkspaceConfigSchemaBundle::compose([ProfileConfigSchemaProvider
+                .contribution()
+                .unwrap()])
+            .unwrap();
+        let snapshot = config_source::ConfigTreeSnapshot::from_entries(1, [config_source::ConfigEntry::new(
+            VirtualPath::parse("main.dcdl").unwrap(), ConfigContentType::Decodal,
+            r#"{ profile = { entries = [{ selector = "project:alpha"; profile = {}; }]; }; } as WorkspaceConfigSchema"#,
+        ).unwrap()]).unwrap();
+        let environment = config_source::SnapshotEnvironment::new(snapshot.clone())
+            .with_schema_bundle(bundle.clone());
+        for (body, token, label) in [
+            (
+                "{ profile = { entries = [{ sel }] } } as WorkspaceConfigSchema",
+                "sel",
+                "selector",
+            ),
+            (
+                "{ profile = { entries = [{ pro }] } } as WorkspaceConfigSchema",
+                "pro",
+                "profile",
+            ),
+            (
+                "{ profile = { entries = [{ profile = { wor } }] } } as WorkspaceConfigSchema",
+                "wor",
+                "worker",
+            ),
+            (
+                "{ profile = { entries = [{ profile = { worker = { mo } } }] } } as WorkspaceConfigSchema",
+                "mo",
+                "mode",
+            ),
+            (
+                "{ profile = { entries = [{ profile = { feature = { ti } } }] } } as WorkspaceConfigSchema",
+                "ti",
+                "ticket",
+            ),
+        ] {
+            let offset = body.rfind(token).unwrap() + token.len();
+            let completion = environment
+                .complete_config(
+                    &VirtualPath::parse("main.dcdl").unwrap(),
+                    body,
+                    offset,
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+            assert!(
+                completion.items.iter().any(|item| item.label == label),
+                "{label}: {completion:?}"
+            );
+        }
+        for invalid in [
+            r#"{ profile = { entries = [{ selector = 42; profile = {}; }]; }; } as WorkspaceConfigSchema"#,
+            r#"{ profile = { entries = [{ selector = "project:alpha"; profile = 42; }]; }; } as WorkspaceConfigSchema"#,
+        ] {
+            assert!(
+                !environment
+                    .analyze(&VirtualPath::parse("main.dcdl").unwrap(), Some(invalid))
+                    .is_empty()
+            );
+        }
+        let evaluation = environment
+            .evaluate_contract(&config_source::ToolchainContract::with_schema_bundle(
+                config_source::DEFAULT_SCHEMA_VERSION,
+                vec![VirtualPath::parse("main.dcdl").unwrap()],
+                config_source::DEFAULT_IMPORT_POLICY_VERSION,
+                bundle,
+            ))
+            .unwrap();
+        assert_eq!(
+            evaluation.projections[0]
+                .data_json
+                .pointer("/profile/entries/0/profile"),
+            Some(&serde_json::json!({}))
         );
     }
 }

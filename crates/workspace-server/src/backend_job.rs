@@ -7,26 +7,28 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use worker_runtime::identity::RuntimeWorkerRef;
 
 use crate::{Error, Result};
 
 pub const BACKEND_JOB_RUNTIME_ID: &str = crate::hosts::EMBEDDED_RUNTIME_ID;
-pub const DEFAULT_MAX_CONCURRENT_JOBS: u16 = 8;
-pub const ABSOLUTE_MAX_CONCURRENT_JOBS: u16 = 64;
-pub const DEFAULT_JOB_TIMEOUT_SECONDS: u32 = 120;
-pub const MAX_JOB_TIMEOUT_SECONDS: u32 = 600;
-pub const DEFAULT_MAX_RESULT_BYTES: u32 = 16 * 1024;
-pub const ABSOLUTE_MAX_RESULT_BYTES: u32 = 64 * 1024;
-pub const DEFAULT_MAX_ATTEMPTS: u8 = 2;
-pub const ABSOLUTE_MAX_ATTEMPTS: u8 = 3;
-pub const MAX_JOB_INPUT_BYTES: usize = 128 * 1024;
-pub const MAX_JOB_INSTRUCTION_BYTES: usize = 16 * 1024;
-pub const MAX_JOB_PURPOSE_BYTES: usize = 120;
-pub const MAX_JOB_REFERENCE_BYTES: usize = 512;
-pub const MAX_JOB_FAILURE_BYTES: usize = 1024;
-pub const MAX_JOB_DELIVERY_BYTES: usize = 16 * 1024;
+pub use job::{
+    ABSOLUTE_MAX_ATTEMPTS, ABSOLUTE_MAX_CONCURRENT_JOBS, ABSOLUTE_MAX_RESULT_BYTES,
+    DEFAULT_JOB_TIMEOUT_SECONDS, DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_CONCURRENT_JOBS,
+    DEFAULT_MAX_RESULT_BYTES, JobResultSubmission as BackendJobResultSubmission,
+    MAX_JOB_DELIVERY_BYTES, MAX_JOB_FAILURE_BYTES, MAX_JOB_INPUT_BYTES, MAX_JOB_INSTRUCTION_BYTES,
+    MAX_JOB_PURPOSE_BYTES, MAX_JOB_REFERENCE_BYTES, MAX_JOB_TIMEOUT_SECONDS, attempt_id,
+    bounded_failure_detail,
+};
+
+// Preserve the Backend InvalidInput surface and its exact historical messages.
+fn backend_error(error: job::JobError) -> Error {
+    match error {
+        job::JobError::InvalidInput(detail) => {
+            Error::InvalidInput(detail.replacen("Job ", "Backend Job ", 1))
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +37,17 @@ pub enum BackendJobState {
     Completed,
     Failed,
     Unknown,
+}
+
+impl From<BackendJobState> for job::JobState {
+    fn from(state: BackendJobState) -> Self {
+        match state {
+            BackendJobState::Pending => Self::Pending,
+            BackendJobState::Completed => Self::Completed,
+            BackendJobState::Failed => Self::Failed,
+            BackendJobState::Unknown => Self::Unknown,
+        }
+    }
 }
 
 impl BackendJobState {
@@ -67,6 +80,19 @@ pub enum BackendJobAttemptState {
     Completed,
     Failed,
     Unknown,
+}
+
+impl From<BackendJobAttemptState> for job::JobAttemptState {
+    fn from(state: BackendJobAttemptState) -> Self {
+        match state {
+            BackendJobAttemptState::Reserved => Self::Reserved,
+            BackendJobAttemptState::Dispatching => Self::Dispatching,
+            BackendJobAttemptState::Dispatched => Self::Dispatched,
+            BackendJobAttemptState::Completed => Self::Completed,
+            BackendJobAttemptState::Failed => Self::Failed,
+            BackendJobAttemptState::Unknown => Self::Unknown,
+        }
+    }
 }
 
 impl BackendJobAttemptState {
@@ -161,28 +187,29 @@ impl Default for BackendJobLimits {
 
 impl BackendJobLimits {
     pub fn validate(&self) -> Result<()> {
-        if self.max_concurrent_jobs == 0 || self.max_concurrent_jobs > ABSOLUTE_MAX_CONCURRENT_JOBS
-        {
-            return Err(Error::InvalidInput(format!(
-                "Backend Job max_concurrent_jobs must be in 1..={ABSOLUTE_MAX_CONCURRENT_JOBS}"
-            )));
+        job::JobLimits::from(self).validate().map_err(backend_error)
+    }
+}
+
+impl From<&BackendJobLimits> for job::JobLimits {
+    fn from(limits: &BackendJobLimits) -> Self {
+        Self {
+            max_concurrent_jobs: limits.max_concurrent_jobs,
+            timeout_seconds: limits.timeout_seconds,
+            max_result_bytes: limits.max_result_bytes,
+            max_attempts: limits.max_attempts,
         }
-        if self.timeout_seconds == 0 || self.timeout_seconds > MAX_JOB_TIMEOUT_SECONDS {
-            return Err(Error::InvalidInput(format!(
-                "Backend Job timeout_seconds must be in 1..={MAX_JOB_TIMEOUT_SECONDS}"
-            )));
+    }
+}
+
+impl From<job::JobLimits> for BackendJobLimits {
+    fn from(limits: job::JobLimits) -> Self {
+        Self {
+            max_concurrent_jobs: limits.max_concurrent_jobs,
+            timeout_seconds: limits.timeout_seconds,
+            max_result_bytes: limits.max_result_bytes,
+            max_attempts: limits.max_attempts,
         }
-        if self.max_result_bytes == 0 || self.max_result_bytes > ABSOLUTE_MAX_RESULT_BYTES {
-            return Err(Error::InvalidInput(format!(
-                "Backend Job max_result_bytes must be in 1..={ABSOLUTE_MAX_RESULT_BYTES}"
-            )));
-        }
-        if self.max_attempts == 0 || self.max_attempts > ABSOLUTE_MAX_ATTEMPTS {
-            return Err(Error::InvalidInput(format!(
-                "Backend Job max_attempts must be in 1..={ABSOLUTE_MAX_ATTEMPTS}"
-            )));
-        }
-        Ok(())
     }
 }
 
@@ -261,17 +288,29 @@ pub struct BackendJobRequest {
 }
 
 impl BackendJobRequest {
-    pub fn validate(&self) -> Result<()> {
-        validate_identifier("job_id", &self.job_id, 256)?;
-        validate_identifier("purpose", &self.purpose, MAX_JOB_PURPOSE_BYTES)?;
-        validate_identifier("input_revision", &self.input_revision, 256)?;
-        validate_bounded_text("input_ref", &self.input_ref, MAX_JOB_REFERENCE_BYTES)?;
-        validate_bounded_text("instruction", &self.instruction, MAX_JOB_INSTRUCTION_BYTES)?;
-        validate_identifier("profile", &self.profile, 256)?;
-        self.profile_selector()?;
-        if let Some(key) = &self.serialization_key {
-            validate_identifier("serialization_key", key, MAX_JOB_REFERENCE_BYTES)?;
+    /// Adapt neutral intent without granting domain access or writer/notification
+    /// authority. Validation remains the Backend submission boundary's job;
+    /// the caller-selected profile is retained exactly, with no fallback.
+    pub fn from_job_request(request: job::JobRequest) -> Self {
+        Self {
+            job_id: request.job_id,
+            purpose: request.purpose,
+            input_revision: request.input_revision,
+            input_ref: request.input_ref,
+            input: request.input,
+            instruction: request.instruction,
+            profile: request.profile,
+            grants: BackendJobGrants::default(),
+            serialization_key: request.serialization_key,
+            source_worker: None,
+            notification_target: None,
+            limits: request.limits.into(),
         }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let request = self.to_job_request();
+        request.validate_fields().map_err(backend_error)?;
         if let Some(grant) = &self.grants.subjektiv_consolidation {
             validate_identifier("grant subject_id", &grant.subject_id, 256)?;
             if grant.candidate_ids.len() > 256 {
@@ -297,44 +336,30 @@ impl BackendJobRequest {
                 ));
             }
         }
-        let input = serde_json::to_vec(&self.input).map_err(|error| {
-            Error::InvalidInput(format!("serialize Backend Job input: {error}"))
-        })?;
-        if input.len() > MAX_JOB_INPUT_BYTES {
-            return Err(Error::InvalidInput(format!(
-                "Backend Job input exceeds {MAX_JOB_INPUT_BYTES} bytes"
-            )));
-        }
+        request.validate_input().map_err(backend_error)?;
         self.limits.validate()
+    }
+
+    /// Transport-neutral projection only. Domain grants, writer authority and
+    /// derived resource locks remain Backend-owned; never fingerprint this
+    /// projection as a substitute for the full Backend intent.
+    pub fn to_job_request(&self) -> job::JobRequest {
+        job::JobRequest {
+            job_id: self.job_id.clone(),
+            purpose: self.purpose.clone(),
+            input_revision: self.input_revision.clone(),
+            input_ref: self.input_ref.clone(),
+            input: self.input.clone(),
+            instruction: self.instruction.clone(),
+            profile: self.profile.clone(),
+            serialization_key: self.serialization_key.clone(),
+            limits: (&self.limits).into(),
+        }
     }
 
     /// Validate selector syntax only. Registry existence and resolution are dispatch authority.
     pub fn profile_selector(&self) -> Result<manifest::ProfileSelector> {
-        use manifest::ProfileSelector;
-        validate_identifier("profile", &self.profile, 256)?;
-        let selector = ProfileSelector::parse_cli(&self.profile);
-        let valid = match &selector {
-            ProfileSelector::Default => true,
-            ProfileSelector::Path { .. } => false,
-            ProfileSelector::Named { source, name } => {
-                !name.is_empty()
-                    && !name.starts_with('.')
-                    && !name.contains(['/', '\\', ':'])
-                    && name
-                        .chars()
-                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-                    && ![".toml", ".json", ".dcdl", ".nix"]
-                        .iter()
-                        .any(|suffix| name.ends_with(suffix))
-                    && (source.is_some() || name != "inherit")
-            }
-        };
-        if !valid {
-            return Err(Error::InvalidInput(
-                "Backend Job profile must be a manifest registry selector, not raw source or a path".into(),
-            ));
-        }
-        Ok(selector)
+        job::profile_selector(&self.profile).map_err(backend_error)
     }
 
     /// Effective single-flight key. Typed grants cannot bypass their subject fence.
@@ -348,20 +373,12 @@ impl BackendJobRequest {
 
     pub fn fingerprint(&self) -> Result<String> {
         self.validate()?;
-        let encoded = serde_json::to_vec(self).map_err(|error| {
-            Error::InvalidInput(format!("serialize Backend Job intent: {error}"))
-        })?;
-        Ok(sha256(&encoded))
+        job::fingerprint(self).map_err(backend_error)
     }
 
     pub fn worker_input(&self, attempt_id: &str) -> Result<String> {
-        let input = serde_json::to_string(&self.input).map_err(|error| {
-            Error::InvalidInput(format!("serialize Backend Job input: {error}"))
-        })?;
-        Ok(format!(
-            "{}\n\nBackend Job envelope (immutable):\njob_id: {}\nattempt_id: {}\ninput_revision: {}\ninput_ref: {}\ninput_json: {}\n\nReturn success only through the structured Backend Job result capability. Final prose and Worker Idle/Stopped state are not result authority.",
-            self.instruction, self.job_id, attempt_id, self.input_revision, self.input_ref, input
-        ))
+        job::worker_input_with_label(&self.to_job_request(), attempt_id, "Backend Job")
+            .map_err(backend_error)
     }
 }
 
@@ -451,13 +468,10 @@ pub struct BackendJobReservation {
     pub resource_reused: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct BackendJobResultSubmission {
-    pub job_id: String,
-    pub attempt_id: String,
-    pub input_revision: String,
-    pub result: Value,
+impl BackendJobReservation {
+    pub fn outcome(&self) -> job::JobOutcome {
+        job_outcome(&self.job, &self.attempt)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -465,6 +479,28 @@ pub struct BackendJobResultAcceptance {
     pub job: BackendJobRecord,
     pub attempt: BackendJobAttemptRecord,
     pub replayed: bool,
+}
+
+impl BackendJobResultAcceptance {
+    pub fn outcome(&self) -> job::JobOutcome {
+        job_outcome(&self.job, &self.attempt)
+    }
+}
+
+// Project the durable Job outcome, not Worker lifecycle, cleanup or delivery.
+// The paired attempt supplies its own identity, number and execution state.
+fn job_outcome(job: &BackendJobRecord, attempt: &BackendJobAttemptRecord) -> job::JobOutcome {
+    job::JobOutcome {
+        job_id: job.request.job_id.clone(),
+        input_revision: job.request.input_revision.clone(),
+        attempt_id: attempt.attempt_id.clone(),
+        attempt: attempt.attempt,
+        state: job.state.into(),
+        attempt_state: attempt.state.into(),
+        result: job.result.clone(),
+        failure_category: job.failure_category.clone(),
+        failure_detail: job.failure_detail.clone(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -489,10 +525,6 @@ pub struct BackendJobDeliveryRecord {
     pub delivered_at: Option<String>,
 }
 
-pub fn attempt_id(job_id: &str, attempt: u8) -> String {
-    format!("{job_id}:attempt:{attempt}")
-}
-
 pub fn allocation_key(attempt_id: &str) -> String {
     format!("backend-job:{attempt_id}")
 }
@@ -515,64 +547,15 @@ pub fn delivery_id(job_id: &str, attempt_id: &str) -> String {
 }
 
 fn tracked_request_id(kind: &str, identity: &[u8]) -> String {
-    format!("backend-job-{kind}:{}", sha256(identity))
+    format!("backend-job-{kind}:{}", job::sha256(identity))
 }
 
 pub fn result_digest(result: &Value, max_bytes: u32) -> Result<(String, String)> {
-    let encoded = serde_json::to_string(result)
-        .map_err(|error| Error::InvalidInput(format!("serialize Backend Job result: {error}")))?;
-    if encoded.len() > max_bytes as usize {
-        return Err(Error::InvalidInput(format!(
-            "Backend Job result exceeds {max_bytes} bytes"
-        )));
-    }
-    Ok((sha256(encoded.as_bytes()), encoded))
-}
-
-pub(crate) fn bounded_failure_detail(detail: &str) -> String {
-    if detail.len() <= MAX_JOB_FAILURE_BYTES {
-        return detail.to_string();
-    }
-    let mut end = MAX_JOB_FAILURE_BYTES;
-    while !detail.is_char_boundary(end) {
-        end -= 1;
-    }
-    detail[..end].to_string()
+    job::result_digest(result, max_bytes).map_err(backend_error)
 }
 
 fn validate_identifier(field: &str, value: &str, max_bytes: usize) -> Result<()> {
-    validate_bounded_text(field, value, max_bytes)?;
-    if value.chars().any(char::is_control) {
-        return Err(Error::InvalidInput(format!(
-            "Backend Job {field} must not contain control characters"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_bounded_text(field: &str, value: &str, max_bytes: usize) -> Result<()> {
-    if value.is_empty() || value.trim() != value {
-        return Err(Error::InvalidInput(format!(
-            "Backend Job {field} must be non-empty and trimmed"
-        )));
-    }
-    if value.len() > max_bytes {
-        return Err(Error::InvalidInput(format!(
-            "Backend Job {field} exceeds {max_bytes} bytes"
-        )));
-    }
-    Ok(())
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(7 + digest.len() * 2);
-    output.push_str("sha256:");
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
+    job::validate_identifier(field, value, max_bytes).map_err(backend_error)
 }
 
 #[cfg(test)]
@@ -594,6 +577,258 @@ mod tests {
             notification_target: Some(RuntimeWorkerRef::new("runtime-a", "worker-a")),
             limits: BackendJobLimits::default(),
         }
+    }
+
+    fn reservation() -> BackendJobReservation {
+        serde_json::from_value(serde_json::json!({
+            "job": {
+                "workspace_id": "workspace-a",
+                "request": request(),
+                "intent_fingerprint": request().fingerprint().unwrap(),
+                "state": "pending",
+                "current_attempt": 2,
+                "created_at": "created",
+                "updated_at": "updated"
+            },
+            "attempt": {
+                "workspace_id": "workspace-a",
+                "job_id": "ticket-check:T-1:r7",
+                "attempt_id": "ticket-check:T-1:r7:attempt:2",
+                "attempt": 2,
+                "input_revision": "7",
+                "state": "reserved",
+                "worker": {"runtime_id": "runtime-a", "worker_id": "worker-a"},
+                "runtime_run_id": "run-a",
+                "deadline_at": "deadline",
+                "created_at": "created",
+                "updated_at": "updated"
+            },
+            "replayed": false,
+            "resource_reused": false
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn backend_state_projections_preserve_existing_wire_vocabulary() {
+        for state in [
+            BackendJobState::Pending,
+            BackendJobState::Completed,
+            BackendJobState::Failed,
+            BackendJobState::Unknown,
+        ] {
+            let shared = job::JobState::from(state);
+            assert_eq!(
+                serde_json::to_value(state).unwrap(),
+                serde_json::to_value(shared).unwrap()
+            );
+        }
+        for state in [
+            BackendJobAttemptState::Reserved,
+            BackendJobAttemptState::Dispatching,
+            BackendJobAttemptState::Dispatched,
+            BackendJobAttemptState::Completed,
+            BackendJobAttemptState::Failed,
+            BackendJobAttemptState::Unknown,
+        ] {
+            let shared = job::JobAttemptState::from(state);
+            assert_eq!(
+                serde_json::to_value(state).unwrap(),
+                serde_json::to_value(shared).unwrap()
+            );
+        }
+        // The shared read vocabulary does not add Backend cancellation support.
+        assert!(BackendJobState::parse("cancelled").is_err());
+        assert!(BackendJobAttemptState::parse("cancelled").is_err());
+        assert!(serde_json::from_str::<BackendJobState>("\"cancelled\"").is_err());
+        assert!(serde_json::from_str::<BackendJobAttemptState>("\"cancelled\"").is_err());
+    }
+
+    #[test]
+    fn neutral_request_round_trip_does_not_infer_authority_or_replace_profile() {
+        for profile in ["builtin:backend-job", "builtin:job", "project:custom-job"] {
+            for key in [None, Some("resource:7".to_string())] {
+                let mut neutral = request().to_job_request();
+                neutral.profile = profile.into();
+                neutral.serialization_key = key;
+                neutral.limits = job::JobLimits {
+                    max_concurrent_jobs: 3,
+                    timeout_seconds: 17,
+                    max_result_bytes: 777,
+                    max_attempts: 1,
+                };
+                let backend = BackendJobRequest::from_job_request(neutral.clone());
+                backend.validate().unwrap();
+                assert_eq!(backend.to_job_request(), neutral);
+                assert!(backend.grants.is_empty());
+                assert!(backend.source_worker.is_none());
+                assert!(backend.notification_target.is_none());
+                let encoded = serde_json::to_value(&backend).unwrap();
+                for field in ["grants", "source_worker", "notification_target"] {
+                    assert!(encoded.get(field).is_none());
+                }
+                assert_eq!(encoded["profile"], profile);
+            }
+        }
+        // Conversion is not validation and must not normalize an invalid request.
+        let mut neutral = request().to_job_request();
+        neutral.limits.timeout_seconds = 0;
+        neutral.profile = "inherit".into();
+        let backend = BackendJobRequest::from_job_request(neutral.clone());
+        assert_eq!(backend.to_job_request(), neutral);
+        assert!(backend.validate().is_err());
+    }
+
+    #[test]
+    fn reservation_and_acceptance_outcomes_expose_durable_job_and_attempt_not_host_lifecycle() {
+        let mut reservation = reservation();
+        let encoded_before = serde_json::to_value(&reservation).unwrap();
+        assert_eq!(
+            reservation.outcome(),
+            job::JobOutcome {
+                job_id: reservation.job.request.job_id.clone(),
+                input_revision: "7".into(),
+                attempt_id: "ticket-check:T-1:r7:attempt:2".into(),
+                attempt: 2,
+                state: job::JobState::Pending,
+                attempt_state: job::JobAttemptState::Reserved,
+                result: None,
+                failure_category: None,
+                failure_detail: None,
+            }
+        );
+        assert_eq!(serde_json::to_value(&reservation).unwrap(), encoded_before);
+        for (state, attempt_state) in [
+            (
+                BackendJobState::Pending,
+                BackendJobAttemptState::Dispatching,
+            ),
+            (BackendJobState::Pending, BackendJobAttemptState::Dispatched),
+            (BackendJobState::Failed, BackendJobAttemptState::Failed),
+            (BackendJobState::Unknown, BackendJobAttemptState::Unknown),
+        ] {
+            reservation.job.state = state;
+            reservation.attempt.state = attempt_state;
+            reservation.job.failure_category = Some("job-category".into());
+            reservation.job.failure_detail = Some("job-detail".into());
+            reservation.attempt.failure_category = Some("attempt-category".into());
+            let outcome = reservation.outcome();
+            assert_eq!(outcome.state, state.into());
+            assert_eq!(outcome.attempt_state, attempt_state.into());
+            assert_eq!(outcome.failure_category.as_deref(), Some("job-category"));
+            assert_eq!(outcome.failure_detail.as_deref(), Some("job-detail"));
+            assert!(outcome.result.is_none());
+            let accepted = BackendJobResultAcceptance {
+                job: reservation.job.clone(),
+                attempt: reservation.attempt.clone(),
+                replayed: true,
+            };
+            assert_eq!(accepted.outcome(), outcome);
+        }
+        reservation.job.state = BackendJobState::Completed;
+        reservation.attempt.state = BackendJobAttemptState::Completed;
+        reservation.job.result = Some(serde_json::json!({"ok": true}));
+        reservation.job.failure_category = None;
+        reservation.job.failure_detail = None;
+        reservation.attempt.worker_cleanup_state = Some(BackendJobWorkerCleanupState::Failed);
+        reservation.attempt.worker_cleanup_failure_detail =
+            Some("cleanup is not model failure".into());
+        reservation.replayed = true;
+        reservation.resource_reused = true;
+        let acceptance = BackendJobResultAcceptance {
+            job: reservation.job.clone(),
+            attempt: reservation.attempt.clone(),
+            replayed: false,
+        };
+        let outcome = acceptance.outcome();
+        assert_eq!(outcome, reservation.outcome());
+        assert_eq!(outcome.state, job::JobState::Completed);
+        assert_eq!(outcome.result, Some(serde_json::json!({"ok": true})));
+        assert!(outcome.failure_category.is_none());
+        assert!(outcome.failure_detail.is_none());
+        let encoded = serde_json::to_value(outcome).unwrap();
+        assert_eq!(encoded.as_object().unwrap().len(), 9);
+        for field in [
+            "workspace_id",
+            "worker",
+            "runtime_run_id",
+            "request",
+            "replayed",
+            "resource_reused",
+            "worker_cleanup_state",
+        ] {
+            assert!(encoded.get(field).is_none());
+        }
+    }
+
+    #[test]
+    fn extraction_preserves_backend_wire_fingerprint_and_worker_envelope() {
+        let request = request();
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"job_id":"ticket-check:T-1:r7","purpose":"ticket_item_check","input_revision":"7","input_ref":"ticket://T-1/revisions/7","input":{"title":"Check me"},"instruction":"Check this immutable Ticket snapshot.","profile":"builtin:backend-job","source_worker":{"runtime_id":"runtime-a","worker_id":"worker-a"},"notification_target":{"runtime_id":"runtime-a","worker_id":"worker-a"},"limits":{"max_concurrent_jobs":8,"timeout_seconds":120,"max_result_bytes":16384,"max_attempts":2}}"#
+        );
+        assert_eq!(
+            request.fingerprint().unwrap(),
+            "sha256:920187fa9efa111a97c4d6869d134943e45b52edb2861cad19a0a173233c8f60"
+        );
+        let neutral = request.to_job_request();
+        neutral.validate().unwrap();
+        assert_ne!(
+            request.fingerprint().unwrap(),
+            neutral.fingerprint().unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&request.limits).unwrap(),
+            serde_json::to_value(&neutral.limits).unwrap()
+        );
+        assert_eq!(
+            request.worker_input("attempt-1").unwrap(),
+            "Check this immutable Ticket snapshot.\n\nBackend Job envelope (immutable):\njob_id: ticket-check:T-1:r7\nattempt_id: attempt-1\ninput_revision: 7\ninput_ref: ticket://T-1/revisions/7\ninput_json: {\"title\":\"Check me\"}\n\nReturn success only through the structured Backend Job result capability. Final prose and Worker Idle/Stopped state are not result authority."
+        );
+    }
+
+    #[test]
+    fn shared_result_contract_preserves_backend_wire_and_errors() {
+        let submission = BackendJobResultSubmission {
+            job_id: "job-1".into(),
+            attempt_id: "job-1:attempt:1".into(),
+            input_revision: "7".into(),
+            result: serde_json::json!({"ok": true}),
+        };
+        let encoded = serde_json::to_string(&submission).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"job_id":"job-1","attempt_id":"job-1:attempt:1","input_revision":"7","result":{"ok":true}}"#
+        );
+        let neutral: job::JobResultSubmission = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(neutral, submission);
+        assert_eq!(
+            result_digest(&submission.result, 128).unwrap(),
+            job::result_digest(&submission.result, 128).unwrap()
+        );
+        assert!(
+            matches!(result_digest(&submission.result, 4), Err(Error::InvalidInput(detail)) if detail == "Backend Job result exceeds 4 bytes")
+        );
+        let mut request = request();
+        request.job_id = "".into();
+        assert!(
+            matches!(request.validate(), Err(Error::InvalidInput(detail)) if detail == "Backend Job job_id must be non-empty and trimmed")
+        );
+        request.job_id = "job-1".into();
+        request.limits.timeout_seconds = 0;
+        assert!(
+            matches!(request.validate(), Err(Error::InvalidInput(detail)) if detail == "Backend Job timeout_seconds must be in 1..=600")
+        );
+        // Preserve domain-before-input/limits error ordering as well.
+        request.grants.subjektiv_consolidation = Some(SubjektivConsolidationGrant {
+            subject_id: "".into(),
+            candidate_ids: vec![],
+        });
+        assert!(
+            matches!(request.validate(), Err(Error::InvalidInput(detail)) if detail == "Backend Job grant subject_id must be non-empty and trimmed")
+        );
     }
 
     #[test]

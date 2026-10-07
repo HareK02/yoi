@@ -189,7 +189,9 @@ pub fn validate_profile_execution_target(
     if feature.memory.profile.enabled || feature.memory.profile.staging_tools {
         requirements.insert(WorkspaceAuthorityRequirement::Memory);
     }
-    if feature.subjektiv.profile.enabled {
+    // Subject policy is Host-neutral. Only an already bound Backend snapshot
+    // requires Workspace authority; a local Host supplies its own live capability.
+    if feature.subjektiv.workspace_settings.is_some() {
         requirements.insert(WorkspaceAuthorityRequirement::Subjektiv);
     }
     if feature.merge_request.show
@@ -1257,6 +1259,23 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(resolved.manifest.worker.name, "role-worker");
+            if matches!(
+                entry.name.as_str(),
+                "job" | "standalone-subjektiv-consolidation"
+            ) {
+                assert!(resolved.manifest.compaction.is_none());
+                assert!(resolved.manifest.scope.allow.is_empty());
+                assert!(resolved.manifest.delegation_scope.allow.is_empty());
+                assert_eq!(
+                    resolved.manifest.engine.instruction,
+                    if entry.name == "job" {
+                        "internal.job_system"
+                    } else {
+                        "internal.subjektiv_memory_consolidation_system"
+                    }
+                );
+                continue;
+            }
         }
     }
 
@@ -1558,7 +1577,10 @@ mod tests {
             panic!("unexpected error: {error}");
         };
         assert_eq!(target, ProfileExecutionTarget::Standalone);
-        assert!(requirements.contains(&WorkspaceAuthorityRequirement::Subjektiv));
+        assert!(
+            !requirements.contains(&WorkspaceAuthorityRequirement::Subjektiv),
+            "subject policy alone is no longer Backend authority"
+        );
         assert!(!requirements.contains(&WorkspaceAuthorityRequirement::Memory));
         assert!(requirements.contains(&WorkspaceAuthorityRequirement::MergeRequest));
         assert!(requirements.contains(&WorkspaceAuthorityRequirement::Ticket));

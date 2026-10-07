@@ -1,0 +1,11 @@
+{
+    profile = {
+        default_profile = String default "builtin:companion";
+        entries = [...{
+            selector = String;
+            profile = { ...Unknown };
+            label = String default "";
+            description = String default "";
+        }] default [];
+    };
+}

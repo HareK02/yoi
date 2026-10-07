@@ -98,29 +98,45 @@ pub fn complete_current(
         let snapshot = session
             .as_ref()
             .ok_or_else(|| JsValue::from_str("config source snapshot is not initialized"))?;
-        let utf8_byte_offset = utf16_to_utf8_offset(&source, utf16_offset)?;
-        let result = session_environment(snapshot.clone())
-            .complete_config(&entrypoint, &source, utf8_byte_offset, explicit)
-            .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
-        let result = result
-            .map(|result| {
-                Ok::<WasmCompletionResult, JsValue>(WasmCompletionResult {
-                    from: utf8_to_utf16_offset(&source, result.from)?,
-                    items: result
-                        .items
-                        .into_iter()
-                        .map(|item| WasmCompletionItem {
-                            label: item.label,
-                            kind: format!("{:?}", item.kind).to_lowercase(),
-                            detail: item.detail,
-                            priority: item.priority,
-                        })
-                        .collect(),
-                })
-            })
-            .transpose()?;
-        encode(result)
+        encode(complete_snapshot(
+            snapshot,
+            &entrypoint,
+            &source,
+            utf16_offset,
+            explicit,
+        )?)
     })
+}
+
+fn complete_snapshot(
+    snapshot: &ConfigTreeSnapshot,
+    entrypoint: &VirtualPath,
+    source: &str,
+    utf16_offset: usize,
+    explicit: bool,
+) -> Result<Option<WasmCompletionResult>, JsValue> {
+    let utf8_byte_offset = utf16_to_utf8_offset(source, utf16_offset)?;
+    let result = session_environment(snapshot.clone())
+        .complete_config(entrypoint, source, utf8_byte_offset, explicit)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let result = result
+        .map(|result| {
+            Ok::<WasmCompletionResult, JsValue>(WasmCompletionResult {
+                from: utf8_to_utf16_offset(source, result.from)?,
+                items: result
+                    .items
+                    .into_iter()
+                    .map(|item| WasmCompletionItem {
+                        label: item.label,
+                        kind: format!("{:?}", item.kind).to_lowercase(),
+                        detail: item.detail,
+                        priority: item.priority,
+                    })
+                    .collect(),
+            })
+        })
+        .transpose()?;
+    Ok(result)
 }
 
 #[wasm_bindgen]
@@ -207,3 +223,98 @@ fn js_error(error: impl std::fmt::Display) -> JsValue {
 
 #[allow(dead_code)]
 fn _assert_serializable(_: EvaluationResult) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config_source::{ConfigContentType, ConfigEntry};
+
+    fn snapshot() -> ConfigTreeSnapshot {
+        ConfigTreeSnapshot::from_entries(
+            7,
+            [
+                ConfigEntry::new(
+                    VirtualPath::parse("main.dcdl").unwrap(),
+                    ConfigContentType::Decodal,
+                    "{}",
+                )
+                .unwrap(),
+                // A same-suffix workspace file must not be an unknown builtin fallback.
+                ConfigEntry::new(
+                    VirtualPath::parse("profiles/missing.dcdl").unwrap(),
+                    ConfigContentType::Decodal,
+                    "{}",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn wasm_completion_boundary_preserves_read_only_builtin_detail() {
+        let snapshot = snapshot();
+        let source = "let 名 = 1; import \"$builtin/profiles/comp\"";
+        let cursor = source.encode_utf16().count() - 1;
+        let result = complete_snapshot(
+            &snapshot,
+            &VirtualPath::parse("main.dcdl").unwrap(),
+            source,
+            cursor,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.from, "let 名 = 1; import \"".encode_utf16().count());
+        let item = result
+            .items
+            .iter()
+            .find(|item| item.label == "$builtin/profiles/companion.dcdl")
+            .unwrap();
+        assert_eq!(item.kind, "file");
+        assert_eq!(
+            item.detail.as_deref(),
+            Some("read-only builtin Decodal source")
+        );
+        assert_eq!(snapshot.entries.len(), 2);
+        assert!(
+            snapshot
+                .entries
+                .keys()
+                .all(|path| !path.as_str().starts_with("$builtin/"))
+        );
+    }
+
+    #[test]
+    fn wasm_analysis_boundary_reports_unknown_builtin_without_workspace_fallback() {
+        let snapshot = snapshot();
+        let path = VirtualPath::parse("main.dcdl").unwrap();
+        let diagnostics = session_environment(snapshot.clone())
+            .analyze(&path, Some("import \"$builtin/profiles/missing.dcdl\""));
+        assert!(!diagnostics.is_empty());
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("unknown or non-public read-only builtin source")
+            })
+            .unwrap();
+        assert_eq!(diagnostic.path, path);
+        assert_eq!(diagnostic.revision, 7);
+        assert_eq!(diagnostic.tree_digest, snapshot.digest);
+        assert!(
+            diagnostic
+                .message
+                .contains("$builtin/profiles/missing.dcdl")
+        );
+        assert!(
+            session_environment(snapshot)
+                .analyze(
+                    &VirtualPath::parse("main.dcdl").unwrap(),
+                    Some("import \"./profiles/missing.dcdl\"")
+                )
+                .is_empty()
+        );
+    }
+}

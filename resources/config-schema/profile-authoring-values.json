@@ -1,0 +1,116 @@
+[
+  {
+    "name": "canonical_compaction_tokens",
+    "profile": {
+      "compaction": {
+        "kind": "tokens",
+        "prune_enabled": false,
+        "prune_protected_tokens": 3000,
+        "prune_min_savings": 1000,
+        "threshold": 80000,
+        "request_threshold": 90000,
+        "retained_tokens": 12000,
+        "overview_target_tokens": 1000,
+        "overview_warning_tokens": 2000,
+        "overview_deadline_tokens": 3000,
+        "worker_context_max_tokens": 20000,
+        "finish_warning_remaining_tokens": 1000,
+        "final_reserve_tokens": 2000,
+        "worker_max_turns": 5,
+        "summary_target_tokens": 1000,
+        "summary_max_tokens": 2000,
+        "auto_read_budget_tokens": 500,
+        "result_context_max_tokens": 4000,
+        "model": { "ref": "codex-oauth/gpt-5.6-sol" }
+      }
+    },
+    "manifest_expect": {
+      "/compaction/prune_enabled": false,
+      "/compaction/prune_protected_tokens": 3000,
+      "/compaction/prune_min_savings": 1000,
+      "/compaction/threshold": 80000,
+      "/compaction/request_threshold": 90000,
+      "/compaction/retained_tokens": 12000,
+      "/compaction/overview_target_tokens": 1000,
+      "/compaction/overview_warning_tokens": 2000,
+      "/compaction/overview_deadline_tokens": 3000,
+      "/compaction/worker_context_max_tokens": 20000,
+      "/compaction/finish_warning_remaining_tokens": 1000,
+      "/compaction/final_reserve_tokens": 2000,
+      "/compaction/worker_max_turns": 5,
+      "/compaction/summary_target_tokens": 1000,
+      "/compaction/summary_max_tokens": 2000,
+      "/compaction/auto_read_budget_tokens": 500,
+      "/compaction/result_context_max_tokens": 4000,
+      "/compaction/model/ref": "codex-oauth/gpt-5.6-sol"
+    }
+  },
+  {
+    "name": "compaction_token_aliases_without_kind",
+    "profile": {
+      "compaction": {
+        "compact_threshold": 80000,
+        "compact_request_threshold": 90000,
+        "compact_retained_tokens": 12000,
+        "compact_worker_max_input_tokens": 20000,
+        "compact_worker_max_turns": 5,
+        "compact_auto_read_budget": 500
+      }
+    },
+    "manifest_expect": {
+      "/compaction/threshold": 80000,
+      "/compaction/request_threshold": 90000,
+      "/compaction/retained_tokens": 12000,
+      "/compaction/worker_context_max_tokens": 20000,
+      "/compaction/worker_max_turns": 5,
+      "/compaction/auto_read_budget_tokens": 500
+    }
+  },
+  {
+    "name": "compaction_ratio_aliases",
+    "profile": {
+      "model": { "context_window": 100000 },
+      "compaction": {
+        "kind": "ratio",
+        "threshold": 0.9,
+        "request": 0.8,
+        "worker": 0.2
+      }
+    },
+    "manifest_expect": {
+      "/compaction/threshold": 90000,
+      "/compaction/request_threshold": 80000,
+      "/compaction/worker_context_max_tokens": 20000
+    }
+  },
+  {
+    "name": "numeric_extraction_reasoning",
+    "profile": {
+      "engine": { "reasoning": -1 },
+      "feature": {
+        "memory": { "extraction": { "enabled": true, "reasoning": 4096 } },
+        "subjektiv": { "extraction": { "enabled": true, "reasoning": 4096 } }
+      }
+    },
+    "manifest_expect": {
+      "/engine/reasoning": -1,
+      "/feature/memory/profile/extraction/reasoning": 4096,
+      "/feature/subjektiv/profile/extraction/reasoning": 4096
+    }
+  },
+  {
+    "name": "string_extraction_reasoning",
+    "profile": {
+      "feature": {
+        "memory": { "extraction": { "enabled": true, "reasoning": "high" } },
+        "subjektiv": {
+          "extraction": { "enabled": true, "reasoning": "medium" }
+        }
+      }
+    },
+    "manifest_expect": {
+      "/feature/memory/profile/extraction/reasoning": "high",
+      "/feature/subjektiv/profile/extraction/reasoning": "medium"
+    }
+  }
+]

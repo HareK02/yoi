@@ -226,6 +226,62 @@ Deno.test("config source API rejects unsafe revisions and oversized entry conten
   );
 });
 
+Deno.test("config source API does not materialize imported builtins in the workspace file list", async () => {
+  const body = {
+    ...tree,
+    snapshot: {
+      ...snapshot,
+      entries: {
+        "profiles/main.dcdl": {
+          ...entry,
+          content: 'import "$builtin/profiles/companion.dcdl"',
+        },
+      },
+    },
+  };
+  const fetcher = (() => Promise.resolve(response(body))) as typeof fetch;
+  const result = await fetchConfigTree("w", fetcher);
+  assertEquals(Object.keys(result.snapshot.entries), ["profiles/main.dcdl"]);
+  assertEquals(
+    result.snapshot.entries["profiles/main.dcdl"].content,
+    body.snapshot.entries["profiles/main.dcdl"].content,
+  );
+});
+
+Deno.test("config source API preserves unknown read-only builtin diagnostics without fallback requests", async () => {
+  const diagnostic = {
+    path: "main.dcdl",
+    revision: 7,
+    tree_digest: "sha256:tree",
+    kind: "import",
+    span: { start_byte: 8, end_byte: 40 },
+    message:
+      "unknown or non-public read-only builtin source: $builtin/profiles/missing.dcdl",
+    labels: [],
+    notes: [],
+  };
+  const calls: string[] = [];
+  const fetcher = ((input: string | URL | Request) => {
+    calls.push(String(input));
+    return Promise.resolve(
+      response({ error: JSON.stringify([diagnostic]) }, 400),
+    );
+  }) as typeof fetch;
+  const error = await assertRejects(
+    () =>
+      commitConfigTree("w", {
+        base_revision: 7,
+        base_digest: "sha256:tree",
+        changes: [],
+        entrypoints: ["main.dcdl"],
+      }, fetcher),
+    ConfigSourceApiError,
+    diagnostic.message,
+  );
+  assert(String(error).includes("main.dcdl"));
+  assertEquals(calls, ["/api/w/w/config/source-tree/commit"]);
+});
+
 Deno.test("config source API surfaces bounded failed evaluation details", async () => {
   const fetcher = (() =>
     Promise.resolve(
@@ -243,4 +299,42 @@ Deno.test("config source API surfaces bounded failed evaluation details", async 
     message = String(error);
   }
   assert(message.includes("structured diagnostics"));
+});
+
+Deno.test("config source API carries bounded optional authoring schemas without changing validation source", () => {
+  const body = withSchema("validation");
+  const authoringSource = "shape\n".repeat(6000);
+  const contribution = {
+    ...body.contract.schema_bundle.contributions[0],
+    authoring_source: authoringSource,
+  };
+  const withAuthoring = {
+    ...body,
+    contract: {
+      ...body.contract,
+      schema_bundle: {
+        ...body.contract.schema_bundle,
+        contributions: [contribution],
+      },
+    },
+  };
+  const parsed = parseWorkspaceConfigTreeResponse(withAuthoring);
+  assertEquals(
+    parsed.contract.schema_bundle.contributions[0].authoring_source,
+    authoringSource,
+  );
+  assertEquals(parsed.contract.schema_bundle.source, "validation");
+  for (const invalid of [null, 42, {}, "é".repeat(4 * 1024 * 1024) + "x"]) {
+    assertThrows(() =>
+      parseWorkspaceConfigTreeResponse({
+        ...withAuthoring,
+        contract: {
+          ...body.contract,
+          schema_bundle: {
+            ...body.contract.schema_bundle,
+            contributions: [{ ...contribution, authoring_source: invalid }],
+          },
+        },
+      }), ConfigSourceApiError);
+  }
 });

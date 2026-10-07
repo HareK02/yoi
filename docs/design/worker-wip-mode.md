@@ -30,9 +30,9 @@ The implementation uses the crates.io `wip-client`, `wip-protocol`, and `wip-htt
 
 A WIP Worker exposes exactly these generic LLM tools instead of exposing every enabled ordinary tool twice:
 
-- `WipDiscover`: observe an object path and bounded descendants, beginning at `/`.
-- `WipInspect`: fetch the descriptor for an opaque interface reference returned by discovery.
-- `WipCall`: call an operation using fresh object and interface observations.
+- `Discover`: observe an object path and bounded descendants, beginning at `/`.
+- `Inspect`: fetch the descriptor for an opaque interface reference returned by discovery.
+- `Call`: call an operation using fresh object and interface observations.
 
 The compatibility projection mounts enabled ordinary tools at:
 
@@ -46,7 +46,7 @@ Each object has one opaque interface reference:
 yoi.tool/<exact-tool-registration-name>/v1
 ```
 
-Its single operation is `call`. For this compatibility route, `WipCall.arguments` is the original ordinary tool argument object. Native projections instead receive a JSON object keyed by the descriptor's declared parameter names. Native input is decoded with the published `wip-http` descriptor-bound codec, so named and composite types are resolved, an integral JSON number remains a WIP `Number` when declared as such, and WIP `Bytes` use the codec's canonical RFC 4648 base64 JSON representation. Tool argument IDs remain JSON values; the adapter never infers a domain object or Worldspace route from them.
+Its single operation is `call`. For this compatibility route, `Call.arguments` is the original ordinary tool argument object. Native projections instead receive a JSON object keyed by the descriptor's declared parameter names. Native input is decoded with the published `wip-http` descriptor-bound codec, so named and composite types are resolved, an integral JSON number remains a WIP `Number` when declared as such, and WIP `Bytes` use the codec's canonical RFC 4648 base64 JSON representation. Tool argument IDs remain JSON values; the adapter never infers a domain object or Worldspace route from them.
 
 The interface descriptor uses WIP `Json` for compatibility input and includes the exact original JSON Schema in descriptor documentation. Before execution, the Host validates the JSON value with that original schema and then delegates to the original async `Tool`. Constraints are therefore neither approximated nor silently dropped. A schema that cannot be compiled prevents WIP startup instead of creating a weaker projection.
 
@@ -65,7 +65,7 @@ Object resolution and operations are separate contracts. One mounted `WipProject
 - A native projection replaces a compatibility projection either by the original same-route semantic capability or by an explicit registry capability claim owned by a mounted native route.
 - Conflicting native claims fail startup. When native is selected, the claimed compatibility tool is hidden rather than exposed through a second entry. Normal Tool mode is unaffected because it does not install the WIP registry.
 
-`WipInspect` renders the complete effective descriptor, including contributed operations, descriptor-local named declarations, and recursive record, list, enum, and union shapes with required flags and declaration documentation. The tests `host_namespace_object_resolution_and_operation_contributions_are_independent`, `operation_contributions_reject_interface_and_target_conflicts`, and `native_projection_preserves_descriptor_and_decodes_typed_arguments_end_to_end` demonstrate root allocation, unique resolution, contribution merging, collision rejection, current call-time authorization, complete descriptor inspection, and descriptor-typed invocation.
+`Inspect` renders the complete effective descriptor, including contributed operations, descriptor-local named declarations, and recursive record, list, enum, and union shapes with required flags and declaration documentation. The tests `host_namespace_object_resolution_and_operation_contributions_are_independent`, `operation_contributions_reject_interface_and_target_conflicts`, and `native_projection_preserves_descriptor_and_decodes_typed_arguments_end_to_end` demonstrate root allocation, unique resolution, contribution merging, collision rejection, current call-time authorization, complete descriptor inspection, and descriptor-typed invocation.
 
 The built-in native route migration is:
 
@@ -103,13 +103,13 @@ The Worldspace contains only the operations registered from enabled Features and
 
 Filesystem scope, provider Workdir capability checks, Backend Workspace authority, Feature enablement, and input-specific restrictions stay in the original tool implementation and are checked again at invocation. `ask` permissions remain denied fail-closed because the runtime has no approval protocol. The gateway does not mint authority or expose authentication material.
 
-Pre/post Engine history still records one bounded `WipCall` result, while the compatibility result retains the original `ToolOutput`, including attachments and normal Engine output pruning. WIP call audit records retain the route, operation, request identity, and terminal classification.
+Pre/post Engine history still records one bounded `Call` result, while the compatibility result retains the original `ToolOutput`, including attachments and normal Engine output pruning. WIP call audit records retain the route, operation, request identity, and terminal classification.
 
 ## Client lifetime, restoration, and compaction
 
 The stateful `wip-client::Client` is owned by one Worker WIP runtime. Sessions are keyed by the canonical endpoint and an opaque security-context identity derived by the Host from Workspace, Worker, and session identity. Authentication credentials are not included in that identity and are never emitted to descriptors, tool output, or history.
 
-Known Space and interface observations are therefore not shared across Workers, endpoints, or security contexts. A restored Worker creates a new runtime/client and must explore again. `WipDiscover(reset = true)` drops all observations before reconnect/authority-change exploration; `refresh = true` explicitly supersedes one cached observation. A normal compaction keeps the live runtime but the three gateway schemas are supplied again on every LLM request, including the instruction to begin discovery at `/`; the compacted transcript is not treated as cache authority.
+Known Space and interface observations are therefore not shared across Workers, endpoints, or security contexts. A restored Worker creates a new runtime/client and must explore again. `Discover(reset = true)` drops all observations before reconnect/authority-change exploration; `refresh = true` explicitly supersedes one cached observation. A normal compaction keeps the live runtime but the three gateway schemas are supplied again on every LLM request, including the instruction to begin discovery at `/`; the compacted transcript is not treated as cache authority.
 
 Saved Session/history entries remain append-only evidence and are never rewritten or replayed as calls. In particular, historical `/features/<feature>/...` text stays displayable but is not a current route alias. Passing such a legacy path to discovery or call returns `NotFound` with guidance to rediscover from `/`; the Host does not translate it, resolve it under another namespace, or expose old and new routes in parallel.
 

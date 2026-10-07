@@ -12,6 +12,7 @@ pub mod fs_view;
 pub mod hook;
 pub(crate) mod in_flight;
 pub mod ipc;
+pub mod job;
 pub mod model_client;
 mod paste_artifact_tool;
 pub mod prompt;
@@ -24,6 +25,7 @@ pub mod shared_state;
 mod shutdown_after_idle;
 pub mod skill;
 pub mod spawn;
+pub mod subjektiv;
 pub mod wip;
 
 mod internal_worker;

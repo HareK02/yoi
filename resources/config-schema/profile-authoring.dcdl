@@ -1,0 +1,88 @@
+# Editor-only shape of partial Profile values, used for completion and constraint
+# analysis without materialization. Never used as defaults: omitted fields remain
+# omitted until Manifest resolution.
+let
+    Flag = { enabled = Bool; };
+    Model = {
+        ref = String; scheme = String; base_url = String; model_id = String;
+        auth = { kind = String; ref = String; file = String; };
+        capability = Unknown; context_window = Int; max_context_window = Int;
+    };
+    Extraction = {
+        # ReasoningControl accepts string effort or signed integer budget.
+        enabled = Bool; model = Model; reasoning = Unknown;
+        threshold = Int; worker_max_turns = Int;
+    };
+    # Profile scope accepts either a string intent or a table. Decodal 0.4 has
+    # no union range; keep this field opaque to constraint analysis and expose
+    # the table only as a completion hint. This shape is never materialized;
+    # actual scope forms, intent values and table fields are checked on save.
+    Scope = Unknown default { intent = String; deny_write = [...String]; symlink_policy = String; };
+    Profile = {
+        slug = String;
+        description = String;
+        worker = { mode = String; };
+        model = Model;
+        engine = {
+            instruction = String; language = String; reasoning = Unknown;
+            max_tokens = Int; max_turns = Int; temperature = Unknown; top_p = Unknown;
+            top_k = Int; stop_sequences = [...String]; tool_call_dispatch = String;
+            tool_output = { default_max_bytes = Int; per_tool = { ...Int }; };
+            file_upload = { max_bytes = Int; };
+        };
+        scope = Scope;
+        delegation_scope = Scope;
+        session = {
+            record_event_trace = Bool;
+        };
+        permissions = { default_action = String; rule = [...{ tool = String; pattern = String; action = String; }]; };
+        feature = {
+            task = Flag; web = Flag; image = Flag; sub_worker = Flag; flow = Flag;
+            worker = { enabled = Bool; direct_spawn = Bool; };
+            workspace_worker_discovery = Flag; objective = Flag; manage_workdir = Flag;
+            workdir_catalog = Flag; workspace_config = Flag; orchestration = Flag;
+            ticket = { enabled = Bool; authoring = Bool; thread = Bool; intake = Bool; workflow = Bool; };
+            merge_request = { show = Bool; open = Bool; review = Bool; readiness_check = Bool; complete = Bool; };
+            memory = {
+                enabled = Bool; staging_tools = Bool;
+                resident = { inject_summary = Bool; };
+                extraction = Extraction;
+                consolidation = { request_enabled = Bool; };
+            };
+            subjektiv = { enabled = Bool; consolidation_tools = Bool; extraction = Extraction; };
+        };
+        mcp = { stdio_server = [...{
+            name = String; command = String; args = [...String];
+            cwd = { kind = String; path = String; };
+            env = { inherit = [...String]; set = { ...Unknown }; };
+        }]; };
+        compaction = {
+            # Token settings (CompactionConfigPartial) and ratio helper fields.
+            # Threshold/context values accept integer tokens or numeric ratios.
+            kind = String; threshold = Unknown; request_threshold = Unknown;
+            worker_context_max_tokens = Unknown; request = Unknown; worker = Unknown;
+            prune_enabled = Bool; prune_protected_tokens = Int; prune_min_savings = Int;
+            retained_tokens = Int;
+            overview_target_tokens = Int; overview_warning_tokens = Int; overview_deadline_tokens = Int;
+            finish_warning_remaining_tokens = Int; final_reserve_tokens = Int;
+            worker_max_turns = Int; summary_target_tokens = Int; summary_max_tokens = Int;
+            auto_read_budget_tokens = Int; result_context_max_tokens = Int; model = Model;
+            # Supported token aliases remain authorable without rewriting recipes.
+            compact_threshold = Int; compact_request_threshold = Int; compact_retained_tokens = Int;
+            compact_worker_max_input_tokens = Int; compact_worker_max_turns = Int; compact_auto_read_budget = Int;
+        };
+        web = {
+            enabled = Bool; allow_private_addresses = Bool;
+            search = { enabled = Bool; provider = String; api_key_secret = String; timeout_secs = Int; base_url = String; country = String; search_lang = String; ui_lang = String; safesearch = String; };
+            fetch = { enabled = Bool; timeout_secs = Int; redirect_limit = Int; max_response_bytes = Int; max_output_bytes = Int; allow_private_addresses = Bool; };
+        };
+        skills = { directories = [...String]; };
+    };
+in {
+    profile = {
+        default_profile = String;
+        entries = [...{
+            selector = String; profile = Profile; label = String; description = String;
+        }];
+    };
+}

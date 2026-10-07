@@ -41,7 +41,9 @@ pub(crate) struct MemoryStagingOutputState {
 #[derive(Clone)]
 enum MemoryStagingDestination {
     WorkspaceMemory,
-    Subjektiv { session_id: String },
+    Subjektiv {
+        host: crate::subjektiv::SubjektivHostConnection,
+    },
 }
 
 impl MemoryStagingOutputState {
@@ -64,17 +66,19 @@ impl MemoryStagingOutputState {
 
     pub(crate) fn new_subjektiv(
         view: SessionCapture,
-        workspace_client: Arc<dyn WorkspaceClient>,
+        host: crate::subjektiv::SubjektivHostConnection,
         source: SourceRef,
         extract_run_id: String,
-        session_id: String,
     ) -> Self {
         Self {
             view: Arc::new(view),
-            workspace_client,
+            workspace_client: crate::unavailable_workspace_client(
+                None,
+                "subjektiv Host has no legacy Memory authority",
+            ),
             source,
             extract_run_id,
-            destination: MemoryStagingDestination::Subjektiv { session_id },
+            destination: MemoryStagingDestination::Subjektiv { host },
             staged: Arc::new(Mutex::new(Vec::new())),
             finished: Arc::new(Mutex::new(None)),
         }
@@ -263,35 +267,11 @@ impl Tool for StageMemoryCandidateTool {
                     }
                 }
             }
-            MemoryStagingDestination::Subjektiv { session_id } => {
-                let response = self
-                    .state
-                    .workspace_client
-                    .execute_server_operation(
-                        crate::worker::WorkspaceServerOperation::SubjektivStageCandidate(
-                            server_api::SubjektivStageCandidateRequest {
-                                session_id: session_id.clone(),
-                                operation,
-                            },
-                        ),
-                    )
-                    .map_err(|error| {
-                        ToolError::ExecutionFailed(format!(
-                            "write subjektiv staging failed: {error}"
-                        ))
-                    })?;
-                if !response.is_success() {
-                    return Err(ToolError::ExecutionFailed(format!(
-                        "write subjektiv staging returned HTTP {}: {}",
-                        response.status, response.body
-                    )));
-                }
-                let output: server_api::SubjektivStageCandidateResponse =
-                    serde_json::from_str(&response.body).map_err(|error| {
-                        ToolError::ExecutionFailed(format!(
-                            "decode subjektiv staging response: {error}"
-                        ))
-                    })?;
+            MemoryStagingDestination::Subjektiv { host } => {
+                let output = host
+                    .host
+                    .stage_candidate(&host.context, operation)
+                    .map_err(ToolError::from)?;
                 vec![output.staging_id]
             }
         };
@@ -607,13 +587,16 @@ mod tests {
         let client = Arc::new(RecordingSubjektivClient::default());
         let state = MemoryStagingOutputState::new_subjektiv(
             SessionCapture::new("segment-1", vec![Item::user_message("durable decision")]),
-            client.clone(),
+            {
+                let mut host = crate::subjektiv::test_connection(client.clone());
+                host.context.session_id = "session-committed".into();
+                host
+            },
             SourceRef {
                 segment_id: "segment-1".to_string(),
                 range: [0, 0],
             },
             "run-1".to_string(),
-            "session-committed".to_string(),
         );
         let tool = StageMemoryCandidateTool {
             state: state.clone(),

@@ -87,6 +87,9 @@ pub struct StandaloneWorkerRecord {
     pub storage_key: String,
     pub cwd: StandaloneCwdIdentity,
     pub manifest: WorkerManifest,
+    /// Original explicit local Subject/storage binding; never inferred from policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<crate::subjektiv::StandaloneSubjectBinding>,
     pub active_session_id: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_segment_id: Option<SegmentId>,
@@ -127,6 +130,16 @@ impl StandaloneWorkerStore {
         Ok(Self { root })
     }
 
+    /// Observational constructor: never creates a missing root or repairs state.
+    pub fn open_existing(root: impl Into<PathBuf>) -> Result<Self, StandaloneStoreError> {
+        let root = root.into();
+        let metadata = fs::symlink_metadata(&root).map_err(StandaloneStoreError::Io)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(StandaloneStoreError::NotDirectory);
+        }
+        Ok(Self { root })
+    }
+
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
@@ -159,6 +172,25 @@ impl StandaloneWorkerStore {
         active_session_id: SessionId,
         active_segment_id: Option<SegmentId>,
     ) -> Result<StandaloneWorkerRecord, StandaloneStoreError> {
+        self.commit_created_connected(
+            allocation,
+            manifest,
+            storage_key,
+            active_session_id,
+            active_segment_id,
+            None,
+        )
+    }
+
+    pub(crate) fn commit_created_connected(
+        &self,
+        allocation: &StandaloneWorkerAllocation,
+        manifest: WorkerManifest,
+        storage_key: String,
+        active_session_id: SessionId,
+        active_segment_id: Option<SegmentId>,
+        subject: Option<crate::subjektiv::StandaloneSubjectBinding>,
+    ) -> Result<StandaloneWorkerRecord, StandaloneStoreError> {
         let now = now_unix_ms()?;
         let record = StandaloneWorkerRecord {
             schema_version: SCHEMA_VERSION,
@@ -168,6 +200,7 @@ impl StandaloneWorkerStore {
             storage_key,
             cwd: allocation.cwd.clone(),
             manifest,
+            subject,
             active_session_id,
             active_segment_id,
             status: StandaloneWorkerStatus::Active,
@@ -352,6 +385,10 @@ impl StandaloneWorkerStore {
     }
 
     #[must_use]
+    pub(crate) fn jobs_path(&self, id: WorkerId) -> PathBuf {
+        self.worker_dir(id).join("jobs.sqlite3")
+    }
+
     pub(crate) fn runtime_dir(&self, id: WorkerId) -> PathBuf {
         self.worker_dir(id).join("runtime")
     }
@@ -789,6 +826,7 @@ permission = "write"
                 inode: None,
             },
             manifest,
+            subject: None,
             active_session_id: "01a05782-d5dd-78f1-b9cd-ce37535bdb9e".parse().unwrap(),
             active_segment_id: None,
             status: StandaloneWorkerStatus::Stopped,

@@ -237,6 +237,10 @@ export type ConfigSchemaContribution = {
   version: string;
   source: string;
   projection_validator?: ConfigProjectionValidator;
+  /**
+   * Completion-only shape for partial values; never materialized as defaults.
+   */
+  authoring_source?: string;
   source_digest: string;
 };
 

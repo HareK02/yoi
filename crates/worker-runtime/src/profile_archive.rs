@@ -125,6 +125,51 @@ pub struct ProfileSourceArchiveInput {
 
 impl ProfileSourceArchive {
     pub fn build(input: ProfileSourceArchiveInput) -> Result<Self, ProfileArchiveError> {
+        Self::build_with_source_format(input, "decodal", "text/x-decodal")
+    }
+
+    /// Archive an already evaluated Profile value without Decodal evaluation or conversion.
+    pub fn build_evaluated_profile(
+        id: String,
+        selector: String,
+        value: serde_json::Value,
+    ) -> Result<Self, ProfileArchiveError> {
+        Self::build_evaluated_profile_with_builtin_sources(id, selector, value, BTreeMap::new())
+    }
+
+    /// Seal the observed builtin import closure as provenance alongside the evaluated JSON.
+    /// Builtin sources are verified, but never evaluated to resolve this entrypoint.
+    pub fn build_evaluated_profile_with_builtin_sources(
+        id: String,
+        selector: String,
+        value: serde_json::Value,
+        sources: BTreeMap<String, String>,
+    ) -> Result<Self, ProfileArchiveError> {
+        for key in sources.keys() {
+            validate_builtin_source_key(key)?;
+        }
+        let path = "profiles/evaluated.json".to_string();
+        let source = serde_json::to_string(&value)
+            .map_err(|err| ProfileArchiveError::Json(err.to_string()))?;
+        let mut sources = sources;
+        sources.insert(path.clone(), source);
+        Self::build_with_source_format(
+            ProfileSourceArchiveInput {
+                id,
+                entrypoints: BTreeMap::from([(selector, path)]),
+                imports: BTreeMap::new(),
+                sources,
+            },
+            "json",
+            "application/json",
+        )
+    }
+
+    fn build_with_source_format(
+        input: ProfileSourceArchiveInput,
+        kind: &str,
+        content_type: &str,
+    ) -> Result<Self, ProfileArchiveError> {
         if input.sources.len() > MAX_SOURCES {
             return Err(ProfileArchiveError::LimitExceeded("source count"));
         }
@@ -142,11 +187,17 @@ impl ProfileSourceArchive {
             if total_source_bytes > MAX_TOTAL_BYTES {
                 return Err(ProfileArchiveError::LimitExceeded("total source bytes"));
             }
+            let (kind, content_type) = if path.starts_with("$builtin/") {
+                validate_builtin_source_key(path)?;
+                ("decodal", "text/x-decodal")
+            } else {
+                (kind, content_type)
+            };
             source_meta.push(ProfileSourceArchiveSource {
                 path: path.clone(),
                 source_key: path.clone(),
-                kind: "decodal".to_string(),
-                content_type: default_decodal_content_type(),
+                kind: kind.to_string(),
+                content_type: content_type.to_string(),
                 digest: sha256_hex(source.as_bytes()),
                 size_bytes: size,
             });
@@ -281,14 +332,35 @@ impl VerifiedProfileSourceArchive {
         let mut manifest_paths = BTreeSet::new();
         for source in &manifest.sources {
             validate_archive_path(&source.path)?;
-            if !source.source_key.is_empty() && source.source_key != source.path {
+            if source.path.starts_with("$builtin/") {
+                validate_builtin_source_key(&source.path)?;
+                if source.kind != "decodal" {
+                    return Err(ProfileArchiveError::UnsupportedSource {
+                        path: source.path.clone(),
+                        kind: source.kind.clone(),
+                    });
+                }
+            }
+            if (source.path.starts_with("$builtin/") || !source.source_key.is_empty())
+                && source.source_key != source.path
+            {
                 return Err(ProfileArchiveError::ImportMapMismatch {
                     specifier: source.path.clone(),
                     expected: source.path.clone(),
                     actual: source.source_key.clone(),
                 });
             }
-            if source.content_type != default_decodal_content_type() {
+            let expected_content_type = match source.kind.as_str() {
+                "decodal" => "text/x-decodal",
+                "json" => "application/json",
+                _ => {
+                    return Err(ProfileArchiveError::UnsupportedSource {
+                        path: source.path.clone(),
+                        kind: source.kind.clone(),
+                    });
+                }
+            };
+            if source.content_type != expected_content_type {
                 return Err(ProfileArchiveError::UnsupportedSource {
                     path: source.path.clone(),
                     kind: source.content_type.clone(),
@@ -296,12 +368,6 @@ impl VerifiedProfileSourceArchive {
             }
             if !manifest_paths.insert(source.path.clone()) {
                 return Err(ProfileArchiveError::DuplicateSource(source.path.clone()));
-            }
-            if source.kind != "decodal" {
-                return Err(ProfileArchiveError::UnsupportedSource {
-                    path: source.path.clone(),
-                    kind: source.kind.clone(),
-                });
             }
             let content = entries
                 .get(&source.path)
@@ -373,30 +439,50 @@ impl VerifiedProfileSourceArchive {
             .entrypoints
             .get(selector)
             .ok_or_else(|| ProfileArchiveError::MissingEntrypoint(selector.to_string()))?;
-        let mut engine = Engine::new(ArchiveSourceLoader { archive: self });
         let source = self
             .sources
             .get(path)
             .ok_or_else(|| ProfileArchiveError::MissingSource(path.clone()))?;
-        let module = engine.add_root_source(path, path, source).map_err(|err| {
-            ProfileArchiveError::Decodal {
-                path: path.clone(),
-                message: format!("{err:?}"),
+        let metadata = self
+            .manifest
+            .sources
+            .iter()
+            .find(|source| &source.path == path)
+            .ok_or_else(|| ProfileArchiveError::MissingSource(path.clone()))?;
+        let json = match metadata.kind.as_str() {
+            "json" => serde_json::from_str(source)
+                .map_err(|err| ProfileArchiveError::Json(err.to_string()))?,
+            "decodal" => {
+                let mut engine = Engine::new(ArchiveSourceLoader { archive: self });
+                let module = engine.add_root_source(path, path, source).map_err(|err| {
+                    ProfileArchiveError::Decodal {
+                        path: path.clone(),
+                        message: format!("{err:?}"),
+                    }
+                })?;
+                let value =
+                    engine
+                        .eval_module(module)
+                        .map_err(|err| ProfileArchiveError::Decodal {
+                            path: path.clone(),
+                            message: format!("{err:?}"),
+                        })?;
+                let data =
+                    engine
+                        .materialize(&value)
+                        .map_err(|err| ProfileArchiveError::Decodal {
+                            path: path.clone(),
+                            message: format!("{err:?}"),
+                        })?;
+                decodal_data_to_json(&data)
             }
-        })?;
-        let value = engine
-            .eval_module(module)
-            .map_err(|err| ProfileArchiveError::Decodal {
-                path: path.clone(),
-                message: format!("{err:?}"),
-            })?;
-        let data = engine
-            .materialize(&value)
-            .map_err(|err| ProfileArchiveError::Decodal {
-                path: path.clone(),
-                message: format!("{err:?}"),
-            })?;
-        let json = decodal_data_to_json(&data);
+            _ => {
+                return Err(ProfileArchiveError::UnsupportedSource {
+                    path: path.clone(),
+                    kind: metadata.kind.clone(),
+                });
+            }
+        };
         let resolved = resolve_profile_artifact_value(
             json,
             ProfileSource::Archive {
@@ -609,6 +695,26 @@ fn append_bytes<W: Write>(
         .map_err(|err| ProfileArchiveError::Io(err.to_string()))
 }
 
+fn validate_builtin_source_key(key: &str) -> Result<(), ProfileArchiveError> {
+    validate_archive_path(key)?;
+    let Some(relative) = key.strip_prefix("$builtin/profiles/") else {
+        return Err(ProfileArchiveError::UnsafePath(key.to_string()));
+    };
+    if !relative.ends_with(".dcdl")
+        || relative.split('/').any(|part| {
+            part.is_empty()
+                || part == "."
+                || part == ".."
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        })
+    {
+        return Err(ProfileArchiveError::UnsafePath(key.to_string()));
+    }
+    Ok(())
+}
+
 fn validate_archive_path(path: &str) -> Result<(), ProfileArchiveError> {
     if path.is_empty() || path == MANIFEST_PATH {
         return if path == MANIFEST_PATH {
@@ -672,6 +778,320 @@ mod tests {
             sources,
         })
         .unwrap()
+    }
+
+    fn evaluated_profile() -> serde_json::Value {
+        serde_json::json!({
+            "slug": "evaluated",
+            "description": "Evaluated profile",
+            "scope": "workspace_read",
+            "worker": { "mode": "wip" },
+            "feature": {
+                "task": { "enabled": true },
+                "memory": { "enabled": true },
+                "sub_worker": { "enabled": true }
+            }
+        })
+    }
+
+    fn evaluated_archive() -> ProfileSourceArchive {
+        ProfileSourceArchive::build_evaluated_profile(
+            "evaluated-archive".to_string(),
+            "project:evaluated".to_string(),
+            evaluated_profile(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn evaluated_json_preserves_explicit_worker_mode_and_features() {
+        let archive = evaluated_archive();
+        let verified = archive.verify().unwrap();
+        let source = &verified.manifest().sources[0];
+        assert_eq!(source.kind, "json");
+        assert_eq!(source.content_type, "application/json");
+        assert_eq!(verified.manifest().imports.len(), 0);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&verified.sources[&source.path]).unwrap(),
+            evaluated_profile()
+        );
+        let root = tempfile::tempdir().unwrap();
+        let manifest = verified
+            .resolve_profile("project:evaluated", root.path(), "evaluated-worker")
+            .unwrap();
+        let json = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(manifest.worker.name, "evaluated-worker");
+        assert_eq!(json["worker"]["mode"], "wip");
+        assert_eq!(json["feature"]["task"]["enabled"], true);
+        assert_eq!(json["feature"]["memory"]["profile"]["enabled"], true);
+        assert_eq!(json["feature"]["sub_worker"]["enabled"], true);
+    }
+
+    // Recompute the outer digest so verification reaches the source-level checks.
+    fn repack_archive(
+        archive: &mut ProfileSourceArchive,
+        manifest: &ProfileSourceArchiveManifest,
+        sources: &BTreeMap<String, String>,
+    ) {
+        let mut content = Vec::new();
+        {
+            let mut builder = Builder::new(&mut content);
+            append_bytes(
+                &mut builder,
+                MANIFEST_PATH,
+                &serde_json::to_vec(manifest).unwrap(),
+            )
+            .unwrap();
+            for (path, source) in sources {
+                append_bytes(&mut builder, path, source.as_bytes()).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        archive.reference.digest = sha256_hex(&content);
+        archive.reference.size_bytes = content.len() as u64;
+        archive.content = content;
+    }
+
+    fn builtin_provenance_archive() -> ProfileSourceArchive {
+        ProfileSourceArchive::build_evaluated_profile_with_builtin_sources(
+            "builtin-provenance".into(),
+            "project:evaluated".into(),
+            evaluated_profile(),
+            BTreeMap::from([
+                (
+                    "$builtin/profiles/companion.dcdl".into(),
+                    "import \"./base.dcdl\"".into(),
+                ),
+                // Intentionally invalid Decodal: provenance must not be reevaluated.
+                (
+                    "$builtin/profiles/base.dcdl".into(),
+                    "not valid Decodal !".into(),
+                ),
+            ]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn evaluated_json_seals_builtin_closure_without_runtime_evaluation() {
+        let archive = builtin_provenance_archive();
+        let verified = archive.verify().unwrap();
+        assert_eq!(
+            archive,
+            builtin_provenance_archive(),
+            "archive must be deterministic"
+        );
+        assert_eq!(archive.reference.source_graph.source_count, 3);
+        assert!(verified.manifest.imports.is_empty());
+        assert_eq!(
+            verified.manifest.entrypoints["project:evaluated"],
+            "profiles/evaluated.json"
+        );
+        for source in &verified.manifest.sources {
+            assert_eq!(source.source_key, source.path);
+            assert_eq!(
+                source.digest,
+                sha256_hex(verified.sources[&source.path].as_bytes())
+            );
+            if source.path.starts_with("$builtin/") {
+                assert_eq!(source.kind, "decodal");
+                assert_eq!(source.content_type, "text/x-decodal");
+            } else {
+                assert_eq!(source.kind, "json");
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let resolved = verified
+            .resolve_profile("project:evaluated", root.path(), "sealed-worker")
+            .unwrap();
+        assert_eq!(resolved.worker.mode, manifest::WorkerMode::Wip);
+        assert!(resolved.feature.task.enabled);
+        assert!(matches!(
+            verified.resolve_profile("builtin:companion", root.path(), "sealed-worker"),
+            Err(ProfileArchiveError::MissingEntrypoint(_))
+        ));
+    }
+
+    #[test]
+    fn evaluated_json_rejects_missing_or_corrupt_builtin_dependency() {
+        for missing in [true, false] {
+            let mut archive = builtin_provenance_archive();
+            let mut verified = archive.verify().unwrap();
+            let path = "$builtin/profiles/base.dcdl";
+            if missing {
+                verified.sources.remove(path);
+            } else {
+                verified
+                    .sources
+                    .insert(path.into(), "corrupt dependency".into());
+            }
+            repack_archive(&mut archive, &verified.manifest, &verified.sources);
+            match archive.verify().unwrap_err() {
+                ProfileArchiveError::MissingSource(actual) if missing => assert_eq!(actual, path),
+                ProfileArchiveError::SourceDigestMismatch { path: actual, .. } if !missing => {
+                    assert_eq!(actual, path)
+                }
+                other => panic!("unexpected error: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn evaluated_json_builtin_provenance_rejects_unsafe_keys_and_reuses_limits() {
+        for key in [
+            "profiles/companion.dcdl",
+            "builtin:profiles/companion.dcdl",
+            "$builtin/prompts/companion.dcdl",
+            "$builtin/profiles/../escape.dcdl",
+            "$builtin/profiles/./base.dcdl",
+            "$builtin/profiles//base.dcdl",
+            "$builtin/profiles/base\\other.dcdl",
+            "$builtin/profiles/base\0.dcdl",
+            "/$builtin/profiles/base.dcdl",
+            "$builtin/profiles/base.json",
+            "profiles/evaluated.json",
+        ] {
+            assert!(
+                matches!(
+                    ProfileSourceArchive::build_evaluated_profile_with_builtin_sources(
+                        "unsafe".into(),
+                        "project:evaluated".into(),
+                        evaluated_profile(),
+                        BTreeMap::from([(key.into(), "{}".into())]),
+                    ),
+                    Err(ProfileArchiveError::UnsafePath(_))
+                ),
+                "{key:?}"
+            );
+        }
+        assert!(matches!(
+            ProfileSourceArchive::build_evaluated_profile_with_builtin_sources(
+                "oversized".into(),
+                "project:evaluated".into(),
+                evaluated_profile(),
+                BTreeMap::from([(
+                    "$builtin/profiles/base.dcdl".into(),
+                    "x".repeat(MAX_SOURCE_BYTES as usize + 1)
+                )]),
+            ),
+            Err(ProfileArchiveError::LimitExceeded("source bytes"))
+        ));
+    }
+
+    #[test]
+    fn evaluated_json_builtin_provenance_requires_canonical_key_and_source_format() {
+        for key in ["", "profiles/base.dcdl", "$builtin/profiles/other.dcdl"] {
+            let mut archive = builtin_provenance_archive();
+            let mut verified = archive.verify().unwrap();
+            verified.manifest.sources[0].source_key = key.into();
+            repack_archive(&mut archive, &verified.manifest, &verified.sources);
+            assert!(matches!(
+                archive.verify(),
+                Err(ProfileArchiveError::ImportMapMismatch { .. })
+            ));
+        }
+        let mut archive = builtin_provenance_archive();
+        let mut verified = archive.verify().unwrap();
+        verified.manifest.sources[0].kind = "json".into();
+        verified.manifest.sources[0].content_type = "application/json".into();
+        repack_archive(&mut archive, &verified.manifest, &verified.sources);
+        assert!(matches!(
+            archive.verify(),
+            Err(ProfileArchiveError::UnsupportedSource { .. })
+        ));
+    }
+
+    #[test]
+    fn evaluated_json_reuses_source_size_limit() {
+        assert!(matches!(
+            ProfileSourceArchive::build_evaluated_profile(
+                "oversized".to_string(),
+                "default".to_string(),
+                serde_json::Value::String("x".repeat(MAX_SOURCE_BYTES as usize)),
+            ),
+            Err(ProfileArchiveError::LimitExceeded("source bytes"))
+        ));
+    }
+
+    #[test]
+    fn evaluated_json_rejects_archive_and_source_tampering() {
+        let mut archive = evaluated_archive();
+        archive.content[0] ^= 1;
+        assert!(matches!(
+            archive.verify(),
+            Err(ProfileArchiveError::ArchiveDigestMismatch { .. })
+        ));
+
+        let mut archive = evaluated_archive();
+        let mut verified = archive.verify().unwrap();
+        let path = verified.manifest.sources[0].path.clone();
+        verified
+            .sources
+            .get_mut(&path)
+            .unwrap()
+            .replace_range(0..1, "[");
+        repack_archive(&mut archive, &verified.manifest, &verified.sources);
+        assert!(matches!(
+            archive.verify(),
+            Err(ProfileArchiveError::SourceDigestMismatch { path: actual, .. }) if actual == path
+        ));
+    }
+
+    #[test]
+    fn evaluated_json_requires_matching_source_kind_and_content_type() {
+        for (kind, content_type) in [
+            ("json", "text/x-decodal"),
+            ("decodal", "application/json"),
+            ("unknown", "application/json"),
+        ] {
+            let mut archive = evaluated_archive();
+            let mut verified = archive.verify().unwrap();
+            verified.manifest.sources[0].kind = kind.to_string();
+            verified.manifest.sources[0].content_type = content_type.to_string();
+            repack_archive(&mut archive, &verified.manifest, &verified.sources);
+            assert!(matches!(
+                archive.verify(),
+                Err(ProfileArchiveError::UnsupportedSource { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn evaluated_json_does_not_fallback_to_filesystem_or_default() {
+        let root = tempfile::tempdir().unwrap();
+        let profiles = root.path().join("profiles");
+        std::fs::create_dir(&profiles).unwrap();
+        let local_profile = profiles.join("evaluated.json");
+        std::fs::write(
+            &local_profile,
+            serde_json::to_vec(&evaluated_profile()).unwrap(),
+        )
+        .unwrap();
+        let verified = evaluated_archive().verify().unwrap();
+        for selector in [
+            "default",
+            "profiles/evaluated.json",
+            local_profile.to_str().unwrap(),
+        ] {
+            assert!(matches!(
+                verified.resolve_profile(selector, root.path(), "evaluated-worker"),
+                Err(ProfileArchiveError::MissingEntrypoint(actual)) if actual == selector
+            ));
+        }
+
+        // A valid local file must not rescue an invalid archived Profile value either.
+        let invalid = ProfileSourceArchive::build_evaluated_profile(
+            "invalid".to_string(),
+            "project:evaluated".to_string(),
+            serde_json::json!({ "not_a_profile_field": true }),
+        )
+        .unwrap()
+        .verify()
+        .unwrap();
+        assert!(matches!(
+            invalid.resolve_profile("project:evaluated", root.path(), "evaluated-worker"),
+            Err(ProfileArchiveError::Profile { .. })
+        ));
     }
 
     #[test]

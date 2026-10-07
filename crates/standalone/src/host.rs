@@ -43,12 +43,16 @@ pub struct StandaloneHost {
     worker_store: FsWorkerStore,
     record: StandaloneWorkerRecord,
     lease: Option<StandaloneWorkerLease>,
+    jobs: crate::jobs::StandaloneJobs,
+    subject: Option<crate::subjektiv::SubjectConnection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum StandaloneStartupError {
     #[error("the standalone state store could not be opened or validated")]
     StateStore,
+    #[error("local Subject connection rejected: {0}")]
+    Subject(String),
     #[error("the standalone Worker is already active")]
     WorkerActive,
     #[error("the standalone Worker lease cannot be observed safely; recovery is rejected")]
@@ -77,6 +81,8 @@ pub enum StandaloneStartupError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum StandaloneShutdownError {
+    #[error("standalone Job execution cleanup or terminal persistence could not be confirmed")]
+    JobCleanup,
     #[error("the standalone Worker did not stop before the shutdown deadline")]
     DeadlineExceeded,
     #[error("the standalone Worker shutdown confirmation was lost")]
@@ -104,13 +110,66 @@ impl StandaloneHost {
         launch: ResolvedStandaloneLaunch,
         model_client: Option<Box<dyn LlmClient>>,
     ) -> Result<Self, StandaloneStartupError> {
+        if launch.subject_id.is_some()
+            && (!launch.profile.manifest.feature.subjektiv.profile.enabled
+                || launch
+                    .profile
+                    .manifest
+                    .feature
+                    .subjektiv
+                    .profile
+                    .consolidation_tools
+                || launch
+                    .profile
+                    .manifest
+                    .feature
+                    .subjektiv
+                    .workspace_settings
+                    .is_some())
+        {
+            return Err(StandaloneStartupError::Subject(
+                "incompatible local Subject policy".into(),
+            ));
+        }
         let store =
             StandaloneWorkerStore::open(&launch.state_dir).map_err(classify_store_startup_error)?;
         let allocation = store
             .allocate(&launch.cwd, StaleLeasePolicy::Reject)
             .map_err(classify_store_startup_error)?;
         let worker_id = allocation.worker_id();
+        let mut subject = match launch
+            .subject_id
+            .as_deref()
+            .map(|id| {
+                crate::subjektiv::StandaloneSubjects::open_existing(&launch.state_dir)?
+                    .connect(id, worker_id)
+            })
+            .transpose()
+        {
+            Ok(subject) => subject,
+            Err(error) => {
+                let _ = store.abandon_allocation(allocation);
+                return Err(StandaloneStartupError::Subject(error.to_string()));
+            }
+        };
+        let jobs_path = subject
+            .as_ref()
+            .map(|s| s.jobs_path.clone())
+            .unwrap_or_else(|| store.jobs_path(worker_id));
+        let jobs = match crate::jobs::StandaloneJobs::open(&jobs_path, launch.cwd.clone()) {
+            Ok(jobs) => jobs,
+            Err(_) => {
+                let _ = store.abandon_allocation(allocation);
+                return Err(StandaloneStartupError::StateStore);
+            }
+        };
 
+        if let Some(client) = &model_client {
+            jobs.bind_model_client(client.clone_boxed());
+        }
+        if let Some(subject) = &subject {
+            subject.host.bind_jobs(jobs.clone())?;
+        }
         // WorkerId is the stable identity. The current Worker store remains
         // name-keyed, so keep its derived storage key separate from the
         // user-facing profile name.
@@ -143,8 +202,14 @@ impl StandaloneHost {
             },
             WorkerControllerTransport::InProcess,
         );
+        if let Some(subject) = &subject {
+            bootstrap = bootstrap.with_subjektiv_host(subject.host.clone());
+        }
         if let Some(model_client) = model_client {
             bootstrap = bootstrap.with_model_client(model_client);
+        }
+        if let Some(subject) = &mut subject {
+            subject.arm();
         }
         let started = match bootstrap.start().await {
             Ok(started) => started,
@@ -161,12 +226,13 @@ impl StandaloneHost {
                 return Err(error);
             }
         };
-        let record = match store.commit_created(
+        let record = match store.commit_created_connected(
             &allocation,
             manifest,
             storage_key,
             active.session_id,
             active.segment_id,
+            subject.as_ref().map(|s| s.binding.clone()),
         ) {
             Ok(record) => record,
             Err(_) => {
@@ -181,6 +247,8 @@ impl StandaloneHost {
             worker_store,
             record,
             allocation.into_lease(),
+            jobs,
+            subject,
         ))
     }
 
@@ -216,6 +284,50 @@ impl StandaloneHost {
         let lease = store
             .acquire_lease(worker_id, StaleLeasePolicy::Recover)
             .map_err(classify_store_startup_error)?;
+        let mut subject = record
+            .subject
+            .as_ref()
+            .map(|binding| {
+                if !record.manifest.feature.subjektiv.profile.enabled
+                    || record
+                        .manifest
+                        .feature
+                        .subjektiv
+                        .profile
+                        .consolidation_tools
+                    || record
+                        .manifest
+                        .feature
+                        .subjektiv
+                        .workspace_settings
+                        .is_some()
+                {
+                    return Err(crate::subjektiv::SubjectError::InvalidScope(
+                        "persisted Subject policy changed".into(),
+                    ));
+                }
+                let catalog = crate::subjektiv::StandaloneSubjects::open_existing(store.root())?;
+                if catalog.scope_id() != binding.scope_id {
+                    return Err(crate::subjektiv::SubjectError::InvalidScope(
+                        "persisted local storage scope changed".into(),
+                    ));
+                }
+                catalog.connect(&binding.subject_id, worker_id)
+            })
+            .transpose()
+            .map_err(|e| StandaloneStartupError::Subject(e.to_string()))?;
+        let jobs_path = subject
+            .as_ref()
+            .map(|s| s.jobs_path.clone())
+            .unwrap_or_else(|| store.jobs_path(worker_id));
+        let jobs = crate::jobs::StandaloneJobs::open(&jobs_path, record.cwd.canonical_path.clone())
+            .map_err(|_| StandaloneStartupError::StateStore)?;
+        if let Some(client) = &model_client {
+            jobs.bind_model_client(client.clone_boxed());
+        }
+        if let Some(subject) = &subject {
+            subject.host.bind_jobs(jobs.clone())?;
+        }
         let (backing_store, worker_store) = backing_store(&store, worker_id)?;
         let storage_key = record.storage_key.clone();
         let mut manifest = record.manifest.clone();
@@ -240,6 +352,9 @@ impl StandaloneHost {
             },
             WorkerControllerTransport::InProcess,
         );
+        if let Some(subject) = &subject {
+            bootstrap = bootstrap.with_subjektiv_host(subject.host.clone());
+        }
         if let Some(model_client) = model_client {
             bootstrap = bootstrap.with_model_client(model_client);
         }
@@ -247,6 +362,9 @@ impl StandaloneHost {
             .prepare_restored(&storage_key)
             .await
             .map_err(classify_startup_error)?;
+        if let Some(subject) = &mut subject {
+            subject.arm();
+        }
         let started = prepared.start().await.map_err(classify_startup_error)?;
         let active = match active_pointer(&worker_store, &storage_key) {
             Ok(active) => active,
@@ -270,6 +388,8 @@ impl StandaloneHost {
             worker_store,
             record,
             lease,
+            jobs,
+            subject,
         ))
     }
 
@@ -279,7 +399,12 @@ impl StandaloneHost {
         worker_store: FsWorkerStore,
         record: StandaloneWorkerRecord,
         lease: StandaloneWorkerLease,
+        jobs: crate::jobs::StandaloneJobs,
+        subject: Option<crate::subjektiv::SubjectConnection>,
     ) -> Self {
+        if let Some(connection) = &subject {
+            connection.host.recover_jobs();
+        }
         Self {
             handle: started.handle,
             shutdown: Some(started.shutdown),
@@ -288,7 +413,15 @@ impl StandaloneHost {
             worker_store,
             record,
             lease: Some(lease),
+            jobs,
+            subject,
         }
+    }
+
+    /// Explicit Host execution capability for local Features, separate from the
+    /// interactive Worker protocol and its model-created SubWorkers.
+    pub fn jobs(&self) -> crate::jobs::StandaloneJobs {
+        self.jobs.clone()
     }
 
     #[must_use]
@@ -318,6 +451,7 @@ impl StandaloneHost {
     }
 
     pub async fn shutdown(mut self) -> Result<(), StandaloneShutdownError> {
+        let jobs_result = self.jobs.shutdown().await;
         let command = protocol::WorkerCommandEnvelope::new(u64::MAX);
         let _ = self.handle.send(Method::Shutdown { command }).await;
         let Some(shutdown) = self.shutdown.take() else {
@@ -334,6 +468,10 @@ impl StandaloneHost {
                 self.retain_lease();
                 return Err(StandaloneShutdownError::DeadlineExceeded);
             }
+        }
+        if jobs_result.is_err() {
+            self.retain_lease();
+            return Err(StandaloneShutdownError::JobCleanup);
         }
         let active = match active_pointer(&self.worker_store, &self.record.storage_key) {
             Ok(active) => active,
@@ -355,6 +493,12 @@ impl StandaloneHost {
             self.retain_lease();
             return Err(StandaloneShutdownError::StateStore);
         }
+        if let Some(subject) = &mut self.subject {
+            if subject.close().is_err() {
+                self.retain_lease();
+                return Err(StandaloneShutdownError::StateStore);
+            }
+        }
         if let Some(lease) = self.lease.take() {
             lease
                 .release()
@@ -364,9 +508,67 @@ impl StandaloneHost {
     }
 
     fn retain_lease(&mut self) {
+        if let Some(subject) = &mut self.subject {
+            subject.retain();
+        }
         if let Some(lease) = self.lease.take() {
             lease.retain();
         }
+    }
+}
+
+impl Drop for StandaloneHost {
+    fn drop(&mut self) {
+        self.jobs.close();
+        // A dropped Host cannot synchronously confirm either controller or Job
+        // cleanup. Keep its lease until explicit shutdown or process recovery,
+        // preventing another Host from reopening a still-live execution store.
+        self.retain_lease();
+    }
+}
+
+// The in-process channel is owned by the local operator's Host, not an
+// arbitrary socket or Backend account. decode_method discards wire provenance;
+// only this boundary can stamp accepted local human input.
+fn authorize_local_input(method: protocol::Method) -> protocol::Method {
+    use protocol::{AuthenticatedInputSource, Method};
+    match method {
+        Method::Submit {
+            submission_request_id,
+            input,
+        }
+        | Method::SubmitTracked {
+            submission_request_id,
+            input,
+            ..
+        } => Method::SubmitTracked {
+            submission_request_id,
+            input,
+            source: AuthenticatedInputSource::LocalOperator,
+        },
+        Method::SubmitIfIdle {
+            submission_request_id,
+            input,
+            ..
+        } => Method::SubmitIfIdle {
+            submission_request_id,
+            input,
+            source: AuthenticatedInputSource::LocalOperator,
+        },
+        Method::Notify {
+            notification_request_id,
+            message,
+        }
+        | Method::NotifyTracked {
+            notification_request_id,
+            message,
+            ..
+        } => Method::NotifyTracked {
+            notification_request_id,
+            message,
+            source: AuthenticatedInputSource::LocalOperator,
+        },
+        method => method,
     }
 }
 
@@ -395,6 +597,7 @@ async fn run_protocol_session(
                 let Ok(method) = decode_method(&message) else {
                     return;
                 };
+                let method = authorize_local_input(method);
                 if let Some(event) = dispatch_worker_protocol_method(&handle, method).await
                     && !send_protocol_event(&peer, event).await
                 {
@@ -535,6 +738,9 @@ fn classify_startup_error(error: WorkerBootstrapError) -> StandaloneStartupError
         WorkerBootstrapError::Worker(WorkerError::Provider(_)) => {
             StandaloneStartupError::ModelProvider
         }
+        WorkerBootstrapError::Worker(WorkerError::SubjektivSessionAttribution {
+            message, ..
+        }) => StandaloneStartupError::Subject(message),
         WorkerBootstrapError::Worker(_) => StandaloneStartupError::WorkerConfiguration,
         WorkerBootstrapError::Controller { source, .. }
             if source.kind() == std::io::ErrorKind::Other =>
@@ -542,5 +748,51 @@ fn classify_startup_error(error: WorkerBootstrapError) -> StandaloneStartupError
             StandaloneStartupError::FeatureComposition
         }
         WorkerBootstrapError::Controller { .. } => StandaloneStartupError::Controller,
+    }
+}
+
+#[cfg(test)]
+mod local_input_tests {
+    use super::*;
+    use protocol::{AuthenticatedInputSource, Method};
+
+    #[test]
+    fn local_transport_stamps_operator_without_backend_account() {
+        let source = AuthenticatedInputSource::Account {
+            account_id: "forged-account".into(),
+        };
+        for method in [
+            Method::submit_text("plain", "hello"),
+            Method::SubmitTracked {
+                submission_request_id: "tracked".into(),
+                input: vec![],
+                source: source.clone(),
+            },
+            Method::SubmitIfIdle {
+                submission_request_id: "idle".into(),
+                input: vec![],
+                source: source.clone(),
+            },
+            Method::Notify {
+                notification_request_id: "plain-notify".into(),
+                message: "hello".into(),
+            },
+            Method::NotifyTracked {
+                notification_request_id: "tracked-notify".into(),
+                message: "hello".into(),
+                source,
+            },
+        ] {
+            let decoded: Method =
+                serde_json::from_str(&serde_json::to_string(&method).unwrap()).unwrap();
+            match authorize_local_input(decoded) {
+                Method::SubmitTracked { source, .. }
+                | Method::SubmitIfIdle { source, .. }
+                | Method::NotifyTracked { source, .. } => {
+                    assert_eq!(source, AuthenticatedInputSource::LocalOperator)
+                }
+                other => panic!("unexpected local input {other:?}"),
+            }
+        }
     }
 }
