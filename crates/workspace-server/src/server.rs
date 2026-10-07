@@ -2137,6 +2137,37 @@ impl WorkerRemovalService {
     }
 }
 
+/// Session attribution is a synchronous callback from Worker create/restore.
+/// It must not wait for the request that is waiting for that callback. Deletion
+/// acquires both lanes, in request-first order, so it cannot fence out a callback
+/// needed by an in-flight create/restore while waiting for that request to finish.
+#[derive(Default)]
+struct WorkspaceMutationGate {
+    requests: AsyncMutex<()>,
+    session_attributions: AsyncMutex<()>,
+}
+
+impl WorkspaceMutationGate {
+    fn request_lock(&self, method: &Method, path: &str, workspace_id: &str) -> &AsyncMutex<()> {
+        if *method == Method::POST && path == format!("/api/w/{workspace_id}/subjektiv/sessions") {
+            &self.session_attributions
+        } else {
+            &self.requests
+        }
+    }
+
+    async fn lock_deletion(
+        &self,
+    ) -> (
+        tokio::sync::MutexGuard<'_, ()>,
+        tokio::sync::MutexGuard<'_, ()>,
+    ) {
+        let requests = self.requests.lock().await;
+        let attributions = self.session_attributions.lock().await;
+        (requests, attributions)
+    }
+}
+
 #[derive(Clone)]
 pub struct WorkspaceServerApi {
     template: Arc<ServerConfig>,
@@ -2145,19 +2176,19 @@ pub struct WorkspaceServerApi {
     signing_materials: Arc<dyn WorkspaceSigningMaterialStore>,
     routers: Arc<AsyncMutex<HashMap<String, Router>>>,
     apis: Arc<AsyncMutex<HashMap<String, WorkspaceApi>>>,
-    mutation_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    mutation_locks: Arc<AsyncMutex<HashMap<String, Arc<WorkspaceMutationGate>>>>,
     running_deletions: Arc<AsyncMutex<HashSet<String>>>,
     hook_handles: Arc<AsyncMutex<HashMap<String, tokio::task::AbortHandle>>>,
 }
 
 async fn workspace_mutation_lock(
-    locks: &Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    locks: &Arc<AsyncMutex<HashMap<String, Arc<WorkspaceMutationGate>>>>,
     workspace_id: &str,
-) -> Arc<AsyncMutex<()>> {
+) -> Arc<WorkspaceMutationGate> {
     let mut locks = locks.lock().await;
     locks
         .entry(workspace_id.to_string())
-        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .or_insert_with(|| Arc::new(WorkspaceMutationGate::default()))
         .clone()
 }
 
@@ -2180,7 +2211,7 @@ impl WorkspaceServerApi {
         }
     }
 
-    async fn mutation_lock(&self, workspace_id: &str) -> Arc<AsyncMutex<()>> {
+    async fn mutation_lock(&self, workspace_id: &str) -> Arc<WorkspaceMutationGate> {
         workspace_mutation_lock(&self.mutation_locks, workspace_id).await
     }
 
@@ -2557,6 +2588,49 @@ fn repository_api_rejection(path: &str, status: StatusCode, message: &str) -> Re
     status.into_response()
 }
 
+// Log here, not only in the inner Workspace router: the catalog dispatcher can
+// reject authentication before that router (and its API error logger) is entered.
+fn runtime_request_proof_rejection(
+    method: &str,
+    path: &str,
+    workspace_id: &str,
+    error: &crate::worker_source::WorkerMutationSourceProofError,
+) -> Response {
+    use crate::worker_source::WorkerMutationSourceProofError;
+
+    // Do not format the error itself: Authority and MissingPermission can carry
+    // internal or request-derived strings. Only emit allowlisted reason codes.
+    let reason = match error {
+        WorkerMutationSourceProofError::Missing => "missing",
+        WorkerMutationSourceProofError::Invalid => "invalid",
+        WorkerMutationSourceProofError::WrongAudience => "wrong_audience",
+        WorkerMutationSourceProofError::WrongWorkspace => "wrong_workspace",
+        WorkerMutationSourceProofError::WrongActor => "wrong_actor",
+        WorkerMutationSourceProofError::MissingPermission(_) => "missing_permission",
+        WorkerMutationSourceProofError::Expired => "expired",
+        WorkerMutationSourceProofError::RevokedRuntimeTrust => "runtime_trust_missing_or_revoked",
+        WorkerMutationSourceProofError::Replay => "replay",
+        WorkerMutationSourceProofError::WorkerCatalogMembership => "worker_catalog_membership",
+        WorkerMutationSourceProofError::Authority(_) => "authority_unavailable",
+    };
+    let path = path.split('?').next().unwrap_or(path);
+    tracing::warn!(
+        target: "yoi::auth",
+        event = "runtime_request_proof_rejected",
+        method,
+        path,
+        workspace_id,
+        status = 401,
+        reason,
+        "Runtime request proof rejected",
+    );
+    repository_api_rejection(
+        path,
+        StatusCode::UNAUTHORIZED,
+        "invalid runtime request proof",
+    )
+}
+
 /// Authored configuration editors are user-facing authority, not a generic
 /// Runtime workspace.request capability. Worker configuration access is only
 /// through the grant- and connection-bound WIP adapter. Keep runtime projections
@@ -2627,12 +2701,8 @@ async fn authorize_scoped_workspace_request(
             &digest,
         )
         .await
-        .map_err(|_| {
-            repository_api_rejection(
-                &request_path,
-                StatusCode::UNAUTHORIZED,
-                "invalid runtime request proof",
-            )
+        .map_err(|error| {
+            runtime_request_proof_rejection(&method, &request_path, workspace_id, &error)
         })?;
         if is_workspace_config_editor_path(&request_path) {
             return Err(repository_api_rejection(
@@ -2756,7 +2826,7 @@ async fn authorize_workspace_api_request(
         } else {
             worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION
         };
-        let Ok(source) = crate::worker_source::verify_runtime_request_source_proof(
+        let source = match crate::worker_source::verify_runtime_request_source_proof(
             &api,
             &proof,
             &workspace_id,
@@ -2766,12 +2836,16 @@ async fn authorize_workspace_api_request(
             &digest,
         )
         .await
-        else {
-            return repository_api_rejection(
-                &request_path,
-                StatusCode::UNAUTHORIZED,
-                "invalid runtime request proof",
-            );
+        {
+            Ok(source) => source,
+            Err(error) => {
+                return runtime_request_proof_rejection(
+                    &method,
+                    &request_path,
+                    &workspace_id,
+                    &error,
+                );
+            }
         };
         if is_workspace_config_editor_path(&request_path) {
             return repository_api_rejection(
@@ -2911,10 +2985,19 @@ async fn dispatch_workspace_request(
 ) -> Response {
     let path = request.uri().path().to_owned();
     let workspace_id = scoped_workspace_id(&path);
-    let _mutation_guard = if let Some(workspace_id) = workspace_id
+    let mutation_gate = if let Some(workspace_id) = workspace_id
         && workspace_request_requires_mutation_lock(request.method(), &path, workspace_id)
     {
-        Some(api.mutation_lock(workspace_id).await.lock_owned().await)
+        Some((api.mutation_lock(workspace_id).await, workspace_id))
+    } else {
+        None
+    };
+    let _mutation_guard = if let Some((gate, workspace_id)) = mutation_gate.as_ref() {
+        Some(
+            gate.request_lock(request.method(), &path, workspace_id)
+                .lock()
+                .await,
+        )
     } else {
         None
     };
@@ -7145,7 +7228,7 @@ impl server_api::ServerApi for ServerApiContractService {
             )
         })?;
         let mutation_lock = api.mutation_lock(&workspace_id).await;
-        let _mutation_guard = mutation_lock.lock().await;
+        let _mutation_guard = mutation_lock.lock_deletion().await;
         let existing = api
             .store
             .workspace_deletion_operation(&actor.account_id, &request.operation_id)
@@ -29570,6 +29653,20 @@ fn compensate_failed_worker_spawn(
         &worker.worker,
         context,
     ));
+    if let Ok(worker_id) = parse_runtime_worker_id_for_registry(&worker.worker.worker_id)
+        && let Err(error) = api
+            .config_store
+            .release_removed_worker_resource_key(&api.config.workspace_id, worker_id)
+    {
+        diagnostics.push(spawn_compensation_diagnostic(
+            "worker_spawn_compensation_resource_key_release_failed",
+            format!(
+                "Failed to release removed Workspace Worker resource key {}: {}",
+                worker.worker.worker_id,
+                sanitize_backend_error(&error.to_string())
+            ),
+        ));
+    }
     diagnostics
 }
 
@@ -29636,20 +29733,6 @@ fn finalize_spawn_compensation_after_worker_delete(
                 ),
             )),
         }
-    }
-    if let Ok(worker_id) = parse_runtime_worker_id_for_registry(&worker_ref.worker_id)
-        && let Err(error) = api
-            .config_store
-            .release_removed_worker_resource_key(&api.config.workspace_id, worker_id)
-    {
-        diagnostics.push(spawn_compensation_diagnostic(
-            "worker_spawn_compensation_resource_key_release_failed",
-            format!(
-                "Failed to release removed Workspace Worker resource key {}: {}",
-                worker_ref.worker_id,
-                sanitize_backend_error(&error.to_string())
-            ),
-        ));
     }
     diagnostics
 }
@@ -33465,6 +33548,8 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
+    mod auth_logging_tests;
+    mod subject_spawn_tests;
     mod subjektiv_jobs_tests;
     mod worker_operations_tests;
     include!("server_workspace_config_tests.rs");
@@ -36226,10 +36311,10 @@ mod tests {
         let deletion = workspace_mutation_lock(&locks, "workspace-a").await;
         assert!(Arc::ptr_eq(&active_mutation, &deletion));
 
-        let active_guard = active_mutation.lock_owned().await;
+        let active_guard = active_mutation.requests.lock().await;
         let (acquired_tx, mut acquired_rx) = tokio::sync::oneshot::channel();
         let waiter = tokio::spawn(async move {
-            let _deletion_guard = deletion.lock_owned().await;
+            let _deletion_guard = deletion.lock_deletion().await;
             let _ = acquired_tx.send(());
         });
         tokio::task::yield_now().await;
