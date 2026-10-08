@@ -69,6 +69,10 @@ pub struct WorkerRemovalPlanRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerRemovalBlocker {
     Hold,
+    PendingTicketClaim {
+        operation_id: String,
+        ticket_id: String,
+    },
     UnfinishedWork {
         assignment_id: String,
         ticket_id: String,
@@ -232,6 +236,9 @@ impl SqliteWorkspaceStore {
             if let Some((assignment_id,ticket_id))=tx.query_row("SELECT a.assignment_id,a.ticket_id FROM ticket_active_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.ticket_id=c.ticket_id AND a.assignment_id=c.assignment_id WHERE a.workspace_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3",params![req.workspace_id,req.worker.runtime_id,req.worker.worker_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()? {
                 blockers.push(WorkerRemovalBlocker::UnfinishedWork{assignment_id,ticket_id});
             }
+            if let Some((operation_id,ticket_id))=tx.query_row("SELECT operation_id,ticket_id FROM ticket_assignment_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND claim_state='pending' AND action IN ('assign','reassign')",params![req.workspace_id,req.worker.runtime_id,req.worker.worker_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()? {
+                blockers.push(WorkerRemovalBlocker::PendingTicketClaim{operation_id,ticket_id});
+            }
             let fp=fingerprint(req,&worker.updated_at,inv,&policy,&blockers)?;
             let plan_id=stable("wrp",&fp); let operation_id=stable("wro",&fp);
             let archive_id=(policy.session_disposition==SessionDisposition::Archive).then(||stable("wra",&fp));
@@ -276,7 +283,7 @@ impl SqliteWorkspaceStore {
                 mark_stale(&tx,&plan,"hold added")?;tx.commit()?;
                 return Err(stale_error(&plan,"hold added"));
             }
-            let assigned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.ticket_id=c.ticket_id AND a.assignment_id=c.assignment_id WHERE a.workspace_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3)",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id],|r|r.get(0))?;
+            let assigned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.ticket_id=c.ticket_id AND a.assignment_id=c.assignment_id WHERE a.workspace_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3 UNION ALL SELECT 1 FROM ticket_assignment_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND claim_state='pending' AND action IN ('assign','reassign'))",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id],|r|r.get(0))?;
             if assigned{
                 mark_stale(&tx,&plan,"unfinished work added")?;tx.commit()?;
                 return Err(stale_error(&plan,"unfinished work added"));
@@ -462,7 +469,7 @@ impl SqliteWorkspaceStore {
             let worker=load_worker(&tx,workspace_id,&plan.worker)?.ok_or_else(||StoreError::InvalidInput("Worker missing before commit".into()))?;
             if worker.updated_at!=plan.worker_revision{return Err(StoreError::InvalidInput(format!("stale:{}:Worker revision changed",plan.plan_id)));}
             if worker.retention_state=="pinned" { return Err(StoreError::InvalidInput(format!("stale:{}:hold added",plan.plan_id))); }
-            let assigned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.ticket_id=c.ticket_id AND a.assignment_id=c.assignment_id WHERE a.workspace_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3)",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id],|row|row.get(0))?;
+            let assigned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.ticket_id=c.ticket_id AND a.assignment_id=c.assignment_id WHERE a.workspace_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3 UNION ALL SELECT 1 FROM ticket_assignment_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND claim_state='pending' AND action IN ('assign','reassign'))",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id],|row|row.get(0))?;
             if assigned { return Err(StoreError::InvalidInput(format!("stale:{}:unfinished work added",plan.plan_id))); }
             let now=Utc::now().to_rfc3339();
             if let Some(a)=&result.archive{
@@ -1092,7 +1099,7 @@ fn parse_state(v: &str) -> rusqlite::Result<WorkerRemovalPlanState> {
 mod tests {
     use super::*;
     use crate::store::{
-        ControlPlaneStore, TicketCoderAssignmentRecord, WorkerCatalogChange, WorkerRegistryRecord,
+        ControlPlaneStore, TicketWorkerAssignmentRecord, WorkerCatalogChange, WorkerRegistryRecord,
     };
     use worker_runtime::identity::WorkerId;
     fn worker_id() -> WorkerId {
@@ -1431,7 +1438,7 @@ mod tests {
         s: &SqliteWorkspaceStore,
         assignment_id: &str,
     ) -> crate::Result<()> {
-        let assignment = TicketCoderAssignmentRecord {
+        let assignment = TicketWorkerAssignmentRecord {
             workspace_id: "w".into(),
             ticket_id: "ticket".into(),
             assignment_id: assignment_id.into(),
@@ -1439,7 +1446,7 @@ mod tests {
             assigned_by: "test".into(),
             assigned_at: "t".into(),
         };
-        s.set_current_ticket_coder_assignment(
+        s.set_current_ticket_worker_assignment(
             &assignment,
             None,
             &format!("event-{assignment_id}"),
@@ -1472,6 +1479,38 @@ mod tests {
             })
             .unwrap();
         store
+    }
+
+    #[test]
+    fn pending_ticket_claim_blocks_removal_and_is_rechecked_after_planning() {
+        let s = setup();
+        let old = s.plan_worker_removal(&req(), &inv()).unwrap();
+        s.reserve_ticket_assignment_operation(
+            "w",
+            "claim",
+            "ticket",
+            "r",
+            Some(&worker_id().to_string()),
+            "intent",
+            "t",
+        )
+        .unwrap();
+        let blocked = s.plan_worker_removal(&req(), &inv()).unwrap();
+        assert!(
+            matches!(&blocked.blockers[..], [WorkerRemovalBlocker::PendingTicketClaim{operation_id,ticket_id}] if operation_id=="claim" && ticket_id=="ticket")
+        );
+        assert!(
+            s.begin_worker_removal("w", &old.plan_id, &old.input_fingerprint)
+                .is_err()
+        );
+        s.fail_ticket_assignment_operation("w", "claim", "No Runtime effects dispatched")
+            .unwrap();
+        assert!(
+            s.plan_worker_removal(&req(), &inv())
+                .unwrap()
+                .blockers
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1758,7 +1797,7 @@ mod tests {
                 let replaced = tx.execute(
                     "UPDATE ticket_current_worker_assignments
                      SET assignment_id='new-assignment', updated_at='new'
-                     WHERE workspace_id='w' AND ticket_id='ticket' AND role='coder'
+                     WHERE workspace_id='w' AND ticket_id='ticket' AND role='worker'
                        AND assignment_id='assignment'
                        AND EXISTS (
                            SELECT 1 FROM ticket_assignment_work_releases
@@ -2088,7 +2127,7 @@ mod tests {
         ).map_err(StoreError::from)).unwrap();
         assert_eq!(revision, "rev1");
 
-        let assignment = TicketCoderAssignmentRecord {
+        let assignment = TicketWorkerAssignmentRecord {
             workspace_id: "w".into(),
             ticket_id: "new-ticket".into(),
             assignment_id: "new-assignment".into(),
@@ -2101,7 +2140,7 @@ mod tests {
         };
         assert!(
             store
-                .set_current_ticket_coder_assignment(
+                .set_current_ticket_worker_assignment(
                     &assignment,
                     None,
                     "event",

@@ -21,7 +21,7 @@ struct ModelTicketQueryItem {
     workspace_action_priority: Option<String>,
     matched_fields: Vec<String>,
     snippet: Option<String>,
-    current_coder: Option<ModelWorkerSummary>,
+    current_worker: Option<ModelWorkerSummary>,
     linked_objectives: Vec<String>,
     relation_count: usize,
     blocker_count: usize,
@@ -47,7 +47,7 @@ pub(super) struct ModelTicketDetail {
     relations: ModelTicketRelations,
     linked_objectives: Vec<ModelObjectiveSummary>,
     assignments: Vec<ModelAssignment>,
-    current_coder: Option<ModelWorkerSummary>,
+    current_worker: Option<ModelWorkerSummary>,
     implementation_reports: Vec<ModelEvidenceEvent>,
     merge_requests: Vec<ModelMergeRequest>,
     merge_request: Option<ModelMergeRequest>,
@@ -195,7 +195,7 @@ struct ModelTicketActions {
     can_assign_orchestrator: bool,
     can_unassign_orchestrator: bool,
     can_queue: bool,
-    can_start_manual_coder: bool,
+    can_start_manual_worker: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -244,8 +244,8 @@ fn project_ticket_query_item(value: &Value) -> Result<ModelTicketQueryItem, Stri
         workspace_action_priority: optional_string(item, "workspace_action_priority")?,
         matched_fields: string_array(item, "matched_fields")?,
         snippet: optional_string(item, "snippet")?,
-        current_coder: item
-            .get("current_coder")
+        current_worker: item
+            .get("current_worker")
             .filter(|value| !value.is_null())
             .map(project_worker)
             .transpose()?,
@@ -272,14 +272,14 @@ fn project_ticket_query_item(value: &Value) -> Result<ModelTicketQueryItem, Stri
 
 pub(super) fn project_ticket_detail(value: Value) -> Result<ModelTicketDetail, String> {
     let root = object(&value, "Ticket detail response")?;
-    let current_coder = root
-        .get("current_coder")
+    let current_worker = root
+        .get("current_worker")
         .filter(|value| !value.is_null())
         .map(project_worker)
         .transpose()?;
     let assignments = array_field(root, "assignments")?
         .iter()
-        .map(|assignment| project_assignment(assignment, current_coder.as_ref()))
+        .map(|assignment| project_assignment(assignment, current_worker.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(ModelTicketDetail {
@@ -302,7 +302,7 @@ pub(super) fn project_ticket_detail(value: Value) -> Result<ModelTicketDetail, S
             .map(project_objective_summary)
             .collect::<Result<Vec<_>, _>>()?,
         assignments,
-        current_coder,
+        current_worker,
         implementation_reports: array_field(root, "implementation_reports")?
             .iter()
             .map(project_evidence_event)
@@ -483,13 +483,13 @@ fn project_ticket_summary(value: &Value) -> Result<ModelTicketSummary, String> {
 
 fn project_assignment(
     value: &Value,
-    current_coder: Option<&ModelWorkerSummary>,
+    current_worker: Option<&ModelWorkerSummary>,
 ) -> Result<ModelAssignment, String> {
     let assignment = object(value, "Ticket assignment")?;
     let principal = object_field(assignment, "principal")?;
     let kind = string_field(principal, "kind")?;
     let principal = match kind.as_str() {
-        "worker" => current_coder
+        "worker" => current_worker
             .map(|coder| coder.worker.clone())
             .ok_or_else(|| "Worker assignment is missing a Workspace key projection".to_string())?,
         "workspace_agent" => format!("workspace-agent:{}", string_field(principal, "agent_key")?),
@@ -572,7 +572,7 @@ fn project_actions(value: &Value) -> Result<ModelTicketActions, String> {
         can_assign_orchestrator: bool_field(actions, "can_assign_orchestrator")?,
         can_unassign_orchestrator: bool_field(actions, "can_unassign_orchestrator")?,
         can_queue: bool_field(actions, "can_queue")?,
-        can_start_manual_coder: bool_field(actions, "can_start_manual_coder")?,
+        can_start_manual_worker: bool_field(actions, "can_start_manual_worker")?,
     })
 }
 
@@ -783,7 +783,7 @@ mod tests {
                 "workspace_action_priority": "active_work",
                 "matched_fields": ["title"],
                 "snippet": "Ticket",
-                "current_coder": {"runtime_id": "runtime-internal", "worker_id": "worker-internal", "worker_resource_key": "W-12"},
+                "current_worker": {"runtime_id": "runtime-internal", "worker_id": "worker-internal", "worker_resource_key": "W-12"},
                 "linked_objective_ids": ["00001OBJECTIVEINTERNAL"],
                 "linked_objective_keys": ["O-6"],
                 "relation_count": 0,
@@ -870,7 +870,7 @@ mod tests {
             "linked_objectives": [],
             "implementation_reports": [],
             "assignments": [],
-            "current_coder": null,
+            "current_worker": null,
             "merge_requests": [],
             "merge_request": null,
             "evidence": {
@@ -889,7 +889,7 @@ mod tests {
                 "can_assign_orchestrator": true,
                 "can_unassign_orchestrator": false,
                 "can_queue": false,
-                "can_start_manual_coder": false
+                "can_start_manual_worker": false
             },
             "event_page": {"next_cursor": null, "has_more": false}
         }))

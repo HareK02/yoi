@@ -7380,7 +7380,7 @@ pub enum TicketAssignmentPrincipal {
 #[serde(rename_all = "snake_case")]
 pub enum TicketAssignmentRole {
     Orchestrator,
-    Coder,
+    Worker,
     Owner,
     Contributor,
 }
@@ -7416,7 +7416,7 @@ pub struct TicketActionEligibility {
     pub can_assign_orchestrator: bool,
     pub can_unassign_orchestrator: bool,
     pub can_queue: bool,
-    pub can_start_manual_coder: bool,
+    pub can_start_manual_worker: bool,
     pub queue_tickets: Vec<String>,
     pub blockers: Vec<String>,
 }
@@ -7554,7 +7554,7 @@ pub struct TicketQueryItem {
     pub evidence: TicketEvidenceSummary,
     pub merge_requests: Vec<TicketMergeRequestSummary>,
     pub merge_request: Option<TicketMergeRequestSummary>,
-    pub current_coder: Option<TicketAssignmentSummary>,
+    pub current_worker: Option<TicketAssignmentSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -7608,7 +7608,7 @@ pub struct TicketDetail {
     pub linked_objectives: Vec<ObjectiveLinkSummary>,
     pub implementation_reports: Vec<TicketEvidenceEvent>,
     pub assignments: Vec<TicketRoleAssignmentSummary>,
-    pub current_coder: Option<TicketAssignmentSummary>,
+    pub current_worker: Option<TicketAssignmentSummary>,
     pub assignment_diagnostics: Vec<String>,
     pub action_eligibility: TicketActionEligibility,
     pub merge_requests: Vec<TicketMergeRequestSummary>,
@@ -7705,6 +7705,19 @@ pub struct TicketOrchestrationPlanSearchRequest {
     pub kind: Option<ticket::OrchestrationPlanKind>,
 }
 
+/// Selected existing live Workdir attachment, including its current connection
+/// identity. The Workspace authority validates the selection against live
+/// attachments; callers must select them explicitly, and use an empty list
+/// only when the Worker has no live Workdirs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketWorkerAttachmentBinding {
+    pub alias: String,
+    pub working_directory_id: String,
+    pub connection_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
@@ -7712,6 +7725,8 @@ pub struct SetTicketRoleAssignmentRequest {
     pub operation_id: String,
     pub principal: TicketAssignmentPrincipal,
     pub expected_assignment_id: Option<String>,
+    #[serde(default)]
+    pub workdir_bindings: Vec<TicketWorkerAttachmentBinding>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -8350,7 +8365,7 @@ pub enum RuntimeWorkerSpawnIntent {
 pub enum RuntimeTicketWorkerRole {
     Intake,
     Orchestrator,
-    Coder,
+    Worker,
     Reviewer,
 }
 
@@ -11120,6 +11135,70 @@ mod skill_typescript_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ticket_role_assignment_request_defaults_empty_bindings_and_requires_each_selected_connection()
+     {
+        let base = serde_json::json!({"operation_id":"claim", "principal":{"kind":"worker","runtime_id":"r","worker_id":"w"}, "expected_assignment_id":null});
+        let omitted: SetTicketRoleAssignmentRequest = serde_json::from_value(base.clone()).unwrap();
+        assert!(omitted.workdir_bindings.is_empty());
+        let mut selected = base;
+        selected["workdir_bindings"] = serde_json::json!([{"alias":"main","working_directory_id":"checkout","connection_id":"connection"}]);
+        let parsed: SetTicketRoleAssignmentRequest =
+            serde_json::from_value(selected.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), selected);
+        for key in ["alias", "working_directory_id", "connection_id"] {
+            let mut malformed = selected.clone();
+            malformed["workdir_bindings"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            assert!(
+                serde_json::from_value::<SetTicketRoleAssignmentRequest>(malformed).is_err(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn ticket_worker_roles_and_manual_start_projection_use_worker_wire_names() {
+        assert_eq!(
+            serde_json::to_value(TicketAssignmentRole::Worker).unwrap(),
+            serde_json::json!("worker")
+        );
+        assert_eq!(
+            serde_json::to_value(RuntimeTicketWorkerRole::Worker).unwrap(),
+            serde_json::json!("worker")
+        );
+        assert!(
+            serde_json::from_value::<TicketAssignmentRole>(serde_json::json!("coder")).is_err()
+        );
+        assert!(
+            serde_json::from_value::<RuntimeTicketWorkerRole>(serde_json::json!("coder")).is_err()
+        );
+        let eligibility = serde_json::json!({
+            "can_assign_orchestrator": false, "can_unassign_orchestrator": false,
+            "can_queue": true, "can_start_manual_worker": true, "queue_tickets": [], "blockers": []
+        });
+        let parsed: TicketActionEligibility = serde_json::from_value(eligibility.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), eligibility);
+        let mut legacy = eligibility;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("can_start_manual_worker");
+        legacy["can_start_manual_coder"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<TicketActionEligibility>(legacy).is_err());
+        for schema in [
+            schemars::schema_for!(TicketDetail),
+            schemars::schema_for!(TicketQueryItem),
+        ] {
+            let schema = serde_json::to_value(schema).unwrap();
+            let properties = schema["properties"].as_object().unwrap();
+            assert!(properties.contains_key("current_worker"));
+            assert!(!properties.contains_key("current_coder"));
+        }
+    }
 
     #[test]
     fn browser_ticket_targets_are_one_collection_authority() {

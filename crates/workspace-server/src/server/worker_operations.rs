@@ -359,6 +359,8 @@ impl WorkspaceWorker {
             "send_input"
         };
         let _guard = self.authorize_operation(context, permission).await?;
+        let session_lock = current_worker_session_lock(&self.api, &self.identity);
+        let _session_guard = session_lock.lock().await;
         self.ensure_interactive()?;
         if matches!(context, WorkerOperationContext::WorkerControl { .. })
             && request.kind == WorkerInputKind::User
@@ -373,6 +375,19 @@ impl WorkspaceWorker {
     }
 
     fn ensure_interactive(&self) -> ApiResult<()> {
+        if let Some(claim) = self
+            .api
+            .store
+            .get_pending_ticket_assignment_operation_for_worker(
+                self.api.workspace_id(),
+                &self.identity,
+            )?
+        {
+            return Err(Error::TicketAssignmentConflict(format!(
+                "Worker has pending Ticket claim {}; reconcile that exact operation before admitting input",
+                claim.operation_id,
+            )).into());
+        }
         if self
             .api
             .store
@@ -578,6 +593,8 @@ impl WorkspaceWorkerMethodSender {
             .worker
             .authorize_operation(context, "send_input")
             .await?;
+        let session_lock = current_worker_session_lock(&self.worker.api, &self.worker.identity);
+        let _session_guard = session_lock.lock().await;
         self.worker.ensure_interactive()?;
         let WorkerOperationContext::Browser { source, .. } = context else {
             return Err(Error::WorkspacePermissionDenied(

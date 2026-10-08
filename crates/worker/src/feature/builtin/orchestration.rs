@@ -20,9 +20,7 @@ use crate::feature::{
 };
 
 const FEATURE_ID: &str = "orchestration";
-const TOOL_NAME: &str = "SpawnTicketCoder";
-const CODER_PROFILE: &str = "builtin:coder";
-const CODER_FLOW: &str = "builtin:coder-review";
+const TOOL_NAME: &str = "SpawnTicketWorker";
 
 #[derive(Debug, Default)]
 pub struct OrchestrationFeature;
@@ -37,15 +35,15 @@ impl FeatureModule for OrchestrationFeature {
             .with_description("Semantic Ticket orchestration operations.")
             .with_service_requirement(ServiceRequirement::required(
                 ServiceId::builtin(TICKET_SERVICE_ID),
-                "SpawnTicketCoder requires current typed Ticket authority",
+                "SpawnTicketWorker requires current typed Ticket authority",
             ))
             .with_service_requirement(ServiceRequirement::required(
                 ServiceId::builtin(WORKER_LIFECYCLE_SERVICE_ID),
-                "SpawnTicketCoder requires Workspace Worker lifecycle authority",
+                "SpawnTicketWorker requires Workspace Worker lifecycle authority",
             ))
             .with_tool(ToolDeclaration::new(
                 TOOL_NAME,
-                "Spawn and atomically assign a Coder Worker for a queued or already-inprogress Ticket. Select every required Workdir by stable alias; Backend authority derives each attachment's access from the Ticket targets. The guarded operation records queued acceptance only after spawn, initial input, assignment, and Workdir finalization. The profile, Flow, display name, assignment operation, and initial message are fixed by orchestration policy.",
+                "Spawn and atomically assign a configurable Worker for a Ticket. Supply a registered profile selector, an initial request, and optionally a Flow selector. Workdir attachments may be empty; Backend authority validates claims and derives each attachment's access from the Ticket targets. The guarded operation records acceptance only after spawn, initial input, assignment, and resource finalization. Selecting a profile or Flow does not grant review authority.",
             ))
     }
 
@@ -68,7 +66,7 @@ impl FeatureModule for OrchestrationFeature {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct SpawnTicketCoderWorkdirInput {
+struct SpawnTicketWorkerWorkdirInput {
     /// Stable Worker-local routing alias (for example `checkout` or `docs`).
     alias: String,
     /// Workspace-authoritative Workdir id. Paths and URLs are not accepted.
@@ -80,27 +78,35 @@ struct SpawnTicketCoderWorkdirInput {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct SpawnTicketCoderInput {
+struct SpawnTicketWorkerInput {
     ticket_id: String,
     runtime_id: String,
-    /// Every Workdir required by the Ticket target set. Backend authority derives
-    /// effective read/write capabilities; callers cannot request capabilities.
-    workdir_attachments: Vec<SpawnTicketCoderWorkdirInput>,
+    /// Registered profile selector. Backend resolves the profile and validates claims.
+    profile: String,
+    /// Initial user request delivered through the normal typed submission path.
+    initial_request: String,
+    /// Optional Flow selector, delivered as a typed Flow segment before the request.
+    #[serde(default)]
+    flow: Option<String>,
+    /// Alias-keyed Workdir selections; omit or leave empty for a Worker without
+    /// Workdirs. Backend derives effective capabilities; callers cannot request them.
+    #[serde(default)]
+    workdir_attachments: Vec<SpawnTicketWorkerWorkdirInput>,
 }
 
-struct SpawnTicketCoderTool {
+struct SpawnTicketWorkerTool {
     ticket_service: Arc<dyn TicketService>,
     worker_service: Arc<dyn WorkerLifecycleService>,
 }
 
 #[async_trait]
-impl Tool for SpawnTicketCoderTool {
+impl Tool for SpawnTicketWorkerTool {
     async fn execute(
         &self,
         input_json: &str,
         ctx: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        let input: SpawnTicketCoderInput = serde_json::from_str(input_json).map_err(|error| {
+        let input: SpawnTicketWorkerInput = serde_json::from_str(input_json).map_err(|error| {
             ToolError::InvalidArgument(format!("invalid {TOOL_NAME} input: {error}"))
         })?;
         let ticket_ref = authority_id(input.ticket_id, "ticket_id")?;
@@ -108,35 +114,28 @@ impl Tool for SpawnTicketCoderTool {
             .ticket_service
             .ticket_handoff(&ticket_ref)
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-        if !matches!(
-            ticket.workflow_state,
-            ticket::TicketWorkflowState::Queued | ticket::TicketWorkflowState::InProgress
-        ) {
-            return Err(ToolError::ExecutionFailed(format!(
-                "Ticket {} must be queued or inprogress before spawning its Coder; current state is {}",
-                ticket.resource_key,
-                ticket.workflow_state.as_str()
-            )));
-        }
         let call_id = non_empty(ctx.call_id, "tool call_id")?;
         let runtime_id = authority_id(input.runtime_id, "runtime_id")?;
+        let profile = non_empty(input.profile, "profile")?;
+        let initial_request = non_empty(input.initial_request, "initial_request")?;
+        let flow = input.flow.map(|flow| non_empty(flow, "flow")).transpose()?;
         let workdir_attachments = validate_workdir_attachments(input.workdir_attachments)?;
+        let mut initial_submit = Vec::new();
+        if let Some(selector) = flow {
+            initial_submit.push(Segment::Flow { selector });
+        }
+        initial_submit.push(Segment::text(initial_request));
         let response = self
             .worker_service
             .spawn(WorkerLifecycleSpawnRequest {
                 runtime_id,
                 workdir_attachments,
-                profile: CODER_PROFILE.to_string(),
+                profile,
                 singleton_key: None,
                 ticket_id: Some(ticket.id.clone()),
-                operation_id: Some(format!("spawn-ticket-coder:{}:{call_id}", ticket.id)),
-                display_name: format!("Coder · {}", ticket.resource_key),
-                initial_submit: vec![
-                    Segment::Flow {
-                        selector: CODER_FLOW.to_string(),
-                    },
-                    Segment::text(format!("Implement Ticket {}.", ticket.resource_key)),
-                ],
+                operation_id: Some(format!("spawn-ticket-worker:{}:{call_id}", ticket.id)),
+                display_name: format!("Worker · {}", ticket.resource_key),
+                initial_submit,
             })
             .await
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
@@ -147,7 +146,7 @@ impl Tool for SpawnTicketCoderTool {
             )));
         }
         Ok(ToolOutput {
-            summary: format!("Spawned Coder for Ticket {}", ticket.resource_key),
+            summary: format!("Spawned Worker for Ticket {}", ticket.resource_key),
             content: Some(response.body),
             attachments: Vec::new(),
         })
@@ -155,14 +154,8 @@ impl Tool for SpawnTicketCoderTool {
 }
 
 fn validate_workdir_attachments(
-    attachments: Vec<SpawnTicketCoderWorkdirInput>,
+    attachments: Vec<SpawnTicketWorkerWorkdirInput>,
 ) -> Result<Vec<WorkerLifecycleWorkdirAttachment>, ToolError> {
-    if attachments.is_empty() {
-        return Err(ToolError::InvalidArgument(
-            "workdir_attachments must contain at least one Workdir".to_string(),
-        ));
-    }
-
     let mut aliases = BTreeSet::new();
     let mut workdir_ids = BTreeSet::new();
     attachments
@@ -200,14 +193,14 @@ fn definition(
     worker_service: Arc<dyn WorkerLifecycleService>,
 ) -> ToolDefinition {
     Arc::new(move || {
-        let schema = serde_json::to_value(schemars::schema_for!(SpawnTicketCoderInput))
+        let schema = serde_json::to_value(schemars::schema_for!(SpawnTicketWorkerInput))
             .unwrap_or_else(|_| serde_json::json!({}));
         let meta = ToolMeta::new(TOOL_NAME)
             .description(
-                "Spawn and atomically assign a policy-configured Coder for a Ticket with every required alias-keyed Workdir attachment.",
+                "Spawn and atomically assign a configurable Ticket Worker with a registered profile, initial request, optional typed Flow, and zero or more alias-keyed Workdir attachments. Backend validates claims and resources; profile and Flow selection do not grant review authority.",
             )
             .input_schema(schema);
-        let tool: Arc<dyn Tool> = Arc::new(SpawnTicketCoderTool {
+        let tool: Arc<dyn Tool> = Arc::new(SpawnTicketWorkerTool {
             ticket_service: ticket_service.clone(),
             worker_service: worker_service.clone(),
         });
@@ -254,32 +247,18 @@ mod tests {
 
     use ticket::{TicketError, TicketWorkflowState};
 
-    use crate::worker::{WorkspaceClientError, WorkspaceResponse};
-
     use super::*;
     use crate::feature::builtin::ticket::TicketHandoff;
-
-    #[derive(Default)]
-    struct RecordingTicketService;
-
-    impl TicketService for RecordingTicketService {
-        fn ticket_handoff(&self, ticket_ref: &str) -> Result<TicketHandoff, TicketError> {
-            assert_eq!(ticket_ref, "T-482");
-            Ok(TicketHandoff {
-                id: "00001KZXN51C7".to_string(),
-                resource_key: "T-482".to_string(),
-                workflow_state: TicketWorkflowState::Queued,
-            })
-        }
-    }
+    use crate::worker::{WorkspaceClientError, WorkspaceResponse};
 
     struct FixedTicketService(TicketWorkflowState);
 
     impl TicketService for FixedTicketService {
-        fn ticket_handoff(&self, _ticket_ref: &str) -> Result<TicketHandoff, TicketError> {
+        fn ticket_handoff(&self, ticket_ref: &str) -> Result<TicketHandoff, TicketError> {
+            assert_eq!(ticket_ref, "T-719");
             Ok(TicketHandoff {
                 id: "00001KZXN51C7".to_string(),
-                resource_key: "T-482".to_string(),
+                resource_key: "T-719".to_string(),
                 workflow_state: self.0,
             })
         }
@@ -288,6 +267,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingService {
         requests: Mutex<Vec<WorkerLifecycleSpawnRequest>>,
+        response: Option<WorkspaceResponse>,
     }
 
     #[async_trait]
@@ -297,193 +277,236 @@ mod tests {
             request: WorkerLifecycleSpawnRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
             self.requests.lock().unwrap().push(request);
-            Ok(WorkspaceResponse {
+            Ok(self.response.clone().unwrap_or_else(|| WorkspaceResponse {
                 status: 200,
                 body: r#"{"worker_id":"42"}"#.to_string(),
-            })
+            }))
+        }
+    }
+
+    fn input() -> serde_json::Value {
+        serde_json::json!({
+            "ticket_id": "T-719",
+            "runtime_id": "runtime-1",
+            "profile": "project:ticket-worker",
+            "initial_request": "Investigate Ticket T-719."
+        })
+    }
+
+    fn tool(service: Arc<RecordingService>, state: TicketWorkflowState) -> SpawnTicketWorkerTool {
+        SpawnTicketWorkerTool {
+            ticket_service: Arc::new(FixedTicketService(state)),
+            worker_service: service,
         }
     }
 
     #[tokio::test]
-    async fn spawn_ticket_coder_fixes_profile_flow_assignment_and_message() {
+    async fn spawn_ticket_worker_forwards_selected_profile_flow_request_and_workdirs() {
         let service = Arc::new(RecordingService::default());
-        let tool = SpawnTicketCoderTool {
-            ticket_service: Arc::new(RecordingTicketService),
-            worker_service: service.clone(),
-        };
-        tool.execute(
-            &serde_json::json!({
-                "ticket_id": "T-482",
-                "runtime_id": "runtime-1",
-                "workdir_attachments": [
-                    {
-                        "alias": "checkout",
-                        "working_directory_id": "workdir-1",
-                        "relative_cwd": "crates/yoi"
-                    },
-                    {
-                        "alias": "docs",
-                        "working_directory_id": "workdir-2"
-                    }
-                ]
-            })
-            .to_string(),
-            ToolExecutionContext::new("call-7", "batch-1", 0),
-        )
-        .await
-        .unwrap();
+        let mut input = input();
+        input["flow"] = serde_json::json!("project:investigation");
+        input["workdir_attachments"] = serde_json::json!([
+            {
+                "alias": "checkout",
+                "working_directory_id": "workdir-1",
+                "relative_cwd": "crates/worker"
+            },
+            {"alias": "docs", "working_directory_id": "workdir-2"}
+        ]);
+        let output = tool(service.clone(), TicketWorkflowState::Queued)
+            .execute(
+                &input.to_string(),
+                ToolExecutionContext::new("call-7", "batch-1", 0),
+            )
+            .await
+            .unwrap();
 
         let requests = service.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
         let request = &requests[0];
-        assert_eq!(request.profile, CODER_PROFILE);
+        assert_eq!(request.runtime_id, "runtime-1");
+        assert_eq!(request.profile, "project:ticket-worker");
         assert_eq!(request.ticket_id.as_deref(), Some("00001KZXN51C7"));
         assert_eq!(
             request.operation_id.as_deref(),
-            Some("spawn-ticket-coder:00001KZXN51C7:call-7")
+            Some("spawn-ticket-worker:00001KZXN51C7:call-7")
         );
-        assert_eq!(request.display_name, "Coder · T-482");
-        assert_eq!(request.workdir_attachments.len(), 2);
-        assert_eq!(request.workdir_attachments[0].alias, "checkout");
+        assert_eq!(request.display_name, "Worker · T-719");
+        assert_eq!(request.singleton_key, None);
         assert_eq!(
-            request.workdir_attachments[0].working_directory_id,
-            "workdir-1"
+            request.workdir_attachments,
+            vec![
+                WorkerLifecycleWorkdirAttachment {
+                    alias: "checkout".into(),
+                    working_directory_id: "workdir-1".into(),
+                    relative_cwd: Some("crates/worker".into()),
+                },
+                WorkerLifecycleWorkdirAttachment {
+                    alias: "docs".into(),
+                    working_directory_id: "workdir-2".into(),
+                    relative_cwd: None,
+                },
+            ]
         );
-        assert_eq!(
-            request.workdir_attachments[0].relative_cwd.as_deref(),
-            Some("crates/yoi")
-        );
-        assert_eq!(request.workdir_attachments[1].alias, "docs");
-        assert_eq!(
-            request.workdir_attachments[1].working_directory_id,
-            "workdir-2"
-        );
-        assert_eq!(request.workdir_attachments[1].relative_cwd, None);
         assert_eq!(
             request.initial_submit,
             vec![
                 Segment::Flow {
-                    selector: CODER_FLOW.to_string()
+                    selector: "project:investigation".into()
                 },
-                Segment::text("Implement Ticket T-482.")
+                Segment::text("Investigate Ticket T-719."),
             ]
         );
-        assert!(!request.display_name.contains("00001KZXN51C7"));
-        assert!(request.initial_submit.iter().all(|segment| {
-            !Segment::flatten_to_text(std::slice::from_ref(segment)).contains("00001KZXN51C7")
-        }));
+        assert_eq!(output.summary, "Spawned Worker for Ticket T-719");
+        assert_eq!(output.content.as_deref(), Some(r#"{"worker_id":"42"}"#));
     }
 
     #[tokio::test]
-    async fn spawn_ticket_coder_rejects_ineligible_ticket_before_worker_side_effect() {
-        let worker_service = Arc::new(RecordingService::default());
-        let tool = SpawnTicketCoderTool {
-            ticket_service: Arc::new(FixedTicketService(TicketWorkflowState::Planning)),
-            worker_service: worker_service.clone(),
-        };
-        let error = tool
+    async fn spawn_ticket_worker_allows_zero_workdirs_and_omitted_flow() {
+        let service = Arc::new(RecordingService::default());
+        for explicit_empty in [false, true] {
+            let mut input = input();
+            if explicit_empty {
+                input["workdir_attachments"] = serde_json::json!([]);
+                input["flow"] = serde_json::Value::Null;
+            }
+            tool(service.clone(), TicketWorkflowState::Queued)
+                .execute(
+                    &input.to_string(),
+                    ToolExecutionContext::new("call-empty", "batch-1", 0),
+                )
+                .await
+                .unwrap();
+        }
+        let requests = service.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert!(request.workdir_attachments.is_empty());
+            assert_eq!(
+                request.initial_submit,
+                vec![Segment::text("Investigate Ticket T-719.")]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_ticket_worker_defers_claim_eligibility_to_backend() {
+        let service = Arc::new(RecordingService {
+            response: Some(WorkspaceResponse {
+                status: 409,
+                body: "Backend rejected Ticket claim".into(),
+            }),
+            ..Default::default()
+        });
+        let error = tool(service.clone(), TicketWorkflowState::Planning)
             .execute(
-                &serde_json::json!({
-                    "ticket_id": "00001KZXN51C7",
-                    "runtime_id": "runtime-1",
-                    "workdir_attachments": [{
-                        "alias": "checkout",
-                        "working_directory_id": "workdir-1"
-                    }]
-                })
-                .to_string(),
-                ToolExecutionContext::new("call-queued", "batch-1", 0),
+                &input().to_string(),
+                ToolExecutionContext::new("call-claim", "batch-1", 0),
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("must be queued or inprogress"));
-        assert!(worker_service.requests.lock().unwrap().is_empty());
+        assert_eq!(service.requests.lock().unwrap().len(), 1);
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP 409: Backend rejected Ticket claim")
+        );
     }
 
     #[tokio::test]
-    async fn spawn_ticket_coder_rejects_invalid_workdir_collections_before_worker_side_effect() {
-        let worker_service = Arc::new(RecordingService::default());
-        let tool = SpawnTicketCoderTool {
-            ticket_service: Arc::new(FixedTicketService(TicketWorkflowState::Queued)),
-            worker_service: worker_service.clone(),
-        };
+    async fn spawn_ticket_worker_rejects_invalid_input_before_worker_side_effect() {
+        let service = Arc::new(RecordingService::default());
+        let tool = tool(service.clone(), TicketWorkflowState::Queued);
         let cases = [
             (
-                serde_json::json!({
-                    "ticket_id": "T-482",
-                    "runtime_id": "runtime-1",
-                    "workdir_attachments": []
-                }),
-                "must contain at least one Workdir",
+                "profile",
+                serde_json::json!("  "),
+                "profile must not be empty",
             ),
             (
-                serde_json::json!({
-                    "ticket_id": "T-482",
-                    "runtime_id": "runtime-1",
-                    "workdir_attachments": [
-                        {"alias": "checkout", "working_directory_id": "workdir-1"},
-                        {"alias": " checkout ", "working_directory_id": "workdir-2"}
-                    ]
-                }),
-                "duplicate Workdir attachment alias `checkout`",
+                "initial_request",
+                serde_json::json!(" \n "),
+                "initial_request must not be empty",
             ),
+            ("flow", serde_json::json!(" "), "flow must not be empty"),
             (
-                serde_json::json!({
-                    "ticket_id": "T-482",
-                    "runtime_id": "runtime-1",
-                    "workdir_attachments": [
-                        {"alias": "checkout", "working_directory_id": "workdir-1"},
-                        {"alias": "docs", "working_directory_id": " workdir-1 "}
-                    ]
-                }),
-                "duplicate Workdir attachment `workdir-1`",
-            ),
-            (
-                serde_json::json!({
-                    "ticket_id": "T-482",
-                    "runtime_id": "runtime-1",
-                    "workdir_attachments": [
-                        {"alias": "docs/path", "working_directory_id": "workdir-1"}
-                    ]
-                }),
-                "workdir_attachments.alias must be an authority id",
-            ),
-            (
-                serde_json::json!({
-                    "ticket_id": "T-482",
-                    "runtime_id": "runtime-1",
-                    "workdir_attachments": [
-                        {"alias": "docs", "working_directory_id": "https://example.test/workdir"}
-                    ]
-                }),
-                "workdir_attachments.working_directory_id must be an authority id",
-            ),
-            (
-                serde_json::json!({
-                    "ticket_id": "T-482",
-                    "runtime_id": "runtime/1",
-                    "workdir_attachments": [
-                        {"alias": "checkout", "working_directory_id": "workdir-1"}
-                    ]
-                }),
+                "runtime_id",
+                serde_json::json!("runtime/1"),
                 "runtime_id must be an authority id",
             ),
             (
-                serde_json::json!({
-                    "ticket_id": "T-482",
-                    "runtime_id": "runtime-1",
-                    "workdir_attachments": [
-                        {
-                            "alias": "checkout",
-                            "working_directory_id": "workdir-1",
-                            "relative_cwd": "../outside"
-                        }
-                    ]
-                }),
+                "ticket_id",
+                serde_json::json!("https://example.test/ticket"),
+                "ticket_id must be an authority id",
+            ),
+            (
+                "workdir_attachments",
+                serde_json::json!([
+                    {"alias": "checkout", "working_directory_id": "workdir-1"},
+                    {"alias": " checkout ", "working_directory_id": "workdir-2"}
+                ]),
+                "duplicate Workdir attachment alias `checkout`",
+            ),
+            (
+                "workdir_attachments",
+                serde_json::json!([
+                    {"alias": "checkout", "working_directory_id": "workdir-1"},
+                    {"alias": "docs", "working_directory_id": " workdir-1 "}
+                ]),
+                "duplicate Workdir attachment `workdir-1`",
+            ),
+            (
+                "workdir_attachments",
+                serde_json::json!([
+                    {"alias": "docs/path", "working_directory_id": "workdir-1"}
+                ]),
+                "workdir_attachments.alias must be an authority id",
+            ),
+            (
+                "workdir_attachments",
+                serde_json::json!([
+                    {"alias": "docs", "working_directory_id": "https://example.test/workdir"}
+                ]),
+                "workdir_attachments.working_directory_id must be an authority id",
+            ),
+            (
+                "workdir_attachments",
+                serde_json::json!([
+                    {"alias": "checkout", "working_directory_id": "workdir-1", "relative_cwd": "../outside"}
+                ]),
                 "relative_cwd must be a normalized relative path inside the Workdir",
             ),
+            (
+                "workdir_attachments",
+                serde_json::json!([
+                    {"alias": "checkout", "working_directory_id": "workdir-1", "access": "write"}
+                ]),
+                "unknown field `access`",
+            ),
+            (
+                "review",
+                serde_json::json!({"ticket_id": "T-719", "merge_request_id": "MR-1"}),
+                "unknown field `review`",
+            ),
+            (
+                "operation_id",
+                serde_json::json!("caller-claim"),
+                "unknown field `operation_id`",
+            ),
+            (
+                "display_name",
+                serde_json::json!("Reviewer"),
+                "unknown field `display_name`",
+            ),
+            (
+                "initial_submit",
+                serde_json::json!([]),
+                "unknown field `initial_submit`",
+            ),
         ];
-
-        for (index, (input, expected)) in cases.into_iter().enumerate() {
+        for (index, (field, value, expected)) in cases.into_iter().enumerate() {
+            let mut input = input();
+            input[field] = value;
             let error = tool
                 .execute(
                     &input.to_string(),
@@ -493,10 +516,27 @@ mod tests {
                 .unwrap_err();
             assert!(
                 error.to_string().contains(expected),
-                "unexpected error for case {index}: {error}"
+                "unexpected error for {field}: {error}"
             );
         }
-        assert!(worker_service.requests.lock().unwrap().is_empty());
+        for field in ["ticket_id", "runtime_id", "profile", "initial_request"] {
+            let mut input = input();
+            input.as_object_mut().unwrap().remove(field);
+            let error = tool
+                .execute(
+                    &input.to_string(),
+                    ToolExecutionContext::new("call-missing", "batch-validation", 0),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("missing field `{field}`")),
+                "{error}"
+            );
+        }
+        assert!(service.requests.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -517,26 +557,38 @@ mod tests {
     }
 
     #[test]
-    fn input_surface_does_not_expose_profile_flow_or_assignment_controls() {
-        let schema = serde_json::to_string(&schemars::schema_for!(SpawnTicketCoderInput)).unwrap();
-        for field in [
-            "ticket_id",
-            "runtime_id",
-            "workdir_attachments",
-            "alias",
-            "working_directory_id",
-            "relative_cwd",
-        ] {
-            assert!(schema.contains(field));
+    fn spawn_ticket_worker_schema_exposes_configuration_not_claim_or_review_grants() {
+        let definition = definition(
+            Arc::new(FixedTicketService(TicketWorkflowState::Queued)),
+            Arc::new(RecordingService::default()),
+        );
+        let (meta, _) = definition();
+        assert_eq!(meta.name, "SpawnTicketWorker");
+        let schema = serde_json::to_value(schemars::schema_for!(SpawnTicketWorkerInput)).unwrap();
+        assert_eq!(schema["additionalProperties"], false);
+        let required = schema["required"].as_array().unwrap();
+        for field in ["ticket_id", "runtime_id", "profile", "initial_request"] {
+            assert!(
+                required.contains(&serde_json::json!(field)),
+                "missing required field {field}"
+            );
+        }
+        for field in ["flow", "workdir_attachments"] {
+            assert!(schema["properties"].get(field).is_some());
+            assert!(!required.contains(&serde_json::json!(field)));
         }
         for forbidden in [
-            "profile",
-            "selector",
+            "review",
             "operation_id",
             "display_name",
             "initial_submit",
+            "claim",
+            "access",
         ] {
-            assert!(!schema.contains(forbidden), "schema leaked {forbidden}");
+            assert!(
+                schema["properties"].get(forbidden).is_none(),
+                "schema leaked {forbidden}"
+            );
         }
     }
 }

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 pub enum TicketRole {
     Intake,
     Orchestrator,
-    Coder,
+    Worker,
     Reviewer,
 }
 
@@ -21,7 +21,7 @@ impl TicketRole {
     pub const ALL: [TicketRole; 4] = [
         TicketRole::Intake,
         TicketRole::Orchestrator,
-        TicketRole::Coder,
+        TicketRole::Worker,
         TicketRole::Reviewer,
     ];
 
@@ -33,7 +33,7 @@ impl TicketRole {
         match self {
             Self::Intake => "intake",
             Self::Orchestrator => "orchestrator",
-            Self::Coder => "coder",
+            Self::Worker => "worker",
             Self::Reviewer => "reviewer",
         }
     }
@@ -42,7 +42,7 @@ impl TicketRole {
         match value {
             "intake" => Some(Self::Intake),
             "orchestrator" => Some(Self::Orchestrator),
-            "coder" => Some(Self::Coder),
+            "worker" => Some(Self::Worker),
             "reviewer" => Some(Self::Reviewer),
             _ => None,
         }
@@ -52,7 +52,7 @@ impl TicketRole {
         match self {
             Self::Intake => "builtin:intake",
             Self::Orchestrator => "builtin:orchestrator",
-            Self::Coder => "builtin:coder",
+            Self::Worker => "builtin:default",
             Self::Reviewer => "builtin:reviewer",
         }
     }
@@ -95,5 +95,21 @@ mod tests {
             assert!(role.default_profile().starts_with("builtin:"));
         }
         assert_eq!(TicketRole::parse("operator"), None);
+    }
+
+    #[test]
+    fn worker_role_uses_worker_wire_name_and_default_profile() {
+        assert_eq!(TicketRole::parse("worker"), Some(TicketRole::Worker));
+        assert_eq!(TicketRole::parse("coder"), None);
+        assert_eq!(
+            serde_json::to_string(&TicketRole::Worker).unwrap(),
+            "\"worker\""
+        );
+        assert_eq!(
+            serde_json::from_str::<TicketRole>("\"worker\"").unwrap(),
+            TicketRole::Worker
+        );
+        assert!(serde_json::from_str::<TicketRole>("\"coder\"").is_err());
+        assert_eq!(TicketRole::Worker.default_profile(), "builtin:default");
     }
 }

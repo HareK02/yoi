@@ -15,6 +15,7 @@ commonWorkerOrchestration = import "./common/worker-orchestration.md";
 commonWorkspace = import "./common/workspace.md";
 commonWriting = import "./common/writing.md";
 roleCoder = import "./role/coder.md";
+roleTicketWorker = import "./role/ticket-worker.md";
 roleIntake = import "./role/intake.md";
 roleOrchestrator = import "./role/orchestrator.md";
 roleReviewer = import "./role/reviewer.md";
@@ -55,6 +56,7 @@ in
     };
     role = {
         coder = roleCoder.content;
+        ticket_worker = roleTicketWorker.content;
         intake = roleIntake.content;
         orchestrator = roleOrchestrator.content;
         reviewer = roleReviewer.content;

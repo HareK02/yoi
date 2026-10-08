@@ -335,8 +335,8 @@ CREATE TABLE ticket_assignment_operations (
             operation_id TEXT NOT NULL,
             action TEXT NOT NULL CHECK (action IN ('assign', 'reassign', 'unassign')),
             ticket_id TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'coder'
-                CHECK(role IN ('orchestrator', 'coder', 'owner', 'contributor')),
+            role TEXT NOT NULL DEFAULT 'worker'
+                CHECK(role IN ('orchestrator', 'worker', 'owner', 'contributor')),
             principal_kind TEXT NOT NULL DEFAULT 'worker'
                 CHECK(principal_kind IN ('user', 'worker', 'workspace_agent')),
             principal_id TEXT,
@@ -346,8 +346,14 @@ CREATE TABLE ticket_assignment_operations (
             expected_assignment_id TEXT,
             created_at TEXT NOT NULL,
             request_fingerprint TEXT,
+            claim_state TEXT NOT NULL DEFAULT 'committed'
+                CHECK(claim_state IN ('pending', 'failed', 'committed')),
+            failure_reason TEXT,
+            binding_recovery_json TEXT,
             PRIMARY KEY (workspace_id, operation_id),
-            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+            CHECK(claim_state = 'committed' OR assignment_id IS NULL),
+            CHECK((claim_state = 'failed') = (failure_reason IS NOT NULL))
         );
 CREATE TABLE ticket_assignment_ticket_tombstones (
     workspace_id TEXT NOT NULL,
@@ -367,8 +373,8 @@ CREATE TABLE ticket_assignment_worker_tombstones (
 CREATE TABLE ticket_current_worker_assignments (
             workspace_id TEXT NOT NULL,
             ticket_id TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'coder'
-                CHECK(role IN ('orchestrator', 'coder', 'owner', 'contributor')),
+            role TEXT NOT NULL DEFAULT 'worker'
+                CHECK(role IN ('orchestrator', 'worker', 'owner', 'contributor')),
             assignment_id TEXT NOT NULL,
             principal_kind TEXT NOT NULL DEFAULT 'worker'
                 CHECK(principal_kind IN ('user', 'worker', 'workspace_agent')),
@@ -393,8 +399,8 @@ CREATE TABLE ticket_current_worker_assignments (
 CREATE TABLE ticket_worker_assignment_events (
             workspace_id TEXT NOT NULL,
             ticket_id TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'coder'
-                CHECK(role IN ('orchestrator', 'coder', 'owner', 'contributor')),
+            role TEXT NOT NULL DEFAULT 'worker'
+                CHECK(role IN ('orchestrator', 'worker', 'owner', 'contributor')),
             event_id TEXT NOT NULL,
             action TEXT NOT NULL CHECK (action IN ('assigned', 'reassigned', 'unassigned')),
             assignment_id TEXT,
@@ -410,8 +416,8 @@ CREATE TABLE ticket_worker_assignments (
             workspace_id TEXT NOT NULL,
             ticket_id TEXT NOT NULL,
             assignment_id TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'coder'
-                CHECK(role IN ('orchestrator', 'coder', 'owner', 'contributor')),
+            role TEXT NOT NULL DEFAULT 'worker'
+                CHECK(role IN ('orchestrator', 'worker', 'owner', 'contributor')),
             principal_kind TEXT NOT NULL DEFAULT 'worker'
                 CHECK(principal_kind IN ('user', 'worker', 'workspace_agent')),
             principal_id TEXT,
@@ -1215,7 +1221,7 @@ CREATE INDEX ticket_current_principal_idx
             ON ticket_current_worker_assignments(workspace_id, principal_kind, principal_id, runtime_id, worker_id);
 CREATE UNIQUE INDEX ticket_current_singleton_role_idx
             ON ticket_current_worker_assignments(workspace_id, ticket_id, role)
-            WHERE role IN ('orchestrator', 'coder');
+            WHERE role IN ('orchestrator', 'worker');
 CREATE INDEX typed_ticket_events_workspace_kind_ticket
             ON typed_ticket_events(workspace_id, kind, ticket_id, event_index);
 CREATE UNIQUE INDEX ux_worker_workdir_attachment_reservation_id

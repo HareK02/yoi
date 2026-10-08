@@ -7657,7 +7657,7 @@
         "enum": [
           "intake",
           "orchestrator",
-          "coder",
+          "worker",
           "reviewer"
         ],
         "type": "string"
@@ -8871,6 +8871,13 @@
           },
           "principal": {
             "$ref": "#/components/schemas/TicketAssignmentPrincipal"
+          },
+          "workdir_bindings": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/TicketWorkerAttachmentBinding"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -10098,7 +10105,7 @@
           "can_queue": {
             "type": "boolean"
           },
-          "can_start_manual_coder": {
+          "can_start_manual_worker": {
             "type": "boolean"
           },
           "can_unassign_orchestrator": {
@@ -10115,7 +10122,7 @@
           "can_assign_orchestrator",
           "can_unassign_orchestrator",
           "can_queue",
-          "can_start_manual_coder",
+          "can_start_manual_worker",
           "queue_tickets",
           "blockers"
         ],
@@ -10195,7 +10202,7 @@
       "TicketAssignmentRole": {
         "enum": [
           "orchestrator",
-          "coder",
+          "worker",
           "owner",
           "contributor"
         ],
@@ -10360,7 +10367,7 @@
               "null"
             ]
           },
-          "current_coder": {
+          "current_worker": {
             "anyOf": [
               {
                 "$ref": "#/components/schemas/TicketAssignmentSummary"
@@ -11526,7 +11533,7 @@
               "null"
             ]
           },
-          "current_coder": {
+          "current_worker": {
             "anyOf": [
               {
                 "$ref": "#/components/schemas/TicketAssignmentSummary"
@@ -12422,6 +12429,27 @@
             "type": "object"
           }
         ]
+      },
+      "TicketWorkerAttachmentBinding": {
+        "additionalProperties": false,
+        "description": "Selected existing live Workdir attachment, including its current connection\nidentity. The Workspace authority validates the selection against live\nattachments; callers must select them explicitly, and use an empty list\nonly when the Worker has no live Workdirs.",
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "connection_id": {
+            "type": "string"
+          },
+          "working_directory_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "alias",
+          "working_directory_id",
+          "connection_id"
+        ],
+        "type": "object"
       },
       "TicketWorkflowState": {
         "enum": [
@@ -15643,7 +15671,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:3c3d4e9f55fca26e5833a07da29a6030e4beeedca645ff1c4ef1583c6c29abe0"
+    "x-yoi-source-digest": "sha256:16796bde0da04973310a14f90cf6eac14b2580bbe184c7c12afde3b6225ce933"
   },
   "openapi": "3.1.0",
   "paths": {
