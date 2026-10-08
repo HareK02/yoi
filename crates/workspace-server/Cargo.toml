@@ -56,6 +56,7 @@ zeroize.workspace = true
 webauthn-rs = { workspace = true }
 
 [dev-dependencies]
+wip-protocol.workspace = true
 agen.workspace = true
 tempfile.workspace = true
 tools.workspace = true
