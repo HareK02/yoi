@@ -17,6 +17,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures.workspace = true
 config-source.workspace = true
 feature-storage.workspace = true
+workspace-drive.workspace = true
 subjektiv.workspace = true
 flow = { path = "../flow" }
 manifest.workspace = true

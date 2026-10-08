@@ -252,6 +252,9 @@ pub struct ServerConfig {
     pub workspace_created_at: String,
     pub workspace_execution_root: PathBuf,
     pub database_path: PathBuf,
+    /// Resolved Yoi data directory, independent of the authority database location.
+    /// Custom database deployments must explicitly configure this path as well.
+    pub data_root: PathBuf,
     pub embedded_runtime_store_root: PathBuf,
     pub static_assets_dir: Option<PathBuf>,
     pub auth: AuthConfig,
@@ -268,14 +271,22 @@ impl ServerConfig {
         workspace: WorkspaceRecord,
     ) -> Self {
         let workspace_id = workspace.workspace_id.clone();
-        let embedded_runtime_store_root = Self::default_embedded_runtime_store_root(&workspace_id);
         let database_path = Self::default_server_database_path();
+        // Reuse the startup-resolved path; Drive never reads the environment.
+        let data_root = database_path
+            .parent()
+            .and_then(Path::parent)
+            .expect("default Server database is below the resolved data directory")
+            .to_path_buf();
+        let embedded_runtime_store_root =
+            Self::embedded_runtime_store_root_for_data_dir(&data_root, &workspace_id);
         Self {
             workspace_id: workspace.workspace_id,
             workspace_display_name: workspace.display_name,
             workspace_created_at: workspace.created_at,
             workspace_execution_root: workspace_execution_root.into(),
             database_path,
+            data_root,
             embedded_runtime_store_root,
             static_assets_dir: None,
             auth: AuthConfig::Passkey {
@@ -343,6 +354,15 @@ impl ServerConfig {
 
     pub fn default_embedded_runtime_store_root(workspace_id: impl AsRef<str>) -> PathBuf {
         Self::default_workspace_backend_data_root(workspace_id).join("embedded-runtime")
+    }
+
+    pub fn with_data_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.data_root = root.into();
+        self
+    }
+
+    pub fn drive_blob_root(&self) -> Result<PathBuf> {
+        crate::workspace_drive_host::drive_blob_root(&self.data_root, &self.workspace_id)
     }
 
     pub fn with_embedded_runtime_store_root(mut self, root: impl Into<PathBuf>) -> Self {
@@ -1554,6 +1574,7 @@ pub struct WorkspaceApi {
     config_schema_registry: crate::config_source::WorkspaceConfigSchemaRegistry,
     prompt_projection_cache: crate::prompt_settings::WorkspacePromptProjectionCache,
     feature_storage: crate::WorkspaceFeatureStorage,
+    drive_host: Arc<crate::workspace_drive_host::WorkspaceDriveHost>,
     subjektiv_registration: crate::RegisteredFeature,
     authority: SqliteWorkspaceAuthority,
     _worker_projection_shutdown: Arc<WorkerProjectionShutdownGuard>,
@@ -2334,6 +2355,7 @@ impl WorkspaceServerApi {
             .await?
             .ok_or_else(|| Error::InvalidInput("Workspace no longer exists".to_string()))?;
 
+        api.fence_drive().await?;
         let mut child_operation_ids = operation.child_operation_ids.clone();
         let mut blockers = Vec::new();
         for worker in self
@@ -2428,11 +2450,18 @@ impl WorkspaceServerApi {
                 None,
             );
         }
-        api.feature_storage.delete().map_err(|error| {
-            Error::Store(format!(
-                "failed to delete Workspace Feature storage: {error}"
-            ))
-        })?;
+        api.purge_drive().await?;
+        let feature_storage = api.feature_storage.clone();
+        tokio::task::spawn_blocking(move || feature_storage.delete())
+            .await
+            .map_err(|error| {
+                Error::Store(format!("Feature storage deletion task failed: {error}"))
+            })?
+            .map_err(|error| {
+                Error::Store(format!(
+                    "failed to delete Workspace Feature storage: {error}"
+                ))
+            })?;
         WorkspaceSigningIdentityService::new(self.store.clone(), self.signing_materials.clone())
             .delete_material(&operation.workspace_id)?;
         let completed = self.store.finalize_workspace_deletion(operation_id)?;
@@ -3201,6 +3230,55 @@ fn embedded_runtime_request_audience(config: &ServerConfig) -> crate::Result<Str
 }
 
 impl WorkspaceApi {
+    /// Trusted Workspace-scoped Drive access for backend adapters. This is not
+    /// model authorization; callers must authorize requests before using it.
+    /// All synchronous Drive operations on the returned handle must run through
+    /// `tokio::task::spawn_blocking` when called from an async context.
+    /// Drive transactions serialize with server DB writes so deletion reservation
+    /// fences even previously returned handles at its authority commit.
+    pub async fn drive(&self) -> Result<workspace_drive::Drive> {
+        let workspace = self
+            .store
+            .get_workspace(&self.config.workspace_id)
+            .await?
+            .ok_or_else(|| Error::WorkspaceConfigConflict("Workspace no longer exists".into()))?;
+        if workspace.state != "active" {
+            if workspace.state == "deleting" {
+                self.fence_drive().await?;
+            }
+            return Err(Error::WorkspaceConfigConflict(
+                "Workspace is not active".into(),
+            ));
+        }
+        self.drive_host
+            .open(
+                &self.feature_storage,
+                self.config.drive_blob_root()?,
+                self.config.database_path.clone(),
+            )
+            .await
+    }
+
+    async fn fence_drive(&self) -> Result<()> {
+        self.drive_host
+            .fence(
+                &self.feature_storage,
+                self.config.drive_blob_root()?,
+                self.config.database_path.clone(),
+            )
+            .await
+    }
+
+    async fn purge_drive(&self) -> Result<()> {
+        self.drive_host
+            .purge(
+                &self.feature_storage,
+                self.config.drive_blob_root()?,
+                self.config.database_path.clone(),
+            )
+            .await
+    }
+
     /// Server-managed, Workspace-scoped storage for trusted Feature repositories.
     /// Feature registration and SQL access stay inside the Server process.
     pub fn feature_storage(&self) -> &crate::WorkspaceFeatureStorage {
@@ -3472,7 +3550,10 @@ impl WorkspaceApi {
             .map_err(|error| {
             Error::Store(format!("failed to register subjektiv storage: {error}"))
         })?;
+        let drive_host =
+            Arc::new(crate::workspace_drive_host::WorkspaceDriveHost::new(&feature_storage).await?);
         let mut api = Self {
+            drive_host,
             config_store,
             repository_secrets,
             signing_identities,
@@ -3510,6 +3591,16 @@ impl WorkspaceApi {
             worker_control_locks: Arc::new(Mutex::new(HashMap::new())),
             attachment_upload_grants: Arc::new(Mutex::new(HashMap::new())),
         };
+        // Restore the domain fence before this API can issue any Drive handle,
+        // including blocked/failed deletions not scheduled for automatic recovery.
+        if api
+            .store
+            .get_workspace(&api.config.workspace_id)
+            .await?
+            .is_some_and(|workspace| workspace.state == "deleting")
+        {
+            api.fence_drive().await?;
+        }
         // The observer snapshot retains the unconfigured authority, not itself:
         // source observation uses Repository access + Runtime authority without a cycle.
         let observer_api = api.clone();
@@ -7265,6 +7356,19 @@ impl server_api::ServerApi for ServerApiContractService {
         }
         let operation = reservation.operation;
         if operation.state != WorkspaceDeletionState::Succeeded {
+            let workspace_api = api
+                .api_for_workspace(&operation.workspace_id)
+                .await
+                .map_err(|error| ApiError::from(error).into_repository_api_error())?
+                .ok_or_else(|| {
+                    ApiError::from(Error::InvalidInput("Workspace no longer exists".into()))
+                        .into_repository_api_error()
+                })?;
+            // Persist before returning deletion start or scheduling resource cleanup.
+            workspace_api
+                .fence_drive()
+                .await
+                .map_err(|error| ApiError::from(error).into_repository_api_error())?;
             api.schedule_workspace_deletion(request.operation_id).await;
         }
         Ok(operation)
@@ -32220,6 +32324,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     mod auth_logging_tests;
+    mod drive_tests;
     mod subject_spawn_tests;
     mod subjektiv_jobs_tests;
     mod ticket_evidence_tests;
@@ -42803,6 +42908,7 @@ mod tests {
         let mut config = ServerConfig::local_dev(workspace_root.clone(), test_workspace())
             .with_embedded_runtime_store_root(store_root);
         config.database_path = workspace_root.join(".test-yoi-server.db");
+        config.data_root = workspace_root.join(".test-yoi-data");
         config.backend_base_url = Some("http://127.0.0.1:8787".to_string());
         let source = server_api::RepositorySource {
             kind: server_api::RepositorySourceKind::LocalPath,
@@ -57778,6 +57884,7 @@ mod tests {
         let mut config = ServerConfig::local_dev(workspace_root, test_workspace())
             .with_embedded_runtime_store_root(default_root.clone());
         config.database_path = ServerConfig::server_database_path_for_data_dir(&data_dir);
+        config.data_root = data_dir.clone();
         let store = test_control_store(&config);
         let app = build_inner_router(
             WorkspaceApi::new_with_execution_backend(

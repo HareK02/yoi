@@ -32,6 +32,7 @@ members = [
     "crates/tui",
     "crates/memory",
     "crates/feature-storage",
+    "crates/workspace-drive",
     "crates/subjektiv",
     "crates/ticket",
     "crates/merge-request",
@@ -71,6 +72,7 @@ default-members = [
     "crates/tui",
     "crates/memory",
     "crates/feature-storage",
+    "crates/workspace-drive",
     "crates/subjektiv",
     "crates/ticket",
     "crates/merge-request",
@@ -100,6 +102,7 @@ mcp = { path = "crates/mcp" }
 lint-common = { path = "crates/lint-common" }
 memory = { path = "crates/memory" }
 feature-storage = { path = "crates/feature-storage" }
+workspace-drive = { path = "crates/workspace-drive" }
 subjektiv = { path = "crates/subjektiv" }
 merge-request = { path = "crates/merge-request" }
 ticket = { path = "crates/ticket" }
