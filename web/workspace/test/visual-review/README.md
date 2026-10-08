@@ -91,4 +91,3 @@ capture error is expected. To repeat dark captures, use a scenario copy with
   The Web parser uses the generated nullable creation-response type directly.
   Backend persistence/idempotency is covered separately by Store/catalog and
   real HTTP boundary tests in `yoi-workspace-server`.
-
