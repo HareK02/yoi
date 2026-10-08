@@ -161,8 +161,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2.5"
 uuid = "1.23"
-wip-client = "0.1.0"
-wip-http = "0.1.0"
-wip-protocol = "0.1.0"
+# Released structured scope/lifetime contract and canonical Text View, one registry source.
+wip-client = "=0.2.0"
+wip-http = "=0.2.0"
+wip-protocol = "=0.2.0"
+wip-text-view = "=0.2.0"
 zeroize = "1"
 webauthn-rs = { version = "0.5.2", features = ["danger-allow-state-serialisation", "danger-credential-internals"] }
+
+[workspace.metadata.wip-upstream]
+repository = "https://gitea.hareworks.net/Hare/wip-rs"
+version = "0.2.0"
+reference-revision = "6086f3c5ef10aa1464ce9c824750d7f667217bfd"
+source = "crates.io"

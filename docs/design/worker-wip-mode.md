@@ -24,15 +24,17 @@ worker = { mode = "wip" }
 
 Omission resolves to `tools`, so existing manifests, profiles, persisted snapshots, and restored Workers retain the ordinary individual-tool surface. A direct Internal SubWorker selected with `profile = "inherit"` inherits the parent mode as reusable behavior. `default` and named profile selections use that profile's own mode and do not implicitly inherit WIP.
 
-The implementation uses the crates.io `wip-client`, `wip-protocol`, and `wip-http` **0.1.0** releases. It does not use Git/path dependencies or the old `wip-https` name. Those releases require Rust 1.88; the workspace declares `rust-version = "1.88"`, and the changed crates inherit it. WIP Host/interface crates are not needed for the async compatibility adapter: the published client/protocol/HTTP state machines remain authoritative while Yoi supplies an in-process async Host transport.
+The implementation uses the published **WIP 0.2.0** Client, HTTP, Protocol and official Text View packages from **crates.io**. Exact workspace version constraints and Cargo.lock registry checksums reproduce one Protocol type source; no local attachment, path override, Git snapshot or old registry 0.1.0 substitutes for the release. Canonical scope/Text View contracts were checked against wip-reference **6086f3c5ef10aa1464ce9c824750d7f667217bfd**. See [validation and resolution checks](../development/wip-integration-validation.md). CI/Nix dependency acquisition requires no upstream Git credentials. Yoi retains its async provider/transport and existing execution boundaries; upstream owns Client cache/lifecycle, codecs and signatures.
 
 ## LLM surface and route contract
 
 A WIP Worker exposes exactly these generic LLM tools instead of exposing every enabled ordinary tool twice:
 
-- `Discover`: observe an object path and bounded descendants, beginning at `/`.
-- `Inspect`: fetch the descriptor for an opaque interface reference returned by discovery.
-- `Call`: call an operation using fresh object and interface observations.
+- `Tree(path, depth)`: retrieve the full indexable range within depth 0..8, or report incomplete/loading/failed/limited coverage as an error. Children at the requested boundary remain unobserved (null), not empty. Cached nonindexable paths are never included by prefix scanning Known Space.
+- `Inspect(path)`: directly acquire an Object, then every published Interface, and return complete official Object/Interface signatures in declaration order. It requires no prior Tree or manual descriptor fetching. The path is explicit JSON envelope context outside the path-free signature. Summaries are complete; runtime metadata and documentation details are not appended to signatures.
+- `Invoke(path, interface, operation, arguments)`: use a structured `{scope, name}` reference and named argument record. The Client owns validators and observed scope_ref. Missing/stale/failed observations are recovered with at most one pre-dispatch retrieval per subject. A dispatched operation is never automatically retried.
+
+Tree and Inspect accept explicit `refresh: true` for blocked observations. An ensure API returning None is never itself readiness evidence: freshness, complete edge coverage and retained data are checked. Loading and capacity pressure are reported rather than superseded or busy-looped.
 
 The compatibility projection mounts enabled ordinary tools at:
 
@@ -40,13 +42,13 @@ The compatibility projection mounts enabled ordinary tools at:
 /tools/<exact-tool-registration-name>
 ```
 
-Each object has one opaque interface reference:
+Each compatibility Object publishes an explicit root-scoped reference:
 
 ```text
-yoi.tool/<exact-tool-registration-name>/v1
+{"scope":"/", "name":"yoi.tool/<exact-tool-registration-name>/v1"}
 ```
 
-Its single operation is `call`. For this compatibility route, `Call.arguments` is the original ordinary tool argument object. Native projections instead receive a JSON object keyed by the descriptor's declared parameter names. Native input is decoded with the published `wip-http` descriptor-bound codec, so named and composite types are resolved, an integral JSON number remains a WIP `Number` when declared as such, and WIP `Bytes` use the codec's canonical RFC 4648 base64 JSON representation. Tool argument IDs remain JSON values; the adapter never infers a domain object or Worldspace route from them.
+Its single operation is `call`. For this compatibility route, `Invoke.arguments` is `{ "input": <original ordinary tool argument object> }`, matching the descriptor's named Json parameter. Native projections instead receive a JSON object keyed by the descriptor's declared parameter names. Native input is decoded with the published `wip-http` descriptor-bound codec, so named and composite types are resolved, an integral JSON number remains a WIP `Number` when declared as such, and WIP `Bytes` use the codec's canonical RFC 4648 base64 JSON representation. Tool argument IDs remain JSON values; the adapter never infers a domain object or Worldspace route from them.
 
 The interface descriptor uses WIP `Json` for compatibility input and includes the exact original JSON Schema in descriptor documentation. Before execution, the Host validates the JSON value with that original schema and then delegates to the original async `Tool`. Constraints are therefore neither approximated nor silently dropped. A schema that cannot be compiled prevents WIP startup instead of creating a weaker projection.
 
@@ -65,7 +67,7 @@ Object resolution and operations are separate contracts. One mounted `WipProject
 - A native projection replaces a compatibility projection either by the original same-route semantic capability or by an explicit registry capability claim owned by a mounted native route.
 - Conflicting native claims fail startup. When native is selected, the claimed compatibility tool is hidden rather than exposed through a second entry. Normal Tool mode is unaffected because it does not install the WIP registry.
 
-`Inspect` renders the complete effective descriptor, including contributed operations, descriptor-local named declarations, and recursive record, list, enum, and union shapes with required flags and declaration documentation. The tests `host_namespace_object_resolution_and_operation_contributions_are_independent`, `operation_contributions_reject_interface_and_target_conflicts`, and `native_projection_preserves_descriptor_and_decodes_typed_arguments_end_to_end` demonstrate root allocation, unique resolution, contribution merging, collision rejection, current call-time authorization, complete descriptor inspection, and descriptor-typed invocation.
+`Inspect` delegates to official `wip-text-view::render_object` and `render_interface`; it renders the complete effective descriptor, including contributed operations, descriptor-local named declarations, and recursive record, list, enum, and union shapes with required flags and declaration documentation. The tests `host_namespace_object_resolution_and_operation_contributions_are_independent`, `operation_contributions_reject_interface_and_target_conflicts`, and `native_projection_preserves_descriptor_and_decodes_typed_arguments_end_to_end` demonstrate root allocation, unique resolution, contribution merging, collision rejection, current call-time authorization, complete descriptor inspection, and descriptor-typed invocation.
 
 The built-in native route migration is:
 
@@ -83,7 +85,7 @@ The built-in Repository/Workdir reference provider allocates `/repositories`, `/
 2. Mount a native collection `WipProjection` at that root with capability `repository:collection`, matching Object name and one declared interface. Static Objects underneath the root use the same capability owner prefix. A mounted collection retains its own identity, interfaces, and validator even when it has static children.
 3. For dynamic items, register one `WipDynamicMount` on the collection with capability `repository:item`. A foreign capability owner is rejected. Its `WipDynamicItemResolver` owns reference acceptance, Object identity, and current Object validator. It returns only a bounded direct child; it must not reinterpret a reference as another namespace or grant permission from existence.
 4. The reference provider supplies its read operations and handlers independently of management Feature enablement. An Object-only provider may use an empty operation descriptor. Enabled management Features register `WipOperationContribution` for static Objects or `WipDynamicOperationContribution` for a dynamic family; they do not allocate the namespace again or replace its resolver.
-5. Contributions use the existing interface reference and identical format, documentation, and type declarations, supplying only their new operations. Interface references are global: extending a descriptor that is also mounted elsewhere must not create different descriptors/validators under the same reference (registration fails). Use separate references for collection and item contracts. Failed contributions leave the registry unchanged.
+5. Contributions use the existing interface reference and identical format, documentation, and type declarations, supplying only their new operations. Interface references are exact (scope, name) keys: extending a descriptor that is also mounted elsewhere must not create different descriptors/validators under the same reference (registration fails). Use separate references for collection and item contracts. Failed contributions leave the registry unchanged.
 6. Handlers are responsible for checking current target capability and current subject authorization before dispatch. Registration/discovery is metadata, not a grant. A resolver/handler must retain the original permission identity and domain audit/failure contracts. Revocation after discovery must fail before provider dispatch. Compatibility mounts are restricted to `/tools/<tool-name>` and cannot bypass namespace ownership or republish legacy routes.
 
 Tests `management_enablement_is_independent_of_read_and_operation_permissions` and `contributed_interface_invalidates_observations_and_restore_requires_discovery` cover all eight enablement/read/manage combinations, direct-call rejection, effective descriptor changes, fresh runtime isolation under the same Worker identity, reset, and post-observation revocation.
@@ -103,13 +105,13 @@ The Worldspace contains only the operations registered from enabled Features and
 
 Filesystem scope, provider Workdir capability checks, Backend Workspace authority, Feature enablement, and input-specific restrictions stay in the original tool implementation and are checked again at invocation. `ask` permissions remain denied fail-closed because the runtime has no approval protocol. The gateway does not mint authority or expose authentication material.
 
-Pre/post Engine history still records one bounded `Call` result, while the compatibility result retains the original `ToolOutput`, including attachments and normal Engine output pruning. WIP call audit records retain the route, operation, request identity, and terminal classification.
+Pre/post Engine history still records one bounded `Invoke` result, while the compatibility result retains the original `ToolOutput`, including attachments and normal Engine output pruning. WIP call audit records retain the route, operation, request identity, and terminal classification.
 
 ## Client lifetime, restoration, and compaction
 
 The stateful `wip-client::Client` is owned by one Worker WIP runtime. Sessions are keyed by the canonical endpoint and an opaque security-context identity derived by the Host from Workspace, Worker, and session identity. Authentication credentials are not included in that identity and are never emitted to descriptors, tool output, or history.
 
-Known Space and interface observations are therefore not shared across Workers, endpoints, or security contexts. A restored Worker creates a new runtime/client and must explore again. `Discover(reset = true)` drops all observations before reconnect/authority-change exploration; `refresh = true` explicitly supersedes one cached observation. A normal compaction keeps the live runtime but the three gateway schemas are supplied again on every LLM request, including the instruction to begin discovery at `/`; the compacted transcript is not treated as cache authority.
+Known Space and interface observations are therefore not shared across Workers, endpoints, or security contexts. A restored Worker creates a new runtime/client and must explore again. `refresh = true` explicitly supersedes requested retrievals. Old string references in saved history remain historical text, not cache/wire authority; observations are runtime-only and are not persisted or restored. Resume by inspecting the target path, not by migrating an opaque display string. A normal compaction keeps the live runtime but the three gateway schemas are supplied again on every LLM request, including direct Inspect and indexable Tree semantics; the compacted transcript is not treated as cache authority.
 
 Saved Session/history entries remain append-only evidence and are never rewritten or replayed as calls. In particular, historical `/features/<feature>/...` text stays displayable but is not a current route alias. Passing such a legacy path to discovery or call returns `NotFound` with guidance to rediscover from `/`; the Host does not translate it, resolve it under another namespace, or expose old and new routes in parallel.
 
@@ -138,3 +140,13 @@ The runtime tracks bounded counters for:
 - successful operations.
 
 These values are returned with discovery/inspection output and are intended for comparing prompt input volume, exploration round trips, and representative operation success with ordinary Tool mode. No fixed reduction percentage is promised.
+
+## Scoped publication and display boundaries
+
+References are structured everywhere; wire requests reject legacy/display strings. Root and self scopes are valid; ancestry uses canonical path segments, not string prefixes. Contextual descriptors use the resolved Object path as their explicit self scope, not an encoded suffix on the local name. Fetching a self-scoped Interface freezes descriptor/validator and optional scope Object ref from the same live projection. A scope without a ref is valid; the adapter does not invent one. Calls check target existence, Object preconditions, scope/membership/ref, then Interface preconditions and arguments, with the selected descriptor and handler pinned for execution/result validation. Existing providers repeat current authorization and their captured Workdir/Workspace metadata checks at their execution/commit boundary. The registered artifacts alone are not call authority.
+
+Separate Interface namespaces on one static Object can be registered with `mount_interface`; the owner/identity cannot be replaced and duplicate Interface keys fail. Inspect preserves each Interface reference, even with identical operation names, and Invoke selects the exact namespace. Contribution merging retains one Interface and disjoint operation names.
+
+Official signature quoting, escapes and summary layout are preserved verbatim. Host documentation is untrusted data in Tool output, not instructions. RenderError categories and the failed path/reference are reported as display failures. Library input limits and Yoi envelope limits reject the entire display rather than truncating it or reporting no operations. No signature parser, shorthand-input parser, independent lexer, or custom escape engine is installed.
+
+Typed Entry results remain values; no eager result acquisition, guessed string-path conversion, or inferred indexable edges occur. A later Inspect failure never reclassifies a completed successful operation. FS indexable/list policy is a separate provider concern (T-714), not Client-side search/ranking.

@@ -101,7 +101,8 @@ pub fn mount_workspace_workdir_wip(
     for domain in [Domain::Repository, Domain::Workdir, Domain::Attachment] {
         let namespace =
             registry.allocate_namespace(domain.owner(), domain.route().trim_start_matches('/'))?;
-        let interface = format!("yoi.{}/collection/v1", domain.owner());
+        let interface =
+            crate::wip::root_reference(&format!("yoi.{}/collection/v1", domain.owner()));
         let handler = Arc::new(CollectionHandler {
             provider: provider.clone(),
             domain,
@@ -130,7 +131,7 @@ pub fn mount_workspace_workdir_wip(
                 handler,
             })?;
         }
-        let item_interface = format!("yoi.{}/item/v1", domain.owner());
+        let item_interface = crate::wip::root_reference(&format!("yoi.{}/item/v1", domain.owner()));
         let resolver = Arc::new(ItemResolver {
             provider: provider.clone(),
             domain,
@@ -668,7 +669,7 @@ impl WipDynamicItemResolver for ItemResolver {
         }
         let raw = self.provider.raw_item(self.domain, &id).ok()?;
         let projected = self.provider.projected(self.domain, &raw).ok()?;
-        let interface = format!("yoi.{}/item/v1", self.domain.owner());
+        let interface = crate::wip::root_reference(&format!("yoi.{}/item/v1", self.domain.owner()));
         Some(WipDynamicItem {
             object: object(&item_path(self.domain, &id), &id, &interface, &projected),
             handler: Arc::new(ItemHandler {
@@ -836,7 +837,12 @@ impl WipOperationHandler for ItemHandler {
     }
 }
 
-fn object(path: &str, identity: &str, interface: &str, value: &Json) -> Object {
+fn object(
+    path: &str,
+    identity: &str,
+    interface: &wip_protocol::InterfaceReference,
+    value: &Json,
+) -> Object {
     let mut digest = Sha256::new();
     digest.update(path);
     digest.update([0]);
@@ -844,7 +850,7 @@ fn object(path: &str, identity: &str, interface: &str, value: &Json) -> Object {
     Object {
         name: path.rsplit('/').next().unwrap_or_default().into(),
         description: Some(format!("Workspace authority Object: {identity}")),
-        interfaces: vec![interface.into()],
+        interfaces: vec![interface.clone()],
         r#ref: Some(identity.into()),
         validator: Some(digest.finalize().to_vec()),
     }
@@ -1658,7 +1664,7 @@ pub(crate) mod tests {
             registry.contribute_operations(WipOperationContribution {
                 route: WORKDIRS.into(),
                 contributor: "another-feature".into(),
-                interface: "yoi.workdir/collection/v1".into(),
+                interface: crate::wip::root_reference("yoi.workdir/collection/v1"),
                 descriptor: collection_descriptor(Domain::Workdir, true),
                 handler: Arc::new(CollectionHandler {
                     provider: provider(Arc::new(CatalogClient::default()), true, true, None),

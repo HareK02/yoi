@@ -33,10 +33,10 @@ fn runtime(
     )
     .unwrap()
 }
-async fn interface(r: &WipRuntime, path: &str) -> String {
-    r.discover(path.into(), 0, true).await.unwrap();
+async fn interface(r: &WipRuntime, path: &str) -> wip_protocol::InterfaceReference {
+    r.tree(path.into(), 0, true).await.unwrap();
     let p = r.host.projection_live(path).await.unwrap().unwrap();
-    r.inspect(p.interface.clone(), true).await.unwrap();
+    r.inspect(path.into(), true).await.unwrap();
     p.interface
 }
 async fn call(
