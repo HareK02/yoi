@@ -139,73 +139,29 @@ impl worker::WorkspaceClient for ConfigRouterClient {
         Ok(response)
     }
 }
-fn config_interface(path: &str) -> String {
-    // Use the published contextual interface identity, not a model-managed validator.
-    let hex = path
-        .bytes()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("yoi.workspace-config/node/v1/@/{hex}")
+async fn inspected_interface(runtime: &worker::wip::WipRuntime, path: &str, refresh: bool) -> wip_protocol::InterfaceReference {
+    let inspected = runtime.inspect(path.into(),refresh).await.unwrap();
+    let value: Value = serde_json::from_str(inspected.content.as_deref().unwrap()).unwrap();
+    assert_eq!(value["path"], path);
+    let reference = &value["interfaces"][0]["reference"];
+    wip_protocol::InterfaceReference { scope:reference["scope"].as_str().unwrap().into(), name:reference["name"].as_str().unwrap().into() }
 }
 async fn config_discover(runtime: &worker::wip::WipRuntime, path: &str) {
-    let observed = runtime
-        .discover(path.into(), 0, true)
-        .await
-        .unwrap()
-        .content
-        .unwrap();
-    assert!(
-        observed.contains(&config_interface(path)),
-        "interface must come from live discovery: {observed}"
-    );
-    runtime.inspect(config_interface(path), true).await.unwrap();
+    runtime.tree(path.into(),0,true).await.unwrap();
+    let reference = inspected_interface(runtime,path,true).await;
+    assert_eq!(reference.scope,path);
+    assert_eq!(reference.name,"yoi.workspace-config/node/v1");
 }
-async fn config_call(
-    runtime: &worker::wip::WipRuntime,
-    path: &str,
-    operation: &str,
-    args: Value,
-) -> std::result::Result<agen::tool::ToolOutput, agen::tool::ToolError> {
-    runtime
-        .call(
-            path.into(),
-            config_interface(path),
-            operation.into(),
-            args,
-            agen::tool::ToolExecutionContext::direct(),
-        )
-        .await
+async fn config_call(runtime: &worker::wip::WipRuntime, path: &str, operation: &str, args: Value) -> std::result::Result<agen::tool::ToolOutput, agen::tool::ToolError> {
+    let interface = inspected_interface(runtime,path,false).await;
+    runtime.invoke(path.into(),interface,operation.into(),args,agen::tool::ToolExecutionContext::direct()).await
 }
-
-async fn catalog_call(
-    runtime: &worker::wip::WipRuntime,
-    path: &str,
-    base: &str,
-    operation: &str,
-) -> Value {
-    let hex = path
-        .bytes()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let interface = format!("{base}/@/{hex}");
-    let discovered = runtime
-        .discover(path.into(), 0, true)
-        .await
-        .unwrap()
-        .content
-        .unwrap();
-    assert!(discovered.contains(&interface), "{discovered}");
-    runtime.inspect(interface.clone(), true).await.unwrap();
-    let output = runtime
-        .call(
-            path.into(),
-            interface,
-            operation.into(),
-            json!({}),
-            agen::tool::ToolExecutionContext::direct(),
-        )
-        .await
-        .unwrap();
+async fn catalog_call(runtime: &worker::wip::WipRuntime, path: &str, base: &str, operation: &str) -> Value {
+    runtime.tree(path.into(),0,true).await.unwrap();
+    let interface = inspected_interface(runtime,path,true).await;
+    assert_eq!(interface.scope,path);
+    assert_eq!(interface.name,base);
+    let output = runtime.invoke(path.into(),interface,operation.into(),json!({}),agen::tool::ToolExecutionContext::direct()).await.unwrap();
     serde_json::from_str(output.content.as_deref().unwrap()).unwrap()
 }
 
@@ -635,7 +591,7 @@ async fn assert_config_production_http_adapter(
     assert_config_catalog(&wip, &attached).await;
     config_discover(&wip, "/workspace-config/main.dcdl").await;
     let main_interface = wip
-        .inspect(config_interface("/workspace-config/main.dcdl"), true)
+        .inspect("/workspace-config/main.dcdl".into(), true)
         .await
         .unwrap()
         .content
