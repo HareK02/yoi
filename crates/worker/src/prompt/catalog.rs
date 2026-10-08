@@ -1027,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_orchestrator_cleanup_policy_renders_with_common_includes() {
+    fn builtin_orchestrator_cleanup_retains_terminal_responsibility_and_blocks_unfinished_work() {
         let rendered = PromptCatalog::builtins_only()
             .unwrap()
             .render_name("role.orchestrator", Value::UNDEFINED)
@@ -1040,7 +1040,21 @@ mod tests {
         assert!(rendered.contains("call `WorkerStop`"));
         assert!(rendered.contains("call `WorkerRemove`"));
         assert!(rendered.contains("only then call `WorkdirDelete`"));
-        assert!(rendered.contains("`CurrentAssignment` means unassign and reread"));
+        assert!(rendered.contains("must have no unfinished Ticket work"));
+        assert!(rendered.contains("does not require unassignment before cleanup"));
+        assert!(rendered.contains("`UnfinishedWork` (`unfinished_work` on the wire)"));
+        assert!(rendered.contains("requires explicit work end or reassignment"));
+        assert!(rendered.contains("idle or stopped status does not end unfinished work"));
+        for stale_policy in [
+            "no current Ticket assignment",
+            "unassign it through the available orchestration authority",
+            "`CurrentAssignment`",
+        ] {
+            assert!(
+                !rendered.contains(stale_policy),
+                "stale cleanup policy: {stale_policy}"
+            );
+        }
         assert!(!rendered.contains("{% include"));
     }
 }

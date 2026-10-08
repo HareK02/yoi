@@ -1149,7 +1149,7 @@ pub fn description(n: &str) -> Option<&'static str> {
             "Record Orchestrator-owned integration for the explicitly addressed Merge Request without completing the Ticket or releasing its assignment.",
         ),
         "CompleteTicket" => Some(
-            "Complete the Ticket only after reviewing its current item revision and exact linked Merge Request result set; this releases the current assignment atomically.",
+            "Complete the Ticket only after reviewing its current item revision and exact linked Merge Request result set; this ends unfinished work atomically while retaining responsibility and assignment history.",
         ),
         "ReviewMergeRequest" => Some(
             "Submit the injected Reviewer capability result for its captured exact source ref; source movement cancels it, while target-only movement does not.",

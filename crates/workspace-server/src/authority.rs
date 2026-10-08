@@ -146,7 +146,7 @@ impl merge_request::AssignmentSource for AuthorityMergeRequestSource {
         ticket_id: &str,
     ) -> std::result::Result<Option<merge_request::CurrentAssignment>, String> {
         self.store
-            .get_current_ticket_coder_assignment(workspace_id, ticket_id)
+            .get_active_ticket_worker_assignment(workspace_id, ticket_id)
             .map(|assignment| {
                 assignment.map(|assignment| merge_request::CurrentAssignment {
                     assignment_id: assignment.assignment_id,
@@ -831,10 +831,15 @@ impl SqliteWorkspaceAuthority {
                 })
             })
             .transpose()?;
-        let has_orchestrator = role_assignments
+        // Responsibility remains visible after work ends; action eligibility must
+        // use only active unfinished work, including after a Ticket is reopened.
+        let active_role_assignments = self
+            .store
+            .list_active_ticket_role_assignments(&self.workspace_id, id)?;
+        let has_orchestrator = active_role_assignments
             .iter()
             .any(|assignment| assignment.role == TicketAssignmentRole::Orchestrator);
-        let has_coder = role_assignments
+        let has_coder = active_role_assignments
             .iter()
             .any(|assignment| assignment.role == TicketAssignmentRole::Coder);
         let targets = ticket
@@ -860,7 +865,7 @@ impl SqliteWorkspaceAuthority {
         for ticket_id in &dependency_check.queue_tickets {
             let assignments = self
                 .store
-                .list_current_ticket_role_assignments(&self.workspace_id, ticket_id)?;
+                .list_active_ticket_role_assignments(&self.workspace_id, ticket_id)?;
             if !assignments
                 .iter()
                 .any(|assignment| assignment.role == TicketAssignmentRole::Orchestrator)

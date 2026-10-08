@@ -69,7 +69,7 @@ pub struct WorkerRemovalPlanRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerRemovalBlocker {
     Hold,
-    CurrentAssignment {
+    UnfinishedWork {
         assignment_id: String,
         ticket_id: String,
     },
@@ -229,8 +229,8 @@ impl SqliteWorkspaceStore {
             };
             let mut blockers=Vec::new();
             if worker.retention_state=="pinned" { blockers.push(WorkerRemovalBlocker::Hold); }
-            if let Some((assignment_id,ticket_id))=tx.query_row("SELECT a.assignment_id,a.ticket_id FROM ticket_current_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.ticket_id=c.ticket_id AND a.assignment_id=c.assignment_id WHERE a.workspace_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3",params![req.workspace_id,req.worker.runtime_id,req.worker.worker_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()? {
-                blockers.push(WorkerRemovalBlocker::CurrentAssignment{assignment_id,ticket_id});
+            if let Some((assignment_id,ticket_id))=tx.query_row("SELECT a.assignment_id,a.ticket_id FROM ticket_active_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.ticket_id=c.ticket_id AND a.assignment_id=c.assignment_id WHERE a.workspace_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3",params![req.workspace_id,req.worker.runtime_id,req.worker.worker_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()? {
+                blockers.push(WorkerRemovalBlocker::UnfinishedWork{assignment_id,ticket_id});
             }
             let fp=fingerprint(req,&worker.updated_at,inv,&policy,&blockers)?;
             let plan_id=stable("wrp",&fp); let operation_id=stable("wro",&fp);
@@ -276,10 +276,10 @@ impl SqliteWorkspaceStore {
                 mark_stale(&tx,&plan,"hold added")?;tx.commit()?;
                 return Err(stale_error(&plan,"hold added"));
             }
-            let assigned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_current_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.ticket_id=c.ticket_id AND a.assignment_id=c.assignment_id WHERE a.workspace_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3)",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id],|r|r.get(0))?;
+            let assigned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.ticket_id=c.ticket_id AND a.assignment_id=c.assignment_id WHERE a.workspace_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3)",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id],|r|r.get(0))?;
             if assigned{
-                mark_stale(&tx,&plan,"current assignment added")?;tx.commit()?;
-                return Err(stale_error(&plan,"current assignment added"));
+                mark_stale(&tx,&plan,"unfinished work added")?;tx.commit()?;
+                return Err(stale_error(&plan,"unfinished work added"));
             }
             let now=Utc::now().to_rfc3339();
             tx.execute("UPDATE worker_removal_operations SET state='executing',updated_at=?1 WHERE operation_id=?2",params![now,plan.operation_id])?;
@@ -462,8 +462,8 @@ impl SqliteWorkspaceStore {
             let worker=load_worker(&tx,workspace_id,&plan.worker)?.ok_or_else(||StoreError::InvalidInput("Worker missing before commit".into()))?;
             if worker.updated_at!=plan.worker_revision{return Err(StoreError::InvalidInput(format!("stale:{}:Worker revision changed",plan.plan_id)));}
             if worker.retention_state=="pinned" { return Err(StoreError::InvalidInput(format!("stale:{}:hold added",plan.plan_id))); }
-            let assigned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_current_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.ticket_id=c.ticket_id AND a.assignment_id=c.assignment_id WHERE a.workspace_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3)",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id],|row|row.get(0))?;
-            if assigned { return Err(StoreError::InvalidInput(format!("stale:{}:current assignment added",plan.plan_id))); }
+            let assigned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.ticket_id=c.ticket_id AND a.assignment_id=c.assignment_id WHERE a.workspace_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3)",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id],|row|row.get(0))?;
+            if assigned { return Err(StoreError::InvalidInput(format!("stale:{}:unfinished work added",plan.plan_id))); }
             let now=Utc::now().to_rfc3339();
             if let Some(a)=&result.archive{
                 if plan.archive_id.as_deref()!=Some(&a.archive_id)||a.workspace_id!=workspace_id||a.source_runtime_id!=plan.worker.runtime_id||a.source_worker_id.to_string()!=plan.worker.worker_id||a.policy_id!=plan.policy_id||a.policy_revision!=plan.policy_revision{return Err(StoreError::InvalidInput("archive manifest mismatch".into()));}
@@ -1427,29 +1427,60 @@ mod tests {
         ).map_err(StoreError::from)).unwrap();
         assert_eq!(historical, 1);
     }
+    fn install_current_assignment(
+        s: &SqliteWorkspaceStore,
+        assignment_id: &str,
+    ) -> crate::Result<()> {
+        let assignment = TicketCoderAssignmentRecord {
+            workspace_id: "w".into(),
+            ticket_id: "ticket".into(),
+            assignment_id: assignment_id.into(),
+            worker: req().worker,
+            assigned_by: "test".into(),
+            assigned_at: "t".into(),
+        };
+        s.set_current_ticket_coder_assignment(
+            &assignment,
+            None,
+            &format!("event-{assignment_id}"),
+            &format!("operation-{assignment_id}"),
+            false,
+        )
+        .map(|_| ())
+    }
+
+    fn seed_current_assignment(s: &SqliteWorkspaceStore) {
+        install_current_assignment(s, "assignment").unwrap();
+    }
+
+    fn reopened_terminal_assignment_store(terminal_state: &str) -> SqliteWorkspaceStore {
+        let store = setup();
+        seed_current_assignment(&store);
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE typed_tickets SET workflow_state=?1
+                     WHERE workspace_id='w' AND ticket_id='ticket'",
+                    [terminal_state],
+                )?;
+                conn.execute(
+                    "UPDATE typed_tickets SET workflow_state='planning'
+                     WHERE workspace_id='w' AND ticket_id='ticket'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        store
+    }
+
     #[test]
     fn assignment_and_orphan_are_authoritative() {
         let s = setup();
-        s.with_conn(|c| {
-            let stable_worker_id = worker_id().to_string();
-            c.execute(
-                "INSERT INTO ticket_worker_assignments(\
-                    workspace_id,ticket_id,assignment_id,runtime_id,worker_id,assigned_by,assigned_at\
-                 ) VALUES('w','ticket','assignment','r',?1,'test','t')",
-                [&stable_worker_id],
-            )?;
-            c.execute(
-                "INSERT INTO ticket_current_worker_assignments(\
-                    workspace_id,ticket_id,assignment_id,runtime_id,worker_id,updated_at\
-                 ) VALUES('w','ticket','assignment','r',?1,'t')",
-                [&stable_worker_id],
-            )?;
-            Ok(())
-        })
-        .unwrap();
+        seed_current_assignment(&s);
         let p = s.plan_worker_removal(&req(), &inv()).unwrap();
         assert!(
-            matches!(&p.blockers[..],[WorkerRemovalBlocker::CurrentAssignment{assignment_id,ticket_id}] if assignment_id=="assignment"&&ticket_id=="ticket")
+            matches!(&p.blockers[..],[WorkerRemovalBlocker::UnfinishedWork{assignment_id,ticket_id}] if assignment_id=="assignment"&&ticket_id=="ticket")
         );
         let runtime_only = WorkerRetentionInventory {
             workspace_id: "w".into(),
@@ -1501,6 +1532,355 @@ mod tests {
             .unwrap();
         assert_eq!(unchanged, 2);
     }
+    #[test]
+    fn unfinished_work_blocker_uses_explicit_wire_kind() {
+        let wire = serde_json::json!({
+            "kind": "unfinished_work",
+            "assignment_id": "assignment",
+            "ticket_id": "ticket",
+        });
+        let blocker: WorkerRemovalBlocker = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(blocker).unwrap(), wire);
+    }
+
+    #[test]
+    fn terminal_retained_assignment_allows_worker_removal_even_after_reopen() {
+        for (status, workflow_state) in [("closed", "closed"), ("open", "done")] {
+            for reopen in [false, true] {
+                let store = setup();
+                seed_current_assignment(&store);
+                store
+                    .with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE typed_tickets SET status=?1, workflow_state=?2
+                             WHERE workspace_id='w' AND ticket_id='ticket'",
+                            params![status, workflow_state],
+                        )?;
+                        if reopen {
+                            conn.execute(
+                                "UPDATE typed_tickets SET status='open', workflow_state='planning'
+                                 WHERE workspace_id='w' AND ticket_id='ticket'",
+                                [],
+                            )?;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                store
+                    .update_worker_retention_policy(
+                        "w",
+                        1,
+                        &WorkerRetentionPolicyUpdate {
+                            policy_id: "purge".into(),
+                            session_disposition: SessionDisposition::Purge,
+                            metadata_disposition: MetadataDisposition::Tombstone,
+                            archive_retention: ArchiveRetention::Forever,
+                            diagnostics_disposition: DiagnosticsDisposition::Purge,
+                            diagnostics_retention_seconds: None,
+                        },
+                    )
+                    .unwrap();
+                let plan = store.plan_worker_removal(&req(), &inv()).unwrap();
+                assert!(
+                    plan.blockers.is_empty(),
+                    "{status}/{workflow_state}, reopened={reopen}"
+                );
+                store
+                    .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+                    .unwrap();
+                let result = WorkerRetentionExecutionResult {
+                    operation_id: plan.operation_id.clone(),
+                    input_fingerprint: plan.input_fingerprint.clone(),
+                    expected_worker_revision: plan.worker_revision.clone(),
+                    worker_id: worker_id(),
+                    session_disposition: plan.session_disposition,
+                    diagnostics_disposition: plan.diagnostics_disposition,
+                    archive: None,
+                    source_removed: true,
+                    diagnostics_retained: false,
+                };
+                let committed = store
+                    .commit_worker_removal(
+                        "w",
+                        &plan.operation_id,
+                        &plan.input_fingerprint,
+                        &result,
+                    )
+                    .unwrap();
+                assert_eq!(committed.plan.state, WorkerRemovalPlanState::Succeeded);
+                assert!(
+                    store
+                        .get_worker_registry("w", &plan.worker)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(store.worker_tombstone("w", &plan.worker).unwrap().is_some());
+                let (retained, historical): (i64, i64) = store
+                    .with_conn(|conn| {
+                        Ok((
+                            conn.query_row(
+                                "SELECT COUNT(*) FROM ticket_current_worker_assignments
+                                 WHERE workspace_id='w' AND assignment_id='assignment'",
+                                [],
+                                |row| row.get(0),
+                            )?,
+                            conn.query_row(
+                                "SELECT COUNT(*) FROM ticket_worker_assignments
+                                 WHERE workspace_id='w' AND assignment_id='assignment'",
+                                [],
+                                |row| row.get(0),
+                            )?,
+                        ))
+                    })
+                    .unwrap();
+                assert_eq!(
+                    (retained, historical),
+                    (1, 1),
+                    "assignment history must survive removal"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unfinished_work_added_after_planning_blocks_preparation() {
+        let store = setup();
+        let plan = store.plan_worker_removal(&req(), &inv()).unwrap();
+        seed_current_assignment(&store);
+        let error = store
+            .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+            .unwrap_err();
+        assert!(
+            matches!(error, WorkerRetentionError::StalePlan { reason, .. }
+            if reason == "unfinished work added")
+        );
+        assert!(
+            store
+                .get_worker_registry("w", &plan.worker)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn distinct_assignment_after_terminal_end_blocks_preparation() {
+        for terminal_state in ["done", "closed"] {
+            let store = reopened_terminal_assignment_store(terminal_state);
+            let plan = store.plan_worker_removal(&req(), &inv()).unwrap();
+            assert!(plan.blockers.is_empty());
+            install_current_assignment(&store, "new-assignment").unwrap();
+            let blocked = store.plan_worker_removal(&req(), &inv()).unwrap();
+            assert_eq!(
+                blocked.blockers,
+                vec![WorkerRemovalBlocker::UnfinishedWork {
+                    assignment_id: "new-assignment".into(),
+                    ticket_id: "ticket".into(),
+                }]
+            );
+            let replay = store.plan_worker_removal(&req(), &inv()).unwrap();
+            assert_eq!(replay.plan_id, blocked.plan_id);
+            assert_eq!(replay.input_fingerprint, blocked.input_fingerprint);
+            assert_ne!(blocked.plan_id, plan.plan_id);
+            let error = store
+                .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+                .unwrap_err();
+            assert!(
+                matches!(error, WorkerRetentionError::StalePlan { reason, .. }
+                if reason == "unfinished work added")
+            );
+            assert!(
+                store
+                    .get_worker_registry("w", &plan.worker)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_removal_fences_distinct_assignment_after_terminal_end() {
+        let store = reopened_terminal_assignment_store("done");
+        let plan = store.plan_worker_removal(&req(), &inv()).unwrap();
+        store
+            .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+            .unwrap();
+        let error = install_current_assignment(&store, "new-assignment").unwrap_err();
+        assert!(
+            matches!(error, StoreError::TicketAssignmentConflict(message)
+            if message.contains("being retained or has been removed"))
+        );
+        let (current, history): (i64, i64) = store
+            .with_conn(|conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM ticket_current_worker_assignments
+                         WHERE workspace_id='w' AND ticket_id='ticket'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM ticket_worker_assignments
+                         WHERE workspace_id='w' AND assignment_id='new-assignment'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(current, 1, "the ended responsibility must remain retained");
+        assert_eq!(history, 0, "the rejected new identity must roll back");
+    }
+
+    #[test]
+    fn commit_rechecks_distinct_assignment_independently_of_admission_fence() {
+        let store = reopened_terminal_assignment_store("done");
+        let plan = store.plan_worker_removal(&req(), &inv()).unwrap();
+        store
+            .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+            .unwrap();
+        // Fault injection is confined to this in-memory authority fixture: use
+        // direct SQLite writes to bypass the public API removal fence, and drop
+        // both principal admission triggers to prove commit's independent guard.
+        store
+            .with_conn_mut(|conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                tx.execute_batch(
+                    "DROP TRIGGER ticket_active_worker_principal_insert;
+                     DROP TRIGGER ticket_active_worker_principal_update;",
+                )?;
+                tx.execute(
+                    "INSERT INTO ticket_worker_assignments (
+                        workspace_id, ticket_id, assignment_id, runtime_id, worker_id,
+                        assigned_by, assigned_at
+                     ) VALUES ('w', 'ticket', 'new-assignment', 'r', ?1, 'test', 'new')",
+                    [worker_id().to_string()],
+                )?;
+                let replaced = tx.execute(
+                    "UPDATE ticket_current_worker_assignments
+                     SET assignment_id='new-assignment', updated_at='new'
+                     WHERE workspace_id='w' AND ticket_id='ticket' AND role='coder'
+                       AND assignment_id='assignment'
+                       AND EXISTS (
+                           SELECT 1 FROM ticket_assignment_work_releases
+                           WHERE workspace_id='w' AND assignment_id='assignment'
+                       )",
+                    [],
+                )?;
+                if replaced != 1 {
+                    return Err(StoreError::InvalidInput(
+                        "fault injection requires one ended current assignment".into(),
+                    ));
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+        let result = WorkerRetentionExecutionResult {
+            operation_id: plan.operation_id.clone(),
+            input_fingerprint: plan.input_fingerprint.clone(),
+            expected_worker_revision: plan.worker_revision.clone(),
+            worker_id: worker_id(),
+            session_disposition: plan.session_disposition,
+            diagnostics_disposition: plan.diagnostics_disposition,
+            archive: None,
+            source_removed: true,
+            diagnostics_retained: false,
+        };
+        let error = store
+            .commit_worker_removal("w", &plan.operation_id, &plan.input_fingerprint, &result)
+            .unwrap_err();
+        assert!(
+            matches!(error, WorkerRetentionError::StalePlan { reason, .. }
+            if reason == "unfinished work added")
+        );
+        assert!(
+            store
+                .get_worker_registry("w", &plan.worker)
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.worker_tombstone("w", &plan.worker).unwrap().is_none());
+        let (state, active): (String, String) = store
+            .with_conn(|conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT state FROM worker_removal_operations WHERE operation_id=?1",
+                        [&plan.operation_id],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT assignment_id FROM ticket_active_worker_assignments
+                         WHERE workspace_id='w' AND ticket_id='ticket'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            state, "executing",
+            "rejected commit must remain recoverable"
+        );
+        assert_eq!(
+            active, "new-assignment",
+            "the ended identity must not reactivate"
+        );
+    }
+
+    #[test]
+    fn terminal_assignment_does_not_bypass_hold_added_before_commit() {
+        let store = setup();
+        seed_current_assignment(&store);
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE typed_tickets SET workflow_state='done'
+                     WHERE workspace_id='w' AND ticket_id='ticket'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let plan = store.plan_worker_removal(&req(), &inv()).unwrap();
+        store
+            .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+            .unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE worker_registry SET retention_state='pinned'
+                     WHERE workspace_id='w' AND runtime_id='r' AND worker_id=?1",
+                    [worker_id().to_string()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let result = WorkerRetentionExecutionResult {
+            operation_id: plan.operation_id.clone(),
+            input_fingerprint: plan.input_fingerprint.clone(),
+            expected_worker_revision: plan.worker_revision.clone(),
+            worker_id: worker_id(),
+            session_disposition: plan.session_disposition,
+            diagnostics_disposition: plan.diagnostics_disposition,
+            archive: None,
+            source_removed: true,
+            diagnostics_retained: false,
+        };
+        let error = store
+            .commit_worker_removal("w", &plan.operation_id, &plan.input_fingerprint, &result)
+            .unwrap_err();
+        assert!(
+            matches!(error, WorkerRetentionError::StalePlan { reason, .. }
+            if reason == "hold added")
+        );
+        assert!(
+            store
+                .get_worker_registry("w", &plan.worker)
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[test]
     fn concurrent_plan_converges_and_purge_omits_tombstone() {
         let s = std::sync::Arc::new(setup());

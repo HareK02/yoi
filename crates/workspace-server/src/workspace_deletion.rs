@@ -45,6 +45,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "repository_ssh_host_trusts",
     "server_secret_versions",
     "ticket_assignment_operations",
+    "ticket_assignment_work_releases",
     "ticket_assignment_ticket_tombstones",
     "ticket_assignment_worker_tombstones",
     "ticket_current_worker_assignments",
@@ -686,10 +687,10 @@ fn workspace_database_blockers(
 
     for (sql, kind, resource_kind, message) in [
         (
-            "SELECT COUNT(*) FROM ticket_current_worker_assignments WHERE workspace_id = ?1",
+            "SELECT COUNT(*) FROM ticket_active_worker_assignments WHERE workspace_id = ?1",
             WorkspaceDeletionBlockerKind::WorkerRemovalBlocked,
             "ticket",
-            "Remove current Ticket assignments before deleting the Workspace.",
+            "End unfinished Ticket work before deleting the Workspace.",
         ),
         (
             "SELECT COUNT(*)
