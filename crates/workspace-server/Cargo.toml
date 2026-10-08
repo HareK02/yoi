@@ -11,6 +11,7 @@ name = "yoi-server"
 path = "src/main.rs"
 
 [dependencies]
+api-macros = { workspace = true, features = ["axum"] }
 async-trait.workspace = true
 axum = { workspace = true, features = ["ws"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

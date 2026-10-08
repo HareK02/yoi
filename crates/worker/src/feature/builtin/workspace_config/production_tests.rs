@@ -428,7 +428,7 @@ fn runtime(client: Arc<dyn WorkspaceClient>) -> (WorkspaceConfigFeature, WipRunt
     let runtime = WipRuntime::from_mounts(mounts, "worker-1@workspace-1".into()).unwrap();
     (feature, runtime)
 }
-fn interface(path: &str, attached: bool) -> String {
+fn interface(path: &str, attached: bool) -> wip_protocol::InterfaceReference {
     crate::wip::contextual_reference(
         if attached {
             "yoi.workspace-config/node/v1"
@@ -438,12 +438,9 @@ fn interface(path: &str, attached: bool) -> String {
         path,
     )
 }
-async fn observe_interface(runtime: &WipRuntime, path: &str, attached: bool) {
-    runtime.discover(path.into(), 0, true).await.unwrap();
-    runtime
-        .inspect(interface(path, attached), true)
-        .await
-        .unwrap();
+async fn observe_interface(runtime: &WipRuntime, path: &str, _attached: bool) {
+    runtime.tree(path.into(), 0, true).await.unwrap();
+    runtime.inspect(path.into(), true).await.unwrap();
 }
 async fn call(
     runtime: &WipRuntime,
@@ -497,7 +494,7 @@ async fn workspace_config_production_slash_deep_discover_read_edit_and_atomic_im
             .starts_with("Already attached")
     );
     let discovered = runtime
-        .discover(CONTENT_ROOT.into(), 5, true)
+        .tree(CONTENT_ROOT.into(), 5, true)
         .await
         .unwrap()
         .content
@@ -606,7 +603,7 @@ async fn workspace_config_production_native_attach_create_delete_and_detach_end_
     );
     assert!(
         runtime
-            .discover("/workspace-config/main.dcdl".into(), 0, true)
+            .tree("/workspace-config/main.dcdl".into(), 0, true)
             .await
             .is_err()
     );
@@ -633,19 +630,15 @@ async fn workspace_config_production_revocation_ro_cross_workspace_and_cache_iso
     );
     observe_interface(&runtime, path, true).await;
     let descriptor = runtime
-        .inspect(interface(path, true), true)
+        .inspect(path.into(), true)
         .await
         .unwrap()
         .content
         .unwrap();
     let descriptor: Json = serde_json::from_str(&descriptor).unwrap();
-    let names = descriptor["descriptor"]["operations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|op| op["name"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(names, ["read"]);
+    let signature = descriptor["interfaces"][0]["signature"].as_str().unwrap();
+    assert!(signature.contains("operation read("));
+    assert!(!signature.contains("operation write("));
     assert!(
         call(&runtime, path, "write", json!({"content":"DENIED"}))
             .await
@@ -657,7 +650,7 @@ async fn workspace_config_production_revocation_ro_cross_workspace_and_cache_iso
     });
     let (feature, other) = runtime_for_cross(cross);
     assert!(feature.attach("cross", None).await.is_err());
-    assert!(other.discover(path.into(), 0, false).await.is_err());
+    assert!(other.tree(path.into(), 0, false).await.is_err());
     assert!(client.state.lock().unwrap().commits.is_empty());
 }
 fn runtime_for_cross(client: Arc<dyn WorkspaceClient>) -> (WorkspaceConfigFeature, WipRuntime) {
@@ -760,21 +753,16 @@ async fn workspace_config_production_bounds_and_traversal_reject_before_content_
     let client = Router::new();
     let (feature, runtime) = runtime(client.clone());
     feature.attach("initial", None).await.unwrap();
-    assert!(
-        runtime
-            .discover(CONTENT_ROOT.into(), 9, true)
-            .await
-            .is_err()
-    );
+    assert!(runtime.tree(CONTENT_ROOT.into(), 9, true).await.is_err());
     for path in [
         "/workspace-config/../secret",
         "/workspace-config//main.dcdl",
         "/workspace-config/./main.dcdl",
     ] {
-        assert!(runtime.discover(path.into(), 0, true).await.is_err());
+        assert!(runtime.tree(path.into(), 0, true).await.is_err());
     }
     let path = format!("/workspace-config/{}", "a".repeat(513));
-    assert!(runtime.discover(path, 0, true).await.is_err());
+    assert!(runtime.tree(path, 0, true).await.is_err());
     assert!(client.state.lock().unwrap().commits.is_empty());
 }
 
@@ -837,7 +825,7 @@ async fn workspace_config_production_cumulative_node_limit_and_edit_growth_are_b
     // No individual depth-1 response exceeds the cap; the whole Host traversal
     // must nevertheless stop before exceeding 256 Objects.
     let error = runtime
-        .discover(CONTENT_ROOT.into(), 4, true)
+        .tree(CONTENT_ROOT.into(), 4, true)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("ResourceLimitExceeded"));
@@ -849,7 +837,7 @@ async fn workspace_config_production_backend_failure_is_not_hidden_as_unauthoriz
     client.state.lock().unwrap().fail_current = true;
     let (_, runtime) = runtime(client);
     let error = runtime
-        .discover(CONTENT_ROOT.into(), 0, true)
+        .tree(CONTENT_ROOT.into(), 0, true)
         .await
         .unwrap_err();
     let message = error.to_string();
@@ -907,16 +895,11 @@ async fn workspace_config_production_ungranted_root_does_not_poison_worldspace_d
     let client = Router::new();
     client.state.lock().unwrap().granted = false;
     let (_, runtime) = runtime(client.clone());
-    let discovery = runtime.discover("/".into(), 2, true).await.unwrap();
+    let discovery = runtime.tree("/".into(), 2, true).await.unwrap();
     let discovery: Json = serde_json::from_str(discovery.content.as_deref().unwrap()).unwrap();
-    assert_eq!(discovery["known_space"].as_array().unwrap().len(), 1);
-    assert_eq!(discovery["known_space"][0]["path"], "/");
-    assert!(
-        runtime
-            .discover(CONTENT_ROOT.into(), 0, true)
-            .await
-            .is_err()
-    );
+    assert_eq!(discovery["tree"]["children"], json!([]));
+    assert_eq!(discovery["tree"]["path"], "/");
+    assert!(runtime.tree(CONTENT_ROOT.into(), 0, true).await.is_err());
     assert!(
         client
             .state

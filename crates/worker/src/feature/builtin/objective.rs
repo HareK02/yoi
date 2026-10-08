@@ -578,11 +578,11 @@ pub fn mount_workspace_http_objective_wip(
                 "Authoritative Objective collection; search and create through Backend authority"
                     .into(),
             ),
-            interfaces: vec![OBJECTIVE_COLLECTION_INTERFACE.into()],
+            interfaces: vec![crate::wip::root_reference(OBJECTIVE_COLLECTION_INTERFACE)],
             r#ref: Some("objective:collection".into()),
             validator: Some(route_validator(&collection_route, "collection")),
         },
-        interface: OBJECTIVE_COLLECTION_INTERFACE.into(),
+        interface: crate::wip::root_reference(OBJECTIVE_COLLECTION_INTERFACE),
         descriptor: collection_descriptor,
         interface_validator: Some(collection_validator),
         handler: collection_handler,
@@ -593,7 +593,7 @@ pub fn mount_workspace_http_objective_wip(
     registry.mount_dynamic(WipDynamicMount {
         collection_route: collection_route.clone(),
         capability: "objective:item".into(),
-        interface: OBJECTIVE_ITEM_INTERFACE.into(),
+        interface: crate::wip::root_reference(OBJECTIVE_ITEM_INTERFACE),
         descriptor: item_descriptor,
         interface_validator: Some(item_validator),
         resolver: Arc::new(ObjectiveItemResolver {
@@ -744,7 +744,7 @@ impl WipDynamicItemResolver for ObjectiveItemResolver {
             object: Object {
                 name: item_reference.to_string(),
                 description: Some("Authoritative Objective bound to this object route".into()),
-                interfaces: vec![OBJECTIVE_ITEM_INTERFACE.into()],
+                interfaces: vec![crate::wip::root_reference(OBJECTIVE_ITEM_INTERFACE)],
                 r#ref: Some(format!("objective:{item_reference}")),
                 validator: Some(route_validator(&route, &revision)),
             },

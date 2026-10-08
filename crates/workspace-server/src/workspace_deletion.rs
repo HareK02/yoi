@@ -87,6 +87,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "worker_workdir_links",
     "workspace_config_entries",
     "workspace_config_grants",
+    "workspace_drive_grants",
     "workspace_config_tree_revisions",
     "workspace_config_trees",
     "workspace_create_operations",

@@ -56,6 +56,9 @@
 //! `#[header("x-request-id")]`. Exactly one JSON or binary body is allowed. JSON request, response,
 //! and error bodies must be named Rust types; tuples, references, arrays, and other anonymous
 //! structural types are rejected. Binary request bodies use [`BinaryBody`] and remain byte-exact.
+//! A named success response whose final type identifier is `BinaryBody` is likewise byte-exact,
+//! uses `application/octet-stream`, and may include declared response headers. Generated clients
+//! collect binary responses under the same configured response byte limit as JSON responses.
 //! `openapi = false` explicitly excludes an operation whose wire body cannot yet satisfy the
 //! strict OpenAPI schema boundary; Reqwest and Axum adapters are still generated.
 //!
@@ -96,7 +99,7 @@
 //! deterministic `Operation<utf8-hex>` fallback. The `ApiContract::OPERATIONS` inventory is
 //! sorted by operation ID, so its ordering is independent of source method order.
 //!
-//! Empty, JSON, and bounded binary request bodies are supported. [`WireKind`] reserves explicit
+//! Empty, JSON, and bounded binary request and success response bodies are supported. [`WireKind`] reserves explicit
 //! variants for other future transport work; accepting one requires a deliberate macro and adapter
 //! change rather than silently treating it as JSON.
 //!
@@ -148,7 +151,7 @@ pub mod openapi;
 #[cfg(feature = "reqwest")]
 pub mod reqwest;
 
-/// Framework-neutral owned bytes used by explicit `#[binary]` request bodies.
+/// Framework-neutral owned bytes used by explicit `#[binary]` requests and binary success responses.
 ///
 /// The wrapper preserves the exact byte sequence while keeping payload content out of `Debug`
 /// output. Its `bytes::Bytes` storage lets generated Axum adapters transfer an extracted body
@@ -314,7 +317,7 @@ pub trait Operation {
     type Parameters;
     /// Typed JSON or binary request body, or [`NoBody`].
     type RequestBody;
-    /// JSON success response body type, generated declared-response result, or [`NoBody`].
+    /// JSON or binary success body type, generated declared-response result, or [`NoBody`].
     type ResponseBody;
     /// JSON public error body type, or [`NoBody`].
     type ErrorBody;

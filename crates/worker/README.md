@@ -90,7 +90,7 @@ manifests of already-running Workers.
 
 Public integration seams: `WorkspaceConfigFeature::for_workspace`,
 `workspace_config::wip::mount_workspace_config_wip`, and
-`WipRuntime::from_mounts` plus `discover`/`inspect`/`call`. Worker tests exercise the
+`WipRuntime::from_mounts` plus `tree`/`inspect`/`invoke`. Worker tests exercise the
 real Feature registry, native mount and WIP Client/Host through a typed in-process
 contract router: deep discovery, slash/native attach, read/edit/write,
 create/delete, atomic multi-source updates, grant restrictions/revocation,

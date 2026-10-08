@@ -318,7 +318,7 @@ impl FeatureInvocationHandler for WorkspaceConfigFeature {
                 result.access.as_str()
             ),
             context: Some(format!(
-                "Workspace configuration is available as logical attachment `{ATTACHMENT_ALIAS}` at WIP `{CONTENT_ROOT}` with {} access. Discover structure through WIP; read and change bodies through published Operations. This attachment grants no OS paths or command execution. Backend validation, concurrency checks and activation rules apply; saving does not imply running Workers adopted new configuration.",
+                "Workspace configuration is available as logical attachment `{ATTACHMENT_ALIAS}` at WIP `{CONTENT_ROOT}` with {} access. Use Tree for indexable structure, Inspect with a known Object path for its complete signatures, and Invoke for published Operations. This attachment grants no OS paths or command execution. Backend validation, concurrency checks and activation rules apply; saving does not imply running Workers adopted new configuration.",
                 result.access.as_str()
             )),
         })

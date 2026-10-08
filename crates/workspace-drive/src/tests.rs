@@ -299,3 +299,183 @@ fn interrupted_full_permission_and_sync_failed_uploads_do_not_publish_metadata_o
         );
     }
 }
+
+fn grant_fixture(t: &tempfile::TempDir) -> (Drive, Connection) {
+    let authority = t.path().join("server.db");
+    let server = Connection::open(&authority).unwrap();
+    feature_storage::configure_connection(&server).unwrap();
+    server
+        .execute_batch(
+            "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,state TEXT NOT NULL);
+        INSERT INTO workspaces VALUES ('ws','active');
+        CREATE TABLE grants(write_access INTEGER NOT NULL,revoked INTEGER NOT NULL);
+        INSERT INTO grants VALUES (1,0);",
+        )
+        .unwrap();
+    let storage = feature_storage::FeatureStorage::new(t.path().join("metadata"))
+        .workspace("ws")
+        .unwrap();
+    let registration = Drive::register(&storage).unwrap();
+    (
+        Drive::open_with_workspace_authority(
+            &storage,
+            &registration,
+            &t.path().join("blobs"),
+            &authority,
+        )
+        .unwrap(),
+        server,
+    )
+}
+fn grant_authorizer(conn: &Connection, write: bool) -> Result<()> {
+    assert!(
+        !conn.is_autocommit(),
+        "authority must be checked in the operation transaction"
+    );
+    let allowed: bool = conn.query_row(
+        "SELECT revoked=0 AND (?1=0 OR write_access=1) FROM yoi_workspace_authority.grants",
+        [write],
+        |r| r.get(0),
+    )?;
+    if allowed { Ok(()) } else { Err(Error::Denied) }
+}
+
+#[test]
+fn bound_authorizer_checks_every_read_write_and_receipt_replay_without_caching() {
+    let t = tempfile::tempdir().unwrap();
+    let (raw, server) = grant_fixture(&t);
+    let root = raw.root().unwrap();
+    let bound = raw.with_authorizer(grant_authorizer);
+    let mutation = create(root.id, "file");
+    let result = bound.mutate("request", "worker", mutation.clone()).unwrap();
+    bound.check_authorized(true).unwrap();
+    server
+        .execute("UPDATE grants SET write_access=0", [])
+        .unwrap();
+    assert!(bound.check_authorized(false).is_ok());
+    assert!(matches!(bound.check_authorized(true), Err(Error::Denied)));
+    assert!(bound.root().is_ok());
+    assert!(bound.metadata(result.node.id).is_ok());
+    assert!(bound.list(root.id, None, 10).is_ok());
+    assert!(bound.search("file", true, None, 10).is_ok());
+    assert!(
+        bound
+            .read(result.node.id, result.node.revision, 0, 100)
+            .is_ok()
+    );
+    assert!(
+        bound
+            .read_text(result.node.id, result.node.revision, 0, 100)
+            .is_ok()
+    );
+    assert!(bound.request_status("request").is_ok());
+    assert!(
+        matches!(
+            bound.mutate("request", "worker", mutation.clone()),
+            Err(Error::Denied)
+        ),
+        "read-only receipt replay is a write request"
+    );
+    let clone = bound.clone();
+    server.execute("UPDATE grants SET revoked=1", []).unwrap();
+    assert!(matches!(clone.check_authorized(false), Err(Error::Denied)));
+    assert!(matches!(clone.check_authorized(true), Err(Error::Denied)));
+    assert!(matches!(clone.root(), Err(Error::Denied)));
+    assert!(matches!(clone.metadata(result.node.id), Err(Error::Denied)));
+    assert!(matches!(clone.list(root.id, None, 10), Err(Error::Denied)));
+    assert!(matches!(
+        clone.search("file", true, None, 10),
+        Err(Error::Denied)
+    ));
+    assert!(matches!(
+        clone.read(result.node.id, result.node.revision, 0, 100),
+        Err(Error::Denied)
+    ));
+    assert!(matches!(
+        clone.read_text(result.node.id, result.node.revision, 0, 100),
+        Err(Error::Denied)
+    ));
+    assert!(matches!(
+        clone.request_status("request"),
+        Err(Error::Denied)
+    ));
+    assert!(matches!(
+        clone.mutate("request", "worker", mutation),
+        Err(Error::Denied)
+    ));
+    assert!(matches!(
+        clone.mutate("denied", "worker", create(root.id, "denied")),
+        Err(Error::Denied)
+    ));
+    assert_eq!(
+        raw.blobs.list(None, 10).unwrap().len(),
+        1,
+        "denied write must not publish a blob"
+    );
+    assert_eq!(
+        raw.request_status("denied").unwrap(),
+        RequestStatus::Uncommitted
+    );
+    assert_eq!(raw.list(root.id, None, 10).unwrap().nodes.len(), 1);
+    raw.collect(None, 10).unwrap();
+}
+
+#[test]
+fn revoke_serializes_with_publication_and_cached_handle_denies_after_revoke_commit() {
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+    let t = tempfile::tempdir().unwrap();
+    let (raw, mut server) = grant_fixture(&t);
+    let root = raw.root().unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let publishing = raw.with_authorizer(move |conn, write| {
+        grant_authorizer(conn, write)?;
+        entered_tx.send(()).unwrap();
+        release_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        Ok(())
+    });
+    let cached = raw.with_authorizer(grant_authorizer);
+    let writer = std::thread::spawn(move || {
+        publishing.mutate("publishing", "worker", create(root.id, "published"))
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    server.busy_timeout(Duration::ZERO).unwrap();
+    assert!(
+        matches!(server.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate),
+        Err(rusqlite::Error::SqliteFailure(e,_)) if e.code==rusqlite::ErrorCode::DatabaseBusy),
+        "revoke cannot acquire authority while mutation publishes"
+    );
+    release_tx.send(()).unwrap();
+    let published = writer.join().unwrap().unwrap();
+    let revoke = server
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    revoke.execute("UPDATE grants SET revoked=1", []).unwrap();
+    revoke.commit().unwrap();
+    assert_eq!(raw.metadata(published.node.id).unwrap(), published.node);
+    assert_eq!(
+        raw.request_status("publishing").unwrap(),
+        RequestStatus::Committed {
+            result: published.clone()
+        }
+    );
+    assert!(matches!(
+        cached.request_status("publishing"),
+        Err(Error::Denied)
+    ));
+    assert!(matches!(
+        cached.mutate("publishing", "worker", create(root.id, "published")),
+        Err(Error::Denied)
+    ));
+    assert!(matches!(
+        cached.mutate("after-revoke", "worker", create(root.id, "denied")),
+        Err(Error::Denied)
+    ));
+    assert_eq!(raw.blobs.list(None, 10).unwrap().len(), 1);
+}

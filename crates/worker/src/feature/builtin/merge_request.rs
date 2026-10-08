@@ -558,14 +558,16 @@ pub fn mount_workspace_http_merge_request_wip(
             description: Some(
                 "Authoritative Merge Request collection through scoped Backend authority".into(),
             ),
-            interfaces: vec![MERGE_REQUEST_COLLECTION_INTERFACE.into()],
+            interfaces: vec![crate::wip::root_reference(
+                MERGE_REQUEST_COLLECTION_INTERFACE,
+            )],
             r#ref: Some("merge-request:collection".into()),
             validator: Some(merge_request_route_validator(
                 &collection_route,
                 "collection",
             )),
         },
-        interface: MERGE_REQUEST_COLLECTION_INTERFACE.into(),
+        interface: crate::wip::root_reference(MERGE_REQUEST_COLLECTION_INTERFACE),
         interface_validator: Some(merge_request_descriptor_validator(&collection_descriptor)),
         descriptor: collection_descriptor,
         handler: Arc::new(MergeRequestCollectionWipHandler {
@@ -584,7 +586,7 @@ pub fn mount_workspace_http_merge_request_wip(
     registry.mount_dynamic(WipDynamicMount {
         collection_route: collection_route.clone(),
         capability: "merge-request:item".into(),
-        interface: MERGE_REQUEST_ITEM_INTERFACE.into(),
+        interface: crate::wip::root_reference(MERGE_REQUEST_ITEM_INTERFACE),
         interface_validator: Some(merge_request_descriptor_validator(&item_descriptor)),
         descriptor: item_descriptor,
         resolver: Arc::new(MergeRequestItemResolver {
@@ -682,7 +684,7 @@ impl WipDynamicItemResolver for MergeRequestItemResolver {
             object: Object {
                 name: item_reference.into(),
                 description: Some("Authoritative Merge Request bound to this object route".into()),
-                interfaces: vec![MERGE_REQUEST_ITEM_INTERFACE.into()],
+                interfaces: vec![crate::wip::root_reference(MERGE_REQUEST_ITEM_INTERFACE)],
                 r#ref: Some(format!("merge-request:{item_reference}")),
                 validator: Some(merge_request_route_validator(&route, &revision)),
             },

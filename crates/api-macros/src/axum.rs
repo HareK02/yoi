@@ -77,6 +77,16 @@ pub fn json_response<T: Serialize>(status: StatusCode, value: T) -> Response {
     (status, Json(value)).into_response()
 }
 
+/// Emit an exact binary response with the contract status and octet-stream content type.
+pub fn binary_response(status: StatusCode, value: crate::BinaryBody) -> Response {
+    (
+        status,
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        value.into_bytes(),
+    )
+        .into_response()
+}
+
 /// Emit an empty response with the contract status.
 pub fn empty_response(status: StatusCode) -> Response {
     status.into_response()

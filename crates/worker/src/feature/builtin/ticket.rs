@@ -1813,11 +1813,11 @@ pub fn mount_workspace_http_ticket_wip(
             description: Some(
                 "Authoritative Ticket collection through scoped Backend authority".into(),
             ),
-            interfaces: vec![TICKET_COLLECTION_INTERFACE.into()],
+            interfaces: vec![crate::wip::root_reference(TICKET_COLLECTION_INTERFACE)],
             r#ref: Some("ticket:collection".into()),
             validator: Some(route_validator(&collection_route, "collection")),
         },
-        interface: TICKET_COLLECTION_INTERFACE.into(),
+        interface: crate::wip::root_reference(TICKET_COLLECTION_INTERFACE),
         interface_validator: Some(descriptor_validator(&collection_descriptor)),
         descriptor: collection_descriptor,
         handler: Arc::new(TicketCollectionWipHandler {
@@ -1836,7 +1836,7 @@ pub fn mount_workspace_http_ticket_wip(
     registry.mount_dynamic(WipDynamicMount {
         collection_route: collection_route.clone(),
         capability: "ticket:item".into(),
-        interface: TICKET_ITEM_INTERFACE.into(),
+        interface: crate::wip::root_reference(TICKET_ITEM_INTERFACE),
         interface_validator: Some(descriptor_validator(&item_descriptor)),
         descriptor: item_descriptor,
         resolver: Arc::new(TicketItemResolver {
@@ -1922,7 +1922,7 @@ impl WipDynamicItemResolver for TicketItemResolver {
             object: Object {
                 name: item_reference.into(),
                 description: Some("Authoritative Ticket bound to this object route".into()),
-                interfaces: vec![TICKET_ITEM_INTERFACE.into()],
+                interfaces: vec![crate::wip::root_reference(TICKET_ITEM_INTERFACE)],
                 r#ref: Some(format!("ticket:{item_reference}")),
                 validator: Some(route_validator(&route, &revision)),
             },

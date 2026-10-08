@@ -103,20 +103,7 @@ impl ClientError {
         else {
             return false;
         };
-        if matches!(
-            code.as_deref(),
-            Some("image_too_large" | "image_size_exceeded")
-        ) {
-            return true;
-        }
-        let message = message.to_ascii_lowercase();
-        message.contains("image")
-            && ((message.contains("patches")
-                && message.contains("exceed")
-                && message.contains("limit"))
-                || message.contains("image is too large")
-                || message.contains("image too large")
-                || (message.contains("image dimensions") && message.contains("exceed")))
+        is_image_size_diagnostic(code.as_deref(), message)
     }
 
     pub fn retry_after(&self) -> Option<Duration> {
@@ -125,6 +112,29 @@ impl ClientError {
             _ => None,
         }
     }
+}
+
+/// Shared diagnostic policy for HTTP rejections and provider Error events.
+/// The caller must establish the rejection path and whether replay is safe;
+/// this predicate alone never authorizes a retry.
+pub(crate) fn is_image_size_diagnostic(code: Option<&str>, message: &str) -> bool {
+    if matches!(code, Some("image_too_large" | "image_size_exceeded")) {
+        return true;
+    }
+    // OpenAI Responses appends structured diagnostic details for observation.
+    // Extra fields (including echoed input) are not the error message itself.
+    let message = message
+        .split(" | diagnostic=")
+        .next()
+        .unwrap_or(message)
+        .to_ascii_lowercase();
+    message.contains("image")
+        && ((message.contains("patches")
+            && message.contains("exceed")
+            && message.contains("limit"))
+            || message.contains("image is too large")
+            || message.contains("image too large")
+            || (message.contains("image dimensions") && message.contains("exceed")))
 }
 
 /// transient な失敗としてリトライ対象になるかを判定する。
