@@ -1,4 +1,7 @@
-import type { TicketMergeRequestSummary } from "#lib/generated/ticket-api.ts";
+import type {
+  TicketEvidenceSummary,
+  TicketMergeRequestSummary,
+} from "#lib/generated/ticket-api.ts";
 import type {
   MergeRequestDetail,
   MergeRequestThreadEvent,
@@ -87,6 +90,14 @@ export function sourceReviewFreshness(
   }
 
   return `Fresh source review required: no effective verdict exists for ${source}.`;
+}
+
+// Source/integration approval can survive rescope; only this exact revision
+// and linked-result attestation approves the current Ticket requirements.
+export function currentRequirementApprovalStatus(
+  evidence: TicketEvidenceSummary,
+): string {
+  return evidence.review_after_rescope ? "approved" : "not established";
 }
 
 export function summarySourceReviewStatus(

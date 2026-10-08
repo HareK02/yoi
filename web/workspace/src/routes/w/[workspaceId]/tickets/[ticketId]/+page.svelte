@@ -13,7 +13,7 @@
     parseTicketRoleAssignmentMutationResponse,
   } from "#lib/workspace/api/ticket-browser.ts";
   import { mergeRequestPagePath } from "#lib/workspace/api/merge-requests.ts";
-  import { summarySourceReviewStatus } from "#lib/workspace/merge-request-status.ts";
+  import { currentRequirementApprovalStatus, summarySourceReviewStatus } from "#lib/workspace/merge-request-status.ts";
   import {
     relationLabel,
     TICKET_STATES,
@@ -686,7 +686,7 @@
       <section class="ticket-control-card">
         <header><h2>Current requirement evidence</h2></header>
         <p><strong>Current requirements:</strong> {ticket.evidence.complete_for_integration ? "satisfied for integration" : "not satisfied for integration"}.</p>
-        <p><strong>Current requirement approval:</strong> {ticket.evidence.approved_current_subject ? "approved" : "not established"}.</p>
+        <p><strong>Current requirement approval:</strong> {currentRequirementApprovalStatus(ticket.evidence)}.</p>
         {#if ticket.evidence.missing.length > 0}
           <ul>
             {#each ticket.evidence.missing as missing}<li>{missing}</li>{/each}

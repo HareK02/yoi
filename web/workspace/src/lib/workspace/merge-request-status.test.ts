@@ -7,6 +7,7 @@ import type { TicketMergeRequestSummary } from "#lib/generated/ticket-api.ts";
 import { fixtureDetail } from "./home/dashboard.test-fixtures.ts";
 import { parseTicketDetail } from "./api/ticket-browser.ts";
 import {
+  currentRequirementApprovalStatus,
   sourceReviewFreshness,
   summarySourceReviewStatus,
 } from "./merge-request-status.ts";
@@ -91,6 +92,13 @@ Deno.test("done Ticket can retain immutable approval while current requirement e
     state: "done",
     evidence: {
       ...fixtureDetail().evidence,
+      has_merge_request: true,
+      has_current_subject_ref: true,
+      has_commit: true,
+      has_review_request: true,
+      review_status: "pending",
+      approved_current_subject: true,
+      review_after_rescope: false,
       missing: ["review_after_rescope"],
     },
     merge_requests: [{
@@ -101,6 +109,26 @@ Deno.test("done Ticket can retain immutable approval while current requirement e
   });
   assertEquals(ticket.state, "done");
   assertEquals(ticket.evidence.complete_for_integration, false);
+  assertEquals(
+    currentRequirementApprovalStatus(ticket.evidence),
+    "not established",
+  );
+  const recovered = parseTicketDetail({
+    ...ticket,
+    evidence: {
+      ...ticket.evidence,
+      review_after_rescope: true,
+      review_status: "approved",
+      complete_for_integration: true,
+      missing: [],
+    },
+  });
+  assertEquals(recovered.evidence.approved_current_subject, true);
+  assertEquals(
+    currentRequirementApprovalStatus(recovered.evidence),
+    "approved",
+  );
+  assertEquals(recovered.state, "done");
   assertEquals(
     summarySourceReviewStatus(ticket.merge_requests[0]!),
     "Integration approval recorded for immutable merged source source-1.",
@@ -118,7 +146,7 @@ Deno.test("Ticket route separates current requirement evidence from immutable in
     const required of [
       "Current requirement evidence",
       "ticket.evidence.complete_for_integration",
-      "ticket.evidence.approved_current_subject",
+      "Current requirement approval:</strong> {currentRequirementApprovalStatus(ticket.evidence)}",
       "ticket.evidence.missing",
       "summarySourceReviewStatus(mergeRequest)",
       "Immutable integration evidence",
