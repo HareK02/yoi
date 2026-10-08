@@ -538,3 +538,84 @@ async fn same_name_scope_replacement_or_loss_of_ref_rejects_old_metadata_without
         );
     }
 }
+
+struct TargetQualifiedProvider {
+    inner: Arc<AncestorProvider>,
+    target_hint: Mutex<Option<String>>,
+}
+#[async_trait]
+impl WipSubtreeProvider for TargetQualifiedProvider {
+    fn interface_target(&self, _: &InterfaceReference) -> Option<String> {
+        self.target_hint.lock().unwrap().clone()
+    }
+    async fn publication(&self, path: &str) -> Result<Option<WipPublication>, ProtocolError> {
+        self.inner.publication(path).await
+    }
+    async fn children(&self, path: &str) -> Result<Vec<String>, ProtocolError> {
+        self.inner.children(path).await
+    }
+}
+
+#[tokio::test]
+async fn ancestor_interface_target_hint_fetches_one_current_publication_and_never_grants_authority()
+{
+    let (_, inner) = fixture("/github", true, false);
+    let provider = Arc::new(TargetQualifiedProvider {
+        inner: inner.clone(),
+        target_hint: Mutex::new(Some(inner.target_path.clone())),
+    });
+    let mut mounts = WipMountRegistry::new();
+    mounts.allocate_namespace("scope", "github").unwrap();
+    mounts
+        .mount(projection(
+            "/github",
+            "/github",
+            "read",
+            inner.calls.clone(),
+        ))
+        .unwrap();
+    mounts
+        .mount_subtree(WipSubtreeMount {
+            root: "/github".into(),
+            provider: provider.clone(),
+        })
+        .unwrap();
+    let host = WipHost::new(mounts);
+    let selected = reference("/github", "read");
+    let fetched = host.fetch_interface_live(&selected).await.unwrap();
+    assert_eq!(fetched.scope_ref, Some("live-scope".into()));
+    assert_eq!(
+        inner.state.lock().unwrap().lookups,
+        [inner.target_path.clone()]
+    );
+    // A hint must not fabricate a Descriptor or restore a deleted scope lifetime.
+    inner.state.lock().unwrap().visible = false;
+    assert_eq!(
+        host.fetch_interface_live(&selected).await.unwrap_err().code,
+        ProtocolErrorCode::InterfaceNotFound
+    );
+    inner.state.lock().unwrap().visible = true;
+    let forged = reference("/github", "not-published");
+    assert_eq!(
+        host.fetch_interface_live(&forged).await.unwrap_err().code,
+        ProtocolErrorCode::InterfaceNotFound
+    );
+    for hint in [
+        None,
+        Some("/outside"),
+        Some("/github-extra/item"),
+        Some("/github/../item"),
+        Some("/github/missing"),
+    ] {
+        *provider.target_hint.lock().unwrap() = hint.map(str::to_owned);
+        inner.state.lock().unwrap().lookups.clear();
+        assert_eq!(
+            host.fetch_interface_live(&selected).await.unwrap_err().code,
+            ProtocolErrorCode::InterfaceNotFound
+        );
+        if hint != Some("/github/missing") {
+            assert!(inner.state.lock().unwrap().lookups.is_empty());
+        }
+    }
+    assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+}

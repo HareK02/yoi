@@ -288,6 +288,13 @@ pub trait WipSubtreeProvider: Send + Sync {
     /// looking up a mutable ancestor after resolving the target. Self-scoped
     /// publishers can use `WipPublication::self_scoped` on their pinned snapshot.
     async fn publication(&self, path: &str) -> Result<Option<WipPublication>, ProtocolError>;
+    /// Routing hint for target-qualified local Interface names in an ancestor
+    /// scope. This grants no authority: Host re-resolves one coherent current
+    /// publication, checks the exact reference, and forbids escaping this owner.
+    /// Self/shared-scope providers retain the ordinary scope Object route.
+    fn interface_target(&self, reference: &InterfaceReference) -> Option<String> {
+        Some(reference.scope.clone())
+    }
     async fn children(&self, path: &str) -> Result<Vec<String>, ProtocolError>;
 }
 
@@ -1248,8 +1255,29 @@ impl WipHost {
         reference
             .validate()
             .map_err(|e| protocol_error(ProtocolErrorCode::InvalidRequest, e.to_string()))?;
+        let target = if let Some(mount) = self.subtree(&reference.scope) {
+            let target = mount.provider.interface_target(reference).ok_or_else(|| {
+                protocol_error(
+                    ProtocolErrorCode::InterfaceNotFound,
+                    "interface is not published",
+                )
+            })?;
+            if wip_protocol::validate_path(&target).is_err()
+                || !self
+                    .subtree(&target)
+                    .is_some_and(|owner| owner.root == mount.root)
+            {
+                return Err(protocol_error(
+                    ProtocolErrorCode::InterfaceNotFound,
+                    "interface target is outside its provider",
+                ));
+            }
+            target
+        } else {
+            reference.scope.clone()
+        };
         if let Some(publication) = self
-            .publication_for_interface_live(&reference.scope, reference)
+            .publication_for_interface_live(&target, reference)
             .await?
             && publication.projection.interface == *reference
             && let Some(scope) = publication.scope
