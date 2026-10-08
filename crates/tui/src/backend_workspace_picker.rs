@@ -199,30 +199,40 @@ fn prompt_create_request_with_io(
     if display_name.is_empty() {
         return Ok(None);
     }
-    let Some(uri) = prompt_line(input, output, "Initial repository absolute path/URI: ")? else {
-        return Ok(None);
-    };
-    let uri = uri.trim().to_string();
-    if uri.is_empty() {
-        writeln!(output, "Repository path/URI is required.")?;
-        return Ok(None);
-    }
-    let repository_key = loop {
-        let Some(repository_key) = prompt_line(input, output, "Repository key (required): ")?
-        else {
-            return Ok(None);
-        };
-        if repository_key.trim().is_empty() {
-            writeln!(output, "Repository key is required.")?;
-            continue;
-        }
-        break repository_key;
-    };
-    let Some(default_ref) = prompt_line(input, output, "Default ref [repository default]: ")?
+    let Some(uri) = prompt_line(
+        input,
+        output,
+        "Initial repository absolute path/URI (optional, Enter to skip): ",
+    )?
     else {
         return Ok(None);
     };
-    let default_ref = default_ref.trim().to_string();
+    let uri = uri.trim().to_string();
+    let repository = if uri.is_empty() {
+        None
+    } else {
+        let repository_key = loop {
+            let Some(repository_key) = prompt_line(input, output, "Repository key (required): ")?
+            else {
+                return Ok(None);
+            };
+            if repository_key.trim().is_empty() {
+                writeln!(output, "Repository key is required.")?;
+                continue;
+            }
+            break repository_key;
+        };
+        let Some(default_ref) = prompt_line(input, output, "Default ref [repository default]: ")?
+        else {
+            return Ok(None);
+        };
+        let default_ref = default_ref.trim().to_string();
+        Some(CreateBackendWorkspaceRepository {
+            uri,
+            repository_key,
+            default_ref: (!default_ref.is_empty()).then_some(default_ref),
+        })
+    };
     let operation_key = format!(
         "tui-workspace-create-{}-{}",
         std::process::id(),
@@ -234,11 +244,7 @@ fn prompt_create_request_with_io(
     Ok(Some(CreateBackendWorkspaceRequest {
         operation_key,
         display_name,
-        repository: CreateBackendWorkspaceRepository {
-            uri,
-            repository_key,
-            default_ref: (!default_ref.is_empty()).then_some(default_ref),
-        },
+        repository,
     }))
 }
 
@@ -287,14 +293,28 @@ mod tests {
     }
 
     #[test]
+    fn workspace_creation_without_initial_repository_skips_repository_prompts() {
+        let (request, output) = prompt_create("Workspace\n\n");
+        assert!(request.unwrap().repository.is_none());
+        assert!(!output.contains("Repository key (required)"));
+        assert!(!output.contains("Default ref"));
+    }
+
+    #[test]
     fn workspace_creation_preserves_an_explicit_non_main_repository_key() {
         let (request, output) = prompt_create("Platform\n/srv/platform\nplatform\ndevelop\n");
         let request = request.expect("complete input should create a request");
 
         assert_eq!(request.display_name, "Platform");
-        assert_eq!(request.repository.uri, "/srv/platform");
-        assert_eq!(request.repository.repository_key, "platform");
-        assert_eq!(request.repository.default_ref.as_deref(), Some("develop"));
+        assert_eq!(request.repository.as_ref().unwrap().uri, "/srv/platform");
+        assert_eq!(
+            request.repository.as_ref().unwrap().repository_key,
+            "platform"
+        );
+        assert_eq!(
+            request.repository.as_ref().unwrap().default_ref.as_deref(),
+            Some("develop")
+        );
         assert!(output.contains("Repository key (required): "));
         assert!(!output.contains("Repository key [main]"));
     }
@@ -304,7 +324,10 @@ mod tests {
         let (request, output) = prompt_create("Platform\n/srv/platform\n\n   \nplatform\n\n");
         let request = request.expect("a later explicit key should create a request");
 
-        assert_eq!(request.repository.repository_key, "platform");
+        assert_eq!(
+            request.repository.as_ref().unwrap().repository_key,
+            "platform"
+        );
         assert_eq!(output.matches("Repository key is required.").count(), 2);
         assert_eq!(output.matches("Repository key (required): ").count(), 3);
     }
@@ -314,7 +337,7 @@ mod tests {
         let (request, _) = prompt_create("Workspace\n/srv/repository\n platform \n\n");
 
         assert_eq!(
-            request.unwrap().repository.repository_key,
+            request.unwrap().repository.unwrap().repository_key,
             " platform ",
             "the Backend must validate the creator's exact Repository key"
         );
@@ -325,7 +348,7 @@ mod tests {
         let (request, _) = prompt_create("Workspace\n/srv/repository\nmain\n\n");
 
         assert_eq!(
-            request.unwrap().repository.repository_key,
+            request.unwrap().repository.unwrap().repository_key,
             "main",
             "main remains valid when the creator enters it explicitly"
         );

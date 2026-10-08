@@ -383,6 +383,53 @@ test("deletion retry reuses the persisted operation id and confirmation, then re
     .toBeNull();
 });
 
+test("zero-repository Workspace deletion follows authoritative preflight and exact-name confirmation", async () => {
+  const resources = {
+    workers: 0,
+    workdirs: 0,
+    repositories: 0,
+    runtime_bindings: 0,
+    secrets: 0,
+    artifacts: 0,
+  };
+  const api = mockApi(async (request) => {
+    if (request.url.includes("/workspace-deletions/")) {
+      return Response.json({
+        ...operation("succeeded", request.url.split("/").pop()),
+        resources,
+      });
+    }
+    if (request.url.endsWith("/deletion")) {
+      return request.method === "POST"
+        ? Response.json({
+          ...operation("succeeded", (await request.json()).operation_id),
+          resources,
+        })
+        : Response.json({
+          ...deletionFixture(),
+          resources,
+          can_delete: true,
+          blockers: [],
+        });
+    }
+    return null;
+  });
+  mount();
+  const confirmation = await openDeletion();
+  const remove = screen.getByRole("button", { name: "Delete Workspace" });
+  expect((remove as HTMLButtonElement).disabled).toBe(true);
+  await fireEvent.input(confirmation, {
+    target: { value: metadataFixture().display_name },
+  });
+  await fireEvent.click(remove);
+  await waitFor(() => expect(goto).toHaveBeenCalledWith("/"));
+  expect(api.mock.calls.filter(([, init]) => init?.method === "POST"))
+    .toHaveLength(1);
+  expect(
+    api.mock.calls.some(([path]) => String(path).includes("/repositories")),
+  ).toBe(false);
+});
+
 test("reload resumes persisted deletion without sending another POST", async () => {
   sessionStorage.setItem(
     "yoi:workspace-deletion:home-owner",

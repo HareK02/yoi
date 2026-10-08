@@ -1,0 +1,135 @@
+{
+  "schemaVersion": 1,
+  "id": "optional-initial-repository",
+  "title": "Optional initial repository and empty Workspace",
+  "baseUrl": "http://127.0.0.1:15281",
+  "colorScheme": "light",
+  "reducedMotion": "reduce",
+  "personas": [
+    {
+      "id": "fixture",
+      "label": "Synthetic account; permissions vary by Workspace",
+      "auth": {
+        "kind": "anonymous"
+      }
+    }
+  ],
+  "viewports": [
+    {
+      "label": "desktop",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "label": "narrow",
+      "width": 768,
+      "height": 900
+    },
+    {
+      "label": "mobile",
+      "width": 390,
+      "height": 844
+    }
+  ],
+  "routes": [
+    {
+      "id": "catalog",
+      "label": "Create Workspace without a repository",
+      "path": "/",
+      "goal": "Reopen a zero-repository Workspace or create a new Workspace without configuring Git.",
+      "dataState": "Accessible Workspaces with no repositories and blank creation form.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-create-panel input"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Blank creation form",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "empty-owner",
+      "label": "Empty Workspace owner",
+      "path": "/w/home-empty",
+      "goal": "Use Home and Sidebar without any repositories or work records.",
+      "dataState": "Owner permissions; zero repositories, Workers, tickets, Objectives, and Merge Requests.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-home:has([data-feed-ready='home-attention']):has([data-feed-ready='home-active']):has([data-feed-ready='home-recent'])"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Empty Home and Sidebar"
+        }
+      ]
+    },
+    {
+      "id": "member",
+      "label": "Zero-repository member",
+      "path": "/w/home-member",
+      "goal": "Navigate authorized work without owner-only repository management actions.",
+      "dataState": "Non-owner permissions; zero repositories, representative work records.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-home:has([data-feed-ready='home-attention']):has([data-feed-ready='home-active']):has([data-feed-ready='home-recent'])"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Member Home and Sidebar"
+        }
+      ]
+    },
+    {
+      "id": "worker",
+      "label": "New Worker without repositories",
+      "path": "/w/home-empty/workers/new",
+      "goal": "Start a normal conversation Worker without a Workdir on embedded Runtime.",
+      "dataState": "No repositories or Workdirs, embedded and remote Runtime candidates.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".worker-launch-form"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Embedded Worker launch",
+          "fullPage": true
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "id": "workspace-fixture",
+      "command": "deno",
+      "cwd": "../../../../tools/web-ux",
+      "args": [
+        "run",
+        "--allow-net",
+        "--allow-read",
+        "browser-tests/workspace_home_fixture_server.ts",
+        "15282",
+        "../../web/workspace/build"
+      ],
+      "readyUrl": "http://127.0.0.1:15282/health"
+    },
+    {
+      "id": "empty-workspace-api",
+      "command": "deno",
+      "cwd": "../..",
+      "args": [
+        "run",
+        "--allow-net",
+        "test/visual-review/empty-workspace-fixture-server.ts",
+        "15281",
+        "http://127.0.0.1:15282"
+      ],
+      "readyUrl": "http://127.0.0.1:15281/health"
+    }
+  ]
+}

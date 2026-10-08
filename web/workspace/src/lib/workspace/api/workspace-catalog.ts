@@ -17,11 +17,11 @@ export type CreateWorkspaceResponse = WorkspaceCreateResponse;
 export type CreateWorkspaceRequest = {
   operation_key: string;
   display_name: string;
-  repository: {
+  repository?: {
     repository_key: string;
     uri: string;
     default_ref: string | null;
-  };
+  } | null;
 };
 
 export class WorkspaceCatalogError extends Error {

@@ -75,18 +75,6 @@ impl RepositoryRegistryReader {
     }
 
     pub fn list(&self) -> RepositoryListProjection {
-        if self.repositories.is_empty() {
-            return RepositoryListProjection {
-                items: Vec::new(),
-                diagnostics: vec![Diagnostic {
-                    severity: DiagnosticSeverity::Warning,
-                    code: "repository_config_empty".to_string(),
-                    message: "No repositories are configured for this workspace backend."
-                        .to_string(),
-                }],
-            };
-        }
-
         RepositoryListProjection {
             items: self
                 .repositories
@@ -598,12 +586,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_registry_reports_diagnostic_without_implicit_repository() {
+    fn empty_registry_is_valid_without_warning_or_implicit_repository() {
         let projection = RepositoryRegistryReader::new(Vec::new()).list();
 
         assert!(projection.items.is_empty());
-        assert_eq!(projection.diagnostics.len(), 1);
-        assert_eq!(projection.diagnostics[0].code, "repository_config_empty");
+        assert!(projection.diagnostics.is_empty());
     }
 
     #[test]

@@ -27,7 +27,8 @@ use client::{BackendAuthTarget, Target, TargetKind, start_device_login, wait_for
 use serde::Deserialize;
 use tui::{BackendWorkerPickerIntent, LaunchMode, LaunchOptions};
 use workspace_bootstrap::{
-    InitOptions, discover_repository_root, run_init, select_backend_workspace_for_repository,
+    InitOptions, WorkspaceCreateOptions, discover_repository_root, run_init, run_workspace_create,
+    select_backend_workspace_for_repository, workspace_creation_message,
 };
 
 #[derive(Debug)]
@@ -56,6 +57,8 @@ enum Mode {
         no_wait: bool,
     },
     Init(InitOptions),
+    WorkspaceHelp,
+    WorkspaceCreate(WorkspaceCreateOptions),
     WorkdirHelp,
     WorkdirShare(workdir_share::WorkdirShareOptions),
     WorkerRuntime(Vec<String>),
@@ -123,14 +126,25 @@ async fn run(mode: Mode) -> ExitCode {
         },
         Mode::Init(options) => match run_init(options).await {
             Ok(workspace) => {
-                println!(
-                    "Initialized Workspace '{}' for repository '{}'",
-                    workspace.workspace.display_name, workspace.repository.repository_key
-                );
+                println!("{}", workspace_creation_message(&workspace));
                 ExitCode::SUCCESS
             }
             Err(error) => {
                 eprintln!("yoi init: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Mode::WorkspaceHelp => {
+            print!("{WORKSPACE_HELP}");
+            ExitCode::SUCCESS
+        }
+        Mode::WorkspaceCreate(options) => match run_workspace_create(options).await {
+            Ok(workspace) => {
+                println!("{}", workspace_creation_message(&workspace));
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("yoi workspace create: {error}");
                 ExitCode::FAILURE
             }
         },
@@ -278,7 +292,7 @@ fn resolve_tui_target<R: CliConnectionResolver + ?Sized>(
             command,
             true,
             None,
-            None,
+            selection.workspace_id.as_deref(),
         );
     }
 
@@ -520,6 +534,9 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             .resolve()
             .map_err(|error| ParseError(error.to_string()))?;
             return Ok(Mode::Ticket { cli, target });
+        }
+        "workspace" => {
+            return parse_workspace_args(&args[1..], &target_selection);
         }
         "init" => {
             if target_selection.explicit_local {
@@ -804,6 +821,68 @@ fn parse_workdir_args(
         ttl,
         permissions,
         non_interactive,
+    }))
+}
+
+const WORKSPACE_HELP: &str = "yoi workspace\n\nUsage:\n  yoi [--backend <URL>] workspace create --display-name <NAME>\n\nCreate a Workspace without an initial repository; no Git checkout is needed.\nUse `yoi init` to create a Workspace with the current Git repository.\nSelect the created Workspace with `yoi --workspace-id <ID>`; this does not require Git.\n\nOptions:\n      --display-name <NAME>  Workspace display name (required)\n  -h, --help                Print help\n";
+
+fn parse_workspace_args(args: &[String], selection: &TargetSelection) -> Result<Mode, ParseError> {
+    let Some((subcommand, args)) = args.split_first() else {
+        return Ok(Mode::WorkspaceHelp);
+    };
+    if matches!(subcommand.as_str(), "--help" | "-h") {
+        return Ok(Mode::WorkspaceHelp);
+    }
+    if subcommand != "create" {
+        return Err(ParseError(format!(
+            "unknown yoi workspace subcommand `{subcommand}`"
+        )));
+    }
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        return Ok(Mode::WorkspaceHelp);
+    }
+    if selection.explicit_local {
+        return Err(ParseError(
+            "yoi workspace create requires a Backend target and cannot use --local".to_string(),
+        ));
+    }
+    if selection.workspace_id.is_some() {
+        return Err(ParseError(
+            "yoi workspace create creates a Workspace and does not accept --workspace-id"
+                .to_string(),
+        ));
+    }
+    let mut display_name = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--display-name" => {
+                if display_name.is_some() {
+                    return Err(ParseError(
+                        "--display-name may only be provided once".to_string(),
+                    ));
+                }
+                display_name =
+                    Some(required_option_value(args, index, "--display-name")?.to_string());
+                index += 2;
+            }
+            unknown => {
+                return Err(ParseError(format!(
+                    "unknown yoi workspace create option `{unknown}`"
+                )));
+            }
+        }
+    }
+    let display_name = display_name.ok_or_else(|| {
+        ParseError("yoi workspace create requires --display-name NAME".to_string())
+    })?;
+    Ok(Mode::WorkspaceCreate(WorkspaceCreateOptions {
+        backend_url: resolve_backend_url(selection.backend_url.clone(), None)?,
+        display_name,
+        repository: None,
     }))
 }
 
@@ -1989,6 +2068,7 @@ Usage:
   yoi [TARGET] workers [-r|--stopped] [--runtime-id <ID>]
   yoi [TARGET] resume [--all] [--runtime-id <ID>]
   yoi --backend <URL> [--workspace-id <ID>] panel
+  yoi [--backend <URL>] workspace create --display-name <NAME>
   yoi [--backend <URL>] init --display-name <NAME> --repository-key <KEY> [--repository <PATH>] [--default-ref <REF>]
   yoi [--backend <URL>] login [--no-wait]
   yoi [--backend <URL>] workdir share <PATH> [--workspace-id <ID>] [--permission <read|write|command>] [--read-only|--read-write] [--ttl <TTL>] [--display-name <NAME>] [--non-interactive]
@@ -1997,9 +2077,11 @@ Usage:
 Target selection:
       --local              Use the client-owned one-process Standalone host
       --backend <URL>      Use a Workspace Backend explicitly
-      --workspace-id <ID>  Scope Backend routes to a Workspace id
+      --workspace-id <ID>  Select a Backend Workspace explicitly; no Git checkout needed
 
   If no target is explicit, connection-aware commands use the merged client config.
+  Explicit --workspace-id selects Backend even when the default connection is local.
+  Without --workspace-id, Backend selection matches the current Git repository.
   `default_connection = "local"` selects Standalone; it does not enable a filesystem
   Ticket, Objective, Worker catalog, PID, socket, or subprocess authority.
 
@@ -2017,6 +2099,7 @@ Console options:
       --worker-id <ID>     Backend Worker id; requires --runtime-id
 
 Host commands:
+  yoi workspace create        Create a Backend Workspace without an initial repository.
   yoi init                    Register the current Git repository as a new Backend Workspace.
   yoi workdir share           Interactively share a client-hosted External Workdir.
   keys                         Manage local model/API keys
@@ -2058,7 +2141,7 @@ Authority:
 
 Options:
       --backend <URL>      Use this Workspace Backend
-      --workspace-id <ID>  Scope Backend routes to a Workspace id
+      --workspace-id <ID>  Select a Backend Workspace explicitly; no Git checkout needed
       --workspace <PATH>   Match this Git repository against Server DB Repository records
   -r, --stopped            List stopped Backend Workers
       --runtime-id <ID>    Restrict the Backend Worker picker to a Runtime id
@@ -2077,7 +2160,7 @@ Usage:
 Target options:
       --local              Restore from the client-owned Standalone Worker store
       --backend <URL>      Restore a stopped Backend Workspace Worker
-      --workspace-id <ID>  Scope Backend routes to a Workspace id
+      --workspace-id <ID>  Select a Backend Workspace explicitly; no Git checkout needed
 
 Options:
       --workspace <PATH>   Scope Standalone Workers to this cwd identity (defaults to cwd)
@@ -2461,7 +2544,8 @@ backend = "shared"
             )
         );
         assert!(!TOP_LEVEL_HELP.contains("Build/check/list/show plugins"));
-        assert!(!TOP_LEVEL_HELP.contains("yoi workspace"));
+        assert!(TOP_LEVEL_HELP.contains("yoi workspace create"));
+        assert!(!TOP_LEVEL_HELP.contains("yoi workspace serve"));
         assert!(!TOP_LEVEL_HELP.contains("yoi server"));
         assert!(!TOP_LEVEL_HELP.contains("TARGET_OPTIONS"));
     }
@@ -3175,6 +3259,232 @@ backend = "shared"
     }
 
     #[test]
+    fn workspace_create_parsing_requires_no_repository_inputs() {
+        let resolver = FixedCliConnectionResolver {
+            backend_url: "http://unused.example",
+        };
+        let args = [
+            "--backend",
+            "http://backend.example",
+            "workspace",
+            "create",
+            "--display-name",
+            "Research",
+        ]
+        .map(String::from);
+        let Mode::WorkspaceCreate(options) =
+            parse_args_slice_with_connection_resolver(&args, &resolver).unwrap()
+        else {
+            panic!("expected workspace creation mode");
+        };
+        assert_eq!(options.backend_url, "http://backend.example");
+        assert_eq!(options.display_name, "Research");
+        assert!(options.repository.is_none());
+    }
+
+    #[test]
+    fn workspace_create_rejects_repository_options_and_invalid_creation_selectors() {
+        let resolver = FixedCliConnectionResolver {
+            backend_url: "http://unused.example",
+        };
+        for (prefix, suffix, expected) in [
+            (
+                vec!["--local"],
+                vec!["--display-name", "Research"],
+                "cannot use --local",
+            ),
+            (
+                vec!["--workspace-id", "existing"],
+                vec!["--display-name", "Research"],
+                "does not accept --workspace-id",
+            ),
+            (vec![], vec![], "requires --display-name NAME"),
+            (
+                vec![],
+                vec!["--display-name"],
+                "--display-name requires a value",
+            ),
+            (
+                vec![],
+                vec!["--display-name", "A", "--display-name", "B"],
+                "may only be provided once",
+            ),
+            (
+                vec![],
+                vec!["--display-name", "A", "--repository", "/tmp"],
+                "unknown yoi workspace create option `--repository`",
+            ),
+            (
+                vec![],
+                vec!["--display-name", "A", "--repository-key", "main"],
+                "unknown yoi workspace create option `--repository-key`",
+            ),
+            (
+                vec![],
+                vec!["--display-name", "A", "--default-ref", "main"],
+                "unknown yoi workspace create option `--default-ref`",
+            ),
+        ] {
+            let args = [prefix, vec!["workspace", "create"], suffix]
+                .concat()
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>();
+            let error = parse_args_slice_with_connection_resolver(&args, &resolver).unwrap_err();
+            assert!(error.to_string().contains(expected), "{args:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn workspace_help_documents_repo_free_creation_without_resolving_backend() {
+        for args in [
+            vec!["workspace"],
+            vec!["workspace", "--help"],
+            vec!["workspace", "create", "--help"],
+        ] {
+            assert!(matches!(
+                parse_args_from(args).unwrap(),
+                Mode::WorkspaceHelp
+            ));
+        }
+        assert!(TOP_LEVEL_HELP.contains("workspace create --display-name <NAME>"));
+        assert!(WORKSPACE_HELP.contains("without an initial repository"));
+        assert!(WORKSPACE_HELP.contains("--workspace-id <ID>"));
+    }
+
+    #[test]
+    fn explicit_workspace_selects_backend_from_non_git_directory_even_with_local_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let resolver = FixedCliConnectionResolver {
+            backend_url: "http://configured-backend.example",
+        };
+        // This resolver defaults to Standalone and rejects repository-based selection.
+        for command in [None, Some("workers"), Some("resume"), Some("panel")] {
+            let mut args = vec!["--workspace-id".to_string(), "repo-free".to_string()];
+            if let Some(command) = command {
+                args.push(command.to_string());
+            }
+            args.extend([
+                "--workspace".to_string(),
+                directory.path().display().to_string(),
+            ]);
+            let Mode::Tui {
+                target,
+                mode,
+                workspace_root,
+            } = parse_args_slice_with_connection_resolver(&args, &resolver).unwrap()
+            else {
+                panic!("expected TUI mode for {args:?}");
+            };
+            assert_eq!(workspace_root, directory.path());
+            assert_eq!(
+                target.resolve().unwrap(),
+                client::ResolvedTarget::Backend {
+                    base_url: "http://configured-backend.example".to_string(),
+                    workspace_id: "repo-free".to_string(),
+                }
+            );
+            match command {
+                None => assert!(matches!(mode, LaunchMode::BackendSpawn)),
+                Some("workers") => assert!(matches!(
+                    mode,
+                    LaunchMode::Workers {
+                        intent: BackendWorkerPickerIntent::Attach { .. },
+                        ..
+                    }
+                )),
+                Some("resume") => assert!(matches!(
+                    mode,
+                    LaunchMode::Workers {
+                        intent: BackendWorkerPickerIntent::Resume,
+                        ..
+                    }
+                )),
+                Some("panel") => assert!(matches!(mode, LaunchMode::Panel)),
+                _ => unreachable!(),
+            }
+        }
+        assert!(!directory.path().join(".git").exists());
+        assert!(!directory.path().join(".yoi").exists());
+    }
+
+    #[test]
+    fn explicit_workspace_attaches_to_backend_worker_without_git_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let resolver = FixedCliConnectionResolver {
+            backend_url: "http://configured-backend.example",
+        };
+        let args = [
+            vec![
+                "--workspace-id=repo-free",
+                "--runtime-id",
+                "runtime-a",
+                "--worker-id",
+                "worker-a",
+                "--workspace",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>(),
+            vec![directory.path().display().to_string()],
+        ]
+        .concat();
+        let Mode::Tui {
+            target,
+            mode:
+                LaunchMode::OpenWorker {
+                    runtime_id,
+                    worker_id,
+                },
+            ..
+        } = parse_args_slice_with_connection_resolver(&args, &resolver).unwrap()
+        else {
+            panic!("expected Backend Worker attach mode");
+        };
+        assert_eq!(
+            target.resolve().unwrap(),
+            client::ResolvedTarget::Backend {
+                base_url: "http://configured-backend.example".to_string(),
+                workspace_id: "repo-free".to_string(),
+            }
+        );
+        assert_eq!(runtime_id, "runtime-a");
+        assert_eq!(worker_id, "worker-a");
+    }
+
+    #[test]
+    fn explicit_workspace_conflicts_with_local_selection() {
+        let resolver = FixedCliConnectionResolver {
+            backend_url: "http://unused.example",
+        };
+        let args = ["--local", "--workspace-id", "repo-free"].map(String::from);
+        let error = parse_args_slice_with_connection_resolver(&args, &resolver).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "--local and --workspace-id are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn init_rejects_non_git_repository_instead_of_creating_repo_free_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = vec![
+            "--display-name".to_string(),
+            "Research".to_string(),
+            "--repository-key".to_string(),
+            "main".to_string(),
+            "--repository".to_string(),
+            directory.path().display().to_string(),
+        ];
+        let error = parse_init_args(&args, Some("http://backend.example".to_string())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not inside a readable Git repository")
+        );
+    }
+
+    #[test]
     fn init_parsing_uses_git_root_without_writing_repository_local_identity() {
         let repository = tempfile::tempdir().unwrap();
         Command::new("git")
@@ -3398,9 +3708,9 @@ backend = "shared"
     }
 
     #[test]
-    fn parse_workspace_command_is_removed_from_yoi_surface() {
+    fn workspace_creation_does_not_restore_removed_workspace_server_command() {
         let err = parse_args_from(["workspace", "serve", "--listen", "127.0.0.1:0"]).unwrap_err();
-        assert_eq!(err.to_string(), "unknown command `workspace`");
+        assert_eq!(err.to_string(), "unknown yoi workspace subcommand `serve`");
     }
 
     #[test]

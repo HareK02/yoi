@@ -1,11 +1,6 @@
 declare const Deno: {
   test(name: string, fn: () => void | Promise<void>): void;
-  readTextFile(path: URL): Promise<string>;
 };
-
-function assert(condition: unknown, message: string): asserts condition {
-  if (!condition) throw new Error(message);
-}
 
 function assertEquals(actual: unknown, expected: unknown): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -35,6 +30,26 @@ import {
   loadWorkspaceCatalog,
   WorkspaceCatalogError,
 } from "../src/lib/workspace/api/workspace-catalog.ts";
+import { creationResponse } from "../src/lib/workspace/api/workspace-catalog.test-fixtures.ts";
+
+Deno.test("workspace creation accepts omitted and null repository requests without fabricating a repository", async () => {
+  for (const repository of [undefined, null]) {
+    const request = {
+      operation_key: "empty-create",
+      display_name: "New Workspace",
+      ...(repository === null ? { repository } : {}),
+    };
+    const fetcher = async (url: string | URL | Request, init?: RequestInit) => {
+      assertEquals(url, "/api/workspaces");
+      assertEquals(init?.method, "POST");
+      assertEquals(JSON.parse(String(init?.body)), request);
+      return Response.json(creationResponse());
+    };
+    const response = await createWorkspace(fetcher as typeof fetch, request);
+    assertEquals(response.repository, null);
+    assertEquals(response.workspace.workspace_id, "home-empty");
+  }
+});
 
 Deno.test("workspace catalog enriches each visible workspace without dropping siblings", async () => {
   const fetcher = (input: string | URL | Request) => {
@@ -117,28 +132,4 @@ Deno.test("workspace creation preserves caller-owned operation key across retry"
     WorkspaceCatalogError,
   );
   assertEquals(bodies, [request, request]);
-});
-
-Deno.test("workspace creation form starts with an explicit required Repository key", async () => {
-  const source = await Deno.readTextFile(
-    new URL("../src/routes/+page.svelte", import.meta.url),
-  );
-
-  assert(
-    source.includes('let repositoryKey = $state("");'),
-    "the form must start without an implicit Repository key",
-  );
-  assert(
-    source.includes("<input bind:value={repositoryKey} required"),
-    "the Browser must require creator input for the Repository key",
-  );
-  assert(
-    source.includes("repository_key: normalized.repositoryKey"),
-    "the Browser must submit the creator-provided Repository key",
-  );
-  assert(
-    !source.includes('repositoryKey || "main"') &&
-      !source.includes("repositoryKey || 'main'"),
-    "the Browser must not fall back to main",
-  );
 });

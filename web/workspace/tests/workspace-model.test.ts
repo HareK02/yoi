@@ -8,11 +8,56 @@ import {
   parseRepositoryApiError,
   parseRepositoryListApiResult,
   parseRepositoryListResponse,
+  parseWorkspaceCreateResponse,
   parseWorkspaceDeletionOperationResponse,
   parseWorkspaceDeletionPreflightResponse,
   parseWorkspaceResponse,
   REPOSITORY_API_LIMITS,
 } from "../src/lib/workspace/api/workspace-model.ts";
+
+import {
+  creationResponse,
+  currentInitialRepository,
+} from "../src/lib/workspace/api/workspace-catalog.test-fixtures.ts";
+
+Deno.test("workspace creation decodes absent and deleted initial repositories as explicit null", () => {
+  for (const replayed of [false, true]) {
+    const parsed = parseWorkspaceCreateResponse(
+      JSON.parse(JSON.stringify(creationResponse(null, replayed))),
+    );
+    if (parsed.repository !== null || parsed.replayed !== replayed) {
+      throw new Error("nullable creation response was not preserved");
+    }
+  }
+});
+
+Deno.test("workspace creation replay preserves the returned current repository record", () => {
+  const parsed = parseWorkspaceCreateResponse(
+    creationResponse(currentInitialRepository, true),
+  );
+  if (
+    JSON.stringify(parsed.repository) !==
+      JSON.stringify(currentInitialRepository)
+  ) throw new Error("current repository record was replaced or lost");
+});
+
+Deno.test("workspace creation rejects missing and malformed repository response fields", () => {
+  for (
+    const value of [undefined, false, {}, {
+      ...currentInitialRepository,
+      source_revision: -1,
+    }]
+  ) {
+    assertThrows(
+      () =>
+        parseWorkspaceCreateResponse({
+          ...creationResponse(),
+          repository: value,
+        }),
+      "workspace create response.repository",
+    );
+  }
+});
 
 function assertThrows(operation: () => unknown, expected: string): void {
   try {

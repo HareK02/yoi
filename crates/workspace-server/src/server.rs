@@ -355,14 +355,16 @@ impl ServerConfig {
         workspace: &WorkspaceRecord,
         repositories: Vec<RepositoryRecord>,
     ) -> Result<Self> {
-        if repositories.is_empty() {
-            return Err(Error::Config(format!(
-                "Workspace {} has no registered repository",
-                workspace.workspace_id
-            )));
-        }
-        let workspace_execution_root =
-            Self::default_workspace_backend_data_root(&workspace.workspace_id);
+        // Derive scoped storage from the configured authority database, not process-global
+        // defaults. This also keeps custom server roots and temporary API fixtures isolated.
+        let workspace_execution_root = self
+            .database_path
+            .parent()
+            .ok_or_else(|| {
+                Error::Config("Server database path must have a parent directory".to_string())
+            })?
+            .join("workspaces")
+            .join(&workspace.workspace_id);
         let repositories = repositories
             .into_iter()
             .map(|repository| ConfiguredRepository {
@@ -386,9 +388,8 @@ impl ServerConfig {
         scoped
             .workspace_created_at
             .clone_from(&workspace.created_at);
+        scoped.embedded_runtime_store_root = workspace_execution_root.join("embedded-runtime");
         scoped.workspace_execution_root = workspace_execution_root;
-        scoped.embedded_runtime_store_root =
-            Self::default_embedded_runtime_store_root(&workspace.workspace_id);
         scoped.repositories = repositories;
         // Runtime trust is server-global. Only explicitly assigned sources enter
         // this Workspace's registry and receive Workspace-scoped capabilities.
@@ -2549,7 +2550,7 @@ fn workspace_create_response(
 ) -> WorkspaceCreateResponse {
     WorkspaceCreateResponse {
         workspace: workspace_summary(created.workspace),
-        repository: workspace_repository_record(created.repository),
+        repository: created.repository.map(workspace_repository_record),
         config_revision: created.config_revision,
         request_fingerprint: created.request_fingerprint,
         replayed: created.replayed,
@@ -42742,7 +42743,10 @@ mod tests {
         );
         assert_eq!(
             scoped.workspace_execution_root,
-            ServerConfig::default_workspace_backend_data_root("remote-workspace")
+            base.database_path
+                .parent()
+                .unwrap()
+                .join("workspaces/remote-workspace")
         );
     }
 
@@ -45040,6 +45044,252 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repository_free_workspace_can_be_created_selected_and_used_then_register_repository() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_server_config(temp.path());
+        let store = Arc::new(SqliteWorkspaceStore::open(&config.database_path).unwrap());
+        let owner = seed_test_api_token(store.as_ref(), "empty-owner");
+        let foreign = seed_test_api_token(store.as_ref(), "empty-foreign");
+        let app = build_workspace_server_router(config.clone(), store.clone())
+            .await
+            .unwrap();
+        let wire =
+            json!({"operation_key": "create-empty-workspace", "display_name": "Empty Workspace"});
+        request_json(
+            app.clone(),
+            "POST",
+            "/api/workspaces",
+            Some(wire.clone()),
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+        let created = request_json_authenticated(
+            app.clone(),
+            "POST",
+            "/api/workspaces",
+            Some(wire.clone()),
+            &owner,
+            StatusCode::CREATED,
+        )
+        .await;
+        assert!(created["repository"].is_null());
+        assert!(!created["replayed"].as_bool().unwrap());
+        let id = created["workspace"]["workspace_id"].as_str().unwrap();
+        assert!(store.list_repositories(id).unwrap().is_empty());
+        let scoped = format!("/api/w/{id}");
+
+        let replay = request_json_authenticated(
+            app.clone(),
+            "POST",
+            "/api/workspaces",
+            Some(wire.clone()),
+            &owner,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(replay["workspace"]["workspace_id"], id);
+        assert!(replay["replayed"].as_bool().unwrap());
+        let repositories = request_json_authenticated(
+            app.clone(),
+            "GET",
+            &format!("{scoped}/repositories"),
+            None,
+            &owner,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(repositories["items"], json!([]));
+        assert_eq!(repositories["diagnostics"], json!([]));
+        request_json_authenticated(
+            app.clone(),
+            "GET",
+            &format!("{scoped}/workspace"),
+            None,
+            &owner,
+            StatusCode::OK,
+        )
+        .await;
+        let non_owner_workspace = request_json_authenticated(
+            app.clone(),
+            "GET",
+            &format!("{scoped}/workspace"),
+            None,
+            &foreign,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(
+            non_owner_workspace["permissions"]["manage_repositories"],
+            false
+        );
+        assert_eq!(
+            non_owner_workspace["permissions"]["delete_workspace"],
+            false
+        );
+        request_json(
+            app.clone(),
+            "GET",
+            &format!("{scoped}/workspace"),
+            None,
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        let foreign_catalog = request_json_authenticated(
+            app.clone(),
+            "GET",
+            "/api/workspaces",
+            None,
+            &foreign,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(foreign_catalog, json!([]));
+        let deletion = request_json_authenticated(
+            app.clone(),
+            "GET",
+            &format!("/api/workspaces/{id}/deletion"),
+            None,
+            &owner,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(deletion["resources"]["repositories"], 0);
+        assert_eq!(
+            deletion["blockers"][0]["kind"], "last_accessible_workspace",
+            "{deletion}"
+        );
+        let worker = request_json_authenticated(app.clone(), "POST", &format!("{scoped}/workers"), Some(json!({"runtime_id": "embedded-worker-runtime", "display_name": "Worker", "initial_submit": [], "feature_connections": {}})), &owner, StatusCode::OK).await;
+        assert!(worker["worker_id"].is_string(), "{worker}");
+        let detail = request_json_authenticated(
+            app.clone(),
+            "GET",
+            &format!(
+                "{scoped}/runtimes/embedded-worker-runtime/workers/{}",
+                worker["worker_id"].as_str().unwrap()
+            ),
+            None,
+            &owner,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(detail["profile"], "builtin:companion");
+        let worker_ref = RuntimeWorkerRef::new(
+            "embedded-worker-runtime",
+            worker["worker_id"].as_str().unwrap(),
+        );
+        assert!(
+            store
+                .list_worker_workdir_links(id, &worker_ref)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(detail["resource_key"], "W-1");
+        let repository = json!({"repository_key": "later", "source": "https://example.test/later.git", "default_ref": "main"});
+        request_json_authenticated(
+            app.clone(),
+            "POST",
+            &format!("{scoped}/repositories"),
+            Some(repository.clone()),
+            &foreign,
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+        request_json_authenticated(
+            app.clone(),
+            "POST",
+            &format!("{scoped}/repositories"),
+            Some(repository),
+            &owner,
+            StatusCode::CREATED,
+        )
+        .await;
+        assert_eq!(store.list_repositories(id).unwrap().len(), 1);
+        let replay = request_json_authenticated(
+            app.clone(),
+            "POST",
+            "/api/workspaces",
+            Some(wire.clone()),
+            &owner,
+            StatusCode::OK,
+        )
+        .await;
+        assert!(
+            replay["repository"].is_null(),
+            "omitted initial repository never means a later asset"
+        );
+        let mut conflict = wire.clone();
+        conflict["repository"] =
+            json!({"repository_key": "later", "uri": "https://example.test/later.git"});
+        request_json_authenticated(
+            app.clone(),
+            "POST",
+            "/api/workspaces",
+            Some(conflict),
+            &owner,
+            StatusCode::CONFLICT,
+        )
+        .await;
+        for repository in [
+            json!({"repository_key": "main", "uri": "relative/repo"}),
+            json!({"repository_key": " main ", "uri": "/runtime/repo"}),
+        ] {
+            let invalid = json!({"operation_key": "invalid-empty-repo", "display_name": "Workspace", "repository": repository});
+            request_json_authenticated(
+                app.clone(),
+                "POST",
+                "/api/workspaces",
+                Some(invalid),
+                &owner,
+                StatusCode::BAD_REQUEST,
+            )
+            .await;
+        }
+        assert_eq!(store.list_workspaces().unwrap().len(), 1);
+        // With another accessible Workspace, zero repositories are not a deletion blocker.
+        let second = request_json_authenticated(
+            app.clone(),
+            "POST",
+            "/api/workspaces",
+            Some(json!({"operation_key": "second-empty", "display_name": "Second Empty"})),
+            &owner,
+            StatusCode::CREATED,
+        )
+        .await;
+        let second_id = second["workspace"]["workspace_id"].as_str().unwrap();
+        let deletion_uri = format!("/api/workspaces/{second_id}/deletion");
+        let preflight = request_json_authenticated(
+            app.clone(),
+            "GET",
+            &deletion_uri,
+            None,
+            &owner,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(preflight["can_delete"], true, "{preflight}");
+        assert_eq!(preflight["resources"]["repositories"], 0);
+        let deletion_request = json!({"operation_id": "delete-second-empty", "expected_revision": preflight["expected_revision"], "confirmation": "Second Empty"});
+        request_json_authenticated(
+            app.clone(),
+            "POST",
+            &deletion_uri,
+            Some(deletion_request.clone()),
+            &foreign,
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+        request_json_authenticated(
+            app,
+            "POST",
+            &deletion_uri,
+            Some(deletion_request),
+            &owner,
+            StatusCode::ACCEPTED,
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn workspace_server_router_requires_identity_for_scoped_rest() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = test_server_config(temp.path());
@@ -45081,11 +45331,11 @@ mod tests {
                 WorkspaceCreateRequest {
                     operation_key: "create-auth".to_owned(),
                     display_name: "Auth Workspace".to_owned(),
-                    repository: crate::workspace_catalog::InitialRepositoryIntent {
+                    repository: Some(crate::workspace_catalog::InitialRepositoryIntent {
                         repository_key: "main".to_string(),
                         uri: repository.display().to_string(),
                         default_ref: None,
-                    },
+                    }),
                 },
                 "account-auth".to_owned(),
             )
@@ -45211,11 +45461,11 @@ mod tests {
         let create_request = WorkspaceCreateRequest {
             operation_key: "create-authenticated-workspace".to_owned(),
             display_name: "Authenticated Workspace".to_owned(),
-            repository: crate::workspace_catalog::InitialRepositoryIntent {
+            repository: Some(crate::workspace_catalog::InitialRepositoryIntent {
                 repository_key: "main".to_string(),
                 uri: created_repository.display().to_string(),
                 default_ref: Some("develop".to_owned()),
-            },
+            }),
         };
         let created_response = app
             .clone()
@@ -46339,11 +46589,11 @@ mod tests {
                 WorkspaceCreateRequest {
                     operation_key: "create-a".to_string(),
                     display_name: "Workspace A".to_string(),
-                    repository: crate::workspace_catalog::InitialRepositoryIntent {
+                    repository: Some(crate::workspace_catalog::InitialRepositoryIntent {
                         repository_key: "main".to_string(),
                         uri: repository_a.display().to_string(),
                         default_ref: None,
-                    },
+                    }),
                 },
                 "account-two-workspaces".to_owned(),
             )
@@ -46353,11 +46603,11 @@ mod tests {
                 WorkspaceCreateRequest {
                     operation_key: "create-b".to_string(),
                     display_name: "Workspace B".to_string(),
-                    repository: crate::workspace_catalog::InitialRepositoryIntent {
+                    repository: Some(crate::workspace_catalog::InitialRepositoryIntent {
                         repository_key: "main".to_string(),
                         uri: repository_b.display().to_string(),
                         default_ref: None,
-                    },
+                    }),
                 },
                 "account-two-workspaces".to_owned(),
             )
@@ -57555,7 +57805,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_repository_config_returns_empty_list_with_warning() {
+    async fn empty_repository_config_returns_valid_empty_list_without_warning() {
         let root = tempfile::tempdir().unwrap();
         let mut config = test_server_config(root.path());
         config.repositories.clear();
@@ -57572,10 +57822,7 @@ mod tests {
         let repositories = get_json(app, "/api/repositories").await;
 
         assert!(repositories["items"].as_array().unwrap().is_empty());
-        assert_eq!(
-            repositories["diagnostics"][0]["code"],
-            "repository_config_empty"
-        );
+        assert_eq!(repositories["diagnostics"], json!([]));
     }
 
     #[tokio::test]

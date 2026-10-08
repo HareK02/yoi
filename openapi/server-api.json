@@ -14056,7 +14056,7 @@
       },
       "WorkspaceCreateRequest": {
         "additionalProperties": false,
-        "description": "Request for atomically creating a Workspace and its initial Repository.",
+        "description": "Request for atomically creating a Workspace with an optional initial Repository.",
         "properties": {
           "display_name": {
             "type": "string"
@@ -14065,19 +14065,25 @@
             "type": "string"
           },
           "repository": {
-            "$ref": "#/components/schemas/InitialRepositoryIntent"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InitialRepositoryIntent"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
           "operation_key",
-          "display_name",
-          "repository"
+          "display_name"
         ],
         "type": "object"
       },
       "WorkspaceCreateResponse": {
         "additionalProperties": false,
-        "description": "Response returned after atomically creating a Workspace and its first Repository.",
+        "description": "Response returned after atomically creating a Workspace.\n\nOn replay, Workspace/config and the Repository at the originally requested key are\ncurrent authority, not historical snapshots. Repository is null when creation omitted\nit or that key has since been removed/renamed; replay never recreates an asset.",
         "properties": {
           "config_revision": {
             "format": "uint64",
@@ -14089,7 +14095,14 @@
             "type": "boolean"
           },
           "repository": {
-            "$ref": "#/components/schemas/WorkspaceRepositoryRecord"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceRepositoryRecord"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "request_fingerprint": {
             "type": "string"
@@ -14100,7 +14113,6 @@
         },
         "required": [
           "workspace",
-          "repository",
           "config_revision",
           "request_fingerprint",
           "replayed"
@@ -15631,7 +15643,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:ab4b109d99077a8b5af98923b77d8fc1b707f7ee9ad08304e26d497ccb3799f6"
+    "x-yoi-source-digest": "sha256:3c3d4e9f55fca26e5833a07da29a6030e4beeedca645ff1c4ef1583c6c29abe0"
   },
   "openapi": "3.1.0",
   "paths": {

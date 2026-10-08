@@ -19,6 +19,13 @@ pub(crate) struct InitOptions {
     pub(crate) default_ref: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceCreateOptions {
+    pub(crate) backend_url: String,
+    pub(crate) display_name: String,
+    pub(crate) repository: Option<CreateBackendWorkspaceRepository>,
+}
+
 pub(crate) async fn run_init(
     options: InitOptions,
 ) -> Result<server_api::WorkspaceCreateResponse, ParseError> {
@@ -26,25 +33,54 @@ pub(crate) async fn run_init(
         .repository_root
         .to_str()
         .ok_or_else(|| ParseError("the repository root is not valid UTF-8".to_string()))?;
+    run_workspace_create(WorkspaceCreateOptions {
+        backend_url: options.backend_url,
+        display_name: options.display_name,
+        repository: Some(CreateBackendWorkspaceRepository {
+            repository_key: options.repository_key,
+            uri: repository_uri.to_string(),
+            default_ref: options.default_ref,
+        }),
+    })
+    .await
+}
+
+pub(crate) async fn run_workspace_create(
+    options: WorkspaceCreateOptions,
+) -> Result<server_api::WorkspaceCreateResponse, ParseError> {
     let target = BackendWorkspaceCatalogTarget {
         base_url: options.backend_url.clone(),
     };
-    let response = create_backend_workspace(
-        &target,
-        &CreateBackendWorkspaceRequest {
-            operation_key: uuid::Uuid::now_v7().to_string(),
-            display_name: options.display_name,
-            repository: CreateBackendWorkspaceRepository {
-                repository_key: options.repository_key,
-                uri: repository_uri.to_string(),
-                default_ref: options.default_ref,
-            },
-        },
-    )
-    .await
-    .map_err(|error| ParseError(format!("Backend rejected Workspace creation: {error}")))?;
+    let request = workspace_create_request(options.display_name, options.repository);
+    let response = create_backend_workspace(&target, &request)
+        .await
+        .map_err(|error| ParseError(format!("Backend rejected Workspace creation: {error}")))?;
     record_workspace_backend_routing(&response.workspace.workspace_id, &options.backend_url)?;
     Ok(response)
+}
+
+fn workspace_create_request(
+    display_name: String,
+    repository: Option<CreateBackendWorkspaceRepository>,
+) -> CreateBackendWorkspaceRequest {
+    CreateBackendWorkspaceRequest {
+        operation_key: uuid::Uuid::now_v7().to_string(),
+        display_name,
+        repository,
+    }
+}
+
+pub(crate) fn workspace_creation_message(response: &server_api::WorkspaceCreateResponse) -> String {
+    match &response.repository {
+        Some(repository) => format!(
+            "Initialized Workspace '{}' for repository '{}'",
+            response.workspace.display_name, repository.repository_key
+        ),
+        None => format!(
+            "Created Workspace '{}' (workspace-id: {}) without an initial repository",
+            response.workspace.display_name, response.workspace.workspace_id
+        ),
+    }
 }
 
 pub(crate) fn select_backend_workspace_for_repository(
@@ -331,6 +367,85 @@ mod tests {
             git: None,
             diagnostics: None,
         }
+    }
+
+    #[test]
+    fn workspace_creation_wire_request_omits_repository_for_repo_free_creation() {
+        let request = workspace_create_request("Research".to_string(), None);
+        let body = serde_json::to_value(request).unwrap();
+        assert_eq!(body["display_name"], "Research");
+        assert!(
+            body.get("repository")
+                .is_none_or(serde_json::Value::is_null)
+        );
+    }
+
+    #[test]
+    fn git_workspace_creation_wire_request_preserves_initial_repository() {
+        let request = workspace_create_request(
+            "Development".to_string(),
+            Some(CreateBackendWorkspaceRepository {
+                repository_key: "platform".to_string(),
+                uri: "/checkout/platform".to_string(),
+                default_ref: Some("develop".to_string()),
+            }),
+        );
+        let body = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            body["repository"],
+            serde_json::json!({
+                "repository_key": "platform",
+                "uri": "/checkout/platform",
+                "default_ref": "develop",
+            })
+        );
+    }
+
+    #[test]
+    fn creation_response_with_null_repository_reports_workspace_including_on_replay() {
+        for replayed in [false, true] {
+            let body = serde_json::json!({
+                "workspace": workspace_summary("workspace-a", "Research"),
+                "repository": null,
+                "config_revision": 0,
+                "request_fingerprint": "fingerprint",
+                "replayed": replayed,
+            });
+            let response = serde_json::from_value(body).unwrap();
+            assert_eq!(
+                workspace_creation_message(&response),
+                "Created Workspace 'Research' (workspace-id: workspace-a) without an initial repository"
+            );
+        }
+    }
+
+    #[test]
+    fn creation_response_with_repository_preserves_git_init_message() {
+        let body = serde_json::json!({
+            "workspace": workspace_summary("workspace-a", "Development"),
+            "repository": {
+                "workspace_id": "workspace-a",
+                "repository_key": "platform",
+                "kind": "git",
+                "provider": "builtin:git",
+                "source": {"kind": "local_path", "uri": "/checkout/platform"},
+                "default_ref": "develop",
+                "source_revision": 1,
+                "source_fingerprint": "fingerprint",
+                "observed_status": "unverified",
+                "observed_at": null,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+            },
+            "config_revision": 1,
+            "request_fingerprint": "fingerprint",
+            "replayed": false,
+        });
+        let response = serde_json::from_value(body).unwrap();
+        assert_eq!(
+            workspace_creation_message(&response),
+            "Initialized Workspace 'Development' for repository 'platform'"
+        );
     }
 
     #[test]

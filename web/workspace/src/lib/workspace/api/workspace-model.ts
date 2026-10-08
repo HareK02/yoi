@@ -569,7 +569,7 @@ export function parseWorkspaceCreateResponse(
       response.workspace,
       "workspace create response.workspace",
     ),
-    repository: workspaceRepositoryRecord(
+    repository: response.repository === null ? null : workspaceRepositoryRecord(
       response.repository,
       "workspace create response.repository",
     ),
