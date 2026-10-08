@@ -3199,6 +3199,55 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         }
     }
 
+    /// Correct one candidate actually sent in the rejected request. Commit the
+    /// durable correction before changing either in-memory projection or retrying.
+    fn recover_rejected_image(
+        &self,
+        history: &mut History<A>,
+        request: &mut Request,
+    ) -> Result<bool, EngineError> {
+        let Some((history_index, request_index)) =
+            crate::image_recovery::largest_candidate(history, request)
+        else {
+            return Ok(false);
+        };
+        let entry = &history.entries()[history_index];
+        let replacement = crate::image_recovery::rejected_result(&entry.item);
+        if let Some(commit) = &self.image_rejection_handler {
+            commit(entry, &replacement).map_err(EngineError::HistoryAppend)?;
+        }
+        history.entries_mut()[history_index].item = replacement.clone();
+        // Retain the original request's prune/interceptor decisions.
+        request.items[request_index] = replacement;
+        self.emit_warning(crate::image_recovery::REJECTION_MESSAGE);
+        Ok(true)
+    }
+
+    /// Opening a corrected request can itself yield an HTTP image rejection.
+    /// Each successful correction removes one candidate, bounding this loop.
+    async fn open_stream_with_image_recovery(
+        &mut self,
+        request: &mut Request,
+        turn: usize,
+        llm_call: usize,
+        history: &mut History<A>,
+    ) -> Result<ResponseStream, EngineError> {
+        loop {
+            match self
+                .open_stream_with_retry(request.clone(), turn, llm_call)
+                .await
+            {
+                Ok(stream) => return Ok(stream),
+                Err(EngineError::Client(error)) if error.is_image_size_rejection() => {
+                    if !self.recover_rejected_image(history, request)? {
+                        return Err(EngineError::Client(error));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Open a stream, dispatch all events to the timeline, handle cancellation.
     async fn stream_response(
         &mut self,
@@ -3217,37 +3266,14 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         );
 
         let mut request = request;
-        let stream = loop {
-            match self
-                .open_stream_with_retry(request.clone(), turn, llm_call)
-                .await
-            {
-                Ok(stream) => break stream,
-                Err(EngineError::Client(error)) if error.is_image_size_rejection() => {
-                    let Some((history_index, request_index)) =
-                        crate::image_recovery::largest_candidate(history, &request)
-                    else {
-                        return Err(EngineError::Client(error));
-                    };
-                    let entry = &history.entries()[history_index];
-                    let replacement = crate::image_recovery::rejected_result(&entry.item);
-                    if let Some(commit) = &self.image_rejection_handler {
-                        commit(entry, &replacement).map_err(EngineError::HistoryAppend)?;
-                    }
-                    history.entries_mut()[history_index].item = replacement.clone();
-                    // Rebuild the provider request from the corrected projection,
-                    // retaining prior prune/interceptor decisions. No tool runs
-                    // or assistant output have occurred for this failed request.
-                    request.items[request_index] = replacement;
-                    self.emit_warning(crate::image_recovery::REJECTION_MESSAGE);
-                }
-                Err(error) => return Err(error),
-            }
-        };
+        let stream = self
+            .open_stream_with_image_recovery(&mut request, turn, llm_call, history)
+            .await?;
         self.tool_call_collector.begin_response();
         let mut stream = ResponseStreamPump::start(stream);
         let mut early_tools: Option<EarlyToolExecutionBatch> = None;
         let mut response_completed = false;
+        let mut response_progress = false;
 
         let mut event_count: usize = 0;
         loop {
@@ -3285,6 +3311,35 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                     json!({}),
                                 );
                             }
+                            self.emit_stream_event(turn, llm_call, &event);
+                            // Only pre-output provider rejection can safely replay the
+                            // original request. Even an empty block start closes this
+                            // window, before collectors or early tool admission run.
+                            // Unknown events are conservatively not replayable either.
+                            match &event {
+                                Event::Ping(_) | Event::Usage(_) | Event::Error(_) => {}
+                                Event::Status(StatusEvent {
+                                    status: crate::llm_client::event::ResponseStatus::Started,
+                                }) => {}
+                                _ => response_progress = true,
+                            }
+                            if let Event::Error(error) = &event {
+                                if !response_progress && error.is_image_size_rejection() {
+                                    self.timeline.flush_usage();
+                                    if self.recover_rejected_image(history, &mut request)? {
+                                        // Drop the old pump (including queued failed status)
+                                        // before opening the corrected request. No collector or
+                                        // tool state exists for this pre-output attempt.
+                                        drop(stream);
+                                        stream = ResponseStreamPump::start(self.open_stream_with_image_recovery(
+                                            &mut request, turn, llm_call, history,
+                                        ).await?);
+                                        self.tool_call_collector.begin_response();
+                                        event_count = 0;
+                                        continue;
+                                    }
+                                }
+                            }
                             if matches!(
                                 &event,
                                 Event::Status(StatusEvent {
@@ -3293,7 +3348,6 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                             ) {
                                 response_completed = true;
                             }
-                            self.emit_stream_event(turn, llm_call, &event);
                             self.timeline.dispatch(&event);
                             if early_dispatch {
                                 let collected = self.tool_call_collector.take_collected_with_index();
