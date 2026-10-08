@@ -139,26 +139,34 @@ impl worker::WorkspaceClient for ConfigRouterClient {
         Ok(response)
     }
 }
-fn config_interface(path: &str) -> String {
-    // Use the published contextual interface identity, not a model-managed validator.
-    let hex = path
-        .bytes()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("yoi.workspace-config/node/v1/@/{hex}")
+fn config_interface(path: &str) -> Value {
+    // Exact contextual reference published by the current config Object.
+    json!({"scope": path, "name": "yoi.workspace-config/node/v1"})
 }
 async fn config_discover(runtime: &worker::wip::WipRuntime, path: &str) {
-    let observed = runtime
-        .discover(path.into(), 0, true)
-        .await
-        .unwrap()
-        .content
-        .unwrap();
-    assert!(
-        observed.contains(&config_interface(path)),
-        "interface must come from live discovery: {observed}"
+    inspect_published_interface(runtime, path, &config_interface(path)).await;
+}
+async fn inspect_published_interface(
+    runtime: &worker::wip::WipRuntime,
+    path: &str,
+    expected: &Value,
+) {
+    let tree = runtime.tree(path.into(), 0, true).await.unwrap();
+    let tree: Value = serde_json::from_str(tree.content.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        tree["path"], path,
+        "Object must come from live Tree: {tree}"
     );
-    runtime.inspect(config_interface(path), true).await.unwrap();
+    let inspected = runtime.inspect(path.into(), true).await.unwrap();
+    let inspected: Value = serde_json::from_str(inspected.content.as_deref().unwrap()).unwrap();
+    assert!(
+        inspected["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|interface| &interface["reference"] == expected),
+        "interface must come from live path-centered Inspect: {inspected}"
+    );
 }
 async fn config_call(
     runtime: &worker::wip::WipRuntime,
@@ -167,9 +175,12 @@ async fn config_call(
     args: Value,
 ) -> std::result::Result<agen::tool::ToolOutput, agen::tool::ToolError> {
     runtime
-        .call(
+        .invoke(
             path.into(),
-            config_interface(path),
+            wip_protocol::InterfaceReference {
+                scope: path.into(),
+                name: "yoi.workspace-config/node/v1".into(),
+            },
             operation.into(),
             args,
             agen::tool::ToolExecutionContext::direct(),
@@ -183,23 +194,16 @@ async fn catalog_call(
     base: &str,
     operation: &str,
 ) -> Value {
-    let hex = path
-        .bytes()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let interface = format!("{base}/@/{hex}");
-    let discovered = runtime
-        .discover(path.into(), 0, true)
-        .await
-        .unwrap()
-        .content
-        .unwrap();
-    assert!(discovered.contains(&interface), "{discovered}");
-    runtime.inspect(interface.clone(), true).await.unwrap();
+    // Live catalog publication contextualizes the Interface to this Object.
+    let reference = json!({"scope": path, "name": base});
+    inspect_published_interface(runtime, path, &reference).await;
     let output = runtime
-        .call(
+        .invoke(
             path.into(),
-            interface,
+            wip_protocol::InterfaceReference {
+                scope: path.into(),
+                name: base.into(),
+            },
             operation.into(),
             json!({}),
             agen::tool::ToolExecutionContext::direct(),
@@ -635,7 +639,7 @@ async fn assert_config_production_http_adapter(
     assert_config_catalog(&wip, &attached).await;
     config_discover(&wip, "/workspace-config/main.dcdl").await;
     let main_interface = wip
-        .inspect(config_interface("/workspace-config/main.dcdl"), true)
+        .inspect("/workspace-config/main.dcdl".into(), true)
         .await
         .unwrap()
         .content
