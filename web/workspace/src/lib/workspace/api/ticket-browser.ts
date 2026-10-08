@@ -446,6 +446,23 @@ function parseActionEligibility(
   };
 }
 
+function parseSourceRefObservation(
+  value: unknown,
+  label: string,
+): TicketMergeRequestSummary["source_ref_observation"] {
+  const item = object(value, label);
+  const status = string(item.status, `${label}.status`);
+  if (status === "observed" || status === "not_required") {
+    exact(item, ["status"], label);
+    return { status };
+  }
+  if (status === "unavailable") {
+    exact(item, ["status", "code"], label);
+    return { status, code: string(item.code, `${label}.code`) };
+  }
+  throw new Error(`${label}.status is invalid`);
+}
+
 function parseTicketMergeRequestSummary(
   value: unknown,
   label: string,
@@ -453,6 +470,8 @@ function parseTicketMergeRequestSummary(
   const item = object(value, label);
   exact(item, [
     "current_subject_ref",
+    "integration_evidence_error",
+    "source_ref_observation",
     "merge_request_id",
     "repository_key",
     "review_excerpt",
@@ -469,6 +488,14 @@ function parseTicketMergeRequestSummary(
     current_subject_ref: optionalNullableString(
       item.current_subject_ref,
       `${label}.current_subject_ref`,
+    ),
+    integration_evidence_error: nullableString(
+      item.integration_evidence_error,
+      `${label}.integration_evidence_error`,
+    ),
+    source_ref_observation: parseSourceRefObservation(
+      item.source_ref_observation,
+      `${label}.source_ref_observation`,
     ),
     merge_request_id: string(
       item.merge_request_id,

@@ -1,5 +1,6 @@
 use serde::Serialize;
 use serde_json::{Map, Value};
+use server_api::TicketSourceRefObservation;
 
 #[derive(Debug, Serialize)]
 pub(super) struct ModelTicketQueryResponse {
@@ -168,6 +169,8 @@ struct ModelMergeRequest {
     selector_to: String,
     review_status: String,
     subject_ref: Option<String>,
+    source_ref_observation: TicketSourceRefObservation,
+    integration_evidence_error: Option<String>,
     review_excerpt: Option<String>,
 }
 
@@ -179,6 +182,7 @@ struct ModelTicketEvidence {
     has_commit: bool,
     review_status: Option<String>,
     approved_current_subject: bool,
+    review_after_rescope: bool,
     unresolved_request_changes: bool,
     complete_for_integration: bool,
     missing: Vec<String>,
@@ -517,6 +521,14 @@ fn project_merge_request(value: &Value) -> Result<ModelMergeRequest, String> {
         selector_to: string_field(merge, "selector_to")?,
         review_status: string_field(merge, "review_status")?,
         subject_ref: optional_string(merge, "current_subject_ref")?,
+        source_ref_observation: serde_json::from_value(
+            merge
+                .get("source_ref_observation")
+                .ok_or_else(|| "missing source_ref_observation".to_string())?
+                .clone(),
+        )
+        .map_err(|error| format!("invalid source_ref_observation: {error}"))?,
+        integration_evidence_error: optional_string(merge, "integration_evidence_error")?,
         review_excerpt: optional_string(merge, "review_excerpt")?,
     })
 }
@@ -530,6 +542,7 @@ fn project_evidence(value: &Value) -> Result<ModelTicketEvidence, String> {
         has_commit: bool_field(evidence, "has_commit")?,
         review_status: optional_string(evidence, "review_status")?,
         approved_current_subject: bool_field(evidence, "approved_current_subject")?,
+        review_after_rescope: bool_field(evidence, "review_after_rescope")?,
         unresolved_request_changes: bool_field(evidence, "unresolved_request_changes")?,
         complete_for_integration: bool_field(evidence, "complete_for_integration")?,
         missing: string_array(evidence, "missing")?,
@@ -735,6 +748,7 @@ mod tests {
                     "has_commit": false,
                     "review_status": null,
                     "approved_current_subject": false,
+                    "review_after_rescope": false,
                     "unresolved_request_changes": false,
                     "complete_for_integration": false,
                     "missing": ["merge_request"]
@@ -817,6 +831,7 @@ mod tests {
                 "has_commit": false,
                 "review_status": null,
                 "approved_current_subject": false,
+                "review_after_rescope": false,
                 "unresolved_request_changes": false,
                 "complete_for_integration": false,
                 "missing": ["merge_request"]
@@ -842,6 +857,123 @@ mod tests {
             }])
         );
         assert!(!projected.to_string().contains("internal-blocker"));
+    }
+
+    #[test]
+    fn ticket_projection_preserves_source_diagnostics_separately_from_rescope_attestation() {
+        for (state, subject_ref, observation, integration_error, attested) in [
+            (
+                "merged",
+                Some("immutable-approved-source"),
+                json!({"status": "not_required"}),
+                None,
+                true,
+            ),
+            (
+                "open",
+                None,
+                json!({"status": "unavailable", "code": "source_ref_unavailable"}),
+                Some("source_ref_unavailable"),
+                true,
+            ),
+            (
+                "open",
+                Some("observed-source"),
+                json!({"status": "observed"}),
+                None,
+                false,
+            ),
+        ] {
+            let merged = state == "merged";
+            let merge_request = json!({
+                "merge_request_id": "mr-source",
+                "repository_key": "repository",
+                "state": state,
+                "selector_from": "source-branch",
+                "selector_to": "main",
+                "review_status": "approved",
+                "current_subject_ref": subject_ref,
+                "source_ref_observation": observation,
+                "integration_evidence_error": integration_error,
+                "review_excerpt": "Reviewed source"
+            });
+            let projected = project_ticket_detail(json!({
+                "resource_key": "T-716",
+                "item_revision": "current-ticket-revision",
+                "title": "Source evidence",
+                "body": "Body",
+                "state": if merged { "done" } else { "inprogress" },
+                "events": [],
+                "linked_objectives": [],
+                "assignments": [],
+                "implementation_reports": [],
+                "merge_requests": [merge_request.clone()],
+                "merge_request": merge_request,
+                "evidence": {
+                    "has_merge_request": true,
+                    "has_current_subject_ref": subject_ref.is_some(),
+                    "has_review_request": true,
+                    "has_commit": subject_ref.is_some(),
+                    "review_status": "approved",
+                    "approved_current_subject": subject_ref.is_some(),
+                    "review_after_rescope": attested,
+                    "unresolved_request_changes": false,
+                    "complete_for_integration": merged,
+                    "missing": if subject_ref.is_none() {
+                        vec!["current_subject_ref"]
+                    } else {
+                        vec![]
+                    }
+                }
+            }))
+            .expect("source evidence must project");
+            let projected = serde_json::to_value(projected).expect("serialize Ticket detail");
+
+            for merge in [&projected["merge_requests"][0], &projected["merge_request"]] {
+                assert_eq!(merge["subject_ref"], json!(subject_ref));
+                assert_eq!(merge["source_ref_observation"], observation);
+                assert_eq!(
+                    merge.get("integration_evidence_error"),
+                    Some(&json!(integration_error))
+                );
+            }
+            assert_eq!(projected["item_revision"], "current-ticket-revision");
+            assert_eq!(projected["evidence"]["review_after_rescope"], attested);
+            assert_eq!(projected["evidence"]["complete_for_integration"], merged);
+        }
+    }
+
+    #[test]
+    fn merge_request_projection_rejects_missing_or_invalid_source_observation() {
+        let merge_request = json!({
+            "merge_request_id": "mr-source",
+            "repository_key": "repository",
+            "state": "open",
+            "selector_to": "main",
+            "review_status": "none",
+            "current_subject_ref": null,
+            "integration_evidence_error": null
+        });
+        assert!(
+            project_merge_request(&merge_request)
+                .expect_err("source observation is required")
+                .contains("source_ref_observation")
+        );
+        for observation in [
+            Value::Null,
+            json!({"status": "unknown"}),
+            json!({"status": "unavailable"}),
+            json!({"status": "unavailable", "code": 42}),
+            json!({"status": "observed", "code": "unexpected"}),
+        ] {
+            let mut merge_request = merge_request.clone();
+            merge_request["source_ref_observation"] = observation;
+            assert!(
+                project_merge_request(&merge_request)
+                    .expect_err("invalid source observation must fail")
+                    .contains("source_ref_observation")
+            );
+        }
     }
 
     #[test]

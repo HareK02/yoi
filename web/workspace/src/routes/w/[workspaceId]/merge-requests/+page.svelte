@@ -1,5 +1,6 @@
 <script lang="ts">
   import { mergeRequestPagePath } from "#lib/workspace/api/merge-requests.ts";
+  import { summarySourceReviewStatus } from "#lib/workspace/merge-request-status.ts";
   import type { PageData } from "./$types";
 
   let { data }: { data: PageData } = $props();
@@ -40,8 +41,12 @@
               </strong>
             </div>
             <p class="ticket-summary">
-              Repository {mergeRequest.repository_key} · {item.ticket_ids.length} linked Ticket{item.ticket_ids.length === 1 ? "" : "s"} · review {mergeRequest.review_status}
+              Repository {mergeRequest.repository_key} · {item.ticket_ids.length} linked Ticket{item.ticket_ids.length === 1 ? "" : "s"}
             </p>
+            <p class="ticket-summary">{summarySourceReviewStatus(mergeRequest)}</p>
+            {#if mergeRequest.integration_evidence_error !== null}
+              <p class="workspace-callout is-error">Integration evidence error: {mergeRequest.integration_evidence_error}</p>
+            {/if}
           </div>
           <div class="ticket-meta">
             <span class={`ticket-state state-${mergeRequest.state}`}>{mergeRequest.state}</span>

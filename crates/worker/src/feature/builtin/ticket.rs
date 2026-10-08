@@ -101,6 +101,7 @@ enum WorkspaceTicketEvidenceFilter {
 #[serde(rename_all = "snake_case")]
 enum WorkspaceTicketReviewFilter {
     None,
+    Unknown,
     Pending,
     Approved,
     RequestChanges,

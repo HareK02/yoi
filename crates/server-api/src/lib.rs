@@ -7406,6 +7406,15 @@ pub struct TicketActionEligibility {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TicketSourceRefObservation {
+    Observed {},
+    Unavailable { code: String },
+    NotRequired {},
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct TicketMergeRequestSummary {
     pub merge_request_id: String,
@@ -7416,6 +7425,8 @@ pub struct TicketMergeRequestSummary {
     pub selector_to: String,
     pub updated_at: String,
     pub current_subject_ref: Option<String>,
+    pub source_ref_observation: TicketSourceRefObservation,
+    pub integration_evidence_error: Option<String>,
     pub review_subject_ref: Option<String>,
     pub review_requested_at: Option<String>,
     pub review_submitted_at: Option<String>,

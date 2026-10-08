@@ -3471,7 +3471,7 @@ impl WorkspaceApi {
             .map_err(|error| {
             Error::Store(format!("failed to register subjektiv storage: {error}"))
         })?;
-        let api = Self {
+        let mut api = Self {
             config_store,
             repository_secrets,
             signing_identities,
@@ -3483,11 +3483,7 @@ impl WorkspaceApi {
             authority: SqliteWorkspaceAuthority::new(
                 config.database_path.clone(),
                 config.workspace_id.clone(),
-            )?
-            .with_merge_revision_source(Arc::new(MergeRequestRepositorySource {
-                workspace_id: config.workspace_id.clone(),
-                reader: RepositoryRegistryReader::new(config.repositories.clone()),
-            })),
+            )?,
             _worker_projection_shutdown: Arc::new(WorkerProjectionShutdownGuard {
                 service: Arc::downgrade(&worker_projection),
             }),
@@ -3513,6 +3509,14 @@ impl WorkspaceApi {
             worker_control_locks: Arc::new(Mutex::new(HashMap::new())),
             attachment_upload_grants: Arc::new(Mutex::new(HashMap::new())),
         };
+        // The observer snapshot retains the unconfigured authority, not itself:
+        // source observation uses Repository access + Runtime authority without a cycle.
+        let observer_api = api.clone();
+        api.authority =
+            api.authority
+                .with_merge_revision_source(Arc::new(RuntimeTicketMergeRevisionSource {
+                    api: observer_api,
+                }));
         if let Some(dispatcher) = worker_remove_dispatcher {
             dispatcher
                 .install_executor(Arc::new(
@@ -14645,12 +14649,36 @@ struct MergeRequestRepositorySource {
     reader: RepositoryRegistryReader,
 }
 
-impl TicketMergeRevisionSource for MergeRequestRepositorySource {
-    fn resolve_subject_ref(&self, repository_id: &str, selector: &str) -> Option<String> {
-        self.reader
-            .observe_merge_target(repository_id, Some(selector))
-            .ok()
-            .map(|target| target.commit)
+#[derive(Clone)]
+struct RuntimeTicketMergeRevisionSource {
+    api: WorkspaceApi,
+}
+
+impl TicketMergeRevisionSource for RuntimeTicketMergeRevisionSource {
+    fn resolve_subject_ref(
+        &self,
+        ticket_id: &str,
+        repository_id: &str,
+        selector: &str,
+    ) -> std::result::Result<String, MergeRequestRefDiagnostic> {
+        let assignment = self
+            .api
+            .store
+            .get_current_ticket_coder_assignment(self.api.workspace_id(), ticket_id)
+            .map_err(|error| merge_ref_diagnostic(error.into()))?
+            .ok_or_else(|| MergeRequestRefDiagnostic {
+                code: "source_ref_runtime_unavailable".into(),
+                message: "No current Coder Runtime is available to observe the source ref".into(),
+            })?;
+        observe_published_source_ref(
+            &self.api,
+            self.api.workspace_id(),
+            &assignment.worker.runtime_id,
+            repository_id,
+            selector,
+        )
+        .map(|observation| observation.revision_ref)
+        .map_err(merge_ref_diagnostic)
     }
 }
 
@@ -15366,7 +15394,11 @@ async fn scoped_list_merge_requests(
             let ticket_ids = merge_request.ticket_ids.clone();
             let thread_event_count = merge_request.thread.len();
             Ok(MergeRequestListItem {
-                summary: merge_request_summary(merge_request, repository_key, current_subject_ref),
+                summary: merge_request_summary(merge_request, repository_key, current_subject_ref.ok_or_else(|| {
+                    ref_diagnostics.first().cloned().unwrap_or_else(|| MergeRequestRefDiagnostic {
+                        code: "source_ref_unavailable".into(), message: "Source observation is unavailable".into(),
+                    })
+                })),
                 ticket_ids,
                 thread_event_count,
                 ref_diagnostics,
@@ -15389,7 +15421,10 @@ fn merge_ref_diagnostic(error: ApiError) -> MergeRequestRefDiagnostic {
             message: diagnostic.message,
         })
         .unwrap_or_else(|| MergeRequestRefDiagnostic {
-            code: "merge_ref_observation_unavailable".to_string(),
+            code: match &error {
+                Error::RuntimeOperationFailed { code, .. } => code.clone(),
+                _ => "merge_ref_observation_unavailable".to_string(),
+            },
             message: sanitize_backend_error(&error.to_string()),
         })
 }
@@ -15430,6 +15465,50 @@ fn merge_ref_response(
     }
 }
 
+// Persisted results are independent of provider availability and mutable selectors.
+fn integrated_merge_refs(
+    mr: &merge_request::MergeRequest,
+) -> Option<(
+    server_api::MergeRequestRefResponse,
+    server_api::MergeRequestRefResponse,
+)> {
+    if mr.state != merge_request::MergeRequestState::Merged {
+        return None;
+    }
+    let result = mr.merged_result().ok();
+    let diagnostic = mr
+        .integration_approval()
+        .err()
+        .map(|error| MergeRequestRefDiagnostic {
+            code: error.code().into(),
+            message: "Stored integration evidence is missing, inconsistent, or revoked".into(),
+        });
+    let source = server_api::MergeRequestRefResponse {
+        status: if diagnostic.is_none() {
+            "known"
+        } else {
+            "unknown"
+        }
+        .into(),
+        revision_ref: result.map(|merge| merge.approved_source_ref.clone()),
+        observed_at: result.map_or_else(
+            || mr.updated_at.to_rfc3339(),
+            |merge| merge.created_at.to_rfc3339(),
+        ),
+        diagnostic,
+    };
+    let target = server_api::MergeRequestRefResponse {
+        status: if result.is_some() { "known" } else { "unknown" }.into(),
+        revision_ref: result.map(|merge| merge.target_ref_after.clone()),
+        observed_at: source.observed_at.clone(),
+        diagnostic: result.is_none().then(|| MergeRequestRefDiagnostic {
+            code: "merge_result_missing".into(),
+            message: "Merged request has no stored result".into(),
+        }),
+    };
+    Some((source, target))
+}
+
 async fn scoped_show_merge_request(
     State(api): State<WorkspaceApi>,
     AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
@@ -15439,6 +15518,7 @@ async fn scoped_show_merge_request(
     require_workspace_access(&workspace_id, &api)?;
     let store = merge_request_store(&api, &workspace_id)?;
     let mut mr = store.get_by_id(&workspace_id, &merge_request_id)?;
+    let integrated_refs = integrated_merge_refs(&mr);
     mr.thread = store.thread_page_by_id(
         &workspace_id,
         &merge_request_id,
@@ -15453,45 +15533,50 @@ async fn scoped_show_merge_request(
     let assignment = api
         .store
         .get_current_ticket_coder_assignment(&workspace_id, ticket_id)?;
-    let source = match (mr.selector_from.as_deref(), assignment.as_ref()) {
-        (Some(selector), Some(assignment)) => {
-            match observe_published_source_ref(
+    let (source, target) = if let Some(refs) = integrated_refs {
+        refs
+    } else {
+        let source = match (mr.selector_from.as_deref(), assignment.as_ref()) {
+            (Some(selector), Some(assignment)) => {
+                match observe_published_source_ref(
+                    &api,
+                    &workspace_id,
+                    &assignment.worker.runtime_id,
+                    &mr.repository_id,
+                    selector,
+                ) {
+                    Ok(observation) => merge_ref_response(observation),
+                    Err(error) => unknown_merge_ref_response(error),
+                }
+            }
+            (Some(_), None) => unknown_merge_ref(
+                "source_ref_runtime_unavailable",
+                "No current Coder Runtime is available to observe the source ref",
+            ),
+            (None, _) => server_api::MergeRequestRefResponse {
+                status: "requires_repair".into(),
+                revision_ref: None,
+                observed_at: Utc::now().to_rfc3339(),
+                diagnostic: None,
+            },
+        };
+        let target = match assignment.as_ref() {
+            Some(assignment) => match observe_published_merge_ref(
                 &api,
                 &workspace_id,
                 &assignment.worker.runtime_id,
                 &mr.repository_id,
-                selector,
+                &mr.selector_to,
             ) {
                 Ok(observation) => merge_ref_response(observation),
                 Err(error) => unknown_merge_ref_response(error),
-            }
-        }
-        (Some(_), None) => unknown_merge_ref(
-            "source_ref_runtime_unavailable",
-            "No current Coder Runtime is available to observe the source ref",
-        ),
-        (None, _) => server_api::MergeRequestRefResponse {
-            status: "requires_repair".into(),
-            revision_ref: None,
-            observed_at: Utc::now().to_rfc3339(),
-            diagnostic: None,
-        },
-    };
-    let target = match assignment.as_ref() {
-        Some(assignment) => match observe_published_merge_ref(
-            &api,
-            &workspace_id,
-            &assignment.worker.runtime_id,
-            &mr.repository_id,
-            &mr.selector_to,
-        ) {
-            Ok(observation) => merge_ref_response(observation),
-            Err(error) => unknown_merge_ref_response(error),
-        },
-        None => unknown_merge_ref(
-            "target_ref_runtime_unavailable",
-            "No current Coder Runtime is available to observe the target ref",
-        ),
+            },
+            None => unknown_merge_ref(
+                "target_ref_runtime_unavailable",
+                "No current Coder Runtime is available to observe the target ref",
+            ),
+        };
+        (source, target)
     };
     let linked_tickets = mr
         .ticket_ids
@@ -15527,24 +15612,34 @@ async fn scoped_merge_request_readiness(
     let assignment = api
         .store
         .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?;
-    let (current_subject_ref, source_blocker) = match (mr.selector_from.as_deref(), assignment) {
-        (Some(selector), Some(assignment)) => match observe_published_source_ref(
-            &api,
-            &workspace_id,
-            &assignment.worker.runtime_id,
-            &mr.repository_id,
-            selector,
-        ) {
-            Ok(observation) => (Some(observation.revision_ref), None),
-            Err(error) => {
-                let diagnostic = merge_ref_diagnostic(error);
-                let blocker = source_ref_readiness_blocker(&diagnostic.code);
-                (None, Some(blocker.to_string()))
+    let (current_subject_ref, source_blocker) =
+        if mr.state == merge_request::MergeRequestState::Merged {
+            (
+                mr.merged_result()
+                    .ok()
+                    .map(|merge| merge.approved_source_ref.clone()),
+                None,
+            )
+        } else {
+            match (mr.selector_from.as_deref(), assignment) {
+                (Some(selector), Some(assignment)) => match observe_published_source_ref(
+                    &api,
+                    &workspace_id,
+                    &assignment.worker.runtime_id,
+                    &mr.repository_id,
+                    selector,
+                ) {
+                    Ok(observation) => (Some(observation.revision_ref), None),
+                    Err(error) => {
+                        let diagnostic = merge_ref_diagnostic(error);
+                        let blocker = source_ref_readiness_blocker(&diagnostic.code);
+                        (None, Some(blocker.to_string()))
+                    }
+                },
+                (Some(_), None) => (None, Some("source_ref_unavailable".to_string())),
+                (None, _) => (None, None),
             }
-        },
-        (Some(_), None) => (None, Some("source_ref_unavailable".to_string())),
-        (None, _) => (None, None),
-    };
+        };
     let mut report = store.readiness(merge_request::ReadinessCheck {
         merge_request_id,
         ticket_id,
@@ -32062,6 +32157,7 @@ mod tests {
     mod auth_logging_tests;
     mod subject_spawn_tests;
     mod subjektiv_jobs_tests;
+    mod ticket_evidence_tests;
     mod value_profiles_tests;
     mod worker_operations_tests;
     include!("server_workspace_config_tests.rs");
@@ -43337,6 +43433,28 @@ mod tests {
         .unwrap();
         let current_job = ticket_check_job(&api, &ticket_ref.id);
         let current_attempt = wait_for_ticket_check_attempt(&api, &current_job).await;
+        // AwaitingResult can be persisted before Runtime input delivery finishes.
+        // Observe both dispatches before attributing subsequent inputs to a result.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let delivered = {
+                    let inputs = execution.inputs.lock().unwrap();
+                    [&stale_job.request.job_id, &current_job.request.job_id]
+                        .iter()
+                        .all(|id| {
+                            inputs
+                                .iter()
+                                .any(|(_, content)| content.contains(id.as_str()))
+                        })
+                };
+                if delivered {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both checker inputs must be delivered before testing result notifications");
         execution.take_inputs();
 
         api.accept_backend_job_result(
@@ -43354,7 +43472,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(execution.take_inputs().is_empty());
+        let unexpected = execution.take_inputs();
+        assert!(
+            unexpected.is_empty(),
+            "unexpected inputs after stale result: {unexpected:?}"
+        );
         let stale_delivery_id =
             crate::backend_job::delivery_id(&stale_job.request.job_id, &stale_attempt.attempt_id);
         let (stale_delivery, claimed) = api

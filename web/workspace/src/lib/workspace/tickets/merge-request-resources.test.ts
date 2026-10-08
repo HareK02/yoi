@@ -80,7 +80,16 @@ Deno.test("Merge Request UI separates source review freshness from target integr
       detailPage.includes("targetIntegrationStatus"),
     "MR detail page does not render authority status projections",
   );
-  for (const source of [`${detailPage}\n${statusProjection}`, ticketPage]) {
+  assert(
+    ticketPage.includes("summarySourceReviewStatus(mergeRequest)"),
+    "Ticket page does not render the source observation/integration evidence projection",
+  );
+  for (
+    const source of [
+      `${detailPage}\n${statusProjection}`,
+      `${ticketPage}\n${statusProjection}`,
+    ]
+  ) {
     assert(
       source.includes("Fresh source review required"),
       "missing source-review freshness diagnostic",

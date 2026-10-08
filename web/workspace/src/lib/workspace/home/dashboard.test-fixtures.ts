@@ -181,6 +181,8 @@ export function dashboardFixture(
             review_requested_at: updated(10),
             review_submitted_at: null,
             current_subject_ref: "abc123",
+            source_ref_observation: { status: "observed" },
+            integration_evidence_error: null,
             review_subject_ref: "abc123",
           },
           thread_event_count: 1,

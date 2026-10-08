@@ -13,6 +13,7 @@
     parseTicketRoleAssignmentMutationResponse,
   } from "#lib/workspace/api/ticket-browser.ts";
   import { mergeRequestPagePath } from "#lib/workspace/api/merge-requests.ts";
+  import { summarySourceReviewStatus } from "#lib/workspace/merge-request-status.ts";
   import {
     relationLabel,
     TICKET_STATES,
@@ -682,6 +683,21 @@
       </details>
 
       <section class="ticket-control-card">
+        <header><h2>Current requirement evidence</h2></header>
+        <p><strong>Current requirements:</strong> {ticket.evidence.complete_for_integration ? "satisfied for integration" : "not satisfied for integration"}.</p>
+        <p><strong>Current requirement approval:</strong> {ticket.evidence.approved_current_subject ? "approved" : "not established"}.</p>
+        {#if ticket.evidence.missing.length > 0}
+          <ul>
+            {#each ticket.evidence.missing as missing}<li>{missing}</li>{/each}
+          </ul>
+        {/if}
+        <p class="workspace-empty-copy">This evidence evaluates current Ticket requirements, separately from persisted integration approval.</p>
+        {#if ticket.state === "done"}
+          <p class="workspace-empty-copy">This Ticket remains done. Incomplete current requirement evidence does not cancel recorded completion.</p>
+        {/if}
+      </section>
+
+      <section class="ticket-control-card">
         <header><h2>Merge Requests</h2></header>
         {#if mergeRequests.length > 0}
           {#each mergeRequests as mergeRequest (mergeRequest.merge_request_id)}
@@ -691,17 +707,16 @@
                 From <code>{mergeRequest.selector_from ?? "requires repair"}</code>
                 to <code>{mergeRequest.selector_to}</code>
               </p>
-              {#if mergeRequest.current_subject_ref && mergeRequest.review_subject_ref === mergeRequest.current_subject_ref}
-                <p><strong>Source review:</strong> {mergeRequest.review_status} for exact ref <code>{mergeRequest.current_subject_ref}</code></p>
-              {:else if mergeRequest.current_subject_ref && mergeRequest.review_subject_ref}
-                <p><strong>Fresh source review required:</strong> selector_from moved from <code>{mergeRequest.review_subject_ref}</code> to <code>{mergeRequest.current_subject_ref}</code>.</p>
-              {:else if mergeRequest.current_subject_ref}
-                <p><strong>Fresh source review required:</strong> no effective verdict exists for <code>{mergeRequest.current_subject_ref}</code>.</p>
-              {:else}
-                <p><strong>Source review unavailable:</strong> selector_from is unresolved.</p>
+              <p><strong>{mergeRequest.state === "merged" ? "Immutable integration evidence" : "Live source review"}:</strong> {summarySourceReviewStatus(mergeRequest)}</p>
+              {#if mergeRequest.integration_evidence_error !== null}
+                <p class="workspace-callout is-error"><strong>Integration evidence error:</strong> {mergeRequest.integration_evidence_error}</p>
               {/if}
               <p><strong>Target integration:</strong> {mergeRequest.state === "merged" ? "recorded" : `awaiting Orchestrator integration into ${mergeRequest.selector_to}`}.</p>
-              <p class="workspace-empty-copy">Target-only movement refreshes integration evidence; it does not invalidate approval for an unchanged source.</p>
+              {#if mergeRequest.state === "merged"}
+                <p class="workspace-empty-copy">The merged source and integration approval are persisted evidence, not a live selector observation.</p>
+              {:else}
+                <p class="workspace-empty-copy">Target-only movement refreshes integration evidence; it does not invalidate approval for an unchanged source.</p>
+              {/if}
               <a
                 class="workspace-secondary-button"
                 href={mergeRequestPagePath(data.workspaceId, mergeRequest.merge_request_id)}

@@ -59,7 +59,10 @@
             <div><dt>Repository</dt><dd>{mergeRequest.repository_key}</dd></div>
             <div><dt>State</dt><dd>{mergeRequest.state}</dd></div>
             <div><dt>Source selector</dt><dd><code>{mergeRequest.selector_from ?? "requires repair"}</code></dd></div>
-            <div><dt>Source revision</dt><dd>{mergeRequest.source.status}{mergeRequest.source.ref ? ` · ${mergeRequest.source.ref}` : ""}</dd></div>
+            <div><dt>Live source revision</dt><dd>{mergeRequest.source.status}{mergeRequest.source.ref ? ` · ${mergeRequest.source.ref}` : ""}</dd></div>
+            {#if mergeRequest.source.diagnostic}
+              <div><dt>Source observation error</dt><dd>{mergeRequest.source.diagnostic.code}: {mergeRequest.source.diagnostic.message}</dd></div>
+            {/if}
             <div><dt>Target selector</dt><dd><code>{mergeRequest.selector_to}</code></dd></div>
             <div><dt>Target revision</dt><dd>{mergeRequest.target.status}{mergeRequest.target.ref ? ` · ${mergeRequest.target.ref}` : ""}</dd></div>
             <div><dt>Updated</dt><dd>{prettyDate(mergeRequest.updated_at)}</dd></div>
@@ -69,7 +72,7 @@
         <section class="ticket-detail-section">
           <div class="ticket-section-heading"><h2>Review and integration status</h2></div>
           <dl class="ticket-facts">
-            <div><dt>Source review freshness</dt><dd>{sourceReviewFreshness(mergeRequest)}</dd></div>
+            <div><dt>{mergeRequest.state === "merged" ? "Recorded integration approval" : "Live source review freshness"}</dt><dd>{sourceReviewFreshness(mergeRequest)}</dd></div>
             <div><dt>Target integration</dt><dd>{targetIntegrationStatus(mergeRequest)}</dd></div>
           </dl>
         </section>
