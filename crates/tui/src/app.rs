@@ -1741,6 +1741,7 @@ impl App {
                 input_tokens,
                 output_tokens,
                 cache_read_input_tokens,
+                ..
             } => {
                 if let Some(input_tokens) = input_tokens {
                     self.session_context_tokens = input_tokens;
@@ -3000,7 +3001,10 @@ impl App {
                         self.apply_system_item(data);
                     }
                 }
-                SessionSnapshotEntryData::RunYielded { .. }
+                SessionSnapshotEntryData::Invoke { .. }
+                | SessionSnapshotEntryData::Usage { .. }
+                | SessionSnapshotEntryData::RunStats { .. }
+                | SessionSnapshotEntryData::RunYielded { .. }
                 | SessionSnapshotEntryData::RunResumed { .. }
                 | SessionSnapshotEntryData::RunCancelled => {
                     // Durable logical-Run transitions are intentionally not
@@ -3981,6 +3985,7 @@ mod completion_flow_tests {
         });
         app.handle_worker_event(Event::TurnStart { turn: 1 });
         app.handle_worker_event(Event::Usage {
+            timestamp_ms: None,
             input_tokens: Some(100),
             output_tokens: Some(0),
             cache_read_input_tokens: Some(40),
@@ -4210,6 +4215,7 @@ mod completion_flow_tests {
         let mut app = App::new("test".into());
         app.handle_worker_event(Event::TurnStart { turn: 1 });
         app.handle_worker_event(Event::InvokeStart {
+            timestamp_ms: None,
             kind: protocol::InvokeKind::UserSend,
         });
         app.handle_worker_event(Event::RunEnd {
@@ -5156,6 +5162,7 @@ mod completion_flow_tests {
         let mut app = App::new("test".into());
 
         app.handle_worker_event(Event::Usage {
+            timestamp_ms: None,
             input_tokens: Some(42_000),
             output_tokens: Some(9),
             cache_read_input_tokens: Some(40_000),

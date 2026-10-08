@@ -26,6 +26,32 @@ declare const Deno: {
   test(name: string, fn: () => void): void;
 };
 
+Deno.test("restored run stats replace live estimates in both Console modes", () => {
+  const answer: SessionSnapshotEntry = {
+    kind: "message", role: "assistant", content: [{ kind: "text", text: "answer" }],
+    entry_id: "answer-1", timestamp: 5000, provenance: "model_output", derived_from: [],
+  };
+  const stats: SessionSnapshotEntry = {
+    kind: "run_stats", entry_id: "run-stats:answer-1", timestamp: 6000,
+    provenance: "legacy_unknown", derived_from: ["answer-1"],
+    elapsed_ms: 5000, requests: 2, upload_tokens: 1500, output_tokens: 200,
+  };
+  for (const commitBeforeEnd of [true, false]) {
+    const projector = createConsoleProjector();
+    projector.append([{ eventId: "text", event: { event: "text_done", data: { text: "answer" } } }]);
+    const commit = { eventId: "commit", event: { event: "session_entry_committed", data: { entry: answer } } } as const;
+    const end = { eventId: "end", event: { event: "run_end", data: { result: "finished" } } } as const;
+    const live = projector.append(commitBeforeEnd ? [commit, end] : [end, commit]);
+    const history = projectSessionHistoryEntries([answer, stats], null);
+    for (const mode of ["normal", "overview"] as const) {
+      const lines = projectConsoleLines(mergeCommittedHistoryLines(history, live.lines), mode);
+      assertEquals(lines.map((line) => line.kind), ["assistant", "run_stats"]);
+      assertEquals(lines[1].body, "5s ・2 reqs ↑1.5k/↓200");
+      assertEquals(projectConsoleLines(history, mode)[1].body, lines[1].body);
+    }
+  }
+});
+
 function workerState(status: WorkerStatus): WorkerStateSnapshot {
   return {
     last_command_id: 0,

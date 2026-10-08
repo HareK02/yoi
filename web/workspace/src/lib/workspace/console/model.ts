@@ -26,6 +26,7 @@ import {
   emptyRunActivityStats,
   formatRunElapsedCompact,
   formatRunTokens,
+  restoredRunActivity,
   type RunActivityStats,
 } from "./run-status.ts";
 import {
@@ -336,9 +337,17 @@ export function mergeCommittedHistoryLines(
   history: ConsoleLine[],
   current: ConsoleLine[],
 ): ConsoleLine[] {
+  const durableStats = new Map(
+    history.filter((line) => line.kind === "run_stats" && line.entryId)
+      .map((line) => [line.entryId!, line]),
+  );
   return aggregateReadToolLines(mergeHistorySourceLines(
     history.flatMap((line) => line.toolCallLines ?? [line]),
-    current.flatMap((line) => line.toolCallLines ?? [line]),
+    current.flatMap((line) => line.toolCallLines ?? [line]).map((line) =>
+      line.kind === "run_stats" && line.entryId
+        ? durableStats.get(line.entryId) ?? line
+        : line
+    ),
   ));
 }
 
@@ -866,6 +875,7 @@ function projectInternalWorkerSnapshot(
     cwd,
   );
   console.status = snapshot.status;
+  console.runActivity = restoredRunActivity(snapshot.session.entries);
   console.workerMetadata = snapshot.greeting
     ? metadataFromGreeting(snapshot.greeting)
     : null;
@@ -1076,6 +1086,13 @@ export function applyProtocolEvent(
         if (committedIndex >= 0) {
           const [committed] = next.lines.splice(committedIndex, 1);
           next.lines.splice(replacementIndex, 0, committed);
+          const stats = next.lines[replacementIndex + 1];
+          if (stats?.kind === "run_stats" && !stats.entryId) {
+            next.lines[replacementIndex + 1] = {
+              ...stats,
+              entryId: `run-stats:${committed.entryId}`,
+            };
+          }
         }
       }
       break;
@@ -1294,15 +1311,24 @@ export function applyProtocolEvent(
     case "llm_retry":
     case "llm_continuation":
       break;
-    case "run_end":
-      next.lines.push(
-        runStatsLine(
-          envelope.eventId,
-          next.runActivity,
-          envelope.observedAtMs ?? next.runActivity.startedAtMs ?? 0,
-        ),
+    case "run_end": {
+      const anchor = next.lines.findLast((line) =>
+        line.kind === "assistant" || line.kind === "user" ||
+        line.kind === "tool" || line.kind === "system"
       );
+      const summary = runStatsLine(
+        envelope.eventId,
+        next.runActivity,
+        envelope.observedAtMs ?? next.runActivity.startedAtMs ?? 0,
+      );
+      if (anchor?.entryId) summary.entryId = `run-stats:${anchor.entryId}`;
+      const previous = next.lines.findIndex((line) =>
+        summary.entryId && line.entryId === summary.entryId
+      );
+      if (previous >= 0) next.lines[previous] = summary;
+      else next.lines.push(summary);
       break;
+    }
     case "alert":
       appendAlertLine(next, envelope.eventId, event.data);
       break;
@@ -2400,6 +2426,21 @@ function applySessionEntry(
       const item = value["data"];
       projection.lines.push(systemItemLine(eventId, item ?? value));
       applyTaskSystemItem(projection, item);
+      break;
+    }
+    case "run_stats": {
+      const elapsed = safeTokenCount(value["elapsed_ms"]);
+      const requests = safeTokenCount(value["requests"]);
+      const upload = safeTokenCount(value["upload_tokens"]);
+      const output = safeTokenCount(value["output_tokens"]);
+      if (elapsed !== null && requests !== null && upload !== null && output !== null) {
+        projection.lines.push(runStatsLine(eventId, {
+          startedAtMs: 0,
+          requests,
+          uploadTokens: upload,
+          outputTokens: output,
+        }, elapsed));
+      }
       break;
     }
     case "run_yielded":

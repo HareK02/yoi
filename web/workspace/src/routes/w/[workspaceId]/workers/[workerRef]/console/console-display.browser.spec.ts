@@ -265,6 +265,86 @@ async function selectRun(cm: EditorView) {
   await waitFor(() => expect(cm.dom.querySelector(".composer-typed-chip")).not.toBeNull());
 }
 
+test("a completed live run displays its stats below the answer", async () => {
+  const { view } = await liveComposer();
+  protocolEvent({ event: "invoke_start", data: { kind: "user_send" } });
+  protocolEvent({ event: "turn_start", data: { turn: 1 } });
+  protocolEvent({ event: "text_done", data: { text: "The final answer" } });
+  protocolEvent({ event: "usage", data: {
+    input_tokens: 2500, cache_read_input_tokens: 1000, output_tokens: 200,
+  } });
+  protocolEvent({ event: "run_end", data: { result: "finished" } });
+  protocolEvent({ event: "worker_state", data: {
+    snapshot: { last_command_id: 0, state: { kind: "idle" } },
+  } });
+  await waitFor(() => {
+    const rows = view.container.querySelectorAll(".console-line");
+    expect(rows[rows.length - 1]?.textContent).toContain("1 reqs ↑1.5k/↓200");
+    expect(view.container.querySelector(".run-stats")).not.toBeNull();
+  });
+});
+
+test("reopening Console restores completed run stats from paged history", async () => {
+  const page = historyPage([1], null);
+  const answer = page.page.turns[0].entries[1];
+  const stats = {
+    kind: "run_stats", entry_id: `run-stats:${answer.entry_id}`, timestamp: 6000,
+    provenance: "legacy_unknown", derived_from: [answer.entry_id],
+    elapsed_ms: 5000, requests: 2, upload_tokens: 1500, output_tokens: 200,
+  };
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    return Response.json(String(input).includes("/session/history")
+      ? { ...page, page: { ...page.page, turns: [{ ...page.page.turns[0], entries: [...page.page.turns[0].entries, stats] }] } }
+      : { availability: "live_protocol" });
+  }));
+  for (let visit = 1; visit <= 2; visit++) {
+    const view = render(ConsolePage, { data: pageData() });
+    await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledTimes(visit));
+    latestListener().onFrame(subscribedFrame());
+    await waitFor(() => {
+      const rows = view.container.querySelectorAll(".console-line");
+      expect(rows[rows.length - 1]?.textContent).toContain("5s ・2 reqs ↑1.5k/↓200");
+      expect(view.container.querySelectorAll(".run-stats")).toHaveLength(1);
+    });
+    view.unmount();
+  }
+});
+
+test("reopening Console keeps the Composer run clock and cumulative traffic", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) =>
+    Response.json(String(input).includes("/session/history")
+      ? emptyHistoryPage() : { availability: "live_protocol" })
+  ));
+  const startedAt = Date.now() - 120_000;
+  for (let visit = 1; visit <= 2; visit++) {
+    const view = render(ConsolePage, { data: pageData() });
+    await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledTimes(visit));
+    const snapshot = snapshotEvent();
+    if (snapshot.event !== "snapshot") throw new Error("expected snapshot");
+    snapshot.data.state = { last_command_id: 0, state: { kind: "busy", state: { kind: "run", state: "running" } } };
+    snapshot.data.session.entries = [
+      { kind: "invoke", trigger: "user_send", timestamp: startedAt, entry_id: "invoke", provenance: "legacy_unknown", derived_from: [] },
+      { kind: "usage", timestamp: startedAt + 1000, entry_id: "usage", provenance: "legacy_unknown", derived_from: [], input_tokens: 25_000, cache_read_input_tokens: 20_000, output_tokens: 300 },
+    ];
+    const frame = subscribedFrame();
+    frame.message.payload.snapshot.data.events = [snapshot];
+    latestListener().onFrame(frame);
+    await waitFor(() => {
+      const status = view.container.querySelector(".worker-run-status");
+      expect(status?.textContent).toContain("2m");
+      expect(status?.textContent).toContain("1 req");
+      expect(status?.textContent).toContain("Run ↑5.0k/↓300");
+    });
+    protocolEvent({ event: "usage", data: { timestamp_ms: Date.now(), input_tokens: 25_000, cache_read_input_tokens: 20_000, output_tokens: 100 } });
+    await waitFor(() => {
+      const status = view.container.querySelector(".worker-run-status");
+      expect(status?.textContent).toContain("2 reqs");
+      expect(status?.textContent).toContain("Run ↑10.0k/↓400");
+    });
+    view.unmount();
+  }
+});
+
 test("Console teardown cancels pending observation frames before they can read history", async () => {
   const { view, fetchMock } = await liveComposer();
   const schedule = vi.spyOn(window, "requestAnimationFrame");

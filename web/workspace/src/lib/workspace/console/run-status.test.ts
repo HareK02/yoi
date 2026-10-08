@@ -114,7 +114,32 @@ Deno.test("run activity follows TUI request and net-token accounting", () => {
   });
 });
 
-Deno.test("new invoke and running snapshot reset run activity", () => {
+Deno.test("reconnect rebuilds run totals from Invoke and individual persisted usage", () => {
+  const entries = [
+    { kind: "invoke", timestamp: 1_000, trigger: "user_send" },
+    { kind: "usage", timestamp: 2_000, input_tokens: 25000, cache_read_input_tokens: 20000, output_tokens: 300 },
+  ];
+  const snapshot = { event: "snapshot", data: {
+    session: { entries },
+    state: { state: { kind: "busy", state: { kind: "run", state: "running" } } },
+  } };
+  let stats = applyRunActivityEvent(emptyRunActivityStats(), snapshot, 60_000);
+  const restored = { startedAtMs: 1_000, requests: 1, uploadTokens: 5_000, outputTokens: 300, fromLog: true };
+  assertEquals(stats, restored);
+  // TurnStart is operational; each committed Usage is counted once instead.
+  stats = applyRunActivityEvent(stats, { event: "turn_start", data: { turn: 2 } }, 61_000);
+  assertEquals(stats, restored);
+  stats = applyRunActivityEvent(stats, { event: "usage", data: {
+    timestamp_ms: 62_000, input_tokens: 2000, cache_read_input_tokens: 1000, output_tokens: 100,
+  } }, 62_100);
+  assertEquals(stats, { ...restored, requests: 2, uploadTokens: 6000, outputTokens: 400 });
+  // Reapplying a snapshot replaces the prefix, rather than adding it again.
+  assertEquals(applyRunActivityEvent(stats, snapshot, 80_000), restored);
+  stats = applyRunActivityEvent(stats, { event: "invoke_start", data: { kind: "notify", timestamp_ms: 90_000 } }, 99_000);
+  assertEquals(stats, { startedAtMs: 90_000, requests: 0, uploadTokens: 0, outputTokens: 0, fromLog: true });
+});
+
+Deno.test("new invoke and legacy snapshot reset run activity", () => {
   const previous = {
     startedAtMs: 1,
     requests: 3,

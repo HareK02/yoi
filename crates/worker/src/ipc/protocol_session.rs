@@ -96,7 +96,22 @@ pub fn live_log_entry_event(entry: LogEntry) -> Option<Event> {
                 item: value,
             })
         }
-        LogEntry::Invoke { trigger, .. } => Some(Event::InvokeStart { kind: trigger }),
+        LogEntry::Invoke { ts, trigger } => Some(Event::InvokeStart {
+            kind: trigger,
+            timestamp_ms: Some(ts),
+        }),
+        LogEntry::LlmUsage {
+            ts,
+            input_total_tokens,
+            cache_read_tokens,
+            output_tokens,
+            ..
+        } => Some(Event::Usage {
+            timestamp_ms: Some(ts),
+            input_tokens: Some(input_total_tokens),
+            cache_read_input_tokens: Some(cache_read_tokens),
+            output_tokens: Some(output_tokens),
+        }),
         other => {
             // `SegmentLogSink::is_live_relevant` keeps non-live-relevant
             // variants off the broadcast lane; reaching here means the two are

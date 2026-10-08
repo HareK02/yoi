@@ -178,7 +178,10 @@ impl WorkerHandle {
             (entries, entry_rx, in_flight)
         };
         let mut session =
-            session_store::public_snapshot::project_current_session_snapshot(&entries);
+            session_store::public_snapshot::project_current_session_snapshot_with_accounting(
+                self.artifact_store.as_ref(),
+                &entries,
+            );
         session.pending_submissions = self
             .pending_activations
             .lock()
@@ -1286,14 +1289,8 @@ pub(crate) fn wire_event_bridges_on_engine<C, St>(
         });
     });
 
-    let tx = working_event_tx.clone();
-    worker.on_usage(move |event| {
-        let _ = tx.send(Event::Usage {
-            input_tokens: event.input_tokens,
-            output_tokens: event.output_tokens,
-            cache_read_input_tokens: event.cache_read_input_tokens,
-        });
-    });
+    // Usage is published from committed LlmUsage records through the session-log
+    // lane. Snapshot and live usage therefore share one exact, gap-free boundary.
 
     let tx = working_event_tx.clone();
     worker.on_error(move |event| {

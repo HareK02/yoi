@@ -494,7 +494,11 @@ impl InternalWorkerSessionHandle {
             (entries, snapshot_from_guard(&guard))
         };
         InternalWorkerSessionSnapshot {
-            session: session_store::public_snapshot::project_current_session_snapshot(&entries),
+            session:
+                session_store::public_snapshot::project_current_session_snapshot_with_accounting(
+                    &self.store,
+                    &entries,
+                ),
             greeting: self.greeting.as_ref().map(|greeting| {
                 greeting
                     .read()

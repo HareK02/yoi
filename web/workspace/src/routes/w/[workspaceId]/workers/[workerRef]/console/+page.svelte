@@ -741,6 +741,7 @@
                     event.event.event === "segment_rotated" ||
                     event.event.event === "rewind_applied" ||
                     event.event.event === "user_message" ||
+                    event.event.event === "run_end" ||
                     event.event.event === "session_entry_committed"
                 )
             ) {

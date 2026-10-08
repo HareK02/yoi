@@ -1,3 +1,5 @@
+mod run_stats;
+
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use protocol::{
     Segment, SessionContentPart, SessionConversationTurn, SessionEntryProvenance,
@@ -850,6 +852,17 @@ fn read_history_turns_backward(
     let mut pending_entries = Vec::new();
     let mut seen_entries = HashSet::new();
     let mut corrections = HashMap::<String, SessionSnapshotEntryData>::new();
+    // Accounting needs the whole Invoke range, including the marker immediately
+    // before the oldest user entry on this page. The existing scan budgets also
+    // bound this suffix; no unbounded second pass over the Session is needed.
+    let mut accounting_records = Vec::new();
+    let finish = |mut turns: Vec<PositionedHistoryTurn>, records: &[LogEntry]| {
+        let stats = run_stats::project(records.iter().rev());
+        for turn in &mut turns {
+            run_stats::append_to(&mut turn.turn.entries, &stats);
+        }
+        turns
+    };
 
     // Carry only bounded log positions, never correction text or image bodies,
     // across pages. Re-read and validate the referenced records from adopted
@@ -994,11 +1007,58 @@ fn read_history_turns_backward(
                 &mut pending_entries,
                 &mut turns,
             ) {
-                return Ok(turns);
+                return Ok(finish(turns, &accounting_records));
             }
             continue;
         }
 
+        // TurnEnd is the lineage boundary, but Worker persists final usage and
+        // the run outcome immediately after it. For a compacted ancestor, read
+        // only this accounting tail, never adopt later conversation records.
+        if before_offset == adopted_end
+            && segment_index > 0
+            && matches!(
+                lineage[segment_index - 1].origin.as_ref().map(|o| o.kind),
+                Some(LineageOriginKind::Compact)
+            )
+        {
+            let mut offset = adopted_end;
+            let mut tail = Vec::new();
+            while offset < segment.file_len {
+                let (record, bytes) = store
+                    .read_next_log_record_read_only_bounded(
+                        session_id,
+                        segment.segment_id,
+                        offset,
+                        limits.max_scan_bytes.saturating_sub(*scanned_bytes),
+                    )
+                    .map_err(map_history_store_error)?;
+                *scanned_bytes = scanned_bytes
+                    .checked_add(bytes)
+                    .ok_or(RetainedHistoryReadError::ResourceLimit)?;
+                let Some(record) = record else { break };
+                *scanned_entries = scanned_entries
+                    .checked_add(persisted_entry_units(std::slice::from_ref(&record.entry)))
+                    .ok_or(RetainedHistoryReadError::ResourceLimit)?;
+                if *scanned_entries > limits.max_entries {
+                    return Err(RetainedHistoryReadError::ResourceLimit);
+                }
+                offset = record.end_offset;
+                match record.entry {
+                    entry @ LogEntry::LlmUsage { .. } => tail.push(entry),
+                    LogEntry::Extension { .. } => {}
+                    entry @ (LogEntry::RunCompleted { .. }
+                    | LogEntry::RunYielded { .. }
+                    | LogEntry::RunCancelled { .. }
+                    | LogEntry::RunErrored { .. }) => {
+                        tail.push(entry);
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            accounting_records.extend(tail.into_iter().rev());
+        }
         let mut reader = store
             .open_retained_segment_reader(session_id, segment.segment_id, before_offset)
             .map_err(map_history_store_error)?;
@@ -1025,6 +1085,16 @@ fn read_history_turns_backward(
                 }
                 continue;
             }
+            let at_invoke = matches!(record.entry, LogEntry::Invoke { .. });
+            accounting_records.push(record.entry.clone());
+            if turns.len() >= turn_limit {
+                if at_invoke {
+                    return Ok(finish(turns, &accounting_records));
+                }
+                // Older records here supply accounting only, never additional
+                // conversation turns beyond the requested page boundary.
+                continue;
+            }
             if capture_tool_correction(&record.entry, &mut corrections) {
                 let LogEntry::ToolResultCorrected { entry, .. } = &record.entry else {
                     unreachable!()
@@ -1044,7 +1114,7 @@ fn read_history_turns_backward(
                 &project_history_record(session_id, segment.segment_id, &record.entry),
                 &corrections,
             );
-            if collect_history_entries_backward(
+            collect_history_entries_backward(
                 &entries,
                 segment.segment_id,
                 record.start_offset,
@@ -1054,12 +1124,11 @@ fn read_history_turns_backward(
                 &mut seen_entries,
                 &mut pending_entries,
                 &mut turns,
-            ) {
-                return Ok(turns);
-            }
+            );
         }
 
-        if segment_index + 1 == lineage.len()
+        if turns.len() < turn_limit
+            && segment_index + 1 == lineage.len()
             && collect_history_entries_backward(
                 &corrected_history_entries(&segment.seed_entries, &corrections),
                 segment.segment_id,
@@ -1072,10 +1141,10 @@ fn read_history_turns_backward(
                 &mut turns,
             )
         {
-            return Ok(turns);
+            return Ok(finish(turns, &accounting_records));
         }
     }
-    Ok(turns)
+    Ok(finish(turns, &accounting_records))
 }
 
 fn capture_tool_correction(
@@ -1322,6 +1391,148 @@ pub fn project_current_session_snapshot(log: &[LogEntry]) -> SessionSnapshot {
     project_session_snapshot(session_id.unwrap_or_else(SessionId::nil), log)
 }
 
+fn run_accounting_entries(session_id: &SessionId, log: &[LogEntry]) -> Vec<SessionSnapshotEntry> {
+    let start = log
+        .iter()
+        .rposition(|entry| matches!(entry, LogEntry::Invoke { .. }))
+        .unwrap_or(0);
+    log.iter()
+        .enumerate()
+        .skip(start)
+        .filter_map(|(index, record)| {
+            let (ts, data) = match record {
+                LogEntry::Invoke { ts, trigger } => {
+                    (*ts, SessionSnapshotEntryData::Invoke { trigger: *trigger })
+                }
+                LogEntry::LlmUsage {
+                    ts,
+                    input_total_tokens,
+                    cache_read_tokens,
+                    output_tokens,
+                    ..
+                } => (
+                    *ts,
+                    SessionSnapshotEntryData::Usage {
+                        input_tokens: *input_total_tokens,
+                        cache_read_input_tokens: *cache_read_tokens,
+                        output_tokens: *output_tokens,
+                    },
+                ),
+                _ => return None,
+            };
+            Some(legacy_entry(session_id, None, index, 0, ts, data))
+        })
+        .collect()
+}
+
+/// Reconstruct snapshot accounting from existing compacted ancestors, without a
+/// second accumulator or checkpoint. The live suffix is the caller's frozen
+/// mirror prefix; never reread the active segment after subscribing.
+pub fn project_current_session_snapshot_with_accounting(
+    store: &dyn crate::Store,
+    log: &[LogEntry],
+) -> SessionSnapshot {
+    let mut snapshot = project_current_session_snapshot(log);
+    let session_id = log
+        .iter()
+        .find_map(|entry| match entry {
+            LogEntry::AnnotatedSegmentStart { session_id, .. } => Some(*session_id),
+            _ => None,
+        })
+        .unwrap_or_else(SessionId::nil);
+    snapshot
+        .entries
+        .extend(run_accounting_entries(&session_id, log));
+    if log
+        .iter()
+        .any(|entry| matches!(entry, LogEntry::Invoke { .. }))
+    {
+        return snapshot;
+    }
+    let mut source = log.to_vec();
+    let mut ancestors = Vec::new();
+    let mut visited = HashSet::new();
+    let mut count = log.len();
+    for _ in 0..DEFAULT_RETAINED_HISTORY_MAX_SEGMENTS {
+        let Some((session_id, origin)) = source.iter().find_map(|entry| match entry {
+            LogEntry::AnnotatedSegmentStart {
+                session_id,
+                compacted_from: Some(origin),
+                ..
+            } => Some((*session_id, origin.clone())),
+            _ => None,
+        }) else {
+            break;
+        };
+        if !visited.insert(origin.segment_id) {
+            break;
+        }
+        let Ok(mut entries) = store.read_all(session_id, origin.segment_id) else {
+            break;
+        };
+        count = count.saturating_add(entries.len());
+        if count > DEFAULT_RETAINED_HISTORY_MAX_ENTRIES {
+            break;
+        }
+        // Compaction adopts through TurnEnd plus its trailing usage/outcome,
+        // never through a subsequent Invoke or unrelated conversation.
+        if let Some(end) = entries.iter().position(|entry| {
+            matches!(entry, LogEntry::TurnEnd { turn_count, .. } if *turn_count == origin.at_turn_index)
+        }) {
+            let mut cutoff = end + 1;
+            while cutoff < entries.len()
+                && matches!(entries[cutoff],
+                    LogEntry::LlmUsage { .. } | LogEntry::Extension { .. }
+                    | LogEntry::RunCompleted { .. } | LogEntry::RunYielded { .. }
+                    | LogEntry::RunErrored { .. } | LogEntry::RunCancelled { .. })
+            {
+                cutoff += 1;
+            }
+            entries.truncate(cutoff);
+        } else if matches!(entries.first(), Some(LogEntry::AnnotatedSegmentStart {
+            compacted_from: Some(inherited), ..
+        }) if origin.at_turn_index <= inherited.at_turn_index) {
+            // Consecutive compactions can adopt only the inherited seed.
+            entries.truncate(1);
+        } else {
+            break;
+        }
+        let complete = entries
+            .iter()
+            .any(|entry| matches!(entry, LogEntry::Invoke { .. }));
+        source = entries.clone();
+        ancestors.push(entries);
+        if complete {
+            break;
+        }
+    }
+    if !ancestors.is_empty() {
+        let combined: Vec<LogEntry> = ancestors
+            .into_iter()
+            .rev()
+            .flatten()
+            .chain(log.iter().cloned())
+            .collect();
+        snapshot.entries.retain(|entry| {
+            !matches!(
+                entry.data,
+                SessionSnapshotEntryData::Invoke { .. } | SessionSnapshotEntryData::Usage { .. }
+            )
+        });
+        let session_id = log
+            .iter()
+            .find_map(|entry| match entry {
+                LogEntry::AnnotatedSegmentStart { session_id, .. } => Some(*session_id),
+                _ => None,
+            })
+            .unwrap_or_else(SessionId::nil);
+        snapshot
+            .entries
+            .extend(run_accounting_entries(&session_id, &combined));
+    }
+    snapshot
+}
+
 /// Project the current durable segment into the only public session-history
 /// representation. Append-log records remain an internal persistence format.
 pub fn project_session_snapshot(session_id: SessionId, log: &[LogEntry]) -> SessionSnapshot {
@@ -1523,6 +1734,7 @@ pub(crate) fn project_session_snapshot_for_segment(
         }
     }
 
+    run_stats::append_to(&mut entries, &run_stats::project(log));
     SessionSnapshot {
         pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
         entries,
@@ -1799,6 +2011,258 @@ mod tests {
         LoggedHistoryDerivation, LoggedSessionHistoryEntryId, LoggedSessionHistoryMetadata,
         LoggedWorkerSubject, Store, WorkerMetadataStore,
     };
+
+    fn usage(ts: u64) -> LogEntry {
+        LogEntry::LlmUsage {
+            ts,
+            history_len: 2,
+            input_total_tokens: 2500,
+            cache_read_tokens: 1000,
+            cache_write_tokens: 0,
+            output_tokens: 200,
+        }
+    }
+
+    fn complete(ts: u64) -> LogEntry {
+        LogEntry::RunCompleted {
+            ts,
+            interrupted: false,
+            result: agen::EngineResult::Finished,
+            active_run_turn_count: None,
+        }
+    }
+
+    fn stats_entries(entries: &[SessionSnapshotEntry]) -> Vec<SessionSnapshotEntry> {
+        entries
+            .iter()
+            .filter(|entry| matches!(entry.data, SessionSnapshotEntryData::RunStats { .. }))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn run_stats_restore_identically_from_snapshot_and_history_pages() {
+        let session_id = SessionId::now_v7();
+        let segment_id = SegmentId::now_v7();
+        let mut log = vec![segment_start(session_id, vec![], None, None)];
+        for turn in 1..=6 {
+            append_turn(&mut log, turn);
+            log.push(usage(turn as u64 * 10 + 4));
+            log.push(complete(turn as u64 * 10 + 8));
+        }
+        let expected = stats_entries(&project_current_session_snapshot(&log).entries);
+        assert_eq!(expected.len(), 6);
+        assert_eq!(
+            expected[0].data,
+            SessionSnapshotEntryData::RunStats {
+                elapsed_ms: 8,
+                requests: 1,
+                upload_tokens: 1500,
+                output_tokens: 200,
+            }
+        );
+        let (_root, path) =
+            persist_history_fixture("stats", session_id, segment_id, vec![(segment_id, log)]);
+        let mut cursor = None;
+        let mut actual = Vec::new();
+        loop {
+            let page = read_retained_session_history_page(
+                &path,
+                "stats",
+                cursor.as_deref(),
+                Some(1),
+                RetainedHistoryReadLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(page.turns.len(), 1);
+            actual.splice(0..0, stats_entries(&page.turns[0].entries));
+            cursor = page.next_cursor;
+            if !page.has_more {
+                break;
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn run_stats_span_compaction_without_counting_seed_history_twice() {
+        let session_id = SessionId::now_v7();
+        let source_id = SegmentId::now_v7();
+        let active_id = SegmentId::now_v7();
+        let mut source = vec![segment_start(session_id, vec![], None, None)];
+        append_turn(&mut source, 1);
+        source.push(usage(15));
+        source.push(LogEntry::RunYielded {
+            ts: 16,
+            entry_id: None,
+            reason: protocol::RunYieldReason::Compaction,
+            active_run_turn_count: 1,
+        });
+        let active = vec![
+            segment_start(
+                session_id,
+                vec![user_message(1), assistant_message(1, "final")],
+                None,
+                Some(SegmentOrigin {
+                    segment_id: source_id,
+                    at_turn_index: 1,
+                }),
+            ),
+            LogEntry::RunResumed {
+                ts: 20,
+                entry_id: None,
+                source: protocol::RunResumeSource::Compaction,
+                active_run_turn_count: 1,
+            },
+            usage(25),
+            LogEntry::AnnotatedAssistantItem {
+                ts: 28,
+                entry: assistant_message(1, "after-compact"),
+            },
+            complete(30),
+        ];
+        assert!(
+            stats_entries(&project_current_session_snapshot(&active).entries).is_empty(),
+            "a partial segment must not invent the missing start or traffic"
+        );
+        let (_root, path) = persist_history_fixture(
+            "stats",
+            session_id,
+            active_id,
+            vec![(source_id, source), (active_id, active)],
+        );
+        let page = read_retained_session_history_page(
+            &path,
+            "stats",
+            None,
+            Some(1),
+            RetainedHistoryReadLimits::default(),
+        )
+        .unwrap();
+        let stats = stats_entries(&page.turns[0].entries);
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].entry_id, "run-stats:assistant-1-after-compact");
+        assert_eq!(
+            stats[0].data,
+            SessionSnapshotEntryData::RunStats {
+                elapsed_ms: 20,
+                requests: 2,
+                upload_tokens: 3000,
+                output_tokens: 400,
+            }
+        );
+    }
+
+    #[test]
+    fn reconnect_accounting_replays_existing_usage_across_compaction() {
+        let session_id = SessionId::now_v7();
+        let source_id = SegmentId::now_v7();
+        let active_id = SegmentId::now_v7();
+        let mut source = vec![segment_start(session_id, vec![], None, None)];
+        append_turn(&mut source, 1);
+        source.push(usage(15));
+        let active = vec![
+            segment_start(
+                session_id,
+                vec![],
+                None,
+                Some(SegmentOrigin {
+                    segment_id: source_id,
+                    at_turn_index: 1,
+                }),
+            ),
+            usage(25),
+        ];
+        let (_root, path) = persist_history_fixture(
+            "accounting",
+            session_id,
+            active_id,
+            vec![(source_id, source), (active_id, active.clone())],
+        );
+        let store = WorkerSessionStore::new(path.join("session")).unwrap();
+        let snapshot = project_current_session_snapshot_with_accounting(&store, &active);
+        let records: Vec<_> = snapshot
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.data,
+                    SessionSnapshotEntryData::Invoke { .. }
+                        | SessionSnapshotEntryData::Usage { .. }
+                )
+            })
+            .collect();
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records
+                .iter()
+                .map(|entry| entry.timestamp)
+                .collect::<Vec<_>>(),
+            [10, 15, 25]
+        );
+        assert!(matches!(
+            records[0].data,
+            SessionSnapshotEntryData::Invoke {
+                trigger: InvokeKind::UserSend
+            }
+        ));
+        assert!(matches!(
+            records[1].data,
+            SessionSnapshotEntryData::Usage {
+                input_tokens: 2500,
+                cache_read_input_tokens: 1000,
+                output_tokens: 200
+            }
+        ));
+        assert!(matches!(
+            records[2].data,
+            SessionSnapshotEntryData::Usage {
+                input_tokens: 2500,
+                cache_read_input_tokens: 1000,
+                output_tokens: 200
+            }
+        ));
+
+        // A second compaction can adopt only the first one's inherited seed.
+        // Its unadopted usage must not leak into the restored totals.
+        let next = vec![
+            segment_start(
+                session_id,
+                vec![],
+                None,
+                Some(SegmentOrigin {
+                    segment_id: active_id,
+                    at_turn_index: 1,
+                }),
+            ),
+            usage(35),
+        ];
+        let snapshot = project_current_session_snapshot_with_accounting(&store, &next);
+        let timestamps: Vec<_> = snapshot
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                matches!(
+                    entry.data,
+                    SessionSnapshotEntryData::Invoke { .. }
+                        | SessionSnapshotEntryData::Usage { .. }
+                )
+                .then_some(entry.timestamp)
+            })
+            .collect();
+        assert_eq!(timestamps, [10, 15, 35]);
+    }
+
+    #[test]
+    fn run_stats_do_not_complete_an_active_or_unmeasured_run() {
+        let mut log = Vec::new();
+        append_turn(&mut log, 1);
+        log.push(usage(15));
+        assert!(stats_entries(&project_current_session_snapshot(&log).entries).is_empty());
+        log.pop();
+        log.push(complete(20));
+        assert!(stats_entries(&project_current_session_snapshot(&log).entries).is_empty());
+    }
 
     fn history_message(
         entry_id: impl Into<String>,

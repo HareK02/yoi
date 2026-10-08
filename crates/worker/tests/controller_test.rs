@@ -1557,6 +1557,70 @@ async fn snapshot_includes_user_input_for_in_flight_turn() {
 }
 
 #[tokio::test]
+async fn reconnect_snapshot_restores_live_run_accounting_from_engine_events() {
+    let client = MockClient::new(vec![
+        LlmEvent::tool_use_start(0, "hold-call", "Hold"),
+        LlmEvent::tool_input_delta(0, "{}"),
+        LlmEvent::tool_use_stop(0),
+        LlmEvent::Usage(UsageEvent {
+            input_tokens: Some(25_000),
+            output_tokens: Some(300),
+            cache_read_input_tokens: Some(20_000),
+            ..Default::default()
+        }),
+        LlmEvent::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ]);
+    let mut worker = make_worker(client).await;
+    worker
+        .engine_mut()
+        .register_tool(hanging_tool_definition("Hold"));
+    let handle = spawn_controller(worker).await;
+    let mut events = handle.sink.subscribe_with_snapshot().1;
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "keep running",
+        ))
+        .await
+        .unwrap();
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let LogEntry::LlmUsage {
+                ts,
+                input_total_tokens,
+                cache_read_tokens,
+                output_tokens,
+                ..
+            } = events.recv().await.unwrap()
+            {
+                break (ts, input_total_tokens, cache_read_tokens, output_tokens);
+            }
+        }
+    })
+    .await
+    .expect("live accounting");
+    assert_eq!((observed.1, observed.2, observed.3), (25_000, 20_000, 300));
+    for _ in 0..2 {
+        let Event::Snapshot { session, .. } = handle.snapshot_event() else {
+            panic!("expected snapshot")
+        };
+        let usage: Vec<_> = session
+            .entries
+            .iter()
+            .filter(|e| matches!(e.data, protocol::SessionSnapshotEntryData::Usage { .. }))
+            .collect();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].timestamp, observed.0);
+        assert!(session.entries.iter().any(|e| matches!(
+            e.data,
+            protocol::SessionSnapshotEntryData::Invoke { .. }
+        ) && e.timestamp > 0));
+    }
+}
+
+#[tokio::test]
 async fn attach_snapshot_includes_current_status() {
     let client = MockClient::sequential(vec![MockResponse::Hang(simple_text_events())]);
     let worker = make_worker(client).await;

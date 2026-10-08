@@ -1,10 +1,13 @@
 import type {
   Event as ProtocolEvent,
   InFlightCompaction,
+  SessionSnapshotEntry,
   WorkerStateSnapshot,
 } from "#lib/generated/protocol.ts";
 
 export type RunActivityStats = {
+  /** Request counts follow persisted usage when the producer supplies it. */
+  fromLog?: boolean;
   startedAtMs: number | null;
   requests: number;
   uploadTokens: number;
@@ -20,6 +23,25 @@ export function emptyRunActivityStats(): RunActivityStats {
   };
 }
 
+export function restoredRunActivity(entries: SessionSnapshotEntry[]): RunActivityStats {
+  let stats = emptyRunActivityStats();
+  for (const entry of entries) {
+    if (entry.kind === "invoke") {
+      stats = applyRunActivityEvent(stats, { event: "invoke_start", data: {
+        kind: entry.trigger, timestamp_ms: entry.timestamp,
+      } }, entry.timestamp);
+    } else if (entry.kind === "usage") {
+      stats = applyRunActivityEvent(stats, { event: "usage", data: {
+        timestamp_ms: entry.timestamp,
+        input_tokens: entry.input_tokens,
+        cache_read_input_tokens: entry.cache_read_input_tokens,
+        output_tokens: entry.output_tokens,
+      } }, entry.timestamp);
+    }
+  }
+  return stats;
+}
+
 export function applyRunActivityEvent(
   current: RunActivityStats,
   event: ProtocolEvent,
@@ -27,14 +49,22 @@ export function applyRunActivityEvent(
 ): RunActivityStats {
   switch (event.event) {
     case "invoke_start":
-      return { ...emptyRunActivityStats(), startedAtMs: observedAtMs };
-    case "snapshot":
+      return {
+        ...emptyRunActivityStats(),
+        ...(event.data.timestamp_ms != null ? { fromLog: true } : {}),
+        startedAtMs: event.data.timestamp_ms ?? observedAtMs,
+      };
+    case "snapshot": {
+      const restored = restoredRunActivity(event.data.session?.entries ?? []);
+      if (restored.fromLog) return restored;
       return event.data.state.state.kind === "busy" &&
           !(event.data.state.state.state.kind === "run" &&
             event.data.state.state.state.state === "paused")
         ? { ...emptyRunActivityStats(), startedAtMs: observedAtMs }
         : emptyRunActivityStats();
+    }
     case "turn_start":
+      if (current.fromLog) return current;
       return {
         ...current,
         startedAtMs: current.startedAtMs ?? observedAtMs,
@@ -43,9 +73,12 @@ export function applyRunActivityEvent(
     case "usage": {
       const input = event.data.input_tokens ?? 0;
       const cacheRead = event.data.cache_read_input_tokens ?? 0;
+      const fromLog = event.data.timestamp_ms != null || current.fromLog;
       return {
         ...current,
-        startedAtMs: current.startedAtMs ?? observedAtMs,
+        ...(fromLog ? { fromLog: true } : {}),
+        requests: current.requests + (fromLog ? 1 : 0),
+        startedAtMs: current.startedAtMs ?? (fromLog ? null : observedAtMs),
         uploadTokens: current.uploadTokens + Math.max(0, input - cacheRead),
         outputTokens: current.outputTokens + (event.data.output_tokens ?? 0),
       };

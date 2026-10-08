@@ -124,6 +124,7 @@ impl SegmentLogSink {
                 | LogEntry::ToolResultCorrected { .. }
                 | LogEntry::AnnotatedSystemItem { .. }
                 | LogEntry::Invoke { .. }
+                | LogEntry::LlmUsage { .. }
                 | LogEntry::RunYielded { .. }
                 | LogEntry::RunResumed { .. }
                 | LogEntry::RunCancelled { .. }
@@ -355,6 +356,54 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn persisted_usage_is_split_once_between_snapshot_and_live_even_with_equal_timestamps() {
+        let sink = SegmentLogSink::new();
+        sink.publish(LogEntry::Invoke {
+            ts: 100,
+            trigger: protocol::InvokeKind::UserSend,
+        });
+        let usage = LogEntry::LlmUsage {
+            ts: 200,
+            history_len: 2,
+            input_total_tokens: 2000,
+            cache_read_tokens: 1000,
+            cache_write_tokens: 0,
+            output_tokens: 100,
+        };
+        sink.publish(usage.clone());
+        let (snapshot, mut rx) = sink.subscribe_with_snapshot();
+        assert_eq!(
+            snapshot
+                .iter()
+                .filter(|e| matches!(e, LogEntry::LlmUsage { .. }))
+                .count(),
+            1
+        );
+        assert!(rx.try_recv().is_err());
+        sink.publish(usage);
+        let event =
+            crate::ipc::protocol_session::live_log_entry_event(rx.try_recv().unwrap()).unwrap();
+        assert!(matches!(
+            event,
+            protocol::Event::Usage {
+                timestamp_ms: Some(200),
+                input_tokens: Some(2000),
+                ..
+            }
+        ));
+        assert!(rx.try_recv().is_err());
+        let (reconnected, mut next_rx) = sink.subscribe_with_snapshot();
+        assert_eq!(
+            reconnected
+                .iter()
+                .filter(|e| matches!(e, LogEntry::LlmUsage { .. }))
+                .count(),
+            2
+        );
+        assert!(next_rx.try_recv().is_err());
     }
 
     #[test]

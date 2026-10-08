@@ -193,7 +193,7 @@ export type RunResumeSource = "compaction" | "pause";
 
 export type RunFailureKind = "engine" | "compaction";
 
-export type SessionSnapshotEntryData = { "kind": "user_input", segments: Array<Segment>, } | { "kind": "message", role: SessionMessageRole, content: Array<SessionContentPart>, } | { "kind": "tool_call", call_id: string, name: string, arguments: string, } | { "kind": "tool_result", call_id: string, summary: string, content?: string | null, is_error: boolean, attachments?: Array<SessionToolAttachment>, } | { "kind": "system_item", item_kind: string, content: string, data?: unknown, } | { "kind": "run_yielded", reason: RunYieldReason, active_run_turn_count: number, } | { "kind": "run_resumed", source: RunResumeSource, active_run_turn_count: number, } | { "kind": "run_cancelled" } | { "kind": "run_error", message: string, failure?: RunFailureKind | null, };
+export type SessionSnapshotEntryData = { "kind": "user_input", segments: Array<Segment>, } | { "kind": "message", role: SessionMessageRole, content: Array<SessionContentPart>, } | { "kind": "tool_call", call_id: string, name: string, arguments: string, } | { "kind": "tool_result", call_id: string, summary: string, content?: string | null, is_error: boolean, attachments?: Array<SessionToolAttachment>, } | { "kind": "system_item", item_kind: string, content: string, data?: unknown, } | { "kind": "run_yielded", reason: RunYieldReason, active_run_turn_count: number, } | { "kind": "run_resumed", source: RunResumeSource, active_run_turn_count: number, } | { "kind": "invoke", trigger: InvokeKind, } | { "kind": "usage", input_tokens: number, cache_read_input_tokens: number, output_tokens: number, } | { "kind": "run_stats", elapsed_ms: number, requests: number, upload_tokens: number, output_tokens: number, } | { "kind": "run_cancelled" } | { "kind": "run_error", message: string, failure?: RunFailureKind | null, };
 
 export type SessionSnapshotEntry = {
 /**
@@ -204,7 +204,7 @@ entry_id: string,
 /**
  * Timestamp copied from the durable log record that commits this entry.
  */
-timestamp: number, provenance: SessionEntryProvenance, derived_from?: Array<string>, } & ({ "kind": "user_input", segments: Array<Segment>, } | { "kind": "message", role: SessionMessageRole, content: Array<SessionContentPart>, } | { "kind": "tool_call", call_id: string, name: string, arguments: string, } | { "kind": "tool_result", call_id: string, summary: string, content?: string | null, is_error: boolean, attachments?: Array<SessionToolAttachment>, } | { "kind": "system_item", item_kind: string, content: string, data?: unknown, } | { "kind": "run_yielded", reason: RunYieldReason, active_run_turn_count: number, } | { "kind": "run_resumed", source: RunResumeSource, active_run_turn_count: number, } | { "kind": "run_cancelled" } | { "kind": "run_error", message: string, failure?: RunFailureKind | null, });
+timestamp: number, provenance: SessionEntryProvenance, derived_from?: Array<string>, } & ({ "kind": "user_input", segments: Array<Segment>, } | { "kind": "message", role: SessionMessageRole, content: Array<SessionContentPart>, } | { "kind": "tool_call", call_id: string, name: string, arguments: string, } | { "kind": "tool_result", call_id: string, summary: string, content?: string | null, is_error: boolean, attachments?: Array<SessionToolAttachment>, } | { "kind": "system_item", item_kind: string, content: string, data?: unknown, } | { "kind": "run_yielded", reason: RunYieldReason, active_run_turn_count: number, } | { "kind": "run_resumed", source: RunResumeSource, active_run_turn_count: number, } | { "kind": "invoke", trigger: InvokeKind, } | { "kind": "usage", input_tokens: number, cache_read_input_tokens: number, output_tokens: number, } | { "kind": "run_stats", elapsed_ms: number, requests: number, upload_tokens: number, output_tokens: number, } | { "kind": "run_cancelled" } | { "kind": "run_error", message: string, failure?: RunFailureKind | null, });
 
 export type SessionConversationTurn = { turn_id: string, entries: Array<SessionSnapshotEntry>, };
 
@@ -431,7 +431,11 @@ entry_id?: string | null, segments: Array<Segment>, } } | { "event": "session_en
 /**
  * Stable durable history identity. Synthetic compatibility events omit it.
  */
-entry_id?: string | null, item: unknown, } } | { "event": "invoke_start", "data": { kind: InvokeKind, } } | { "event": "turn_start", "data": { turn: number, } } | { "event": "turn_end", "data": { turn: number, result: TurnResult, } } | { "event": "llm_call_start", "data": { llm_call: number, } } | { "event": "llm_call_end", "data": { llm_call: number, } } | { "event": "llm_retry", "data": { llm_call: number,
+entry_id?: string | null, item: unknown, } } | { "event": "invoke_start", "data": { kind: InvokeKind,
+/**
+ * Timestamp of the persisted Invoke, not the client's attach time.
+ */
+timestamp_ms?: number | null, } } | { "event": "turn_start", "data": { turn: number, } } | { "event": "turn_end", "data": { turn: number, result: TurnResult, } } | { "event": "llm_call_start", "data": { llm_call: number, } } | { "event": "llm_call_end", "data": { llm_call: number, } } | { "event": "llm_retry", "data": { llm_call: number,
 /**
  * The attempt that just failed. 1 origin.
  */
@@ -445,7 +449,11 @@ summary: string,
  * Full tool output. Absent when the tool chose to return
  * summary-only, or when the result was pruned.
  */
-output?: string | null, disposition?: ToolResultDisposition | null, is_error: boolean, } } | { "event": "usage", "data": { input_tokens: number | null, output_tokens: number | null, cache_read_input_tokens?: number | null, } } | { "event": "context_usage", "data": { usage?: ContextUsage | null, } } | { "event": "run_end", "data": { result: RunResult, } } | { "event": "error", "data": { code: ErrorCode, message: string, } } | { "event": "snapshot", "data": { session: SessionSnapshot, greeting: Greeting,
+output?: string | null, disposition?: ToolResultDisposition | null, is_error: boolean, } } | { "event": "usage", "data": {
+/**
+ * Present for usage delivered from the committed session-log lane.
+ */
+timestamp_ms?: number | null, input_tokens: number | null, output_tokens: number | null, cache_read_input_tokens?: number | null, } } | { "event": "context_usage", "data": { usage?: ContextUsage | null, } } | { "event": "run_end", "data": { result: RunResult, } } | { "event": "error", "data": { code: ErrorCode, message: string, } } | { "event": "snapshot", "data": { session: SessionSnapshot, greeting: Greeting,
 /**
  * Full revisioned live execution state. `Stopped` remains Runtime
  * catalog authority and is deliberately not represented here.

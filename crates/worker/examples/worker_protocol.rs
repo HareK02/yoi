@@ -83,6 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     input_tokens,
                     output_tokens,
                     cache_read_input_tokens,
+                    ..
                 } => {
                     println!(
                         "[usage] in={} (cache_read={}) out={}",

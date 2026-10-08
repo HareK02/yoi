@@ -1054,6 +1054,23 @@ pub enum SessionSnapshotEntryData {
         source: RunResumeSource,
         active_run_turn_count: usize,
     },
+    /// Snapshot-only replay of persisted invocation/usage records. These are
+    /// accounting metadata, never model context or conversation rows.
+    Invoke {
+        trigger: InvokeKind,
+    },
+    Usage {
+        input_tokens: u64,
+        cache_read_input_tokens: u64,
+        output_tokens: u64,
+    },
+    /// Display-only accounting reconstructed from persisted run/usage records.
+    RunStats {
+        elapsed_ms: u64,
+        requests: u64,
+        upload_tokens: u64,
+        output_tokens: u64,
+    },
     /// Durable terminal for an intentional cancellation. Consumers must not
     /// present this lifecycle result as an execution failure.
     RunCancelled,
@@ -1177,6 +1194,9 @@ pub enum Event {
     /// following `UserMessage` / `SystemItem` event.
     InvokeStart {
         kind: InvokeKind,
+        /// Timestamp of the persisted Invoke, not the client's attach time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
     },
     /// One AgentTurn boundary opened. An AgentTurn is a maximal run of
     /// LLM generation calls whose input messages are identical (i.e.
@@ -1293,6 +1313,9 @@ pub enum Event {
     /// actually paid full price to send on this request, which is what
     /// the TUI status line accumulates per turn.
     Usage {
+        /// Present for usage delivered from the committed session-log lane.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2335,19 +2358,29 @@ mod tests {
             InvokeKind::SystemReminder,
             InvokeKind::Wakeup,
         ] {
-            let event = Event::InvokeStart { kind };
+            let event = Event::InvokeStart {
+                kind,
+                timestamp_ms: Some(1234),
+            };
             let json = serde_json::to_string(&event).unwrap();
             let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed["event"], "invoke_start");
             let decoded: Event = serde_json::from_str(&json).unwrap();
             match decoded {
-                Event::InvokeStart { kind: k } => assert_eq!(k, kind),
+                Event::InvokeStart {
+                    kind: k,
+                    timestamp_ms,
+                } => {
+                    assert_eq!(k, kind);
+                    assert_eq!(timestamp_ms, Some(1234));
+                }
                 other => panic!("expected InvokeStart, got {other:?}"),
             }
         }
         let parsed: serde_json::Value = serde_json::from_str(
             &serde_json::to_string(&Event::InvokeStart {
                 kind: InvokeKind::UserSend,
+                timestamp_ms: None,
             })
             .unwrap(),
         )
