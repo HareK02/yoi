@@ -6,6 +6,10 @@ pub(crate) use worker_operations::{
     WorkerOperationContext, WorkspaceWorker, WorkspaceWorkerMethodSender,
 };
 
+#[path = "server_drive.rs"]
+mod drive;
+#[path = "server_drive_grants.rs"]
+mod drive_grants;
 #[path = "server_workspace_config.rs"]
 mod workspace_config;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2601,6 +2605,9 @@ fn signed_request_target(uri: &Uri) -> &str {
 }
 
 fn repository_api_rejection(path: &str, status: StatusCode, message: &str) -> Response {
+    if path.starts_with("/api/w/") && path.contains("/drive/") {
+        return (status, Json(drive::failure(status.as_u16()))).into_response();
+    }
     if path == "/api/repositories"
         || path.starts_with("/api/repositories/")
         || (path.starts_with("/api/w/") && path.contains("/repositories"))
@@ -6303,6 +6310,7 @@ fn generated_workspace_catalog_contract_router(service: ServerApiContractService
 fn generated_workspace_contract_router(service: ServerApiContractService) -> Router {
     let service = Arc::new(service);
     Router::new()
+        .merge(drive::router(service.clone()))
         .merge(server_api::server_api_axum::workspace_current(
             service.clone(),
         ))
@@ -11110,6 +11118,128 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn drive_root(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::DriveEntry, server_api::DriveApiError> {
+        let api = self.workspace_api().map_err(|_| drive::failure(404))?;
+        drive::root(api, &context, &workspace_id).await
+    }
+    async fn drive_metadata(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        query: server_api::DriveEntryQuery,
+    ) -> std::result::Result<server_api::DriveEntry, server_api::DriveApiError> {
+        let api = self.workspace_api().map_err(|_| drive::failure(404))?;
+        drive::metadata(api, &context, &workspace_id, query).await
+    }
+    async fn drive_list(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        query: server_api::DriveListQuery,
+    ) -> std::result::Result<server_api::DriveListResponse, server_api::DriveApiError> {
+        let api = self.workspace_api().map_err(|_| drive::failure(404))?;
+        drive::list(api, &context, &workspace_id, query).await
+    }
+    async fn drive_search(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        query: server_api::DriveSearchQuery,
+    ) -> std::result::Result<server_api::DriveListResponse, server_api::DriveApiError> {
+        let api = self.workspace_api().map_err(|_| drive::failure(404))?;
+        drive::search(api, &context, &workspace_id, query).await
+    }
+    async fn drive_read_text(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        query: server_api::DriveReadTextQuery,
+    ) -> std::result::Result<server_api::DriveReadTextResponse, server_api::DriveApiError> {
+        let api = self.workspace_api().map_err(|_| drive::failure(404))?;
+        drive::read_text(api, &context, &workspace_id, query).await
+    }
+    async fn drive_read_chunk(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        query: server_api::DriveReadChunkQuery,
+    ) -> std::result::Result<server_api::BinaryBody, server_api::DriveApiError> {
+        let api = self.workspace_api().map_err(|_| drive::failure(404))?;
+        drive::read_chunk(api, &context, &workspace_id, query).await
+    }
+    async fn drive_download(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        query: server_api::DriveDownloadQuery,
+    ) -> std::result::Result<
+        server_api::server_api_responses::DriveDownload,
+        server_api::DriveApiError,
+    > {
+        let api = self.workspace_api().map_err(|_| drive::failure(404))?;
+        drive::download(api, &context, &workspace_id, query).await
+    }
+    async fn drive_mutate(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::DriveMutationRequest,
+    ) -> std::result::Result<server_api::DriveMutationResponse, server_api::DriveApiError> {
+        let api = self.workspace_api().map_err(|_| drive::failure(404))?;
+        drive::mutate(api, &context, &workspace_id, request).await
+    }
+    async fn drive_upload(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        query: server_api::DriveUploadQuery,
+        body: server_api::BinaryBody,
+    ) -> std::result::Result<server_api::DriveMutationResponse, server_api::DriveApiError> {
+        let api = self.workspace_api().map_err(|_| drive::failure(404))?;
+        drive::upload(api, &context, &workspace_id, query, body).await
+    }
+    async fn drive_request_status(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request_id: String,
+    ) -> std::result::Result<server_api::DriveRequestStatusResponse, server_api::DriveApiError>
+    {
+        let api = self.workspace_api().map_err(|_| drive::failure(404))?;
+        drive::request_status(api, &context, &workspace_id, request_id).await
+    }
+    async fn drive_grant_create(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::DriveGrantCreateRequest,
+    ) -> std::result::Result<server_api::DriveGrantResponse, server_api::DriveApiError> {
+        let api = self.workspace_api().map_err(|_| drive::failure(404))?;
+        drive_grants::create_grant(api, &context, &workspace_id, request).await
+    }
+    async fn drive_grant_revoke(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        grant_id: String,
+    ) -> std::result::Result<server_api::DriveGrantResponse, server_api::DriveApiError> {
+        let api = self.workspace_api().map_err(|_| drive::failure(404))?;
+        drive_grants::revoke_grant(api, &context, &workspace_id, &grant_id).await
+    }
+    async fn drive_grant_list(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        query: server_api::DriveGrantListQuery,
+    ) -> std::result::Result<server_api::DriveGrantListResponse, server_api::DriveApiError> {
+        let api = self.workspace_api().map_err(|_| drive::failure(404))?;
+        drive_grants::list_grants(api, &context, &workspace_id, query).await
     }
 
     async fn current_worker_workspace_config_get(
@@ -32591,6 +32721,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     mod auth_logging_tests;
+    mod drive_api_tests;
     mod drive_tests;
     mod subject_spawn_tests;
     mod subjektiv_jobs_tests;

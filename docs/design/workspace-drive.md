@@ -5,8 +5,9 @@
 Drive is a Workspace-owned **latest-version document tree**, not a mounted or
 POSIX-compatible filesystem. `workspace-drive` owns storage, hierarchy, revision
 conflicts, mutation receipts, bounded reads/search, and garbage collection.
-`WorkspaceApi::drive` is the trusted Server adapter. Authorization and HTTP DTOs
-belong to T-722; Worker/Web clients and end-to-end routing belong to T-723–725.
+`WorkspaceApi::drive` is the trusted Server adapter. The authorized HTTP API and
+Backend-managed grants are documented below. Worker Tools/WIP, Web UI, and full
+end-to-end routing belong to T-723–725.
 Session attachments remain Session-owned and are not Drive authority. Worker,
 Session, and Workdir cleanup do not delete Drive.
 
@@ -262,3 +263,106 @@ The hermetic backup test stops writers, snapshots actual FeatureStorage SQLite,
 copies actual LocalFileSystem blobs, restores into absent roots, and checks stable
 IDs/latest content/receipts and non-reused ID allocation. It does not validate a
 production backup scheduler, volume snapshot, or physical power cut.
+
+## Authorized typed HTTP API
+
+The Rust `server-api` contract owns `/api/w/{workspace_id}/drive/` operations:
+
+- `GET root`, `metadata`, `list`, `search`, `read-text`, `read-chunk`, `download`;
+- `POST mutate` (create folder/bounded UTF-8 text, replace text, relocate, delete);
+- `PUT upload` (binary body with flat query metadata);
+- `GET requests/{request_id}` for the committed receipt snapshot;
+- owner-controlled `POST/GET grants` and `DELETE grants/{grant_id}`.
+
+Ordinary usage follows the existing member-facing authenticated Server-user
+policy. Non-ownership alone does not deny use. Grant management follows the
+existing Workspace-owner account boundary. No new general membership ACL is
+introduced. Browser/API-token identity is supplied by authentication middleware;
+user/account existence and active Workspace state are checked again in the
+operation transaction. Cookie mutations require the configured application
+Origin through the existing middleware. No ordinary DTO accepts an actor.
+
+Runtime-forwarded requests require the existing signed source proof and live
+Runtime/Worker catalog membership. Workers receive an explicit whole-Drive
+`read_only` or `read_write` grant, independently of Profile, Subject, Ticket,
+Workdir or commands. Incomplete/mismatched Runtime or Worker identity cannot fall
+back to a browser actor. Grant creation rechecks owner, active Workspace, and
+existing live Worker in the Server DB transaction; active access changes require
+revoking the previous grant first (no silent downgrade). Migration 84 stores
+creation/revocation actor and time. Removal fences and catalog deletion revoke
+access and retain audit; grant rows cascade with Workspace deletion. No alternate
+Worker registry or Drive Workdir attachment is created.
+
+A clone-bound Drive authorizer queries the attached Server authority under every
+client-operation `BEGIN IMMEDIATE`, including receipt replay/result queries.
+The lock spans validation, blob persistence and DB publication. Grant revocation
+and Worker removal use the same Server DB write authority: whichever transaction
+wins first is ordered first. A mutation committing before revocation is valid;
+a revoked cached handle cannot commit later. Upload admission also checks access
+before consuming the body, but that admission is not a lease: publication always
+rechecks current access. Download checks authorization separately for every
+chunk, and stops on revocation, deletion, revision expiry or storage failure.
+
+References contain **both** Workspace ID and stable decimal node ID. JSON uses
+`DriveEntryRef`; flat GET/binary queries require `entry_workspace_id` matching the
+route Workspace before resolving `id`/`parent_id`. IDs/revisions are canonical
+positive decimal strings within signed 64-bit range; file sizes/offsets are
+bounded `u32`. List/search cursors carry Workspace identity and the last node ID;
+they are continuation hints, not capabilities or snapshots. Returned `latest_url`
+is a relative authenticated URL bound to Workspace and ID, independent of logical
+name/parent. It confers neither public sharing nor approval. File URLs download;
+folder URLs return metadata. Deletion/recreation never reuses the old reference.
+
+Web upload consumes binary HTTP frames with an observed **16 MiB** ceiling and
+checks declared size and lowercase SHA-256 before publication. Oversized announced
+or received data, mismatches, aborted bodies and I/O errors never return success.
+The storage boundary currently requires a whole-file Vec, so uploads retain at
+most one bounded binary file in memory before calling T-721; they are not
+constant-memory object-store multipart uploads and are never expanded to
+JSON/base64. Runtime source-proof verification separately buffers a bounded body
+before granting trusted ingress, as in other signed Server operations. Web
+downloads stream **64 KiB** revision-fixed chunks; they do not materialize the
+whole file. Generated Rust clients retain their explicit bounded-response policy
+and return exact `BinaryBody` bytes. Worker JSON-facing adapters can request
+bounded text or binary chunks through this same contract, but Tools/WIP and
+model-context/image presentation belong to T-723; this API does not emit large
+base64 JSON blobs.
+
+Downloads validate bare MIME types and always use `Content-Disposition:
+attachment` with percent-encoded UTF-8 names, `nosniff`, a sandbox/default-none
+CSP, `private, no-store`, and a Workspace/node/revision ETag. Arbitrary HTML/SVG
+bytes are storable, not safe app-origin inline previews. Content length is exact;
+if a later chunk loses authority or expires, the response stream fails rather
+than returning another generation or a successful truncated file. Even an empty
+file validates its referenced blob before HTTP success. Conditional 304/range
+HTTP semantics are not added; revision-selected chunk reads are explicit.
+
+Errors use fixed, path-free typed codes: `denied`, `not_found`, `conflict`,
+`invalid`, `limit`, `storage_unavailable`, `outcome_unknown`. SQL/commit/task
+uncertainty at a mutation boundary is `outcome_unknown`/`unknown`; known rejection
+or blob persistence failure is `not_committed`. A successful DB commit alone
+returns a mutation response. After a lost response, query the same request ID;
+`uncommitted` only means no committed receipt in that snapshot and must not be
+interpreted as proof that an in-flight request can never commit. Exact replay uses
+the same identity/payload/transport-bound actor and current permissions. Never
+blindly create a fresh request ID to resolve an unknown outcome. Physical paths,
+blob keys and raw provider errors are not public.
+
+Contract regeneration/freshness:
+
+```sh
+cargo run -q -p server-api --example export_openapi -- openapi/server-api.json
+cargo run -q -p server-api --example export_openapi -- --check openapi/server-api.json
+cargo run -q -p server-api --features typescript --example generate_drive_api_types > web/workspace/src/lib/generated/drive-api.ts
+deno fmt web/workspace/src/lib/generated/drive-api.ts
+cargo test -p server-api --features typescript generated_drive_api_contract_is_current
+# Existing OpenAPI-derived projections embed the whole-contract digest:
+for example in generate_repository_openapi_types generate_runtime_api_types generate_ticket_api_types generate_companion_api_types generate_worker_launch_api_types; do
+    cargo run -q -p server-api --example "$example"
+    cargo run -q -p server-api --example "$example" -- --check
+done
+```
+
+The existing BinaryBody contract also supports binary **success responses**,
+including declared response headers, without changing binary request bytes or
+JSON/error behavior. It exports inline OpenAPI binary bodies, not JSON byte arrays.

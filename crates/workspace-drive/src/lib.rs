@@ -29,6 +29,8 @@ pub enum Error {
     NotFound,
     #[error("Drive revision, name, or request identity conflict")]
     Conflict,
+    #[error("Drive access denied")]
+    Denied,
     #[error("Workspace Drive is fenced for deletion")]
     Fenced,
     #[error("Drive storage failure: {0}")]
@@ -174,8 +176,11 @@ pub struct CollectionPage {
     pub next_after: Option<String>,
 }
 
+type Authorizer = dyn Fn(&Connection, bool) -> Result<()> + Send + Sync;
+
 #[derive(Clone)]
 pub struct Drive {
+    authorizer: Option<Arc<Authorizer>>,
     database: FeatureDatabase,
     blobs: Arc<blob::BlobStore>,
     workspace_id: String,
@@ -232,6 +237,7 @@ impl Drive {
             Ok(())
         })?;
         Ok(Self {
+            authorizer: None,
             database,
             blobs,
             workspace_id,
@@ -278,8 +284,36 @@ impl Drive {
         })?;
         Ok(drive)
     }
+    /// Bind immutable caller authority to this handle and its clones. The callback
+    /// runs within every client operation's IMMEDIATE transaction, never at bind
+    /// time; attached authority stays locked through blob I/O and publication.
+    /// Host maintenance must use an unbound handle.
+    pub fn with_authorizer<F>(&self, authorizer: F) -> Self
+    where
+        F: Fn(&Connection, bool) -> Result<()> + Send + Sync + 'static,
+    {
+        Self {
+            authorizer: Some(Arc::new(authorizer)),
+            ..self.clone()
+        }
+    }
+    fn authorize(&self, connection: &Connection, write: bool) -> Result<()> {
+        match &self.authorizer {
+            Some(authorizer) => authorizer(connection, write),
+            None => Ok(()),
+        }
+    }
+    /// Early admission check, not a lease: every subsequent operation still
+    /// invokes its authorizer in that operation's own transaction.
+    pub fn check_authorized(&self, write: bool) -> Result<()> {
+        self.database.try_transaction(|tx| {
+            self.authorize(tx, write)?;
+            accepting(tx)
+        })
+    }
     pub fn root(&self) -> Result<Node> {
-        self.database.try_with_connection(|c| {
+        self.database.try_transaction(|c| {
+            self.authorize(c, false)?;
             let id = c.query_row(
                 "SELECT id FROM drive_nodes WHERE parent_id IS NULL",
                 [],
@@ -289,7 +323,10 @@ impl Drive {
         })
     }
     pub fn metadata(&self, id: NodeId) -> Result<Node> {
-        self.database.try_with_connection(|c| node(c, id))
+        self.database.try_transaction(|c| {
+            self.authorize(c, false)?;
+            node(c, id)
+        })
     }
 
     /// Keyset pages are ordered by stable ID, not name. Concurrent mutations may
@@ -297,6 +334,7 @@ impl Drive {
     pub fn list(&self, parent: NodeId, after: Option<NodeId>, limit: usize) -> Result<Page> {
         validate_limit(limit, MAX_PAGE)?;
         self.database.try_transaction(|tx| {
+            self.authorize(tx, false)?;
             directory(tx, parent)?;
             let mut stmt = tx.prepare(
                 "SELECT id FROM drive_nodes WHERE parent_id=?1 AND id>?2 ORDER BY id LIMIT ?3",
@@ -320,7 +358,8 @@ impl Drive {
 
     pub fn request_status(&self, request_id: &str) -> Result<RequestStatus> {
         validate_identity(request_id, "request_id", 128)?;
-        self.database.try_with_connection(|c| {
+        self.database.try_transaction(|c| {
+            self.authorize(c, false)?;
             let result = c
                 .query_row(
                     "SELECT result_json FROM drive_receipts WHERE request_id=?1",
@@ -354,6 +393,7 @@ impl Drive {
             .map(|b| format!("{b:02x}"))
             .collect();
         self.database.try_transaction(|tx| {
+            self.authorize(tx, true)?;
             if let Some((old_fingerprint,json)) = tx.query_row("SELECT fingerprint,result_json FROM drive_receipts WHERE request_id=?1",
                 [request_id], |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()? {
                 if old_fingerprint != fingerprint { return Err(Error::Conflict); }
@@ -419,6 +459,7 @@ impl Drive {
     ) -> Result<ReadChunk> {
         validate_limit(length, MAX_READ_BYTES)?;
         self.database.try_transaction(|tx| {
+            self.authorize(tx, false)?;
             accepting(tx)?;
             let selected = node(tx, id)?;
             if selected.revision != revision {
@@ -488,6 +529,7 @@ impl Drive {
         validate_identity(query, "query", 256)?;
         validate_limit(budget, MAX_SEARCH_NODES)?;
         self.database.try_transaction(|tx| {
+            self.authorize(tx, false)?;
             accepting(tx)?;
             let mut stmt = tx.prepare("SELECT id FROM drive_nodes WHERE parent_id IS NOT NULL AND id>?1 ORDER BY id LIMIT ?2")?;
             let ids = stmt.query_map(params![after.map_or(0,|v|v.0),budget+1],|r|r.get::<_,i64>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
