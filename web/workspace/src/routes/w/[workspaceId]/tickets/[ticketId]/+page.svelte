@@ -93,8 +93,8 @@
   let cancellationReason = $state("");
   let routeTicketSnapshot = `${initialData.ticketId}:${loadedTicket.item_revision}`;
   let routeGeneration = 0;
-  const coderAssignment = $derived(
-    ticket.assignments.find((assignment) => assignment.role === "coder") ?? null,
+  const workerAssignment = $derived(
+    ticket.assignments.find((assignment) => assignment.role === "worker") ?? null,
   );
   function repositoryFor(repositoryKey: string): RepositorySummary | null {
     return (loadedRepositories?.items ?? []).find((repository: RepositorySummary) =>
@@ -124,7 +124,7 @@
     return readWriteCount === 1;
   });
   const implementationStartEligible = $derived(
-    ticket.action_eligibility.can_start_manual_coder,
+    ticket.action_eligibility.can_start_manual_worker,
   );
 
   const ticketPath = $derived(
@@ -235,7 +235,7 @@
 
   async function mutateAssignment(
     action: string,
-    role: "orchestrator" | "coder",
+    role: "orchestrator" | "worker",
     principal: Record<string, string>,
   ): Promise<void> {
     if (busy) return;
@@ -281,10 +281,10 @@
     });
   }
 
-  async function startManualCoder(event: SubmitEvent): Promise<void> {
+  async function startManualWorker(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     if (!manualRuntimeId.trim() || !manualWorkerId.trim()) return;
-    await mutateAssignment("start-manual", "coder", {
+    await mutateAssignment("start-manual", "worker", {
       kind: "worker",
       runtime_id: manualRuntimeId.trim(),
       worker_id: manualWorkerId.trim(),
@@ -293,11 +293,11 @@
 
   async function cancelImplementation(event: SubmitEvent): Promise<void> {
     event.preventDefault();
-    if (!coderAssignment || !cancellationReason.trim()) return;
+    if (!workerAssignment || !cancellationReason.trim()) return;
     if (
       await mutate("cancel-implementation", "/implementation-cancellations", {
         operation_id: crypto.randomUUID(),
-        assignment_id: coderAssignment.assignment_id,
+        assignment_id: workerAssignment.assignment_id,
         reason: cancellationReason.trim(),
       })
     ) cancellationReason = "";
@@ -561,7 +561,7 @@
           </button>
         {/if}
         {#if implementationStartEligible}
-          <form class="ticket-control-form" onsubmit={startManualCoder}>
+          <form class="ticket-control-form" onsubmit={startManualWorker}>
             <label>Runtime ID<input bind:value={manualRuntimeId} required /></label>
             <label>Worker ID<input bind:value={manualWorkerId} required /></label>
             <button
@@ -569,16 +569,16 @@
               type="submit"
               disabled={busy !== null || !manualRuntimeId.trim() || !manualWorkerId.trim()}
             >
-              {busy === "start-manual" ? "Starting…" : "Assign Coder and start"}
+              {busy === "start-manual" ? "Starting…" : "Assign Worker and start"}
             </button>
           </form>
         {/if}
-        {#if ticket.state === "inprogress" && coderAssignment}
+        {#if ticket.state === "inprogress" && workerAssignment}
           <details class="ticket-cancel-implementation">
             <summary>Cancel implementation</summary>
             <form class="ticket-control-form" onsubmit={cancelImplementation}>
               <p class="workspace-empty-copy">
-                Cancel the assigned Coder, remove its assignment, and return this Ticket to ready.
+                Cancel the assigned Worker, remove its assignment, and return this Ticket to ready.
               </p>
               <label>Reason<textarea bind:value={cancellationReason} rows="3" required></textarea></label>
               <button
@@ -667,7 +667,7 @@
             {busy === "queue" ? "Queueing…" : `Queue ${ticket.action_eligibility.queue_tickets.length} Ticket(s)`}
           </button>
           {#if !ticket.action_eligibility.can_queue}
-            <p class="workspace-empty-copy">Queue requires a valid target, an active Orchestrator assignment, no active Coder assignment, and no dependency still in planning.</p>
+            <p class="workspace-empty-copy">Queue requires a valid target, an active Orchestrator assignment, no active Worker assignment, and no dependency still in planning.</p>
           {:else if ticket.action_eligibility.queue_tickets.length > 0}
             <p class="workspace-empty-copy">This operation queues: {ticket.action_eligibility.queue_tickets.join(", ")}.</p>
             {#if ticket.relations.blockers.length > 0}
@@ -733,7 +733,7 @@
             </article>
           {/each}
         {:else}
-          <p class="workspace-empty-copy">The assigned Coder has not opened a Merge Request.</p>
+          <p class="workspace-empty-copy">The assigned Worker has not opened a Merge Request.</p>
         {/if}
       </section>
 

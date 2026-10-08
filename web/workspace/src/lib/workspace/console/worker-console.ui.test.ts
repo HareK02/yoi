@@ -438,7 +438,7 @@ Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", as
       ticketDetailPage.includes("mergeRequestPagePath") &&
       ticketDetailPage.includes('mutate("close", "/close"') &&
       ticketDetailPage.includes("mutateAssignment") &&
-      ticketDetailPage.includes("can_start_manual_coder") &&
+      ticketDetailPage.includes("can_start_manual_worker") &&
       ticketDetailPage.includes("ticket.relations.outgoing"),
     "Ticket detail should expose typed lifecycle actions, relations, target selection, assignments, and Merge Request navigation",
   );

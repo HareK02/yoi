@@ -196,10 +196,10 @@ export function loadDashboard(
                 ? (blockedKeys.length === blockers.length
                   ? `Blocked by ${blockedKeys.join(", ")}`
                   : `${blockers.length} unresolved dependencies`)
-                : current.current_coder
+                : current.current_worker
                 ? undefined
-                : "No coder assigned",
-              workerKey: current.current_coder?.worker_resource_key ??
+                : "No Worker assigned",
+              workerKey: current.current_worker?.worker_resource_key ??
                 undefined,
             },
           };

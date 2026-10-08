@@ -9,6 +9,7 @@ import {
   parseTicketDetail,
   parseTicketListResponse,
   parseTicketRecordRef,
+  parseTicketRoleAssignmentMutationResponse,
 } from "./ticket-browser.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
@@ -81,13 +82,48 @@ Deno.test("Ticket Browser parser rejects unknown fields and out-of-range limits"
   );
 });
 
+Deno.test("Ticket Browser accepts generic Worker eligibility and assignments", () => {
+  const fixture = ticketDetailFixture();
+  const worker = {
+    assignment_id: "assignment-1",
+    runtime_id: "runtime-1",
+    worker_id: "worker-1",
+    worker_resource_key: "W-1",
+  };
+  const parsed = parseTicketDetail({
+    ...fixture,
+    current_worker: worker,
+    action_eligibility: {
+      ...fixture.action_eligibility,
+      can_start_manual_worker: true,
+    },
+  });
+  assertEquals(parsed.current_worker, worker);
+  assertEquals(parsed.action_eligibility.can_start_manual_worker, true);
+
+  const assignment = {
+    assigned_at: "2026-10-06T00:00:00Z",
+    assigned_by: "user-1",
+    assignment_id: "assignment-1",
+    principal: { kind: "worker", runtime_id: "runtime-1", worker_id: "worker-1" },
+    role: "worker",
+    ticket_id: "ticket-id",
+    workspace_id: "workspace-a",
+  };
+  assertEquals(parseTicketRoleAssignmentMutationResponse({
+    assignment,
+    ticket_id: "ticket-id",
+    workspace_id: "workspace-a",
+  }).assignment, assignment);
+});
+
 function ticketDetailFixture() {
   return {
     action_eligibility: {
       blockers: [],
       can_assign_orchestrator: false,
       can_queue: false,
-      can_start_manual_coder: false,
+      can_start_manual_worker: false,
       can_unassign_orchestrator: false,
       queue_tickets: [],
     },
@@ -97,7 +133,7 @@ function ticketDetailFixture() {
     assignments: [],
     body: "Body",
     body_truncated: false,
-    current_coder: null,
+    current_worker: null,
     event_count: 0,
     event_page: { ...page, returned: 0 },
     events: [],

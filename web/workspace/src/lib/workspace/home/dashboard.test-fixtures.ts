@@ -59,7 +59,7 @@ export function fixtureDetail(key = "T-101") {
       complete_for_integration: false,
       missing: [],
     },
-    current_coder: key === "T-101"
+    current_worker: key === "T-101"
       ? {
         assignment_id: "a-1",
         runtime_id: "internal-runtime",
@@ -71,7 +71,7 @@ export function fixtureDetail(key = "T-101") {
       blockers: [],
       can_assign_orchestrator: false,
       can_queue: false,
-      can_start_manual_coder: false,
+      can_start_manual_worker: false,
       can_unassign_orchestrator: false,
       queue_tickets: [],
     },
