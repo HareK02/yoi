@@ -1213,7 +1213,7 @@ impl MergeRequestStore {
         }
         let assignment_is_current: bool = transaction.query_row(
             "SELECT EXISTS(
-                SELECT 1 FROM ticket_current_worker_assignments
+                SELECT 1 FROM ticket_active_worker_assignments
                  WHERE workspace_id=?1 AND ticket_id=?2 AND assignment_id=?3
              )",
             params![i.auth.workspace_id, i.ticket_id, i.auth.assignment_id],
@@ -1408,7 +1408,7 @@ impl MergeRequestStore {
         }
         let assignment_is_current: bool = transaction.query_row(
             "SELECT EXISTS(
-                SELECT 1 FROM ticket_current_worker_assignments
+                SELECT 1 FROM ticket_active_worker_assignments
                  WHERE workspace_id=?1 AND ticket_id=?2 AND assignment_id=?3
              )",
             params![
@@ -1474,20 +1474,8 @@ impl MergeRequestStore {
                 "Ticket state changed during completion".into(),
             ));
         }
-        let released = transaction.execute(
-            "DELETE FROM ticket_current_worker_assignments
-              WHERE workspace_id=?1 AND ticket_id=?2 AND assignment_id=?3",
-            params![
-                input.auth.workspace_id,
-                input.ticket_id,
-                input.auth.assignment_id
-            ],
-        )?;
-        if released != 1 {
-            return Err(MergeRequestError::Unauthorized(
-                "Ticket completion assignment changed while releasing it".into(),
-            ));
-        }
+        // Terminal state ends unfinished work through the Workspace authority's
+        // lifecycle trigger. Keep the responsibility identity and its history.
         let event = TicketCompletionEvent {
             operation_id: input.operation_id,
             ticket_id: input.ticket_id.clone(),

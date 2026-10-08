@@ -520,7 +520,8 @@
 
     <aside class="ticket-control-rail">
       <section class="ticket-control-card ticket-worker-card">
-        <header><h2>Role assignments</h2><span>Server-authoritative</span></header>
+        <header><h2>Role assignments</h2><span>Retained responsibility</span></header>
+        <p class="workspace-empty-copy">Responsibility is retained after work ends and Worker removal; it does not indicate a running Worker or active work authority.</p>
         {#if ticket.assignments.length > 0}
           <ul class="ticket-assignment-list">
             {#each ticket.assignments as assignment}
@@ -539,7 +540,7 @@
             {/each}
           </ul>
         {:else}
-          <p class="workspace-empty-copy">No active role assignment.</p>
+          <p class="workspace-empty-copy">No role responsibility recorded.</p>
         {/if}
         {#if ticket.action_eligibility.can_assign_orchestrator}
           <button

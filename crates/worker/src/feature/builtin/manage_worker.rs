@@ -875,7 +875,7 @@ impl WorkerOperation {
                 "Restore a stopped Backend/Runtime Worker session in the current Workspace. Supply expected_observation_token from WorkerList; a conflict requires refreshing and deliberate new intent. New requests default to the durable Tool call ID. For explicit recovery of an unknown/pending outcome, supply the reported request_id and the original token unchanged; never create a new intent or automatically retry."
             }
             Self::Remove => {
-                "Remove an eligible stopped, unassigned, non-internal Worker. Supply a bounded reason; Backend validation and retention are authoritative."
+                "Remove an eligible stopped, non-internal Worker with no unfinished Ticket work. Terminal Ticket responsibility is retained and does not require unassignment. Supply a bounded reason; Backend validation and retention are authoritative."
             }
         }
     }

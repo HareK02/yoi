@@ -28,7 +28,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 81;
+const LATEST_SCHEMA_VERSION: i64 = 82;
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
@@ -282,6 +282,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 81,
         name: "Backend Job immutable resource serialization",
         apply: migrate_backend_job_resources_v80_to_v81,
+    },
+    Migration {
+        version: 82,
+        name: "Ticket responsibility and unfinished work separation",
+        apply: migrate_assignment_work_v81_to_v82,
     },
 ];
 
@@ -1853,6 +1858,26 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         workspace_id: &str,
         operation_id: &str,
     ) -> Result<()>;
+    /// Operational authority/occupancy only. Terminal state releases these
+    /// identities durably; reopening does not reactivate retained responsibility.
+    fn list_active_ticket_role_assignments(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+    ) -> Result<Vec<TicketRoleAssignmentRecord>>;
+    fn get_active_ticket_role_assignment_for_worker(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<TicketRoleAssignmentRecord>>;
+    fn get_active_ticket_role_assignment(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        role: TicketAssignmentRole,
+    ) -> Result<Option<TicketRoleAssignmentRecord>>;
+    /// Retained responsibility, including ended work and removed principals.
+    /// Use the active variants for admission, routing, authorization or removal.
     fn list_current_ticket_role_assignments(
         &self,
         workspace_id: &str,
@@ -1907,6 +1932,11 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         occurred_at: &str,
         reason: &str,
     ) -> Result<bool>;
+    fn get_active_ticket_worker_assignment(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+    ) -> Result<Option<TicketCoderAssignmentRecord>>;
     fn get_current_ticket_coder_assignment(
         &self,
         workspace_id: &str,
@@ -8026,6 +8056,69 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn list_active_ticket_role_assignments(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+    ) -> Result<Vec<TicketRoleAssignmentRecord>> {
+        self.with_conn(|conn| {
+            let sql = active_ticket_role_assignment_select_sql(
+                "WHERE current.workspace_id = ?1 AND current.ticket_id = ?2 \
+             ORDER BY current.role, a.assigned_at, a.assignment_id",
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params![workspace_id, ticket_id],
+                read_ticket_role_assignment_record,
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    fn get_active_ticket_role_assignment(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        role: TicketAssignmentRole,
+    ) -> Result<Option<TicketRoleAssignmentRecord>> {
+        self.with_conn(|conn| {
+            let sql = active_ticket_role_assignment_select_sql(
+                "WHERE current.workspace_id = ?1 AND current.ticket_id = ?2 AND current.role = ?3 \
+             ORDER BY a.assigned_at, a.assignment_id LIMIT 1",
+            );
+            Ok(conn
+                .query_row(
+                    &sql,
+                    params![workspace_id, ticket_id, role.as_str()],
+                    read_ticket_role_assignment_record,
+                )
+                .optional()?)
+        })
+    }
+
+    fn get_active_ticket_role_assignment_for_worker(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<TicketRoleAssignmentRecord>> {
+        self.with_conn(|conn| {
+            let sql = active_ticket_role_assignment_select_sql(
+                "WHERE current.workspace_id = ?1 \
+                   AND current.principal_kind = 'worker' \
+                   AND current.runtime_id = ?2 AND current.worker_id = ?3 \
+                 ORDER BY a.assigned_at, a.assignment_id LIMIT 1",
+            );
+            Ok(conn
+                .query_row(
+                    &sql,
+                    params![workspace_id, worker.runtime_id, worker.worker_id],
+                    read_ticket_role_assignment_record,
+                )
+                .optional()?)
+        })
+    }
+
     fn list_current_ticket_role_assignments(
         &self,
         workspace_id: &str,
@@ -8203,12 +8296,15 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 }
                 Some(expected.clone())
             } else if record.role.is_singleton() && !current.is_empty() {
-                return Err(Error::TicketAssignmentConflict(format!(
-                    "Ticket `{}` already has an active `{}` assignment `{}`",
-                    record.ticket_id,
-                    record.role.as_str(),
-                    current[0].assignment_id
-                )));
+                let active: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments WHERE workspace_id=?1 AND assignment_id=?2)",
+                    params![record.workspace_id, current[0].assignment_id], |row| row.get(0))?;
+                if active {
+                    return Err(Error::TicketAssignmentConflict(format!(
+                        "Ticket {} already has unfinished {} work; use explicit reassign",
+                        record.ticket_id, record.role.as_str())));
+                }
+                Some(current[0].clone())
             } else {
                 None
             };
@@ -8434,7 +8530,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ));
             }
             let conflicting: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM ticket_current_worker_assignments
+                "SELECT COUNT(*) FROM ticket_active_worker_assignments
                   WHERE workspace_id = ?1 AND ticket_id = ?2
                     AND role IN ('orchestrator', 'coder')",
                 params![record.workspace_id, record.ticket_id],
@@ -8447,6 +8543,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ));
             }
 
+            let previous: Option<String> = tx.query_row(
+                "SELECT assignment_id FROM ticket_current_worker_assignments WHERE workspace_id=?1 AND ticket_id=?2 AND role='coder'",
+                params![record.workspace_id, record.ticket_id], |row| row.get(0)).optional()?;
+            tx.execute("DELETE FROM ticket_current_worker_assignments WHERE workspace_id=?1 AND ticket_id=?2 AND role='coder'",
+                params![record.workspace_id, record.ticket_id])?;
             tx.execute(
                 "INSERT INTO ticket_assignment_operations (
                      workspace_id, operation_id, action, ticket_id, role, principal_kind,
@@ -8478,10 +8579,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             tx.execute(
                 "INSERT INTO ticket_worker_assignment_events (
                      workspace_id, ticket_id, role, event_id, action, assignment_id,
-                     actor, created_at, operation_id
-                 ) VALUES (?1, ?2, 'coder', ?3, 'assigned', ?4, ?5, ?6, ?7)",
+                     actor, created_at, operation_id, previous_assignment_id
+                 ) VALUES (?1, ?2, 'coder', ?3, ?8, ?4, ?5, ?6, ?7, ?9)",
                 params![record.workspace_id, record.ticket_id, event_id, record.assignment_id,
-                    record.assigned_by, record.assigned_at, operation_id],
+                    record.assigned_by, record.assigned_at, operation_id,
+                    if previous.is_some() { "reassigned" } else { "assigned" }, previous],
             )?;
             let event_index: i64 = tx.query_row(
                 "SELECT COALESCE(MAX(event_index), -1) + 1 FROM typed_ticket_events
@@ -8649,6 +8751,27 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn get_active_ticket_worker_assignment(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+    ) -> Result<Option<TicketCoderAssignmentRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                current_ticket_worker_assignment_select_sql()
+                    .replace(
+                        "ticket_current_worker_assignments",
+                        "ticket_active_worker_assignments",
+                    )
+                    .as_str(),
+                params![workspace_id, ticket_id],
+                read_ticket_worker_assignment_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
     fn get_current_ticket_coder_assignment(
         &self,
         workspace_id: &str,
@@ -8753,7 +8876,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     read_ticket_worker_assignment_record,
                 )
                 .optional()?;
-            if previous.is_some() && !allow_reassign {
+            let previous_active: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments WHERE workspace_id=?1 AND ticket_id=?2 AND role='coder')",
+                params![record.workspace_id, record.ticket_id], |row| row.get(0))?;
+            if previous_active && !allow_reassign {
                 return Err(Error::TicketAssignmentConflict(format!(
                     "Ticket {} is already assigned; use the explicit reassign operation",
                     record.ticket_id
@@ -8790,7 +8916,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.assigned_at,
                 ],
             )?;
-            let current_write = if allow_reassign {
+            let current_write = if previous.is_some() {
                 tx.execute(
                     r#"UPDATE ticket_current_worker_assignments
                        SET assignment_id = ?3, runtime_id = ?4, worker_id = ?5, updated_at = ?6
@@ -10633,7 +10759,7 @@ fn runtime_removal_preflight(
         ),
         (
             "active_worker_assignment",
-            "SELECT EXISTS(SELECT 1 FROM ticket_current_worker_assignments WHERE runtime_id = ?1)",
+            "SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments WHERE runtime_id = ?1)",
         ),
         (
             "active_workdir",
@@ -11743,6 +11869,13 @@ fn read_ticket_role_assignment_by_id(
         .optional()?)
 }
 
+fn active_ticket_role_assignment_select_sql(where_clause: &str) -> String {
+    ticket_role_assignment_select_sql(where_clause).replace(
+        "ticket_current_worker_assignments",
+        "ticket_active_worker_assignments",
+    )
+}
+
 fn ticket_role_assignment_select_sql(where_clause: &str) -> String {
     format!(
         "SELECT a.workspace_id, a.ticket_id, a.assignment_id, a.role, \
@@ -11982,7 +12115,7 @@ fn read_assignment_operation(
 fn map_assignment_constraint(error: rusqlite::Error, ticket_id: &str, worker_id: &str) -> Error {
     if matches!(error, rusqlite::Error::SqliteFailure(_, _)) {
         Error::TicketAssignmentConflict(format!(
-            "Ticket {ticket_id} or Worker {worker_id} already has a current assignment"
+            "Ticket {ticket_id} has a responsibility conflict or Worker {worker_id} has unfinished work"
         ))
     } else {
         Error::Sqlite(error)
@@ -15128,6 +15261,99 @@ fn migrate_archive_observe_grants_v75_to_v76(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_assignment_work_v81_to_v82(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 81 {
+        return Err(Error::Store(
+            "Ticket work separation requires schema 81".into(),
+        ));
+    }
+    let foreign_keys =
+        conn.pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))?;
+    let legacy =
+        conn.pragma_query_value(None, "legacy_alter_table", |row| row.get::<_, bool>(0))?;
+    conn.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;")?;
+    let result = (|| {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+        let dependents = {
+            let mut stmt = tx.prepare("SELECT sql FROM sqlite_schema WHERE tbl_name='ticket_current_worker_assignments' AND type IN ('index','trigger') AND sql IS NOT NULL AND name != 'ticket_current_worker_role_idx'")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let schema = include_str!("latest_schema.sql");
+        let start = schema
+            .find("CREATE TABLE ticket_current_worker_assignments (")
+            .ok_or_else(|| Error::Store("Missing assignment schema".into()))?;
+        let end = schema[start..]
+            .find("CREATE TABLE ticket_worker_assignment_events")
+            .ok_or_else(|| Error::Store("Missing assignment schema end".into()))?
+            + start;
+        tx.execute_batch(&schema[start..end].replace(
+            "CREATE TABLE ticket_current_worker_assignments",
+            "CREATE TABLE ticket_current_worker_assignments_v82",
+        ))?;
+        tx.execute_batch("INSERT INTO ticket_current_worker_assignments_v82 SELECT * FROM ticket_current_worker_assignments;
+            DROP TABLE ticket_current_worker_assignments;
+            ALTER TABLE ticket_current_worker_assignments_v82 RENAME TO ticket_current_worker_assignments;")?;
+        for sql in dependents {
+            tx.execute_batch(&sql)?;
+        }
+        tx.execute_batch(include_str!("assignment_work.sql"))?;
+        // Existing done/closed + current-assignment data is preserved, and a
+        // durable release prevents a later reopen from resurrecting old work.
+        tx.execute_batch("INSERT OR IGNORE INTO ticket_assignment_work_releases
+            SELECT current.workspace_id, current.assignment_id, COALESCE(ticket.updated_at, current.updated_at)
+            FROM ticket_current_worker_assignments current JOIN typed_tickets ticket
+              ON ticket.workspace_id=current.workspace_id AND ticket.ticket_id=current.ticket_id
+            WHERE ticket.workflow_state IN ('done','closed');")?;
+        let legacy_plans = {
+            let mut statement =
+                tx.prepare("SELECT operation_id, blockers_json FROM worker_removal_operations")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (operation_id, encoded) in legacy_plans {
+            let mut blockers: Vec<serde_json::Value> = serde_json::from_str(&encoded)
+                .map_err(|error| Error::Store(format!("invalid removal blockers: {error}")))?;
+            let mut changed = false;
+            for blocker in &mut blockers {
+                if blocker.get("kind").and_then(serde_json::Value::as_str)
+                    == Some("current_assignment")
+                {
+                    blocker["kind"] = serde_json::Value::String("unfinished_work".into());
+                    changed = true;
+                }
+            }
+            if changed {
+                let encoded = serde_json::to_string(&blockers)
+                    .map_err(|error| Error::Store(error.to_string()))?;
+                // Historical blocked plans stay blocked; issued fingerprints
+                // and identities are immutable. Fresh planning rereads active work.
+                tx.execute(
+                    "UPDATE worker_removal_operations SET blockers_json=?2 WHERE operation_id=?1",
+                    params![operation_id, encoded],
+                )?;
+            }
+        }
+        let broken: i64 =
+            tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        if broken != 0 {
+            return Err(Error::Store(
+                "Ticket work migration foreign-key verification failed".into(),
+            ));
+        }
+        tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES (82,'Ticket responsibility and unfinished work separation')", [])?;
+        tx.commit()?;
+        Ok(())
+    })();
+    conn.pragma_update(None, "legacy_alter_table", legacy)?;
+    conn.pragma_update(None, "foreign_keys", foreign_keys)?;
+    result
+}
+
 fn migrate_backend_job_resources_v80_to_v81(conn: &Connection) -> Result<()> {
     if current_schema_version(conn)? != 80 {
         return Err(Error::Store(
@@ -15371,6 +15597,7 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
             ));
         "#,
     )?;
+    conn.execute_batch(include_str!("assignment_work.sql"))?;
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
         Error::Store(format!(
             "fresh Workspace Ticket schema verification failed: {error}"
@@ -15401,6 +15628,32 @@ fn verify_workspace_resource_constraints(conn: &Connection) -> Result<()> {
             return Err(Error::Store(format!(
                 "Workspace resource constraint trigger `{trigger}` is missing"
             )));
+        }
+    }
+    if current_schema_version(conn)? >= 82 {
+        for (kind, name) in [
+            ("table", "ticket_assignment_work_releases"),
+            ("view", "ticket_active_worker_assignments"),
+            ("trigger", "ticket_terminal_releases_work"),
+            ("trigger", "ticket_terminal_assignment_releases_work_insert"),
+            ("trigger", "ticket_terminal_assignment_releases_work_update"),
+            ("trigger", "ticket_active_worker_role_insert"),
+            ("trigger", "ticket_active_worker_role_update"),
+            ("trigger", "ticket_active_worker_principal_insert"),
+            ("trigger", "ticket_active_worker_principal_update"),
+            ("trigger", "ticket_unfinished_work_blocks_worker_delete"),
+            ("trigger", "ticket_unfinished_work_blocks_worker_move"),
+        ] {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type=?1 AND name=?2)",
+                params![kind, name],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(Error::Store(format!(
+                    "unfinished Ticket work constraint {name} is missing"
+                )));
+            }
         }
     }
     Ok(())
@@ -17212,6 +17465,9 @@ mod tests {
         let store = SqliteWorkspaceStore::open(&path).unwrap();
         store
             .with_conn(|conn| {
+                conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")?;
+                downgrade_assignment_work_schema(conn);
+                conn.execute_batch("PRAGMA legacy_alter_table=OFF; PRAGMA foreign_keys=ON;")?;
                 downgrade_schema_66_ticket_and_workdir_authority(conn)?;
                 conn.execute_batch(
                     "DROP TRIGGER runtime_binding_insert_blocked_by_removal; \
@@ -17281,6 +17537,11 @@ mod tests {
         drop(SqliteWorkspaceStore::open(&path).unwrap());
         {
             let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")
+                .unwrap();
+            downgrade_assignment_work_schema(&conn);
+            conn.execute_batch("PRAGMA legacy_alter_table=OFF; PRAGMA foreign_keys=ON;")
+                .unwrap();
             downgrade_schema_66_ticket_and_workdir_authority(&conn).unwrap();
             conn.execute_batch(
                 "ALTER TABLE worker_removal_operations \
@@ -17659,6 +17920,44 @@ mod tests {
             .unwrap();
     }
 
+    fn downgrade_assignment_work_schema(conn: &Connection) {
+        conn.execute_batch(
+            r#"
+DROP TRIGGER ticket_terminal_releases_work;
+DROP TRIGGER ticket_terminal_assignment_releases_work_insert;
+DROP TRIGGER ticket_terminal_assignment_releases_work_update;
+DROP TRIGGER ticket_active_worker_role_insert;
+DROP TRIGGER ticket_active_worker_role_update;
+DROP TRIGGER ticket_active_worker_principal_insert;
+DROP TRIGGER ticket_active_worker_principal_update;
+DROP TRIGGER ticket_unfinished_work_blocks_worker_delete;
+DROP TRIGGER ticket_unfinished_work_blocks_worker_move;
+DROP VIEW ticket_active_worker_assignments;
+DROP TABLE ticket_assignment_work_releases;
+CREATE UNIQUE INDEX ticket_current_worker_role_idx
+    ON ticket_current_worker_assignments(workspace_id, role, runtime_id, worker_id)
+    WHERE principal_kind='worker';
+"#,
+        )
+        .unwrap();
+        // Restore the actual old FK contract, not just the old unique index.
+        let dependents = {
+            let mut stmt = conn.prepare("SELECT sql FROM sqlite_schema WHERE tbl_name='ticket_current_worker_assignments' AND type IN ('index','trigger') AND sql IS NOT NULL").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let table: String = conn.query_row("SELECT sql FROM sqlite_schema WHERE type='table' AND name='ticket_current_worker_assignments'", [], |row| row.get(0)).unwrap();
+        let old_table = table.replace("CREATE TABLE ticket_current_worker_assignments", "CREATE TABLE current_assignments_old")
+            .replace("            CHECK(\n", "            FOREIGN KEY(workspace_id,runtime_id,worker_id) REFERENCES worker_registry(workspace_id,runtime_id,worker_id) ON DELETE RESTRICT,\n            CHECK(\n");
+        conn.execute_batch(&old_table).unwrap();
+        conn.execute_batch("INSERT INTO current_assignments_old SELECT * FROM ticket_current_worker_assignments; DROP TABLE ticket_current_worker_assignments; ALTER TABLE current_assignments_old RENAME TO ticket_current_worker_assignments;").unwrap();
+        for sql in dependents {
+            conn.execute_batch(&sql).unwrap();
+        }
+    }
+
     fn prepare_schema_v52(path: &Path) {
         let conn = Connection::open(path).unwrap();
         configure_sqlite(&conn).unwrap();
@@ -17667,6 +17966,7 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;")
             .unwrap();
         create_latest_workspace_schema(&conn).unwrap();
+        downgrade_assignment_work_schema(&conn);
         downgrade_schema_66_ticket_and_workdir_authority(&conn).unwrap();
         conn.execute_batch("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;")
             .unwrap();
@@ -17928,6 +18228,10 @@ mod tests {
                     version: 81,
                     name: "Backend Job immutable resource serialization".to_string()
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 82,
+                    name: "Ticket responsibility and unfinished work separation".to_string()
+                },
             ]
         );
 
@@ -18019,6 +18323,7 @@ mod tests {
                         (79, WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME.to_string()),
                         (80, WORKER_RESTORE_INTENTS_MIGRATION_NAME.to_string()),
                         (81, "Backend Job immutable resource serialization".to_string()),
+                        (82, "Ticket responsibility and unfinished work separation".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -18370,7 +18675,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
-                73, 74, 75, 76, 77, 78, 79, 80, 81
+                73, 74, 75, 76, 77, 78, 79, 80, 81, 82
             ]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -18379,7 +18684,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 32);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 33);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());
@@ -20471,6 +20776,203 @@ mod tests {
             .unwrap();
         assert_eq!(pinned.content, workspace_source);
         assert_eq!(pinned.definition.name, "coder-review");
+    }
+
+    // Equivalent to the reported closed T-12 + retained Coder data. The
+    // migration fixture is a real pre-cutover schema, not the live Workspace.
+    #[test]
+    fn schema_v81_terminal_responsibility_survives_migration_reopen_and_worker_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.db");
+        prepare_schema_v50(&path, Some("workspace-a"));
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= 81) {
+            (migration.apply)(&conn).unwrap();
+        }
+        conn.execute_batch(r#"
+            INSERT INTO worker_registry(workspace_id,runtime_id,worker_id,display_name,retention_state,created_at,updated_at)
+                VALUES('workspace-a','runtime-a','old-coder','Coder T-12','normal','1','1');
+            INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit,updated_at)
+                VALUES('workspace-a','closed-ticket','closed-ticket','Closed Ticket','closed','task','normal','','closed',1,'2');
+            INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,runtime_id,worker_id,assigned_by,assigned_at)
+                VALUES('workspace-a','closed-ticket','old-assignment','runtime-a','old-coder','actor','1');
+            INSERT INTO ticket_current_worker_assignments(workspace_id,ticket_id,assignment_id,runtime_id,worker_id,updated_at)
+                VALUES('workspace-a','closed-ticket','old-assignment','runtime-a','old-coder','1');
+            INSERT INTO ticket_worker_assignment_events(workspace_id,ticket_id,event_id,action,assignment_id,actor,created_at)
+                VALUES('workspace-a','closed-ticket','assigned-event','assigned','old-assignment','actor','1');
+        "#).unwrap();
+        let legacy_blockers = serde_json::json!([
+            {"kind":"hold"}, {"kind":"current_assignment","assignment_id":"current_assignment","ticket_id":"closed-ticket"}
+        ]).to_string();
+        conn.execute("INSERT INTO worker_removal_operations(operation_id,plan_id,input_fingerprint,workspace_id,runtime_id,worker_id,worker_revision,policy_id,policy_revision,session_disposition,metadata_disposition,archive_retention_kind,diagnostics_disposition,blockers_json,state,reason,created_at,updated_at)
+            VALUES('old-op','old-plan','immutable-fingerprint','workspace-a','runtime-a','old-coder','1','workspace-default-conservative',1,'purge','tombstone','forever','purge',?1,'blocked','retain','1','1')", [&legacy_blockers]).unwrap();
+        migrate_assignment_work_v81_to_v82(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 82);
+        apply_migrations(&conn).unwrap(); // canonical retry is a no-op
+        let (plan, fingerprint, state, encoded): (String,String,String,String) = conn.query_row(
+            "SELECT plan_id,input_fingerprint,state,blockers_json FROM worker_removal_operations WHERE operation_id='old-op'", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(
+            (plan.as_str(), fingerprint.as_str(), state.as_str()),
+            ("old-plan", "immutable-fingerprint", "blocked")
+        );
+        let blockers: Vec<crate::retention::WorkerRemovalBlocker> =
+            serde_json::from_str(&encoded).unwrap();
+        assert!(
+            matches!(&blockers[..], [crate::retention::WorkerRemovalBlocker::Hold,crate::retention::WorkerRemovalBlocker::UnfinishedWork { assignment_id,ticket_id }] if assignment_id=="current_assignment" && ticket_id=="closed-ticket")
+        );
+        conn.execute_batch(
+            "UPDATE typed_tickets SET workflow_state='planning' WHERE ticket_id='closed-ticket';
+            DELETE FROM worker_registry WHERE worker_id='old-coder';",
+        )
+        .unwrap();
+        let (responsibility, active, history, tombstone): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM ticket_current_worker_assignments),
+                    (SELECT COUNT(*) FROM ticket_active_worker_assignments),
+                    (SELECT COUNT(*) FROM ticket_worker_assignment_events),
+                    (SELECT COUNT(*) FROM ticket_assignment_worker_tombstones)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((responsibility, active, history, tombstone), (1, 0, 1, 1));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        assert!(
+            conn.execute(
+                "UPDATE ticket_current_worker_assignments SET updated_at='3'",
+                []
+            )
+            .is_err(),
+            "removed Worker cannot receive new authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_retains_responsibility_without_occupying_new_work_and_reopen_requires_new_identity()
+     {
+        use ticket::TicketBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.db");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "w".into(),
+                owner_account_id: "owner-account".into(),
+                display_name: "W".into(),
+                state: "active".into(),
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            })
+            .await
+            .unwrap();
+        store.with_conn(|conn| {
+            conn.execute_batch("INSERT INTO worker_registry(workspace_id,runtime_id,worker_id,display_name,retention_state,created_at,updated_at) VALUES('w','r','coder','Coder','normal','1','1');")?;
+            Ok(())
+        }).unwrap();
+        let backend = ticket::SqliteTicketBackend::open_verified(&path, "w").unwrap();
+        let first = backend.create(ticket::NewTicket::new("First")).unwrap();
+        let second = backend.create(ticket::NewTicket::new("Second")).unwrap();
+        let assignment = TicketCoderAssignmentRecord {
+            workspace_id: "w".into(),
+            ticket_id: first.id.clone(),
+            assignment_id: "a1".into(),
+            worker: RuntimeWorkerRef::new("r", "coder"),
+            assigned_by: "actor".into(),
+            assigned_at: "1".into(),
+        };
+        store
+            .set_current_ticket_coder_assignment(&assignment, None, "e1", "op1", false)
+            .unwrap();
+        let next = TicketCoderAssignmentRecord {
+            ticket_id: second.id.clone(),
+            assignment_id: "a2".into(),
+            ..assignment.clone()
+        };
+        assert!(
+            store
+                .set_current_ticket_coder_assignment(&next, None, "e2", "op2", false)
+                .is_err()
+        );
+        backend
+            .close(
+                first.id.clone().into(),
+                ticket::MarkdownText::new("Closed without integration proof"),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .get_current_ticket_coder_assignment("w", &first.id)
+                .unwrap(),
+            Some(assignment.clone())
+        );
+        assert!(
+            store
+                .get_active_ticket_worker_assignment("w", &first.id)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .set_current_ticket_coder_assignment(&next, None, "e2", "op2", false)
+            .unwrap();
+        // Generic Ticket tools do not expose terminal -> planning. Seed the
+        // authority state boundary to prove future/reconciled reopen is inert.
+        store.with_conn(|conn| { conn.execute("UPDATE typed_tickets SET workflow_state='planning' WHERE workspace_id='w' AND ticket_id=?1", [&first.id])?; Ok(()) }).unwrap();
+        assert!(
+            store
+                .get_active_ticket_worker_assignment("w", &first.id)
+                .unwrap()
+                .is_none()
+        );
+        // Replay of the original operation reports its identity but does not revive work.
+        store
+            .set_current_ticket_coder_assignment(&assignment, None, "e1", "op1", false)
+            .unwrap();
+        assert!(
+            store
+                .get_active_ticket_worker_assignment("w", &first.id)
+                .unwrap()
+                .is_none()
+        );
+        let restarted = TicketCoderAssignmentRecord {
+            assignment_id: "a3".into(),
+            ..assignment.clone()
+        };
+        assert!(
+            store
+                .set_current_ticket_coder_assignment(&restarted, None, "e3", "op3", false)
+                .is_err(),
+            "another Ticket still occupies the Worker"
+        );
+        backend
+            .close(second.id.clone().into(), ticket::MarkdownText::new("Ended"))
+            .unwrap();
+        store
+            .set_current_ticket_coder_assignment(&restarted, None, "e3", "op3", false)
+            .unwrap();
+        assert_eq!(
+            store
+                .get_active_ticket_worker_assignment("w", &first.id)
+                .unwrap(),
+            Some(restarted)
+        );
+        let events = store
+            .list_ticket_coder_assignment_events("w", &first.id, 10)
+            .unwrap();
+        assert_eq!(events[0].previous_assignment_id.as_deref(), Some("a1"));
+        assert_eq!(events[0].action, "reassigned");
+        assert!(
+            store
+                .delete_worker_registry("w", &assignment.worker)
+                .is_err()
+        );
     }
 
     #[tokio::test]

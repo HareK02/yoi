@@ -313,9 +313,17 @@ async fn done_merged_remote_ticket_uses_immutable_result_in_show_query_list_and_
         fixture
             .api
             .store
-            .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+            .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
             .unwrap()
             .is_none()
+    );
+    assert!(
+        fixture
+            .api
+            .store
+            .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+            .unwrap()
+            .is_some()
     );
 
     let shown = fixture.show().await;
@@ -508,14 +516,30 @@ async fn open_source_without_runtime_is_typed_unavailable_not_stale_after_rescop
     let fixture = EvidenceApiFixture::new().await;
     let approval = fixture.approve("open-review");
     fixture.rescope();
-    // Simulate a retired Coder assignment, leaving an open MR and its review
-    // history. Only this temporary authority fixture is changed.
+    // End this assignment identity's work without erasing its responsibility.
+    // A retained Coder must not silently supply a Runtime for an open source.
     let connection = Connection::open(&fixture.api.config.database_path).unwrap();
     assert_eq!(connection.execute(
-        "DELETE FROM ticket_current_worker_assignments WHERE workspace_id=?1 AND ticket_id=?2",
-        params![TEST_WORKSPACE_ID, fixture.ticket_id],
+        "INSERT INTO ticket_assignment_work_releases(workspace_id,assignment_id,released_at) VALUES(?1,?2,?3)",
+        params![TEST_WORKSPACE_ID, fixture.auth.assignment_id, evidence_time().to_rfc3339()],
     ).unwrap(), 1);
     drop(connection);
+    assert!(
+        fixture
+            .api
+            .store
+            .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        fixture
+            .api
+            .store
+            .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+            .unwrap()
+            .is_none()
+    );
 
     let shown = fixture.show().await;
     let summary = &shown.merge_requests[0];

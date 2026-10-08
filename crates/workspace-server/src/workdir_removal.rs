@@ -356,10 +356,10 @@ impl SqliteWorkspaceStore {
                 params![operation.workspace_id, operation.working_directory_id],
                 |row| row.get(0),
             )?;
-            let current_assignment: bool = conn.query_row(
+            let unfinished_work: bool = conn.query_row(
                 r#"SELECT EXISTS(
                     SELECT 1 FROM worker_workdir_links AS link
-                    JOIN ticket_current_worker_assignments AS current
+                    JOIN ticket_active_worker_assignments AS current
                       ON current.workspace_id=link.workspace_id
                     JOIN ticket_worker_assignments AS assignment
                       ON assignment.workspace_id=current.workspace_id
@@ -404,10 +404,10 @@ impl SqliteWorkspaceStore {
                     detail: "Workdir has a pending Worker attachment reservation",
                 });
             }
-            if current_assignment {
+            if unfinished_work {
                 guards.push(WorkdirRemovalGuard {
-                    category: "current_assignment",
-                    detail: "Workdir is bound to a Worker with a current Ticket assignment",
+                    category: "unfinished_work",
+                    detail: "Workdir is bound to a Worker with unfinished Ticket work",
                 });
             }
             if retention_hold {
@@ -1194,6 +1194,156 @@ mod tests {
             retained.disposition,
             Some(WorkdirRemovalDisposition::Retained)
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_assignments_release_unfinished_work_guard_but_not_attachment_or_hold() {
+        for (status, workflow_state) in [("closed", "closed"), ("open", "done")] {
+            let (store, workdir) = seeded_store().await;
+            store
+                .with_conn(|conn| {
+                    conn.execute(
+                        "INSERT INTO worker_registry (
+                            workspace_id, runtime_id, worker_id, display_name, retention_state,
+                            created_at, updated_at
+                         ) VALUES ('workspace-a', 'runtime-a', 'worker-a', 'Worker A', 'pinned', '1', '1')",
+                        [],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO worker_workdir_links (
+                            workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at
+                         ) VALUES ('workspace-a', 'runtime-a', 'worker-a', 'workdir-a', 'main', 'read_write', '1')",
+                        [],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO typed_tickets (
+                            workspace_id, ticket_id, slug, title, status, kind, priority, body,
+                            workflow_state, workflow_state_explicit
+                         ) VALUES ('workspace-a', 'ticket-a', 'ticket-a', 'Ticket A', 'open',
+                                   'task', 'normal', '', 'inprogress', 1)",
+                        [],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO ticket_worker_assignments (
+                            workspace_id, ticket_id, assignment_id, runtime_id, worker_id,
+                            assigned_by, assigned_at
+                         ) VALUES ('workspace-a', 'ticket-a', 'assignment-a', 'runtime-a', 'worker-a', 'test', '1')",
+                        [],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO ticket_current_worker_assignments (
+                            workspace_id, ticket_id, assignment_id, runtime_id, worker_id, updated_at
+                         ) VALUES ('workspace-a', 'ticket-a', 'assignment-a', 'runtime-a', 'worker-a', '1')",
+                        [],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            let intent =
+                workdir_removal_intent(&workdir, "workspace-api", "remove Workdir").unwrap();
+            let operation = store.reserve_workdir_removal_operation(&intent).unwrap();
+            let categories = |guards: Vec<WorkdirRemovalGuard>| {
+                guards
+                    .into_iter()
+                    .map(|guard| guard.category)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                categories(store.workdir_removal_guards(&operation).unwrap()),
+                vec!["active_attachment", "unfinished_work", "retention_hold"]
+            );
+            store
+                .with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE typed_tickets SET status=?1, workflow_state=?2
+                         WHERE workspace_id='workspace-a' AND ticket_id='ticket-a'",
+                        params![status, workflow_state],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                categories(store.workdir_removal_guards(&operation).unwrap()),
+                vec!["active_attachment", "retention_hold"]
+            );
+            store
+                .with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE typed_tickets SET status='open', workflow_state='planning'
+                         WHERE workspace_id='workspace-a' AND ticket_id='ticket-a'",
+                        [],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                categories(store.workdir_removal_guards(&operation).unwrap()),
+                vec!["active_attachment", "retention_hold"],
+                "reopening must not restore unfinished work on the retained assignment"
+            );
+            assert!(matches!(
+                store.commit_workdir_removal_removed(&operation),
+                Err(Error::WorkdirAttachmentConflict(_))
+            ));
+            assert!(
+                store
+                    .get_workdir_registry("workspace-a", "workdir-a")
+                    .unwrap()
+                    .is_some()
+            );
+            store
+                .with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE worker_registry SET retention_state='normal'
+                         WHERE workspace_id='workspace-a' AND runtime_id='runtime-a' AND worker_id='worker-a'",
+                        [],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                categories(store.workdir_removal_guards(&operation).unwrap()),
+                vec!["active_attachment"]
+            );
+            assert!(matches!(
+                store.commit_workdir_removal_removed(&operation),
+                Err(Error::WorkdirAttachmentConflict(_))
+            ));
+            store
+                .with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE worker_workdir_links SET unlinked_at='2'
+                         WHERE workspace_id='workspace-a' AND workdir_id='workdir-a'",
+                        [],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(store.workdir_removal_guards(&operation).unwrap().is_empty());
+            let completed = store.commit_workdir_removal_removed(&operation).unwrap();
+            assert_eq!(
+                completed.disposition,
+                Some(WorkdirRemovalDisposition::Removed)
+            );
+            assert!(
+                store
+                    .get_workdir_registry("workspace-a", "workdir-a")
+                    .unwrap()
+                    .is_none()
+            );
+            let retained: i64 = store
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM ticket_current_worker_assignments
+                         WHERE workspace_id='workspace-a' AND assignment_id='assignment-a'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(Error::from)
+                })
+                .unwrap();
+            assert_eq!(retained, 1);
+        }
     }
 
     #[tokio::test]
