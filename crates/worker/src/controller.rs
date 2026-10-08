@@ -1303,16 +1303,24 @@ pub(crate) fn wire_event_bridges_on_engine<C, St>(
         });
     });
 
-    let alerter_for_worker = alerter.clone();
-    worker.on_warning(move |message| {
-        alerter_for_worker.alert(AlertLevel::Warn, AlertSource::Engine, message.to_owned());
-    });
+    wire_engine_warnings(worker, alerter);
 
     // History-append broadcasts (previously `Event::SystemMessage`)
     // have been removed: every persistent history item is now committed
     // through the session-log sink as a typed `LogEntry`, and clients
     // see it via `Event::Snapshot` + live `Event::Entry`. The
     // per-item commit channel is wired at the top of this function.
+}
+
+/// Forward genuine Engine warnings to both live clients and the alert snapshot.
+fn wire_engine_warnings<C: LlmClient, A: Send + Sync>(
+    engine: &mut agen::Engine<C, agen::state::Mutable, A>,
+    alerter: &Alerter,
+) {
+    let alerter = alerter.clone();
+    engine.on_warning(move |message| {
+        alerter.alert(AlertLevel::Warn, AlertSource::Engine, message.to_owned());
+    });
 }
 
 fn validate_memory_lifecycle_targets(
@@ -3905,6 +3913,198 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::net::UnixListener;
+
+    mod engine_alerts {
+        use super::*;
+        use agen::llm_client::event::Event as LlmEvent;
+        use agen::llm_client::{ClientError, Item, Request, ToolCallCompletionSupport};
+        use agen::tool::{
+            Tool, ToolError, ToolExecutionContext, ToolMeta, ToolOutput, ToolOutputLimits,
+        };
+        use agen::{Engine, EngineRunExit, History, ToolCallDispatchMode};
+        use std::collections::VecDeque;
+        use std::pin::Pin;
+        use std::sync::Mutex;
+
+        #[derive(Clone)]
+        struct ScriptedClient {
+            responses: Arc<Mutex<VecDeque<Vec<LlmEvent>>>>,
+            requests: Arc<Mutex<Vec<Request>>>,
+        }
+
+        impl ScriptedClient {
+            fn new(responses: Vec<Vec<LlmEvent>>) -> Self {
+                Self {
+                    responses: Arc::new(Mutex::new(responses.into())),
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl LlmClient for ScriptedClient {
+            fn clone_boxed(&self) -> Box<dyn LlmClient> {
+                Box::new(self.clone())
+            }
+
+            fn tool_call_completion_support(&self) -> ToolCallCompletionSupport {
+                ToolCallCompletionSupport::ResponseComplete
+            }
+
+            async fn stream(
+                &self,
+                request: Request,
+            ) -> Result<
+                Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, ClientError>> + Send>>,
+                ClientError,
+            > {
+                self.requests.lock().unwrap().push(request);
+                let events = self
+                    .responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("unexpected LLM request");
+                Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+            }
+        }
+
+        struct LargeOutputTool;
+
+        #[async_trait::async_trait]
+        impl Tool for LargeOutputTool {
+            async fn execute(
+                &self,
+                _input_json: &str,
+                _ctx: ToolExecutionContext,
+            ) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput {
+                    summary: "Fixed large output".into(),
+                    content: Some("useful output line\n".repeat(512)),
+                    attachments: Vec::new(),
+                })
+            }
+        }
+
+        fn finished_response() -> Vec<LlmEvent> {
+            vec![
+                LlmEvent::text_block_start(0),
+                LlmEvent::text_delta(0, "Done"),
+                LlmEvent::text_block_stop(0, None),
+            ]
+        }
+
+        #[tokio::test]
+        async fn truncated_tool_output_preserves_model_result_without_live_or_buffered_alerts() {
+            let client = ScriptedClient::new(vec![
+                vec![
+                    LlmEvent::tool_use_start(0, "large-call", "large_output"),
+                    LlmEvent::tool_input_delta(0, "{}"),
+                    LlmEvent::tool_use_stop(0),
+                ],
+                finished_response(),
+            ]);
+            let requests = client.requests.clone();
+            let mut engine = Engine::new(client);
+            // Isolate output limiting from the independent early-dispatch warning.
+            engine.set_tool_call_dispatch_mode(ToolCallDispatchMode::AfterResponse);
+            engine.set_tool_output_limits(Some(ToolOutputLimits {
+                default_max_bytes: 256,
+                per_tool: Default::default(),
+            }));
+            engine.register_tool(Arc::new(|| {
+                (
+                    ToolMeta::new("large_output")
+                        .input_schema(serde_json::json!({"type": "object"})),
+                    Arc::new(LargeOutputTool),
+                )
+            }));
+            let (tx, _) = broadcast::channel(8);
+            let alerter = Alerter::new(tx);
+            let (_, mut live) = alerter.subscribe_with_snapshot();
+            wire_engine_warnings(&mut engine, &alerter);
+
+            let output = engine.run(&mut History::new(), "Run the tool").await;
+            assert!(
+                matches!(output.result, EngineRunExit::Finished),
+                "{:?}",
+                output.result
+            );
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let result = requests[1].items.iter().find(|item| {
+                matches!(item, Item::ToolResult { call_id, .. } if call_id == "large-call")
+            }).expect("the next model request must include the bounded tool result");
+            match result {
+                Item::ToolResult {
+                    summary,
+                    content: Some(content),
+                    is_error,
+                    disposition,
+                    ..
+                } => {
+                    assert_eq!(summary, "Fixed large output");
+                    assert!(!is_error);
+                    assert_eq!(*disposition, agen::ToolResultDisposition::Success);
+                    assert!(content.len() <= 256, "{content}");
+                    assert!(content.starts_with("useful output line\n"), "{content}");
+                    assert!(content.contains("[truncated:"), "{content}");
+                    assert!(content.contains("refine your query]"), "{content}");
+                }
+                other => panic!("unexpected model-visible result: {other:?}"),
+            }
+            assert!(matches!(
+                live.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+            let (snapshot, _) = alerter.subscribe_with_snapshot();
+            assert!(snapshot.is_empty(), "unexpected alerts: {snapshot:?}");
+        }
+
+        #[tokio::test]
+        async fn unsupported_early_dispatch_warning_reaches_live_and_buffered_engine_alerts() {
+            let mut engine = Engine::new(ScriptedClient::new(vec![finished_response()]));
+            engine.set_tool_call_dispatch_mode(ToolCallDispatchMode::OnToolCallComplete);
+            let (tx, _) = broadcast::channel(8);
+            let alerter = Alerter::new(tx);
+            let (_, mut live) = alerter.subscribe_with_snapshot();
+            wire_engine_warnings(&mut engine, &alerter);
+
+            let output = engine.run(&mut History::new(), "Finish").await;
+            assert!(
+                matches!(output.result, EngineRunExit::Finished),
+                "{:?}",
+                output.result
+            );
+            let alert = match live.try_recv() {
+                Ok(Event::Alert(alert)) => alert,
+                other => panic!("expected live Engine warning: {other:?}"),
+            };
+            assert_eq!(alert.level, AlertLevel::Warn);
+            assert_eq!(alert.source, AlertSource::Engine);
+            assert!(
+                alert.message.contains(
+                    "provider does not expose a trustworthy per-call completion boundary"
+                ),
+                "{}",
+                alert.message
+            );
+            assert!(matches!(
+                live.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+            let (snapshot, mut late_live) = alerter.subscribe_with_snapshot();
+            assert_eq!(snapshot.len(), 1, "unexpected alerts: {snapshot:?}");
+            assert_eq!(snapshot[0].level, alert.level);
+            assert_eq!(snapshot[0].source, alert.source);
+            assert_eq!(snapshot[0].message, alert.message);
+            assert_eq!(snapshot[0].timestamp_ms, alert.timestamp_ms);
+            assert!(matches!(
+                late_live.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+        }
+    }
 
     #[test]
     fn runtime_session_head_is_materialized_after_feature_installation_before_exposure() {

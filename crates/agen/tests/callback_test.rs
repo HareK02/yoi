@@ -16,6 +16,182 @@ use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
 use common::MockLlmClient;
 
+/// A per-run tracing sink: no global subscriber or output-body logging.
+#[derive(Clone)]
+struct DiagnosticLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for DiagnosticLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn output_limits_keep_partial_results_without_warning_callbacks() {
+    use agen::tool::{Attachment, ImageAttachment, ToolOutputLimits, ToolResult};
+    use agen::{History, Item, ToolResultDisposition};
+    use tracing::instrument::WithSubscriber;
+
+    let limit = 256;
+    let cases = [
+        ("below", "small result".to_string(), limit),
+        ("exact", "x".repeat(limit), limit),
+        ("Grep", "matched line\n".repeat(200), limit),
+        ("Read", "あいうえお".repeat(200), 120),
+    ];
+    let mut events = Vec::new();
+    for (index, name) in cases.iter().map(|c| c.0).chain(["erroring"]).enumerate() {
+        events.extend([
+            Event::tool_use_start(index, name, name),
+            Event::tool_input_delta(index, "{}"),
+            Event::tool_use_stop(index),
+        ]);
+    }
+    events.push(Event::Status(ClientStatusEvent {
+        status: ResponseStatus::Completed,
+    }));
+    let client = MockLlmClient::with_responses(vec![
+        events,
+        vec![Event::Status(ClientStatusEvent {
+            status: ResponseStatus::Completed,
+        })],
+    ]);
+    let probe = client.clone();
+    let mut engine = Engine::new(client);
+    engine.set_tool_call_dispatch_mode(agen::ToolCallDispatchMode::AfterResponse);
+    engine.set_tool_output_limits(Some(ToolOutputLimits {
+        default_max_bytes: limit,
+        per_tool: [("Read".to_string(), 120)].into(),
+    }));
+    let attachments = vec![Attachment::Image(ImageAttachment::new(
+        "image/png",
+        b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01".to_vec(),
+    ))];
+    for (name, content, _) in &cases {
+        engine.register_tool(fixed_tool(
+            name,
+            ToolOutput {
+                summary: format!("result from {name}"),
+                content: Some(content.clone()),
+                attachments: attachments.clone(),
+            },
+        ));
+    }
+    engine.register_tool(erroring_tool("erroring", "execution failed"));
+
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    let sink = warnings.clone();
+    engine.on_warning(move |warning| sink.lock().unwrap().push(warning.to_owned()));
+    let published = Arc::new(Mutex::new(Vec::<ToolResult>::new()));
+    let sink = published.clone();
+    engine.on_tool_result(move |result| sink.lock().unwrap().push(result.clone()));
+    let committed = Arc::new(Mutex::new(Vec::new()));
+    let sink = committed.clone();
+    engine.on_history_append(move |item| {
+        if matches!(item, Item::ToolResult { .. }) {
+            sink.lock().unwrap().push(item.clone());
+        }
+        Ok(())
+    });
+
+    let log = DiagnosticLog(Arc::new(Mutex::new(Vec::new())));
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    let mut history = History::new();
+    let run = engine
+        .run(&mut history, "run tools")
+        .with_subscriber(subscriber)
+        .await;
+    assert!(matches!(run.result, agen::EngineRunExit::Finished));
+    assert!(warnings.lock().unwrap().is_empty());
+
+    let requests = probe.requests();
+    assert_eq!(requests.len(), 2);
+    let saved: Vec<_> = history
+        .iter()
+        .filter_map(|entry| matches!(entry.item, Item::ToolResult { .. }).then_some(&entry.item))
+        .collect();
+    assert_eq!(saved.len(), cases.len() + 1);
+    let committed = committed.lock().unwrap();
+    let published = published.lock().unwrap();
+    let logs = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    for item in saved {
+        let Item::ToolResult {
+            call_id,
+            summary,
+            content,
+            disposition,
+            is_error,
+            attachments: saved_attachments,
+            ..
+        } = item
+        else {
+            unreachable!()
+        };
+        assert!(committed.iter().any(|candidate| candidate == item));
+        assert!(requests[1].items.iter().any(|candidate| candidate == item));
+        let result = published
+            .iter()
+            .find(|result| result.tool_use_id == *call_id)
+            .unwrap();
+        assert_eq!(&result.summary, summary);
+        assert_eq!(&result.content, content);
+        assert_eq!(&result.disposition, disposition);
+        assert_eq!(&result.is_error, is_error);
+        assert_eq!(&result.attachments, saved_attachments);
+        if call_id == "erroring" {
+            assert_eq!(*disposition, ToolResultDisposition::Error);
+            assert!(*is_error);
+            assert!(content.is_none());
+            continue;
+        }
+        assert_eq!(*disposition, ToolResultDisposition::Success);
+        assert!(!*is_error);
+        assert_eq!(*summary, format!("result from {call_id}"));
+        assert_eq!(saved_attachments, &attachments);
+        let (_, original, cap) = cases.iter().find(|c| c.0 == call_id).unwrap();
+        let content = content.as_ref().unwrap();
+        assert!(content.len() <= *cap);
+        if original.len() <= *cap {
+            assert_eq!(content, original);
+        } else {
+            let (body, marker) = content.split_once("\n\n[truncated: ").unwrap();
+            assert!(original.starts_with(body));
+            assert_eq!(
+                marker,
+                format!(
+                    "{} bytes dropped, refine your query]",
+                    original.len() - body.len()
+                )
+            );
+            let diagnostic = logs
+                .lines()
+                .find(|line| line.contains(&format!("tool={call_id}")))
+                .unwrap();
+            assert!(diagnostic.contains(&format!("before_bytes={}", original.len())));
+            assert!(diagnostic.contains(&format!("after_bytes={}", content.len())));
+            assert!(diagnostic.contains(&format!("limit_bytes={cap}")));
+            assert!(!diagnostic.contains(body));
+        }
+    }
+    assert_eq!(
+        logs.lines()
+            .filter(|line| line.contains("Tool output exceeded byte limit"))
+            .count(),
+        2
+    );
+}
+
 #[derive(Clone)]
 struct FailOnceClient {
     calls: Arc<AtomicUsize>,
