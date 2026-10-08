@@ -765,10 +765,16 @@ pub(crate) fn parse_sse(
                 })
                 .unwrap_or_else(|_| TopLevelErrorEnvelope {
                     error: TopLevelError {
-                        message: Some(data.to_string()),
+                        // Raw data is observation, not a provider diagnostic that
+                        // can authorize request recovery. Keep it out of the base
+                        // message even when it contains image-size wording.
+                        message: Some("OpenAI Responses error with unparseable data".to_string()),
                         error_type: None,
                         code: None,
-                        extra: BTreeMap::new(),
+                        extra: BTreeMap::from([(
+                            "raw_data".to_string(),
+                            Value::String(data.to_string()),
+                        )]),
                     },
                     extra: BTreeMap::new(),
                 });

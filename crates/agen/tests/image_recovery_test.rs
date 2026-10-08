@@ -72,6 +72,7 @@ struct Client {
     path: RejectionPath,
     prefix: Vec<(&'static str, Value)>,
     wait_before_error: Option<Arc<tokio::sync::Notify>>,
+    rejection_data: Option<&'static str>,
 }
 impl Client {
     fn new(failures: usize) -> Self {
@@ -82,6 +83,7 @@ impl Client {
             path: RejectionPath::Http,
             prefix: Vec::new(),
             wait_before_error: None,
+            rejection_data: None,
         }
     }
     fn streamed(failures: usize, path: RejectionPath) -> Self {
@@ -116,7 +118,12 @@ impl Client {
         for (kind, data) in &self.prefix {
             events.extend(scheme.parse_sse(kind, &data.to_string(), &mut state)?);
         }
-        events.extend(scheme.parse_sse(kind, &data.to_string(), &mut state)?);
+        let encoded = data.to_string();
+        events.extend(scheme.parse_sse(
+            kind,
+            self.rejection_data.unwrap_or(&encoded),
+            &mut state,
+        )?);
         let wait = self.wait_before_error.clone();
         Ok(Box::pin(futures::stream::iter(events).then(move |event| {
             let wait = wait.clone();
@@ -691,4 +698,41 @@ fn streamed_error_extra_fields_do_not_turn_unrelated_message_into_image_rejectio
         }
         .is_image_size_rejection()
     );
+}
+
+#[tokio::test]
+async fn unparseable_stream_error_data_preserves_images_and_terminates_with_diagnostic() {
+    for data in [
+        r#"{"type":"error","code":"invalid_value","message":123,"input":"image too large"}"#,
+        "unparseable provider error with echoed input: image too large",
+    ] {
+        let mut client = Client::streamed(1, RejectionPath::SseError);
+        client.rejection_data = Some(data);
+        let mut history = history();
+        let original = history.items_cloned();
+        let out = Engine::new(client.clone())
+            .run(&mut history, "continue")
+            .await;
+        let EngineRunExit::Interrupted(agen::RunInterruptionReason::Unexpected(
+            agen::EngineError::Client(ClientError::Api { code, message, .. }),
+        )) = out.result
+        else {
+            panic!(
+                "malformed provider error must terminate, got {:?}",
+                out.result
+            );
+        };
+        assert_eq!(code, None);
+        let (base, diagnostic) = message
+            .split_once(" | diagnostic=")
+            .expect("raw data remains diagnostic-only");
+        assert!(!base.contains("image"));
+        let diagnostic: Value = serde_json::from_str(diagnostic).unwrap();
+        assert_eq!(diagnostic["error_extra"]["raw_data"], data);
+        assert_eq!(client.requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            &history.items_cloned()[..original.len()],
+            original.as_slice()
+        );
+    }
 }
