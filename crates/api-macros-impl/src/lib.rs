@@ -1534,6 +1534,13 @@ fn validate_named_body_type(ty: &Type, kind: &str) -> syn::Result<()> {
     Ok(())
 }
 
+fn is_binary_body_type(ty: &Type) -> bool {
+    matches!(ty, Type::Path(path)
+        if path.qself.is_none()
+            && path.path.segments.last().is_some_and(|last|
+                last.ident == "BinaryBody" && matches!(last.arguments, PathArguments::None)))
+}
+
 fn validate_binary_body_type(ty: &Type) -> syn::Result<()> {
     let Type::Path(path) = ty else {
         return Err(syn::Error::new_spanned(
@@ -1738,6 +1745,9 @@ fn reqwest_adapter_tokens(
                     }
                 });
                 let body_parser = match response.body.as_ref() {
+                    Some(ty) if is_binary_body_type(ty) => quote! {
+                        let body = __response.decode_binary();
+                    },
                     Some(ty) => quote! {
                         let body = __response
                             .decode_json::<#ty>(#api_crate::reqwest::DecodeKind::Success)
@@ -1775,7 +1785,11 @@ fn reqwest_adapter_tokens(
                 .alternate_status
                 .map(|alternate| quote!(__actual == #response_status || __actual == #alternate))
                 .unwrap_or_else(|| quote!(__actual == #response_status));
-            let success = if let Some(response) = operation.response_body.as_ref() {
+            let success = if operation.response_body.as_ref().is_some_and(is_binary_body_type) {
+                quote! {
+                    return ::core::result::Result::Ok(__response.decode_binary());
+                }
+            } else if let Some(response) = operation.response_body.as_ref() {
                 quote! {
                     return __response
                         .decode_json::<#response>(#api_crate::reqwest::DecodeKind::Success)
@@ -2133,7 +2147,9 @@ fn axum_adapter_tokens(
                 let variant_ident = format_ident!("Status{}", status);
                 let body_pattern = response.body.as_ref().map(|_| quote!(body,));
                 let header_fields = response.headers.iter().map(|header| &header.field_ident);
-                let base_response = if response.body.is_some() {
+                let base_response = if response.body.as_ref().is_some_and(is_binary_body_type) {
+                    quote!(#api_crate::axum::binary_response(#api_crate::axum::status(#status), body))
+                } else if response.body.is_some() {
                     quote!(#api_crate::axum::json_response(#api_crate::axum::status(#status), body))
                 } else {
                     quote!(#api_crate::axum::empty_response(#api_crate::axum::status(#status)))
@@ -2170,14 +2186,21 @@ fn axum_adapter_tokens(
                 }
             }
         } else if let Some(alternate_status) = operation.alternate_status {
+            let response_encoder = if operation.response_body.as_ref().is_some_and(is_binary_body_type) {
+                quote!(#api_crate::axum::binary_response)
+            } else {
+                quote!(#api_crate::axum::json_response)
+            };
             quote!({
                 let status = #api_crate::HttpSuccess::status_code(&value);
                 if status == #response_status || status == #alternate_status {
-                    #api_crate::axum::json_response(#api_crate::axum::status(status), value)
+                    #response_encoder(#api_crate::axum::status(status), value)
                 } else {
                     #api_crate::axum::empty_response(#api_crate::axum::status(500))
                 }
             })
+        } else if operation.response_body.as_ref().is_some_and(is_binary_body_type) {
+            quote!(#api_crate::axum::binary_response(#api_crate::axum::status(#response_status), value))
         } else if operation.response_body.is_some() {
             quote!(#api_crate::axum::json_response(#api_crate::axum::status(#response_status), value))
         } else {
@@ -2323,6 +2346,9 @@ fn openapi_adapter_tokens(
                 "Alternate successful response"
             };
             let body = match response.body.as_ref() {
+                Some(ty) if is_binary_body_type(ty) => quote! {
+                    operation.binary_response(#status, #description)?;
+                },
                 Some(ty) => quote! {
                     operation.response::<#ty>(#status, "application/json", #description)?;
                 },
@@ -2620,7 +2646,9 @@ fn metadata_tokens(
     };
     let success_responses = operation.success_responses.iter().map(|response| {
         let status = response.status;
-        let wire_kind = if response.body.is_some() {
+        let wire_kind = if response.body.as_ref().is_some_and(is_binary_body_type) {
+            quote!(#api_crate::WireKind::Binary)
+        } else if response.body.is_some() {
             quote!(#api_crate::WireKind::Json)
         } else {
             quote!(#api_crate::WireKind::Empty)

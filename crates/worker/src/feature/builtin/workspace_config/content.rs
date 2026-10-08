@@ -185,16 +185,8 @@ async fn observe(
     Ok(result)
 }
 
-#[async_trait]
-impl WipSubtreeProvider for ConfigProvider {
-    fn max_depth(&self) -> u32 {
-        MAX_DEPTH
-    }
-    fn max_nodes(&self) -> usize {
-        MAX_NODES
-    }
-
-    async fn projection(&self, path: &str) -> Result<Option<WipProjection>, ProtocolError> {
+impl ConfigProvider {
+    async fn projection_at(&self, path: &str) -> Result<Option<WipProjection>, ProtocolError> {
         let source = source_path(path).map_err(protocol)?;
         let Some(attachment) = visible_metadata(self.backend.current_async().await)? else {
             return Ok(None);
@@ -205,7 +197,7 @@ impl WipSubtreeProvider for ConfigProvider {
                 return Ok(None);
             }
             let mut projection = super::wip::attach_projection(&self.feature);
-            projection.interface = contextual_reference(&projection.interface, path);
+            projection.interface = contextual_reference(&projection.interface.name, path);
             projection.object.interfaces = vec![projection.interface.clone()];
             return Ok(Some(projection));
         };
@@ -258,6 +250,26 @@ impl WipSubtreeProvider for ConfigProvider {
                 operations,
             }),
         }))
+    }
+}
+
+#[async_trait]
+impl WipSubtreeProvider for ConfigProvider {
+    fn max_depth(&self) -> u32 {
+        MAX_DEPTH
+    }
+    fn max_nodes(&self) -> usize {
+        MAX_NODES
+    }
+
+    async fn publication(
+        &self,
+        path: &str,
+    ) -> Result<Option<crate::wip::WipPublication>, ProtocolError> {
+        self.projection_at(path)
+            .await?
+            .map(crate::wip::WipPublication::self_scoped)
+            .transpose()
     }
 
     async fn children(&self, path: &str) -> Result<Vec<String>, ProtocolError> {

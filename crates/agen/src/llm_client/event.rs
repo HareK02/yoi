@@ -109,6 +109,15 @@ pub struct ErrorEvent {
     pub message: String,
 }
 
+impl ErrorEvent {
+    /// A provider Error event has no HTTP status. Classify its diagnostic
+    /// explicitly, rather than making every status-less ClientError eligible.
+    /// The engine must separately establish that no response output was seen.
+    pub(crate) fn is_image_size_rejection(&self) -> bool {
+        super::error::is_image_size_diagnostic(self.code.as_deref(), &self.message)
+    }
+}
+
 /// 未対応 SSE イベントの観測用メタイベント。
 ///
 /// `data_preview` は provider から受け取った raw SSE data の bounded preview、

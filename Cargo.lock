@@ -1968,6 +1968,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
+name = "humantime"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3023,6 +3029,32 @@ dependencies = [
  "serde",
  "serde_json",
  "url",
+]
+
+[[package]]
+name = "object_store"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "622acbc9100d3c10e2ee15804b0caa40e55c933d5aa53814cd520805b7958a49"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures-channel",
+ "futures-core",
+ "futures-util",
+ "http",
+ "humantime",
+ "itertools",
+ "parking_lot",
+ "percent-encoding",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "walkdir",
+ "wasm-bindgen-futures",
+ "web-time",
 ]
 
 [[package]]
@@ -6308,9 +6340,9 @@ dependencies = [
 
 [[package]]
 name = "wip-client"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73a82416411af69b7eb4ad0ed9a954df062769d3a03b3a1c59b0b4bf617f3534"
+checksum = "def7dc8d056477bf8cb7c12f2dc70cabdb3eee3527cf95ba6131a8a44519ed7b"
 dependencies = [
  "wip-http",
  "wip-protocol",
@@ -6318,9 +6350,9 @@ dependencies = [
 
 [[package]]
 name = "wip-http"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ec0d32d1e56e52fb9ce925db808354a3432b3ebbd112fab8c443c9b865c58c6"
+checksum = "da1f6a0023c0c599cbdc5571e9b131c8bb6b113ef04c20467d77634d66b44a5a"
 dependencies = [
  "base64 0.22.1",
  "http",
@@ -6332,9 +6364,18 @@ dependencies = [
 
 [[package]]
 name = "wip-protocol"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "275ffaebf544a077de7578fd3674c062a098a72c5a904cf66e934f76bd9efbab"
+checksum = "5a23ee0fe02badd2ef77847652cff241c6d868c8f162a911475500831ff348fe"
+
+[[package]]
+name = "wip-text-view"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c95fd8e3fba673de44084c2f89c11b50d744c6db73726c50e04975c974d2759c"
+dependencies = [
+ "wip-protocol",
+]
 
 [[package]]
 name = "wiremock"
@@ -6518,6 +6559,7 @@ dependencies = [
  "wip-client",
  "wip-http",
  "wip-protocol",
+ "wip-text-view",
  "workdir",
 ]
 
@@ -6558,6 +6600,24 @@ dependencies = [
  "workdir",
  "worker",
  "zeroize",
+]
+
+[[package]]
+name = "workspace-drive"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "feature-storage",
+ "futures",
+ "object_store",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -6666,6 +6726,7 @@ name = "yoi-workspace-server"
 version = "0.1.0"
 dependencies = [
  "agen",
+ "api-macros",
  "async-trait",
  "axum",
  "chrono",
@@ -6709,6 +6770,7 @@ dependencies = [
  "workdir",
  "worker",
  "worker-runtime",
+ "workspace-drive",
  "yoi",
  "zeroize",
 ]

@@ -10,7 +10,9 @@ use api_macros::api;
 pub use api_macros::axum as server_support;
 pub use api_macros::reqwest as client_support;
 pub use api_macros::{ApiContract, BinaryBody, HttpMethod, TransportMetadata, WebSocketOperation};
+mod drive;
 pub mod repository_openapi_typescript;
+pub use drive::*;
 mod workspace_config;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -2603,6 +2605,116 @@ pub trait ServerApi {
         #[path] working_directory_id: String,
         #[body] request: WorkingDirectoryRemovalRequest,
     ) -> Result<WorkingDirectoryRemovalResponse, RepositoryApiError>;
+    // Ordinary operations accept member browser sessions or trusted Worker request
+    // context. The service resolves Worker grants; no operation accepts an actor or
+    // grant ID from the caller. Grant management is Workspace-owner-only.
+    #[get("/api/w/{workspace_id}/drive/root", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    async fn drive_root(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+    ) -> Result<DriveEntry, DriveApiError>;
+    #[get("/api/w/{workspace_id}/drive/metadata", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    async fn drive_metadata(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] query: DriveEntryQuery,
+    ) -> Result<DriveEntry, DriveApiError>;
+    #[get("/api/w/{workspace_id}/drive/list", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    async fn drive_list(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] query: DriveListQuery,
+    ) -> Result<DriveListResponse, DriveApiError>;
+    #[get("/api/w/{workspace_id}/drive/search", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    async fn drive_search(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] query: DriveSearchQuery,
+    ) -> Result<DriveListResponse, DriveApiError>;
+    #[get("/api/w/{workspace_id}/drive/read-text", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    async fn drive_read_text(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] query: DriveReadTextQuery,
+    ) -> Result<DriveReadTextResponse, DriveApiError>;
+    #[get("/api/w/{workspace_id}/drive/read-chunk", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    async fn drive_read_chunk(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] query: DriveReadChunkQuery,
+    ) -> Result<BinaryBody, DriveApiError>;
+    // Download safety/cache headers are service-produced typed response metadata;
+    // Content-Type/Content-Length remain controlled by the binary transport.
+    #[get(
+        "/api/w/{workspace_id}/drive/download",
+        responses = [(status = 200, body = BinaryBody, headers = [
+            ("content-disposition", String),
+            ("cache-control", String),
+            ("etag", String),
+            ("x-content-type-options", String),
+            ("content-security-policy", String)
+        ])],
+        error_status = 400,
+        additional_error_statuses = [401,403,404,409,413,503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn drive_download(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] query: DriveDownloadQuery,
+    ) -> Result<server_api_responses::DriveDownload, DriveApiError>;
+    #[post("/api/w/{workspace_id}/drive/mutate", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    async fn drive_mutate(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: DriveMutationRequest,
+    ) -> Result<DriveMutationResponse, DriveApiError>;
+    #[put("/api/w/{workspace_id}/drive/upload", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    async fn drive_upload(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] query: DriveUploadQuery,
+        #[binary] body: BinaryBody,
+    ) -> Result<DriveMutationResponse, DriveApiError>;
+    #[get("/api/w/{workspace_id}/drive/requests/{request_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    async fn drive_request_status(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] request_id: String,
+    ) -> Result<DriveRequestStatusResponse, DriveApiError>;
+    #[post("/api/w/{workspace_id}/drive/grants", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    async fn drive_grant_create(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: DriveGrantCreateRequest,
+    ) -> Result<DriveGrantResponse, DriveApiError>;
+    #[delete("/api/w/{workspace_id}/drive/grants/{grant_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    async fn drive_grant_revoke(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] grant_id: String,
+    ) -> Result<DriveGrantResponse, DriveApiError>;
+    #[get("/api/w/{workspace_id}/drive/grants", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    async fn drive_grant_list(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] query: DriveGrantListQuery,
+    ) -> Result<DriveGrantListResponse, DriveApiError>;
+
     #[get("/api/w/{workspace_id}/workers/self/workspace-config", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false)]
     async fn current_worker_workspace_config_get(
         &self,
@@ -7380,7 +7492,7 @@ pub enum TicketAssignmentPrincipal {
 #[serde(rename_all = "snake_case")]
 pub enum TicketAssignmentRole {
     Orchestrator,
-    Coder,
+    Worker,
     Owner,
     Contributor,
 }
@@ -7416,7 +7528,7 @@ pub struct TicketActionEligibility {
     pub can_assign_orchestrator: bool,
     pub can_unassign_orchestrator: bool,
     pub can_queue: bool,
-    pub can_start_manual_coder: bool,
+    pub can_start_manual_worker: bool,
     pub queue_tickets: Vec<String>,
     pub blockers: Vec<String>,
 }
@@ -7554,7 +7666,7 @@ pub struct TicketQueryItem {
     pub evidence: TicketEvidenceSummary,
     pub merge_requests: Vec<TicketMergeRequestSummary>,
     pub merge_request: Option<TicketMergeRequestSummary>,
-    pub current_coder: Option<TicketAssignmentSummary>,
+    pub current_worker: Option<TicketAssignmentSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -7608,7 +7720,7 @@ pub struct TicketDetail {
     pub linked_objectives: Vec<ObjectiveLinkSummary>,
     pub implementation_reports: Vec<TicketEvidenceEvent>,
     pub assignments: Vec<TicketRoleAssignmentSummary>,
-    pub current_coder: Option<TicketAssignmentSummary>,
+    pub current_worker: Option<TicketAssignmentSummary>,
     pub assignment_diagnostics: Vec<String>,
     pub action_eligibility: TicketActionEligibility,
     pub merge_requests: Vec<TicketMergeRequestSummary>,
@@ -7705,6 +7817,19 @@ pub struct TicketOrchestrationPlanSearchRequest {
     pub kind: Option<ticket::OrchestrationPlanKind>,
 }
 
+/// Selected existing live Workdir attachment, including its current connection
+/// identity. The Workspace authority validates the selection against live
+/// attachments; callers must select them explicitly, and use an empty list
+/// only when the Worker has no live Workdirs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketWorkerAttachmentBinding {
+    pub alias: String,
+    pub working_directory_id: String,
+    pub connection_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
@@ -7712,6 +7837,8 @@ pub struct SetTicketRoleAssignmentRequest {
     pub operation_id: String,
     pub principal: TicketAssignmentPrincipal,
     pub expected_assignment_id: Option<String>,
+    #[serde(default)]
+    pub workdir_bindings: Vec<TicketWorkerAttachmentBinding>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -8350,7 +8477,7 @@ pub enum RuntimeWorkerSpawnIntent {
 pub enum RuntimeTicketWorkerRole {
     Intake,
     Orchestrator,
-    Coder,
+    Worker,
     Reviewer,
 }
 
@@ -11120,6 +11247,70 @@ mod skill_typescript_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ticket_role_assignment_request_defaults_empty_bindings_and_requires_each_selected_connection()
+     {
+        let base = serde_json::json!({"operation_id":"claim", "principal":{"kind":"worker","runtime_id":"r","worker_id":"w"}, "expected_assignment_id":null});
+        let omitted: SetTicketRoleAssignmentRequest = serde_json::from_value(base.clone()).unwrap();
+        assert!(omitted.workdir_bindings.is_empty());
+        let mut selected = base;
+        selected["workdir_bindings"] = serde_json::json!([{"alias":"main","working_directory_id":"checkout","connection_id":"connection"}]);
+        let parsed: SetTicketRoleAssignmentRequest =
+            serde_json::from_value(selected.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), selected);
+        for key in ["alias", "working_directory_id", "connection_id"] {
+            let mut malformed = selected.clone();
+            malformed["workdir_bindings"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            assert!(
+                serde_json::from_value::<SetTicketRoleAssignmentRequest>(malformed).is_err(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn ticket_worker_roles_and_manual_start_projection_use_worker_wire_names() {
+        assert_eq!(
+            serde_json::to_value(TicketAssignmentRole::Worker).unwrap(),
+            serde_json::json!("worker")
+        );
+        assert_eq!(
+            serde_json::to_value(RuntimeTicketWorkerRole::Worker).unwrap(),
+            serde_json::json!("worker")
+        );
+        assert!(
+            serde_json::from_value::<TicketAssignmentRole>(serde_json::json!("coder")).is_err()
+        );
+        assert!(
+            serde_json::from_value::<RuntimeTicketWorkerRole>(serde_json::json!("coder")).is_err()
+        );
+        let eligibility = serde_json::json!({
+            "can_assign_orchestrator": false, "can_unassign_orchestrator": false,
+            "can_queue": true, "can_start_manual_worker": true, "queue_tickets": [], "blockers": []
+        });
+        let parsed: TicketActionEligibility = serde_json::from_value(eligibility.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), eligibility);
+        let mut legacy = eligibility;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("can_start_manual_worker");
+        legacy["can_start_manual_coder"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<TicketActionEligibility>(legacy).is_err());
+        for schema in [
+            schemars::schema_for!(TicketDetail),
+            schemars::schema_for!(TicketQueryItem),
+        ] {
+            let schema = serde_json::to_value(schema).unwrap();
+            let properties = schema["properties"].as_object().unwrap();
+            assert!(properties.contains_key("current_worker"));
+            assert!(!properties.contains_key("current_coder"));
+        }
+    }
 
     #[test]
     fn browser_ticket_targets_are_one_collection_authority() {

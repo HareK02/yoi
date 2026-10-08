@@ -36,6 +36,7 @@ mod worker_projection;
 pub mod worker_source;
 pub mod workspace_catalog;
 mod workspace_deletion;
+mod workspace_drive_host;
 pub mod workspace_signing_identity;
 mod workspace_subscription;
 
@@ -151,6 +152,8 @@ pub enum Error {
     WorkerSourceIdentity(String),
     #[error("Workspace signing identity error ({code}): {message}")]
     WorkspaceSigningIdentity { code: String, message: String },
+    #[error("Workspace Drive error: {0}")]
+    Drive(#[from] workspace_drive::Error),
     #[error("store error: {0}")]
     Store(String),
 }

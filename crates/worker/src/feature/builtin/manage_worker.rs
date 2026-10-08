@@ -725,8 +725,8 @@ struct WorkerSpawnInput {
     /// Optional opaque Workspace singleton key. Prefixes are caller-owned and uninterpreted.
     #[serde(default)]
     singleton_key: Option<String>,
-    /// Optional inprogress Ticket already accepted by the Orchestrator. Set
-    /// this with one Flow segment to assign the new Coder atomically.
+    /// Optional Ticket assignment. Backend validates claims and resource requirements;
+    /// neither the profile nor an initial Flow segment grants review authority.
     #[serde(default)]
     ticket_id: Option<String>,
     #[serde(default)]
@@ -861,7 +861,7 @@ impl WorkerOperation {
                 "List only known Runtime Workers and direct SubWorkers granted to the current Worker."
             }
             Self::Spawn => {
-                "Spawn a Backend/Runtime Worker session in one existing Workspace Workdir. The model-facing input remains singular and the shared lifecycle wraps it as the canonical attachment collection under the stable `workdir` alias. The Workdir id is authority; filesystem paths and Runtime URLs are not accepted. `initial_submit` carries the normal typed user submission. After the Orchestrator has committed a Ticket to `inprogress`, set `ticket_id` with a Flow segment in `initial_submit` to atomically assign the new Coder Worker; the operation id is derived from the durable tool call rather than model input."
+                "Spawn a Backend/Runtime Worker session in one existing Workspace Workdir. The model-facing input remains singular and the shared lifecycle wraps it as the canonical attachment collection under the stable `workdir` alias. The Workdir id is authority; filesystem paths and Runtime URLs are not accepted. `initial_submit` carries the normal typed user submission, with an optional Flow segment. Set `ticket_id` to atomically assign the Worker; Backend validates claims and resource requirements. Selecting a profile or Flow does not grant review authority. The operation id is derived from the durable tool call rather than model input."
             }
             Self::SendInput => {
                 "Start a fresh turn for an Idle Worker. Non-Idle Workers reject WorkerSendInput without queueing. Use WorkerNotify for advisory information during work already in progress. Direct SubWorkers also require Idle."
@@ -1947,6 +1947,41 @@ mod tests {
         );
         assert_eq!(value["initial_submit"][1]["kind"], "text");
         assert!(value.get("initial_text").is_none());
+    }
+
+    #[test]
+    fn worker_lifecycle_spawn_serializes_ticket_assignment_without_workdirs_or_flow() {
+        let request = workspace_worker_create_request(WorkerLifecycleSpawnRequest {
+            runtime_id: "runtime-1".to_string(),
+            workdir_attachments: Vec::new(),
+            profile: "project:ticket-worker".to_string(),
+            singleton_key: None,
+            ticket_id: Some("T-719".to_string()),
+            operation_id: Some("spawn-ticket-worker:T-719:call-1".to_string()),
+            display_name: "Worker · T-719".to_string(),
+            initial_submit: vec![Segment::text("Investigate Ticket T-719.")],
+        })
+        .unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["workdir_attachments"], serde_json::json!([]));
+        assert_eq!(value["profile"], "project:ticket-worker");
+        assert_eq!(
+            value["ticket_assignment"],
+            serde_json::json!({
+                "ticket_id": "T-719",
+                "operation_id": "spawn-ticket-worker:T-719:call-1",
+            })
+        );
+        assert_eq!(
+            value["control_operation_id"],
+            "spawn-ticket-worker:T-719:call-1"
+        );
+        assert_eq!(
+            value["initial_submit"],
+            serde_json::json!([
+                {"kind": "text", "content": "Investigate Ticket T-719."}
+            ])
+        );
     }
 
     #[tokio::test]

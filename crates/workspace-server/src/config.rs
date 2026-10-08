@@ -104,13 +104,10 @@ impl ResolvedWorkspaceBackendConfig {
         host_config: &ServerHostConfigFile,
     ) -> Result<Self> {
         let workspace_root = workspace_root.as_ref();
-        let data_root = ServerConfig::default_workspace_backend_data_root(&workspace.workspace_id);
-        let database_path = ServerConfig::default_server_database_path();
         let (browser_public_url, browser_rp_id) =
             resolve_browser_public_url(&host_config.browser.public_url)?;
         let mut server = ServerConfig::local_dev(workspace_root.to_path_buf(), workspace);
-        server.database_path = database_path.clone();
-        server.embedded_runtime_store_root = data_root.join("embedded-runtime");
+        let database_path = server.database_path.clone();
         server.max_records = DEFAULT_MAX_RECORDS;
         server.remote_runtime_sources = Vec::new();
         server.auth = AuthConfig::Passkey {

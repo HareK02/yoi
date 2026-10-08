@@ -753,17 +753,31 @@ pub(crate) fn parse_sse(
         }
 
         "error" => {
-            let ev = from_json::<TopLevelErrorEnvelope>(data).unwrap_or_else(|_| {
-                TopLevelErrorEnvelope {
+            // Responses documents flat error frames (code/message/param),
+            // while providers also send nested error envelopes. Normalize both
+            // structurally so classification never scans arbitrary raw JSON.
+            let ev = from_json::<TopLevelErrorEnvelope>(data)
+                .or_else(|_| {
+                    from_json::<TopLevelError>(data).map(|error| TopLevelErrorEnvelope {
+                        error,
+                        extra: BTreeMap::new(),
+                    })
+                })
+                .unwrap_or_else(|_| TopLevelErrorEnvelope {
                     error: TopLevelError {
-                        message: Some(data.to_string()),
+                        // Raw data is observation, not a provider diagnostic that
+                        // can authorize request recovery. Keep it out of the base
+                        // message even when it contains image-size wording.
+                        message: Some("OpenAI Responses error with unparseable data".to_string()),
                         error_type: None,
                         code: None,
-                        extra: BTreeMap::new(),
+                        extra: BTreeMap::from([(
+                            "raw_data".to_string(),
+                            Value::String(data.to_string()),
+                        )]),
                     },
                     extra: BTreeMap::new(),
-                }
-            });
+                });
             let (code, message) = top_level_error_diagnostic(ev);
             Ok(vec![Event::Error(ErrorEvent { code, message })])
         }

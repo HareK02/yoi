@@ -165,16 +165,16 @@ Ticket/Objective/Merge Request routes retain their T-698 contracts.
 
 ## First-Workspace example
 
-1. `Discover(path="/", depth=1)` finds `repositories`, `workdirs` and
+1. `Tree(path="/", depth=1)` finds `repositories`, `workdirs` and
    `workdir-attachments` when permitted.
-2. Inspect the returned Repository collection Interface and call `list` with a
+2. Inspect the Repository collection path and Invoke `list` with a
    bounded limit. An empty registered/visible catalog explicitly returns an empty
    list; do not invent a key. Follow `next_cursor` when supplied.
-3. Discover the returned item `path`, inspect its Interface and call `read`.
+3. Inspect the returned item `path` directly and Invoke `read`.
    `default_selector: null` means no configured default, not `main`.
 4. Inspect the Workdir collection and `create` using the discovered formal key,
    with optional selector, display name and Runtime under the existing contract.
-5. Follow created `item.path`, discover/inspect and `attach` with a chosen
+5. Follow created `item.path`, Inspect directly and Invoke `attach` with a chosen
    Worker-local alias. This is separate from creation.
 6. Follow `attachments_path`, `list`, then discover/read the returned connection
    path to confirm alias, Workdir and effective capabilities.

@@ -1280,6 +1280,78 @@ mod tests {
     }
 
     #[test]
+    fn ticket_worker_profile_enables_work_reporting_without_authoring_or_integration() {
+        let tmp = TempDir::new().unwrap();
+        let registry = ProfileDiscovery::with_sources(None, None)
+            .discover()
+            .unwrap();
+        let selector = ProfileSelector::parse_cli("builtin:ticket-worker");
+        assert_eq!(
+            registry.select(&selector).unwrap().qualified_name(),
+            "builtin:ticket-worker"
+        );
+        let manifest = ProfileResolver::new()
+            .with_workspace_base(tmp.path())
+            .resolve(
+                &selector,
+                ProfileResolveOptions::with_worker_name("ticket-worker"),
+            )
+            .unwrap()
+            .manifest;
+
+        assert_eq!(manifest.engine.instruction, "role.ticket_worker");
+        // enabled supplies ShowTicket; thread supplies TicketComment,
+        // TicketWorkflowState and CompleteTicket without broad workflow access.
+        let feature = &manifest.feature;
+        assert!(feature.ticket.enabled);
+        assert!(feature.ticket.thread);
+        assert!(!feature.ticket.authoring);
+        assert!(!feature.ticket.intake);
+        assert!(!feature.ticket.workflow);
+        assert!(!feature.merge_request.show);
+        assert!(!feature.merge_request.open);
+        assert!(!feature.merge_request.review);
+        assert!(!feature.merge_request.readiness_check);
+        assert!(!feature.merge_request.complete);
+        assert!(!feature.orchestration.enabled);
+    }
+
+    #[test]
+    fn ticket_worker_profile_inherits_default_without_flow_or_workdir_management() {
+        let tmp = TempDir::new().unwrap();
+        let resolve = |selector| {
+            ProfileResolver::new()
+                .with_workspace_base(tmp.path())
+                .resolve(
+                    &ProfileSelector::parse_cli(selector),
+                    ProfileResolveOptions::with_worker_name("ticket-worker"),
+                )
+                .unwrap()
+                .manifest
+        };
+        let default = resolve("builtin:default");
+        let worker = resolve("builtin:ticket-worker");
+
+        assert_eq!(worker.model, default.model);
+        assert_eq!(worker.scope.allow, default.scope.allow);
+        assert_eq!(worker.scope.deny, default.scope.deny);
+        assert_eq!(
+            worker.delegation_scope.allow,
+            default.delegation_scope.allow
+        );
+        assert_eq!(worker.delegation_scope.deny, default.delegation_scope.deny);
+        assert!(worker.feature.task.enabled);
+        assert!(worker.feature.web.enabled);
+        assert!(worker.feature.image.enabled);
+        assert!(worker.feature.sub_worker.enabled);
+        assert!(!worker.feature.flow.enabled);
+        assert!(!worker.feature.manage_workdir.enabled);
+        assert!(!worker.feature.worker.enabled);
+        assert!(!worker.feature.memory.profile.enabled);
+        assert!(!worker.feature.subjektiv.profile.enabled);
+    }
+
+    #[test]
     fn builtin_workspace_profiles_cut_over_to_subjektiv_without_legacy_memory() {
         let tmp = TempDir::new().unwrap();
         let resolve = |name: &str| {

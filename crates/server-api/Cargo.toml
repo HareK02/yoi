@@ -55,3 +55,7 @@ required-features = ["typescript"]
 [[example]]
 name = "generate_repository_access_types"
 required-features = ["typescript"]
+
+[[example]]
+name = "generate_drive_api_types"
+required-features = ["typescript"]

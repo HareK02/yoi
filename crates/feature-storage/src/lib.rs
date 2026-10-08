@@ -242,6 +242,15 @@ impl FeatureStorage {
     }
 
     fn open(&self, scope_id: &str, registration: &RegisteredFeature) -> Result<FeatureDatabase> {
+        self.open_with_directory_sync(scope_id, registration, sync_directory)
+    }
+
+    fn open_with_directory_sync(
+        &self,
+        scope_id: &str,
+        registration: &RegisteredFeature,
+        mut sync: impl FnMut(&Path) -> std::io::Result<()>,
+    ) -> Result<FeatureDatabase> {
         if registration.manager_id != self.inner.id {
             return Err(FeatureStorageError::ForeignRegistration);
         }
@@ -263,7 +272,7 @@ impl FeatureStorage {
         }
 
         let feature_dir = self.feature_dir(scope_id);
-        fs::create_dir_all(&feature_dir)?;
+        durable_create_directory(&feature_dir, &mut sync)?;
         let path = feature_dir.join(format!("{}.sqlite", registration.feature_id));
         let connection = Connection::open_with_flags(
             path,
@@ -702,6 +711,37 @@ fn ensure_running(state: &FeatureStorageState) -> Result<()> {
     }
 }
 
+/// Establish every link to a metadata directory before opening SQLite. FULL
+/// commits cover DB/WAL and the immediate directory, not newly created ancestors.
+/// Re-sync existing directories too: a failed earlier attempt may have created
+/// them without persisting their links. Host paths (including symlink targets)
+/// are trusted and must not be concurrently replaced by an untrusted actor.
+fn durable_create_directory(
+    path: &Path,
+    sync: &mut impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<()> {
+    fs::create_dir_all(path)?;
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let resolved = fs::canonicalize(&absolute)?;
+    let mut synced = HashSet::new();
+    // Sync both the configured link chain and its resolved target chain. For a
+    // symlinked Host root these need not have the same parent directories.
+    for directory in absolute.ancestors().chain(resolved.ancestors()) {
+        if synced.insert(directory.to_path_buf()) {
+            sync(directory)?;
+        }
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
 /// Applies the common durable Host SQLite connection policy: five-second busy
 /// timeout, foreign keys, WAL, and FULL synchronous commits. Call immediately
 /// after opening a file-backed database, before transactions or migrations.
@@ -1021,6 +1061,125 @@ mod tests {
 
     fn registration(feature_id: &'static str) -> FeatureRegistration {
         FeatureRegistration::new(feature_id, MIGRATIONS)
+    }
+
+    #[test]
+    fn metadata_ancestor_links_are_synced_before_sqlite_initialization() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("server/feature-storage");
+        let manager = FeatureStorage::new(&root);
+        let registration = manager.register(registration("test-feature")).unwrap();
+        let directory = root.join("workspace/features");
+        let database_path = directory.join("test-feature.sqlite");
+        let mut observed = Vec::new();
+        let database = manager
+            .open_with_directory_sync("workspace", &registration, |path| {
+                assert!(
+                    !database_path.exists(),
+                    "SQLite must not start before directory durability"
+                );
+                assert!(path.is_dir());
+                observed.push(path.to_path_buf());
+                sync_directory(path)
+            })
+            .unwrap();
+        for ancestor in directory.ancestors() {
+            assert!(
+                observed.iter().any(|path| path == ancestor),
+                "missing parent-link sync: {}",
+                ancestor.display()
+            );
+        }
+        assert_eq!(database.schema_version().unwrap(), 2);
+        insert(&database, "acknowledged").unwrap();
+        assert_eq!(values(&database).unwrap(), vec!["acknowledged"]);
+    }
+
+    #[test]
+    fn metadata_directory_sync_failure_rejects_admission_and_retry_resyncs_existing_links() {
+        for fail_component in [
+            "server",
+            "server/feature-storage",
+            "server/feature-storage/workspace",
+            "server/feature-storage/workspace/features",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("server/feature-storage");
+            let manager = FeatureStorage::new(&root);
+            let registration = manager.register(registration("test-feature")).unwrap();
+            let directory = root.join("workspace/features");
+            let database_path = directory.join("test-feature.sqlite");
+            let fail_at = temp.path().join(fail_component);
+            let result = manager.open_with_directory_sync("workspace", &registration, |path| {
+                if path == fail_at {
+                    return Err(std::io::Error::other("injected directory flush failure"));
+                }
+                sync_directory(path)
+            });
+            assert!(matches!(result, Err(FeatureStorageError::Io(_))));
+            assert!(
+                directory.is_dir(),
+                "failure leaves created directories to retry"
+            );
+            assert!(
+                !database_path.exists(),
+                "failure must precede SQLite initialization"
+            );
+            assert!(manager.lock_state().unwrap().connections.is_empty());
+            let mut resynced = HashSet::new();
+            let database = manager
+                .open_with_directory_sync("workspace", &registration, |path| {
+                    resynced.insert(path.to_path_buf());
+                    sync_directory(path)
+                })
+                .unwrap();
+            for ancestor in directory.ancestors() {
+                assert!(
+                    resynced.contains(ancestor),
+                    "retry omitted existing link: {}",
+                    ancestor.display()
+                );
+            }
+            insert(&database, "retry committed").unwrap();
+            drop(database);
+            let reopened = FeatureStorage::new(&root);
+            let registered = reopened
+                .register(FeatureRegistration::new("test-feature", MIGRATIONS))
+                .unwrap();
+            let database = reopened
+                .scope("workspace")
+                .unwrap()
+                .open(&registered)
+                .unwrap();
+            assert_eq!(values(&database).unwrap(), vec!["retry committed"]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_host_symlink_paths_sync_configured_and_resolved_parent_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("separate-target/nested");
+        fs::create_dir_all(&target).unwrap();
+        let alias = temp.path().join("configured-alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let directory = alias.join("feature-storage/workspace/features");
+        let mut observed = HashSet::new();
+        durable_create_directory(&directory, &mut |path| {
+            observed.insert(path.to_path_buf());
+            sync_directory(path)
+        })
+        .unwrap();
+        for ancestor in directory
+            .ancestors()
+            .chain(fs::canonicalize(&directory).unwrap().ancestors())
+        {
+            assert!(
+                observed.contains(ancestor),
+                "missing configured/target link: {}",
+                ancestor.display()
+            );
+        }
     }
 
     #[test]

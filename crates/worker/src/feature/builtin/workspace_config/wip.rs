@@ -93,13 +93,13 @@ pub(super) fn attach_projection(feature: &WorkspaceConfigFeature) -> WipProjecti
         object: Object {
             name: ATTACHMENT_ALIAS.into(),
             description: Some("Logical Workspace configuration attachment entrance".into()),
-            interfaces: vec![interface.into()],
+            interfaces: vec![crate::wip::root_reference(interface)],
             r#ref: None,
             // Attaching does not modify config content. The content subtree will
             // supply its own Backend validators for file/directory Operations.
             validator: None,
         },
-        interface: interface.into(),
+        interface: crate::wip::root_reference(interface),
         descriptor,
         interface_validator,
         handler: Arc::new(AttachHandler(feature.clone())),

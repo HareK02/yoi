@@ -750,9 +750,9 @@ impl SqliteWorkspaceAuthority {
                 assigned_at: assignment.assigned_at,
             })
             .collect::<Vec<_>>();
-        let current_coder = role_assignments
+        let current_worker = role_assignments
             .iter()
-            .find(|assignment| assignment.role == TicketAssignmentRole::Coder)
+            .find(|assignment| assignment.role == TicketAssignmentRole::Worker)
             .and_then(|assignment| {
                 assignment
                     .principal
@@ -779,9 +779,9 @@ impl SqliteWorkspaceAuthority {
         let has_orchestrator = active_role_assignments
             .iter()
             .any(|assignment| assignment.role == TicketAssignmentRole::Orchestrator);
-        let has_coder = active_role_assignments
+        let has_worker = active_role_assignments
             .iter()
-            .any(|assignment| assignment.role == TicketAssignmentRole::Coder);
+            .any(|assignment| assignment.role == TicketAssignmentRole::Worker);
         let targets = ticket
             .meta
             .targets
@@ -799,7 +799,6 @@ impl SqliteWorkspaceAuthority {
             })
             .collect::<Result<Vec<_>>>()?;
         let write_repository_keys = ticket_write_target_repository_keys(&targets);
-        let has_target = !write_repository_keys.is_empty();
         let has_blockers = !ticket.relations.blockers.is_empty();
         let mut assignment_diagnostics = Vec::new();
         if let Some(legacy_assignee) = ticket
@@ -818,17 +817,20 @@ impl SqliteWorkspaceAuthority {
                 ticket.meta.workflow_state,
                 TicketWorkflowState::Planning | TicketWorkflowState::Ready
             ) && !has_orchestrator
-                && !has_coder,
+                && !has_worker,
             can_unassign_orchestrator: has_orchestrator
                 && matches!(
                     ticket.meta.workflow_state,
                     TicketWorkflowState::Planning | TicketWorkflowState::Ready
                 ),
             can_queue: true,
-            can_start_manual_coder: ticket.meta.workflow_state == TicketWorkflowState::Ready
-                && !has_orchestrator
-                && !has_coder
-                && has_target
+            can_start_manual_worker: matches!(
+                ticket.meta.workflow_state,
+                TicketWorkflowState::Planning
+                    | TicketWorkflowState::Ready
+                    | TicketWorkflowState::Queued
+                    | TicketWorkflowState::InProgress
+            ) && !has_worker
                 && !has_blockers,
             queue_tickets: dependency_check.queue_tickets.clone(),
             blockers: action_blockers,
@@ -960,7 +962,7 @@ impl SqliteWorkspaceAuthority {
             linked_objectives,
             implementation_reports,
             assignments,
-            current_coder,
+            current_worker,
             assignment_diagnostics,
             action_eligibility,
             merge_requests,
@@ -2353,7 +2355,7 @@ fn ticket_query_item(
         evidence: detail.evidence.clone(),
         merge_requests: detail.merge_requests.clone(),
         merge_request: detail.merge_request.clone(),
-        current_coder: detail.current_coder.clone(),
+        current_worker: detail.current_worker.clone(),
     }
 }
 
@@ -3190,6 +3192,143 @@ mod tests {
             !project_evidence(&[closed], "revision-1", &[Ok("commit-1".into())])
                 .1
                 .complete_for_integration
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_worker_eligibility_accepts_explicit_states_without_reviving_released_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.db");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "w".into(),
+                owner_account_id: "owner-account".into(),
+                display_name: "W".into(),
+                state: "active".into(),
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            })
+            .await
+            .unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        store
+            .upsert_worker_registry(&crate::store::WorkerRegistryRecord {
+                workspace_id: "w".into(),
+                worker: worker_runtime::identity::RuntimeWorkerRef::new("runtime", "worker"),
+                display_name: "Worker".into(),
+                profile: Some("builtin:default".into()),
+                retention_state: "normal".into(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            })
+            .unwrap();
+        let backend = SqliteTicketBackend::open_verified(&path, "w").unwrap();
+        let ticket = backend
+            .create(ticket::NewTicket::new("Explicit work"))
+            .unwrap();
+        let authority = SqliteWorkspaceAuthority::new(&path, "w").unwrap();
+        for (state, allowed) in [
+            ("planning", true),
+            ("ready", true),
+            ("queued", true),
+            ("inprogress", true),
+            ("done", false),
+            ("closed", false),
+        ] {
+            conn.execute(
+                "UPDATE typed_tickets SET workflow_state=?1 WHERE ticket_id=?2",
+                rusqlite::params![state, ticket.id],
+            )
+            .unwrap();
+            assert_eq!(
+                authority
+                    .ticket(&ticket.id)
+                    .unwrap()
+                    .action_eligibility
+                    .can_start_manual_worker,
+                allowed,
+                "{state}"
+            );
+        }
+        conn.execute(
+            "UPDATE typed_tickets SET workflow_state='planning' WHERE ticket_id=?1",
+            [&ticket.id],
+        )
+        .unwrap();
+        let record = crate::store::TicketRoleAssignmentRecord {
+            workspace_id: "w".into(),
+            ticket_id: ticket.id.clone(),
+            assignment_id: "assignment".into(),
+            role: TicketAssignmentRole::Worker,
+            principal: TicketAssignmentPrincipal::Worker {
+                runtime_id: "runtime".into(),
+                worker_id: "worker".into(),
+            },
+            assigned_by: "owner-account".into(),
+            assigned_at: "2".into(),
+        };
+        let orchestrator = crate::store::TicketRoleAssignmentRecord {
+            role: TicketAssignmentRole::Orchestrator,
+            assignment_id: "orchestrator".into(),
+            principal: TicketAssignmentPrincipal::WorkspaceAgent {
+                agent_key: "workspace-orchestrator".into(),
+            },
+            ..record.clone()
+        };
+        store
+            .set_current_ticket_role_assignment(
+                &orchestrator,
+                None,
+                "orchestrator-event",
+                "orchestrator-op",
+                false,
+            )
+            .unwrap();
+        assert!(
+            authority
+                .ticket(&ticket.id)
+                .unwrap()
+                .action_eligibility
+                .can_start_manual_worker
+        );
+        store
+            .start_ticket_with_worker_assignment(&record, "event", "operation", None)
+            .unwrap();
+        assert!(
+            !authority
+                .ticket(&ticket.id)
+                .unwrap()
+                .action_eligibility
+                .can_start_manual_worker
+        );
+        conn.execute(
+            "UPDATE typed_tickets SET workflow_state='closed' WHERE ticket_id=?1",
+            [&ticket.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE typed_tickets SET workflow_state='planning' WHERE ticket_id=?1",
+            [&ticket.id],
+        )
+        .unwrap();
+        let detail = authority.ticket(&ticket.id).unwrap();
+        assert!(detail.action_eligibility.can_start_manual_worker);
+        assert_eq!(detail.assignments.len(), 2);
+        let worker = detail
+            .assignments
+            .iter()
+            .find(|a| a.role == "worker")
+            .unwrap();
+        assert_eq!(worker.assignment_id, record.assignment_id);
+        assert_eq!(
+            detail.current_worker.unwrap().assignment_id,
+            record.assignment_id
         );
     }
 
