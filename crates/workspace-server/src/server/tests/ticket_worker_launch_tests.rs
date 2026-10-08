@@ -1,6 +1,7 @@
 // T-719 launch regressions. Parent wiring: mod ticket_worker_launch_tests;
 // under server::tests. Runtime execution is in-process; no Worker binary is spawned.
 use super::*;
+use crate::hosts::{InternalRuntimeSummary, WorkspaceWorkerRuntime};
 use worker_runtime::execution::{
     WorkerExecutionBackend, WorkerExecutionResult, WorkerExecutionSpawnRequest,
     WorkerExecutionSpawnResult, WorkspaceConfigFetchRequest, WorkspaceConfigFetchResult,
@@ -1049,5 +1050,187 @@ async fn choosing_reviewer_profile_does_not_register_a_reviewer_child_or_grant_m
         store
             .authorize_review_submission(mr_id, "profile-alone-is-not-a-capability")
             .is_err()
+    );
+}
+
+// Narrow provider fault seam: creation succeeds and the summary is then lost,
+// while the delete default cannot confirm compensation. No product process runs.
+struct LostSpawnResponseRuntime {
+    inner: WorkdirlessFixtureRuntime,
+}
+
+impl crate::hosts::WorkspaceWorkerRuntime for LostSpawnResponseRuntime {
+    fn runtime_id(&self) -> &str {
+        self.inner.runtime_id()
+    }
+    fn runtime_summary(&self, limit: usize) -> InternalRuntimeSummary {
+        self.inner.runtime_summary(limit)
+    }
+    fn list_hosts(
+        &self,
+        limit: usize,
+    ) -> crate::hosts::RuntimeList<crate::hosts::InternalHostSummary> {
+        self.inner.list_hosts(limit)
+    }
+    fn list_workers(&self, limit: usize) -> crate::hosts::RuntimeList<InternalWorkerSummary> {
+        self.inner.list_workers(limit)
+    }
+    fn worker(&self, worker_id: &str) -> crate::hosts::WorkerLookupResult {
+        self.inner.worker(worker_id)
+    }
+    fn working_directory(&self, id: &str) -> crate::hosts::RuntimeWorkingDirectoryResult {
+        self.inner.working_directory(id)
+    }
+    fn spawn_worker(
+        &self,
+        binding: WorkerCreateBinding,
+        request: WorkerSpawnRequest,
+    ) -> WorkerSpawnResult {
+        let result = self.inner.spawn_worker(binding, request);
+        assert_eq!(result.state, InternalWorkerOperationState::Accepted);
+        assert!(result.worker.is_some());
+        WorkerSpawnResult {
+            state: InternalWorkerOperationState::Rejected,
+            worker: None,
+            acceptance_evidence: Vec::new(),
+            diagnostics: vec![RuntimeDiagnostic::new(
+                "spawn_response_lost",
+                "error",
+                "Created Worker but lost the response",
+            )],
+        }
+    }
+}
+
+#[tokio::test]
+async fn uncertain_launch_replay_after_target_edit_keeps_claim_and_blocks_competing_start() {
+    let fixture = manual_worker_assignment_fixture().await;
+    for id in [&fixture.main_workdir_id, &fixture.docs_workdir_id] {
+        fixture
+            .api
+            .store
+            .detach_worker_workdir(
+                TEST_WORKSPACE_ID,
+                &fixture.worker,
+                Some(id),
+                TEST_CREATED_AT,
+            )
+            .unwrap();
+    }
+    sync_runtime_worker_workdir_attachments(&fixture.api, &fixture.worker).unwrap();
+    fixture
+        .api
+        .runtime
+        .register_or_replace(LostSpawnResponseRuntime {
+            inner: fixture.runtime.clone(),
+        });
+    let initial_spawns = fixture.runtime.spawn_requests().len();
+    let payload = json!({
+        "runtime_id": fixture.worker.runtime_id,
+        "display_name": "Uncertain Ticket Worker", "profile": "builtin:companion",
+        "ticket_assignment": {"ticket_id": fixture.ticket_id, "operation_id": "lost-spawn"},
+        "initial_submit": [{"kind":"text", "content":"Research the Ticket"}],
+        "workdir_attachments": [
+            {"alias":"checkout", "working_directory_id":fixture.main_workdir_id},
+            {"alias":"docs", "working_directory_id":fixture.docs_workdir_id}
+        ], "feature_connections": {}
+    });
+    let launch = |body: Value| {
+        create_workspace_worker(
+            State(fixture.api.clone()),
+            HeaderMap::new(),
+            Json(serde_json::from_value(body).unwrap()),
+        )
+    };
+    let lost = launch(payload.clone()).await.unwrap_err();
+    assert!(
+        lost.diagnostics
+            .iter()
+            .any(|d| d.code == "worker_spawn_compensation_create_reservation_retained"),
+        "{lost:?}"
+    );
+    let receipt = fixture
+        .api
+        .store
+        .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "lost-spawn")
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.claim_state, "pending");
+    assert!(receipt.assignment_id.is_none());
+    let original_worker = receipt.worker.clone().unwrap();
+    assert!(
+        fixture
+            .runtime
+            .worker(&original_worker.worker_id)
+            .worker
+            .is_some()
+    );
+    assert_eq!(fixture.runtime.spawn_requests().len(), initial_spawns + 1);
+
+    browser_ticket_backend(&fixture.api)
+        .unwrap()
+        .edit_item(
+            fixture.ticket_id.clone().into(),
+            TicketItemEdit {
+                targets: Some(TicketTargetsEdit::Set {
+                    targets: vec![
+                        test_ticket_target(
+                            "test-repository",
+                            "changed-selector",
+                            TicketTargetAccess::ReadWrite,
+                        ),
+                        test_ticket_target("docs", "develop", TicketTargetAccess::ReadOnly),
+                    ],
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let rejected = launch(payload.clone()).await.unwrap_err();
+    assert!(
+        rejected.error.to_string().contains("selector"),
+        "{rejected:?}"
+    );
+    let retained = fixture
+        .api
+        .store
+        .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "lost-spawn")
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.claim_state, "pending");
+    assert_eq!(retained.worker, Some(original_worker.clone()));
+    assert_eq!(retained.request_fingerprint, receipt.request_fingerprint);
+    assert!(retained.failure_reason.is_none());
+    let mut competing = payload;
+    competing["ticket_assignment"]["operation_id"] = json!("competing-spawn");
+    let conflict = launch(competing).await.unwrap_err();
+    assert!(
+        conflict.error.to_string().contains("pending"),
+        "{conflict:?}"
+    );
+    assert!(
+        fixture
+            .api
+            .store
+            .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "competing-spawn")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fixture.runtime.spawn_requests().len(), initial_spawns + 1);
+    assert!(
+        fixture
+            .runtime
+            .worker(&original_worker.worker_id)
+            .worker
+            .is_some()
+    );
+    assert_eq!(
+        fixture
+            .api
+            .authority
+            .ticket(&fixture.ticket_id)
+            .unwrap()
+            .state,
+        "ready"
     );
 }

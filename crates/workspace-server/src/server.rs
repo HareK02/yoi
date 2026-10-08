@@ -4718,12 +4718,22 @@ impl WorkspaceApi {
         runtime_id: &str,
         request: WorkerSpawnRequest,
     ) -> ApiResult<WorkerSpawnResult> {
+        self.spawn_workspace_worker_with_claim_admission(runtime_id, request, false)
+    }
+
+    fn spawn_workspace_worker_with_claim_admission(
+        &self,
+        runtime_id: &str,
+        request: WorkerSpawnRequest,
+        fresh_ticket_claim: bool,
+    ) -> ApiResult<WorkerSpawnResult> {
         let assignment = request.ticket_assignment.clone();
         let mut dispatched = false;
         let mut result = self.spawn_workspace_worker_inner(runtime_id, request, &mut dispatched);
-        // A definite pre-dispatch rejection must not strand a Ticket claim. Once
-        // dispatch was attempted, only confirmed compensation may settle it.
-        if !dispatched && result.is_err() {
+        // Only a newly inserted durable receipt proves there was no earlier
+        // dispatch. A local rejection on replay says nothing about a prior
+        // unknown outcome; keep its fence until absence is confirmed.
+        if fresh_ticket_claim && !dispatched && result.is_err() {
             if let Some(assignment) = assignment.as_ref() {
                 if let Err(error) = self.store.fail_ticket_assignment_operation(
                     &self.config.workspace_id,
@@ -27597,10 +27607,11 @@ async fn create_workspace_worker_inner(
     let assignment_fingerprint = crate::hosts::worker_spawn_idempotency(&request)
         .map_err(Error::Config)?
         .map(|(_, fingerprint)| fingerprint);
+    let mut fresh_ticket_claim = false;
     if let (Some(assignment), Some(fingerprint)) =
         (assignment.as_ref(), assignment_fingerprint.as_deref())
     {
-        api.store.reserve_ticket_assignment_operation(
+        fresh_ticket_claim = api.store.reserve_ticket_assignment_operation(
             &api.config.workspace_id,
             &assignment.operation_id,
             &assignment.ticket_id,
@@ -27635,7 +27646,11 @@ async fn create_workspace_worker_inner(
             .into());
         }
     }
-    let result = match api.spawn_workspace_worker(&runtime_id, request) {
+    let result = match api.spawn_workspace_worker_with_claim_admission(
+        &runtime_id,
+        request,
+        fresh_ticket_claim,
+    ) {
         Ok(result) => result,
         Err(error) => return Err(error.into()),
     };
@@ -28784,10 +28799,11 @@ async fn create_runtime_worker(
     let requested_worker_name = request.requested_worker_name.clone();
     let spawn_idempotency =
         crate::hosts::worker_spawn_idempotency(&request).map_err(Error::Config)?;
+    let mut fresh_ticket_claim = false;
     if let (Some(assignment), Some((_, fingerprint))) =
         (lifecycle_assignment.as_ref(), spawn_idempotency.as_ref())
     {
-        if let Err(error) = api.store.reserve_ticket_assignment_operation(
+        fresh_ticket_claim = match api.store.reserve_ticket_assignment_operation(
             &api.config.workspace_id,
             &assignment.operation_id,
             &assignment.ticket_id,
@@ -28796,9 +28812,12 @@ async fn create_runtime_worker(
             fingerprint,
             &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         ) {
-            let diagnostics = cleanup_spawn_created_workdirs(&api, &created_workdir_ids);
-            return Err(ApiError::with_diagnostics(error, diagnostics));
-        }
+            Ok(fresh) => fresh,
+            Err(error) => {
+                let diagnostics = cleanup_spawn_created_workdirs(&api, &created_workdir_ids);
+                return Err(ApiError::with_diagnostics(error, diagnostics));
+            }
+        };
     }
     if let Some(assignment) = lifecycle_assignment.as_ref()
         && let Some(worker) = existing_lifecycle_assignment_worker(&api, assignment, &runtime_id)?
@@ -28811,7 +28830,8 @@ async fn create_runtime_worker(
             diagnostics: Vec::new(),
         })?));
     }
-    let result = api.spawn_workspace_worker(&runtime_id, request)?;
+    let result =
+        api.spawn_workspace_worker_with_claim_admission(&runtime_id, request, fresh_ticket_claim)?;
     if let Some(worker) = result.worker.as_ref() {
         let compensation = WorkerSpawnCompensationContext {
             assignment: lifecycle_assignment.as_ref(),
