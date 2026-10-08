@@ -22,7 +22,7 @@ const MAX_OPERATION_KEY_BYTES: usize = 200;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceCreateResult {
     pub workspace: WorkspaceRecord,
-    pub repository: RepositoryRecord,
+    pub repository: Option<RepositoryRecord>,
     pub config_revision: u64,
     pub request_fingerprint: String,
     pub replayed: bool,
@@ -94,19 +94,23 @@ impl WorkspaceCatalogService {
         )?;
         let display_name =
             normalize_required("display_name", request.display_name, MAX_DISPLAY_NAME_BYTES)?;
-        let repository_source = validate_repository_source(&request.repository.uri)?;
-        let repository_uri = repository_source.uri.clone();
-        server_api::validate_repository_key(&request.repository.repository_key)
-            .map_err(|error| Error::InvalidInput(format!("invalid Repository key: {error}")))?;
-        let repository_key = request.repository.repository_key.clone();
-        let default_ref = request
+        let repository_intent = request
             .repository
-            .default_ref
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("HEAD")
-            .to_string();
+            .map(|repository| {
+                let source = validate_repository_source(&repository.uri)?;
+                server_api::validate_repository_key(&repository.repository_key).map_err(
+                    |error| Error::InvalidInput(format!("invalid Repository key: {error}")),
+                )?;
+                let default_ref = repository
+                    .default_ref
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("HEAD")
+                    .to_string();
+                Ok::<_, Error>((repository.repository_key, source, default_ref))
+            })
+            .transpose()?;
         let requested_workspace_id = requested_workspace_id
             .map(|value| {
                 Uuid::parse_str(value.trim())
@@ -121,9 +125,9 @@ impl WorkspaceCatalogService {
             requested_workspace_id.as_deref(),
             &display_name,
             Some(&owner_account_id),
-            &repository_key,
-            &repository_uri,
-            &default_ref,
+            repository_intent.as_ref().map(|(key, source, selector)| {
+                (key.as_str(), source.uri.as_str(), selector.as_str())
+            }),
         );
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let (signing_identity, identity_provisioning_operation_key) =
@@ -146,21 +150,23 @@ impl WorkspaceCatalogService {
                     created_at: now.clone(),
                     updated_at: now.clone(),
                 },
-                repository: RepositoryRecord {
-                    workspace_id,
-                    repository_id: Uuid::now_v7().to_string(),
-                    repository_key: repository_key.clone(),
-                    kind: "git".to_string(),
-                    provider: Some("git".to_string()),
-                    source: repository_source.clone(),
-                    default_ref: Some(default_ref),
-                    source_revision: 1,
-                    source_fingerprint: repository_source_fingerprint(&repository_source),
-                    observed_status: RepositoryObservedStatus::Unverified,
-                    observed_at: None,
-                    created_at: now.clone(),
-                    updated_at: now,
-                },
+                repository: repository_intent.map(
+                    |(repository_key, repository_source, default_ref)| RepositoryRecord {
+                        workspace_id,
+                        repository_id: Uuid::now_v7().to_string(),
+                        repository_key: repository_key.clone(),
+                        kind: "git".to_string(),
+                        provider: Some("git".to_string()),
+                        source: repository_source.clone(),
+                        default_ref: Some(default_ref),
+                        source_revision: 1,
+                        source_fingerprint: repository_source_fingerprint(&repository_source),
+                        observed_status: RepositoryObservedStatus::Unverified,
+                        observed_at: None,
+                        created_at: now.clone(),
+                        updated_at: now,
+                    },
+                ),
             },
             &signing_identity,
             &identity_provisioning_operation_key,
@@ -193,20 +199,19 @@ fn workspace_create_fingerprint(
     requested_workspace_id: Option<&str>,
     display_name: &str,
     owner_account_id: Option<&str>,
-    repository_key: &str,
-    repository_uri: &str,
-    default_ref: &str,
+    repository: Option<(&str, &str, &str)>,
 ) -> String {
     let payload = serde_json::json!({
         "requested_workspace_id": requested_workspace_id,
         "display_name": display_name,
         "owner_account_id": owner_account_id,
-        "repository": {
-            "repository_key": repository_key,
-            "uri": repository_uri,
-            "default_ref": default_ref,
+        // Preserve repository-present fingerprint bytes for persisted create receipts.
+        "repository": repository.map(|(key, uri, selector)| serde_json::json!({
+            "repository_key": key,
+            "uri": uri,
+            "default_ref": selector,
             "kind": "git",
-        }
+        }))
     });
     let mut hasher = Sha256::new();
     hasher.update(serde_json::to_vec(&payload).expect("workspace fingerprint serializes"));
@@ -294,11 +299,11 @@ mod tests {
         let request = WorkspaceCreateRequest {
             operation_key: "request-1".to_string(),
             display_name: "Workspace A".to_string(),
-            repository: InitialRepositoryIntent {
+            repository: Some(InitialRepositoryIntent {
                 uri: repository.path().display().to_string(),
                 repository_key: "platform".to_string(),
                 default_ref: None,
-            },
+            }),
         };
 
         let owner_account_id = owner_account(store.as_ref());
@@ -354,11 +359,11 @@ mod tests {
             let request = WorkspaceCreateRequest {
                 operation_key: operation_key.to_string(),
                 display_name: "Workspace A".to_string(),
-                repository: InitialRepositoryIntent {
+                repository: Some(InitialRepositoryIntent {
                     uri: repository.path().display().to_string(),
                     repository_key: repository_key.to_string(),
                     default_ref: None,
-                },
+                }),
             };
 
             let error = service
@@ -373,36 +378,37 @@ mod tests {
 
     #[tokio::test]
     async fn create_recovers_same_reserved_identity_after_material_write_failure() {
-        let temp = tempfile::tempdir().unwrap();
-        let database_path = temp.path().join("server.db");
-        let store = Arc::new(SqliteWorkspaceStore::open(&database_path).unwrap());
-        let owner_account_id = owner_account(store.as_ref());
-        let materials = Arc::new(InMemoryWorkspaceSigningMaterialStore::default());
-        let service = WorkspaceCatalogService::new(
-            store.clone(),
-            Arc::new(FailFirstMaterialWrite {
-                inner: materials.clone(),
-                fail: AtomicBool::new(true),
-            }),
-        );
-        let repository = git_repository();
-        let request = WorkspaceCreateRequest {
-            operation_key: "material-failure".to_string(),
-            display_name: "Workspace A".to_string(),
-            repository: InitialRepositoryIntent {
-                uri: repository.path().display().to_string(),
-                repository_key: "main".to_string(),
-                default_ref: None,
-            },
-        };
+        for with_repository in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let database_path = temp.path().join("server.db");
+            let store = Arc::new(SqliteWorkspaceStore::open(&database_path).unwrap());
+            let owner_account_id = owner_account(store.as_ref());
+            let materials = Arc::new(InMemoryWorkspaceSigningMaterialStore::default());
+            let service = WorkspaceCatalogService::new(
+                store.clone(),
+                Arc::new(FailFirstMaterialWrite {
+                    inner: materials.clone(),
+                    fail: AtomicBool::new(true),
+                }),
+            );
+            let repository = git_repository();
+            let request = WorkspaceCreateRequest {
+                operation_key: "material-failure".to_string(),
+                display_name: "Workspace A".to_string(),
+                repository: with_repository.then(|| InitialRepositoryIntent {
+                    uri: repository.path().display().to_string(),
+                    repository_key: "main".to_string(),
+                    default_ref: None,
+                }),
+            };
 
-        assert!(
-            service
-                .create(request.clone(), owner_account_id.clone())
-                .is_err()
-        );
-        assert!(store.list_workspaces().unwrap().is_empty());
-        let reserved_key = store
+            assert!(
+                service
+                    .create(request.clone(), owner_account_id.clone())
+                    .is_err()
+            );
+            assert!(store.list_workspaces().unwrap().is_empty());
+            let reserved_key = store
             .with_conn(|conn| {
                 conn.query_row(
                     "SELECT key_id FROM workspace_signing_identity_provisioning_operations WHERE operation_key = 'workspace-create:material-failure' AND state = 'pending'",
@@ -413,55 +419,57 @@ mod tests {
             })
             .unwrap();
 
-        drop(service);
-        drop(store);
-        let store = Arc::new(SqliteWorkspaceStore::open(&database_path).unwrap());
-        let restarted = WorkspaceCatalogService::new(store.clone(), materials);
-        let created = restarted.create(request, owner_account_id).unwrap();
-        let identity = store
-            .get_workspace_signing_identity(&created.workspace.workspace_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(identity.key_id, reserved_key);
-        assert_eq!(store.list_workspaces().unwrap().len(), 1);
+            drop(service);
+            drop(store);
+            let store = Arc::new(SqliteWorkspaceStore::open(&database_path).unwrap());
+            let restarted = WorkspaceCatalogService::new(store.clone(), materials);
+            let created = restarted.create(request, owner_account_id).unwrap();
+            let identity = store
+                .get_workspace_signing_identity(&created.workspace.workspace_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(identity.key_id, reserved_key);
+            assert_eq!(store.list_workspaces().unwrap().len(), 1);
+        }
     }
 
     #[tokio::test]
     async fn create_rolls_back_db_state_and_recovers_published_identity_after_restart() {
-        let temp = tempfile::tempdir().unwrap();
-        let database_path = temp.path().join("server.db");
-        let store = Arc::new(SqliteWorkspaceStore::open(&database_path).unwrap());
-        let owner_account_id = owner_account(store.as_ref());
-        let materials = Arc::new(InMemoryWorkspaceSigningMaterialStore::default());
-        let service = WorkspaceCatalogService::new(store.clone(), materials.clone());
-        let repository = git_repository();
-        let request = WorkspaceCreateRequest {
-            operation_key: "db-failure".to_string(),
-            display_name: "Workspace A".to_string(),
-            repository: InitialRepositoryIntent {
-                uri: repository.path().display().to_string(),
-                repository_key: "main".to_string(),
-                default_ref: None,
-            },
-        };
-        store
-            .with_conn(|conn| {
-                conn.execute_batch(
-                    r#"CREATE TRIGGER fail_workspace_create_identity_audit
+        for with_repository in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let database_path = temp.path().join("server.db");
+            let store = Arc::new(SqliteWorkspaceStore::open(&database_path).unwrap());
+            let owner_account_id = owner_account(store.as_ref());
+            let materials = Arc::new(InMemoryWorkspaceSigningMaterialStore::default());
+            let service = WorkspaceCatalogService::new(store.clone(), materials.clone());
+            let repository = git_repository();
+            let request = WorkspaceCreateRequest {
+                operation_key: "db-failure".to_string(),
+                display_name: "Workspace A".to_string(),
+                repository: with_repository.then(|| InitialRepositoryIntent {
+                    uri: repository.path().display().to_string(),
+                    repository_key: "main".to_string(),
+                    default_ref: None,
+                }),
+            };
+            store
+                .with_conn(|conn| {
+                    conn.execute_batch(
+                        r#"CREATE TRIGGER fail_workspace_create_identity_audit
                        BEFORE INSERT ON workspace_signing_identity_audit
                        BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END;"#,
-                )?;
-                Ok(())
-            })
-            .unwrap();
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
 
-        assert!(
-            service
-                .create(request.clone(), owner_account_id.clone())
-                .is_err()
-        );
-        assert!(store.list_workspaces().unwrap().is_empty());
-        let (reserved_key, material_ref) = store
+            assert!(
+                service
+                    .create(request.clone(), owner_account_id.clone())
+                    .is_err()
+            );
+            assert!(store.list_workspaces().unwrap().is_empty());
+            let (reserved_key, material_ref) = store
             .with_conn(|conn| {
                 conn.query_row(
                     "SELECT key_id, private_material_ref FROM workspace_signing_identity_provisioning_operations WHERE operation_key = 'workspace-create:db-failure' AND state = 'pending'",
@@ -471,25 +479,26 @@ mod tests {
                 .map_err(Error::from)
             })
             .unwrap();
-        assert!(materials.load(&material_ref).unwrap().is_some());
-        store
-            .with_conn(|conn| {
-                conn.execute_batch("DROP TRIGGER fail_workspace_create_identity_audit;")?;
-                Ok(())
-            })
-            .unwrap();
+            assert!(materials.load(&material_ref).unwrap().is_some());
+            store
+                .with_conn(|conn| {
+                    conn.execute_batch("DROP TRIGGER fail_workspace_create_identity_audit;")?;
+                    Ok(())
+                })
+                .unwrap();
 
-        drop(service);
-        drop(store);
-        let store = Arc::new(SqliteWorkspaceStore::open(&database_path).unwrap());
-        let restarted = WorkspaceCatalogService::new(store.clone(), materials);
-        let created = restarted.create(request, owner_account_id).unwrap();
-        let identity = store
-            .get_workspace_signing_identity(&created.workspace.workspace_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(identity.key_id, reserved_key);
-        assert_eq!(identity.state, "active");
+            drop(service);
+            drop(store);
+            let store = Arc::new(SqliteWorkspaceStore::open(&database_path).unwrap());
+            let restarted = WorkspaceCatalogService::new(store.clone(), materials);
+            let created = restarted.create(request, owner_account_id).unwrap();
+            let identity = store
+                .get_workspace_signing_identity(&created.workspace.workspace_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(identity.key_id, reserved_key);
+            assert_eq!(identity.state, "active");
+        }
     }
 
     #[tokio::test]
@@ -506,11 +515,11 @@ mod tests {
         let mut request = WorkspaceCreateRequest {
             operation_key: "request-1".to_string(),
             display_name: "Workspace A".to_string(),
-            repository: InitialRepositoryIntent {
+            repository: Some(InitialRepositoryIntent {
                 uri: repository.path().display().to_string(),
                 repository_key: "main".to_string(),
                 default_ref: None,
-            },
+            }),
         };
         service
             .create(request.clone(), owner_account_id.clone())
@@ -522,6 +531,199 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("different input"), "{error}");
+    }
+
+    #[test]
+    fn repository_free_create_initializes_authority_and_concurrent_retries_converge() {
+        let store = Arc::new(SqliteWorkspaceStore::in_memory().unwrap());
+        let owner = owner_account(store.as_ref());
+        let service = WorkspaceCatalogService::new(
+            store.clone(),
+            Arc::new(InMemoryWorkspaceSigningMaterialStore::default()),
+        );
+        let request = WorkspaceCreateRequest {
+            operation_key: "empty-concurrent".to_string(),
+            display_name: "No repositories".to_string(),
+            repository: None,
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let handles = (0..4)
+            .map(|_| {
+                let (service, request, owner, barrier) = (
+                    service.clone(),
+                    request.clone(),
+                    owner.clone(),
+                    barrier.clone(),
+                );
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    service.create(request, owner).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        let id = &results[0].workspace.workspace_id;
+        assert_eq!(results.iter().filter(|result| !result.replayed).count(), 1);
+        assert!(
+            results
+                .iter()
+                .all(|result| &result.workspace.workspace_id == id && result.repository.is_none())
+        );
+        assert_eq!(store.list_workspaces().unwrap().len(), 1);
+        assert!(store.list_repositories(id).unwrap().is_empty());
+        assert!(store.load_workspace_config(id).unwrap().is_some());
+        assert_eq!(
+            store
+                .get_workspace_signing_identity(id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "active"
+        );
+        let counters = store.with_conn(|conn| {
+            let mut query = conn.prepare("SELECT resource_kind, next_sequence FROM workspace_resource_key_counters WHERE workspace_id = ?1 ORDER BY resource_kind")?;
+            Ok(query.query_map([id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?.collect::<std::result::Result<Vec<_>, _>>()?)
+        }).unwrap();
+        assert_eq!(
+            counters,
+            vec![
+                ("objective".into(), 1),
+                ("ticket".into(), 1),
+                ("worker".into(), 1)
+            ]
+        );
+        let mut different = request.clone();
+        different.repository = Some(InitialRepositoryIntent {
+            repository_key: "main".into(),
+            uri: "/runtime/repo".into(),
+            default_ref: None,
+        });
+        assert!(
+            service
+                .create(different, owner.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("different input")
+        );
+        assert!(service.create(request, "missing-owner".into()).is_err());
+        assert!(store.list_repositories(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn replay_reads_current_repository_at_initial_key_and_never_recreates_it() {
+        let store = Arc::new(SqliteWorkspaceStore::in_memory().unwrap());
+        let owner = owner_account(store.as_ref());
+        let service = WorkspaceCatalogService::new(
+            store.clone(),
+            Arc::new(InMemoryWorkspaceSigningMaterialStore::default()),
+        );
+        let request = WorkspaceCreateRequest {
+            operation_key: "current-repository".into(),
+            display_name: "Workspace".into(),
+            repository: Some(InitialRepositoryIntent {
+                repository_key: "main".into(),
+                uri: "/runtime/original".into(),
+                default_ref: None,
+            }),
+        };
+        let created = service.create(request.clone(), owner.clone()).unwrap();
+        let mut repository = created.repository.unwrap();
+        repository.source = validate_repository_source("https://example.test/changed.git").unwrap();
+        repository.source_revision += 1;
+        repository.source_fingerprint = repository_source_fingerprint(&repository.source);
+        store.with_conn(|conn| {
+            conn.execute("UPDATE repositories SET source_kind = ?1, source_uri = ?2, source_revision = ?3, source_fingerprint = ?4 WHERE workspace_id = ?5 AND repository_key = 'main'",
+                rusqlite::params![repository.source.kind.as_str(), repository.source.uri, repository.source_revision, repository.source_fingerprint, repository.workspace_id])?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(
+            service
+                .create(request.clone(), owner.clone())
+                .unwrap()
+                .repository,
+            Some(repository)
+        );
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "DELETE FROM repositories WHERE workspace_id = ?1",
+                    [&created.workspace.workspace_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let replay = service.create(request, owner).unwrap();
+        assert!(replay.replayed);
+        assert!(replay.repository.is_none());
+        assert!(
+            store
+                .list_repositories(&replay.workspace.workspace_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn persisted_repository_free_receipt_replays_after_catalog_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("server.db");
+        let materials = Arc::new(InMemoryWorkspaceSigningMaterialStore::default());
+        let request = WorkspaceCreateRequest {
+            operation_key: "persist-empty".into(),
+            display_name: "Workspace".into(),
+            repository: None,
+        };
+        let (owner, created) = {
+            let store = Arc::new(SqliteWorkspaceStore::open(&database).unwrap());
+            let owner = owner_account(store.as_ref());
+            let service = WorkspaceCatalogService::new(store, materials.clone());
+            let created = service.create(request.clone(), owner.clone()).unwrap();
+            (owner, created)
+        };
+        let store = Arc::new(SqliteWorkspaceStore::open(&database).unwrap());
+        let reopened = WorkspaceCatalogService::new(store.clone(), materials);
+        let replay = reopened.create(request, owner).unwrap();
+        assert_eq!(replay.workspace, created.workspace);
+        assert!(replay.replayed);
+        assert!(replay.repository.is_none());
+        assert!(
+            store
+                .list_repositories(&replay.workspace.workspace_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn repository_present_fingerprint_preserves_saved_receipt_contract() {
+        let legacy_payload = serde_json::json!({
+            "requested_workspace_id": null, "display_name": "Workspace", "owner_account_id": "owner",
+            "repository": {"repository_key": "main", "uri": "/runtime/repo", "default_ref": "HEAD", "kind": "git"}
+        });
+        let legacy_digest = Sha256::digest(serde_json::to_vec(&legacy_payload).unwrap());
+        let legacy = format!(
+            "sha256:{}",
+            legacy_digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        assert_eq!(
+            workspace_create_fingerprint(
+                None,
+                "Workspace",
+                Some("owner"),
+                Some(("main", "/runtime/repo", "HEAD"))
+            ),
+            legacy
+        );
+        assert_ne!(
+            workspace_create_fingerprint(None, "Workspace", Some("owner"), None),
+            legacy
+        );
     }
 
     #[test]
@@ -564,11 +766,11 @@ mod tests {
                 WorkspaceCreateRequest {
                     operation_key: "organization-owner-create".to_string(),
                     display_name: "Organization Workspace".to_string(),
-                    repository: InitialRepositoryIntent {
+                    repository: Some(InitialRepositoryIntent {
                         uri: repository.path().display().to_string(),
                         repository_key: "main".to_string(),
                         default_ref: None,
-                    },
+                    }),
                 },
                 "organization-owner".to_string(),
             )
@@ -605,11 +807,11 @@ mod tests {
                 WorkspaceCreateRequest {
                     operation_key: "owner-a-create".to_string(),
                     display_name: "Owner A Workspace".to_string(),
-                    repository: InitialRepositoryIntent {
+                    repository: Some(InitialRepositoryIntent {
                         uri: repository_a.path().display().to_string(),
                         repository_key: "main".to_string(),
                         default_ref: None,
-                    },
+                    }),
                 },
                 owner_a.clone(),
             )
@@ -619,11 +821,11 @@ mod tests {
                 WorkspaceCreateRequest {
                     operation_key: "owner-b-create".to_string(),
                     display_name: "Owner B Workspace".to_string(),
-                    repository: InitialRepositoryIntent {
+                    repository: Some(InitialRepositoryIntent {
                         uri: repository_b.path().display().to_string(),
                         repository_key: "main".to_string(),
                         default_ref: None,
-                    },
+                    }),
                 },
                 owner_b.clone(),
             )
@@ -660,11 +862,11 @@ mod tests {
                 WorkspaceCreateRequest {
                     operation_key: "remote-create".to_string(),
                     display_name: "Remote Workspace".to_string(),
-                    repository: InitialRepositoryIntent {
+                    repository: Some(InitialRepositoryIntent {
                         uri: "ssh://git@example.test/org/repository.git".to_string(),
                         repository_key: "remote".to_string(),
                         default_ref: Some("main".to_string()),
-                    },
+                    }),
                 },
                 owner_account_id,
             )
@@ -673,7 +875,7 @@ mod tests {
         let persisted = store
             .get_repository(
                 &result.workspace.workspace_id,
-                &result.repository.repository_id,
+                &result.repository.as_ref().unwrap().repository_id,
             )
             .unwrap()
             .unwrap();

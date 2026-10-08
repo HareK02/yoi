@@ -24,7 +24,6 @@ Collection interface `yoi.merge-request/collection/v1`:
 | Native operation | Existing Tool | Preserved authority inputs |
 | --- | --- | --- |
 | `open` | `OpenMergeRequest` | Ticket, repository key, source selector, target selector, summary |
-| `complete_ticket` | `CompleteTicket` | Ticket, operation ID, current item revision, exact linked-MR result set, requirement approval event |
 
 Item interface `yoi.merge-request/item/v1`:
 
@@ -39,9 +38,9 @@ Typical role surfaces are therefore:
 
 - Coder: collection `open`; item `read`.
 - Reviewer: item `read` and `review`.
-- Orchestrator: collection `complete_ticket`; item `read`, `check_readiness`, and `complete`.
+- Orchestrator: item `read`, `check_readiness`, and `complete`.
 
-`complete_ticket` is deliberately collection-scoped because its subject is a Ticket and an exact set of linked Merge Request results rather than one route-bound MR. It keeps those identities explicit. The review descriptor never contains the injected capability token, and a review item route must exactly match the Merge Request captured by that capability before the ordinary review Tool can run.
+`CompleteTicket` belongs to the Ticket Feature and route-bound Ticket item `complete`, alongside state and close decisions. It takes current item/state CAS, a replay key, reason, and optional references; it requires neither an MR result set nor a Reviewer approval. The former MR collection `complete_ticket` operation is not published. The review descriptor never contains the injected capability token, and a review item route must exactly match the Merge Request captured by that capability before the ordinary review Tool can run.
 
 ## Preserved review and integration gates
 
@@ -55,8 +54,8 @@ The native projection delegates to the same ordinary tools and REST endpoints. I
 - source movement invalidating source approval while target-only movement preserves unchanged-source review;
 - unresolved request-change and revoked/stale approval rejection;
 - current target observation, target-before/after proof, strategy, and conflict-resolution checks;
-- Orchestrator-only Merge Request and Ticket completion;
-- immutable integration/result evidence and exact linked-result-set Ticket completion.
+- Orchestrator-only Merge Request integration;
+- immutable integration/result evidence and exact linked-result-set requirement attestation.
 
 The Worldspace adapter performs no Git or provider integration. A visible `complete` operation remains unusable without the ordinary Backend's authenticated online Orchestrator source and integration evidence.
 
@@ -64,7 +63,7 @@ The Worldspace adapter performs no Git or provider integration. A visible `compl
 
 `read` exposes the existing bounded thread page with optional `after` and a `1..=200` limit. Responses keep linked Tickets as references/data, so Ticket or Objective native projections are not prerequisites. Descriptors never expand repository diffs, unbounded thread history, credentials, or capability material.
 
-A successful item read records a response fingerprint. A successful item mutation advances a local mutation generation. Opening records the returned MR and adds its native path to the result. Ticket completion invalidates every MR route named in its exact result set because releasing the assignment can change later ref observations. The common WIP Host rejects calls made with stale object/interface validators; callers must rediscover before deciding whether to call again.
+A successful item read records a response fingerprint. A successful item mutation advances a local mutation generation. Opening records the returned MR and adds its native path to the result. Ticket decisions advance the Ticket provider's object generation, not the MR integration state or proofs. Ending Ticket work can affect later live source observation, so clients reread MR authority before MR actions; Backend checks remain authoritative. The common WIP Host rejects calls made with stale object/interface validators; callers must rediscover before deciding whether to call again.
 
 Optional fields preserve ordinary JSON-input semantics: omission remains omission and explicit WIP unit/null remains JSON `null` for schema and permission matching. The reconstructed object is validated against the original Tool JSON Schema before the Tool executes.
 

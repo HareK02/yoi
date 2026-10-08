@@ -324,7 +324,6 @@ impl_openapi_schema!(
     SubmitMergeRequestReviewRequest,
     TextResponse,
     TicketCloseRecordRequest,
-    TicketCompletionEvent,
     TicketDependencyCheckResponse,
     TicketDetail,
     TicketDoctorResponse,
@@ -350,6 +349,7 @@ impl_openapi_schema!(
     TicketRoleAssignmentsResponse,
     TicketShowRequest,
     TicketStateChangeRequest,
+    TicketStateUpdateRequest,
     TicketSummarySearchQuery,
     TicketThreadEventRequest,
     RuntimeManagementApiError,
@@ -2917,7 +2917,7 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: TicketThreadEventRequest,
     ) -> Result<(), RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/state-changes", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    #[post("/api/w/{workspace_id}/tickets/{id}/state-changes", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_state_change_add(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2933,7 +2933,7 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: TicketIntakeSummaryRequest,
     ) -> Result<(), RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/state-fields/{field}", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    #[post("/api/w/{workspace_id}/tickets/{id}/state-fields/{field}", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_state_field_set(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2942,7 +2942,7 @@ pub trait ServerApi {
         #[path] field: String,
         #[body] request: TicketStateChangeRequest,
     ) -> Result<(), RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/workflow-state", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    #[post("/api/w/{workspace_id}/tickets/{id}/workflow-state", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_workflow_state_set(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2950,6 +2950,14 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: TicketStateChangeRequest,
     ) -> Result<(), RepositoryApiError>;
+    #[post("/api/w/{workspace_id}/tickets/{id}/state-update", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_state_update(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: TicketStateUpdateRequest,
+    ) -> Result<TicketRecord, RepositoryApiError>;
     #[post("/api/w/{workspace_id}/tickets/{id}/workflow/mark-ready", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_mark_ready_record(
         &self,
@@ -3047,15 +3055,15 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: CompleteMergeRequestRequest,
     ) -> Result<MergeEvent, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/complete", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    #[post("/api/w/{workspace_id}/tickets/{id}/complete", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_complete(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
         #[body] request: CompleteTicketRequest,
-    ) -> Result<TicketCompletionEvent, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/workflow/close", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    ) -> Result<TicketRecord, RepositoryApiError>;
+    #[post("/api/w/{workspace_id}/tickets/{id}/workflow/close", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_close_record(
         &self,
         #[extension] context: ServerRequestContext,
@@ -3150,9 +3158,10 @@ pub trait ServerApi {
         #[body] request: CancelTicketImplementationRequest,
     ) -> Result<TicketDetail, RepositoryApiError>;
 
-    #[post("/api/w/{workspace_id}/tickets/{id}/state", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    #[post("/api/w/{workspace_id}/tickets/{id}/state", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_state_transition(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
         #[body] request: BrowserTransitionTicketStateRequest,
@@ -3161,6 +3170,7 @@ pub trait ServerApi {
     #[post("/api/w/{workspace_id}/tickets/{id}/ready", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_ready(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
         #[body] request: TicketMarkReadyRequest,
@@ -3177,14 +3187,16 @@ pub trait ServerApi {
     #[post("/api/w/{workspace_id}/tickets/{id}/queue", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_queue(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
         #[body] request: BrowserQueueTicketRequest,
     ) -> Result<TicketQueueResponse, RepositoryApiError>;
 
-    #[post("/api/w/{workspace_id}/tickets/{id}/close", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    #[post("/api/w/{workspace_id}/tickets/{id}/close", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_close(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
         #[body] request: BrowserCloseTicketRequest,
@@ -4239,22 +4251,27 @@ pub struct InitialRepositoryIntent {
     pub default_ref: Option<String>,
 }
 
-/// Request for atomically creating a Workspace and its initial Repository.
+/// Request for atomically creating a Workspace with an optional initial Repository.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceCreateRequest {
     pub operation_key: String,
     pub display_name: String,
-    pub repository: InitialRepositoryIntent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<InitialRepositoryIntent>,
 }
 
-/// Response returned after atomically creating a Workspace and its first Repository.
+/// Response returned after atomically creating a Workspace.
+///
+/// On replay, Workspace/config and the Repository at the originally requested key are
+/// current authority, not historical snapshots. Repository is null when creation omitted
+/// it or that key has since been removed/renamed; replay never recreates an asset.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceCreateResponse {
     pub workspace: WorkspaceSummary,
-    pub repository: WorkspaceRepositoryRecord,
+    pub repository: Option<WorkspaceRepositoryRecord>,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub config_revision: u64,
@@ -7406,6 +7423,15 @@ pub struct TicketActionEligibility {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TicketSourceRefObservation {
+    Observed {},
+    Unavailable { code: String },
+    NotRequired {},
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct TicketMergeRequestSummary {
     pub merge_request_id: String,
@@ -7416,6 +7442,8 @@ pub struct TicketMergeRequestSummary {
     pub selector_to: String,
     pub updated_at: String,
     pub current_subject_ref: Option<String>,
+    pub source_ref_observation: TicketSourceRefObservation,
+    pub integration_evidence_error: Option<String>,
     pub review_subject_ref: Option<String>,
     pub review_requested_at: Option<String>,
     pub review_submitted_at: Option<String>,
@@ -7636,9 +7664,10 @@ transparent_ticket_dto!(
 transparent_ticket_dto!(CreateTicketRecordRequest, ticket::NewTicket);
 transparent_ticket_dto!(EditTicketRecordItemRequest, ticket::TicketItemEdit);
 transparent_ticket_dto!(TicketThreadEventRequest, ticket::NewTicketEvent);
-transparent_ticket_dto!(TicketStateChangeRequest, ticket::TicketStateChange);
+transparent_ticket_dto!(TicketStateChangeRequest, ticket::TicketStateUpdate);
+transparent_ticket_dto!(TicketStateUpdateRequest, ticket::TicketStateUpdate);
 transparent_ticket_dto!(TicketIntakeSummaryRequest, ticket::TicketIntakeSummary);
-transparent_ticket_dto!(TicketCloseRecordRequest, ticket::MarkdownText);
+transparent_ticket_dto!(TicketCloseRecordRequest, ticket::TicketCompletion);
 transparent_ticket_dto!(CreateTicketRelationRequest, ticket::NewTicketRelation);
 transparent_ticket_dto!(
     CreateTicketOrchestrationPlanRequest,
@@ -7763,9 +7792,11 @@ pub struct BrowserEditTicketRequest {
 #[serde(deny_unknown_fields)]
 pub struct BrowserTransitionTicketStateRequest {
     pub state: BrowserTicketWorkflowState,
-    pub reason: Option<String>,
+    pub operation_key: String,
+    pub expected_item_revision: String,
+    pub expected_state: BrowserTicketWorkflowState,
+    pub reason: String,
     pub body: Option<String>,
-    pub author: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -7796,6 +7827,9 @@ pub struct BrowserQueueTicketRequest {}
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct BrowserCloseTicketRequest {
+    pub operation_key: String,
+    pub expected_item_revision: String,
+    pub expected_state: BrowserTicketWorkflowState,
     pub resolution: String,
 }
 
@@ -8174,22 +8208,12 @@ pub struct CompleteMergeRequestRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CompleteTicketRequest {
-    pub operation_id: String,
-    pub item_revision: String,
-    pub merge_request_ids: Vec<String>,
-    pub requirement_approval_event_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct TicketCompletionEvent {
-    pub operation_id: String,
-    pub ticket_id: String,
-    pub item_revision: String,
-    pub merge_request_ids: Vec<String>,
-    pub requirement_approval_event_id: String,
-    pub completed_by: MergeRequestWorkerIdentity,
-    pub created_at: String,
+    pub operation_key: String,
+    pub expected_item_revision: String,
+    pub expected_state: ticket::TicketWorkflowState,
+    pub reason: String,
+    #[serde(default)]
+    pub references: Vec<ticket::TicketReference>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -11453,13 +11477,6 @@ mod tests {
         assert_eq!(
             operations
                 .iter()
-                .filter(|operation| operation.operation_id.starts_with("ticket_"))
-                .count(),
-            38
-        );
-        assert_eq!(
-            operations
-                .iter()
                 .filter(|operation| operation.operation_id.starts_with("objective_"))
                 .count(),
             11
@@ -11472,6 +11489,16 @@ mod tests {
             11
         );
         for (operation_id, method, path) in [
+            (
+                "ticket_state_update",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/tickets/{id}/state-update",
+            ),
+            (
+                "ticket_complete",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/tickets/{id}/complete",
+            ),
             (
                 "ticket_relation_query",
                 HttpMethod::Post,
@@ -12193,12 +12220,27 @@ mod tests {
         let request = WorkspaceCreateRequest {
             operation_key: "workspace-create-1".to_string(),
             display_name: "Workspace".to_string(),
-            repository: InitialRepositoryIntent {
+            repository: Some(InitialRepositoryIntent {
                 repository_key: "main".to_string(),
                 uri: "/srv/repositories/main".to_string(),
                 default_ref: Some("develop".to_string()),
-            },
+            }),
         };
+        for repository in [None, Some(serde_json::Value::Null)] {
+            let mut wire =
+                serde_json::json!({"operation_key": "empty", "display_name": "Workspace"});
+            if let Some(repository) = repository {
+                wire["repository"] = repository;
+            }
+            let decoded: WorkspaceCreateRequest = serde_json::from_value(wire).unwrap();
+            assert!(decoded.repository.is_none());
+            assert!(
+                serde_json::to_value(decoded)
+                    .unwrap()
+                    .get("repository")
+                    .is_none()
+            );
+        }
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["operation_key"], "workspace-create-1");
         assert_eq!(json["repository"]["uri"], "/srv/repositories/main");
@@ -12527,6 +12569,34 @@ mod tests {
         let mut unknown = compatible;
         unknown["capabilities"] = serde_json::json!(["shell"]);
         assert!(serde_json::from_value::<RuntimeConnectionTestResponse>(unknown).is_err());
+    }
+
+    #[test]
+    fn ticket_completion_wire_requires_cas_and_judgment_not_merge_evidence() {
+        let request = serde_json::json!({
+            "operation_key": "investigation-done",
+            "expected_item_revision": "ticket:1",
+            "expected_state": "planning",
+            "reason": "Question answered in the thread"
+        });
+        let parsed: CompleteTicketRequest = serde_json::from_value(request.clone()).unwrap();
+        assert!(parsed.references.is_empty());
+        for field in [
+            "operation_key",
+            "expected_item_revision",
+            "expected_state",
+            "reason",
+        ] {
+            let mut missing = request.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<CompleteTicketRequest>(missing).is_err(),
+                "{field}"
+            );
+        }
+        let mut old = request;
+        old["requirement_approval_event_id"] = serde_json::json!("not-a-judgment");
+        assert!(serde_json::from_value::<CompleteTicketRequest>(old).is_err());
     }
 
     #[cfg(feature = "typescript")]
@@ -13377,7 +13447,6 @@ mod openapi_artifact_tests {
             "merge_request_review_revoke",
             "merge_request_review_submit",
             "merge_request_reviewer_child_register",
-            "ticket_complete",
             "runtime_resource_fetch",
             "worker_control_cancel",
             "worker_control_input",

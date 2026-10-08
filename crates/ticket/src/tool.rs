@@ -134,18 +134,15 @@ const DECISION_DESCRIPTION: &str = "Append a typed Ticket decision event. `body`
 const IMPLEMENTATION_REPORT_DESCRIPTION: &str =
     "Append a typed Ticket implementation_report event. `body` is Markdown.";
 const MARK_READY_DESCRIPTION: &str = "Mark a planning Ticket ready through the typed Ticket backend. \
-The backend atomically validates and normalizes every persisted repository target, requires at least one \
-read_write target, records one typed state_changed event, and transitions planning -> ready. `reason` is optional.";
+Targets are optional; provided targets are validated against the Workspace catalog without Git resolution. \
+Records one typed state_changed event and transitions planning -> ready. `reason` is optional.";
 const INTAKE_READY_DESCRIPTION: &str = "Record a bounded intake summary and mark a planning Ticket ready. \
-The backend applies the same targets validation and lock as TicketMarkReady and commits the summary, \
+The backend applies the same optional catalog targets validation as TicketMarkReady and commits the summary, \
 state_changed event, effective targets, and planning -> ready transition atomically.";
-const QUEUE_DESCRIPTION: &str = "Queue a ready Ticket for Orchestrator routing through the typed \
-Ticket backend. The backend rejects transitive planning dependencies and cycles, atomically queues the \
-requested Ticket plus every transitive ready dependency, and leaves queued or in-progress dependencies unchanged.";
-const WORKFLOW_STATE_DESCRIPTION: &str = "Transition Ticket `state` through the typed \
-Ticket backend with a bounded `state_changed` event. Treat `queued -> inprogress` \
-as the implementation acceptance step: implementation side effects should happen only after that \
-transition is accepted and recorded. Orchestrator may return `ready` or `queued` Tickets to `planning` only with a concrete missing decision/information reason.";
+const QUEUE_DESCRIPTION: &str = "Queue only the explicitly requested Ticket for Orchestrator routing through the typed \
+Ticket backend, regardless of state or dependencies. Dependency diagnostics are retained; no dependencies are auto-queued.";
+const WORKFLOW_STATE_DESCRIPTION: &str = "Change Ticket state with a bounded audited state_changed event. \
+State and dependency metadata do not impose an implementation phase path. Reopening does not revive released work identities.";
 const CLOSE_DESCRIPTION: &str = "Close a Ticket with a Markdown resolution through the typed Ticket \
 backend. The backend sets the Ticket state to closed and appends a close event.";
 const RELATION_RECORD_DESCRIPTION: &str = "Record a forward typed Ticket-to-Ticket relation as durable \
@@ -319,6 +316,18 @@ impl TicketBackend for TicketToolBackend {
         change: TicketStateChange,
     ) -> TicketResult<()> {
         self.backend.set_workflow_state(id, change)
+    }
+
+    fn update_state(
+        &self,
+        ticket: &str,
+        request: crate::TicketStateUpdate,
+    ) -> TicketResult<Ticket> {
+        self.backend.update_state(ticket, request)
+    }
+
+    fn complete(&self, ticket: &str, request: crate::TicketCompletion) -> TicketResult<Ticket> {
+        self.backend.complete(ticket, request)
     }
 
     fn mark_ready(&self, id: TicketIdOrSlug, request: TicketMarkReady) -> TicketResult<Ticket> {
@@ -1953,7 +1962,7 @@ mod tests {
         ) -> crate::Result<crate::ResolvedTicketTarget> {
             Ok(crate::ResolvedTicketTarget {
                 repository_key: repository_key.to_owned(),
-                ref_selector: ref_selector.unwrap_or("develop").to_owned(),
+                ref_selector: Some(ref_selector.unwrap_or("develop").to_owned()),
                 access: crate::TicketTargetAccess::ReadOnly,
             })
         }
@@ -2061,15 +2070,21 @@ mod tests {
     }
 
     #[test]
-    fn state_tool_description_explains_queued_acceptance() {
+    fn state_tool_description_explains_phase_independence() {
         let temp = TempDir::new().unwrap();
         let definition = ticket_tools(backend(&temp))
             .into_iter()
             .find(|definition| definition().0.name == "TicketWorkflowState")
             .expect("state tool exists");
         let (meta, _) = definition();
-        assert!(meta.description.contains("queued -> inprogress"));
-        assert!(meta.description.contains("implementation side effects"));
+        assert!(
+            meta.description
+                .contains("do not impose an implementation phase path")
+        );
+        assert!(
+            meta.description
+                .contains("does not revive released work identities")
+        );
     }
 
     #[test]
@@ -2668,10 +2683,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(queued.summary.contains("2 ticket(s)"));
+        assert!(queued.summary.contains("1 ticket(s)"));
         let queued_content = queued.content.unwrap();
         assert!(queued_content.contains(&target_key));
-        assert!(queued_content.contains(&dependency_key));
+        assert!(!queued_content.contains(&dependency_key));
         assert!(!queued_content.contains(&target.id));
         assert!(!queued_content.contains(&dependency.id));
 
@@ -2931,79 +2946,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_workflow_tool_rejects_disallowed_transition_graph_edges() {
+    async fn ticket_workflow_tool_allows_direct_state_changes_without_phase_path() {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
         let workflow = tool_by_name(backend.clone(), "TicketWorkflowState");
-
-        let mut ready_input = NewTicket::new("Ready Bypass");
-        ready_input.workflow_state = Some(TicketWorkflowState::Ready);
-        let ready = backend.create(ready_input).unwrap();
-        let ready_error = workflow
-            .execute(
-                &json!({
-                    "ticket": ready.id,
-                    "from": "ready",
-                    "to": "inprogress",
-                    "reason": "bypass_queue",
-                    "body": "Should not bypass Queue.\n"
-                })
-                .to_string(),
-                Default::default(),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            ready_error
-                .to_string()
-                .contains("invalid ticket workflow transition")
-        );
-
-        let mut done_input = NewTicket::new("Backward Bypass");
-        done_input.workflow_state = Some(TicketWorkflowState::Done);
-        let done = backend.create(done_input).unwrap();
-        let backward_error = workflow
-            .execute(
-                &json!({
-                    "ticket": done.id,
-                    "from": "done",
-                    "to": "planning",
-                    "reason": "backwards",
-                    "body": "Should not move backwards.\n"
-                })
-                .to_string(),
-                Default::default(),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            backward_error
-                .to_string()
-                .contains("invalid ticket workflow transition")
-        );
-
-        let mut queued_input = NewTicket::new("Skip Bypass");
-        queued_input.workflow_state = Some(TicketWorkflowState::Queued);
-        let queued = backend.create(queued_input).unwrap();
-        let skip_error = workflow
-            .execute(
-                &json!({
-                    "ticket": queued.id,
-                    "from": "queued",
-                    "to": "done",
-                    "reason": "skip_inprogress",
-                    "body": "Should not skip inprogress.\n"
-                })
-                .to_string(),
-                Default::default(),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            skip_error
-                .to_string()
-                .contains("invalid ticket workflow transition")
-        );
+        for (from, to) in [
+            (TicketWorkflowState::Ready, TicketWorkflowState::InProgress),
+            (TicketWorkflowState::Done, TicketWorkflowState::Planning),
+            (TicketWorkflowState::Queued, TicketWorkflowState::Done),
+        ] {
+            let mut input = NewTicket::new(format!("{from} to {to}"));
+            input.workflow_state = Some(from);
+            let ticket = backend.create(input).unwrap();
+            workflow.execute(&json!({"ticket": ticket.id, "from": from.as_str(), "to": to.as_str(), "reason": "explicit_update", "body": "State metadata updated."}).to_string(), Default::default()).await.unwrap();
+            assert_eq!(
+                backend.show(ticket.id.into()).unwrap().meta.workflow_state,
+                to
+            );
+        }
     }
 
     #[tokio::test]

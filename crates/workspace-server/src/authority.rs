@@ -1,6 +1,8 @@
 use std::{path::PathBuf, sync::Arc};
 
-use chrono::{DateTime, Utc};
+#[cfg(test)]
+use chrono::DateTime;
+use chrono::Utc;
 use merge_request::{
     MergeRequest, MergeRequestState, MergeRequestStore, MergeRequestThreadEvent, ReviewDecision,
 };
@@ -146,7 +148,7 @@ impl merge_request::AssignmentSource for AuthorityMergeRequestSource {
         ticket_id: &str,
     ) -> std::result::Result<Option<merge_request::CurrentAssignment>, String> {
         self.store
-            .get_current_ticket_coder_assignment(workspace_id, ticket_id)
+            .get_active_ticket_worker_assignment(workspace_id, ticket_id)
             .map(|assignment| {
                 assignment.map(|assignment| merge_request::CurrentAssignment {
                     assignment_id: assignment.assignment_id,
@@ -173,14 +175,27 @@ impl merge_request::RepositorySource for AuthorityMergeRequestSource {
 }
 
 pub trait TicketMergeRevisionSource: Send + Sync {
-    fn resolve_subject_ref(&self, repository_id: &str, selector: &str) -> Option<String>;
+    fn resolve_subject_ref(
+        &self,
+        ticket_id: &str,
+        repository_id: &str,
+        selector: &str,
+    ) -> std::result::Result<String, server_api::MergeRequestRefDiagnostic>;
 }
 
 struct UnresolvedTicketMergeRevisionSource;
 
 impl TicketMergeRevisionSource for UnresolvedTicketMergeRevisionSource {
-    fn resolve_subject_ref(&self, _repository_id: &str, _selector: &str) -> Option<String> {
-        None
+    fn resolve_subject_ref(
+        &self,
+        _ticket_id: &str,
+        _repository_id: &str,
+        _selector: &str,
+    ) -> std::result::Result<String, server_api::MergeRequestRefDiagnostic> {
+        Err(server_api::MergeRequestRefDiagnostic {
+            code: "source_ref_runtime_unavailable".into(),
+            message: "No Runtime source observer is configured".into(),
+        })
     }
 }
 
@@ -437,100 +452,25 @@ impl SqliteWorkspaceAuthority {
               AND ((relation.ticket_id=t.ticket_id AND relation.kind='depends_on')
                 OR (relation.target=t.ticket_id AND relation.kind='blocks'))
               AND blocker.workflow_state NOT IN ('queued','inprogress','done','closed'))";
-        let report_index = "(SELECT max(event.event_index) FROM typed_ticket_events event WHERE event.workspace_id=t.workspace_id AND event.ticket_id=t.ticket_id AND event.kind='implementation_report')";
-        let edit_index = "(SELECT max(event.event_index) FROM typed_ticket_events event WHERE event.workspace_id=t.workspace_id AND event.ticket_id=t.ticket_id AND event.kind='item_edit')";
-        let current_report = format!(
-            "({report_index} IS NOT NULL AND ({edit_index} IS NULL OR {report_index}>={edit_index}))"
-        );
-        let merge_request_id = "(SELECT relation.merge_request_id FROM merge_request_ticket_relations relation
-            JOIN merge_requests request ON request.workspace_id=relation.workspace_id AND request.merge_request_id=relation.merge_request_id
-            WHERE relation.workspace_id=t.workspace_id AND relation.ticket_id=t.ticket_id
-            ORDER BY CASE WHEN request.state='open' THEN 0 ELSE 1 END, request.created_at DESC LIMIT 1)";
-        let review_subject = format!(
-            "(SELECT json_extract(requested.payload_json,'$.subject_ref')
-            FROM merge_request_thread_events requested
-            WHERE requested.workspace_id=t.workspace_id
-              AND requested.merge_request_id={merge_request_id}
-              AND requested.kind='review_requested'
-            ORDER BY requested.sequence DESC LIMIT 1)"
-        );
-        let review_decision = format!(
-            "(SELECT json_extract(event.payload_json,'$.decision')
-            FROM merge_request_thread_events event
-            WHERE event.workspace_id=t.workspace_id
-              AND event.merge_request_id={merge_request_id} AND event.kind='review'
-              AND json_extract(event.payload_json,'$.subject_ref')={review_subject}
-              AND NOT EXISTS (SELECT 1 FROM merge_request_thread_events revoked
-                WHERE revoked.workspace_id=event.workspace_id
-                  AND revoked.merge_request_id=event.merge_request_id
-                  AND revoked.kind='review_revoked'
-                  AND json_extract(revoked.payload_json,'$.review_event_id')=event.event_id)
-            ORDER BY event.sequence DESC LIMIT 1)"
-        );
-        let review_status = format!(
-            "CASE WHEN {merge_request_id} IS NULL THEN 'none' WHEN {review_decision}='approve' THEN 'approved' WHEN {review_decision}='request_changes' THEN 'request_changes' ELSE 'pending' END"
-        );
-        let has_commit = format!(
-            "({review_subject} IS NOT NULL OR EXISTS (SELECT 1 FROM typed_ticket_event_references reference WHERE reference.workspace_id=t.workspace_id AND reference.ticket_id=t.ticket_id AND reference.kind='commit'))"
-        );
         if !query.event_kinds.is_empty() {
             let event_kinds = query
                 .event_kinds
                 .iter()
-                .map(|event_kind| bind(SqlValue::Text(event_kind.clone())))
+                .map(|kind| bind(SqlValue::Text(kind.clone())))
                 .collect::<Vec<_>>();
             predicates.push(format!("EXISTS (SELECT 1 FROM typed_ticket_events event WHERE event.workspace_id=t.workspace_id AND event.ticket_id=t.ticket_id AND event.kind IN ({}))", event_kinds.join(",")));
         }
-        for evidence in &query.evidence {
-            predicates.push(match evidence.as_str() {
-                "implementation_report" => format!("{report_index} IS NOT NULL"),
-                "implementation_report_after_rescope" => current_report.clone(),
-                "merge_request" => format!("{merge_request_id} IS NOT NULL"),
-                "commit" => has_commit.clone(),
-                "approved_review" => format!("{review_status}='approved'"),
-                other => {
-                    return Err(Error::InvalidRecordId(format!(
-                        "unsupported evidence filter `{other}`"
-                    )));
-                }
-            });
-        }
-        if let Some(status) = &query.review_status {
-            let status = if matches!(status.as_str(), "unresolved_changes" | "changes_requested") {
-                "request_changes"
-            } else {
-                status.as_str()
-            };
-            let status = bind(SqlValue::Text(status.to_string()));
-            predicates.push(format!("{review_status}={status}"));
-        }
+        // SQL only narrows immutable Ticket metadata. Review/evidence filters
+        // must use the same provider + complete linked-result projection as ShowTicket;
+        // a primary-MR/latest-request or implementation-report heuristic loses candidates.
         for attention in &query.attention {
-            predicates.push(match attention.as_str() {
-                "done_not_closed" => "t.workflow_state='done'".to_string(),
-                "implementation_report_not_closed" => {
-                    format!("{report_index} IS NOT NULL AND t.workflow_state!='closed'")
-                }
-                "report_after_rescope" => current_report.clone(),
-                "unresolved_review" | "unresolved_changes" => {
-                    format!("{review_status}='request_changes'")
-                }
-                "missing_commit" => format!("NOT {has_commit}"),
-                "blocked" => blocker.to_string(),
-                "unblocked" => format!("NOT {blocker}"),
-                "ready" => format!("t.workflow_state='ready' AND NOT {blocker}"),
-                "awaiting_review" => format!("{review_status}='pending'"),
-                "stale_after_rescope" => {
-                    format!("{report_index} IS NOT NULL AND NOT {current_report}")
-                }
-                "missing_evidence" => format!(
-                    "NOT ({current_report} AND {has_commit} AND {review_status}='approved')"
-                ),
-                other => {
-                    return Err(Error::InvalidRecordId(format!(
-                        "unsupported attention filter `{other}`"
-                    )));
-                }
-            });
+            match attention.as_str() {
+                "done_not_closed" => predicates.push("t.workflow_state='done'".into()),
+                "blocked" => predicates.push(blocker.into()),
+                "unblocked" => predicates.push(format!("NOT {blocker}")),
+                "ready" => predicates.push(format!("t.workflow_state='ready' AND NOT {blocker}")),
+                _ => {} // live evidence is evaluated after observation
+            }
         }
         let rank_expression = match sort {
             TicketQuerySort::Priority => format!(
@@ -831,10 +771,15 @@ impl SqliteWorkspaceAuthority {
                 })
             })
             .transpose()?;
-        let has_orchestrator = role_assignments
+        // Responsibility remains visible after work ends; action eligibility must
+        // use only active unfinished work, including after a Ticket is reopened.
+        let active_role_assignments = self
+            .store
+            .list_active_ticket_role_assignments(&self.workspace_id, id)?;
+        let has_orchestrator = active_role_assignments
             .iter()
             .any(|assignment| assignment.role == TicketAssignmentRole::Orchestrator);
-        let has_coder = role_assignments
+        let has_coder = active_role_assignments
             .iter()
             .any(|assignment| assignment.role == TicketAssignmentRole::Coder);
         let targets = ticket
@@ -856,27 +801,6 @@ impl SqliteWorkspaceAuthority {
         let write_repository_keys = ticket_write_target_repository_keys(&targets);
         let has_target = !write_repository_keys.is_empty();
         let has_blockers = !ticket.relations.blockers.is_empty();
-        let mut queue_assignment_blockers = Vec::new();
-        for ticket_id in &dependency_check.queue_tickets {
-            let assignments = self
-                .store
-                .list_current_ticket_role_assignments(&self.workspace_id, ticket_id)?;
-            if !assignments
-                .iter()
-                .any(|assignment| assignment.role == TicketAssignmentRole::Orchestrator)
-            {
-                queue_assignment_blockers.push(format!(
-                    "Ticket {ticket_id} requires an active Orchestrator assignment"
-                ));
-            }
-            if assignments
-                .iter()
-                .any(|assignment| assignment.role == TicketAssignmentRole::Coder)
-            {
-                queue_assignment_blockers
-                    .push(format!("Ticket {ticket_id} has an active Coder assignment"));
-            }
-        }
         let mut assignment_diagnostics = Vec::new();
         if let Some(legacy_assignee) = ticket
             .meta
@@ -888,19 +812,7 @@ impl SqliteWorkspaceAuthority {
                 "legacy Ticket assignee `{legacy_assignee}` is not assignment authority"
             ));
         }
-        let mut action_blockers = Vec::new();
-        if !has_target {
-            action_blockers.push("Ticket target is required".to_string());
-        }
-        if !dependency_check.queue_guard.can_queue_for_orchestrator {
-            if let Some(reason) = dependency_check.queue_guard.blocked_reason.clone() {
-                action_blockers.push(reason);
-            } else if let Some(reason) = dependency_check.queue_guard.reason.clone() {
-                action_blockers.push(reason);
-            }
-        }
-        let queue_assignments_valid = queue_assignment_blockers.is_empty();
-        action_blockers.extend(queue_assignment_blockers);
+        let action_blockers = Vec::new();
         let action_eligibility = TicketActionEligibility {
             can_assign_orchestrator: matches!(
                 ticket.meta.workflow_state,
@@ -912,12 +824,7 @@ impl SqliteWorkspaceAuthority {
                     ticket.meta.workflow_state,
                     TicketWorkflowState::Planning | TicketWorkflowState::Ready
                 ),
-            can_queue: ticket.meta.workflow_state == TicketWorkflowState::Ready
-                && has_orchestrator
-                && !has_coder
-                && has_target
-                && dependency_check.queue_guard.can_queue_for_orchestrator
-                && queue_assignments_valid,
+            can_queue: true,
             can_start_manual_coder: ticket.meta.workflow_state == TicketWorkflowState::Ready
                 && !has_orchestrator
                 && !has_coder
@@ -926,31 +833,49 @@ impl SqliteWorkspaceAuthority {
             queue_tickets: dependency_check.queue_tickets.clone(),
             blockers: action_blockers,
         };
-        let merge_requests = self
+        let requests = self
             .merge_request_store
             .list_for_ticket(&self.workspace_id, id)
-            .map_err(|error| Error::Store(error.to_string()))?
-            .into_iter()
+            .map_err(|error| Error::Store(error.to_string()))?;
+        let merge_requests = requests
+            .iter()
             .map(|request| {
-                let current_subject_ref = request.selector_from.as_deref().and_then(|selector| {
-                    self.merge_revision_source
-                        .resolve_subject_ref(&request.repository_id, selector)
-                });
+                // Integrated results never require observation of a mutable branch.
+                let observation = if request.state == MergeRequestState::Open {
+                    request.selector_from.as_deref().map_or_else(
+                        || {
+                            Err(server_api::MergeRequestRefDiagnostic {
+                                code: "source_ref_selector_missing".into(),
+                                message: "Open Merge Request has no source selector".into(),
+                            })
+                        },
+                        |selector| {
+                            self.merge_revision_source.resolve_subject_ref(
+                                id,
+                                &request.repository_id,
+                                selector,
+                            )
+                        },
+                    )
+                } else {
+                    Err(server_api::MergeRequestRefDiagnostic {
+                        code: "not_required".into(),
+                        message: String::new(),
+                    })
+                };
                 let repository_key = self
                     .store
                     .get_repository(&self.workspace_id, &request.repository_id)?
                     .map(|repository| repository.repository_key)
                     .ok_or_else(|| Error::UnknownRepository(request.repository_id.clone()))?;
                 Ok(merge_request_summary(
-                    request,
+                    request.clone(),
                     repository_key,
-                    current_subject_ref,
+                    observation,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
         let merge_request = (merge_requests.len() == 1).then(|| merge_requests[0].clone());
-        let evidence =
-            ticket_evidence_summary(&write_repository_keys, &ticket.events, &merge_requests);
         let item_revision = ticket
             .events
             .iter()
@@ -959,6 +884,13 @@ impl SqliteWorkspaceAuthority {
             .and_then(|event| event.attributes.get("event_id").cloned())
             .or_else(|| ticket.meta.updated_at.clone())
             .unwrap_or_else(|| format!("{}:0", ticket.meta.id));
+        let requirement_approved =
+            ticket_requirement_approved(&requests, &merge_requests, &item_revision);
+        let evidence = ticket_evidence_summary(
+            &write_repository_keys,
+            &merge_requests,
+            requirement_approved,
+        );
         let resource_key = ticket
             .meta
             .resource_key
@@ -1141,10 +1073,11 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
             .transpose()?;
         let candidate_limit = limit.saturating_add(1);
         let candidate_ids =
-            self.query_ticket_candidate_ids(&query, sort, cursor.as_ref(), candidate_limit)?;
-        let source_truncated = candidate_ids.len() == candidate_limit;
+            self.query_ticket_candidate_ids(&query, sort, cursor.as_ref(), candidate_limit + 1)?;
+        let source_truncated = candidate_ids.len() > candidate_limit;
         let mut items = Vec::new();
-        for ticket_id in candidate_ids {
+        let mut last_scanned_cursor = None;
+        for ticket_id in candidate_ids.into_iter().take(candidate_limit) {
             let authoritative = self
                 .ticket_backend
                 .show(TicketIdOrSlug::Id(ticket_id.clone()))?;
@@ -1159,35 +1092,43 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
                 },
                 &self.ticket_backend,
             )?;
-            if ticket_matches_query(
+            let matches = ticket_matches_query(
                 &summary,
                 &detail,
                 authoritative_body.as_str(),
                 &authoritative_events,
                 &query,
-            ) {
-                items.push(ticket_query_item(
-                    summary,
-                    &detail,
-                    authoritative_body.as_str(),
-                    &authoritative_events,
-                    &query,
-                ));
+            );
+            let item = ticket_query_item(
+                summary,
+                &detail,
+                authoritative_body.as_str(),
+                &authoritative_events,
+                &query,
+            );
+            last_scanned_cursor = Some(make_ticket_cursor(&item, sort, &fingerprint));
+            if matches {
+                items.push(item);
             }
         }
         sort_ticket_query_items(&mut items, sort);
         if let Some(cursor) = cursor {
             items.retain(|item| ticket_item_after_cursor(item, sort, &cursor));
         }
-        let has_more = items.len() > limit;
+        let matches_truncated = items.len() > limit;
+        let has_more = matches_truncated || source_truncated;
         items.truncate(limit);
-        let next_cursor = has_more
-            .then(|| {
-                items
-                    .last()
-                    .map(|item| make_ticket_cursor(item, sort, &fingerprint))
-            })
-            .flatten();
+        // A bounded scan can contain no matches. Continue after the last scanned
+        // candidate rather than falsely reporting exhaustion or losing later matches.
+        let next_cursor = if matches_truncated {
+            items
+                .last()
+                .map(|item| make_ticket_cursor(item, sort, &fingerprint))
+        } else if source_truncated {
+            last_scanned_cursor
+        } else {
+            None
+        };
         Ok(TicketQueryResponse {
             page: QueryPage {
                 limit,
@@ -1766,15 +1707,52 @@ fn ticket_evidence_event(sequence: usize, event: &TicketEvent) -> TicketEvidence
 pub(crate) fn merge_request_summary(
     request: MergeRequest,
     repository_key: String,
-    current_subject_ref: Option<String>,
+    source_observation: std::result::Result<String, server_api::MergeRequestRefDiagnostic>,
 ) -> TicketMergeRequestSummary {
+    let (current_subject_ref, source_ref_observation, integration_evidence_error) =
+        if request.state == MergeRequestState::Merged {
+            (
+                request
+                    .merged_result()
+                    .ok()
+                    .map(|merge| merge.approved_source_ref.clone()),
+                server_api::TicketSourceRefObservation::NotRequired {},
+                request
+                    .integration_approval()
+                    .err()
+                    .map(|error| error.code().to_string()),
+            )
+        } else if request.state == MergeRequestState::Closed {
+            (
+                None,
+                server_api::TicketSourceRefObservation::NotRequired {},
+                None,
+            )
+        } else {
+            match source_observation {
+                Ok(subject) => (
+                    Some(subject),
+                    server_api::TicketSourceRefObservation::Observed {},
+                    None,
+                ),
+                Err(error) => (
+                    None,
+                    server_api::TicketSourceRefObservation::Unavailable { code: error.code },
+                    None,
+                ),
+            }
+        };
     let latest_review_request = request.thread.iter().rev().find_map(|event| match event {
         MergeRequestThreadEvent::ReviewRequested(review) => Some(review),
         _ => None,
     });
-    let current_review = current_subject_ref
-        .as_deref()
-        .and_then(|subject_ref| request.effective_review(subject_ref));
+    let current_review = if request.state == MergeRequestState::Merged {
+        request.integration_approval().ok()
+    } else {
+        current_subject_ref
+            .as_deref()
+            .and_then(|subject_ref| request.effective_review(subject_ref))
+    };
     let current_review_request = current_review
         .and_then(|review| {
             request.thread.iter().find_map(|event| match event {
@@ -1798,11 +1776,19 @@ pub(crate) fn merge_request_summary(
                 })
             })
         });
-    let review_status = match current_review.map(|review| &review.decision) {
-        Some(ReviewDecision::Approve) => "approved",
-        Some(ReviewDecision::RequestChanges) => "changes_requested",
-        None if latest_review_request.is_some() => "pending",
-        None => "none",
+    let review_status = if integration_evidence_error.is_some()
+        || matches!(
+            source_ref_observation,
+            server_api::TicketSourceRefObservation::Unavailable { .. }
+        ) {
+        "unknown"
+    } else {
+        match current_review.map(|review| &review.decision) {
+            Some(ReviewDecision::Approve) => "approved",
+            Some(ReviewDecision::RequestChanges) => "changes_requested",
+            None if latest_review_request.is_some() => "pending",
+            None => "none",
+        }
     }
     .to_string();
     let state = match request.state {
@@ -1821,7 +1807,11 @@ pub(crate) fn merge_request_summary(
         selector_to: request.selector_to.clone(),
         updated_at: request.updated_at.to_rfc3339(),
         current_subject_ref,
-        review_subject_ref: latest_review_request.map(|review| review.subject_ref.clone()),
+        source_ref_observation,
+        integration_evidence_error,
+        review_subject_ref: current_review_request
+            .or(latest_review_request)
+            .map(|review| review.subject_ref.clone()),
         review_requested_at: current_review_request.map(|review| review.created_at.to_rfc3339()),
         review_submitted_at: current_review.map(|review| review.created_at.to_rfc3339()),
         review_excerpt: current_review.map(|review| truncate_body(&review.body, 240).0),
@@ -1843,14 +1833,6 @@ fn substantive_item_edit(event: &TicketEvent) -> bool {
         .any(|field| matches!(field, "title" | "body" | "target" | "targets"))
 }
 
-fn event_timestamp(event: &TicketEvent) -> Option<DateTime<Utc>> {
-    event
-        .at
-        .as_deref()
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| value.with_timezone(&Utc))
-}
-
 fn ticket_write_target_repository_keys(targets: &[ticket::TicketTarget]) -> Vec<&str> {
     targets
         .iter()
@@ -1859,102 +1841,104 @@ fn ticket_write_target_repository_keys(targets: &[ticket::TicketTarget]) -> Vec<
         .collect()
 }
 
+fn ticket_requirement_approved(
+    requests: &[MergeRequest],
+    summaries: &[TicketMergeRequestSummary],
+    item_revision: &str,
+) -> bool {
+    let subjects = summaries
+        .iter()
+        .map(|request| {
+            request.current_subject_ref.as_ref().map(|subject_ref| {
+                merge_request::MergeRequestReviewSubject {
+                    merge_request_id: request.merge_request_id.clone(),
+                    subject_ref: subject_ref.clone(),
+                }
+            })
+        })
+        .collect::<Option<Vec<_>>>();
+    subjects.is_some_and(|subjects| {
+        merge_request::requirement_approval(requests, item_revision, &subjects, None).is_ok()
+    })
+}
+
 fn ticket_evidence_summary(
-    ticket_write_repository_keys: &[&str],
-    events: &[TicketEvent],
+    _ticket_write_repository_keys: &[&str],
     merge_requests: &[TicketMergeRequestSummary],
+    requirement_approved: bool,
 ) -> TicketEvidenceSummary {
     let relevant = merge_requests
         .iter()
-        .filter(|request| {
-            request.state != "closed"
-                && ticket_write_repository_keys.contains(&request.repository_key.as_str())
-        })
+        .filter(|request| request.state != "closed")
         .collect::<Vec<_>>();
     let has_merge_request = !relevant.is_empty();
     let has_current_subject_ref = has_merge_request
         && relevant.iter().all(|request| {
-            request.state == "merged"
-                || request
-                    .current_subject_ref
-                    .as_deref()
-                    .is_some_and(|subject_ref| !subject_ref.is_empty())
+            request
+                .current_subject_ref
+                .as_deref()
+                .is_some_and(|subject| !subject.is_empty())
         });
     let has_review_request = has_merge_request
-        && relevant.iter().all(|request| {
-            request.state == "merged"
-                || request
-                    .review_subject_ref
-                    .as_deref()
-                    .is_some_and(|subject_ref| !subject_ref.is_empty())
-        });
+        && relevant
+            .iter()
+            .all(|request| request.review_subject_ref.is_some());
     let has_commit = has_current_subject_ref;
     let unresolved_request_changes = relevant
         .iter()
         .any(|request| request.review_status == "changes_requested");
     let approved_current_subject = has_merge_request
-        && relevant
-            .iter()
-            .all(|request| request.state == "merged" || request.review_status == "approved");
+        && relevant.iter().all(|request| {
+            request.review_status == "approved" && request.integration_evidence_error.is_none()
+        });
+    let observation_unavailable = relevant.iter().any(|request| {
+        matches!(
+            request.source_ref_observation,
+            server_api::TicketSourceRefObservation::Unavailable { .. }
+        )
+    });
+    // Exact revision/snapshot attestation, not a timestamp heuristic.
+    let review_after_rescope = approved_current_subject && requirement_approved;
     let review_status = if !has_merge_request {
         None
+    } else if observation_unavailable
+        || relevant
+            .iter()
+            .any(|request| request.integration_evidence_error.is_some())
+    {
+        Some("unknown".into())
     } else if unresolved_request_changes {
-        Some("changes_requested".to_string())
-    } else if approved_current_subject {
-        Some("approved".to_string())
+        Some("changes_requested".into())
+    } else if review_after_rescope {
+        Some("approved".into())
     } else {
-        Some("pending".to_string())
+        Some("pending".into())
     };
-    let latest_rescope = events
-        .iter()
-        .filter(|event| substantive_item_edit(event))
-        .last();
-    let review_after_rescope = approved_current_subject
-        && relevant.iter().all(|request| {
-            latest_rescope.is_none_or(|rescope| {
-                let Some(rescope_at) = event_timestamp(rescope) else {
-                    return false;
-                };
-                let Some(requested_at) = request
-                    .review_requested_at
-                    .as_deref()
-                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-                    .map(|value| value.with_timezone(&Utc))
-                else {
-                    return false;
-                };
-                let Some(reviewed_at) = request
-                    .review_submitted_at
-                    .as_deref()
-                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-                    .map(|value| value.with_timezone(&Utc))
-                else {
-                    return false;
-                };
-                requested_at > rescope_at && reviewed_at > rescope_at
-            })
-        });
-
     let mut missing = Vec::new();
-    if !has_merge_request {
-        missing.push("merge_request".to_string());
+    if observation_unavailable {
+        missing.push("source_ref_unavailable".into());
     }
-    if !has_current_subject_ref {
-        missing.push("current_subject_ref".to_string());
+    if relevant
+        .iter()
+        .any(|request| request.integration_evidence_error.is_some())
+    {
+        missing.push("integration_evidence".into());
     }
-    if !has_commit {
-        missing.push("commit".to_string());
+    if has_merge_request && !has_current_subject_ref {
+        missing.push("current_subject_ref".into());
+    }
+    if has_merge_request && !has_commit {
+        missing.push("commit".into());
     }
     if unresolved_request_changes {
-        missing.push("unresolved_request_changes".to_string());
+        missing.push("unresolved_request_changes".into());
     }
-    if !approved_current_subject {
-        missing.push("approved_current_subject".to_string());
+    if has_merge_request && !approved_current_subject {
+        missing.push("approved_current_subject".into());
     }
-    if approved_current_subject && !review_after_rescope {
-        missing.push("review_after_rescope".to_string());
+    if approved_current_subject && !requirement_approved {
+        missing.push("review_after_rescope".into());
     }
-
     TicketEvidenceSummary {
         has_merge_request,
         has_current_subject_ref,
@@ -1964,7 +1948,7 @@ fn ticket_evidence_summary(
         approved_current_subject,
         review_after_rescope,
         unresolved_request_changes,
-        complete_for_integration: missing.is_empty(),
+        complete_for_integration: has_merge_request && missing.is_empty(),
         missing,
     }
 }
@@ -2010,6 +1994,7 @@ fn validate_ticket_query(query: &TicketQueryRequest) -> Result<()> {
         && !matches!(
             status,
             "none"
+                | "unknown"
                 | "pending"
                 | "approved"
                 | "request_changes"
@@ -2143,7 +2128,7 @@ fn ticket_evidence_matches(evidence: &TicketEvidenceSummary, filter: &str) -> bo
     match filter {
         "merge_request" => evidence.has_merge_request,
         "commit" => evidence.has_commit,
-        "approved_review" => evidence.approved_current_subject,
+        "approved_review" => evidence.review_after_rescope,
         _ => false,
     }
 }
@@ -2167,9 +2152,13 @@ fn ticket_attention_matches(
         }
         "unresolved_changes" => evidence.unresolved_request_changes,
         "stale_after_rescope" => {
-            authoritative_events.iter().any(substantive_item_edit) && !evidence.review_after_rescope
+            authoritative_events.iter().any(substantive_item_edit)
+                && evidence
+                    .missing
+                    .iter()
+                    .any(|reason| reason == "review_after_rescope")
         }
-        "missing_evidence" => !evidence.complete_for_integration,
+        "missing_evidence" => evidence.has_merge_request && !evidence.complete_for_integration,
         _ => false,
     }
 }
@@ -2877,253 +2866,331 @@ mod tests {
         }
     }
 
-    #[test]
-    fn merge_request_summary_uses_the_provider_resolved_current_subject() {
-        let approved = merge_request_summary(
-            reviewed_merge_request(ReviewDecision::Approve, false),
-            "main".to_string(),
-            Some("commit-1".to_string()),
-        );
-        assert_eq!(approved.review_status, "approved");
-        assert_eq!(approved.current_subject_ref.as_deref(), Some("commit-1"));
-        assert_eq!(
-            approved.review_requested_at.as_deref(),
-            Some("2026-01-01T00:03:00+00:00")
-        );
+    fn unavailable_source(
+        code: &str,
+    ) -> std::result::Result<String, server_api::MergeRequestRefDiagnostic> {
+        Err(server_api::MergeRequestRefDiagnostic {
+            code: code.into(),
+            message: "Provider unavailable".into(),
+        })
+    }
 
-        let moved = merge_request_summary(
-            reviewed_merge_request(ReviewDecision::Approve, false),
-            "main".to_string(),
-            Some("commit-2".to_string()),
-        );
-        assert_eq!(moved.review_status, "pending");
-        assert_eq!(moved.current_subject_ref.as_deref(), Some("commit-2"));
-        assert_eq!(moved.review_subject_ref.as_deref(), Some("commit-1"));
-        assert_eq!(moved.review_submitted_at, None);
+    fn merged_request() -> MergeRequest {
+        let mut request = reviewed_merge_request(ReviewDecision::Approve, false);
+        request.state = MergeRequestState::Merged;
+        request
+            .thread
+            .push(MergeRequestThreadEvent::Merge(merge_request::MergeEvent {
+                event_id: "merge-1".into(),
+                sequence: 3,
+                operation_id: "operation-1".into(),
+                approval_event_id: "review-1".into(),
+                approved_source_ref: "commit-1".into(),
+                target_ref_before: "target-1".into(),
+                target_ref_after: "commit-1".into(),
+                strategy: merge_request::MergeStrategy::FastForward,
+                resolution: merge_request::ConflictResolution::None,
+                merged_by: actor(),
+                created_at: request.updated_at,
+            }));
+        request
+    }
+
+    fn project_evidence(
+        requests: &[MergeRequest],
+        revision: &str,
+        observations: &[std::result::Result<String, server_api::MergeRequestRefDiagnostic>],
+    ) -> (Vec<TicketMergeRequestSummary>, TicketEvidenceSummary) {
+        let summaries = requests
+            .iter()
+            .zip(observations)
+            .map(|(request, observation)| {
+                merge_request_summary(
+                    request.clone(),
+                    request.repository_id.clone(),
+                    observation.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let approved = ticket_requirement_approved(requests, &summaries, revision);
+        let evidence = ticket_evidence_summary(&["main", "other"], &summaries, approved);
+        (summaries, evidence)
     }
 
     #[test]
-    fn ticket_target_projection_accepts_multiple_write_targets() {
-        let target = |repository_key: &str, access| ticket::TicketTarget {
-            repository_key: repository_key.to_string(),
-            ref_selector: Some("develop".to_string()),
-            access,
-        };
-
-        assert!(ticket_write_target_repository_keys(&[]).is_empty());
-        assert!(
-            ticket_write_target_repository_keys(&[target(
-                "docs",
-                ticket::TicketTargetAccess::ReadOnly,
-            )])
-            .is_empty()
-        );
-
-        let one_write = [
-            target("main", ticket::TicketTargetAccess::ReadWrite),
-            target("docs", ticket::TicketTargetAccess::ReadOnly),
-        ];
-        assert_eq!(
-            ticket_write_target_repository_keys(&one_write),
-            vec!["main"]
-        );
-
-        let two_writes = [
-            target("main", ticket::TicketTargetAccess::ReadWrite),
-            target("docs", ticket::TicketTargetAccess::ReadWrite),
-        ];
-        assert_eq!(
-            ticket_write_target_repository_keys(&two_writes),
-            vec!["main", "docs"]
-        );
+    fn open_source_movement_changes_and_revocation_fail_closed() {
+        for (decision, revoked, source, approved, changes) in [
+            (ReviewDecision::Approve, false, "commit-1", true, false),
+            (ReviewDecision::Approve, false, "commit-2", false, false),
+            (ReviewDecision::Approve, true, "commit-1", false, false),
+            (
+                ReviewDecision::RequestChanges,
+                false,
+                "commit-1",
+                false,
+                true,
+            ),
+        ] {
+            let (summaries, evidence) = project_evidence(
+                &[reviewed_merge_request(decision, revoked)],
+                "revision-1",
+                &[Ok(source.into())],
+            );
+            assert_eq!(evidence.complete_for_integration, approved);
+            assert_eq!(evidence.unresolved_request_changes, changes);
+            assert_eq!(summaries[0].current_subject_ref.as_deref(), Some(source));
+            assert_eq!(
+                ticket_evidence_matches(&evidence, "approved_review"),
+                approved
+            );
+        }
     }
 
     #[test]
-    fn ticket_evidence_is_tied_only_to_the_write_target() {
-        let read_only_request = merge_request_summary(
-            reviewed_merge_request(ReviewDecision::Approve, false),
-            "docs".to_string(),
-            Some("commit-1".to_string()),
-        );
-        let evidence =
-            ticket_evidence_summary(&["main"], &[], std::slice::from_ref(&read_only_request));
-
-        assert!(!evidence.has_merge_request);
-        assert!(!evidence.complete_for_integration);
-        assert!(evidence.missing.contains(&"merge_request".to_string()));
-    }
-
-    #[test]
-    fn ticket_readiness_requires_current_unrevoked_approval_without_a_report() {
-        let approved = merge_request_summary(
-            reviewed_merge_request(ReviewDecision::Approve, false),
-            "main".to_string(),
-            Some("commit-1".to_string()),
-        );
-        let evidence = ticket_evidence_summary(&["main"], &[], std::slice::from_ref(&approved));
-        assert!(evidence.complete_for_integration);
-        assert!(evidence.approved_current_subject);
-        assert!(evidence.review_after_rescope);
-        assert!(evidence.has_commit);
-
-        let with_audit_events = ticket_evidence_summary(
-            &["main"],
-            &[
-                ticket_event("comment", "2026-01-01T00:05:00Z", None),
-                ticket_event("implementation_report", "2026-01-01T00:06:00Z", None),
-            ],
-            std::slice::from_ref(&approved),
-        );
-        assert!(with_audit_events.complete_for_integration);
-
-        let revoked = merge_request_summary(
-            reviewed_merge_request(ReviewDecision::Approve, true),
-            "main".to_string(),
-            Some("commit-1".to_string()),
-        );
-        let evidence = ticket_evidence_summary(&["main"], &[], std::slice::from_ref(&revoked));
-        assert!(!evidence.approved_current_subject);
-        assert!(!evidence.complete_for_integration);
-
-        let changes = merge_request_summary(
-            reviewed_merge_request(ReviewDecision::RequestChanges, false),
-            "main".to_string(),
-            Some("commit-1".to_string()),
-        );
-        let evidence = ticket_evidence_summary(&["main"], &[], std::slice::from_ref(&changes));
-        assert!(evidence.unresolved_request_changes);
-        assert!(!evidence.complete_for_integration);
-    }
-
-    #[test]
-    fn ticket_readiness_fails_closed_for_missing_or_closed_current_merge_request() {
-        let unresolved = merge_request_summary(
-            reviewed_merge_request(ReviewDecision::Approve, false),
-            "main".to_string(),
-            None,
-        );
-        let evidence = ticket_evidence_summary(&["main"], &[], std::slice::from_ref(&unresolved));
-        assert!(!evidence.has_current_subject_ref);
-        assert!(!evidence.has_commit);
-        assert!(!evidence.complete_for_integration);
-
-        let mut closed_request = reviewed_merge_request(ReviewDecision::Approve, false);
-        closed_request.state = MergeRequestState::Closed;
-        let closed = merge_request_summary(
-            closed_request,
-            "main".to_string(),
-            Some("commit-1".to_string()),
-        );
-        let evidence = ticket_evidence_summary(&["main"], &[], std::slice::from_ref(&closed));
-        assert!(!evidence.has_merge_request);
-        assert!(!evidence.complete_for_integration);
-        assert!(evidence.missing.contains(&"merge_request".to_string()));
-    }
-
-    #[test]
-    fn ticket_readiness_requires_request_and_approval_after_substantive_rescope() {
-        let approved = merge_request_summary(
-            reviewed_merge_request(ReviewDecision::Approve, false),
-            "main".to_string(),
-            Some("commit-1".to_string()),
-        );
-        let fresh = ticket_evidence_summary(
-            &["main"],
-            &[ticket_event(
-                "item_edit",
-                "2026-01-01T00:02:00Z",
-                Some("body"),
-            )],
-            std::slice::from_ref(&approved),
-        );
-        assert!(fresh.review_after_rescope);
-        assert!(fresh.complete_for_integration);
-
-        let stale = ticket_evidence_summary(
-            &["main"],
-            &[ticket_event(
-                "item_edit",
-                "2026-01-01T00:05:00Z",
-                Some("title"),
-            )],
-            std::slice::from_ref(&approved),
-        );
-        assert!(!stale.review_after_rescope);
-        assert!(!stale.complete_for_integration);
-        assert!(stale.missing.contains(&"review_after_rescope".to_string()));
-
-        let metadata_only = ticket_evidence_summary(
-            &["main"],
-            &[ticket_event(
-                "item_edit",
-                "2026-01-01T00:05:00Z",
-                Some("formatter"),
-            )],
-            std::slice::from_ref(&approved),
-        );
-        assert!(metadata_only.complete_for_integration);
-    }
-
-    #[test]
-    fn ticket_query_filters_map_to_current_merge_request_evidence() {
-        let approved_summary = merge_request_summary(
-            reviewed_merge_request(ReviewDecision::Approve, false),
-            "main".to_string(),
-            Some("commit-1".to_string()),
-        );
-        let approved =
-            ticket_evidence_summary(&["main"], &[], std::slice::from_ref(&approved_summary));
-        assert!(ticket_evidence_matches(&approved, "merge_request"));
-        assert!(ticket_evidence_matches(&approved, "commit"));
-        assert!(ticket_evidence_matches(&approved, "approved_review"));
-        assert!(!ticket_attention_matches(
-            "inprogress",
-            &approved,
-            false,
-            &[],
-            "missing_evidence",
-        ));
-
-        let pending_summary = merge_request_summary(
-            reviewed_merge_request(ReviewDecision::Approve, false),
-            "main".to_string(),
-            Some("commit-2".to_string()),
-        );
-        let pending =
-            ticket_evidence_summary(&["main"], &[], std::slice::from_ref(&pending_summary));
-        assert!(ticket_attention_matches(
-            "inprogress",
-            &pending,
-            false,
-            &[],
-            "awaiting_review",
-        ));
-        assert!(!ticket_evidence_matches(&pending, "approved_review"));
-
-        let stale_events = vec![ticket_event(
+    fn unobservable_open_source_is_unknown_not_stale_after_rescope() {
+        let events = [ticket_event(
             "item_edit",
             "2026-01-01T00:05:00Z",
-            Some("targets"),
+            Some("body"),
         )];
-        let stale = ticket_evidence_summary(
-            &["main"],
-            &stale_events,
-            std::slice::from_ref(&approved_summary),
+        let (summaries, evidence) = project_evidence(
+            &[reviewed_merge_request(ReviewDecision::Approve, false)],
+            "revision-2",
+            &[unavailable_source("source_ref_provider_timeout")],
         );
-        assert!(ticket_attention_matches(
-            "inprogress",
-            &stale,
+        assert!(
+            matches!(&summaries[0].source_ref_observation, server_api::TicketSourceRefObservation::Unavailable { code } if code == "source_ref_provider_timeout")
+        );
+        assert_eq!(evidence.review_status.as_deref(), Some("unknown"));
+        assert!(evidence.missing.contains(&"source_ref_unavailable".into()));
+        assert!(!evidence.missing.contains(&"review_after_rescope".into()));
+        assert!(!ticket_attention_matches(
+            "done",
+            &evidence,
             false,
-            &stale_events,
-            "stale_after_rescope",
+            &events,
+            "stale_after_rescope"
         ));
         assert!(ticket_attention_matches(
-            "inprogress",
+            "done",
+            &evidence,
+            false,
+            &events,
+            "missing_evidence"
+        ));
+        assert!(!ticket_evidence_matches(&evidence, "approved_review"));
+    }
+
+    #[test]
+    fn merged_evidence_uses_immutable_result_despite_deleted_moved_or_unavailable_source() {
+        for observation in [
+            Ok("moved-source".into()),
+            unavailable_source("source_ref_not_found"),
+            unavailable_source("source_ref_provider_unavailable"),
+            unavailable_source("source_ref_runtime_unavailable"),
+        ] {
+            let (summaries, evidence) =
+                project_evidence(&[merged_request()], "revision-1", &[observation]);
+            assert_eq!(
+                summaries[0].current_subject_ref.as_deref(),
+                Some("commit-1")
+            );
+            assert_eq!(
+                summaries[0].source_ref_observation,
+                server_api::TicketSourceRefObservation::NotRequired {}
+            );
+            assert_eq!(
+                summaries[0].review_submitted_at.as_deref(),
+                Some("2026-01-01T00:04:00+00:00")
+            );
+            assert!(evidence.complete_for_integration, "{:?}", evidence.missing);
+            assert!(ticket_evidence_matches(&evidence, "approved_review"));
+            assert!(!ticket_attention_matches(
+                "done",
+                &evidence,
+                false,
+                &[],
+                "missing_evidence"
+            ));
+        }
+    }
+
+    #[test]
+    fn merged_state_does_not_create_missing_mismatched_or_revoked_approval() {
+        for case in ["merge", "approval", "source", "request", "revoked"] {
+            let mut request = merged_request();
+            match case {
+                "merge" => request
+                    .thread
+                    .retain(|event| !matches!(event, MergeRequestThreadEvent::Merge(_))),
+                "approval" => request
+                    .thread
+                    .retain(|event| !matches!(event, MergeRequestThreadEvent::Review(_))),
+                "request" => request
+                    .thread
+                    .retain(|event| !matches!(event, MergeRequestThreadEvent::ReviewRequested(_))),
+                "source" => {
+                    if let MergeRequestThreadEvent::Merge(merge) =
+                        request.thread.last_mut().unwrap()
+                    {
+                        merge.approved_source_ref = "wrong-source".into();
+                    }
+                }
+                "revoked" => request.thread.extend(
+                    reviewed_merge_request(ReviewDecision::Approve, true)
+                        .thread
+                        .into_iter()
+                        .filter(|event| matches!(event, MergeRequestThreadEvent::ReviewRevoked(_))),
+                ),
+                _ => unreachable!(),
+            }
+            let (summaries, evidence) = project_evidence(
+                &[request],
+                "revision-1",
+                &[unavailable_source("source_ref_not_found")],
+            );
+            assert!(summaries[0].integration_evidence_error.is_some(), "{case}");
+            assert!(!evidence.approved_current_subject, "{case}");
+            assert!(!evidence.complete_for_integration, "{case}");
+            assert!(
+                evidence.missing.contains(&"integration_evidence".into()),
+                "{case}"
+            );
+        }
+    }
+
+    fn approve_snapshot(
+        request: &mut MergeRequest,
+        revision: &str,
+        subjects: Vec<merge_request::MergeRequestReviewSubject>,
+    ) {
+        let sequence = request
+            .thread
+            .iter()
+            .map(|event| event.sequence())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let mut reviewed = reviewed_merge_request(ReviewDecision::Approve, false);
+        for event in &mut reviewed.thread {
+            match event {
+                MergeRequestThreadEvent::ReviewRequested(review) => {
+                    review.event_id = format!("request-{sequence}");
+                    review.sequence = sequence;
+                    review.ticket_item_revision = revision.into();
+                    review.ticket_merge_request_subjects = subjects.clone();
+                }
+                MergeRequestThreadEvent::Review(review) => {
+                    review.event_id = format!("review-{sequence}");
+                    review.request_event_id = format!("request-{sequence}");
+                    review.sequence = sequence + 1;
+                    review.ticket_item_revision = revision.into();
+                    review.ticket_merge_request_subjects = subjects.clone();
+                }
+                _ => unreachable!(),
+            }
+        }
+        request.thread.extend(reviewed.thread);
+    }
+
+    #[test]
+    fn exact_revision_and_multi_result_snapshot_require_fresh_attestation_not_later_dates() {
+        let mut requests = vec![
+            merged_request(),
+            reviewed_merge_request(ReviewDecision::Approve, false),
+        ];
+        requests[1].merge_request_id = "mr-2".into();
+        requests[1].repository_id = "other".into();
+        let observations = [
+            unavailable_source("source_ref_not_found"),
+            Ok("commit-1".into()),
+        ];
+        let (_, stale) = project_evidence(&requests, "revision-1", &observations);
+        assert!(stale.approved_current_subject);
+        assert!(!stale.review_after_rescope); // linked set grew, even though dates did not change
+        assert!(!ticket_evidence_matches(&stale, "approved_review"));
+        let snapshot = vec![
+            merge_request::MergeRequestReviewSubject {
+                merge_request_id: "mr-1".into(),
+                subject_ref: "commit-1".into(),
+            },
+            merge_request::MergeRequestReviewSubject {
+                merge_request_id: "mr-2".into(),
+                subject_ref: "commit-1".into(),
+            },
+        ];
+        approve_snapshot(&mut requests[0], "revision-2", snapshot);
+        let (summaries, fresh) = project_evidence(&requests, "revision-2", &observations);
+        assert!(fresh.complete_for_integration);
+        assert_eq!(summaries[0].review_excerpt.as_deref(), Some("review body"));
+        assert!(
+            !project_evidence(&requests, "revision-3", &observations)
+                .1
+                .complete_for_integration
+        );
+        // Complete the second result: the exact approved source set is unchanged.
+        let mut other_result = merged_request();
+        if let MergeRequestThreadEvent::Merge(merge) = other_result.thread.pop().unwrap() {
+            requests[1]
+                .thread
+                .push(MergeRequestThreadEvent::Merge(merge));
+        }
+        requests[1].state = MergeRequestState::Merged;
+        assert!(
+            project_evidence(&requests, "revision-2", &observations)
+                .1
+                .complete_for_integration
+        );
+        assert!(
+            !project_evidence(&requests[..1], "revision-2", &observations[..1])
+                .1
+                .complete_for_integration
+        );
+        let events = [ticket_event(
+            "item_edit",
+            "2026-01-01T00:00:00Z",
+            Some("body"),
+        )];
+        let stale = project_evidence(&requests, "revision-3", &observations).1;
+        assert!(ticket_attention_matches(
+            "done",
             &stale,
             false,
-            &stale_events,
-            "missing_evidence",
+            &events,
+            "stale_after_rescope"
         ));
+    }
+
+    #[test]
+    fn write_targets_are_authorized_not_mandatory_and_closed_requests_are_not_ready() {
+        let target = |repository_key: &str, access| ticket::TicketTarget {
+            repository_key: repository_key.into(),
+            ref_selector: Some("develop".into()),
+            access,
+        };
+        assert_eq!(
+            ticket_write_target_repository_keys(&[
+                target("main", ticket::TicketTargetAccess::ReadWrite),
+                target("docs", ticket::TicketTargetAccess::ReadOnly)
+            ]),
+            vec!["main"]
+        );
+        let (summaries, _) = project_evidence(
+            &[merged_request()],
+            "revision-1",
+            &[unavailable_source("unused")],
+        );
+        assert!(
+            ticket_evidence_summary(&["main", "other"], &summaries, true).complete_for_integration
+        );
+        assert!(ticket_evidence_summary(&["docs"], &summaries, true).has_merge_request);
+        let mut closed = reviewed_merge_request(ReviewDecision::Approve, false);
+        closed.state = MergeRequestState::Closed;
+        assert!(
+            !project_evidence(&[closed], "revision-1", &[Ok("commit-1".into())])
+                .1
+                .complete_for_integration
+        );
     }
 
     #[tokio::test]
@@ -3302,19 +3369,16 @@ VALUES ('workspace-test', 'ticket', 4);
         assert_eq!(tickets.items[0].record_source, "sqlite_yoi_ticket");
         assert_eq!(tickets.items[0].id, "00000000001J2");
         assert_eq!(tickets.items[0].state, "ready");
-        assert_eq!(tickets.items[0].workspace_action_priority, "background");
+        assert_eq!(
+            tickets.items[0].workspace_action_priority,
+            "ready_for_queue"
+        );
         let ticket_by_key = authority.ticket(&tickets.items[0].resource_key).unwrap();
         assert_eq!(ticket_by_key.id, tickets.items[0].id);
 
         let ticket = authority.ticket("00000000001J2").unwrap();
-        assert!(!ticket.action_eligibility.can_queue);
-        assert!(
-            ticket
-                .action_eligibility
-                .blockers
-                .iter()
-                .any(|reason| reason.contains("00000000001J6"))
-        );
+        assert!(ticket.action_eligibility.can_queue);
+        assert!(ticket.action_eligibility.blockers.is_empty());
         assert!(ticket.body.contains("Ticket body"));
         assert!(ticket.body_truncated);
         assert!(!ticket.body.contains("Deep Ticket marker"));

@@ -937,7 +937,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
     ///
     /// The callback is invoked with a short human-readable message
     /// whenever the Engine encounters a condition that should be
-    /// surfaced to a human (e.g. tool output byte-cap truncation).
+    /// surfaced to a human (e.g. a provider-rejected image). Tool output
+    /// byte-cap truncation is reported in the tool result, not this channel.
     /// This channel is separate from `tracing::warn!`, which remains
     /// in place for developer logs.
     pub fn on_warning(&mut self, callback: impl Fn(&str) + Send + Sync + 'static) {
@@ -2379,13 +2380,9 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     limit_bytes = limit,
                     "Tool output exceeded byte limit and was truncated"
                 );
-                self.emit_warning(&format!(
-                    "tool `{}` output truncated from {} to {} bytes (limit {})",
-                    tool_call.name,
-                    before,
-                    content.len(),
-                    limit
-                ));
+                // Truncation is a tool-result constraint, not an actionable
+                // engine warning. The content marker tells the model to refine
+                // its query; keep diagnostics in tracing, not user alerts.
             }
         }
 

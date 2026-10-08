@@ -48,3 +48,15 @@ Deno.test("ticket detail fences stale mutation responses", () => {
     assertStringIncludes(operationSource, "generation === routeGeneration");
   }
 });
+
+Deno.test("ticket responsibility display does not claim Worker liveness or work authority", () => {
+  assertStringIncludes(pageSource, "Retained responsibility");
+  assertStringIncludes(pageSource, "after work ends and Worker removal");
+  assertStringIncludes(
+    pageSource,
+    "does not indicate a running Worker or active work authority",
+  );
+  assertStringIncludes(pageSource, "assignment.principal.runtime_id");
+  assertStringIncludes(pageSource, "assignment.principal.worker_id");
+  assert(!pageSource.includes("No active role assignment."));
+});

@@ -41,13 +41,12 @@ fn workflow_instruction() -> FeatureInstructionDeclaration {
     .expect("static Merge Request workflow instruction declaration is valid")
 }
 
-const ALL_KINDS: [Kind; 6] = [
+const ALL_KINDS: [Kind; 5] = [
     Kind::Show,
     Kind::Open,
     Kind::Review,
     Kind::Readiness,
     Kind::Complete,
-    Kind::CompleteTicket,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,7 +55,6 @@ enum Kind {
     Readiness,
     Open,
     Complete,
-    CompleteTicket,
     Review,
 }
 #[derive(Clone)]
@@ -96,14 +94,6 @@ struct CompleteMergeRequestInput {
     target_ref_after: String,
     strategy: MergeStrategyInput,
     resolution: MergeResolutionInput,
-}
-#[derive(Debug, Deserialize, JsonSchema)]
-struct CompleteTicketInput {
-    ticket: String,
-    operation_id: String,
-    item_revision: String,
-    merge_request_ids: Vec<String>,
-    requirement_approval_event_id: String,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -150,7 +140,7 @@ impl Kind {
             Self::Open => config.open,
             Self::Review => config.review,
             Self::Readiness => config.readiness_check,
-            Self::Complete | Self::CompleteTicket => config.complete,
+            Self::Complete => config.complete,
         }
     }
 
@@ -160,7 +150,6 @@ impl Kind {
             Self::Readiness => "CheckMergeRequestReadiness",
             Self::Open => "OpenMergeRequest",
             Self::Complete => "CompleteMergeRequest",
-            Self::CompleteTicket => "CompleteTicket",
             Self::Review => "ReviewMergeRequest",
         }
     }
@@ -170,16 +159,12 @@ impl Kind {
             Self::Readiness => json!(schemars::schema_for!(MergeRequestInput)),
             Self::Open => json!(schemars::schema_for!(OpenMergeRequestInput)),
             Self::Complete => json!(schemars::schema_for!(CompleteMergeRequestInput)),
-            Self::CompleteTicket => json!(schemars::schema_for!(CompleteTicketInput)),
             Self::Review => json!(schemars::schema_for!(ReviewMergeRequestInput)),
         }
     }
 
     fn mutating(self) -> bool {
-        matches!(
-            self,
-            Self::Open | Self::Review | Self::Complete | Self::CompleteTicket
-        )
+        matches!(self, Self::Open | Self::Review | Self::Complete)
     }
 }
 #[async_trait]
@@ -238,23 +223,6 @@ impl Tool for MergeRequestTool {
                     Some(
                         json!({"operation_id":v.operation_id,"approval_event_id":v.approval_event_id,"target_ref_before":v.target_ref_before,"target_ref_after":v.target_ref_after,"strategy":match v.strategy{MergeStrategyInput::FastForward=>"fast_forward",MergeStrategyInput::Merge=>"merge"},"resolution":match v.resolution{MergeResolutionInput::None=>"none",MergeResolutionInput::Clean=>"clean",MergeResolutionInput::ConflictsResolved=>"conflicts_resolved"}}),
                     ),
-                )
-            }
-            Kind::CompleteTicket => {
-                let v: CompleteTicketInput = parse(input)?;
-                nonempty_named("ticket", &v.ticket)?;
-                (
-                    WorkspaceRequestMethod::Post,
-                    format!(
-                        "/api/w/{ws}/tickets/{}/complete",
-                        encode_path_segment(&v.ticket)
-                    ),
-                    Some(json!({
-                        "operation_id": v.operation_id,
-                        "item_revision": v.item_revision,
-                        "merge_request_ids": v.merge_request_ids,
-                        "requirement_approval_event_id": v.requirement_approval_event_id,
-                    })),
                 )
             }
             Kind::Review => {
@@ -499,11 +467,6 @@ fn native_merge_request_operation(kind: Kind) -> NativeMergeRequestOperation {
             surface: NativeMergeRequestSurface::Item,
             identity_field: Some("merge_request_id"),
         },
-        Kind::CompleteTicket => NativeMergeRequestOperation {
-            operation: "complete_ticket",
-            surface: NativeMergeRequestSurface::Collection,
-            identity_field: None,
-        },
     }
 }
 
@@ -584,8 +547,8 @@ pub fn mount_workspace_http_merge_request_wip(
 
     let collection_descriptor = merge_request_descriptor(
         &collection_tools,
-        "Open Merge Requests and complete Tickets through existing scoped authority",
-        "Only collection-scoped Merge Request Feature operations enabled for this Worker are published. Opening retains repository and selector inputs; Ticket completion retains its full guarded result-set inputs.",
+        "Open Merge Requests through existing scoped authority",
+        "Only collection-scoped Merge Request Feature operations enabled for this Worker are published. Opening retains repository and selector inputs; Ticket completion is a separate Ticket operation.",
     )?;
     registry.mount(WipProjection {
         route: collection_route.clone(),
@@ -617,7 +580,7 @@ pub fn mount_workspace_http_merge_request_wip(
     let item_descriptor = merge_request_descriptor(
         &item_tools,
         "Inspect and operate on the Merge Request bound to this object route",
-        "The subject Merge Request identity comes exclusively from the target route. Repository selectors, exact review capability/candidate, Ticket result snapshot, approval, target refs, strategy, and resolution remain ordinary Backend-validated preconditions.",
+        "The subject Merge Request identity comes exclusively from the target route. Repository selectors, exact review capability/candidate, approval, target refs, strategy, and resolution remain ordinary Backend-validated preconditions.",
     )?;
     registry.mount_dynamic(WipDynamicMount {
         collection_route: collection_route.clone(),
@@ -665,18 +628,6 @@ impl WipOperationHandler for MergeRequestCollectionWipHandler {
             .get(operation)
             .ok_or_else(merge_request_operation_not_found)?;
         let input = native_merge_request_input(arguments, None, tool.projection.identity_field)?;
-        let affected_merge_requests = if tool.kind == Kind::CompleteTicket {
-            input
-                .get("merge_request_ids")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
         let output =
             execute_native_merge_request_tool(tool, &self.permissions, input, None, context)
                 .await?;
@@ -697,18 +648,6 @@ impl WipOperationHandler for MergeRequestCollectionWipHandler {
                         "path".into(),
                         Value::String(format!("{}/{}", self.collection_route, reference)),
                     );
-                }
-            }
-            Kind::CompleteTicket => {
-                for reference in affected_merge_requests {
-                    if is_merge_request_route_reference(&reference) {
-                        record_merge_request_observation(
-                            &self.revisions,
-                            &reference,
-                            &response,
-                            true,
-                        );
-                    }
                 }
             }
             _ => {}
@@ -1148,9 +1087,6 @@ pub fn description(n: &str) -> Option<&'static str> {
         "CompleteMergeRequest" => Some(
             "Record Orchestrator-owned integration for the explicitly addressed Merge Request without completing the Ticket or releasing its assignment.",
         ),
-        "CompleteTicket" => Some(
-            "Complete the Ticket only after reviewing its current item revision and exact linked Merge Request result set; this releases the current assignment atomically.",
-        ),
         "ReviewMergeRequest" => Some(
             "Submit the injected Reviewer capability result for its captured exact source ref; source movement cancels it, while target-only movement does not.",
         ),
@@ -1220,7 +1156,6 @@ mod tests {
             "CheckMergeRequestReadiness",
             "OpenMergeRequest",
             "CompleteMergeRequest",
-            "CompleteTicket",
             "ReviewMergeRequest",
         ] {
             assert!(description(name).is_some(), "missing operation {name}");
@@ -1369,8 +1304,7 @@ mod tests {
             [
                 "ShowMergeRequest",
                 "CheckMergeRequestReadiness",
-                "CompleteMergeRequest",
-                "CompleteTicket"
+                "CompleteMergeRequest"
             ]
         );
         assert_eq!(install(coder).1, [FEATURE_PROMPT_REF]);
@@ -1427,7 +1361,6 @@ mod tests {
                 (NativeMergeRequestSurface::Item, "read"),
                 (NativeMergeRequestSurface::Item, "check_readiness"),
                 (NativeMergeRequestSurface::Item, "complete"),
-                (NativeMergeRequestSurface::Collection, "complete_ticket"),
             ]
         );
 

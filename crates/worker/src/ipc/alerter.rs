@@ -2,7 +2,7 @@
 //!
 //! Separate from `tracing` (which is for developer logs). Alerts
 //! are short human-readable messages the Worker layer wants a client to
-//! see — for example "compaction failed", "tool output truncated".
+//! see — for example "compaction failed", "tool-call early dispatch deferred".
 //!
 //! Each alert is broadcast on the shared `Event` channel and
 //! also appended to an in-memory buffer so that clients connecting

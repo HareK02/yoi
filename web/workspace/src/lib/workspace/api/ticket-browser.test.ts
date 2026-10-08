@@ -4,6 +4,7 @@ declare const Deno: {
 
 import {
   parseMergeRequestDetailResponse,
+  parseMergeRequestListResponse,
   parseObjectiveListResponse,
   parseTicketDetail,
   parseTicketListResponse,
@@ -80,8 +81,8 @@ Deno.test("Ticket Browser parser rejects unknown fields and out-of-range limits"
   );
 });
 
-Deno.test("Ticket Browser parser accepts target collections and rejects singular target authority", () => {
-  const fixture = {
+function ticketDetailFixture() {
+  return {
     action_eligibility: {
       blockers: [],
       can_assign_orchestrator: false,
@@ -142,7 +143,10 @@ Deno.test("Ticket Browser parser accepts target collections and rejects singular
     ],
     title: "Ticket",
   };
+}
 
+Deno.test("Ticket Browser parser accepts target collections and rejects singular target authority", () => {
+  const fixture = ticketDetailFixture();
   const parsed = parseTicketDetail(fixture);
   assertEquals(parsed.targets.length, 2);
   assertEquals(parsed.targets[0]?.repository_key, "docs");
@@ -166,6 +170,157 @@ Deno.test("Ticket Browser parser accepts target collections and rejects singular
       }),
     "unknown field repository_key",
   );
+});
+
+const mergeRequestSummary = {
+  merge_request_id: "mr-1",
+  repository_key: "main",
+  state: "open",
+  selector_from: "work/T-1",
+  selector_to: "develop",
+  updated_at: "2026-10-08T00:00:00Z",
+  current_subject_ref: "source-1",
+  source_ref_observation: { status: "observed" },
+  integration_evidence_error: null,
+  review_status: "approved",
+  review_subject_ref: "source-1",
+  review_requested_at: null,
+  review_submitted_at: null,
+  review_excerpt: null,
+};
+
+function mergeRequestListFixture(summary: unknown) {
+  return {
+    items: [{ summary, ticket_ids: ["ticket-id"], thread_event_count: 2 }],
+    next_cursor: null,
+  };
+}
+
+Deno.test("Merge Request summaries preserve live observation and immutable merged evidence separately", () => {
+  for (
+    const summary of [
+      mergeRequestSummary,
+      {
+        ...mergeRequestSummary,
+        current_subject_ref: null,
+        source_ref_observation: {
+          status: "unavailable",
+          code: "repository_unavailable",
+        },
+        review_status: "pending",
+      },
+      {
+        ...mergeRequestSummary,
+        state: "merged",
+        source_ref_observation: { status: "not_required" },
+      },
+      {
+        ...mergeRequestSummary,
+        state: "merged",
+        source_ref_observation: { status: "not_required" },
+        integration_evidence_error: "approval_event_missing",
+        review_status: "none",
+      },
+    ]
+  ) {
+    const listed = parseMergeRequestListResponse(
+      mergeRequestListFixture(summary),
+    );
+    const detailed = parseTicketDetail({
+      ...ticketDetailFixture(),
+      merge_requests: [summary],
+      merge_request: summary,
+    });
+    for (
+      const parsed of [
+        listed.items[0]?.summary,
+        detailed.merge_requests[0],
+        detailed.merge_request,
+      ]
+    ) {
+      assertEquals(
+        parsed?.source_ref_observation,
+        summary.source_ref_observation,
+      );
+      assertEquals(parsed?.current_subject_ref, summary.current_subject_ref);
+      assertEquals(
+        parsed?.integration_evidence_error,
+        summary.integration_evidence_error,
+      );
+      assertEquals(parsed?.review_subject_ref, summary.review_subject_ref);
+    }
+  }
+});
+
+Deno.test("Merge Request summaries reject missing and malformed tagged source observations", () => {
+  for (
+    const [observation, message] of [
+      [undefined, "source_ref_observation must be an object"],
+      [null, "source_ref_observation must be an object"],
+      ["observed", "source_ref_observation must be an object"],
+      [{ status: "unknown" }, "status is invalid"],
+      [{ status: "unavailable" }, "code must be a string"],
+      [{ status: "unavailable", code: 42 }, "code must be a string"],
+      [
+        { status: "unavailable", code: "x".repeat(262_145) },
+        "code exceeds its length limit",
+      ],
+      [{ status: "observed", code: "stale" }, "unknown field code"],
+      [{ status: "not_required", code: "stale" }, "unknown field code"],
+      [
+        { status: "unavailable", code: "missing", extra: true },
+        "unknown field extra",
+      ],
+    ] as const
+  ) {
+    assertThrows(
+      () =>
+        parseMergeRequestListResponse(mergeRequestListFixture({
+          ...mergeRequestSummary,
+          source_ref_observation: observation,
+        })),
+      message,
+    );
+  }
+});
+
+Deno.test("Merge Request summaries require a nullable bounded integration evidence error", () => {
+  for (
+    const [error, message] of [
+      [undefined, "integration_evidence_error must be a string"],
+      [false, "integration_evidence_error must be a string"],
+      [
+        "x".repeat(262_145),
+        "integration_evidence_error exceeds its length limit",
+      ],
+    ] as const
+  ) {
+    assertThrows(
+      () =>
+        parseMergeRequestListResponse(mergeRequestListFixture({
+          ...mergeRequestSummary,
+          integration_evidence_error: error,
+        })),
+      message,
+    );
+  }
+});
+
+Deno.test("done Ticket state is preserved when current requirement evidence is incomplete", () => {
+  const fixture = ticketDetailFixture();
+  const parsed = parseTicketDetail({
+    ...fixture,
+    state: "done",
+    evidence: { ...fixture.evidence, missing: ["review_after_rescope"] },
+    merge_requests: [{
+      ...mergeRequestSummary,
+      state: "merged",
+      source_ref_observation: { status: "not_required" },
+    }],
+  });
+  assertEquals(parsed.state, "done");
+  assertEquals(parsed.evidence.complete_for_integration, false);
+  assertEquals(parsed.merge_requests[0]?.review_status, "approved");
 });
 
 Deno.test("Ticket Browser parser validates Ticket create responses", () => {

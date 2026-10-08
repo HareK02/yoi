@@ -384,9 +384,6 @@ CREATE TABLE ticket_current_worker_assignments (
             FOREIGN KEY (workspace_id, ticket_id)
                 REFERENCES typed_tickets(workspace_id, ticket_id)
                 ON DELETE CASCADE,
-            FOREIGN KEY (workspace_id, runtime_id, worker_id)
-                REFERENCES worker_registry(workspace_id, runtime_id, worker_id)
-                ON DELETE RESTRICT,
             CHECK(
                 (principal_kind = 'worker' AND runtime_id IS NOT NULL AND worker_id IS NOT NULL AND principal_id IS NULL)
                 OR
@@ -1219,9 +1216,6 @@ CREATE INDEX ticket_current_principal_idx
 CREATE UNIQUE INDEX ticket_current_singleton_role_idx
             ON ticket_current_worker_assignments(workspace_id, ticket_id, role)
             WHERE role IN ('orchestrator', 'coder');
-CREATE UNIQUE INDEX ticket_current_worker_role_idx
-            ON ticket_current_worker_assignments(workspace_id, role, runtime_id, worker_id)
-            WHERE principal_kind = 'worker';
 CREATE INDEX typed_ticket_events_workspace_kind_ticket
             ON typed_ticket_events(workspace_id, kind, ticket_id, event_index);
 CREATE UNIQUE INDEX ux_worker_workdir_attachment_reservation_id

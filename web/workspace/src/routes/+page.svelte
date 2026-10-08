@@ -17,6 +17,7 @@
   let creating = $state(false);
   let creationError = $state<string | null>(null);
   let displayName = $state("");
+  let includeRepository = $state(false);
   let repositoryKey = $state("");
   let repositoryUri = $state("");
   let defaultRef = $state("");
@@ -46,23 +47,17 @@
     event.preventDefault();
     if (creating) return;
     const normalized = {
-      displayName: displayName.trim(),
-      repositoryUri: repositoryUri.trim(),
-      repositoryKey: repositoryKey.trim(),
-      defaultRef: defaultRef.trim(),
+      display_name: displayName.trim(),
+      repository: includeRepository ? {
+        repository_key: repositoryKey.trim(),
+        uri: repositoryUri.trim(),
+        default_ref: defaultRef.trim() || null,
+      } : null,
     };
     const signature = JSON.stringify(normalized);
     const request = lastSubmission?.signature === signature
       ? lastSubmission.request
-      : {
-        operation_key: createOperationKey(),
-        display_name: normalized.displayName,
-        repository: {
-          repository_key: normalized.repositoryKey,
-          uri: normalized.repositoryUri,
-          default_ref: normalized.defaultRef || null,
-        },
-      };
+      : { operation_key: createOperationKey(), ...normalized };
     lastSubmission = { signature, request };
     creating = true;
     creationError = null;
@@ -154,29 +149,38 @@
     <div>
       <p class="workspace-catalog-eyebrow">New team space</p>
       <h2 id="workspace-create-title">Create Workspace</h2>
-      <p>
-        Repository sources are interpreted by Backend authority. Supported Git sources are absolute local paths, file://, ssh://, http(s)://, and user@host:path; Browser-local paths and embedded credentials are not authority. Plain HTTP is unencrypted, so prefer HTTPS or SSH.
-      </p>
+      <p>You can add repositories later in Workspace Settings.</p>
     </div>
     <form onsubmit={submitCreation}>
       <label>
         Workspace display name
         <input bind:value={displayName} required autocomplete="off" />
       </label>
-      <label>
-        Initial repository absolute path or URI
-        <input bind:value={repositoryUri} required autocomplete="off" />
+      <label class="workspace-repository-toggle">
+        <input type="checkbox" bind:checked={includeRepository} aria-controls={includeRepository ? "initial-repository-fields" : undefined} />
+        Add an initial repository (optional)
       </label>
-      <div class="workspace-create-row">
-        <label>
-          Repository key
-          <input bind:value={repositoryKey} required pattern="[a-z0-9]|[a-z0-9][a-z0-9-]*[a-z0-9]" maxlength="64" autocomplete="off" />
-        </label>
-        <label>
-          Default ref
-          <input bind:value={defaultRef} placeholder="repository default" autocomplete="off" />
-        </label>
-      </div>
+      {#if includeRepository}
+        <div id="initial-repository-fields" class="workspace-repository-fields">
+          <p>
+            Repository sources are interpreted by Backend authority. Supported Git sources are absolute local paths, file://, ssh://, http(s)://, and user@host:path; Browser-local paths and embedded credentials are not authority. Plain HTTP is unencrypted, so prefer HTTPS or SSH.
+          </p>
+          <label>
+            Initial repository absolute path or URI
+            <input bind:value={repositoryUri} required autocomplete="off" />
+          </label>
+          <div class="workspace-create-row">
+            <label>
+              Repository key
+              <input bind:value={repositoryKey} required pattern="[a-z0-9]|[a-z0-9](?:[a-z0-9]|-)*[a-z0-9]" maxlength="64" autocomplete="off" />
+            </label>
+            <label>
+              Default ref
+              <input bind:value={defaultRef} placeholder="repository default" autocomplete="off" />
+            </label>
+          </div>
+        </div>
+      {/if}
       {#if creationError}
         <div class="workspace-catalog-alert" role="alert">{creationError}</div>
       {/if}

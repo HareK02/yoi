@@ -1,0 +1,113 @@
+{
+  "schemaVersion": 1,
+  "id": "optional-repository-interactions",
+  "title": "Optional repository disclosure and validation failure",
+  "baseUrl": "http://127.0.0.1:15281",
+  "colorScheme": "light",
+  "reducedMotion": "reduce",
+  "personas": [
+    {
+      "id": "fixture",
+      "label": "Synthetic account; permissions vary by Workspace",
+      "auth": {
+        "kind": "anonymous"
+      }
+    }
+  ],
+  "viewports": [
+    {
+      "label": "desktop",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "label": "narrow",
+      "width": 768,
+      "height": 900
+    },
+    {
+      "label": "mobile",
+      "width": 390,
+      "height": 844
+    }
+  ],
+  "routes": [
+    {
+      "id": "catalog",
+      "label": "Create Workspace without a repository",
+      "path": "/",
+      "goal": "Reopen a zero-repository Workspace or create a new Workspace without configuring Git.",
+      "dataState": "Opt-in Git fields followed by intentional HTTP400 creation validation failure; no actual resources are created.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-create-panel input"
+      },
+      "capturePoints": [
+        {
+          "id": "repository-fields",
+          "label": "Opt-in Git fields",
+          "fullPage": true,
+          "interaction": [
+            {
+              "action": "click",
+              "selector": ".workspace-repository-toggle input"
+            }
+          ]
+        },
+        {
+          "id": "validation-error",
+          "label": "Intentional Backend validation failure",
+          "fullPage": true,
+          "interaction": [
+            {
+              "action": "click",
+              "selector": ".workspace-repository-toggle input"
+            },
+            {
+              "action": "fill",
+              "selector": ".workspace-create-panel input[required]",
+              "value": "Rejected Workspace"
+            },
+            {
+              "action": "click",
+              "selector": ".workspace-create-panel button[type=submit]"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": ".workspace-create-panel [role=alert]"
+          }
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "id": "workspace-fixture",
+      "command": "deno",
+      "cwd": "../../../../tools/web-ux",
+      "args": [
+        "run",
+        "--allow-net",
+        "--allow-read",
+        "browser-tests/workspace_home_fixture_server.ts",
+        "15282",
+        "../../web/workspace/build"
+      ],
+      "readyUrl": "http://127.0.0.1:15282/health"
+    },
+    {
+      "id": "empty-workspace-api",
+      "command": "deno",
+      "cwd": "../..",
+      "args": [
+        "run",
+        "--allow-net",
+        "test/visual-review/empty-workspace-fixture-server.ts",
+        "15281",
+        "http://127.0.0.1:15282"
+      ],
+      "readyUrl": "http://127.0.0.1:15281/health"
+    }
+  ]
+}
