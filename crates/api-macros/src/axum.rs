@@ -77,6 +77,26 @@ pub fn json_response<T: Serialize>(status: StatusCode, value: T) -> Response {
     (status, Json(value)).into_response()
 }
 
+/// Serialize a public error and retain its typed value for outer application middleware.
+///
+/// The extension is server-local (`Arc<T>`); it is not another wire field. This lets observers
+/// inspect the declared error without consuming the response body or requiring `T: Clone`.
+/// Applications still choose which public fields are safe to log; the adapter does not log them.
+pub fn error_response<T: Serialize + Send + Sync + 'static>(
+    status: StatusCode,
+    error: T,
+) -> Response {
+    let mut response = json_response(status, &error);
+    // JSON encoding failures are plain-text responses, including when the requested status is 500.
+    if response.status() == status
+        && response.headers().get(axum::http::header::CONTENT_TYPE)
+            == Some(&axum::http::HeaderValue::from_static("application/json"))
+    {
+        response.extensions_mut().insert(std::sync::Arc::new(error));
+    }
+    response
+}
+
 /// Emit an empty response with the contract status.
 pub fn empty_response(status: StatusCode) -> Response {
     status.into_response()

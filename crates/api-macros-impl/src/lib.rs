@@ -2077,7 +2077,7 @@ fn axum_adapter_tokens(
                                             status,
                                             rejection.body_text(),
                                         );
-                                        return #api_crate::axum::json_response(
+                                        return #api_crate::axum::error_response(
                                             #api_crate::axum::status(status),
                                             error,
                                         );
@@ -2111,7 +2111,7 @@ fn axum_adapter_tokens(
                                             status,
                                             rejection.body_text(),
                                         );
-                                        return #api_crate::axum::json_response(
+                                        return #api_crate::axum::error_response(
                                             #api_crate::axum::status(status),
                                             error,
                                         );
@@ -2188,7 +2188,7 @@ fn axum_adapter_tokens(
             let error = match operation.error_status {
                 Some(_) => quote!({
                     let status = #api_crate::HttpError::status_code(&error);
-                    #api_crate::axum::json_response(#api_crate::axum::status(status), error)
+                    #api_crate::axum::error_response(#api_crate::axum::status(status), error)
                 }),
                 None => quote!({ let _ = error; #api_crate::axum::empty_response(#api_crate::axum::framework::StatusCode::INTERNAL_SERVER_ERROR) }),
             };

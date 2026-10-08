@@ -198,6 +198,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "tokio",
+ "tower",
  "trybuild",
  "url",
 ]

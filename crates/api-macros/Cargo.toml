@@ -35,4 +35,5 @@ oas3 = { version = "0.22", default-features = false }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
+tower = { workspace = true, features = ["util"] }
 trybuild = "1"

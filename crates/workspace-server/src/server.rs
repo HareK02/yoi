@@ -11422,7 +11422,15 @@ async fn log_failed_api_response(request: Request, next: Next) -> Response {
     let status = response.status();
 
     if uri.path().starts_with("/api/") && (status.is_client_error() || status.is_server_error()) {
-        let error = response.extensions().get::<ApiErrorLog>();
+        // Generated routes bypass ApiError::into_response; inspect their typed error, not the body.
+        let generated_error = response
+            .extensions()
+            .get::<Arc<server_api::RepositoryApiError>>()
+            .map(|error| ApiErrorLog::from_repository_error(error));
+        let error = response
+            .extensions()
+            .get::<ApiErrorLog>()
+            .or(generated_error.as_ref());
         let event = api_failure_log_event(&method, &uri, status, error);
         tracing::error!(
             target: "yoi::api",
@@ -31785,6 +31793,32 @@ struct ApiErrorLog {
     diagnostics: Vec<RuntimeDiagnostic>,
 }
 
+impl ApiErrorLog {
+    fn from_repository_error(error: &server_api::RepositoryApiError) -> Self {
+        Self {
+            kind: error
+                .diagnostics
+                .first()
+                .map(|diagnostic| diagnostic.code.clone())
+                .unwrap_or_else(|| error.error.to_ascii_lowercase().replace(' ', "_")),
+            message: sanitize_backend_error(&error.message),
+            diagnostics: error
+                .diagnostics
+                .iter()
+                .map(|diagnostic| RuntimeDiagnostic {
+                    code: diagnostic.code.clone(),
+                    severity: match diagnostic.severity {
+                        server_api::DiagnosticSeverity::Info => HostDiagnosticSeverity::Info,
+                        server_api::DiagnosticSeverity::Warning => HostDiagnosticSeverity::Warning,
+                        server_api::DiagnosticSeverity::Error => HostDiagnosticSeverity::Error,
+                    },
+                    message: sanitize_backend_error(&diagnostic.message),
+                })
+                .collect(),
+        }
+    }
+}
+
 impl From<merge_request::MergeRequestError> for ApiError {
     fn from(error: merge_request::MergeRequestError) -> Self {
         Error::MergeRequest(error).into()
@@ -32059,6 +32093,7 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
+    mod api_logging_tests;
     mod auth_logging_tests;
     mod subject_spawn_tests;
     mod subjektiv_jobs_tests;
@@ -42163,6 +42198,7 @@ mod tests {
         materializer: worker_runtime::working_directory::RuntimeGitMaterializer,
         spawn_failure: std::sync::Mutex<Option<String>>,
         input_failure: std::sync::Mutex<Option<String>>,
+        cancel_failure: std::sync::Mutex<Option<String>>,
         input_hook: std::sync::Mutex<
             Option<Box<dyn FnOnce(&worker_runtime::identity::WorkerRef) + Send + 'static>>,
         >,
@@ -42197,6 +42233,7 @@ mod tests {
                 ),
                 spawn_failure: std::sync::Mutex::new(None),
                 input_failure: std::sync::Mutex::new(None),
+                cancel_failure: std::sync::Mutex::new(None),
                 input_hook: std::sync::Mutex::new(None),
                 input_request_ids: std::sync::Mutex::new(Vec::new()),
                 accept_restores: std::sync::atomic::AtomicBool::new(false),
@@ -42523,6 +42560,12 @@ mod tests {
             &self,
             _worker_ref: &worker_runtime::identity::WorkerRef,
         ) -> worker_runtime::execution::WorkerExecutionResult {
+            if let Some(message) = self.cancel_failure.lock().unwrap().clone() {
+                return worker_runtime::execution::WorkerExecutionResult::rejected(
+                    worker_runtime::execution::WorkerExecutionOperation::Cancel,
+                    message,
+                );
+            }
             worker_runtime::execution::WorkerExecutionResult::accepted(
                 worker_runtime::execution::WorkerExecutionOperation::Cancel,
             )
