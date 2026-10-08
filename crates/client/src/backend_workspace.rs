@@ -434,11 +434,11 @@ mod tests {
         let request = CreateBackendWorkspaceRequest {
             operation_key: "workspace-create-1".to_string(),
             display_name: "Alpha".to_string(),
-            repository: CreateBackendWorkspaceRepository {
+            repository: Some(CreateBackendWorkspaceRepository {
                 repository_key: "main".to_string(),
                 uri: "/srv/repos/alpha".to_string(),
                 default_ref: Some("develop".to_string()),
-            },
+            }),
         };
 
         let retry = request.clone();

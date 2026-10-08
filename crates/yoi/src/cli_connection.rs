@@ -250,10 +250,15 @@ pub(crate) fn resolve_connection_aware_cli_connection<R: CliConnectionResolver +
             "--local and --backend are mutually exclusive".to_string(),
         ));
     }
+    if explicit_local && workspace_id.is_some() {
+        return Err(ParseError(
+            "--local and --workspace-id are mutually exclusive".to_string(),
+        ));
+    }
     if explicit_local {
         return resolver.resolve_connection(command, CliConnectionInput::StandaloneTarget);
     }
-    if explicit_backend_url.is_some() {
+    if explicit_backend_url.is_some() || workspace_id.is_some() {
         return resolver.resolve_connection(
             command,
             CliConnectionInput::BackendTarget {

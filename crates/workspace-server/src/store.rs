@@ -384,13 +384,13 @@ pub struct WorkspaceBootstrapRecord {
     pub operation_key: String,
     pub request_fingerprint: String,
     pub workspace: WorkspaceRecord,
-    pub repository: RepositoryRecord,
+    pub repository: Option<RepositoryRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceBootstrapResult {
     pub workspace: WorkspaceRecord,
-    pub repository: RepositoryRecord,
+    pub repository: Option<RepositoryRecord>,
     pub config_revision: u64,
     pub replayed: bool,
 }
@@ -4431,7 +4431,14 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         signing_identity: &WorkspaceSigningIdentityActivation,
         identity_provisioning_operation_key: &str,
     ) -> Result<WorkspaceBootstrapResult> {
-        validate_repository_record_identity(&record.repository)?;
+        if let Some(repository) = &record.repository {
+            validate_repository_record_identity(repository)?;
+            if repository.workspace_id != record.workspace.workspace_id {
+                return Err(Error::Store(
+                    "Initial Repository does not belong to the Workspace bootstrap".to_string(),
+                ));
+            }
+        }
         if signing_identity.workspace_id != record.workspace.workspace_id {
             return Err(Error::Store(
                 "Workspace signing identity does not belong to the Workspace bootstrap".to_string(),
@@ -4472,14 +4479,14 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     params![workspace_id],
                     read_workspace_record,
                 )?;
-                let repository = tx.query_row(
+                let repository = if let Some(initial) = &record.repository { tx.query_row(
                     r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
                               source_kind, source_uri, default_ref, source_revision,
                               source_fingerprint, observed_status, observed_at, created_at, updated_at
                        FROM repositories WHERE workspace_id = ?1 AND repository_key = ?2"#,
-                    params![workspace.workspace_id, record.repository.repository_key],
+                    params![workspace.workspace_id, initial.repository_key],
                     read_repository_record,
-                )?;
+                ).optional()? } else { None };
                 let persisted_identity = tx.query_row(
                     r#"SELECT workspace_id, key_id, algorithm, public_key,
                               public_key_fingerprint, private_material_ref, revision, state,
@@ -4566,6 +4573,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         record.workspace.updated_at,
                     ],
                 )?;
+                if let Some(repository) = &record.repository {
                 tx.execute(
                     r#"INSERT INTO repositories (
                         workspace_id, repository_id, repository_key, kind, provider, uri,
@@ -4573,23 +4581,24 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         source_fingerprint, observed_status, observed_at, created_at, updated_at
                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
                     params![
-                        record.repository.workspace_id,
-                        record.repository.repository_id,
-                        record.repository.repository_key,
-                        record.repository.kind,
-                        record.repository.provider,
-                        record.repository.source.uri,
-                        record.repository.source.kind.as_str(),
-                        record.repository.source.uri,
-                        record.repository.default_ref,
-                        record.repository.source_revision,
-                        record.repository.source_fingerprint,
-                        record.repository.observed_status.as_str(),
-                        record.repository.observed_at,
-                        record.repository.created_at,
-                        record.repository.updated_at,
+                        repository.workspace_id,
+                        repository.repository_id,
+                        repository.repository_key,
+                        repository.kind,
+                        repository.provider,
+                        repository.source.uri,
+                        repository.source.kind.as_str(),
+                        repository.source.uri,
+                        repository.default_ref,
+                        repository.source_revision,
+                        repository.source_fingerprint,
+                        repository.observed_status.as_str(),
+                        repository.observed_at,
+                        repository.created_at,
+                        repository.updated_at,
                     ],
                 )?;
+                }
             }
             if crate::config_source::load_state(&tx, &record.workspace.workspace_id)?.is_none() {
                 let state = crate::config_source::initial_state()?;
@@ -21732,7 +21741,7 @@ INSERT INTO worker_registry (
                     operation_key: "invalid-key".to_string(),
                     request_fingerprint: "sha256:invalid-key".to_string(),
                     workspace: workspace.clone(),
-                    repository,
+                    repository: Some(repository),
                 },
                 &signing_identity,
                 "identity-store-test",
@@ -21771,7 +21780,7 @@ INSERT INTO worker_registry (
             operation_key: "create-workspace".to_string(),
             request_fingerprint: "sha256:create-workspace".to_string(),
             workspace,
-            repository: valid_repository,
+            repository: Some(valid_repository),
         };
         store
             .reserve_workspace_signing_identity_provisioning(
@@ -21798,7 +21807,7 @@ INSERT INTO worker_registry (
         );
         let mut duplicate = first;
         duplicate.operation_key = "duplicate-workspace".to_string();
-        duplicate.repository.repository_id = Uuid::now_v7().to_string();
+        duplicate.repository.as_mut().unwrap().repository_id = Uuid::now_v7().to_string();
         let error = store
             .create_workspace_bootstrap(&duplicate, &signing_identity, "identity-store-test")
             .unwrap_err()

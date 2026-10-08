@@ -34,7 +34,7 @@ export type WorkspaceRepositoryRecord = {
 
 export type WorkspaceCreateResponse = {
   workspace: WorkspaceSummary;
-  repository: WorkspaceRepositoryRecord;
+  repository: WorkspaceRepositoryRecord | null;
   config_revision: number;
   request_fingerprint: string;
   replayed: boolean;
