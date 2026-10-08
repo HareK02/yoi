@@ -1,0 +1,202 @@
+{
+  "schemaVersion": 1,
+  "id": "tickets",
+  "title": "Flexible Ticket progress and optional resources",
+  "baseUrl": "http://127.0.0.1:15289",
+  "colorScheme": "light",
+  "reducedMotion": "reduce",
+  "personas": [
+    {
+      "id": "member",
+      "label": "Workspace member, not settings owner",
+      "auth": {
+        "kind": "anonymous"
+      }
+    }
+  ],
+  "viewports": [
+    {
+      "label": "desktop",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "label": "narrow",
+      "width": 768,
+      "height": 900
+    },
+    {
+      "label": "mobile",
+      "width": 390,
+      "height": 844
+    }
+  ],
+  "routes": [
+    {
+      "id": "options",
+      "label": "Return options without conclusion",
+      "path": "/w/tickets/tickets/T-1",
+      "goal": "Read intent, record results and progress without a repository",
+      "dataState": "No repository or MR",
+      "ready": {
+        "kind": "selector",
+        "selector": ".ticket-detail-header"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Ticket detail",
+          "fullPage": true
+        },
+        {
+          "id": "resolution",
+          "label": "Resolution and MR state",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": ".ticket-close-card > summary"
+            },
+            {
+              "action": "click",
+              "selector": ".ticket-close-card textarea"
+            }
+          ],
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "read-only",
+      "label": "Investigation without review",
+      "path": "/w/tickets/tickets/T-2",
+      "goal": "Use read-only resources without requiring write or MR",
+      "dataState": "Read-only target",
+      "ready": {
+        "kind": "selector",
+        "selector": ".ticket-detail-header"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Ticket detail",
+          "fullPage": true
+        },
+        {
+          "id": "resolution",
+          "label": "Resolution and MR state",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": ".ticket-close-card > summary"
+            },
+            {
+              "action": "click",
+              "selector": ".ticket-close-card textarea"
+            }
+          ],
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "review",
+      "label": "Independent review before merge",
+      "path": "/w/tickets/tickets/T-3",
+      "goal": "Separate progress from actual MR review and integration",
+      "dataState": "Open MR, unavailable source observation",
+      "ready": {
+        "kind": "selector",
+        "selector": ".ticket-detail-header"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Ticket detail",
+          "fullPage": true
+        },
+        {
+          "id": "resolution",
+          "label": "Resolution and MR state",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": ".ticket-close-card > summary"
+            },
+            {
+              "action": "click",
+              "selector": ".ticket-close-card textarea"
+            }
+          ],
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "launch",
+      "label": "Natural request with optional recipe and resources",
+      "path": "/w/tickets/workers/new?ticketId=T-1&ticketTitle=Compare%20options%20without%20deciding&initialInput=Return%20options%20without%20a%20conclusion.%20Review%20is%20unnecessary.",
+      "goal": "Choose the general Ticket worker, no mandatory repository or Flow",
+      "dataState": "Member with embedded and remote Runtimes, read-only external grant available but not claimed",
+      "ready": {
+        "kind": "selector",
+        "selector": ".worker-launch-form"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Ticket launch",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "list",
+      "label": "Member creates a repository-free Ticket",
+      "path": "/w/tickets/tickets",
+      "goal": "Create work from intent with optional resources, not a fixed delivery pipeline",
+      "dataState": "Three lightweight progress lanes, member normal operations",
+      "ready": {
+        "kind": "selector",
+        "selector": ".ticket-kanban"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Progress lanes",
+          "fullPage": true
+        },
+        {
+          "id": "create",
+          "label": "Optional resources",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": "button:has-text(\"Add Ticket\")"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": ".ticket-create-form"
+          },
+          "fullPage": true
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "id": "ticket-fixture",
+      "command": "deno",
+      "cwd": "..",
+      "args": [
+        "run",
+        "--allow-net",
+        "--allow-read",
+        "browser-tests/ticket_fixture_server.ts",
+        "15289",
+        "../../web/workspace/build"
+      ],
+      "readyUrl": "http://127.0.0.1:15289/health"
+    }
+  ]
+}

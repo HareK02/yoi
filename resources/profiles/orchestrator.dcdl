@@ -1,6 +1,6 @@
 import "./base.dcdl" // {
     slug = "orchestrator";
-    description = "Ticket orchestrator profile.";
+    description = "Intent-led Ticket orchestration with separate guarded MR integration authority.";
     scope = "workspace_write";
     engine = { instruction = "role.orchestrator"; };
 

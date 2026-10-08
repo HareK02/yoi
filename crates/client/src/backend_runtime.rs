@@ -823,7 +823,7 @@ mod tests {
                 "display_name": "Embedded",
                 "built_in": true,
                 "worker_creation_available": true,
-                "working_directory_required": false,
+                "supports_workdir_attachments": false,
                 "status": "online",
                 "diagnostics": []
             }],

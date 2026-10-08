@@ -1034,7 +1034,8 @@ mod tests {
             .unwrap();
 
         assert!(rendered.contains("This policy governs naming only"));
-        assert!(rendered.contains("Coder cleanup is a separate post-completion decision"));
+        assert!(rendered.contains("Worker cleanup is a separate lifecycle decision"));
+        assert!(rendered.contains("not an automatic consequence of a Ticket state"));
         assert!(rendered.contains("perform one cleanup pass before ending the orchestration turn"));
         assert!(rendered.contains("Never predeclare `delete_on_completion`"));
         assert!(rendered.contains("call `WorkerStop`"));

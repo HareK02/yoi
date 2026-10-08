@@ -397,7 +397,7 @@ function parseTicketRoleAssignmentRecord(
     "workspace_id",
   ], label);
   const role = string(item.role, `${label}.role`);
-  if (!["orchestrator", "coder", "owner", "contributor"].includes(role)) {
+  if (!["orchestrator", "worker", "owner", "contributor"].includes(role)) {
     throw new Error(`${label}.role is invalid`);
   }
   return {
@@ -423,7 +423,7 @@ function parseActionEligibility(
     "blockers",
     "can_assign_orchestrator",
     "can_queue",
-    "can_start_manual_coder",
+    "can_start_manual_worker",
     "can_unassign_orchestrator",
     "queue_tickets",
   ], label);
@@ -434,9 +434,9 @@ function parseActionEligibility(
       `${label}.can_assign_orchestrator`,
     ),
     can_queue: boolean(item.can_queue, `${label}.can_queue`),
-    can_start_manual_coder: boolean(
-      item.can_start_manual_coder,
-      `${label}.can_start_manual_coder`,
+    can_start_manual_worker: boolean(
+      item.can_start_manual_worker,
+      `${label}.can_start_manual_worker`,
     ),
     can_unassign_orchestrator: boolean(
       item.can_unassign_orchestrator,
@@ -730,7 +730,7 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     "body",
     "body_truncated",
     "created_at",
-    "current_coder",
+    "current_worker",
     "event_count",
     "event_page",
     "events",
@@ -774,13 +774,13 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     body: string(item.body, `${label}.body`),
     body_truncated: boolean(item.body_truncated, `${label}.body_truncated`),
     created_at: optionalNullableString(item.created_at, `${label}.created_at`),
-    current_coder: item.current_coder === undefined
+    current_worker: item.current_worker === undefined
       ? undefined
-      : item.current_coder === null
+      : item.current_worker === null
       ? null
       : parseTicketAssignmentSummary(
-        item.current_coder,
-        `${label}.current_coder`,
+        item.current_worker,
+        `${label}.current_worker`,
       ),
     event_count: integer(item.event_count, `${label}.event_count`),
     event_page: parseQueryPage(item.event_page, `${label}.event_page`),

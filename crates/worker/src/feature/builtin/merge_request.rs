@@ -27,8 +27,7 @@ use wip_protocol::{
 
 pub const FEATURE_ID: &str = "merge_request";
 const FEATURE_NAME: &str = "Merge Request tools";
-const FEATURE_DESCRIPTION: &str =
-    "Operation-specific Merge Request workflow tools over Workspace authority.";
+const FEATURE_DESCRIPTION: &str = "Optional repository MR workflow with trusted review and separate Orchestrator integration authority; not a universal Ticket conclusion gate.";
 const FEATURE_INSTRUCTION_ID: &str = "merge_request.workflow";
 pub const FEATURE_PROMPT_REF: &str = "common.merge_request";
 
@@ -1085,10 +1084,10 @@ pub fn description(n: &str) -> Option<&'static str> {
             "Open one repository-scoped Merge Request linked to the Ticket; reuse an existing Merge Request for that repository and advance only its selector_from with a normal non-force push.",
         ),
         "CompleteMergeRequest" => Some(
-            "Record Orchestrator-owned integration for the explicitly addressed Merge Request without completing the Ticket or releasing its assignment.",
+            "Record Orchestrator-owned integration for the explicitly addressed Merge Request using current trusted exact-source approval and provider evidence. This records an already-applied integration, not a Ticket conclusion or assignment release; a review-not-required Ticket request does not bypass MR integration guards.",
         ),
         "ReviewMergeRequest" => Some(
-            "Submit the injected Reviewer capability result for its captured exact source ref; source movement cancels it, while target-only movement does not.",
+            "Submit the injected trusted Reviewer capability result for its captured exact source ref; source movement cancels it, while target-only movement does not. The capability authenticates the attempt, not the verdict: independent natural-language judgment and validation remain the Reviewer's responsibility.",
         ),
         _ => None,
     }

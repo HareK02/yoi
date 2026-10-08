@@ -1,258 +1,95 @@
-# Tickets and development workflow
+# Tickets and work outcomes
 
-Yoi project work is tracked through Tickets. For normal use, interact with Tickets through `yoi panel`, Ticket tools, the `yoi ticket ...` CLI, and typed role surfaces. Workspace Server control-plane records plus the append-only Ticket event and Merge Request evidence streams are authoritative.
+A Ticket is a durable record of natural-language user intent and a concrete work outcome, not a mandatory code/review/merge pipeline. Research, analysis, planning, documentation, operations, and code can all be Ticket work. Requirements, acceptance criteria, and binding decisions govern what must be done; the requested return path governs whether to continue, complete, close, or return results without concluding the Ticket.
 
-Ticket and Objective records are stored in the Workspace Server database. Repository-local `.yoi/tickets`, `.yoi/objectives`, and config files are ignored legacy input, not a debugging or compatibility backend.
-
-Do not treat ad-hoc chat summaries, memory records, or Worker notifications as the final source of project state. Notifications are hints to inspect concrete state, not proof of completion.
+Workspace Server control-plane records, append-only Ticket events, and any linked Merge Request evidence are authoritative. Ticket and Objective records live in the Workspace Server database. Repository-local `.yoi/tickets`, `.yoi/objectives`, and config files are ignored legacy input, not a debugging or compatibility backend. Notifications, chat summaries, and Memory are hints to inspect current authority, not proof of completion.
 
 ## Concepts
 
-- `Ticket`: durable project/orchestration record. It contains requirements, decisions, plans, implementation reports, reviews, artifacts, and resolution history.
-- `Objective`: first-class medium-term goal record stored by the Workspace Server. It stores goal, motivation/background, strategy/design direction, success criteria/exit conditions, decision context, current Objective lifecycle, and canonical Ticket links. Objective context is judgment/background context; it is not implementation authority and does not replace reading each Ticket body, thread, and evidence.
-- `Task`: session-local progress tracking inside a Worker. It is not the project record.
-- `Assignment`: a concrete delegation from an Orchestrator to a coder/reviewer Worker or task-specific helper Worker.
-- `IntentPacket`: the short implementation/review contract derived from a Ticket and handed to an Assignment.
-- `Ticket backend`: the Workspace Server control-plane database exposed through typed Workspace APIs.
-- `Ticket relation`: durable project-level Ticket-to-Ticket metadata stored as forward canonical-id relations (`depends_on`, `blocks`, `related`, `supersedes`, `duplicate_of`). Inverse views such as `blocked_by` are derived, not stored.
+- `Ticket`: durable work record containing intent, requirements, decisions, useful results/evidence, and resolution history.
+- `Objective`: a first-class medium-term goal with background, strategy, success criteria, and canonical Ticket context links. It neither schedules nor authorizes Ticket work.
+- `Task`: session-local progress tracking, not the project record.
+- `Assignment`: an authorized delegation of Ticket work to a Worker, independent from its Profile or Flow.
+- `IntentPacket`: a bounded natural-language handoff of intent, requirements, binding decisions, latitude, escalation conditions, and validation.
+- `Ticket relation`: non-hierarchical project metadata (`depends_on`, `blocks`, `related`, `supersedes`, `duplicate_of`). Inverse views are derived. Relations do not grant resources or start Workers.
 
-A Ticket may represent a feature, bug, cleanup, design decision, investigation, workflow change, release task, or orchestration task. The common requirement is that the Ticket is a concrete work item that can be implemented, reviewed, validated, and closed on its own terms.
+One Ticket should describe an independently useful outcome that can be judged on its own terms. Do not convert temporary execution steps or a broad effort's progress container into mandatory product deliverables.
 
-## User-facing entry points
+## Entry points and authority
 
-Use the highest-level interface that matches the work:
+Use the highest-level interface matching the request: Workspace Dashboard/Ticket UI, authenticated Workspace APIs, product `yoi ticket ...` or `yoi objective ...` commands, and typed Worker tools. Inside Workers, use the supplied typed Ticket tools; do not substitute a CLI or direct storage access for missing tools. Maintainers inspect authority through the Workspace API, Server administration surfaces, and database diagnostics, not repository-local Ticket files.
 
-- Use `yoi panel` for the Ticket/Intake/Orchestrator workspace Dashboard and role-launch actions.
-- Use `yoi objective ...` for lightweight medium-term Objective records and their non-blocking canonical Ticket links.
-- Inside Workers, use typed Ticket tools for Ticket records and typed Merge Request tools for immutable implementation/review/completion evidence.
-- For multi-step work, follow the typed Ticket role surfaces and recorded Ticket lifecycle gates.
+The Server resolves Workspace access, active configuration, and immutable Profile launch material; Runtime does not infer identity or authority from a checkout's `.yoi` files, cwd, or launch prose. The first committed user request supplies bounded action context, not actor identity or new grants. Profile/Flow selection is configuration, not review, merge, or resource authority. Availability of a tool is not authorization to use it for unrelated work.
 
-Maintainers inspect Ticket state through the authenticated Workspace API, Server administration surfaces, and database diagnostics. Repository-local Ticket files are not storage authority.
+## Starting and returning Ticket work
 
-## Ticket tools inside Workers
+`SpawnTicketWorker` starts and atomically assigns a generic Worker with an `initial_request`. Its registered `profile` is optional (omitted/null selects `builtin:ticket-worker`); `flow` and alias-keyed `workdir_attachments` are optional. No repository or Flow is required for non-code work. Choose an explicit Profile when its tools and instructions fit the task; assignment does not depend on choosing the Coder role. Backend validates claims, derives repository attachment access from declared Ticket targets, and preserves explicit ExternalGrant ceilings. Callers cannot request capabilities through attachment selection.
 
-Workers with the Ticket and operation-specific Merge Request built-in features can use typed workflow tools:
+The guarded start records acceptance only after spawn, initial input, assignment, and attachment finalization. Do not pre-write `inprogress` or mistake a state update for a launch. On a failed or unknown outcome, reread durable operation evidence before retrying or spawning a replacement. After acceptance, reread Ticket state and current Worker responsibility.
 
-- `TicketCreate`
-- `QueryTicket` — bounded authoritative Ticket discovery with typed state/text/event/evidence/relation/Objective/time/attention filters, stable snippets, and cursor metadata.
-- `ShowTicket` — detailed authority for one Ticket, including item revision, bounded thread/event references, relations, linked Objectives, implementation reports, and current Merge Request/review evidence.
-- `TicketComment`
-- Coder: `ShowMergeRequest`, `OpenMergeRequest`
-- Reviewer: `ShowMergeRequest`, `ReviewMergeRequest` — available only inside the attested direct-child Reviewer request; grant and subject-ref capability material are not model input.
-- Orchestrator: `ShowMergeRequest`, `CheckMergeRequestReadiness`, `CompleteMergeRequest`
-- `TicketClose`
-- `TicketRelationRecord`
+Results can be returned in conversation, optionally recorded in a `TicketComment`, optionally published as a Drive document/artifact when that surface is available, or written/published to an authorized repository. Neither comments nor Drive artifacts are universally required. Preserve concise evidence useful to the user without fabricating work, tests, or conclusions. `implementation_report` is optional historical/audit context, not integration readiness or completion authority.
 
-Profile-visible Ticket catalogs are intentionally smaller than the former broad read catalog: Workspace authoring exposes 9 tools instead of 13, workflow exposes 10 instead of 12, and review exposes only `QueryTicket` plus `ShowTicket` (2 instead of 6). The `QueryTicket` schema is regression-guarded below 8 KiB while consolidating relation/evidence/attention discovery; diagnostics are not projected into normal profiles, while specialized orchestration-plan commands remain visible only to workflow roles that need their distinct semantics.
+The return choice is independent of result format. Examples:
 
-These tools operate through the typed Workspace Ticket API. They do not grant arbitrary filesystem access and never select repository-local Ticket storage.
+- Research with review not required: answer the question and optionally record a useful summary; no MR or approval is required for an authorized completion decision.
+- Code requiring independent review before merge: use the trusted review path and guarded MR integration. A Profile, Flow transition, tool invocation, or prose approval is not the review judgment.
+- Return without conclusion: report the result/limitations and leave the Ticket unconcluded. A finished turn, an artifact, or an approved MR does not itself decide completion.
 
-Relation tools are for non-hierarchical project metadata only. Use canonical opaque Ticket ids, store forward relations only, and keep runtime execution planning (capacity, ordering decisions, do-not-parallelize notes, Worker/session/worktree ownership) in OrchestrationPlan or session-local records instead of relation metadata. Unresolved `depends_on` and incoming unresolved `blocks` are queue/acceptance blockers; `related` is not blocking, and `supersedes` / `duplicate_of` are diagnostics rather than automatic lifecycle transitions.
+These are instruction/tool contracts, not a claim that a mechanism proves real agent judgment. Backend authenticates actors and enforces typed boundaries; the responsible Worker/human must actually judge satisfaction against the natural-language request.
 
-Use them when a Worker needs to materialize or update project records:
+## Ticket tools and decisions
 
-- Intake creates a new Ticket after user agreement.
-- Orchestrator records routing decisions and intent packets.
-- Reviewer commits an approve/request-changes result against one immutable Merge Request revision.
-- Maintainer closes a Ticket with a resolution when merge/validation/cleanup evidence is complete.
+`QueryTicket` provides bounded discovery/filtering; `ShowTicket` provides authoritative item revision, paged thread, relations, Objectives, and any current MR context. Read the relevant Ticket before implementation, routing, review, state, or conclusion decisions. Check potential duplicates before creation or material rescope. Use `QueryObjective` and `ShowObjective` for broader context without replacing the Ticket read.
 
-Do not bypass Ticket lifecycle gates just because Ticket tools are available. Ticket mutation is a project-record operation and should remain auditable.
+Useful mutation surfaces include `TicketCreate`, `TicketComment`, relation/plan tools, and authorized `TicketWorkflowState`, `CompleteTicket`, and `TicketClose` decisions. Exposure depends on the effective Profile/Feature configuration. Decision tools use current item revision, expected state, a reason/resolution, stable operation key, and optional supporting references. Backend checks actor authority, CAS, replay, and resource boundaries. It does not enforce a universal state sequence, MR/approval gate, or natural-language satisfaction.
 
-## Objective records
+`CompleteTicket` records completion; `TicketClose` records closure. Neither integrates an MR or expands resource grants. Ticket progress/conclusion can occur without commits, MRs, or approvals when consistent with the request. Conversely, code's default publication/review practices must not be erased by confusing an independent Ticket decision with merge authority. Do not claim an unmerged result was integrated. Reread after conflicts and replay a recorded operation only with the same fingerprint.
 
-Objectives are Workspace Server control-plane records, not files in a checkout. Use typed Objective tools or `yoi objective ...`; both resolve the selected Backend/Workspace through the shared client target and call the Workspace API.
+Relations remain metadata, not a scheduling mechanism: record actual project dependencies, but do not encode capacity, Worker/worktree ownership, or execution ordering as relations. Use orchestration/session records for those concerns and inspect current Backend claim rules rather than inferring launch eligibility from a relation alone.
 
-Objective-to-Ticket links are context links only: they are not dependency, blocking, ordering, ownership, or scheduling relations. Objective lifecycle does not drive Ticket state or authorize implementation. A role reading Objective context must still inspect each Ticket and its current Merge Request evidence.
+## Optional code Git/MR recipe
 
-Repository-local `.yoi/objectives` trees are ignored. There is no automatic import or cwd/ancestor fallback.
+For code work using the default publication/review recipe, select `builtin:coder` and optionally `builtin:coder-review`. The Flow guides implement, review, fix, and handoff; it is not a Backend Ticket completion requirement and grants no authority. Read current repository state, use coherent commits and normal non-force publication only when authorized, validate the changed contracts, and report changed files, validation, and limitations. No commits/push should be inferred from a request explicitly prohibiting them.
 
-## Ticket configuration
+Use one open repository-scoped MR per Ticket/repository. `OpenMergeRequest` creates selectors; once an MR exists, explicitly address its ID with `ShowMergeRequest` and preserve its selectors. Advance only the existing source selector with a normal non-force push. Do not invent an add-revision operation, replacement MR, or fresh integration branch for every fix. Publish the exact committed source and verify provider resolution before requesting review.
 
-Workspace Ticket data and workflow authority live in the Workspace Server's SQLite control-plane store. Repository-local `.yoi/workspace.toml` and `.yoi/ticket.config.toml` are not Ticket, Workspace identity, Backend connection, or role-launch authority. `yoi init --display-name <NAME> --repository-key <KEY>` registers the current Git repository through the Backend API and writes only global client routing under `$XDG_CONFIG_HOME/yoi/client.toml`.
+The assigned Coder launches the Reviewer as an actual direct-child `builtin:reviewer` SubWorker, with explicit command grant and appropriate Workdir scope for inspection/validation, plus the structured Ticket/MR handoff. Server authority verifies assignment, Runtime-owned child identity, effective Profile, one-shot attempt, and captured subject. Review capability is injected by the trusted layer, not supplied by the model. The Reviewer makes an independent judgment against intent, acceptance criteria, the complete captured result snapshot, and validation, then records `ReviewMergeRequest`; prose and observation are not approval authority.
 
-Fixed Ticket workflow roles are `intake`, `orchestrator`, `coder`, and `reviewer`. The Server resolves the selected Profile and launch material from the active Workspace configuration authority, and Runtime receives the resulting immutable launch snapshot. A repository checkout may still contain ordinary project files, but neither the client nor Runtime may infer Workspace identity, Backend routing, role Profile, or Ticket storage from repository-local `.yoi` files.
+Source movement requires fresh review for the exact new source. Target-only movement preserves unchanged-source approval but requires refreshed integration evidence. Keep routine review/fix/rereview evidence on the MR rather than repeating each iteration in Ticket comments.
 
-## Ticket lifecycle
+MR integration remains separate Orchestrator authority. Immediately before integration, reread Ticket/MR authority and `CheckMergeRequestReadiness`. Verify exact approved source, current target, strategy, and approval event. Apply and validate integration through ordinary source control in the bound Workdir, push normally, and verify provider resolution. `CompleteMergeRequest` records that already-applied repository result; it does not move a branch, complete the Ticket, or release assignment. If push succeeded but recording failed, reread/replay the same operation rather than pushing again. A Ticket request saying review is not required does not bypass MR integration guards.
 
-Ticket-driven development normally moves through these gates:
+## Responsibility, unfinished work, and cleanup (T-715)
 
-1. Intake
-2. Orchestrator routing
-3. Planning/requirements sync or spike when needed
-4. Implementation assignment
-5. Review
-6. Merge / validation / cleanup
-7. Close
+Terminal current responsibility is retained for display after unfinished work ends. It is not the same as an unfinished assignment and does not require an invented unassignment operation before cleanup. A stopped or idle Worker may still own unfinished work; a completed/closed Ticket does not automatically stop/remove the Worker, release its attachments, or delete a Workdir. A result report or Flow terminal state is neither conclusion nor cleanup authority.
 
-Each gate records its decision or evidence in the Ticket thread or artifacts.
+Worker stop, retention/removal, attachment release, and Workdir deletion are independent guarded decisions. Do not predeclare `delete_on_completion` or `retain_on_completion` at launch. Retain Workers while a requested review/fix or other handoff can still return; do not remove them just because one turn ended.
 
-### 1. Intake
+When authorized cleanup is in scope:
 
-Use the Intake role launch prompt when a user request is broad, ambiguous, or not yet a Ticket.
+1. Reread Ticket responsibility, active unfinished work, Worker state, handoffs/notifications, and current retention constraints. Use the exact Worker subject from `WorkerList`.
+2. Stop the Worker if needed and confirm terminal state. Stop alone does not end unfinished work. `UnfinishedWork` (`unfinished_work`) requires explicit authorized work end or reassignment and a fresh authority read.
+3. Call `WorkerRemove` only with no unfinished work, running/restoring state, pin/legal hold, pending notification, or handoff. Backend revalidates guards; removal releases attachments but preserves Workdir materialization.
+4. Reread actual Workdir attachment release, occupancy, cleanliness, ownership, provider availability, and other use. Retain still-needed/existing resources. Only then use `WorkdirDelete` for a proven clean, unoccupied, no-longer-needed Ticket-dedicated Workdir owned/selected for this work.
 
-Intake should:
+Never delete before attachment release, force removal, discard changes, or advance on a partial/unknown failure. Reread authority before a bounded retry. Cleanup failures do not roll back recorded Ticket or MR outcomes; report concrete blockers rather than adding routine success comments.
 
-- clarify user intent;
-- check duplicate/related Tickets;
-- draft background, requirements, acceptance criteria, binding decisions/invariants, implementation latitude, readiness, risk flags, and validation;
-- create or update the Ticket only after user agreement.
+## Authoring and granularity
 
-Intake should not schedule implementation, spawn coder/reviewer Workers, create worktrees, merge, or close Tickets.
+Intake clarifies ambiguous intent, checks duplicates and relevant context, and records agreed work. Create/update only after user agreement or explicit instruction to record the draft. A minimum investigation gate is an authoring responsibility, not a universal implementation approval gate. Intake is not scheduling, implementation, review, merge, or cleanup authority.
 
-### 2. Orchestrator routing
+A useful Ticket records background/motivation, requirements, acceptance criteria, binding decisions/invariants, implementation latitude, and relevant open questions/risks. Include useful result evidence and final resolution when appropriate. Separate confirmed facts, user claims, hypotheses, and undecided questions. Do not copy Worker role boundaries, a temporary plan, or a decision to stop after authoring into the Ticket as a product prohibition. Record an approval gate only when the user asks for it; do not prematurely prescribe implementation tactics.
 
-Use the Orchestrator role launch prompt to classify the next action for an existing Ticket.
+Risk flags prompt context checks and reviewer focus, not automatic stop gates. Return to planning only for a named missing decision/information after bounded checks; escalate beyond-scope decisions without inventing new constraints.
 
-Routing classifications include:
+Do not create new umbrella/progress-container Tickets. Split broad work into concrete useful outcomes, record the split in Ticket/Objective context, and use Objectives for enduring medium-term goals. Do not replace umbrellas with parent/child, sub-ticket, part-of, contains, or other hierarchy relations. A concrete planning/design/investigation Ticket is valid when requested. Existing umbrellas can be retired as superseded/decomposed without rewriting history; distinguish container retirement from completion of future work.
 
-- `requirements_sync_needed`
-- `return_to_planning`
-- `spike_needed`
-- `implementation_ready`
-- `review_needed`
-- `blocked_by_dependency_or_missing_authority`
-- `close_ready`
-- `closed_or_noop`
+Keep long research dumps outside the item body and summarize necessary bounded artifacts. Never store secrets, credentials, private prompt contents, or secret-bearing logs in Ticket/MR/Drive records or model-visible evidence.
 
-Routing decisions should be recorded with `TicketComment` using `plan` or `decision` role. The decision should state the classification, evidence checked, reason, next action, and escalation conditions. For `return_to_planning`, the record must also state the concrete missing decision/information, context checked, why implementation latitude is insufficient, and the next planning question/action.
+## Configuration and validation
 
-### 3. Planning/requirements sync
+Workspace Ticket data and authority live in Server SQLite and active Workspace configuration. `yoi init --display-name <NAME> --repository-key <KEY>` registers a repository through Backend and writes global client routing only. Repository-local `.yoi/workspace.toml` and `.yoi/ticket.config.toml` do not grant Workspace identity, Backend connection, role selection, or Ticket authority. Legacy `ticket init` and `ticket import-local` are unsupported; no automatic migration reads local Ticket trees.
 
-Use planning/requirements sync only as a bounded Ticket refinement step. Return `ready` or `queued` Tickets to `planning` only when the Orchestrator can name a concrete missing decision or information item after bounded project-context checks; risk flags and risky domains are context-lookup and reviewer-focus signals, not automatic stop gates.
+Dashboard actions are explicit user actions, not scheduler/auto-maintainer authority. Launch success without a visible result calls for attaching to or observing the Worker and rereading authority, not assuming conclusion. Select an accessible Workspace and current registered Profile when a launch reports missing configuration.
 
-Planning sync should resolve or record:
-
-- requirements and acceptance criteria;
-- current code map;
-- binding decisions/invariants and implementation latitude;
-- critical risks and failure modes;
-- implementation-ready vs requirements-sync/spike/blocked classification.
-
-Do not send Tickets with unresolved concrete missing decisions/information directly to coder Workers. If no concrete missing item remains after bounded checks, risky-but-specified Tickets should proceed with an IntentPacket plus escalation conditions and reviewer focus.
-
-### 4. Implementation assignment
-
-Use the Coder and Reviewer role launch prompts for implementation-ready Tickets.
-
-The Orchestrator should prepare an `IntentPacket` with:
-
-- intent;
-- requirements;
-- binding decisions/invariants;
-- implementation latitude;
-- escalation conditions;
-- validation;
-- current code map;
-- critical risks.
-
-Implementation normally happens in a child git worktree created by the Orchestrator, not by the coder Worker. The coder Worker receives narrow write scope to the worktree and must report changed files, implementation summary, validation, unresolved risks, and review readiness.
-
-### 5. Review
-
-The assigned Coder launches the Reviewer as an actual direct-child `builtin:reviewer` SubWorker with write scope, so it can use the Workdir command tools required for inspection and validation, and a structured handoff bound to the current immutable Merge Request revision. Server authority revalidates the parent assignment, Runtime-owned child session, effective profile, one-shot review attempt, and revision; prose output is not approval.
-
-The Reviewer records the structured result with `ReviewMergeRequest`. Request changes advances the existing Merge Request source selector with a normal non-force push and requires a fresh child attempt for that exact new source ref; do not create a replacement Merge Request, add-revision operation, or fresh integration branch. Target-only movement preserves approval for an unchanged source and requires refreshed integration evidence. The Orchestrator uses `CheckMergeRequestReadiness` and then `CompleteMergeRequest` for guarded integration with operation-id dedupe/CAS semantics; Flow transitions are not completion authority.
-
-Blockers must be fixed or explicitly escalated before merge-ready submission.
-
-### 6. Merge and close
-
-Unless explicitly authorized otherwise, final merge, cleanup, design-boundary decisions, and Ticket closure remain Orchestrator/human responsibilities.
-
-Before closing, verify concrete evidence:
-
-- SubWorker committed session via worker-observation tools;
-- worktree state and diff;
-- validation command output;
-- review result;
-- Ticket requirements and acceptance criteria;
-- merge/cleanup state in the main workspace.
-
-Close with a resolution that summarizes what changed, key commits, validation, review state, and remaining follow-ups.
-
-## Workspace Dashboard Ticket role actions
-
-`yoi panel` is the active Ticket/Intake/Orchestrator Dashboard. It owns fixed Ticket role-launch actions and uses the shared client Ticket role launcher. The single-Worker Console no longer supports `:ticket ...` commands; typing them in command mode is treated like any other unknown command.
-
-Role actions map to the fixed Workspace Ticket roles:
-
-- intake launches the intake role without an existing Ticket and requires freeform context.
-- route launches the orchestrator role for an existing Ticket.
-- implement launches the coder role for an implementation assignment.
-- review launches the reviewer role for review.
-
-All actions are explicit and user-triggered. They are not a scheduler, queue, spawned-Worker Dashboard, or automatic maintainer loop.
-
-### Dashboard execution path
-
-The Dashboard sends the selected action and Ticket context to the Workspace Server. The Server validates Workspace access, resolves the current Server DB Workspace/Ticket authority and active Profile projection, launches or restores the role Worker through the shared Worker path, commits the typed initial input, and returns durable acceptance evidence. The client does not inspect repository-local `.yoi` files, choose a Ticket storage directory, or construct Runtime launch authority.
-
-The launched Worker receives dynamic Ticket/action context as its first committed run input. The selected Profile supplies durable system/role behavior. Workspace Ticket metadata does not override system instruction.
-
-### Dashboard troubleshooting
-
-- unresolved Workspace selection: select an accessible Workspace from the Server catalog or pass an explicit Workspace selector.
-- unavailable role Profile: update the active Workspace configuration and retry after the Server projects the new revision.
-- missing Ticket id for route, implement, or review actions: provide the target Ticket.
-- launch success but no visible completion: attach to or inspect the launched Worker; completion notifications are hints, not authority.
-
-## Granularity
-
-One Ticket should describe a complete change that can be explained as a feature, behavior, design decision, investigation result, or maintenance outcome when closed. It should be concrete enough to implement, review, validate, and close without relying on another open Ticket as its progress container.
-
-Avoid Tickets that only mirror an implementation step unless that step is independently reviewable and useful. Phase/step lists inside a Ticket are execution order, not a separate dependency system.
-
-Do not create new umbrella Tickets for broad multi-Ticket efforts. When a request is too broad for one concrete work item:
-
-- create concrete implementable Tickets for the slices;
-- record the split decision in the relevant Ticket thread, Objective context, or both;
-- use Objectives for medium-term goal, motivation, strategy, and success-criteria context when that context would outlive one concrete Ticket;
-- once typed Ticket relations exist, use them only for non-hierarchical dependency, related, blocking, superseded-by, duplicate, or replacement metadata;
-- do not replace umbrellas with parent/child, sub-ticket, umbrella, part-of, contains, or other hierarchy/container relations;
-- do not keep a separate umbrella Ticket open merely as a progress container.
-
-This policy does not forbid an initial concrete planning, design, or investigation Ticket when the user asks for one. The deprecated pattern is a long-lived umbrella/progress-container Ticket whose main purpose is to keep a broad effort open while other concrete Tickets carry the actual work.
-
-Existing umbrella Tickets may be retired without rewriting history. Once concrete follow-up Tickets and any needed Objective context exist, close the umbrella as superseded/decomposed. The close resolution should state that the container role is retired, not that every related future concern is complete, and should list completed concrete Tickets plus remaining follow-up Tickets/Objectives.
-
-## Ticket contents
-
-A useful Ticket states:
-
-- background and motivation;
-- requirements;
-- acceptance criteria;
-- relevant binding decisions/invariants, implementation latitude, and escalation conditions;
-- readiness, open questions, and risk flags when relevant;
-- implementation reports when work is submitted;
-- reviews;
-- final resolution when closed.
-
-Keep long research dumps out of the item body. Attach necessary bounded artifacts through the Ticket evidence surface and summarize the conclusion in the thread.
-
-Do not store secrets, credentials, private prompt contents, or raw logs containing secrets in Ticket bodies, thread entries, artifacts, diagnostics, or model-visible prompts.
-
-## Backend CLI: `yoi ticket`
-
-The product CLI resolves an explicit or configured Backend target and performs Ticket operations through the Workspace API. It does not open a repository-local backend. Use command help for the current typed command surface.
-
-Legacy `ticket init` and `ticket import-local` workflows are unsupported. No automatic migration reads old `.yoi/tickets` trees; export data with an older version before upgrading if it must be retained, then import it through an explicit supported Workspace surface.
-
-## Validation
-
-Run at least:
-
-```sh
-yoi ticket doctor
-git diff --check
-```
-
-Implementation Tickets usually also need focused tests and broader checks, for example:
-
-```sh
-cargo fmt --check
-cargo check --workspace --all-targets
-cargo test -p <crate> <filter>
-```
-
-Record validation commands and results in the implementation report or resolution.
+Validate the actual result with checks appropriate to its acceptance criteria. Code changes follow `AGENTS.md` and [Rust testing strategy](rust-testing-strategy.md): begin with the smallest contract-proving target/filter, then the required compile/test/format checks. Record only validation actually run. Narrow effective instruction/tool fixtures protect inclusion, schema, and policy wording; they do not prove real Worker judgment or end-to-end behavior.

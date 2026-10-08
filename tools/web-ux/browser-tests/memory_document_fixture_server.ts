@@ -418,7 +418,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
         display_name: "Embedded Runtime",
         built_in: true,
         worker_creation_available: true,
-        working_directory_required: false,
+        supports_workdir_attachments: false,
         status: "active",
         diagnostics: [],
       }],

@@ -84,75 +84,45 @@ Deno.test("ticket lane visibility advances in bounded pages of 30", () => {
   assertEquals(nextTicketLaneVisibleCount(95, 95), 95);
 });
 
-Deno.test("ticket worker launch uses the common Worker route and bounded Ticket context", () => {
-  const ticket = {
-    id: "00001KYRRDVH9",
-    title: "Ticket panel API",
-    targets: [
-      {
-        repository_key: "docs",
-        ref_selector: "main",
-        access: "read_only",
-      },
-      {
-        repository_key: "main repo",
-        ref_selector: "work/ticket",
-        access: "read_write",
-      },
-    ],
-  } as TicketDetail;
-
-  assertEquals(
-    ticketWorkerMessage(ticket.id, "coder"),
-    "Work on Ticket 00001KYRRDVH9 as its coder.",
-  );
-
-  const href = ticketWorkerLaunchHref("workspace one", ticket, "reviewer");
-  const url = new URL(href, "https://example.test");
-  assertEquals(url.pathname, "/w/workspace%20one/workers/new");
-  assertEquals(url.searchParams.get("ticketId"), ticket.id);
-  assertEquals(url.searchParams.get("ticketRole"), "reviewer");
-  assertEquals(url.searchParams.get("repositoryKey"), "main repo");
-  assertEquals(url.searchParams.get("refSelector"), "work/ticket");
-  assertEquals(
-    url.searchParams.get("initialInput"),
-    "Work on Ticket 00001KYRRDVH9 as its reviewer.",
-  );
+Deno.test("generic Ticket launch carries natural text without role or resource claims", () => {
+  const requests = [
+    "Review is unnecessary; complete the requested work.",
+    "Review the change, then merge it if approved.",
+    "Investigate and return without a conclusion.",
+  ];
+  const targetSets: TicketDetail["targets"][] = [
+    [],
+    [{ repository_key: "docs", ref_selector: "main", access: "read_only" }],
+    [{ repository_key: "repo", ref_selector: "main", access: "read_write" }],
+  ];
+  assertEquals(ticketWorkerMessage("T-720"), "Work on Ticket T-720.");
+  for (const targets of targetSets) {
+    const ticket = { id: "T-720", title: "Flexible launch", targets };
+    for (const request of requests) {
+      const url = new URL(
+        ticketWorkerLaunchHref("workspace one", ticket, request),
+        "https://example.test",
+      );
+      assertEquals(url.pathname, "/w/workspace%20one/workers/new");
+      assertEquals(url.searchParams.get("ticketId"), ticket.id);
+      assertEquals(url.searchParams.get("ticketTitle"), ticket.title);
+      assertEquals(url.searchParams.get("initialInput"), request);
+      for (
+        const field of [
+          "ticketRole",
+          "profile",
+          "repositoryKey",
+          "refSelector",
+          "flow",
+        ]
+      ) {
+        assertEquals(url.searchParams.has(field), false);
+      }
+    }
+  }
 });
 
-Deno.test("ticket worker launch never selects a read_only or ambiguous write target", () => {
-  const readOnly = {
-    id: "ticket-read-only",
-    title: "Read only",
-    targets: [{
-      repository_key: "docs",
-      ref_selector: "main",
-      access: "read_only",
-    }],
-  } as TicketDetail;
-  const readOnlyUrl = new URL(
-    ticketWorkerLaunchHref("workspace", readOnly, "coder"),
-    "https://example.test",
-  );
-  assertEquals(readOnlyUrl.searchParams.has("repositoryKey"), false);
-  assertEquals(readOnlyUrl.searchParams.has("refSelector"), false);
-
-  const ambiguous = {
-    ...readOnly,
-    targets: [
-      { repository_key: "main", ref_selector: "develop", access: "read_write" },
-      { repository_key: "docs", ref_selector: "main", access: "read_write" },
-    ],
-  } as TicketDetail;
-  const ambiguousUrl = new URL(
-    ticketWorkerLaunchHref("workspace", ambiguous, "coder"),
-    "https://example.test",
-  );
-  assertEquals(ambiguousUrl.searchParams.has("repositoryKey"), false);
-  assertEquals(ambiguousUrl.searchParams.has("refSelector"), false);
-});
-
-Deno.test("ticket detail uses server-derived role assignment actions", async () => {
+Deno.test("ticket detail retains backend queue eligibility and generic Worker assignment actions", async () => {
   const source = await Deno.readTextFile(
     new URL(
       "../../../routes/w/[workspaceId]/tickets/[ticketId]/+page.svelte",
@@ -162,11 +132,6 @@ Deno.test("ticket detail uses server-derived role assignment actions", async () 
 
   assertEquals(source.includes("ticket.action_eligibility.can_queue"), true);
   assertEquals(source.includes("ticket.relations.blockers.length > 0"), true);
-  assertEquals(
-    source.includes("ticket.action_eligibility.queue_tickets"),
-    true,
-  );
-  assertEquals(source.includes("This operation queues:"), true);
   assertEquals(source.includes("outcome.queued_tickets.join"), true);
   assertEquals(
     source.includes("resolve the listed blockers before Queue"),
@@ -176,7 +141,14 @@ Deno.test("ticket detail uses server-derived role assignment actions", async () 
     source.includes("ticket.action_eligibility.can_assign_orchestrator"),
     true,
   );
-  assertEquals(source.includes("/assignments/${role}"), true);
+  assertEquals(
+    source.includes('mutateAssignment("start-manual", "worker"'),
+    true,
+  );
+  assertEquals(
+    source.includes('mutateAssignment("start-manual", "reviewer"'),
+    false,
+  );
   assertEquals(source.includes('kind: "workspace_agent"'), true);
   assertEquals(source.includes('kind: "worker"'), true);
   assertEquals(source.includes("ticket.assignee"), false);
@@ -187,10 +159,6 @@ Deno.test("ticket detail uses server-derived role assignment actions", async () 
   assertEquals(
     source.includes("(repository.diagnostics ?? []).length > 0"),
     false,
-  );
-  assertEquals(
-    source.includes("unique registered repository targets"),
-    true,
   );
 });
 

@@ -12902,10 +12902,11 @@
           "status": {
             "type": "string"
           },
-          "worker_creation_available": {
+          "supports_workdir_attachments": {
+            "description": "Whether this Runtime supports explicitly selected Workdir attachments.\nWorkdirs are optional for generic launches; embedded Runtime does not support them.",
             "type": "boolean"
           },
-          "working_directory_required": {
+          "worker_creation_available": {
             "type": "boolean"
           }
         },
@@ -12914,7 +12915,7 @@
           "display_name",
           "built_in",
           "worker_creation_available",
-          "working_directory_required",
+          "supports_workdir_attachments",
           "status",
           "diagnostics"
         ],
@@ -15671,7 +15672,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:16796bde0da04973310a14f90cf6eac14b2580bbe184c7c12afde3b6225ce933"
+    "x-yoi-source-digest": "sha256:3ae89b3b76b2c31f016f4f9e1bc339115fdfb0b7d2a9964c4c708488a3e5f6f1"
   },
   "openapi": "3.1.0",
   "paths": {

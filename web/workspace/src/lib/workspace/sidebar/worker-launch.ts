@@ -1,6 +1,9 @@
 import type {
   BrowserWorkerWorkingDirectorySelection,
   CreateWorkspaceWorkerRequest,
+  CreateWorkspaceWorkerTicketAssignmentRequest,
+  RepositoryApiError,
+  WorkerLaunchProfileCandidate,
 } from "#lib/generated/worker-launch-api.ts";
 import { parseCreateWorkspaceWorkerRequest } from "#lib/workspace/api/workers.ts";
 
@@ -14,6 +17,8 @@ export type WorkerLaunchAttachmentFormState = {
 
 export type WorkerLaunchFormState = {
   runtime_id: string;
+  flow?: string;
+  ticket_assignment?: CreateWorkspaceWorkerTicketAssignmentRequest | null;
   display_name: string;
   profile: string;
   subjektiv_subject_id: string;
@@ -35,84 +40,33 @@ export function defaultWorkerLaunchForm(
     ) ??
       options?.runtimes.find((runtime) => runtime.worker_creation_available) ??
       options?.runtimes[0];
-  const preferredProfile = options?.profiles.find((candidate) =>
-    candidate.id === options.default_profile
-  );
-  const availableWorkingDirectories =
-    options?.working_directories.filter((directory) =>
-      directory.status === "active" &&
-      directory.source.kind !== "workspace_config" &&
-      (directory.source.kind === "external_grant" ||
-        directory.cleanliness === "clean") &&
-      directory.occupied_by == null
-    ) ?? [];
-  const selectedRuntime = current.runtime_id
-    ? options?.runtimes.find((runtime) =>
-      runtime.runtime_id === current.runtime_id
-    )
-    : preferredRuntime;
-  const workdirlessRuntime =
-    selectedRuntime?.working_directory_required === false;
-  const preferredWorkingDirectory = workdirlessRuntime
-    ? undefined
-    : availableWorkingDirectories.find((directory) =>
-      Boolean(current.working_directory_repository_key) &&
-      directory.source.kind === "repository" &&
-      directory.source.repository_key ===
-        current.working_directory_repository_key &&
-      (!current.working_directory_selector ||
-        (directory.current_selector ?? directory.creation_selector) ===
-          current.working_directory_selector)
-    ) ?? availableWorkingDirectories.find((directory) =>
-      Boolean(current.working_directory_repository_key) &&
-      directory.source.kind === "repository" &&
-      directory.source.repository_key ===
-        current.working_directory_repository_key
-    ) ?? (current.working_directory_repository_key
-      ? undefined
-      : availableWorkingDirectories[0]);
-  const preferredRepository =
-    options?.repositories.find((repository) =>
-      repository.repository_key === current.working_directory_repository_key
-    ) ??
-      options?.repositories[0];
+  const runtime =
+    options?.runtimes.find((candidate) => candidate.runtime_id === current.runtime_id) ??
+      preferredRuntime;
   const availableWorkdirIds = new Set(
-    availableWorkingDirectories.map((directory) =>
-      directory.working_directory_id
-    ),
+    (options?.working_directories ?? []).filter((directory) =>
+      directory.status === "active" && directory.source.kind !== "workspace_config" &&
+      (directory.source.kind === "external_grant" || directory.cleanliness === "clean") &&
+      directory.occupied_by == null
+    ).map((directory) => directory.working_directory_id),
   );
-  const currentAttachments = workdirlessRuntime
-    ? []
-    : current.workdir_attachments.filter((attachment) =>
-      availableWorkdirIds.has(attachment.working_directory_id)
-    );
-  const workdirAttachments = currentAttachments.length > 0
-    ? currentAttachments
-    : preferredWorkingDirectory
-    ? [{
-      alias: "workdir",
-      working_directory_id: preferredWorkingDirectory.working_directory_id,
-      relative_cwd: "",
-    }]
-    : selectedRuntime?.working_directory_required === true
-    ? [{ alias: "workdir", working_directory_id: "", relative_cwd: "" }]
-    : [];
-
+  // Defaults never claim resource attachments or infer an execution recipe from a Ticket.
   return {
+    ...current,
     runtime_id: current.runtime_id || preferredRuntime?.runtime_id || "",
     display_name: current.display_name || "Worker",
     profile:
-      options?.profiles.some((candidate) => candidate.id === current.profile)
+      genericLaunchProfiles(options?.profiles ?? []).some((candidate) =>
+          candidate.id === current.profile
+        )
         ? current.profile
-        : preferredProfile?.id || "",
-    subjektiv_subject_id: current.subjektiv_subject_id,
-    initial_text: current.initial_text,
-    workdir_attachments: workdirAttachments,
-    working_directory_repository_key:
-      current.working_directory_repository_key ||
-      preferredRepository?.repository_key || "",
-    working_directory_selector: current.working_directory_selector ||
-      preferredRepository?.default_selector || "HEAD",
+        : "",
+    workdir_attachments: runtime?.supports_workdir_attachments === false
+      ? []
+      : current.workdir_attachments.filter((attachment) =>
+        availableWorkdirIds.has(attachment.working_directory_id)
+      ),
+    working_directory_selector: current.working_directory_selector || "HEAD",
   };
 }
 
@@ -172,19 +126,41 @@ function validatedAttachments(
 export function buildCreateWorkspaceWorkerRequest(
   form: WorkerLaunchFormState,
 ): CreateWorkspaceWorkerRequest {
+  if (["builtin:reviewer", "reviewer"].includes(form.profile.trim())) {
+    throw new Error("Trusted Reviewer launch requires a bound review request.");
+  }
   const initialMessage = form.initial_text.trim();
   return parseCreateWorkspaceWorkerRequest({
     runtime_id: form.runtime_id.trim(),
     display_name: form.display_name.trim(),
     profile: form.profile.trim() || null,
-    ticket_assignment: null,
-    initial_submit: initialMessage
-      ? [{ kind: "text", content: form.initial_text }]
-      : [],
+    ticket_assignment: form.ticket_assignment ?? null,
+    initial_submit: [
+      ...(initialMessage ? [{ kind: "text", content: form.initial_text }] : []),
+      ...(form.flow?.trim() ? [{ kind: "flow", selector: form.flow.trim() }] : []),
+    ],
     workdir_attachments: validatedAttachments(form.workdir_attachments),
     feature_connections: form.subjektiv_subject_id.trim()
       ? { subjektiv: { subject_id: form.subjektiv_subject_id.trim() } }
       : {},
     control_operation_id: null,
   });
+}
+
+// A trusted Reviewer is launched through the bound review path, not a Profile selection.
+export function genericLaunchProfiles(
+  profiles: WorkerLaunchProfileCandidate[],
+): WorkerLaunchProfileCandidate[] {
+  return profiles.filter((candidate) =>
+    candidate.id !== "builtin:reviewer" && candidate.id !== "reviewer"
+  );
+}
+
+export function workerLaunchOutcomeUnknown(error: RepositoryApiError): boolean {
+  return [
+    error.error,
+    error.message,
+    ...(error.diagnostics ?? []).flatMap((item) => [item.code, item.message]),
+  ]
+    .some((value) => /outcome[_\s-]?unknown|OutcomeUnknown/i.test(value));
 }

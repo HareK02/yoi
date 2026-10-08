@@ -870,12 +870,14 @@ impl WorkerOperation {
                 "Send an advisory notification to a known Runtime Worker so information can be incorporated into work already in progress without creating a queued Submit."
             }
             Self::Cancel => "Cancel the current turn of a known Runtime Worker when allowed.",
-            Self::Stop => "Stop a known Runtime Worker when allowed.",
+            Self::Stop => {
+                "Stop a known Runtime Worker when allowed. Stop is independent of Ticket conclusion: it does not end unfinished work, remove retained session records, release attachments, or delete Workdirs."
+            }
             Self::Restore => {
                 "Restore a stopped Backend/Runtime Worker session in the current Workspace. Supply expected_observation_token from WorkerList; a conflict requires refreshing and deliberate new intent. New requests default to the durable Tool call ID. For explicit recovery of an unknown/pending outcome, supply the reported request_id and the original token unchanged; never create a new intent or automatically retry."
             }
             Self::Remove => {
-                "Remove an eligible stopped, non-internal Worker with no unfinished Ticket work. Terminal Ticket responsibility is retained and does not require unassignment. Supply a bounded reason; Backend validation and retention are authoritative."
+                "Remove an eligible stopped, non-internal Worker with no unfinished Ticket work. Terminal Ticket responsibility is retained and does not require unassignment. Conclusion, stopping, retention/removal, attachment release, and Workdir deletion are separate decisions. Removal releases attachments but preserves Workdir materialization. Supply a bounded reason; Backend validation and retention are authoritative."
             }
         }
     }
@@ -2048,6 +2050,28 @@ mod tests {
                 assert_eq!(body["kind"], expected_kind);
             }
         }
+    }
+
+    #[test]
+    fn worker_lifecycle_descriptions_separate_unfinished_work_retention_and_attachment_cleanup() {
+        let stop = worker_tool_declaration(WorkerOperation::Stop);
+        assert!(stop.description.contains("does not end unfinished work"));
+        assert!(
+            stop.description
+                .contains("release attachments, or delete Workdirs")
+        );
+        let remove = worker_tool_declaration(WorkerOperation::Remove);
+        assert!(
+            remove
+                .description
+                .contains("Terminal Ticket responsibility is retained")
+        );
+        assert!(remove.description.contains("does not require unassignment"));
+        assert!(
+            remove
+                .description
+                .contains("releases attachments but preserves Workdir materialization")
+        );
     }
 
     #[tokio::test]

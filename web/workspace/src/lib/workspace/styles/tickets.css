@@ -73,13 +73,22 @@
     justify-content: space-between;
     gap: var(--space-4);
   }
+  .ticket-panel-header {
+    flex-wrap: wrap;
+  }
+  .ticket-panel-header > div:first-child {
+    flex: 1 1 12rem;
+  }
   .ticket-panel-controls {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
+    max-width: 100%;
     gap: var(--space-3);
   }
   .orchestrator-status {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 0.65rem;
     border: 1px solid var(--line);
@@ -480,17 +489,11 @@
     .ticket-detail-grid {
       grid-template-columns: minmax(0, 1fr);
     }
-    .ticket-control-rail {
-      grid-row: 1;
-    }
   }
 
   @media (max-width: 64rem) {
     .ticket-detail-grid {
       grid-template-columns: 1fr;
-    }
-    .ticket-control-rail {
-      grid-row: 1;
     }
   }
 }

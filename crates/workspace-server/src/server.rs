@@ -30373,7 +30373,7 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> ApiResult<WorkerLaunchO
                 display_name: runtime.label,
                 built_in,
                 worker_creation_available: runtime.worker_creation_available,
-                working_directory_required: !built_in,
+                supports_workdir_attachments: !built_in,
                 status: runtime.status,
                 diagnostics: runtime
                     .diagnostics
@@ -36614,7 +36614,12 @@ mod tests {
         assert_eq!(builtin.definition.name, "coder-review");
         assert_eq!(builtin.selector.to_string(), "builtin:coder-review");
         assert_eq!(builtin.flow_id, "builtin:coder-review");
-        assert_eq!(builtin.revision, 4);
+        assert_eq!(
+            builtin.revision,
+            flow::builtin_flow_source(flow::CODER_REVIEW_FLOW_SLUG)
+                .unwrap()
+                .revision
+        );
         assert_eq!(
             api.store
                 .list_flow_sources(&api.config.workspace_id)
@@ -56517,12 +56522,12 @@ mod tests {
             .iter()
             .find(|runtime| runtime["runtime_id"] == EMBEDDED_WORKER_RUNTIME_ID)
             .expect("embedded runtime launch option");
-        assert_eq!(embedded_runtime["working_directory_required"], false);
+        assert_eq!(embedded_runtime["supports_workdir_attachments"], false);
         let team_runtime = runtimes
             .iter()
             .find(|runtime| runtime["runtime_id"] == "team-runtime")
             .expect("team runtime launch option");
-        assert_eq!(team_runtime["working_directory_required"], true);
+        assert_eq!(team_runtime["supports_workdir_attachments"], true);
 
         let removal_request = serde_json::json!({
             "operation_id": "remove-team-runtime",

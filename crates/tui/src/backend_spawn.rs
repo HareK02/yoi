@@ -120,13 +120,6 @@ impl FormState {
             self.field = Field::Runtime;
             return None;
         }
-        if runtime.working_directory_required {
-            self.status =
-                "The selected Runtime requires a workdir; this launch flow does not select one yet."
-                    .to_string();
-            self.field = Field::Runtime;
-            return None;
-        }
         let Some(profile) = self.current_profile(options) else {
             self.status = "No Worker profile is available.".to_string();
             self.field = Field::Profile;
@@ -377,8 +370,8 @@ fn profile_title(state: &FormState, options: &BackendWorkerLaunchOptions) -> Str
 fn runtime_label(runtime: &BackendWorkerLaunchRuntimeOption) -> String {
     let availability = if !runtime.worker_creation_available {
         "unavailable"
-    } else if runtime.working_directory_required {
-        "workdir required"
+    } else if runtime.supports_workdir_attachments {
+        "optional workdirs"
     } else {
         "no workdir"
     };
@@ -389,7 +382,7 @@ fn runtime_label(runtime: &BackendWorkerLaunchRuntimeOption) -> String {
 }
 
 fn runtime_supports_workdirless_creation(runtime: &BackendWorkerLaunchRuntimeOption) -> bool {
-    runtime.worker_creation_available && !runtime.working_directory_required
+    runtime.worker_creation_available
 }
 
 fn cycle_index(current: usize, len: usize, delta: isize) -> usize {
@@ -413,7 +406,7 @@ mod tests {
                     display_name: "External".to_string(),
                     built_in: false,
                     worker_creation_available: true,
-                    working_directory_required: true,
+                    supports_workdir_attachments: true,
                     status: "online".to_string(),
                     diagnostics: Vec::new(),
                 },
@@ -422,7 +415,7 @@ mod tests {
                     display_name: "Embedded".to_string(),
                     built_in: true,
                     worker_creation_available: true,
-                    working_directory_required: false,
+                    supports_workdir_attachments: false,
                     status: "online".to_string(),
                     diagnostics: Vec::new(),
                 },
@@ -454,20 +447,18 @@ mod tests {
         let state = FormState::new(&options);
         assert_eq!(
             state.current_runtime(&options).unwrap().runtime_id,
-            "embedded"
+            "external"
         );
         assert_eq!(state.current_profile(&options).unwrap().id, "builtin:coder");
         assert_eq!(state.display_name, "Worker");
     }
 
     #[test]
-    fn workdir_required_runtime_cannot_be_submitted() {
+    fn attachment_capable_runtime_can_submit_without_resources() {
         let options = options();
         let mut state = FormState::new(&options);
         state.runtime_index = 0;
-        assert_eq!(state.submit(&options), None);
-        assert!(state.status.contains("requires a workdir"));
-        assert_eq!(state.field, Field::Runtime);
+        assert_eq!(state.submit(&options).unwrap().runtime_id, "external");
     }
 
     #[test]
