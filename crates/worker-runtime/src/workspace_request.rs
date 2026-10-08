@@ -255,7 +255,7 @@ impl RuntimeWorkspaceRequestClient {
         request: RuntimeWorkspaceRequest,
     ) -> Result<RuntimeWorkspaceResponse, RuntimeWorkspaceRequestError> {
         let client = self.clone();
-        std::thread::spawn(move || client.execute_blocking_inner(request))
+        std::thread::spawn(move || client.execute_blocking_inner(request, true))
             .join()
             .map_err(|_| RuntimeWorkspaceRequestError::Transport {
                 message: "Workspace request thread panicked".to_string(),
@@ -263,15 +263,45 @@ impl RuntimeWorkspaceRequestClient {
             })?
     }
 
-    fn execute_blocking_inner(
+    /// Binary requests must retain their exact target and never follow redirects.
+    pub(crate) fn execute_binary_blocking(
         &self,
         request: RuntimeWorkspaceRequest,
     ) -> Result<RuntimeWorkspaceResponse, RuntimeWorkspaceRequestError> {
+        let client = self.clone();
+        std::thread::spawn(move || client.execute_blocking_inner(request, false))
+            .join()
+            .map_err(|_| RuntimeWorkspaceRequestError::Transport {
+                message: "Workspace binary request thread panicked".to_string(),
+                timeout: false,
+            })?
+    }
+
+    fn execute_blocking_inner(
+        &self,
+        request: RuntimeWorkspaceRequest,
+        follow_redirects: bool,
+    ) -> Result<RuntimeWorkspaceResponse, RuntimeWorkspaceRequestError> {
         let prepared = self.prepare(&request)?;
+        if !follow_redirects {
+            let mut target = prepared.url.path().to_string();
+            if let Some(query) = prepared.url.query() {
+                target.push('?');
+                target.push_str(query);
+            }
+            if prepared.url.fragment().is_some() || target != request.path_and_query {
+                return Err(RuntimeWorkspaceRequestError::InvalidRequest(
+                    "binary request target must be exact".to_string(),
+                ));
+            }
+        }
         // The blocking client defaults to 30 seconds. Apply None explicitly so
         // provider-owned command waits are not cut short by an HTTP deadline.
-        let client = reqwest::blocking::Client::builder()
-            .timeout(request.timeout)
+        let mut client_builder = reqwest::blocking::Client::builder().timeout(request.timeout);
+        if !follow_redirects {
+            client_builder = client_builder.redirect(reqwest::redirect::Policy::none());
+        }
+        let client = client_builder
             .build()
             .map_err(RuntimeWorkspaceRequestError::transport)?;
         let mut builder = client
