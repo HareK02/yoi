@@ -17,10 +17,10 @@ Cargo resolves the release, not that checkout or an unreleased Rust revision.
 
 ## Executed checks on registry 0.2.0
 
-- `cargo test -p worker --locked --offline`: **893 unit + 110 integration tests
+- `cargo test -p worker --locked --offline`: **894 unit + 110 integration tests
   passed**, no ignored/failed tests. This includes ordinary Tools mode, Feature
   permission/revocation, restore, session/history and controller integration.
-- Narrow development checks: `wip::binding` (25), `wip::provider_tests` (11), existing
+- Narrow development checks: `wip::binding` (25), `wip::provider_tests` (12), existing
   `wip::tests` and workdir projection tests (43), checkout transports/providers
   (20), workspace-config production/authority tests (19). These are included
   in the complete worker run.
@@ -35,6 +35,26 @@ Cargo resolves the release, not that checkout or an unreleased Rust revision.
 - `nix build --no-link .#yoi.cargoDeps` passed with the updated registry dependency
   hash. This validates credential-free dependency acquisition, not a full Nix
   binary/image build or deployment update.
+
+## Current target compatibility (preview, not integration)
+
+Source runtime at `23cf6c4f882ce78985ba4bd673751cebe64e2d87` and current develop
+`b5ea162f838fc36e364edec9ab6689292b59cffd` produce the conflict-free `git merge-tree`
+preview tree `7ef3545b635cbdfc5e24658f6d1532e0f8b0947c`. An archive of this tree,
+without a branch/ref change, passed root locked/offline Cargo check, all **91**
+Server API TypeScript tests (including OpenAPI/checked-in generator freshness),
+registry WIP resolution checks, and Nix dependency acquisition with the same hash.
+T-722's API macros, Server API/Drive/Server source, OpenAPI and generated TS blobs
+are unchanged from develop in the combined tree; no artifact overwrite or
+regeneration is necessary for this source change. The later added same-name scope
+regression changes tests only, not the validated runtime or shared contracts.
+
+The initial archive check reused a Cargo target directory; returning to the older
+main checkout exposed stale preview Server API artifacts. All local workspace
+artifacts were invalidated, and a fresh main root check and complete **894 + 110**
+Worker suite passed. Use an isolated target directory for future cross-tree checks.
+No target push, integration branch, deployment, or live dogfood update was made.
+Orchestrator readiness/integration must still resolve the then-current target.
 
 ## Contract evidence
 
@@ -60,6 +80,8 @@ valid live ancestor refs that differ from registration placeholders, root `/` an
 intermediate provider-owned ancestors, ref-less and ref-bearing scope deletion
 without a prior scope Inspect, rejected cached dispatch and orphan observation,
 replacement/republication without restoring old Interface registrations,
+same-name scope replacement or loss of public ref rejecting copied old metadata
+without replay (and later explicit Inspect/Invoke copying only the new optional ref),
 shape/target/Object-validator/Interface-mismatch precedence, and frozen in-flight
 ancestor Descriptor/handler/result validation after replacement. Valid Invoke
 makes one provider publication call for the target, not a separate scope lookup.

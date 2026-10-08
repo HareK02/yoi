@@ -457,3 +457,84 @@ async fn ancestor_replacement_during_in_flight_call_keeps_the_original_descripto
     assert_eq!(new.content.as_deref(), Some("2"));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn same_name_scope_replacement_or_loss_of_ref_rejects_old_metadata_without_replay() {
+    for identity in [Some("replacement"), None] {
+        let (runtime, provider) = fixture("/github/team", true, false);
+        let selected = reference("/github/team", "read");
+        runtime
+            .inspect(provider.target_path.clone(), false)
+            .await
+            .unwrap();
+        {
+            let mut state = provider.state.lock().unwrap();
+            state.identity = identity.map(Into::into);
+            if identity.is_some() {
+                state.generation = 1;
+            }
+        }
+        assert_eq!(
+            rejected_code(
+                &runtime,
+                metadata_request(
+                    &provider.target_path,
+                    json!({"scope":"/github/team","name":"read"}),
+                    None,
+                    Some("live-scope")
+                )
+            )
+            .await,
+            "interface_mismatch"
+        );
+        let failed = runtime
+            .invoke(
+                provider.target_path.clone(),
+                selected.clone(),
+                "read".into(),
+                json!({}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap_err();
+        assert!(failed.to_string().contains("InterfaceMismatch"), "{failed}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let fetched = runtime.host.fetch_interface_live(&selected).await.unwrap();
+        assert_eq!(fetched.scope_ref.as_deref(), identity);
+        assert_eq!(
+            fetched.descriptor.documentation.unwrap().summary,
+            if identity.is_some() {
+                "Published generation 1"
+            } else {
+                "Published generation 0"
+            }
+        );
+        runtime
+            .inspect(provider.target_path.clone(), true)
+            .await
+            .unwrap();
+        runtime
+            .invoke(
+                provider.target_path.clone(),
+                selected,
+                "read".into(),
+                json!({}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let state = runtime.state.lock().unwrap();
+        let call = state
+            .client
+            .call_history(&state.session)
+            .unwrap()
+            .back()
+            .unwrap();
+        // Omitted scope_ref is never filled from the placeholder or other observations.
+        assert_eq!(
+            call.context.request().interface.scope_ref.as_deref(),
+            identity
+        );
+    }
+}
