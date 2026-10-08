@@ -80,6 +80,14 @@ read/upload/GC activity across independent processes. A→B/B→A, parent deleti
 versus child creation, and same-revision updates therefore have one valid winner.
 FeatureStorage configures foreign keys, WAL, `synchronous=FULL`, and a 5-second
 busy timeout. Busy/SQL/I/O failures remain errors; they do not mean an empty Drive.
+Before opening SQLite or admitting a Feature handle, FeatureStorage creates and
+syncs **every metadata directory ancestor link**, including configured path and
+resolved target chains for trusted Host symlink paths. It re-syncs existing
+directories on retry after any prior flush failure. Directory sync failure aborts
+admission before DB initialization/migration; no usable connection is cached.
+SQLite's DB/WAL and immediate-directory synchronization alone would not protect
+new FeatureStorage/Workspace ancestors. Both this metadata link durability and the
+separate blob link durability below are required for acknowledged Drive success.
 
 The Server uses `Drive::open_with_workspace_authority` to attach its trusted
 `server.db` to the Feature DB connection. An IMMEDIATE transaction also locks that
