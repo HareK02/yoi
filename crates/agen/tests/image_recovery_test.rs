@@ -1,8 +1,11 @@
 use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
+use agen::llm_client::scheme::{Scheme, openai_responses::OpenAIResponsesScheme};
 use agen::llm_client::{ClientError, LlmClient, Request, ResponseStream};
 use agen::tool::{Attachment, ImageAttachment};
 use agen::{Engine, EngineRunExit, History, Item, ToolResultDisposition};
 use async_trait::async_trait;
+use futures::StreamExt;
+use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
 fn rejection() -> ClientError {
@@ -48,11 +51,28 @@ fn images(request: &Request) -> Vec<String> {
         })
         .collect()
 }
+#[derive(Clone, Copy)]
+enum RejectionPath {
+    Http,
+    SseError,
+    SseNestedError,
+    ResponseFailed,
+}
+const STREAM_PATHS: [RejectionPath; 3] = [
+    RejectionPath::SseError,
+    RejectionPath::SseNestedError,
+    RejectionPath::ResponseFailed,
+];
+
 #[derive(Clone)]
 struct Client {
     requests: Arc<Mutex<Vec<Request>>>,
     failures: usize,
     other_error: bool,
+    path: RejectionPath,
+    prefix: Vec<(&'static str, Value)>,
+    wait_before_error: Option<Arc<tokio::sync::Notify>>,
+    rejection_data: Option<&'static str>,
 }
 impl Client {
     fn new(failures: usize) -> Self {
@@ -60,11 +80,69 @@ impl Client {
             requests: Arc::default(),
             failures,
             other_error: false,
+            path: RejectionPath::Http,
+            prefix: Vec::new(),
+            wait_before_error: None,
+            rejection_data: None,
         }
+    }
+    fn streamed(failures: usize, path: RejectionPath) -> Self {
+        Self {
+            path,
+            ..Self::new(failures)
+        }
+    }
+    fn reject(&self, error: ClientError) -> Result<ResponseStream, ClientError> {
+        if matches!(self.path, RejectionPath::Http) {
+            return Err(error);
+        }
+        let ClientError::Api { code, message, .. } = error else {
+            unreachable!()
+        };
+        let error = json!({"type":"invalid_request_error", "code":code, "message":message, "param":"input"});
+        let (kind, data) = match self.path {
+            RejectionPath::SseError => (
+                "error",
+                json!({"type":"error", "code":code, "message":message, "param":"input", "error_type":"invalid_request_error"}),
+            ),
+            RejectionPath::SseNestedError => ("error", json!({"type":"error", "error":error})),
+            RejectionPath::ResponseFailed => (
+                "response.failed",
+                json!({"type":"response.failed", "response":{"id":"rejected", "error":error}}),
+            ),
+            RejectionPath::Http => unreachable!(),
+        };
+        let scheme = OpenAIResponsesScheme::new();
+        let mut state = Default::default();
+        let mut events = scheme.parse_sse("response.created", r#"{"response":{}}"#, &mut state)?;
+        for (kind, data) in &self.prefix {
+            events.extend(scheme.parse_sse(kind, &data.to_string(), &mut state)?);
+        }
+        let encoded = data.to_string();
+        events.extend(scheme.parse_sse(
+            kind,
+            self.rejection_data.unwrap_or(&encoded),
+            &mut state,
+        )?);
+        let wait = self.wait_before_error.clone();
+        Ok(Box::pin(futures::stream::iter(events).then(move |event| {
+            let wait = wait.clone();
+            async move {
+                if matches!(event, Event::Error(_))
+                    && let Some(wait) = wait
+                {
+                    wait.notified().await;
+                }
+                Ok(event)
+            }
+        })))
     }
 }
 #[async_trait]
 impl LlmClient for Client {
+    fn tool_call_completion_support(&self) -> agen::llm_client::ToolCallCompletionSupport {
+        agen::llm_client::ToolCallCompletionSupport::PerBlock
+    }
     fn clone_boxed(&self) -> Box<dyn LlmClient> {
         Box::new(self.clone())
     }
@@ -72,10 +150,10 @@ impl LlmClient for Client {
         let mut requests = self.requests.lock().unwrap();
         requests.push(request);
         if requests.len() <= self.failures {
-            return Err(rejection());
+            return self.reject(rejection());
         }
         if self.other_error {
-            return Err(ClientError::Api {
+            return self.reject(ClientError::Api {
                 status: Some(400),
                 code: Some("invalid_value".into()),
                 message: "invalid tool arguments".into(),
@@ -226,6 +304,7 @@ async fn early_results_remain_candidates_despite_later_text_in_same_response() {
 struct CountingTool {
     image: bool,
     count: Arc<std::sync::atomic::AtomicUsize>,
+    executed: Option<Arc<tokio::sync::Notify>>,
 }
 #[async_trait]
 impl agen::tool::Tool for CountingTool {
@@ -235,6 +314,9 @@ impl agen::tool::Tool for CountingTool {
         _: agen::tool::ToolExecutionContext,
     ) -> Result<agen::tool::ToolOutput, agen::tool::ToolError> {
         self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(executed) = &self.executed {
+            executed.notify_one();
+        }
         let attachments = if self.image {
             let Item::ToolResult { attachments, .. } = image_result("image", 1600, 33349, 0) else {
                 unreachable!()
@@ -297,6 +379,7 @@ async fn fresh_image_recovery_does_not_repeat_tools_in_either_dispatch_mode() {
             let tool = CountingTool {
                 image,
                 count: Arc::default(),
+                executed: None,
             };
             counts.push(tool.count.clone());
             engine.register_tool(Arc::new(move || {
@@ -345,6 +428,311 @@ fn image_error_classifier_is_not_a_generic_400_retry() {
                 retry_after: None
             }
             .is_image_size_rejection()
+        );
+    }
+}
+
+#[tokio::test]
+async fn streamed_image_rejections_correct_largest_candidate_before_next_request() {
+    for path in STREAM_PATHS {
+        let client = Client::streamed(1, path);
+        let mut history = history();
+        let mut engine = Engine::new(client.clone());
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let commits = committed.clone();
+        engine.set_image_rejection_handler(move |original, replacement| {
+            commits
+                .lock()
+                .unwrap()
+                .push((original.item.clone(), replacement.clone()));
+            Ok(())
+        });
+        let out = engine.run(&mut history, "continue").await;
+        assert!(
+            matches!(out.result, EngineRunExit::Finished),
+            "{:?}",
+            out.result
+        );
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(images(&requests[0]), ["small", "large"]);
+        assert_eq!(images(&requests[1]), ["small"]);
+        assert!(requests[1].items.iter().any(|item| matches!(item, Item::ToolResult { call_id, is_error: true, disposition: ToolResultDisposition::Error, summary, .. } if call_id == "large" && summary.contains("Resize or crop") && summary.contains("retry ViewImage"))));
+        assert!(requests[1].items.iter().any(|item| matches!(item, Item::ToolCall { call_id, name, .. } if call_id == "large" && name == "ViewImage")));
+        assert_eq!(committed.lock().unwrap().len(), 1);
+        assert_eq!(
+            history
+                .items()
+                .filter(
+                    |item| matches!(item, Item::ToolResult { call_id, .. } if call_id == "large")
+                )
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn streamed_rejections_stop_when_images_are_absent_or_candidates_exhausted() {
+    for path in STREAM_PATHS {
+        for (mut history, expected_requests) in [(History::new(), 1), (history(), 3)] {
+            let client = Client::streamed(99, path);
+            let out = Engine::new(client.clone())
+                .run(&mut history, "continue")
+                .await;
+            assert!(
+                matches!(out.result, EngineRunExit::Interrupted(_)),
+                "{:?}",
+                out.result
+            );
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(requests.len(), expected_requests);
+            assert!(images(requests.last().unwrap()).is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn unrelated_streamed_invalid_value_preserves_images_and_diagnostic() {
+    for path in STREAM_PATHS {
+        let mut client = Client::streamed(0, path);
+        client.other_error = true;
+        let mut history = history();
+        let original = history.items_cloned();
+        let out = Engine::new(client.clone())
+            .run(&mut history, "continue")
+            .await;
+        let EngineRunExit::Interrupted(reason) = out.result else {
+            panic!("{:?}", out.result)
+        };
+        let reason = format!("{reason:?}");
+        assert!(
+            reason.contains("invalid_value")
+                && reason.contains("invalid tool arguments")
+                && reason.contains("diagnostic=")
+                && reason.contains("input"),
+            "{reason}"
+        );
+        assert_eq!(client.requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            &history.items_cloned()[..original.len()],
+            original.as_slice()
+        );
+    }
+}
+
+#[tokio::test]
+async fn streamed_correction_commit_failure_does_not_mutate_or_resend() {
+    for path in STREAM_PATHS {
+        let client = Client::streamed(99, path);
+        let mut history = history();
+        let original = history.items_cloned();
+        let mut engine = Engine::new(client.clone());
+        engine.set_image_rejection_handler(|_, _| Err("disk full".into()));
+        let out = engine.run(&mut history, "continue").await;
+        assert!(matches!(out.result, EngineRunExit::Interrupted(_)));
+        assert_eq!(
+            &history.items_cloned()[..original.len()],
+            original.as_slice()
+        );
+        assert_eq!(client.requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn streamed_rejection_after_output_never_replays_or_corrects_input() {
+    for path in STREAM_PATHS {
+        // Start alone closes the replay window, as do partial/completed text,
+        // reasoning and unrecognized events. None may change accepted input.
+        for prefix in [
+            vec![(
+                "response.content_part.added",
+                json!({"output_index":0,"content_index":0,"part":{"type":"output_text"}}),
+            )],
+            vec![(
+                "response.output_text.delta",
+                json!({"output_index":0,"content_index":0,"delta":"partial"}),
+            )],
+            vec![
+                (
+                    "response.output_text.delta",
+                    json!({"output_index":0,"content_index":0,"delta":"completed"}),
+                ),
+                (
+                    "response.content_part.done",
+                    json!({"output_index":0,"content_index":0,"part":{"type":"output_text"}}),
+                ),
+            ],
+            vec![(
+                "response.reasoning_text.delta",
+                json!({"output_index":0,"content_index":0,"delta":"thinking"}),
+            )],
+            vec![("future.unknown", json!({"value":"unknown semantics"}))],
+        ] {
+            let mut client = Client::streamed(1, path);
+            client.prefix = prefix;
+            let mut history = history();
+            let original = history.items_cloned();
+            let out = Engine::new(client.clone())
+                .run(&mut history, "continue")
+                .await;
+            assert!(
+                matches!(out.result, EngineRunExit::Interrupted(_)),
+                "{:?}",
+                out.result
+            );
+            assert_eq!(client.requests.lock().unwrap().len(), 1);
+            assert_eq!(
+                &history.items_cloned()[..original.len()],
+                original.as_slice()
+            );
+        }
+    }
+}
+
+#[test]
+fn statusless_api_errors_are_not_image_retry_authority() {
+    let ClientError::Api { code, message, .. } = rejection() else {
+        unreachable!()
+    };
+    assert!(
+        !ClientError::Api {
+            status: None,
+            code,
+            message,
+            retry_after: None
+        }
+        .is_image_size_rejection()
+    );
+}
+
+#[tokio::test]
+async fn streamed_rejection_after_tool_completion_never_reexecutes_side_effects() {
+    for path in STREAM_PATHS {
+        for mode in [
+            agen::ToolCallDispatchMode::AfterResponse,
+            agen::ToolCallDispatchMode::OnToolCallComplete,
+        ] {
+            let executed = Arc::new(tokio::sync::Notify::new());
+            let mut client = Client::streamed(1, path);
+            client.prefix = vec![
+                (
+                    "response.output_item.added",
+                    json!({"output_index":0,"item":{"type":"function_call","call_id":"side-effect","name":"Bash","arguments":"{}"}}),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({"output_index":0,"item":{"type":"function_call","call_id":"side-effect","name":"Bash","arguments":"{}"}}),
+                ),
+            ];
+            if mode == agen::ToolCallDispatchMode::OnToolCallComplete {
+                client.wait_before_error = Some(executed.clone());
+            }
+            let tool = CountingTool {
+                image: false,
+                count: Arc::default(),
+                executed: Some(executed),
+            };
+            let count = tool.count.clone();
+            let mut engine = Engine::new(client.clone());
+            engine.set_tool_call_dispatch_mode(mode);
+            engine.register_tool(Arc::new(move || {
+                (
+                    agen::tool::ToolMeta::new("Bash")
+                        .description("side effect")
+                        .input_schema(json!({"type":"object"})),
+                    Arc::new(tool.clone()),
+                )
+            }));
+            let mut history = history();
+            let original = history.items_cloned();
+            let out = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                engine.run(&mut history, "continue"),
+            )
+            .await
+            .expect("tool admission/error cleanup must terminate");
+            assert!(
+                matches!(out.result, EngineRunExit::Interrupted(_)),
+                "{:?}",
+                out.result
+            );
+            assert_eq!(client.requests.lock().unwrap().len(), 1);
+            assert_eq!(
+                &history.items_cloned()[..original.len()],
+                original.as_slice()
+            );
+            if mode == agen::ToolCallDispatchMode::OnToolCallComplete {
+                assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(history.items().filter(|item| matches!(item, Item::ToolCall { call_id, .. } if call_id == "side-effect")).count(), 1);
+                assert_eq!(history.items().filter(|item| matches!(item, Item::ToolResult { call_id, .. } if call_id == "side-effect")).count(), 1);
+            } else {
+                assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert!(!history.items().any(|item| matches!(item, Item::ToolCall { call_id, .. } | Item::ToolResult { call_id, .. } if call_id == "side-effect")));
+            }
+        }
+    }
+}
+
+#[test]
+fn streamed_error_extra_fields_do_not_turn_unrelated_message_into_image_rejection() {
+    let scheme = OpenAIResponsesScheme::new();
+    let mut state = Default::default();
+    let events = scheme.parse_sse("error", r#"{"type":"error","code":"invalid_value","message":"invalid tool arguments","param":"input","input":"image too large"}"#, &mut state).unwrap();
+    let Event::Error(error) = &events[0] else {
+        panic!("{events:?}")
+    };
+    assert_eq!(error.code.as_deref(), Some("invalid_value"));
+    assert!(
+        error
+            .message
+            .starts_with("invalid tool arguments | diagnostic=")
+    );
+    // HTTP uses the same diagnostic policy, but still requires status authority.
+    assert!(
+        !ClientError::Api {
+            status: Some(400),
+            code: error.code.clone(),
+            message: error.message.clone(),
+            retry_after: None
+        }
+        .is_image_size_rejection()
+    );
+}
+
+#[tokio::test]
+async fn unparseable_stream_error_data_preserves_images_and_terminates_with_diagnostic() {
+    for data in [
+        r#"{"type":"error","code":"invalid_value","message":123,"input":"image too large"}"#,
+        "unparseable provider error with echoed input: image too large",
+    ] {
+        let mut client = Client::streamed(1, RejectionPath::SseError);
+        client.rejection_data = Some(data);
+        let mut history = history();
+        let original = history.items_cloned();
+        let out = Engine::new(client.clone())
+            .run(&mut history, "continue")
+            .await;
+        let EngineRunExit::Interrupted(agen::RunInterruptionReason::Unexpected(
+            agen::EngineError::Client(ClientError::Api { code, message, .. }),
+        )) = out.result
+        else {
+            panic!(
+                "malformed provider error must terminate, got {:?}",
+                out.result
+            );
+        };
+        assert_eq!(code, None);
+        let (base, diagnostic) = message
+            .split_once(" | diagnostic=")
+            .expect("raw data remains diagnostic-only");
+        assert!(!base.contains("image"));
+        let diagnostic: Value = serde_json::from_str(diagnostic).unwrap();
+        assert_eq!(diagnostic["error_extra"]["raw_data"], data);
+        assert_eq!(client.requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            &history.items_cloned()[..original.len()],
+            original.as_slice()
         );
     }
 }
