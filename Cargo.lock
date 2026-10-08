@@ -6340,8 +6340,6 @@ dependencies = [
 [[package]]
 name = "wip-client"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73a82416411af69b7eb4ad0ed9a954df062769d3a03b3a1c59b0b4bf617f3534"
 dependencies = [
  "wip-http",
  "wip-protocol",
@@ -6350,8 +6348,6 @@ dependencies = [
 [[package]]
 name = "wip-http"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ec0d32d1e56e52fb9ce925db808354a3432b3ebbd112fab8c443c9b865c58c6"
 dependencies = [
  "base64 0.22.1",
  "http",
@@ -6364,8 +6360,13 @@ dependencies = [
 [[package]]
 name = "wip-protocol"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "275ffaebf544a077de7578fd3674c062a098a72c5a904cf66e934f76bd9efbab"
+
+[[package]]
+name = "wip-text-view"
+version = "0.1.0"
+dependencies = [
+ "wip-protocol",
+]
 
 [[package]]
 name = "wiremock"
@@ -6549,6 +6550,7 @@ dependencies = [
  "wip-client",
  "wip-http",
  "wip-protocol",
+ "wip-text-view",
  "workdir",
 ]
 

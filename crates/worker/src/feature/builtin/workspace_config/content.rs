@@ -205,7 +205,7 @@ impl WipSubtreeProvider for ConfigProvider {
                 return Ok(None);
             }
             let mut projection = super::wip::attach_projection(&self.feature);
-            projection.interface = contextual_reference(&projection.interface, path);
+            projection.interface = contextual_reference(&projection.interface.name, path);
             projection.object.interfaces = vec![projection.interface.clone()];
             return Ok(Some(projection));
         };

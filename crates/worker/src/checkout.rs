@@ -146,8 +146,10 @@ impl Provider {
         kind: &str,
         handler: Arc<dyn WipOperationHandler>,
     ) -> WipProjection {
-        let encoded: String = path.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        let interface = format!("yoi.checkout/{}/{kind}/v1/@/{encoded}", self.incarnation);
+        let interface = crate::wip::contextual_reference(
+            &format!("yoi.checkout/{}/{kind}/v1", self.incarnation),
+            path,
+        );
         let interface_validator = Sha256::digest(format!("{descriptor:?}")).to_vec();
         WipProjection {
             route: path.into(),

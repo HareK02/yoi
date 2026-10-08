@@ -2,7 +2,7 @@
 //!
 //! The adapter intentionally keeps authority in the existing Worker host. In WIP
 //! mode ordinary tools are mounted below `/tools`, removed from the model-visible
-//! tool list, and invoked through three stateful discover/inspect/call tools. The
+//! tool list, and invoked through three stateful tree/inspect/invoke tools. The
 //! published WIP crates own protocol validation, HTTP encoding, Known Space, and
 //! operation lifecycle state; this module owns only the in-process transport and
 //! the compatibility projection into existing async `Tool` implementations.
@@ -35,12 +35,17 @@ use wip_http::{
 };
 use wip_protocol::{
     CallOperationRequest, CallOperationResponse, Documentation, FetchInterfaceResponse,
-    INTERFACE_FORMAT_V1, InterfaceDescriptor, Object, ObjectObservation, OperationDeclaration,
-    ParameterDeclaration, ProtocolError, ProtocolErrorCode, ProtocolInteraction, ReturnDeclaration,
-    TypeExpr, Value,
+    INTERFACE_FORMAT_V1, InterfaceDescriptor, InterfaceReference, Object, ObjectObservation,
+    OperationDeclaration, ParameterDeclaration, ProtocolError, ProtocolErrorCode,
+    ProtocolInteraction, ReturnDeclaration, TypeExpr, Value,
 };
 
 use crate::permission::permission_action_for;
+
+mod binding;
+#[cfg(test)]
+mod provider_tests;
+use binding::wip_tool_definitions;
 
 #[cfg(test)]
 #[path = "checkout_http_tests.rs"]
@@ -73,8 +78,8 @@ pub enum WipMountError {
     InvalidRoute { route: String, message: String },
     #[error("WIP route `{route}` is already owned by capability `{existing}`")]
     RouteCollision { route: String, existing: String },
-    #[error("WIP interface `{interface}` has conflicting descriptors")]
-    InterfaceCollision { interface: String },
+    #[error("WIP interface `{interface:?}` has conflicting descriptors")]
+    InterfaceCollision { interface: InterfaceReference },
     #[error("WIP operation `{operation}` on `{route}` is already contributed by `{existing}`")]
     OperationCollision {
         route: String,
@@ -192,7 +197,7 @@ pub struct WipProjection {
     pub capability: String,
     pub kind: WipProjectionKind,
     pub object: Object,
-    pub interface: String,
+    pub interface: InterfaceReference,
     pub descriptor: InterfaceDescriptor,
     pub interface_validator: Option<Vec<u8>>,
     pub handler: Arc<dyn WipOperationHandler>,
@@ -205,7 +210,7 @@ pub struct WipProjection {
 pub struct WipOperationContribution {
     pub route: String,
     pub contributor: String,
-    pub interface: String,
+    pub interface: InterfaceReference,
     pub descriptor: InterfaceDescriptor,
     pub handler: Arc<dyn WipOperationHandler>,
 }
@@ -231,7 +236,7 @@ pub trait WipDynamicItemResolver: Send + Sync {
 pub struct WipDynamicMount {
     pub collection_route: String,
     pub capability: String,
-    pub interface: String,
+    pub interface: InterfaceReference,
     pub descriptor: InterfaceDescriptor,
     pub interface_validator: Option<Vec<u8>>,
     pub resolver: Arc<dyn WipDynamicItemResolver>,
@@ -264,7 +269,7 @@ pub trait WipDynamicOperationResolver: Send + Sync {
 pub struct WipDynamicOperationContribution {
     pub collection_route: String,
     pub contributor: String,
-    pub interface: String,
+    pub interface: InterfaceReference,
     pub descriptor: InterfaceDescriptor,
     pub resolver: Arc<dyn WipDynamicOperationResolver>,
 }
@@ -365,6 +370,7 @@ impl WipOperationHandler for OperationDispatchHandler {
 #[derive(Default)]
 pub struct WipMountRegistry {
     mounts: BTreeMap<String, MountedProjection>,
+    additional_interfaces: BTreeMap<String, Vec<WipProjection>>,
     dynamic_mounts: Vec<WipDynamicMount>,
     subtree_mounts: Vec<WipSubtreeMount>,
     dynamic_operation_contributions: BTreeMap<String, Vec<MountedDynamicOperationContribution>>,
@@ -447,7 +453,10 @@ impl WipMountRegistry {
                 message: "compatibility Objects must use /tools/<tool-name>".into(),
             });
         }
-        if projection.kind == WipProjectionKind::Native && !is_tool_route(&projection.route) {
+        if projection.kind == WipProjectionKind::Native
+            && projection.route != WIP_ROOT
+            && !is_tool_route(&projection.route)
+        {
             let namespace_root = projection
                 .route
                 .strip_prefix('/')
@@ -531,6 +540,47 @@ impl WipMountRegistry {
             },
         );
         Ok(WipMountDisposition::Mounted)
+    }
+
+    /// Publish a separate Interface on an existing Object without flattening its
+    /// operation namespace. Object resolution/identity and authority remain owned
+    /// by the original provider; each Interface keeps its exact dispatch handler.
+    pub fn mount_interface(&mut self, projection: WipProjection) -> Result<(), WipMountError> {
+        validate_projection(&projection)?;
+        let Some(owner) = self.mounts.get(&projection.route) else {
+            return Err(WipMountError::OperationTargetNotFound {
+                route: projection.route,
+            });
+        };
+        let object = &owner.projection.object;
+        if projection.capability != owner.projection.capability
+            || projection.kind != owner.projection.kind
+            || projection.object.name != object.name
+            || projection.object.r#ref != object.r#ref
+            || projection.object.validator != object.validator
+            || projection.object.description != object.description
+        {
+            return Err(WipMountError::InvalidProjection {
+                route: projection.route,
+                message: "additional Interface cannot replace Object ownership or identity".into(),
+            });
+        }
+        if owner.projection.interface == projection.interface
+            || self
+                .additional_interfaces
+                .get(&projection.route)
+                .is_some_and(|all| all.iter().any(|p| p.interface == projection.interface))
+        {
+            return Err(WipMountError::InterfaceCollision {
+                interface: projection.interface,
+            });
+        }
+        self.ensure_interface_available(&projection, None)?;
+        self.additional_interfaces
+            .entry(projection.route.clone())
+            .or_default()
+            .push(projection);
+        Ok(())
     }
 
     /// Add operations from another Feature without changing Object ownership or
@@ -846,12 +896,12 @@ impl WipMountRegistry {
 
     fn registry_interface_conflicts_static(
         &self,
-        interface: &str,
+        interface: &InterfaceReference,
         descriptor: &InterfaceDescriptor,
         validator: Option<&[u8]>,
     ) -> bool {
         self.mounts.values().any(|mounted| {
-            mounted.projection.interface == interface
+            mounted.projection.interface == *interface
                 && (mounted.projection.descriptor != *descriptor
                     || mounted.projection.interface_validator.as_deref() != validator)
         })
@@ -910,18 +960,25 @@ impl WipMountRegistry {
 
     fn interface_conflicts(
         &self,
-        interface: &str,
+        interface: &InterfaceReference,
         descriptor: &InterfaceDescriptor,
         validator: Option<&[u8]>,
         replacing_route: Option<&str>,
     ) -> bool {
-        self.mounts.iter().any(|(route, mounted)| {
+        self.additional_interfaces.iter().any(|(route, all)| {
             Some(route.as_str()) != replacing_route
-                && mounted.projection.interface == interface
+                && all.iter().any(|p| {
+                    p.interface == *interface
+                        && (p.descriptor != *descriptor
+                            || p.interface_validator.as_deref() != validator)
+                })
+        }) || self.mounts.iter().any(|(route, mounted)| {
+            Some(route.as_str()) != replacing_route
+                && mounted.projection.interface == *interface
                 && (mounted.projection.descriptor != *descriptor
                     || mounted.projection.interface_validator.as_deref() != validator)
         }) || self.dynamic_mounts.iter().any(|mounted| {
-            mounted.interface == interface
+            mounted.interface == *interface
                 && (mounted.descriptor != *descriptor
                     || mounted.interface_validator.as_deref() != validator)
         })
@@ -979,34 +1036,19 @@ fn descriptor_validator(descriptor: &InterfaceDescriptor) -> Vec<u8> {
     digest.finalize().to_vec()
 }
 
-pub(crate) fn contextual_reference(base: &str, path: &str) -> String {
-    let encoded: String = path
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    format!("{base}/@/{encoded}")
-}
-
-fn decode_contextual_path(encoded: &str) -> Option<String> {
-    if encoded.len() % 2 != 0 {
-        return None;
+/// Explicit deployment root registration, never a legacy wire parser.
+pub(crate) fn root_reference(name: &str) -> InterfaceReference {
+    InterfaceReference {
+        scope: "/".into(),
+        name: name.into(),
     }
-    let bytes = encoded
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let digit = |byte| match byte {
-                b'0'..=b'9' => Some(byte - b'0'),
-                b'a'..=b'f' => Some(byte - b'a' + 10),
-                _ => None,
-            };
-            Some(digit(pair[0])? * 16 + digit(pair[1])?)
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let path = String::from_utf8(bytes).ok()?;
-    wip_protocol::validate_path(&path).ok()?;
-    Some(path)
+}
+/// A contextual descriptor belongs to the resolved Object's publication.
+pub(crate) fn contextual_reference(base: &str, path: &str) -> InterfaceReference {
+    InterfaceReference {
+        scope: path.into(),
+        name: base.into(),
+    }
 }
 
 fn is_tool_route(route: &str) -> bool {
@@ -1022,12 +1064,6 @@ fn validate_projection(projection: &WipProjection) -> Result<(), WipMountError> 
             message: error.to_string(),
         }
     })?;
-    if projection.route == WIP_ROOT {
-        return Err(WipMountError::InvalidRoute {
-            route: projection.route.clone(),
-            message: "the Host reserves the Worldspace root".into(),
-        });
-    }
     projection
         .object
         .validate_at_path(&projection.route)
@@ -1102,18 +1138,40 @@ impl WipHost {
         Ok(self.projection(path))
     }
 
+    async fn projection_for_interface_live(
+        &self,
+        path: &str,
+        reference: &InterfaceReference,
+    ) -> Result<Option<WipProjection>, ProtocolError> {
+        let Some(owner) = self.projection_live(path).await? else {
+            return Ok(None);
+        };
+        if owner.interface == *reference {
+            return Ok(Some(owner));
+        }
+        if let Some(all) = self.registry.additional_interfaces.get(path) {
+            for other in all {
+                if let Some(mut selected) = self.project_current(other.clone(), false)
+                    && selected.interface == *reference
+                {
+                    selected.object = owner.object;
+                    return Ok(Some(selected));
+                }
+            }
+        }
+        // Retain the owner so preconditions report InterfaceMismatch with target precedence.
+        Ok(Some(owner))
+    }
+
     async fn descriptor_live(
         &self,
-        reference: &str,
+        reference: &InterfaceReference,
     ) -> Result<Option<(InterfaceDescriptor, Option<Vec<u8>>)>, ProtocolError> {
-        if let Some((_, encoded)) = reference.rsplit_once("/@/")
-            && let Some(path) = decode_contextual_path(encoded)
-            && self.subtree(&path).is_some()
-        {
+        if self.subtree(&reference.scope).is_some() {
             return Ok(self
-                .projection_live(&path)
+                .projection_live(&reference.scope)
                 .await?
-                .filter(|p| p.interface == reference)
+                .filter(|p| p.interface == *reference)
                 .map(|p| (p.descriptor, p.interface_validator)));
         }
         // Never expose the static registration placeholder descriptor of a subtree.
@@ -1121,7 +1179,7 @@ impl WipHost {
             .registry
             .subtree_mounts
             .iter()
-            .any(|m| self.registry.mounts[&m.root].projection.interface == reference)
+            .any(|m| self.registry.mounts[&m.root].projection.interface == *reference)
         {
             return Ok(None);
         }
@@ -1130,8 +1188,31 @@ impl WipHost {
 
     async fn fetch_interface_live(
         &self,
-        reference: &str,
+        reference: &InterfaceReference,
     ) -> Result<FetchInterfaceResponse, ProtocolError> {
+        reference
+            .validate()
+            .map_err(|e| protocol_error(ProtocolErrorCode::InvalidRequest, e.to_string()))?;
+        if let Some(projection) = self
+            .projection_for_interface_live(&reference.scope, reference)
+            .await?
+            && projection.interface == *reference
+        {
+            return Ok(FetchInterfaceResponse {
+                interface: reference.clone(),
+                scope_ref: projection.object.r#ref,
+                descriptor: projection.descriptor,
+                validator: projection.interface_validator,
+            });
+        }
+        // Shared static registrations belong to the pinned published scope, not
+        // to an arbitrary target's identity. A missing scope ends publication.
+        let scope = self.object_at(&reference.scope).ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::InterfaceNotFound,
+                "scope is not published",
+            )
+        })?;
         let (descriptor, validator) = self.descriptor_live(reference).await?.ok_or_else(|| {
             protocol_error(
                 ProtocolErrorCode::InterfaceNotFound,
@@ -1139,7 +1220,8 @@ impl WipHost {
             )
         })?;
         Ok(FetchInterfaceResponse {
-            interface: reference.into(),
+            interface: reference.clone(),
+            scope_ref: scope.r#ref,
             descriptor,
             validator,
         })
@@ -1234,19 +1316,34 @@ impl WipHost {
         })
     }
 
-    fn descriptor(&self, reference: &str) -> Option<(InterfaceDescriptor, Option<Vec<u8>>)> {
+    fn descriptor(
+        &self,
+        reference: &InterfaceReference,
+    ) -> Option<(InterfaceDescriptor, Option<Vec<u8>>)> {
+        for (path, all) in &self.registry.additional_interfaces {
+            if self.projection(path).is_none() {
+                continue;
+            }
+            for p in all {
+                if let Some(current) = self.project_current(p.clone(), false)
+                    && current.interface == *reference
+                {
+                    return Some((current.descriptor, current.interface_validator));
+                }
+            }
+        }
         for (path, mounted) in &self.registry.mounts {
-            if mounted.projection.interface == reference {
+            if mounted.projection.interface == *reference {
                 let Some(projection) = self.projection(path) else {
                     continue;
                 };
-                if projection.interface == reference {
+                if projection.interface == *reference {
                     return Some((projection.descriptor, projection.interface_validator));
                 }
             }
         }
         if let Some(descriptor) = self.registry.dynamic_mounts.iter().find_map(|mounted| {
-            if mounted.interface != reference || self.dynamic_contextual(mounted) {
+            if mounted.interface != *reference || self.dynamic_contextual(mounted) {
                 return None;
             }
             // Legacy families retain their shared descriptor. Contextual
@@ -1258,13 +1355,11 @@ impl WipHost {
         }) {
             return Some(descriptor);
         }
-        let (_, encoded_path) = reference.rsplit_once("/@/")?;
-        let path = decode_contextual_path(encoded_path)?;
-        let projection = self.projection(&path)?;
+        let projection = self.projection(&reference.scope)?;
         // Re-resolve the exact current Object, not a cached descriptor or an
         // arbitrary base interface with an appended path. Exact legacy refs
         // above remain opaque even if they contain our contextual delimiter.
-        if projection.interface != reference {
+        if projection.interface != *reference {
             return None;
         }
         Some((projection.descriptor, projection.interface_validator))
@@ -1306,7 +1401,8 @@ impl WipHost {
             projection.interface_validator = Some(digest.finalize().to_vec());
         }
         if contextual {
-            projection.interface = contextual_reference(&projection.interface, &projection.route);
+            projection.interface =
+                contextual_reference(&projection.interface.name, &projection.route);
             projection.object.interfaces = vec![projection.interface.clone()];
         }
         Some(projection)
@@ -1314,7 +1410,15 @@ impl WipHost {
 
     fn projection(&self, path: &str) -> Option<WipProjection> {
         if let Some(mounted) = self.registry.mounts.get(path) {
-            return self.project_current(mounted.resolved(), false);
+            let mut projection = self.project_current(mounted.resolved(), false)?;
+            if let Some(all) = self.registry.additional_interfaces.get(path) {
+                for other in all {
+                    if let Some(current) = self.project_current(other.clone(), false) {
+                        projection.object.interfaces.push(current.interface);
+                    }
+                }
+            }
+            return Some(projection);
         }
         self.registry.dynamic_mounts.iter().find_map(|mounted| {
             let item_reference = path.strip_prefix(&format!("{}/", mounted.collection_route))?;
@@ -1456,7 +1560,10 @@ impl WipHost {
     }
 
     #[cfg(test)]
-    fn fetch_interface(&self, reference: &str) -> Result<FetchInterfaceResponse, ProtocolError> {
+    fn fetch_interface(
+        &self,
+        reference: &InterfaceReference,
+    ) -> Result<FetchInterfaceResponse, ProtocolError> {
         let (descriptor, validator) = self.descriptor(reference).ok_or_else(|| {
             protocol_error(
                 ProtocolErrorCode::InterfaceNotFound,
@@ -1464,7 +1571,10 @@ impl WipHost {
             )
         })?;
         Ok(FetchInterfaceResponse {
-            interface: reference.to_string(),
+            interface: reference.clone(),
+            scope_ref: self
+                .object_at(&reference.scope)
+                .and_then(|object| object.r#ref),
             descriptor,
             validator,
         })
@@ -1476,8 +1586,14 @@ impl WipHost {
         request: CallOperationRequest,
         context: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
+        request.validate().map_err(|e| {
+            WipOperationError::Protocol(protocol_error(
+                ProtocolErrorCode::InvalidRequest,
+                e.to_string(),
+            ))
+        })?;
         let projection = self
-            .projection_live(&request.target.path)
+            .projection_for_interface_live(&request.target.path, &request.interface.reference)
             .await
             .map_err(WipOperationError::Protocol)?
             .ok_or_else(|| {
@@ -1486,52 +1602,66 @@ impl WipHost {
         self.call_projection(projection, request, context).await
     }
 
-    async fn call_projection(
+    // The deployment root is pinned; self-scoped interfaces use the exact same
+    // resolved Object snapshot as descriptor/handler selection, not an artifact lookup.
+    fn scope_matches(
         &self,
-        projection: WipProjection,
-        request: CallOperationRequest,
-        context: WipCallContext,
-    ) -> Result<WipOperationOutput, WipOperationError> {
-        let expected_object_validator = projection.object.validator.as_deref();
-        match (
-            expected_object_validator,
-            request.target.validator.as_deref(),
-        ) {
-            (Some(_), None) => {
-                return Err(WipOperationError::Protocol(protocol_error(
-                    ProtocolErrorCode::ValidatorRequired,
-                    "object validator is required",
-                )));
-            }
-            (Some(expected), Some(actual)) if expected != actual => {
-                return Err(WipOperationError::Protocol(protocol_error(
-                    ProtocolErrorCode::ValidatorMismatch,
-                    "object validator is stale",
-                )));
-            }
-            _ => {}
+        projection: &WipProjection,
+        interface: &wip_protocol::InterfaceTarget,
+    ) -> Result<bool, ProtocolError> {
+        let scope = if interface.reference.scope == projection.route {
+            Some(projection.object.clone())
+        } else {
+            self.object_at(&interface.reference.scope)
+        };
+        Ok(scope.is_some_and(|scope| {
+            interface
+                .scope_ref
+                .as_ref()
+                .is_none_or(|expected| scope.r#ref.as_ref() == Some(expected))
+        }))
+    }
+
+    fn check_call_preconditions(
+        &self,
+        projection: &WipProjection,
+        target: &wip_protocol::Target,
+        interface: &wip_protocol::InterfaceTarget,
+        operation_name: &str,
+    ) -> Result<(), ProtocolError> {
+        if let Some(actual) = target.validator.as_deref()
+            && projection.object.validator.as_deref() != Some(actual)
+        {
+            return Err(protocol_error(
+                ProtocolErrorCode::ValidatorMismatch,
+                "object validator is stale or unavailable",
+            ));
         }
-        if request.interface.reference != projection.interface {
-            return Err(WipOperationError::Protocol(protocol_error(
+        if interface.reference.validate_for_path(&target.path).is_err()
+            || interface.reference != projection.interface
+            || !projection.object.interfaces.contains(&interface.reference)
+            || !self.scope_matches(projection, interface)?
+        {
+            return Err(protocol_error(
                 ProtocolErrorCode::InterfaceMismatch,
                 "interface is not a member of the target object",
-            )));
+            ));
         }
         match (
             projection.interface_validator.as_deref(),
-            request.interface.validator.as_deref(),
+            interface.validator.as_deref(),
         ) {
             (Some(_), None) => {
-                return Err(WipOperationError::Protocol(protocol_error(
+                return Err(protocol_error(
                     ProtocolErrorCode::InterfaceValidatorRequired,
                     "interface validator is required",
-                )));
+                ));
             }
-            (Some(expected), Some(actual)) if expected != actual => {
-                return Err(WipOperationError::Protocol(protocol_error(
+            (expected, Some(actual)) if expected != Some(actual) => {
+                return Err(protocol_error(
                     ProtocolErrorCode::InterfaceValidatorMismatch,
                     "interface validator is stale",
-                )));
+                ));
             }
             _ => {}
         }
@@ -1539,13 +1669,52 @@ impl WipHost {
             .descriptor
             .operations
             .iter()
-            .any(|operation| operation.name == request.operation)
+            .any(|operation| operation.name == operation_name)
         {
-            return Err(WipOperationError::Protocol(protocol_error(
+            return Err(protocol_error(
                 ProtocolErrorCode::OperationNotFound,
                 "operation is not published by the selected interface",
-            )));
+            ));
         }
+        if projection.object.validator.is_some() && target.validator.is_none() {
+            return Err(protocol_error(
+                ProtocolErrorCode::ValidatorRequired,
+                "object validator is required",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn call_projection(
+        &self,
+        projection: WipProjection,
+        request: CallOperationRequest,
+        context: WipCallContext,
+    ) -> Result<WipOperationOutput, WipOperationError> {
+        request.validate().map_err(|e| {
+            WipOperationError::Protocol(protocol_error(
+                ProtocolErrorCode::InvalidRequest,
+                e.to_string(),
+            ))
+        })?;
+        self.check_call_preconditions(
+            &projection,
+            &request.target,
+            &request.interface,
+            &request.operation,
+        )
+        .map_err(WipOperationError::Protocol)?;
+        self.execute_projection(projection, request, context).await
+    }
+
+    // Preconditions have already fixed publication; do not resolve target or
+    // scope again between argument decoding and the provider execution boundary.
+    async fn execute_projection(
+        &self,
+        projection: WipProjection,
+        request: CallOperationRequest,
+        context: WipCallContext,
+    ) -> Result<WipOperationOutput, WipOperationError> {
         projection
             .descriptor
             .validate_call(&request)
@@ -1688,7 +1857,7 @@ fn compatibility_projection(
         }
     })?;
     let route = format!("{WIP_TOOLS_ROOT}/{}", meta.name);
-    let interface = format!("yoi.tool/{}/v1", meta.name);
+    let interface = root_reference(&format!("yoi.tool/{}/v1", meta.name));
     let schema = serde_json::to_string(&meta.input_schema).map_err(|error| {
         WipMountError::InvalidProjection {
             route: route.clone(),
@@ -1826,6 +1995,7 @@ struct ActiveOperation {
 pub struct WipRuntime {
     endpoint: Endpoint,
     wire_limits: Limits,
+    #[cfg(test)]
     client_limits: ClientLimits,
     security_context: SecurityContext,
     state: Arc<Mutex<ClientState>>,
@@ -1870,6 +2040,7 @@ impl WipRuntime {
         Ok(Self {
             endpoint,
             wire_limits,
+            #[cfg(test)]
             client_limits,
             security_context,
             state: Arc::new(Mutex::new(ClientState { client, session })),
@@ -1893,6 +2064,7 @@ impl WipRuntime {
             .collect()
     }
 
+    #[cfg(test)]
     fn reset_observations(&self) -> Result<(), ToolError> {
         let mut client = Client::new(self.client_limits, self.wire_limits);
         let session = client
@@ -1903,136 +2075,33 @@ impl WipRuntime {
         Ok(())
     }
 
-    pub async fn discover(
+    pub(crate) async fn call(
         &self,
         path: String,
-        depth: u32,
-        refresh: bool,
-    ) -> Result<ToolOutput, ToolError> {
-        let prepared = {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            let session = state.session.clone();
-            if refresh {
-                state
-                    .client
-                    .refresh_observed(&session, path.clone(), depth)
-                    .map(Some)
-            } else {
-                state.client.ensure_observed(&session, path.clone(), depth)
-            }
-            .map_err(client_tool_error)?
-        };
-        if let Some(prepared) = prepared {
-            self.metrics
-                .discover_round_trips
-                .fetch_add(1, Ordering::Relaxed);
-            let response = self.dispatch_retrieval(&prepared.request).await?;
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            let completion = state
-                .client
-                .complete(prepared.id, response)
-                .map_err(client_tool_error)?;
-            check_retrieval_completion(completion)?;
-        }
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let values = state
-            .client
-            .known_space(&state.session)
-            .ok_or_else(|| ToolError::ExecutionFailed("WIP session disappeared".into()))?;
-        let visible = values
-            .into_iter()
-            .filter(|observation| {
-                observation.path == path || is_descendant(&path, &observation.path)
-            })
-            .map(object_observation_json)
-            .collect::<Vec<_>>();
-        Ok(json_output(
-            format!("Observed {} WIP object(s)", visible.len()),
-            json!({
-                "known_space": visible,
-                "metrics": metrics_json(self.metrics.snapshot()),
-                "cache_policy": "fresh observations are isolated to this Worker endpoint/security context; use refresh or reset after external authority changes"
-            }),
-        ))
-    }
-
-    pub async fn inspect(&self, interface: String, refresh: bool) -> Result<ToolOutput, ToolError> {
-        let prepared = {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            let session = state.session.clone();
-            if refresh {
-                state
-                    .client
-                    .prepare_interface(&session, interface.clone())
-                    .map(Some)
-            } else {
-                state.client.ensure_interface(&session, interface.clone())
-            }
-            .map_err(client_tool_error)?
-        };
-        if let Some(prepared) = prepared {
-            self.metrics
-                .inspect_round_trips
-                .fetch_add(1, Ordering::Relaxed);
-            let response = self.dispatch_retrieval(&prepared.request).await?;
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            let completion = state
-                .client
-                .complete(prepared.id, response)
-                .map_err(client_tool_error)?;
-            check_retrieval_completion(completion)?;
-        }
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let observed = state
-            .client
-            .interface(&state.session, &interface)
-            .ok_or_else(|| ToolError::InvalidArgument("interface has not been observed".into()))?;
-        Ok(json_output(
-            format!("Inspected WIP interface `{interface}`"),
-            json!({
-                "interface": interface,
-                "state": observation_state_name(&observed.state),
-                "validator": observed.validator.as_ref().map(hex),
-                "descriptor": observed.descriptor.as_ref().map(descriptor_json),
-                "metrics": metrics_json(self.metrics.snapshot())
-            }),
-        ))
-    }
-
-    pub async fn call(
-        &self,
-        path: String,
-        interface: String,
+        interface: InterfaceReference,
         operation: String,
         arguments: Json,
         execution: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        let arguments = match self
-            .host
-            .projection_live(&path)
-            .await
-            .map_err(|e| ToolError::InvalidArgument(e.message))?
-        {
-            Some(projection) if projection.kind == WipProjectionKind::Compatibility => {
-                BTreeMap::from([(
-                    "input".to_string(),
-                    json_to_wip(&arguments).map_err(ToolError::InvalidArgument)?,
-                )])
-            }
-            Some(projection) => decode_native_arguments(
-                &path,
-                &interface,
-                &operation,
-                &arguments,
-                &projection.descriptor,
-                self.wire_limits,
-            )
-            .map_err(ToolError::InvalidArgument)?,
-            None => {
-                let error = unpublished_path_error(&path);
-                return Err(ToolError::InvalidArgument(error.message));
-            }
+        let descriptor = {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state
+                .client
+                .interface(&state.session, &interface)
+                .and_then(|observation| observation.descriptor.clone())
+                .ok_or_else(|| {
+                    ToolError::InvalidArgument("Interface has not been observed".into())
+                })?
         };
+        let arguments = decode_native_arguments(
+            &path,
+            &interface,
+            &operation,
+            &arguments,
+            &descriptor,
+            self.wire_limits,
+        )
+        .map_err(ToolError::InvalidArgument)?;
         let prepared = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             let session = state.session.clone();
@@ -2195,49 +2264,74 @@ impl WipRuntime {
         ),
         ToolError,
     > {
-        let metadata = decode_call_operation_metadata(request.body(), self.wire_limits)
-            .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
-        let descriptor = self
+        let rejected = |error: ProtocolError| -> Result<_, ToolError> {
+            Ok((
+                encode_protocol_error_response(
+                    ProtocolInteraction::CallOperation,
+                    &error,
+                    self.wire_limits,
+                )
+                .map_err(|e| ToolError::Internal(e.to_string()))?,
+                None,
+                WipAuditOutcome::Rejected,
+            ))
+        };
+        let metadata = match decode_call_operation_metadata(request.body(), self.wire_limits) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return rejected(protocol_error(
+                    ProtocolErrorCode::InvalidRequest,
+                    error.to_string(),
+                ));
+            }
+        };
+        let projection = match self
             .host
-            .descriptor_live(&metadata.interface.reference)
+            .projection_for_interface_live(&metadata.target.path, &metadata.interface.reference)
             .await
-            .map_err(|e| ToolError::InvalidArgument(e.message))?
-            .map(|(descriptor, _)| descriptor.clone())
-            .ok_or_else(|| ToolError::InvalidArgument("interface is not published".into()))?;
-        let request_value = metadata
-            .decode_request(request.body(), &descriptor, self.wire_limits)
-            .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
+        {
+            Ok(Some(projection)) => projection,
+            Ok(None) => return rejected(unpublished_path_error(&metadata.target.path)),
+            Err(error) => return rejected(error),
+        };
+        if let Err(error) = self.host.check_call_preconditions(
+            &projection,
+            &metadata.target,
+            &metadata.interface,
+            &metadata.operation,
+        ) {
+            return rejected(error);
+        }
+        let descriptor = projection.descriptor.clone();
+        let target_validator = projection.object.validator.clone();
+        let request_value =
+            match metadata.decode_request(request.body(), &descriptor, self.wire_limits) {
+                Ok(request) => request,
+                Err(error) => {
+                    return rejected(protocol_error(
+                        ProtocolErrorCode::InvalidArguments,
+                        error.to_string(),
+                    ));
+                }
+            };
         let context = WipCallContext {
             execution,
             security_context: self.security_context.as_str().to_string(),
         };
-        let result = match self
+        self.active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                context.execution.execution_id(),
+                ActiveOperation {
+                    operation: request_value.operation.clone(),
+                    handler: Arc::clone(&projection.handler),
+                },
+            );
+        let result = self
             .host
-            .projection_live(&request_value.target.path)
-            .await
-            .map_err(|e| ToolError::InvalidArgument(e.message))?
-        {
-            Some(projection) => {
-                // Pin the exact resolved instance used for dispatch. A dynamic
-                // resolver may return a fresh stateful handler on each lookup.
-                self.active
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .insert(
-                        context.execution.execution_id(),
-                        ActiveOperation {
-                            operation: request_value.operation.clone(),
-                            handler: Arc::clone(&projection.handler),
-                        },
-                    );
-                self.host
-                    .call_projection(projection, request_value.clone(), context)
-                    .await
-            }
-            None => Err(WipOperationError::Protocol(unpublished_path_error(
-                &request_value.target.path,
-            ))),
-        };
+            .execute_projection(projection, request_value.clone(), context)
+            .await;
         match result {
             Ok(output) => {
                 let response = encode_call_operation_response(
@@ -2248,10 +2342,7 @@ impl WipRuntime {
                         validator: match output.validator {
                             Some(validator) => Some(validator),
                             None if self.host.subtree(&request_value.target.path).is_some() => None,
-                            None => self
-                                .host
-                                .projection(&request_value.target.path)
-                                .and_then(|projection| projection.object.validator.clone()),
+                            None => target_validator,
                         },
                     },
                     self.wire_limits,
@@ -2400,160 +2491,6 @@ impl Drop for DispatchedCallGuard {
     }
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct WipDiscoverInput {
-    /// Canonical Worldspace path. Begin at `/`.
-    #[serde(default = "root_path")]
-    path: String,
-    /// Descendant depth to materialize. Use 1 to explore one level at a time.
-    #[serde(default = "one")]
-    depth: u32,
-    /// Explicitly supersede cached observations for this path.
-    #[serde(default)]
-    refresh: bool,
-    /// Drop all Known Space for this Worker/security context before observing.
-    #[serde(default)]
-    reset: bool,
-}
-
-fn root_path() -> String {
-    WIP_ROOT.into()
-}
-
-fn one() -> u32 {
-    1
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct WipInspectInput {
-    /// Opaque interface reference returned by Discover.
-    interface: String,
-    /// Explicitly supersede the cached descriptor observation.
-    #[serde(default)]
-    refresh: bool,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct WipCallInput {
-    /// Exact object path returned by Discover.
-    path: String,
-    /// Exact interface reference selected from that object.
-    interface: String,
-    /// Exact operation name from Inspect.
-    operation: String,
-    /// Original operation arguments. Compatibility operations accept the original tool object here.
-    arguments: Json,
-}
-
-struct WipDiscoverTool {
-    runtime: Arc<WipRuntime>,
-}
-
-#[async_trait]
-impl Tool for WipDiscoverTool {
-    async fn execute(
-        &self,
-        input_json: &str,
-        _context: ToolExecutionContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let input: WipDiscoverInput = serde_json::from_str(input_json)
-            .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
-        if input.reset {
-            self.runtime.reset_observations()?;
-        }
-        self.runtime
-            .discover(input.path, input.depth.min(8), input.refresh)
-            .await
-    }
-}
-
-struct WipInspectTool {
-    runtime: Arc<WipRuntime>,
-}
-
-#[async_trait]
-impl Tool for WipInspectTool {
-    async fn execute(
-        &self,
-        input_json: &str,
-        _context: ToolExecutionContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let input: WipInspectInput = serde_json::from_str(input_json)
-            .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
-        self.runtime.inspect(input.interface, input.refresh).await
-    }
-}
-
-struct WipCallTool {
-    runtime: Arc<WipRuntime>,
-}
-
-#[async_trait]
-impl Tool for WipCallTool {
-    async fn execute(
-        &self,
-        input_json: &str,
-        context: ToolExecutionContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let input: WipCallInput = serde_json::from_str(input_json)
-            .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
-        self.runtime
-            .call(
-                input.path,
-                input.interface,
-                input.operation,
-                input.arguments,
-                context,
-            )
-            .await
-    }
-
-    async fn cancel_execution(&self, context: &ToolExecutionContext) -> Result<(), ToolError> {
-        self.runtime.cancel(context).await
-    }
-}
-
-fn wip_tool_definitions(runtime: Arc<WipRuntime>) -> Vec<ToolDefinition> {
-    let discover_runtime = Arc::clone(&runtime);
-    let inspect_runtime = Arc::clone(&runtime);
-    let call_runtime = Arc::clone(&runtime);
-    vec![
-        Arc::new(move || {
-            let schema = schemars::schema_for!(WipDiscoverInput);
-            (
-                ToolMeta::new("Discover")
-                    .description("Explore the authorized WIP Worldspace and stateful Known Space. Start at `/`; use reset after reconnect or authority changes.")
-                    .input_schema(serde_json::to_value(schema).expect("WIP discover schema serializes")),
-                Arc::new(WipDiscoverTool {
-                    runtime: Arc::clone(&discover_runtime),
-                }) as Arc<dyn Tool>,
-            )
-        }),
-        Arc::new(move || {
-            let schema = schemars::schema_for!(WipInspectInput);
-            (
-                ToolMeta::new("Inspect")
-                    .description("Fetch and validate one descriptor returned by Discover. Inspect before calling an operation.")
-                    .input_schema(serde_json::to_value(schema).expect("WIP inspect schema serializes")),
-                Arc::new(WipInspectTool {
-                    runtime: Arc::clone(&inspect_runtime),
-                }) as Arc<dyn Tool>,
-            )
-        }),
-        Arc::new(move || {
-            let schema = schemars::schema_for!(WipCallInput);
-            (
-                ToolMeta::new("Call")
-                    .description("Invoke an operation only from fresh object/interface observations. Stale validators and invalid original JSON Schema inputs fail closed; unknown write outcomes must not be retried automatically.")
-                    .input_schema(serde_json::to_value(schema).expect("WIP call schema serializes")),
-                Arc::new(WipCallTool {
-                    runtime: Arc::clone(&call_runtime),
-                }) as Arc<dyn Tool>,
-            )
-        }),
-    ]
-}
-
 /// Replace all currently registered ordinary tools with one WIP client surface.
 /// Call this once after every enabled Feature has contributed its tools.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2647,113 +2584,6 @@ fn client_tool_error(error: wip_client::ClientError) -> ToolError {
     ToolError::ExecutionFailed(error.to_string())
 }
 
-fn is_descendant(parent: &str, candidate: &str) -> bool {
-    if parent == WIP_ROOT {
-        candidate.starts_with('/')
-    } else {
-        candidate.starts_with(&format!("{parent}/"))
-    }
-}
-
-fn object_observation_json(observation: wip_client::ObjectObservation) -> Json {
-    json!({
-        "path": observation.path,
-        "state": observation_state_name(&observation.state),
-        "validator": observation.validator.as_ref().map(hex),
-        "object": observation.object.map(|object| json!({
-            "name": object.name,
-            "description": object.description,
-            "interfaces": object.interfaces,
-            "ref": object.r#ref,
-            "validator": object.validator.as_ref().map(hex),
-        }))
-    })
-}
-
-fn observation_state_name(state: &ObservationState) -> &'static str {
-    match state {
-        ObservationState::Loading(_) => "loading",
-        ObservationState::Fresh => "fresh",
-        ObservationState::Stale => "stale",
-        ObservationState::Error(_) => "error",
-    }
-}
-
-fn descriptor_json(descriptor: &InterfaceDescriptor) -> Json {
-    json!({
-        "format": descriptor.format,
-        "documentation": descriptor.documentation.as_ref().map(documentation_json),
-        "types": descriptor.types.iter().map(|declaration| json!({
-            "name": declaration.name,
-            "documentation": declaration.documentation.as_ref().map(documentation_json),
-            "definition": type_json(&declaration.definition),
-        })).collect::<Vec<_>>(),
-        "operations": descriptor.operations.iter().map(|operation| json!({
-            "name": operation.name,
-            "documentation": operation.documentation.as_ref().map(documentation_json),
-            "parameters": operation.parameters.iter().map(|parameter| json!({
-                "name": parameter.name,
-                "required": parameter.required,
-                "documentation": parameter.documentation.as_ref().map(documentation_json),
-                "type": type_json(&parameter.r#type),
-            })).collect::<Vec<_>>(),
-            "returns": {
-                "documentation": operation.returns.documentation.as_ref().map(documentation_json),
-                "type": type_json(&operation.returns.r#type),
-            }
-        })).collect::<Vec<_>>()
-    })
-}
-
-fn documentation_json(documentation: &Documentation) -> Json {
-    json!({
-        "summary": documentation.summary,
-        "details": documentation.details,
-    })
-}
-
-fn type_json(value: &TypeExpr) -> Json {
-    match value {
-        TypeExpr::Unit => json!("unit"),
-        TypeExpr::Boolean => json!("boolean"),
-        TypeExpr::Integer => json!("integer"),
-        TypeExpr::Number => json!("number"),
-        TypeExpr::String => json!("string"),
-        TypeExpr::Bytes => json!("bytes"),
-        TypeExpr::Json => json!("json"),
-        TypeExpr::Entry => json!("entry"),
-        TypeExpr::Named { name } => json!({"named": name}),
-        TypeExpr::Record { fields } => json!({
-            "record": {
-                "fields": fields.iter().map(|field| json!({
-                    "name": field.name,
-                    "required": field.required,
-                    "documentation": field.documentation.as_ref().map(documentation_json),
-                    "type": type_json(&field.r#type),
-                })).collect::<Vec<_>>()
-            }
-        }),
-        TypeExpr::List { items } => json!({"list": {"items": type_json(items)}}),
-        TypeExpr::Enum { cases } => json!({
-            "enum": {
-                "cases": cases.iter().map(|case| json!({
-                    "name": case.name,
-                    "documentation": case.documentation.as_ref().map(documentation_json),
-                })).collect::<Vec<_>>()
-            }
-        }),
-        TypeExpr::Union { cases } => json!({
-            "union": {
-                "cases": cases.iter().map(|case| json!({
-                    "name": case.name,
-                    "documentation": case.documentation.as_ref().map(documentation_json),
-                    "payload": case.payload.as_ref().map(type_json),
-                })).collect::<Vec<_>>()
-            }
-        }),
-    }
-}
-
 fn metrics_json(metrics: WipMetricsSnapshot) -> Json {
     json!({
         "ordinary_schema_bytes": metrics.ordinary_schema_bytes,
@@ -2830,7 +2660,7 @@ fn json_output(summary: String, value: Json) -> ToolOutput {
 
 fn decode_native_arguments(
     path: &str,
-    interface: &str,
+    interface: &InterfaceReference,
     operation: &str,
     arguments: &Json,
     descriptor: &InterfaceDescriptor,
@@ -2838,7 +2668,7 @@ fn decode_native_arguments(
 ) -> Result<BTreeMap<String, Value>, String> {
     let body = serde_json::to_vec(&json!({
         "target": {"path": path},
-        "interface": {"reference": interface},
+        "interface": {"reference": {"scope":interface.scope,"name":interface.name}},
         "operation": operation,
         "arguments": arguments,
     }))
@@ -2906,10 +2736,6 @@ pub(crate) fn wip_to_json(value: &Value) -> Result<Json, String> {
             .collect::<Result<Vec<_>, _>>()
             .map(Json::Array),
     }
-}
-
-fn hex(bytes: &Vec<u8>) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -3093,68 +2919,53 @@ mod tests {
                 .into_iter()
                 .map(|definition| definition.name)
                 .collect::<Vec<_>>(),
-            ["Call", "Discover", "Inspect"]
+            ["Inspect", "Invoke", "Tree"]
         );
         let metrics = runtime.metrics();
         assert!(metrics.ordinary_schema_bytes > metrics.wip_schema_bytes);
     }
 
     #[tokio::test]
-    async fn renamed_gateway_tools_discover_inspect_and_call_through_registered_surface() {
+    async fn object_centered_tools_inspect_without_tree_and_invoke_original_schema() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
         engine.register_tool(echo_definition("Echo".into(), Arc::clone(&calls)));
         install_wip_mode(&mut engine, None, "worker-a".into()).unwrap();
         let tools = engine.tool_server_handle();
         tools.flush_pending();
-
-        let discovered = transport_output_json(
+        let inspected = transport_output_json(
             tools
                 .call_tool(
-                    "Discover",
+                    "Inspect",
+                    r#"{"path":"/tools/Echo"}"#,
+                    ToolExecutionContext::direct(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(inspected["path"], "/tools/Echo");
+        let interface = &inspected["interfaces"][0]["reference"];
+        assert_eq!(interface, &json!({"scope":"/","name":"yoi.tool/Echo/v1"}));
+        assert!(
+            inspected["interfaces"][0]["signature"]
+                .as_str()
+                .unwrap()
+                .contains("operation call(")
+        );
+        let tree = transport_output_json(
+            tools
+                .call_tool(
+                    "Tree",
                     r#"{"path":"/","depth":2}"#,
                     ToolExecutionContext::direct(),
                 )
                 .await
                 .unwrap(),
         );
-        let object = discovered["known_space"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|item| item["path"] == "/tools/Echo")
-            .unwrap();
-        assert_eq!(object["state"], "fresh");
-        let interface = object["object"]["interfaces"][0].as_str().unwrap();
-        let inspected = transport_output_json(
-            tools
-                .call_tool(
-                    "Inspect",
-                    &json!({"interface": interface}).to_string(),
-                    ToolExecutionContext::direct(),
-                )
-                .await
-                .unwrap(),
-        );
-        assert_eq!(inspected["interface"], interface);
-        assert_eq!(inspected["state"], "fresh");
-        assert_eq!(inspected["descriptor"]["operations"][0]["name"], "call");
-
-        let arguments = json!({"message": "hello"});
-        let output = tools
-            .call_tool(
-                "Call",
-                &json!({
-                    "path": object["path"],
-                    "interface": interface,
-                    "operation": "call",
-                    "arguments": arguments,
-                })
-                .to_string(),
-                ToolExecutionContext::direct(),
-            )
-            .await
-            .unwrap();
+        assert_eq!(tree["coverage"]["complete"], true);
+        assert!(tree.to_string().contains("/tools/Echo"));
+        let arguments = json!({"message":"hello"});
+        let output = tools.call_tool("Invoke", &json!({"path":"/tools/Echo","interface":interface,"operation":"call","arguments":{"input":arguments}}).to_string(), ToolExecutionContext::direct()).await.unwrap();
         assert_eq!(output.summary, arguments.to_string());
         assert!(output.content.is_none());
         assert!(output.attachments.is_empty());
@@ -3239,18 +3050,12 @@ mod tests {
             0,
         )
         .unwrap();
-        runtime
-            .discover("/assets/A-1".into(), 0, true)
-            .await
-            .unwrap();
-        runtime
-            .inspect("test.asset/item/v1".into(), true)
-            .await
-            .unwrap();
+        runtime.tree("/assets/A-1".into(), 0, true).await.unwrap();
+        runtime.inspect("/assets/A-1".into(), true).await.unwrap();
         let error = runtime
             .call(
                 "/assets/A-1".into(),
-                "test.asset/item/v1".into(),
+                crate::wip::root_reference("test.asset/item/v1"),
                 "read".into(),
                 Json::Object(Default::default()),
                 Default::default(),
@@ -3311,11 +3116,11 @@ mod tests {
             object: Object {
                 name: "A-1".into(),
                 description: Some("host-resolved asset".into()),
-                interfaces: vec!["test.asset/item/v1".into()],
+                interfaces: vec![root_reference("test.asset/item/v1")],
                 r#ref: Some("asset:A-1".into()),
                 validator: Some(vec![1]),
             },
-            interface: "test.asset/item/v1".into(),
+            interface: root_reference("test.asset/item/v1"),
             interface_validator: Some(descriptor_validator(&descriptor)),
             descriptor,
             handler,
@@ -3374,7 +3179,7 @@ mod tests {
             .contribute_operations(WipOperationContribution {
                 route: "/assets/A-1".into(),
                 contributor: "asset-management".into(),
-                interface: "test.asset/item/v1".into(),
+                interface: root_reference("test.asset/item/v1"),
                 descriptor: contribution_descriptor.clone(),
                 handler: Arc::new(ContributionHandler {
                     calls: Arc::clone(&manage_calls),
@@ -3386,7 +3191,7 @@ mod tests {
             registry.contribute_operations(WipOperationContribution {
                 route: "/assets/A-1".into(),
                 contributor: "duplicate-management".into(),
-                interface: "test.asset/item/v1".into(),
+                interface: root_reference("test.asset/item/v1"),
                 descriptor: contribution_descriptor,
                 handler: Arc::new(ContributionHandler {
                     calls: Arc::clone(&manage_calls),
@@ -3413,6 +3218,7 @@ mod tests {
                 validator: projection.object.validator.clone(),
             },
             interface: wip_protocol::InterfaceTarget {
+                scope_ref: None,
                 reference: projection.interface.clone(),
                 validator: projection.interface_validator.clone(),
             },
@@ -3473,7 +3279,7 @@ mod tests {
             registry.contribute_operations(WipOperationContribution {
                 route: "/assets/A-1".into(),
                 contributor: "management".into(),
-                interface: "test.asset/item/v1".into(),
+                interface: root_reference("test.asset/item/v1"),
                 descriptor: inconsistent.clone(),
                 handler: Arc::clone(&handler),
             }),
@@ -3484,7 +3290,7 @@ mod tests {
             registry.contribute_operations(WipOperationContribution {
                 route: "/assets/A-2".into(),
                 contributor: "management".into(),
-                interface: "test.asset/item/v1".into(),
+                interface: root_reference("test.asset/item/v1"),
                 descriptor: inconsistent,
                 handler,
             }),
@@ -3511,7 +3317,7 @@ mod tests {
                 .contribute_operations(WipOperationContribution {
                     route: "/assets/A-1".into(),
                     contributor: "asset-management".into(),
-                    interface: "test.asset/item/v1".into(),
+                    interface: root_reference("test.asset/item/v1"),
                     descriptor,
                     handler: Arc::new(ContributionHandler { calls, allowed }),
                 })
@@ -3527,6 +3333,7 @@ mod tests {
                 validator: projection.object.validator.clone(),
             },
             interface: wip_protocol::InterfaceTarget {
+                scope_ref: None,
                 reference: projection.interface.clone(),
                 validator: projection.interface_validator.clone(),
             },
@@ -3612,11 +3419,11 @@ mod tests {
         let old_projection = old_host.projection("/assets/A-1").unwrap();
         let old_runtime = WipRuntime::new(old_host, SecurityContext::new("worker-a"), 0).unwrap();
         old_runtime
-            .discover("/assets/A-1".into(), 0, false)
+            .tree("/assets/A-1".into(), 0, false)
             .await
             .unwrap();
         old_runtime
-            .inspect(old_projection.interface.clone(), false)
+            .inspect(old_projection.route.clone(), false)
             .await
             .unwrap();
         let restored_host = WipHost::new(asset_registry(
@@ -3654,12 +3461,9 @@ mod tests {
                 .is_err()
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        restored.tree("/assets/A-1".into(), 0, false).await.unwrap();
         restored
-            .discover("/assets/A-1".into(), 0, false)
-            .await
-            .unwrap();
-        restored
-            .inspect(current.interface.clone(), false)
+            .inspect(current.route.clone(), false)
             .await
             .unwrap();
         restored
@@ -3761,9 +3565,9 @@ mod tests {
 
         let runtime = WipRuntime::new(host, SecurityContext::new("worker-a"), 0).unwrap();
         let error = runtime
-            .call(
+            .invoke(
                 "/features/ticket/tickets/T-1".into(),
-                "yoi.ticket/item/v1".into(),
+                crate::wip::root_reference("yoi.ticket/item/v1"),
                 "read".into(),
                 json!({}),
                 ToolExecutionContext::direct(),
@@ -3845,7 +3649,7 @@ mod tests {
             .contribute_operations(WipOperationContribution {
                 route: "/assets/A-1".into(),
                 contributor: "management".into(),
-                interface: "test.asset/item/v1".into(),
+                interface: root_reference("test.asset/item/v1"),
                 descriptor,
                 handler: contributor,
             })
@@ -3875,7 +3679,10 @@ mod tests {
         assert_ne!(initial.interface, other.interface);
         assert_eq!(operation_names(&initial.descriptor), ["read"]);
         assert!(other.descriptor.operations.is_empty());
-        assert!(host.fetch_interface("test.asset/item/v1").is_err());
+        assert!(
+            host.fetch_interface(&root_reference("test.asset/item/v1"))
+                .is_err()
+        );
         assert_eq!(
             host.fetch_interface(&initial.interface).unwrap().descriptor,
             initial.descriptor
@@ -3934,7 +3741,7 @@ mod tests {
             }))
         ));
         let mut unqualified = asset_request(&current, "read");
-        unqualified.interface.reference = "test.asset/item/v1".into();
+        unqualified.interface.reference = crate::wip::root_reference("test.asset/item/v1");
         assert!(matches!(
             host.call(unqualified, direct_wip_context()).await,
             Err(WipOperationError::Protocol(ProtocolError {
@@ -3983,7 +3790,7 @@ mod tests {
         child.route = "/assets/A-1/child".into();
         child.object.name = "child".into();
         // Legacy interface references stay opaque, including this delimiter.
-        child.interface = "legacy/@/opaque".into();
+        child.interface = crate::wip::root_reference("legacy/@/opaque");
         child.object.interfaces = vec![child.interface.clone()];
         registry.mount(child.clone()).unwrap();
         let mut host = WipHost::new(registry);
@@ -4036,7 +3843,7 @@ mod tests {
                 object: Object {
                     name: item_reference.into(),
                     description: None,
-                    interfaces: vec!["test.dynamic/v1".into()],
+                    interfaces: vec![root_reference("test.dynamic/v1")],
                     r#ref: Some(format!("objective:{item_reference}")),
                     validator: Some(vec![self.revision.load(Ordering::SeqCst) as u8]),
                 },
@@ -4081,7 +3888,7 @@ mod tests {
             .contribute_dynamic_operations(WipDynamicOperationContribution {
                 collection_route: "/objectives".into(),
                 contributor: "management".into(),
-                interface: "test.dynamic/v1".into(),
+                interface: root_reference("test.dynamic/v1"),
                 descriptor,
                 resolver: Arc::new(ContextualContributionResolver(contributor)),
             })
@@ -4113,7 +3920,10 @@ mod tests {
                 operation_names(&host.fetch_interface(&other.interface).unwrap().descriptor),
                 ["manage"]
             );
-            assert!(host.fetch_interface("test.dynamic/v1").is_err());
+            assert!(
+                host.fetch_interface(&root_reference("test.dynamic/v1"))
+                    .is_err()
+            );
             assert!(
                 host.fetch_interface(&contextual_reference("wrong.base/v1", "/objectives/O-1"))
                     .is_err()
@@ -4125,8 +3935,14 @@ mod tests {
                 ))
                 .is_err()
             );
-            assert!(host.fetch_interface("test.dynamic/v1/@/ff").is_err());
-            assert!(host.fetch_interface("test.dynamic/v1/@/2f0").is_err());
+            assert!(
+                host.fetch_interface(&root_reference("test.dynamic/v1/@/ff"))
+                    .is_err()
+            );
+            assert!(
+                host.fetch_interface(&root_reference("test.dynamic/v1/@/2f0"))
+                    .is_err()
+            );
             let mut wrong_path = asset_request(&initial, "read");
             wrong_path.target.path = other.route.clone();
             assert!(matches!(
@@ -4201,12 +4017,9 @@ mod tests {
             0,
         )
         .unwrap();
-        runtime
-            .discover("/assets/A-1".into(), 0, false)
-            .await
-            .unwrap();
+        runtime.tree("/assets/A-1".into(), 0, false).await.unwrap();
         let interface = runtime.host.projection("/assets/A-1").unwrap().interface;
-        runtime.inspect(interface.clone(), false).await.unwrap();
+        runtime.inspect("/assets/A-1".into(), false).await.unwrap();
         contributor.permitted.store(false, Ordering::SeqCst);
         // The Client still knows the old descriptor; the Host must independently
         // check its current filtered descriptor rather than trust Known Space.
@@ -4235,7 +4048,7 @@ mod tests {
         );
         assert_eq!(owner.calls.load(Ordering::SeqCst), 0);
         assert_eq!(contributor.calls.load(Ordering::SeqCst), 0);
-        runtime.inspect(interface.clone(), true).await.unwrap();
+        runtime.inspect("/assets/A-1".into(), true).await.unwrap();
         runtime
             .call(
                 "/assets/A-1".into(),
@@ -4248,12 +4061,14 @@ mod tests {
             .unwrap();
         owner.visible.store(false, Ordering::SeqCst);
         assert!(runtime.host.fetch_interface(&interface).is_err());
-        let error = runtime.inspect(interface.clone(), true).await.unwrap_err();
-        assert!(error.to_string().contains("InterfaceNotFound"));
+        let error = runtime
+            .inspect("/assets/A-1".into(), true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("NotFound"));
         {
             let state = runtime.state.lock().unwrap();
-            let observed = state.client.interface(&state.session, &interface).unwrap();
-            assert!(matches!(observed.state, ObservationState::Error(_)));
+            assert!(state.client.interface(&state.session, &interface).is_none());
         }
         assert!(
             runtime
@@ -4316,7 +4131,7 @@ mod tests {
             .contribute_operations(WipOperationContribution {
                 route: "/assets/A-1".into(),
                 contributor: "management".into(),
-                interface: "test.asset/item/v1".into(),
+                interface: root_reference("test.asset/item/v1"),
                 descriptor,
                 handler: Arc::new(CurrentObjectValidatorHandler {
                     inner: Arc::new(ContextualHandler::new(true, true)),
@@ -4408,30 +4223,23 @@ mod tests {
         serde_json::from_str(output.content.as_deref().expect("transport JSON output")).unwrap()
     }
 
-    async fn observed_contextual_interface(runtime: &WipRuntime, path: &str) -> String {
-        let observed = transport_output_json(runtime.discover(path.into(), 0, true).await.unwrap());
-        let object = observed["known_space"]
-            .as_array()
+    async fn observed_contextual_interface(runtime: &WipRuntime, path: &str) -> InterfaceReference {
+        runtime.inspect(path.into(), true).await.unwrap();
+        let state = runtime.state.lock().unwrap();
+        state
+            .client
+            .object(&state.session, path)
             .unwrap()
-            .iter()
-            .find(|item| item["path"] == path)
-            .unwrap();
-        assert_eq!(object["state"], "fresh");
-        let interface = object["object"]["interfaces"][0]
-            .as_str()
+            .object
             .unwrap()
-            .to_string();
-        assert!(interface.contains("/@/"));
-        let inspected =
-            transport_output_json(runtime.inspect(interface.clone(), true).await.unwrap());
-        assert_eq!(inspected["state"], "fresh");
-        interface
+            .interfaces[0]
+            .clone()
     }
 
     async fn transport_call_json(
         runtime: &WipRuntime,
         path: &str,
-        interface: &str,
+        interface: &InterfaceReference,
         operation: &str,
         arguments: Json,
     ) -> Json {
@@ -4439,7 +4247,7 @@ mod tests {
             runtime
                 .call(
                     path.into(),
-                    interface.into(),
+                    interface.clone(),
                     operation.into(),
                     arguments,
                     ToolExecutionContext::direct(),
@@ -4665,8 +4473,8 @@ mod tests {
         use crate::worker::WorkspaceRequestMethod;
         let client = Arc::new(CatalogClient::default());
         let runtime = catalog_transport_runtime(client.clone(), true, None);
-        let root = transport_output_json(runtime.discover("/".into(), 1, false).await.unwrap());
-        let paths = root["known_space"]
+        let root = transport_output_json(runtime.tree("/".into(), 1, false).await.unwrap());
+        let paths = root["tree"]["children"]
             .as_array()
             .unwrap()
             .iter()
@@ -4838,7 +4646,7 @@ mod tests {
             "source":{"kind":"repository", "repository_key":"registered-key"},
         }));
         let runtime = catalog_transport_runtime(client.clone(), false, None);
-        runtime.discover("/".into(), 1, false).await.unwrap();
+        runtime.tree("/".into(), 1, false).await.unwrap();
         let collection_interface = observed_contextual_interface(&runtime, "/workdirs").await;
         assert_eq!(
             operation_names(
@@ -5085,11 +4893,11 @@ mod tests {
             object: Object {
                 name: "typed".into(),
                 description: Some("native typed sample".into()),
-                interfaces: vec!["yoi.native/typed/v1".into()],
+                interfaces: vec![root_reference("yoi.native/typed/v1")],
                 r#ref: Some("native:typed".into()),
                 validator: Some(vec![1]),
             },
-            interface: "yoi.native/typed/v1".into(),
+            interface: root_reference("yoi.native/typed/v1"),
             descriptor: InterfaceDescriptor {
                 format: INTERFACE_FORMAT_V1.into(),
                 documentation: documentation("typed interface"),
@@ -5188,33 +4996,22 @@ mod tests {
         registry.mount(native_typed_projection()).unwrap();
         let runtime =
             WipRuntime::new(WipHost::new(registry), SecurityContext::new("worker-a"), 0).unwrap();
-        runtime.discover("/".into(), 2, false).await.unwrap();
+        runtime.tree("/".into(), 2, false).await.unwrap();
         let inspected = runtime
-            .inspect("yoi.native/typed/v1".into(), false)
+            .inspect("/native/typed".into(), false)
             .await
             .unwrap();
         let inspected: Json = serde_json::from_str(inspected.content.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            inspected.pointer(
-                "/descriptor/types/0/definition/record/fields/1/type/list/items/enum/cases/0/documentation/summary"
-            ),
-            Some(&json!("red tag"))
-        );
-        assert_eq!(
-            inspected.pointer("/descriptor/types/0/definition/record/fields/1/required"),
-            Some(&json!(false))
-        );
-        assert_eq!(
-            inspected.pointer(
-                "/descriptor/types/0/definition/record/fields/2/type/union/cases/1/payload"
-            ),
-            Some(&json!("entry"))
-        );
-
+        let signature = inspected["interfaces"][0]["signature"].as_str().unwrap();
+        assert!(signature.contains("type Payload"));
+        assert!(signature.contains("red tag"));
+        assert!(signature.contains("tags?: [enum"));
+        assert!(signature.contains("found(entry)"));
+        assert!(signature.contains("operation accept("));
         let output = runtime
             .call(
                 "/native/typed".into(),
-                "yoi.native/typed/v1".into(),
+                crate::wip::root_reference("yoi.native/typed/v1"),
                 "accept".into(),
                 json!({
                     "payload": {
@@ -5235,7 +5032,7 @@ mod tests {
         let invalid = runtime
             .call(
                 "/native/typed".into(),
-                "yoi.native/typed/v1".into(),
+                crate::wip::root_reference("yoi.native/typed/v1"),
                 "accept".into(),
                 json!({
                     "payload": {
@@ -5258,17 +5055,14 @@ mod tests {
         let host = WipHost::new(registry_with_tool("Echo", Arc::clone(&calls), None));
         let runtime = WipRuntime::new(host, SecurityContext::new("worker-a"), 4096).unwrap();
 
-        runtime.discover("/".into(), 2, false).await.unwrap();
-        runtime
-            .inspect("yoi.tool/Echo/v1".into(), false)
-            .await
-            .unwrap();
+        runtime.tree("/".into(), 2, false).await.unwrap();
+        runtime.inspect("/tools/Echo".into(), false).await.unwrap();
         let output = runtime
             .call(
                 "/tools/Echo".into(),
-                "yoi.tool/Echo/v1".into(),
+                crate::wip::root_reference("yoi.tool/Echo/v1"),
                 "call".into(),
-                json!({"message": "ok"}),
+                json!({"input":{"message": "ok"}}),
                 ToolExecutionContext::direct(),
             )
             .await
@@ -5279,9 +5073,9 @@ mod tests {
         let invalid = runtime
             .call(
                 "/tools/Echo".into(),
-                "yoi.tool/Echo/v1".into(),
+                crate::wip::root_reference("yoi.tool/Echo/v1"),
                 "call".into(),
-                json!({"message": "x"}),
+                json!({"input":{"message": "x"}}),
                 ToolExecutionContext::direct(),
             )
             .await
@@ -5299,11 +5093,8 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let host = WipHost::new(registry_with_tool("Echo", Arc::clone(&calls), None));
         let runtime = WipRuntime::new(host, SecurityContext::new("worker-a"), 0).unwrap();
-        runtime.discover("/".into(), 2, false).await.unwrap();
-        runtime
-            .inspect("yoi.tool/Echo/v1".into(), false)
-            .await
-            .unwrap();
+        runtime.tree("/".into(), 2, false).await.unwrap();
+        runtime.inspect("/tools/Echo".into(), false).await.unwrap();
 
         let projection = runtime.host.projection("/tools/Echo").unwrap();
         let mut request = CallOperationRequest {
@@ -5312,6 +5103,7 @@ mod tests {
                 validator: Some(vec![0]),
             },
             interface: wip_protocol::InterfaceTarget {
+                scope_ref: None,
                 reference: projection.interface.clone(),
                 validator: projection.interface_validator.clone(),
             },
@@ -5436,7 +5228,7 @@ mod tests {
                 object: Object {
                     name: item_reference.into(),
                     description: None,
-                    interfaces: vec!["test.dynamic/v1".into()],
+                    interfaces: vec![root_reference("test.dynamic/v1")],
                     r#ref: Some(format!("objective:{item_reference}")),
                     validator: Some(vec![self.revision.load(Ordering::SeqCst) as u8]),
                 },
@@ -5479,8 +5271,9 @@ mod tests {
         collection.capability = "objective:collection".into();
         collection.kind = WipProjectionKind::Native;
         collection.object.name = "objectives".into();
-        collection.object.interfaces = vec!["test.dynamic.collection/v1".into()];
-        collection.interface = "test.dynamic.collection/v1".into();
+        collection.object.interfaces =
+            vec![crate::wip::root_reference("test.dynamic.collection/v1")];
+        collection.interface = crate::wip::root_reference("test.dynamic.collection/v1");
         collection.handler = Arc::new(DynamicHandler {
             calls: Arc::clone(&calls),
         });
@@ -5491,7 +5284,7 @@ mod tests {
             .mount_dynamic(WipDynamicMount {
                 collection_route,
                 capability: "objective:item".into(),
-                interface: "test.dynamic/v1".into(),
+                interface: root_reference("test.dynamic/v1"),
                 descriptor,
                 interface_validator,
                 resolver: Arc::new(DynamicResolver { revision, calls }),
@@ -5519,6 +5312,7 @@ mod tests {
                         validator: initial.object.validator,
                     },
                     interface: wip_protocol::InterfaceTarget {
+                        scope_ref: None,
                         reference: initial.interface,
                         validator: initial.interface_validator,
                     },
@@ -5571,7 +5365,7 @@ mod tests {
         let contribution = |descriptor| WipDynamicOperationContribution {
             collection_route: "/objectives".into(),
             contributor: "management".into(),
-            interface: "test.dynamic/v1".into(),
+            interface: root_reference("test.dynamic/v1"),
             descriptor,
             resolver: Arc::new(DynamicContributionResolver {
                 calls: Arc::clone(&calls),
@@ -5623,7 +5417,7 @@ mod tests {
             .contribute_dynamic_operations(WipDynamicOperationContribution {
                 collection_route: "/objectives".into(),
                 contributor: "objective-management".into(),
-                interface: "test.dynamic/v1".into(),
+                interface: root_reference("test.dynamic/v1"),
                 descriptor,
                 resolver: Arc::new(DynamicContributionResolver {
                     calls: Arc::clone(&contribution_calls),
@@ -5649,6 +5443,7 @@ mod tests {
                     validator: projection.object.validator,
                 },
                 interface: wip_protocol::InterfaceTarget {
+                    scope_ref: None,
                     reference: projection.interface,
                     validator: projection.interface_validator,
                 },
@@ -5742,21 +5537,18 @@ mod tests {
         )
         .unwrap();
 
-        let discovered = authoring.discover("/".into(), 3, false).await.unwrap();
+        let discovered = authoring.tree("/".into(), 3, false).await.unwrap();
         let discovered = discovered.content.unwrap();
         assert!(discovered.contains("/tickets"));
         assert!(!discovered.contains("/features"));
         assert!(!discovered.contains("/tools/QueryTicket"));
         assert!(!discovered.contains("/tools/TicketCreate"));
-        authoring
-            .inspect("yoi.ticket/collection/v1".into(), false)
-            .await
-            .unwrap();
+        authoring.inspect("/tickets".into(), false).await.unwrap();
         let collection = "/tickets";
         authoring
             .call(
                 collection.into(),
-                "yoi.ticket/collection/v1".into(),
+                crate::wip::root_reference("yoi.ticket/collection/v1"),
                 "query".into(),
                 json!({}),
                 ToolExecutionContext::direct(),
@@ -5766,7 +5558,7 @@ mod tests {
         let created = authoring
             .call(
                 collection.into(),
-                "yoi.ticket/collection/v1".into(),
+                crate::wip::root_reference("yoi.ticket/collection/v1"),
                 "create".into(),
                 json!({"title": "New ticket"}),
                 ToolExecutionContext::direct(),
@@ -5775,15 +5567,12 @@ mod tests {
             .unwrap();
         assert!(created.content.unwrap().contains("/tickets/T-9"));
         let item = "/tickets/T-9";
-        authoring.discover(item.into(), 0, false).await.unwrap();
-        authoring
-            .inspect("yoi.ticket/item/v1".into(), false)
-            .await
-            .unwrap();
+        authoring.tree(item.into(), 0, false).await.unwrap();
+        authoring.inspect(item.into(), false).await.unwrap();
         authoring
             .call(
                 item.into(),
-                "yoi.ticket/item/v1".into(),
+                crate::wip::root_reference("yoi.ticket/item/v1"),
                 "comment".into(),
                 json!({"body": "Native comment"}),
                 ToolExecutionContext::direct(),
@@ -5849,15 +5638,12 @@ mod tests {
             workflow_registry,
         )
         .unwrap();
-        workflow.discover(item.into(), 0, false).await.unwrap();
-        workflow
-            .inspect("yoi.ticket/item/v1".into(), false)
-            .await
-            .unwrap();
+        workflow.tree(item.into(), 0, false).await.unwrap();
+        workflow.inspect(item.into(), false).await.unwrap();
         let result = workflow
             .call(
                 item.into(),
-                "yoi.ticket/item/v1".into(),
+                crate::wip::root_reference("yoi.ticket/item/v1"),
                 "record_relation".into(),
                 json!({"kind": "depends_on", "target": "T-10"}),
                 ToolExecutionContext::direct(),
@@ -5951,20 +5737,20 @@ mod tests {
             coder_registry,
         )
         .unwrap();
-        let discovered = coder.discover("/".into(), 3, false).await.unwrap();
+        let discovered = coder.tree("/".into(), 3, false).await.unwrap();
         let discovered = discovered.content.unwrap();
         assert!(discovered.contains("/merge-requests"));
         assert!(!discovered.contains("/tools/OpenMergeRequest"));
         assert!(!discovered.contains("/tools/ShowMergeRequest"));
         coder
-            .inspect("yoi.merge-request/collection/v1".into(), false)
+            .inspect("/merge-requests".into(), false)
             .await
             .unwrap();
         let collection = "/merge-requests";
         let opened = coder
             .call(
                 collection.into(),
-                "yoi.merge-request/collection/v1".into(),
+                crate::wip::root_reference("yoi.merge-request/collection/v1"),
                 "open".into(),
                 json!({
                     "ticket": "T-685",
@@ -5983,15 +5769,12 @@ mod tests {
                 .contains(&format!("{collection}/MR-1"))
         );
         let item = format!("{collection}/MR-1");
-        coder.discover(item.clone(), 0, false).await.unwrap();
-        coder
-            .inspect("yoi.merge-request/item/v1".into(), false)
-            .await
-            .unwrap();
+        coder.tree(item.clone(), 0, false).await.unwrap();
+        coder.inspect(item.clone(), false).await.unwrap();
         coder
             .call(
                 item.clone(),
-                "yoi.merge-request/item/v1".into(),
+                crate::wip::root_reference("yoi.merge-request/item/v1"),
                 "read".into(),
                 json!({"after": 7, "limit": 25}),
                 ToolExecutionContext::direct(),
@@ -6073,15 +5856,12 @@ mod tests {
             reviewer_registry,
         )
         .unwrap();
-        reviewer.discover(item.clone(), 0, false).await.unwrap();
-        reviewer
-            .inspect("yoi.merge-request/item/v1".into(), false)
-            .await
-            .unwrap();
+        reviewer.tree(item.clone(), 0, false).await.unwrap();
+        reviewer.inspect(item.clone(), false).await.unwrap();
         reviewer
             .call(
                 item.clone(),
-                "yoi.merge-request/item/v1".into(),
+                crate::wip::root_reference("yoi.merge-request/item/v1"),
                 "review".into(),
                 json!({"decision": "approve", "body": "approved", "findings": []}),
                 ToolExecutionContext::direct(),
@@ -6151,25 +5931,23 @@ mod tests {
             orchestrator_registry,
         )
         .unwrap();
-        orchestrator.discover(item.clone(), 0, false).await.unwrap();
-        orchestrator
-            .inspect("yoi.merge-request/item/v1".into(), false)
-            .await
-            .unwrap();
+        orchestrator.tree(item.clone(), 0, false).await.unwrap();
+        orchestrator.inspect(item.clone(), false).await.unwrap();
         orchestrator
             .call(
                 item.clone(),
-                "yoi.merge-request/item/v1".into(),
+                crate::wip::root_reference("yoi.merge-request/item/v1"),
                 "check_readiness".into(),
                 json!({}),
                 ToolExecutionContext::direct(),
             )
             .await
             .unwrap();
+        orchestrator.tree(item.clone(), 0, true).await.unwrap();
         orchestrator
             .call(
                 item.clone(),
-                "yoi.merge-request/item/v1".into(),
+                crate::wip::root_reference("yoi.merge-request/item/v1"),
                 "complete".into(),
                 json!({
                     "operation_id": "merge-op-1",
@@ -6184,17 +5962,17 @@ mod tests {
             .await
             .unwrap();
         orchestrator
-            .discover(collection.into(), 0, false)
+            .tree(collection.into(), 0, false)
             .await
             .unwrap();
         orchestrator
-            .inspect("yoi.merge-request/collection/v1".into(), false)
+            .inspect("/merge-requests".into(), false)
             .await
             .unwrap();
         let rejected = orchestrator
             .call(
                 collection.into(),
-                "yoi.merge-request/collection/v1".into(),
+                crate::wip::root_reference("yoi.merge-request/collection/v1"),
                 "complete_ticket".into(),
                 json!({}),
                 ToolExecutionContext::direct(),
@@ -6289,19 +6067,16 @@ mod tests {
             install_wip_mode_with_mounts(&mut engine, permissions, "worker-a".into(), registry)
                 .unwrap();
 
-        let discovered = runtime.discover("/".into(), 3, false).await.unwrap();
+        let discovered = runtime.tree("/".into(), 3, false).await.unwrap();
         let discovered = discovered.content.unwrap();
         assert!(discovered.contains("/objectives"));
         assert!(!discovered.contains("/tools/QueryObjective"));
-        runtime
-            .inspect("yoi.objective/collection/v1".into(), false)
-            .await
-            .unwrap();
+        runtime.inspect("/objectives".into(), false).await.unwrap();
         let collection_path = "/objectives";
         runtime
             .call(
                 collection_path.into(),
-                "yoi.objective/collection/v1".into(),
+                crate::wip::root_reference("yoi.objective/collection/v1"),
                 "query".into(),
                 json!({}),
                 ToolExecutionContext::direct(),
@@ -6311,7 +6086,7 @@ mod tests {
         let denied = runtime
             .call(
                 collection_path.into(),
-                "yoi.objective/collection/v1".into(),
+                crate::wip::root_reference("yoi.objective/collection/v1"),
                 "create".into(),
                 json!({"title": "Denied"}),
                 ToolExecutionContext::direct(),
@@ -6323,7 +6098,7 @@ mod tests {
         let created = runtime
             .call(
                 collection_path.into(),
-                "yoi.objective/collection/v1".into(),
+                crate::wip::root_reference("yoi.objective/collection/v1"),
                 "create".into(),
                 json!({"title": "Objective"}),
                 ToolExecutionContext::direct(),
@@ -6333,11 +6108,8 @@ mod tests {
         assert!(created.content.unwrap().contains("/objectives/O-3"));
 
         let item_path = "/objectives/O-3";
-        runtime.discover(item_path.into(), 0, false).await.unwrap();
-        runtime
-            .inspect("yoi.objective/item/v1".into(), false)
-            .await
-            .unwrap();
+        runtime.tree(item_path.into(), 0, false).await.unwrap();
+        runtime.inspect(item_path.into(), false).await.unwrap();
         for (operation, arguments) in [
             ("read", json!({})),
             ("edit", json!({"title": "Changed"})),
@@ -6345,10 +6117,11 @@ mod tests {
             ("link_ticket", json!({"ticket_id": "T-7"})),
             ("unlink_ticket", json!({"ticket_id": "T-7"})),
         ] {
+            runtime.tree(item_path.into(), 0, true).await.unwrap();
             runtime
                 .call(
                     item_path.into(),
-                    "yoi.objective/item/v1".into(),
+                    crate::wip::root_reference("yoi.objective/item/v1"),
                     operation.into(),
                     arguments,
                     ToolExecutionContext::direct(),
@@ -6395,9 +6168,9 @@ mod tests {
             .unwrap();
         let runtime =
             WipRuntime::new(WipHost::new(registry), SecurityContext::new("worker-a"), 0).unwrap();
-        runtime.discover("/".into(), 2, false).await.unwrap();
+        runtime.tree("/".into(), 2, false).await.unwrap();
         runtime
-            .inspect(format!("yoi.tool/{name}/v1"), false)
+            .inspect(format!("/tools/{name}"), false)
             .await
             .unwrap();
         runtime
@@ -6515,7 +6288,7 @@ mod tests {
             let mut collection = projection.clone();
             collection.route = "/assets".into();
             collection.object.name = "assets".into();
-            collection.interface = "test.asset/collection/v1".into();
+            collection.interface = crate::wip::root_reference("test.asset/collection/v1");
             collection.object.interfaces = vec![collection.interface.clone()];
             registry.mount(collection).unwrap();
             registry
@@ -6548,7 +6321,7 @@ mod tests {
                 .contribute_operations(WipOperationContribution {
                     route: "/assets/A-1".into(),
                     contributor: "management".into(),
-                    interface: "test.asset/item/v1".into(),
+                    interface: root_reference("test.asset/item/v1"),
                     descriptor,
                     handler: PendingCancellationResolver {
                         started: Arc::clone(&started),
@@ -6560,18 +6333,12 @@ mod tests {
         }
         let runtime =
             WipRuntime::new(WipHost::new(registry), SecurityContext::new("worker-a"), 0).unwrap();
-        runtime
-            .discover("/assets/A-1".into(), 0, false)
-            .await
-            .unwrap();
-        runtime
-            .inspect("test.asset/item/v1".into(), false)
-            .await
-            .unwrap();
+        runtime.tree("/assets/A-1".into(), 0, false).await.unwrap();
+        runtime.inspect("/assets/A-1".into(), false).await.unwrap();
         let execution = ToolExecutionContext::direct();
         let call = runtime.call(
             "/assets/A-1".into(),
-            "test.asset/item/v1".into(),
+            crate::wip::root_reference("test.asset/item/v1"),
             "write".into(),
             json!({}),
             execution.clone(),
@@ -6616,9 +6383,9 @@ mod tests {
         let error = cancelled
             .call(
                 "/tools/Cancelled".into(),
-                "yoi.tool/Cancelled/v1".into(),
+                crate::wip::root_reference("yoi.tool/Cancelled/v1"),
                 "call".into(),
-                json!({"message": "ok"}),
+                json!({"input":{"message": "ok"}}),
                 ToolExecutionContext::direct(),
             )
             .await
@@ -6634,9 +6401,9 @@ mod tests {
         let error = unknown
             .call(
                 "/tools/Unknown".into(),
-                "yoi.tool/Unknown/v1".into(),
+                crate::wip::root_reference("yoi.tool/Unknown/v1"),
                 "call".into(),
-                json!({"message": "ok"}),
+                json!({"input":{"message": "ok"}}),
                 ToolExecutionContext::direct(),
             )
             .await
@@ -6647,7 +6414,7 @@ mod tests {
             WipAuditOutcome::OutcomeUnknown
         );
         unknown
-            .discover("/tools/Unknown".into(), 0, true)
+            .tree("/tools/Unknown".into(), 0, true)
             .await
             .unwrap();
 
@@ -6659,7 +6426,7 @@ mod tests {
                 .prepare_call(
                     &session,
                     "/tools/Unknown",
-                    "yoi.tool/Unknown/v1",
+                    &root_reference("yoi.tool/Unknown/v1"),
                     "call",
                     BTreeMap::from([(
                         "input".into(),
@@ -6705,17 +6472,14 @@ mod tests {
             Some(permissions),
         ));
         let runtime = WipRuntime::new(host, SecurityContext::new("worker-a"), 0).unwrap();
-        runtime.discover("/".into(), 2, false).await.unwrap();
-        runtime
-            .inspect("yoi.tool/Echo/v1".into(), false)
-            .await
-            .unwrap();
+        runtime.tree("/".into(), 2, false).await.unwrap();
+        runtime.inspect("/tools/Echo".into(), false).await.unwrap();
         let error = runtime
             .call(
                 "/tools/Echo".into(),
-                "yoi.tool/Echo/v1".into(),
+                crate::wip::root_reference("yoi.tool/Echo/v1"),
                 "call".into(),
-                json!({"message": "ok"}),
+                json!({"input":{"message": "ok"}}),
                 ToolExecutionContext::direct(),
             )
             .await

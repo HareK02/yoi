@@ -181,9 +181,9 @@ truncation under the existing search contract.
 
 ## Typical sequence
 
-1. Discover `/checkouts` with depth 1; inspect its Interface and call `list`.
-2. Discover an entrance or known deep directory, inspect it, call `glob`/`grep`.
-3. Follow a returned file `path`, discover/inspect, call line `read`.
+1. Use Tree on `/checkouts` with depth 1; Inspect `/checkouts` directly and Invoke `list`.
+2. Inspect an entrance or a known deep directory directly; Invoke `glob`/`grep`.
+3. Follow a returned file `path`, Inspect that path and Invoke line `read`.
 4. Call `edit` or `write`; Client-managed validators protect the exact observed
    object while the shared tracker enforces the prior Read.
 5. Rediscover after external changes; a stale rejection is not permission to skip

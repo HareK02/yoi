@@ -320,8 +320,8 @@ fn native_runtime(remote: Arc<RemoteWorkdirSession>) -> (WipRuntime, Arc<Workdir
     (runtime, router)
 }
 
-async fn observe_interface(runtime: &WipRuntime, path: &str) -> String {
-    runtime.discover(path.into(), 0, true).await.unwrap();
+async fn observe_interface(runtime: &WipRuntime, path: &str) -> wip_protocol::InterfaceReference {
+    runtime.tree(path.into(), 0, true).await.unwrap();
     // Select from the real Client's Known Space, not a direct handler invocation.
     let interface = {
         let state = runtime.state.lock().unwrap();
@@ -337,7 +337,7 @@ async fn observe_interface(runtime: &WipRuntime, path: &str) -> String {
             .interfaces[0]
             .clone()
     };
-    runtime.inspect(interface.clone(), true).await.unwrap();
+    runtime.inspect(path.into(), true).await.unwrap();
     interface
 }
 

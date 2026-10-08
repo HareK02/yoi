@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor/wip-rs/wip-client", "vendor/wip-rs/wip-http", "vendor/wip-rs/wip-protocol", "vendor/wip-rs/wip-text-view"]
 resolver = "2"
 members = [
     "crates/client",
@@ -161,8 +162,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2.5"
 uuid = "1.23"
-wip-client = "0.1.0"
-wip-http = "0.1.0"
-wip-protocol = "0.1.0"
+# Structured scope/lifetime contract and canonical Text View (Unreleased upstream).
+wip-client = { path = "vendor/wip-rs/wip-client", version = "=0.1.0" }
+wip-http = { path = "vendor/wip-rs/wip-http", version = "=0.1.0" }
+wip-protocol = { path = "vendor/wip-rs/wip-protocol", version = "=0.1.0" }
+wip-text-view = { path = "vendor/wip-rs/wip-text-view", version = "=0.1.0" }
 zeroize = "1"
 webauthn-rs = { version = "0.5.2", features = ["danger-allow-state-serialisation", "danger-credential-internals"] }
+
+[workspace.metadata.wip-upstream]
+repository = "ssh://git@gitea.hareworks.net/Hare/wip-rs.git"
+revision = "1cbe03b49e48dd7e0be28b76fbc3c932f8920a36"
+reference-revision = "6086f3c5ef10aa1464ce9c824750d7f667217bfd"
+source = "vendor/wip-rs"

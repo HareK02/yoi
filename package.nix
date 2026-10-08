@@ -43,7 +43,8 @@ rustPlatform.buildRustPackage rec {
     filter = sourceFilter;
   };
 
-  cargoHash = "sha256-LjswbsalQA0Yny0DIBJg3FiqwdmTADZ1CnqNJ9oo9Kw=";
+  # WIP SDK source is pinned in vendor/wip-rs; this hash covers registry deps only.
+  cargoHash = "sha256-bKRHNyEHqI/xW8J7s5PgQgxerKaUVG0dRs0sHWKutmc=";
 
   depsExtraArgs = {
     # Older fetchCargoVendor utilities used crates.io's API download endpoint,

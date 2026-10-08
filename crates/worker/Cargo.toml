@@ -54,6 +54,7 @@ base64 = { workspace = true }
 wip-client = { workspace = true }
 wip-http = { workspace = true }
 wip-protocol = { workspace = true }
+wip-text-view = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
