@@ -98,7 +98,9 @@ pub struct FeatureConfigPartial {
     #[serde(default)]
     pub workdir_catalog: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
-    pub workspace_config: Option<WorkspaceConfigFeatureConfigPartial>,
+    pub workspace_config: Option<ActivationFeatureConfigPartial>,
+    #[serde(default)]
+    pub drive: Option<ActivationFeatureConfigPartial>,
     #[serde(default)]
     pub ticket: Option<TicketFeatureConfigPartial>,
     #[serde(default)]
@@ -149,7 +151,12 @@ impl FeatureConfigPartial {
             workspace_config: merge_option(
                 self.workspace_config,
                 other.workspace_config,
-                WorkspaceConfigFeatureConfigPartial::merge,
+                ActivationFeatureConfigPartial::merge,
+            ),
+            drive: merge_option(
+                self.drive,
+                other.drive,
+                ActivationFeatureConfigPartial::merge,
             ),
             ticket: merge_option(self.ticket, other.ticket, TicketFeatureConfigPartial::merge),
             merge_request: merge_option(
@@ -183,12 +190,12 @@ impl FeatureFlagConfigPartial {
 /// Activation only: no Workspace/grant/source/permission fields are accepted.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkspaceConfigFeatureConfigPartial {
+pub struct ActivationFeatureConfigPartial {
     #[serde(default)]
     pub enabled: Option<bool>,
 }
 
-impl WorkspaceConfigFeatureConfigPartial {
+impl ActivationFeatureConfigPartial {
     fn merge(self, other: Self) -> Self {
         Self {
             enabled: other.enabled.or(self.enabled),
@@ -196,15 +203,15 @@ impl WorkspaceConfigFeatureConfigPartial {
     }
 }
 
-impl From<WorkspaceConfigFeatureConfigPartial> for FeatureFlagConfig {
-    fn from(value: WorkspaceConfigFeatureConfigPartial) -> Self {
+impl From<ActivationFeatureConfigPartial> for FeatureFlagConfig {
+    fn from(value: ActivationFeatureConfigPartial) -> Self {
         Self {
             enabled: value.enabled.unwrap_or_default(),
         }
     }
 }
 
-impl From<FeatureFlagConfig> for WorkspaceConfigFeatureConfigPartial {
+impl From<FeatureFlagConfig> for ActivationFeatureConfigPartial {
     fn from(value: FeatureFlagConfig) -> Self {
         Self {
             enabled: Some(value.enabled),
@@ -448,6 +455,7 @@ impl From<FeatureConfigPartial> for FeatureConfig {
                 .workspace_config
                 .map(FeatureFlagConfig::from)
                 .unwrap_or_default(),
+            drive: value.drive.map(FeatureFlagConfig::from).unwrap_or_default(),
             ticket: value
                 .ticket
                 .map(TicketFeatureConfig::from)
@@ -643,6 +651,7 @@ impl From<FeatureConfig> for FeatureConfigPartial {
             manage_workdir: Some(value.manage_workdir.into()),
             workdir_catalog: Some(value.workdir_catalog.into()),
             workspace_config: Some(value.workspace_config.into()),
+            drive: Some(value.drive.into()),
             ticket: Some(value.ticket.into()),
             merge_request: Some(value.merge_request.into()),
             orchestration: Some(value.orchestration.into()),
@@ -2309,6 +2318,93 @@ worker_max_turns = 7
         assert!(!manifest.feature.workspace_config.enabled);
         assert!(!manifest.feature.ticket.enabled);
         assert!(!manifest.feature.merge_request.any());
+    }
+
+    #[test]
+    fn drive_defaults_disabled_in_partial_resolved_and_missing_snapshot_fields() {
+        for source in ["", "[feature]\n", "[feature.drive]\n"] {
+            let partial = WorkerManifestConfig::from_toml(source).unwrap();
+            let manifest: WorkerManifest = minimal_valid().merge(partial).try_into().unwrap();
+            assert!(!manifest.feature.drive.enabled, "{source}");
+        }
+        for source in ["{}", r#"{"drive": {}}"#] {
+            let feature: FeatureConfig = serde_json::from_str(source).unwrap();
+            assert!(!feature.drive.enabled);
+        }
+        let manifest: WorkerManifest = minimal_valid().try_into().unwrap();
+        let mut snapshot = crate::write_persisted_worker_manifest_snapshot(&manifest).unwrap();
+        snapshot["manifest"]["feature"]
+            .as_object_mut()
+            .unwrap()
+            .remove("drive");
+        let restored = crate::read_persisted_worker_manifest_snapshot(snapshot).unwrap();
+        assert!(!restored.feature.drive.enabled);
+    }
+
+    #[test]
+    fn drive_activation_merges_and_roundtrips_config_and_snapshots() {
+        for enabled in [false, true] {
+            let lower =
+                WorkerManifestConfig::from_toml(&format!("[feature.drive]\nenabled = {enabled}\n"))
+                    .unwrap();
+            let empty = WorkerManifestConfig::from_toml("[feature.drive]\n").unwrap();
+            let manifest: WorkerManifest = minimal_valid()
+                .merge(lower.clone())
+                .merge(empty)
+                .try_into()
+                .unwrap();
+            assert_eq!(manifest.feature.drive.enabled, enabled);
+            assert!(!manifest.feature.workspace_config.enabled);
+            assert!(!manifest.feature.manage_workdir.enabled);
+            let partial = FeatureConfigPartial::from(manifest.feature.clone());
+            assert_eq!(partial.drive.as_ref().unwrap().enabled, Some(enabled));
+            let restored: FeatureConfigPartial =
+                toml::from_str(&toml::to_string(&partial).unwrap()).unwrap();
+            assert_eq!(FeatureConfig::from(restored), manifest.feature);
+            let json = serde_json::to_value(&manifest.feature).unwrap();
+            assert_eq!(json["drive"], serde_json::json!({"enabled": enabled}));
+            assert_eq!(
+                serde_json::from_value::<FeatureConfig>(json).unwrap(),
+                manifest.feature
+            );
+            let snapshot = crate::write_persisted_worker_manifest_snapshot(&manifest).unwrap();
+            let restored = crate::read_persisted_worker_manifest_snapshot(snapshot).unwrap();
+            assert_eq!(restored.feature.drive.enabled, enabled);
+            let upper = WorkerManifestConfig::from_toml(&format!(
+                "[feature.drive]\nenabled = {}\n",
+                !enabled
+            ))
+            .unwrap();
+            let overridden: WorkerManifest = minimal_valid()
+                .merge(lower)
+                .merge(upper)
+                .try_into()
+                .unwrap();
+            assert_eq!(overridden.feature.drive.enabled, !enabled);
+        }
+    }
+
+    #[test]
+    fn drive_activation_rejects_authority_and_unknown_fields() {
+        for (field, value) in [
+            ("workspace_id", "\"workspace-1\""),
+            ("grant_id", "\"grant-1\""),
+            ("access", "\"read_write\""),
+            ("host_path", "\"/host/drive\""),
+            ("source", "\"drive\""),
+            ("writable", "true"),
+            ("enabeld", "true"),
+        ] {
+            let source = format!("[feature.drive]\nenabled = true\n{field} = {value}\n");
+            assert!(WorkerManifestConfig::from_toml(&source).is_err(), "{field}");
+            assert!(
+                toml::from_str::<FeatureConfig>(&format!(
+                    "[drive]\nenabled = true\n{field} = {value}\n"
+                ))
+                .is_err(),
+                "{field}"
+            );
+        }
     }
 
     #[test]

@@ -2,6 +2,7 @@ import "./default.dcdl" // {
     slug = "standalone";
     description = "Standalone Yoi coding profile.";
     model = { ref = "codex-oauth/gpt-6.1-sol"; };
+    feature = { drive = { enabled = false; }; };
     scope = {
         intent = "workspace_write";
         symlink_policy = "logical";

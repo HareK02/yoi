@@ -6766,6 +6766,7 @@ dependencies = [
  "uuid",
  "webauthn-authenticator-rs",
  "webauthn-rs",
+ "wip-protocol",
  "workdir",
  "worker",
  "worker-runtime",

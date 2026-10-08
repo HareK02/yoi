@@ -1280,6 +1280,34 @@ mod tests {
     }
 
     #[test]
+    fn builtin_drive_activation_is_workspace_role_specific_and_excludes_jobs() {
+        // Production DCDL imports are the policy boundary: changing the shared
+        // base must not accidentally activate Drive in a read-only Job/Reviewer.
+        let tmp = TempDir::new().unwrap();
+        let registry = ProfileDiscovery::with_sources(None, None)
+            .discover()
+            .unwrap();
+        for entry in registry.entries() {
+            let resolved = ProfileResolver::new()
+                .with_workspace_base(tmp.path())
+                .resolve(
+                    &ProfileSelector::source_named(ProfileRegistrySource::Builtin, &entry.name),
+                    ProfileResolveOptions::with_worker_name("drive-profile-worker"),
+                )
+                .unwrap();
+            let expected = matches!(
+                entry.name.as_str(),
+                "default" | "ticket-worker" | "coder" | "companion" | "intake" | "orchestrator"
+            );
+            assert_eq!(
+                resolved.manifest.feature.drive.enabled, expected,
+                "{}",
+                entry.name
+            );
+        }
+    }
+
+    #[test]
     fn ticket_worker_profile_enables_work_reporting_without_authoring_or_integration() {
         let tmp = TempDir::new().unwrap();
         let registry = ProfileDiscovery::with_sources(None, None)

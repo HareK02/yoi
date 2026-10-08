@@ -5,6 +5,7 @@ import "./base.dcdl" // {
     engine = { instruction = "role.orchestrator"; };
 
     feature = {
+        drive = { enabled = true; };
         task = { enabled = true; };
         memory = { enabled = false; };
         subjektiv = { enabled = true; };
