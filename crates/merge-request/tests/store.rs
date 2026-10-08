@@ -1098,3 +1098,143 @@ fn partial_integration_retains_ticket_and_assignment_until_guarded_ticket_comple
         .unwrap();
     assert_eq!(replay, completed);
 }
+
+#[test]
+fn persisted_merged_result_requires_matching_nonrevoked_requested_approval_before_completion() {
+    for (case, expected) in [
+        (
+            "merge-missing",
+            MergeRequestEvidenceError::MergeResultMissing,
+        ),
+        (
+            "approval-missing",
+            MergeRequestEvidenceError::ApprovalMissing,
+        ),
+        ("revoked", MergeRequestEvidenceError::ApprovalRevoked),
+        (
+            "source-mismatch",
+            MergeRequestEvidenceError::ApprovalSourceMismatch,
+        ),
+        (
+            "not-approved",
+            MergeRequestEvidenceError::ApprovalNotApproved,
+        ),
+        (
+            "request-missing",
+            MergeRequestEvidenceError::ReviewRequestMissing,
+        ),
+        (
+            "request-mismatch",
+            MergeRequestEvidenceError::ReviewRequestMismatch,
+        ),
+        (
+            "approval-after-merge",
+            MergeRequestEvidenceError::ApprovalTimelineMismatch,
+        ),
+    ] {
+        let (dir, store) = fixture();
+        open(&store);
+        let review = approve(&store, "merged-source", "integration-token");
+        let merge = store
+            .complete(CompleteMergeRequest {
+                merge_request_id: "MR".into(),
+                ticket_id: "T".into(),
+                operation_id: "merge".into(),
+                approval_event_id: review.event_id.clone(),
+                current_subject_ref: "merged-source".into(),
+                target_ref_before: "before".into(),
+                target_ref_after: "after".into(),
+                strategy: MergeStrategy::FastForward,
+                resolution: ConflictResolution::None,
+                auth: auth(),
+                now: at(5),
+            })
+            .unwrap();
+        let persisted = store.get_by_id("W", "MR").unwrap();
+        assert_eq!(persisted.merged_result().unwrap(), &merge);
+        assert_eq!(persisted.integration_approval().unwrap(), &review);
+
+        let connection = Connection::open(dir.path().join("db")).unwrap();
+        match case {
+            "merge-missing" | "approval-missing" | "request-missing" => {
+                let kind = match case {
+                    "merge-missing" => "merge",
+                    "approval-missing" => "review",
+                    _ => "review_requested",
+                };
+                connection.execute(
+                    "DELETE FROM merge_request_thread_events WHERE workspace_id='W' AND merge_request_id='MR' AND kind=?1",
+                    [kind],
+                ).unwrap();
+            }
+            "revoked" => {
+                store
+                    .revoke_review(RevokeMergeRequestReview {
+                        merge_request_id: "MR".into(),
+                        ticket_id: "T".into(),
+                        review_event_id: review.event_id.clone(),
+                        reason: "invalid integration evidence".into(),
+                        auth: auth(),
+                        now: at(6),
+                    })
+                    .unwrap();
+            }
+            "approval-after-merge" => {
+                let mut altered = review.clone();
+                altered.sequence = merge.sequence + 1;
+                connection.execute(
+                    "UPDATE merge_request_thread_events SET payload_json=?1,sequence=?2 WHERE workspace_id='W' AND merge_request_id='MR' AND kind='review'",
+                    rusqlite::params![serde_json::to_string(&altered).unwrap(), altered.sequence],
+                ).unwrap();
+            }
+            _ => {
+                let mut altered = review.clone();
+                match case {
+                    "source-mismatch" => altered.subject_ref = "different-source".into(),
+                    "not-approved" => altered.decision = ReviewDecision::RequestChanges,
+                    "request-mismatch" => {
+                        altered.ticket_item_revision = "different-revision".into()
+                    }
+                    _ => unreachable!(),
+                }
+                connection.execute(
+                    "UPDATE merge_request_thread_events SET payload_json=?1 WHERE workspace_id='W' AND merge_request_id='MR' AND kind='review'",
+                    [serde_json::to_string(&altered).unwrap()],
+                ).unwrap();
+            }
+        }
+        let reloaded = store.get_by_id("W", "MR").unwrap();
+        assert_eq!(reloaded.integration_approval(), Err(expected), "{case}");
+        let rejected = store
+            .complete_ticket(CompleteTicket {
+                ticket_id: "T".into(),
+                operation_id: "complete-ticket".into(),
+                item_revision: "t".into(),
+                merge_request_ids: vec!["MR".into()],
+                requirement_approval_event_id: review.event_id.clone(),
+                auth: auth(),
+                now: at(7),
+            })
+            .unwrap_err();
+        match rejected {
+            MergeRequestError::Corrupt(message)
+                if expected == MergeRequestEvidenceError::MergeResultMissing =>
+            {
+                assert!(message.contains(expected.as_str()), "{case}: {message}");
+            }
+            MergeRequestError::NotReady(message)
+                if expected != MergeRequestEvidenceError::MergeResultMissing =>
+            {
+                assert!(message.contains(expected.as_str()), "{case}: {message}");
+            }
+            other => panic!("{case}: unexpected completion error {other}"),
+        }
+        let (state, assigned): (String, bool) = connection.query_row(
+            "SELECT workflow_state, EXISTS(SELECT 1 FROM ticket_current_worker_assignments WHERE workspace_id='W' AND ticket_id='T') FROM typed_tickets WHERE workspace_id='W' AND ticket_id='T'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(state, "inprogress", "{case}");
+        assert!(assigned, "{case}");
+    }
+}

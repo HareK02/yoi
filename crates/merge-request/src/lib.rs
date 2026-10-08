@@ -236,10 +236,244 @@ pub struct MergeRequest {
     #[serde(default)]
     pub thread: Vec<MergeRequestThreadEvent>,
 }
+/// Bounded failures from pure evaluation of persisted review and merge evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeRequestEvidenceError {
+    NotMerged,
+    MergeResultMissing,
+    ApprovalMissing,
+    ApprovalRevoked,
+    ApprovalNotApproved,
+    ApprovalSourceMismatch,
+    ApprovalTimelineMismatch,
+    ReviewRequestMissing,
+    ReviewRequestMismatch,
+    ApprovalNotEffective,
+    ItemRevisionMismatch,
+    SourceSnapshotMismatch,
+    RequirementApprovalMissing,
+}
+
+impl MergeRequestEvidenceError {
+    /// Stable machine-readable diagnostic code, separate from the human message.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NotMerged => "not_merged",
+            Self::MergeResultMissing => "merge_result_missing",
+            Self::ApprovalMissing => "approval_missing",
+            Self::ApprovalRevoked => "approval_revoked",
+            Self::ApprovalNotApproved => "approval_not_approved",
+            Self::ApprovalSourceMismatch => "approval_source_mismatch",
+            Self::ApprovalTimelineMismatch => "approval_timeline_mismatch",
+            Self::ReviewRequestMissing => "review_request_missing",
+            Self::ReviewRequestMismatch => "review_request_mismatch",
+            Self::ApprovalNotEffective => "approval_not_effective",
+            Self::ItemRevisionMismatch => "item_revision_mismatch",
+            Self::SourceSnapshotMismatch => "source_snapshot_mismatch",
+            Self::RequirementApprovalMissing => "requirement_approval_missing",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotMerged => "Merge Request has no merged result",
+            Self::MergeResultMissing => "merged Merge Request has no MergeResult",
+            Self::ApprovalMissing => "integration approval is missing",
+            Self::ApprovalRevoked => "Reviewer approval is revoked",
+            Self::ApprovalNotApproved => "Reviewer decision is not an approval",
+            Self::ApprovalSourceMismatch => "Reviewer approval does not match the exact source ref",
+            Self::ApprovalTimelineMismatch => {
+                "integration approval does not predate the merged result"
+            }
+            Self::ReviewRequestMissing => "linked ReviewRequested evidence is missing",
+            Self::ReviewRequestMismatch => {
+                "Reviewer approval does not match linked ReviewRequested evidence"
+            }
+            Self::ApprovalNotEffective => "Reviewer approval is not the effective review",
+            Self::ItemRevisionMismatch => {
+                "Reviewer approval does not attest the current Ticket revision"
+            }
+            Self::SourceSnapshotMismatch => {
+                "Reviewer approval does not attest the exact linked source set"
+            }
+            Self::RequirementApprovalMissing => {
+                "no effective Reviewer approval attests the current Ticket revision and exact linked source set"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for MergeRequestEvidenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for MergeRequestEvidenceError {}
+
 impl MergeRequest {
     pub fn effective_review(&self, subject: &str) -> Option<&ReviewEvent> {
         self.thread.iter().rev().find_map(|e|match e{MergeRequestThreadEvent::Review(v)if v.subject_ref==subject&&!self.thread.iter().any(|x|matches!(x,MergeRequestThreadEvent::ReviewRevoked(r)if r.review_event_id==v.event_id))=>Some(v),_=>None})
     }
+
+    /// Returns the recorded merged result, without resolving selectors or mutating state.
+    pub fn merged_result(&self) -> Result<&MergeEvent, MergeRequestEvidenceError> {
+        if self.state != MergeRequestState::Merged {
+            return Err(MergeRequestEvidenceError::NotMerged);
+        }
+        self.thread
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                MergeRequestThreadEvent::Merge(event) => Some(event),
+                _ => None,
+            })
+            .ok_or(MergeRequestEvidenceError::MergeResultMissing)
+    }
+
+    /// Validates the specific approval recorded by the merged result. A later
+    /// requirement review does not replace this integration evidence.
+    pub fn integration_approval(&self) -> Result<&ReviewEvent, MergeRequestEvidenceError> {
+        let merge = self.merged_result()?;
+        let review = self
+            .thread
+            .iter()
+            .find_map(|event| match event {
+                MergeRequestThreadEvent::Review(review)
+                    if review.event_id == merge.approval_event_id =>
+                {
+                    Some(review)
+                }
+                _ => None,
+            })
+            .ok_or(MergeRequestEvidenceError::ApprovalMissing)?;
+        if merge.approved_source_ref.trim().is_empty()
+            || review.subject_ref != merge.approved_source_ref
+        {
+            return Err(MergeRequestEvidenceError::ApprovalSourceMismatch);
+        }
+        if review.sequence >= merge.sequence {
+            return Err(MergeRequestEvidenceError::ApprovalTimelineMismatch);
+        }
+        self.approval_evidence(review)?;
+        Ok(review)
+    }
+
+    fn approval_evidence(&self, review: &ReviewEvent) -> Result<(), MergeRequestEvidenceError> {
+        if self.thread.iter().any(|event| {
+            matches!(event, MergeRequestThreadEvent::ReviewRevoked(revoked)
+                if revoked.review_event_id == review.event_id)
+        }) {
+            return Err(MergeRequestEvidenceError::ApprovalRevoked);
+        }
+        if review.decision != ReviewDecision::Approve {
+            return Err(MergeRequestEvidenceError::ApprovalNotApproved);
+        }
+        let requested = self
+            .thread
+            .iter()
+            .find_map(|event| match event {
+                MergeRequestThreadEvent::ReviewRequested(requested)
+                    if requested.event_id == review.request_event_id =>
+                {
+                    Some(requested)
+                }
+                _ => None,
+            })
+            .ok_or(MergeRequestEvidenceError::ReviewRequestMissing)?;
+        if requested.subject_ref != review.subject_ref
+            || requested.ticket_item_revision != review.ticket_item_revision
+            || requested.ticket_merge_request_subjects != review.ticket_merge_request_subjects
+            || requested.reviewer != review.reviewer
+            || requested.sequence >= review.sequence
+        {
+            return Err(MergeRequestEvidenceError::ReviewRequestMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Finds an effective approval of the authoritative current Ticket revision and
+/// exact linked source snapshot. Callers supply all linked requests and resolved
+/// source refs (recorded merged refs for completion); this function does not read
+/// authority, resolve selectors, require merged state, or mutate lifecycle state.
+/// An explicit event id validates that approval only; `None` discovers any valid
+/// attestation. Snapshot ordering is immaterial, but duplicate ids are rejected.
+pub fn requirement_approval<'a>(
+    requests: &'a [MergeRequest],
+    item_revision: &str,
+    subjects: &[MergeRequestReviewSubject],
+    event_id: Option<&str>,
+) -> Result<&'a ReviewEvent, MergeRequestEvidenceError> {
+    if requests.len() != subjects.len()
+        || !same_source_snapshot(subjects, subjects)
+        || requests.iter().any(|request| {
+            requests
+                .iter()
+                .filter(|other| other.merge_request_id == request.merge_request_id)
+                .count()
+                != 1
+                || !subjects
+                    .iter()
+                    .any(|subject| subject.merge_request_id == request.merge_request_id)
+        })
+    {
+        return Err(MergeRequestEvidenceError::SourceSnapshotMismatch);
+    }
+    for request in requests {
+        for event in request.thread.iter().rev() {
+            let MergeRequestThreadEvent::Review(review) = event else {
+                continue;
+            };
+            if event_id.is_some_and(|id| id != review.event_id) {
+                continue;
+            }
+            let evidence = (|| {
+                request.approval_evidence(review)?;
+                if !request
+                    .effective_review(&review.subject_ref)
+                    .is_some_and(|effective| effective.event_id == review.event_id)
+                {
+                    return Err(MergeRequestEvidenceError::ApprovalNotEffective);
+                }
+                if review.ticket_item_revision != item_revision || item_revision.trim().is_empty() {
+                    return Err(MergeRequestEvidenceError::ItemRevisionMismatch);
+                }
+                if !same_source_snapshot(&review.ticket_merge_request_subjects, subjects) {
+                    return Err(MergeRequestEvidenceError::SourceSnapshotMismatch);
+                }
+                if !subjects.iter().any(|subject| {
+                    subject.merge_request_id == request.merge_request_id
+                        && subject.subject_ref == review.subject_ref
+                }) {
+                    return Err(MergeRequestEvidenceError::ApprovalSourceMismatch);
+                }
+                Ok(review)
+            })();
+            if evidence.is_ok() || event_id.is_some() {
+                return evidence;
+            }
+        }
+    }
+    Err(MergeRequestEvidenceError::RequirementApprovalMissing)
+}
+
+fn same_source_snapshot(
+    left: &[MergeRequestReviewSubject],
+    right: &[MergeRequestReviewSubject],
+) -> bool {
+    !left.is_empty()
+        && left.len() == right.len()
+        && left.iter().all(|subject| {
+            !subject.merge_request_id.trim().is_empty()
+                && !subject.subject_ref.trim().is_empty()
+                && left
+                    .iter()
+                    .filter(|other| other.merge_request_id == subject.merge_request_id)
+                    .count()
+                    == 1
+                && right.iter().filter(|other| *other == subject).count() == 1
+        })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1201,81 +1435,30 @@ impl MergeRequestStore {
         for merge_request_id in &actual_ids {
             let request = load_mr(&transaction, &input.auth.workspace_id, merge_request_id)?
                 .ok_or(MergeRequestError::NotFound)?;
-            if request.state != MergeRequestState::Merged {
-                return Err(MergeRequestError::NotReady(format!(
-                    "Merge Request `{merge_request_id}` has no merged result"
-                )));
-            }
+            request.integration_approval().map_err(|error| {
+                let message = format!("Merge Request `{merge_request_id}`: {}", error.as_str());
+                if error == MergeRequestEvidenceError::MergeResultMissing {
+                    MergeRequestError::Corrupt(message)
+                } else {
+                    MergeRequestError::NotReady(message)
+                }
+            })?;
             let merge = request
-                .thread
-                .iter()
-                .rev()
-                .find_map(|event| match event {
-                    MergeRequestThreadEvent::Merge(event) => Some(event),
-                    _ => None,
-                })
-                .ok_or_else(|| {
-                    MergeRequestError::Corrupt(format!(
-                        "merged Merge Request `{merge_request_id}` has no MergeResult"
-                    ))
-                })?;
-            let review = request
-                .thread
-                .iter()
-                .find_map(|event| match event {
-                    MergeRequestThreadEvent::Review(review)
-                        if review.event_id == merge.approval_event_id
-                            && review.subject_ref == merge.approved_source_ref =>
-                    {
-                        Some(review)
-                    }
-                    _ => None,
-                })
-                .filter(|review| {
-                    !request.thread.iter().any(|event| {
-                        matches!(
-                            event,
-                            MergeRequestThreadEvent::ReviewRevoked(revoked)
-                                if revoked.review_event_id == review.event_id
-                        )
-                    })
-                })
-                .ok_or_else(|| {
-                    MergeRequestError::NotReady(format!(
-                        "Merge Request `{merge_request_id}` integration approval is missing or revoked"
-                    ))
-                })?;
-            if review.decision != ReviewDecision::Approve {
-                return Err(MergeRequestError::NotReady(format!(
-                    "Merge Request `{merge_request_id}` lacks an approved integration result"
-                )));
-            }
+                .merged_result()
+                .map_err(|error| MergeRequestError::Corrupt(error.as_str().into()))?;
             merged_subjects.push(MergeRequestReviewSubject {
                 merge_request_id: merge_request_id.clone(),
                 subject_ref: merge.approved_source_ref.clone(),
             });
             requests.push(request);
         }
-        let has_requirement_attestation = requests.iter().any(|request| {
-            request.thread.iter().rev().any(|event| {
-                let MergeRequestThreadEvent::Review(review) = event else {
-                    return false;
-                };
-                review.event_id == input.requirement_approval_event_id
-                    && review.decision == ReviewDecision::Approve
-                    && review.ticket_item_revision == input.item_revision
-                    && review.ticket_merge_request_subjects == merged_subjects
-                    && request
-                        .effective_review(&review.subject_ref)
-                        .is_some_and(|effective| effective.event_id == review.event_id)
-            })
-        });
-        if !has_requirement_attestation {
-            return Err(MergeRequestError::NotReady(
-                "no effective Reviewer approval attests the current Ticket revision and exact merged source set"
-                    .into(),
-            ));
-        }
+        requirement_approval(
+            &requests,
+            &input.item_revision,
+            &merged_subjects,
+            Some(&input.requirement_approval_event_id),
+        )
+        .map_err(|error| MergeRequestError::NotReady(error.as_str().into()))?;
         let updated = transaction.execute(
             "UPDATE typed_tickets
                 SET workflow_state='done',workflow_state_explicit=1,updated_at=?3
