@@ -166,7 +166,7 @@ fn review_submission_authorization_rejects_invalid_grants_before_side_effects() 
 }
 
 #[test]
-fn selectors_thread_and_completion_have_no_revision_or_commit_api() {
+fn integration_preserves_selectors_ticket_state_and_assignment_and_replays_its_merge() {
     let (d, s) = fixture();
     open(&s);
     let review = approve(&s, "opaque-source-ref", "token");
@@ -226,45 +226,14 @@ fn selectors_thread_and_completion_have_no_revision_or_commit_api() {
         })
         .unwrap();
     assert_eq!(replayed, merged);
-    let completed = s
-        .complete_ticket(CompleteTicket {
-            ticket_id: "T".into(),
-            operation_id: "ticket-op".into(),
-            item_revision: "t".into(),
-            merge_request_ids: vec!["MR".into()],
-            requirement_approval_event_id: merged.approval_event_id.clone(),
-            auth: auth(),
-            now: at(7),
-        })
-        .unwrap();
-    assert_eq!(completed.merge_request_ids, vec!["MR"]);
     let connection = Connection::open(d.path().join("db")).unwrap();
-    let (state, assignment_exists): (String, bool) = connection
-        .query_row(
-            "SELECT workflow_state, EXISTS(
-                SELECT 1 FROM ticket_current_worker_assignments
-                 WHERE workspace_id='W' AND ticket_id='T'
-             ) FROM typed_tickets WHERE workspace_id='W' AND ticket_id='T'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(state, "done");
-    assert!(assignment_exists);
-    let active: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments WHERE workspace_id='W' AND ticket_id='T')", [], |row| row.get(0)).unwrap();
-    assert!(!active);
-    let replayed_completion = s
-        .complete_ticket(CompleteTicket {
-            ticket_id: "T".into(),
-            operation_id: "ticket-op".into(),
-            item_revision: "t".into(),
-            merge_request_ids: vec!["MR".into()],
-            requirement_approval_event_id: merged.approval_event_id.clone(),
-            auth: auth(),
-            now: at(8),
-        })
-        .unwrap();
-    assert_eq!(replayed_completion, completed);
+    let (state, active): (String, bool) = connection.query_row(
+        "SELECT workflow_state, EXISTS(SELECT 1 FROM ticket_active_worker_assignments WHERE workspace_id='W' AND ticket_id='T') FROM typed_tickets WHERE workspace_id='W' AND ticket_id='T'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(state, "inprogress");
+    assert!(active);
     let json = serde_json::to_string(&mr).unwrap();
     for banned in [
         "revision_id",
@@ -866,12 +835,12 @@ fn ticket_rescope_after_integration_accepts_fresh_requirement_attestation() {
     let (dir, store) = fixture();
     open(&store);
     let integration_approval = approve(&store, "subject", "token-integration");
-    store
+    let merge = store
         .complete(CompleteMergeRequest {
             merge_request_id: "MR".into(),
             ticket_id: "T".into(),
             operation_id: "merge".into(),
-            approval_event_id: integration_approval.event_id,
+            approval_event_id: integration_approval.event_id.clone(),
             current_subject_ref: "subject".into(),
             target_ref_before: "target-before".into(),
             target_ref_after: "target-after".into(),
@@ -895,6 +864,26 @@ fn ticket_rescope_after_integration_accepts_fresh_requirement_attestation() {
         )
         .unwrap();
     drop(connection);
+
+    let snapshot = vec![MergeRequestReviewSubject {
+        merge_request_id: "MR".into(),
+        subject_ref: merge.approved_source_ref.clone(),
+    }];
+    let before_refresh = store.list_for_ticket("W", "T").unwrap();
+    assert_eq!(
+        requirement_approval(
+            &before_refresh,
+            "T:1",
+            &snapshot,
+            Some(&integration_approval.event_id),
+        ),
+        Err(MergeRequestEvidenceError::ItemRevisionMismatch)
+    );
+    assert_eq!(before_refresh[0].merged_result().unwrap(), &merge);
+    assert_eq!(
+        before_refresh[0].integration_approval().unwrap(),
+        &integration_approval
+    );
 
     store
         .register_reviewer_child_session(RegisterReviewerChildSession {
@@ -922,7 +911,7 @@ fn ticket_rescope_after_integration_accepts_fresh_requirement_attestation() {
             now: at(7),
         })
         .unwrap();
-    let requirement_approval = store
+    let requirement_review = store
         .submit_review(SubmitMergeRequestReview {
             merge_request_id: "MR".into(),
             ticket_id: "T".into(),
@@ -934,17 +923,33 @@ fn ticket_rescope_after_integration_accepts_fresh_requirement_attestation() {
             now: at(8),
         })
         .unwrap();
-    store
-        .complete_ticket(CompleteTicket {
-            ticket_id: "T".into(),
-            operation_id: "ticket-complete-post-rescope".into(),
-            item_revision: "T:1".into(),
-            merge_request_ids: vec!["MR".into()],
-            requirement_approval_event_id: requirement_approval.event_id,
-            auth: auth(),
-            now: at(9),
-        })
-        .unwrap();
+    let refreshed = store.list_for_ticket("W", "T").unwrap();
+    assert_eq!(
+        requirement_approval(
+            &refreshed,
+            "T:1",
+            &snapshot,
+            Some(&requirement_review.event_id),
+        )
+        .unwrap(),
+        &requirement_review
+    );
+    assert_eq!(
+        requirement_approval(&refreshed, "T:1", &snapshot, None).unwrap(),
+        &requirement_review
+    );
+    assert_eq!(refreshed[0].merged_result().unwrap(), &merge);
+    assert_eq!(
+        refreshed[0].integration_approval().unwrap(),
+        &integration_approval
+    );
+    let connection = Connection::open(dir.path().join("db")).unwrap();
+    let merge_payload: String = connection.query_row(
+        "SELECT payload_json FROM merge_request_thread_events WHERE workspace_id='W' AND merge_request_id='MR' AND kind='merge'",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(merge_payload, serde_json::to_string(&merge).unwrap());
 }
 
 #[test]
@@ -980,19 +985,19 @@ fn review_request_rejects_a_snapshot_that_omits_a_linked_merge_request() {
 }
 
 #[test]
-fn partial_integration_retains_ticket_and_assignment_until_guarded_ticket_completion() {
+fn partial_and_full_integration_retain_ticket_state_and_active_assignment() {
     let (dir, store) = fixture();
     open_for(&store, "MR", "R");
     open_for(&store, "MR-2", "R2");
     let first = approve_for(&store, "MR", "R", "subject-one", "token-one");
     let second = approve_for(&store, "MR-2", "R2", "subject-two", "token-two");
 
-    store
+    let first_merge = store
         .complete(CompleteMergeRequest {
             merge_request_id: "MR".into(),
             ticket_id: "T".into(),
             operation_id: "merge-one".into(),
-            approval_event_id: first.event_id,
+            approval_event_id: first.event_id.clone(),
             current_subject_ref: "subject-one".into(),
             target_ref_before: "target-one-before".into(),
             target_ref_after: "target-one-after".into(),
@@ -1002,30 +1007,33 @@ fn partial_integration_retains_ticket_and_assignment_until_guarded_ticket_comple
             now: at(5),
         })
         .unwrap();
-    let connection = Connection::open(dir.path().join("db")).unwrap();
-    let (state, assigned): (String, bool) = connection
-        .query_row(
-            "SELECT workflow_state, EXISTS(SELECT 1 FROM ticket_current_worker_assignments WHERE workspace_id='W' AND ticket_id='T') FROM typed_tickets WHERE workspace_id='W' AND ticket_id='T'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(state, "inprogress");
-    assert!(assigned);
-    assert!(matches!(
-        store.complete_ticket(CompleteTicket {
-            ticket_id: "T".into(),
-            operation_id: "ticket-complete".into(),
-            item_revision: "t".into(),
-            merge_request_ids: vec!["MR".into(), "MR-2".into()],
-            requirement_approval_event_id: second.event_id.clone(),
-            auth: auth(),
-            now: at(6),
-        }),
-        Err(MergeRequestError::NotReady(_))
-    ));
+    let partial = store.get_by_id("W", "MR-2").unwrap();
+    assert_eq!(
+        partial.integration_approval(),
+        Err(MergeRequestEvidenceError::NotMerged)
+    );
 
-    store
+    let connection = Connection::open(dir.path().join("db")).unwrap();
+    let assert_ticket_unchanged = || {
+        let (state, assigned, active, state_changes): (String, bool, bool, i64) = connection
+            .query_row(
+                "SELECT workflow_state,
+                    EXISTS(SELECT 1 FROM ticket_current_worker_assignments WHERE workspace_id='W' AND ticket_id='T'),
+                    EXISTS(SELECT 1 FROM ticket_active_worker_assignments WHERE workspace_id='W' AND ticket_id='T'),
+                    (SELECT COUNT(*) FROM typed_ticket_events WHERE workspace_id='W' AND ticket_id='T' AND kind='state_changed')
+                 FROM typed_tickets WHERE workspace_id='W' AND ticket_id='T'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "inprogress");
+        assert!(assigned);
+        assert!(active);
+        assert_eq!(state_changes, 0);
+    };
+    assert_ticket_unchanged();
+
+    let second_merge = store
         .complete(CompleteMergeRequest {
             merge_request_id: "MR-2".into(),
             ticket_id: "T".into(),
@@ -1040,69 +1048,84 @@ fn partial_integration_retains_ticket_and_assignment_until_guarded_ticket_comple
             now: at(7),
         })
         .unwrap();
-    assert!(matches!(
-        store.complete_ticket(CompleteTicket {
-            ticket_id: "T".into(),
-            operation_id: "ticket-complete".into(),
-            item_revision: "stale".into(),
-            merge_request_ids: vec!["MR".into(), "MR-2".into()],
-            requirement_approval_event_id: second.event_id.clone(),
-            auth: auth(),
-            now: at(8),
-        }),
-        Err(MergeRequestError::Conflict(_))
-    ));
-    assert!(matches!(
-        store.complete_ticket(CompleteTicket {
-            ticket_id: "T".into(),
-            operation_id: "ticket-complete-missing-attestation".into(),
-            item_revision: "t".into(),
-            merge_request_ids: vec!["MR".into(), "MR-2".into()],
-            requirement_approval_event_id: "missing-review".into(),
-            auth: auth(),
-            now: at(8),
-        }),
-        Err(MergeRequestError::NotReady(_))
-    ));
-    assert!(matches!(
-        store.complete_ticket(CompleteTicket {
-            ticket_id: "T".into(),
-            operation_id: "ticket-complete".into(),
-            item_revision: "t".into(),
-            merge_request_ids: vec!["MR".into()],
-            requirement_approval_event_id: second.event_id.clone(),
-            auth: auth(),
-            now: at(8),
-        }),
-        Err(MergeRequestError::Conflict(_))
-    ));
-    let completed = store
-        .complete_ticket(CompleteTicket {
-            ticket_id: "T".into(),
-            operation_id: "ticket-complete".into(),
-            item_revision: "t".into(),
-            merge_request_ids: vec!["MR-2".into(), "MR".into()],
-            requirement_approval_event_id: second.event_id.clone(),
-            auth: auth(),
-            now: at(9),
+    assert_ticket_unchanged();
+    let requests = store.list_for_ticket("W", "T").unwrap();
+    let snapshot = requests
+        .iter()
+        .map(|request| MergeRequestReviewSubject {
+            merge_request_id: request.merge_request_id.clone(),
+            subject_ref: request.merged_result().unwrap().approved_source_ref.clone(),
         })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        requirement_approval(&requests, "t", &snapshot, Some(&second.event_id)).unwrap(),
+        &second
+    );
+    let first_request = requests
+        .iter()
+        .find(|request| request.merge_request_id == "MR")
         .unwrap();
-    let replay = store
-        .complete_ticket(CompleteTicket {
-            ticket_id: "T".into(),
-            operation_id: "ticket-complete".into(),
-            item_revision: "t".into(),
-            merge_request_ids: vec!["MR".into(), "MR-2".into()],
-            requirement_approval_event_id: second.event_id.clone(),
-            auth: auth(),
-            now: at(10),
-        })
+    let second_request = requests
+        .iter()
+        .find(|request| request.merge_request_id == "MR-2")
         .unwrap();
-    assert_eq!(replay, completed);
+    assert_eq!(first_request.merged_result().unwrap(), &first_merge);
+    assert_eq!(second_request.merged_result().unwrap(), &second_merge);
+    assert_eq!(first_request.integration_approval().unwrap(), &first);
+    assert_eq!(second_request.integration_approval().unwrap(), &second);
 }
 
 #[test]
-fn persisted_merged_result_requires_matching_nonrevoked_requested_approval_before_completion() {
+fn historical_ticket_completion_payload_remains_readable_and_unchanged_on_migration() {
+    let (dir, _store) = fixture();
+    let connection = Connection::open(dir.path().join("db")).unwrap();
+    let payload = r#"{
+        "operation_id": "historical-operation",
+        "ticket_id": "T",
+        "item_revision": "historical-revision",
+        "merge_request_ids": ["MR-2", "MR"],
+        "requirement_approval_event_id": "historical-review",
+        "completed_by": {"runtime_id": "runtime", "worker_id": "coder"},
+        "created_at": "2026-07-26T12:00:07Z"
+    }"#;
+    connection.execute_batch(
+        "UPDATE typed_tickets SET workflow_state='done' WHERE workspace_id='W' AND ticket_id='T';
+         INSERT INTO typed_ticket_events VALUES('W','T',0,'state_changed','worker:runtime:coder','2026-07-26T12:00:07Z','inprogress','done','Ticket requirements completed','historical body');"
+    ).unwrap();
+    connection
+        .execute(
+            "INSERT INTO typed_ticket_event_attributes VALUES('W','T',0,'ticket_completion',?1)",
+            [payload],
+        )
+        .unwrap();
+
+    migrate(&connection).unwrap();
+
+    let (saved_payload, kind, from_state, to_state, heading, body, state): (String, String, String, String, String, String, String) = connection.query_row(
+        "SELECT attribute.value,event.kind,event.from_state,event.to_state,event.heading,event.body,ticket.workflow_state
+           FROM typed_ticket_event_attributes attribute
+           JOIN typed_ticket_events event USING(workspace_id,ticket_id,event_index)
+           JOIN typed_tickets ticket USING(workspace_id,ticket_id)
+          WHERE attribute.workspace_id='W' AND attribute.ticket_id='T' AND attribute.key='ticket_completion'",
+        [],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+    ).unwrap();
+    assert_eq!(saved_payload, payload);
+    assert_eq!(kind, "state_changed");
+    assert_eq!(from_state, "inprogress");
+    assert_eq!(to_state, "done");
+    assert_eq!(heading, "Ticket requirements completed");
+    assert_eq!(body, "historical body");
+    assert_eq!(state, "done");
+    let historical: TicketCompletionEvent = serde_json::from_str(&saved_payload).unwrap();
+    assert_eq!(
+        serde_json::to_value(&historical).unwrap(),
+        serde_json::from_str::<serde_json::Value>(payload).unwrap()
+    );
+}
+
+#[test]
+fn persisted_integration_evidence_rejects_missing_mismatched_revoked_or_late_approval() {
     for (case, expected) in [
         (
             "merge-missing",
@@ -1207,30 +1230,6 @@ fn persisted_merged_result_requires_matching_nonrevoked_requested_approval_befor
         }
         let reloaded = store.get_by_id("W", "MR").unwrap();
         assert_eq!(reloaded.integration_approval(), Err(expected), "{case}");
-        let rejected = store
-            .complete_ticket(CompleteTicket {
-                ticket_id: "T".into(),
-                operation_id: "complete-ticket".into(),
-                item_revision: "t".into(),
-                merge_request_ids: vec!["MR".into()],
-                requirement_approval_event_id: review.event_id.clone(),
-                auth: auth(),
-                now: at(7),
-            })
-            .unwrap_err();
-        match rejected {
-            MergeRequestError::Corrupt(message)
-                if expected == MergeRequestEvidenceError::MergeResultMissing =>
-            {
-                assert!(message.contains(expected.as_str()), "{case}: {message}");
-            }
-            MergeRequestError::NotReady(message)
-                if expected != MergeRequestEvidenceError::MergeResultMissing =>
-            {
-                assert!(message.contains(expected.as_str()), "{case}: {message}");
-            }
-            other => panic!("{case}: unexpected completion error {other}"),
-        }
         let (state, assigned): (String, bool) = connection.query_row(
             "SELECT workflow_state, EXISTS(SELECT 1 FROM ticket_current_worker_assignments WHERE workspace_id='W' AND ticket_id='T') FROM typed_tickets WHERE workspace_id='W' AND ticket_id='T'",
             [],

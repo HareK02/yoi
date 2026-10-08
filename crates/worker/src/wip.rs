@@ -6119,17 +6119,6 @@ mod tests {
                 })
                 .to_string(),
             },
-            crate::worker::WorkspaceResponse {
-                status: 200,
-                body: json!({
-                    "operation_id": "complete-ticket-1",
-                    "ticket_id": "ticket-internal",
-                    "item_revision": "ticket-rev-1",
-                    "merge_request_ids": ["MR-1"],
-                    "requirement_approval_event_id": "review-1"
-                })
-                .to_string(),
-            },
         ]));
         let orchestrator_config = MergeRequestFeatureConfig {
             readiness_check: true,
@@ -6202,51 +6191,22 @@ mod tests {
             .inspect("yoi.merge-request/collection/v1".into(), false)
             .await
             .unwrap();
-        let before_ticket_completion = orchestrator
-            .host
-            .projection(&item)
-            .unwrap()
-            .object
-            .validator;
-        orchestrator
+        let rejected = orchestrator
             .call(
                 collection.into(),
                 "yoi.merge-request/collection/v1".into(),
                 "complete_ticket".into(),
-                json!({
-                    "ticket": "T-685",
-                    "operation_id": "complete-ticket-1",
-                    "item_revision": "ticket-rev-1",
-                    "merge_request_ids": ["MR-1"],
-                    "requirement_approval_event_id": "review-1"
-                }),
-                ToolExecutionContext::direct(),
-            )
-            .await
-            .unwrap();
-        assert_ne!(
-            before_ticket_completion,
-            orchestrator
-                .host
-                .projection(&item)
-                .unwrap()
-                .object
-                .validator,
-            "Ticket completion must stale every Merge Request in its exact result set"
-        );
-        let stale = orchestrator
-            .call(
-                item,
-                "yoi.merge-request/item/v1".into(),
-                "check_readiness".into(),
                 json!({}),
                 ToolExecutionContext::direct(),
             )
             .await
-            .expect_err("affected Merge Request observation must be stale");
-        assert!(stale.to_string().contains("ValidatorMismatch"));
+            .expect_err("Ticket completion is not a Merge Request operation");
+        assert!(
+            rejected.to_string().contains("operation is not declared"),
+            "{rejected}"
+        );
         let orchestrator_requests = orchestrator_client.requests();
-        assert_eq!(orchestrator_requests.len(), 3);
+        assert_eq!(orchestrator_requests.len(), 2);
         assert_eq!(
             orchestrator_requests[0].path,
             "/api/w/workspace/merge-requests/MR-1/readiness"
@@ -6260,10 +6220,6 @@ mod tests {
         assert_eq!(completion_body["approval_event_id"], "review-1");
         assert_eq!(completion_body["target_ref_before"], "target-1");
         assert_eq!(completion_body["target_ref_after"], "result-1");
-        assert_eq!(
-            orchestrator_requests[2].path,
-            "/api/w/workspace/tickets/T-685/complete"
-        );
     }
 
     #[tokio::test]

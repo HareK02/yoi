@@ -155,14 +155,40 @@ impl BackendWorkspaceProductClient {
         })
     }
 
+    fn decision_from_state_change(
+        &self,
+        id: &TicketIdOrSlug,
+        change: &TicketStateChange,
+    ) -> Result<ticket::TicketStateUpdate, BackendWorkspaceClientError> {
+        let current = self.show_ticket(id)?;
+        let parse = |state: &str| {
+            ticket::TicketWorkflowState::parse(state).ok_or_else(|| {
+                BackendWorkspaceClientError::InvalidTarget(format!("invalid Ticket state {state}"))
+            })
+        };
+        Ok(ticket::TicketStateUpdate {
+            operation_key: uuid::Uuid::now_v7().to_string(),
+            expected_item_revision: ticket::ticket_item_revision(&current),
+            expected_state: parse(&change.from)?,
+            state: parse(&change.to)?,
+            reason: if change.body.as_str().is_empty() {
+                change.reason.clone()
+            } else {
+                format!("{}\n\n{}", change.reason, change.body.as_str())
+            },
+            references: change.references.clone(),
+            author: change.author.clone(),
+        })
+    }
+
     pub fn set_ticket_workflow_state(
         &self,
         id: &TicketIdOrSlug,
         change: &TicketStateChange,
     ) -> Result<(), BackendWorkspaceClientError> {
+        let change = self.decision_from_state_change(id, change)?;
         let workspace_id = self.workspace_id.clone();
         let id = ticket_reference(id);
-        let change = change.clone();
         self.generated(move |client| async move {
             client
                 .ticket_workflow_state_set(
@@ -179,15 +205,23 @@ impl BackendWorkspaceProductClient {
         id: &TicketIdOrSlug,
         resolution: &MarkdownText,
     ) -> Result<(), BackendWorkspaceClientError> {
+        let current = self.show_ticket(id)?;
+        let request = ticket::TicketCompletion {
+            operation_key: uuid::Uuid::now_v7().to_string(),
+            expected_item_revision: ticket::ticket_item_revision(&current),
+            expected_state: current.meta.workflow_state,
+            reason: resolution.as_str().to_string(),
+            references: Vec::new(),
+            author: None,
+        };
         let workspace_id = self.workspace_id.clone();
         let id = ticket_reference(id);
-        let resolution = resolution.clone();
         self.generated(move |client| async move {
             client
                 .ticket_close_record(
                     workspace_id,
                     id,
-                    server_api::TicketCloseRecordRequest(resolution),
+                    server_api::TicketCloseRecordRequest(request),
                 )
                 .await
         })
@@ -633,6 +667,9 @@ impl TicketBackend for BackendWorkspaceProductClient {
         id: TicketIdOrSlug,
         change: TicketStateChange,
     ) -> ticket::Result<()> {
+        let change = self
+            .decision_from_state_change(&id, &change)
+            .map_err(ticket_client_error)?;
         let workspace_id = self.workspace_id.clone();
         let id = ticket_reference(&id);
         self.generated(move |client| async move {
@@ -672,6 +709,14 @@ impl TicketBackend for BackendWorkspaceProductClient {
         field: &str,
         change: TicketStateChange,
     ) -> ticket::Result<()> {
+        if field != "state" {
+            return Err(TicketError::Conflict(
+                "unsupported Ticket state field".into(),
+            ));
+        }
+        let change = self
+            .decision_from_state_change(&id, &change)
+            .map_err(ticket_client_error)?;
         let workspace_id = self.workspace_id.clone();
         let id = ticket_reference(&id);
         let field = field.to_string();
@@ -695,6 +740,26 @@ impl TicketBackend for BackendWorkspaceProductClient {
     ) -> ticket::Result<()> {
         self.set_ticket_workflow_state(&id, &change)
             .map_err(ticket_client_error)
+    }
+
+    fn update_state(
+        &self,
+        ticket: &str,
+        request: ticket::TicketStateUpdate,
+    ) -> ticket::Result<Ticket> {
+        let workspace_id = self.workspace_id.clone();
+        let id = ticket.to_owned();
+        self.generated(move |client| async move {
+            client
+                .ticket_state_update(
+                    workspace_id,
+                    id,
+                    server_api::TicketStateUpdateRequest(request),
+                )
+                .await
+                .map(|response| response.0)
+        })
+        .map_err(ticket_client_error)
     }
 
     fn mark_ready(&self, id: TicketIdOrSlug, request: TicketMarkReady) -> ticket::Result<Ticket> {
@@ -903,8 +968,12 @@ mod tests {
     }
 
     fn response_sequence_server(
-        responses: Vec<(&'static str, &'static str)>,
+        responses: Vec<(&str, &str)>,
     ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+        let responses = responses
+            .into_iter()
+            .map(|(status, body)| (status.to_owned(), body.to_owned()))
+            .collect::<Vec<_>>();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (sender, receiver) = mpsc::channel();
@@ -925,6 +994,117 @@ mod tests {
             }
         });
         (format!("http://{address}"), receiver, handle)
+    }
+
+    #[test]
+    fn legacy_state_adapter_uses_snapshot_revision_without_overriding_stale_expected_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend =
+            ticket::SqliteTicketBackend::open(temp.path().join("fixture.db"), "workspace-a")
+                .unwrap();
+        let reference = backend.create(NewTicket::new("Adapter snapshot")).unwrap();
+        let snapshot = backend.show(reference.id.clone().into()).unwrap();
+        let body = serde_json::to_string(&snapshot).unwrap();
+        let (base_url, requests, handle) =
+            response_sequence_server(vec![("200 OK", &body), ("204 No Content", "")]);
+        let client =
+            BackendWorkspaceProductClient::new_with_access_token(base_url, "workspace-a", "token")
+                .unwrap();
+        client
+            .set_ticket_workflow_state(
+                &reference.id.clone().into(),
+                &TicketStateChange::new("ready", "done", "Judgment", "Results in the thread"),
+            )
+            .unwrap();
+        assert!(requests.recv().unwrap().starts_with("GET "));
+        let request = requests.recv().unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            body["expected_item_revision"],
+            ticket::ticket_item_revision(&snapshot)
+        );
+        assert_eq!(body["expected_state"], "ready");
+        assert_eq!(body["state"], "done");
+        assert!(!body["operation_key"].as_str().unwrap().is_empty());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn legacy_close_adapter_forwards_snapshot_cas_and_resolution_as_judgment() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend =
+            ticket::SqliteTicketBackend::open(temp.path().join("fixture.db"), "workspace-a")
+                .unwrap();
+        let reference = backend
+            .create(NewTicket::new("Close adapter snapshot"))
+            .unwrap();
+        let snapshot = backend.show(reference.id.clone().into()).unwrap();
+        let body = serde_json::to_string(&snapshot).unwrap();
+        let (base_url, requests, handle) =
+            response_sequence_server(vec![("200 OK", &body), ("204 No Content", "")]);
+        let client =
+            BackendWorkspaceProductClient::new_with_access_token(base_url, "workspace-a", "token")
+                .unwrap();
+        client
+            .close_ticket(
+                &reference.id.into(),
+                &MarkdownText::new("The request was withdrawn"),
+            )
+            .unwrap();
+        assert!(requests.recv().unwrap().starts_with("GET "));
+        let request = requests.recv().unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            body["expected_item_revision"],
+            ticket::ticket_item_revision(&snapshot)
+        );
+        assert_eq!(body["expected_state"], "planning");
+        assert_eq!(body["reason"], "The request was withdrawn");
+        assert!(!body["operation_key"].as_str().unwrap().is_empty());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn ticket_backend_completion_forwards_cas_judgment_and_backend_conflicts() {
+        let (base_url, request, handle) = one_response_server(
+            "409 Conflict",
+            r#"{"error":"ticket_conflict","message":"stale revision","diagnostics":[]}"#,
+        );
+        let client = BackendWorkspaceProductClient::new_with_access_token(
+            base_url,
+            "workspace-a",
+            "test-token",
+        )
+        .unwrap();
+        let result = TicketBackend::complete(
+            &client,
+            "T-718",
+            ticket::TicketCompletion {
+                operation_key: "research-done".into(),
+                expected_item_revision: "ticket:1".into(),
+                expected_state: ticket::TicketWorkflowState::Planning,
+                reason: "Research findings recorded".into(),
+                references: Vec::new(),
+                author: None,
+            },
+        );
+        assert!(result.is_err());
+        let request = request.recv().unwrap();
+        assert!(
+            request.starts_with("POST /api/w/workspace-a/tickets/T-718/state-update "),
+            "{request}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["state"], "done");
+        assert_eq!(body["operation_key"], "research-done");
+        assert_eq!(body["expected_item_revision"], "ticket:1");
+        assert_eq!(body["expected_state"], "planning");
+        assert_eq!(body["reason"], "Research findings recorded");
+        assert!(body.get("merge_request_ids").is_none());
+        handle.join().unwrap();
     }
 
     #[test]

@@ -176,6 +176,8 @@ struct ModelMergeRequest {
 
 #[derive(Debug, Serialize)]
 struct ModelTicketEvidence {
+    /// MR evidence is inapplicable without a linked MR, independent of Ticket decisions.
+    integration_applicable: bool,
     has_merge_request: bool,
     has_current_subject_ref: bool,
     has_review_request: bool,
@@ -535,8 +537,10 @@ fn project_merge_request(value: &Value) -> Result<ModelMergeRequest, String> {
 
 fn project_evidence(value: &Value) -> Result<ModelTicketEvidence, String> {
     let evidence = object(value, "Ticket evidence")?;
-    Ok(ModelTicketEvidence {
-        has_merge_request: bool_field(evidence, "has_merge_request")?,
+    let has_merge_request = bool_field(evidence, "has_merge_request")?;
+    let projected = ModelTicketEvidence {
+        integration_applicable: has_merge_request,
+        has_merge_request,
         has_current_subject_ref: bool_field(evidence, "has_current_subject_ref")?,
         has_review_request: bool_field(evidence, "has_review_request")?,
         has_commit: bool_field(evidence, "has_commit")?,
@@ -546,7 +550,20 @@ fn project_evidence(value: &Value) -> Result<ModelTicketEvidence, String> {
         unresolved_request_changes: bool_field(evidence, "unresolved_request_changes")?,
         complete_for_integration: bool_field(evidence, "complete_for_integration")?,
         missing: string_array(evidence, "missing")?,
-    })
+    };
+    if !has_merge_request {
+        // Empty MR sets are neither missing evidence nor vacuous approval.
+        return Ok(ModelTicketEvidence {
+            review_status: None,
+            approved_current_subject: false,
+            review_after_rescope: false,
+            unresolved_request_changes: false,
+            complete_for_integration: false,
+            missing: Vec::new(),
+            ..projected
+        });
+    }
+    Ok(projected)
 }
 
 fn project_actions(value: &Value) -> Result<ModelTicketActions, String> {
@@ -676,6 +693,38 @@ fn validate_resource_ref(value: String, prefix: &str) -> Result<String, String> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn mrless_evidence_is_inapplicable_not_missing_or_vacuously_approved() {
+        for state in [
+            "planning",
+            "ready",
+            "queued",
+            "inprogress",
+            "done",
+            "closed",
+        ] {
+            let projected = project_ticket_detail(json!({
+                "resource_key": "T-718", "item_revision": "rev-1", "title": "No Git required", "body": "Decision",
+                "state": state, "events": [{"sequence": 1, "kind": "completed", "body": "No Git needed"}],
+                "linked_objectives": [], "assignments": [], "implementation_reports": [],
+                "merge_requests": [], "merge_request": null,
+                "evidence": {
+                    "has_merge_request": false, "has_current_subject_ref": false, "has_review_request": false, "has_commit": false,
+                    "review_status": "approved", "approved_current_subject": true, "review_after_rescope": true,
+                    "unresolved_request_changes": false, "complete_for_integration": true, "missing": ["merge_request"]
+                }
+            })).unwrap();
+            let projected = serde_json::to_value(projected).unwrap();
+            assert_eq!(projected["state"], state);
+            assert_eq!(projected["thread"][0]["kind"], "completed");
+            assert_eq!(projected["evidence"]["integration_applicable"], false);
+            assert_eq!(projected["evidence"]["review_status"], Value::Null);
+            assert_eq!(projected["evidence"]["approved_current_subject"], false);
+            assert_eq!(projected["evidence"]["complete_for_integration"], false);
+            assert_eq!(projected["evidence"]["missing"], json!([]));
+        }
+    }
 
     #[test]
     fn objective_projection_exposes_only_resource_references() {

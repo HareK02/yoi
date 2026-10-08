@@ -6441,6 +6441,9 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::ticket_workflow_state_set(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::ticket_state_update(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::ticket_mark_ready_record(
             service.clone(),
         ))
@@ -10229,8 +10232,7 @@ impl server_api::ServerApi for ServerApiContractService {
         workspace_id: String,
         id: String,
         request: server_api::CompleteTicketRequest,
-    ) -> std::result::Result<server_api::TicketCompletionEvent, server_api::RepositoryApiError>
-    {
+    ) -> std::result::Result<server_api::TicketRecord, server_api::RepositoryApiError> {
         let Json(response) = scoped_complete_ticket(
             State(self.workspace_api()?.clone()),
             contract_request_headers(&context)?,
@@ -10239,7 +10241,25 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map_err(ApiError::into_repository_api_error)?;
-        Ok(response)
+        Ok(server_api::TicketRecord(response))
+    }
+
+    async fn ticket_state_update(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::TicketStateUpdateRequest,
+    ) -> std::result::Result<server_api::TicketRecord, server_api::RepositoryApiError> {
+        let Json(response) = scoped_ticket_state_update(
+            State(self.workspace_api()?.clone()),
+            contract_request_headers(&context)?,
+            AxumPath((workspace_id, id)),
+            Json(request.0),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketRecord(response))
     }
 
     async fn ticket_close_record(
@@ -10455,12 +10475,14 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn ticket_state_transition(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         id: String,
         request: server_api::BrowserTransitionTicketStateRequest,
     ) -> std::result::Result<server_api::TicketDetail, server_api::RepositoryApiError> {
         let Json(response) = scoped_transition_ticket_state(
             State(self.workspace_api()?.clone()),
+            contract_request_headers(&context)?,
             AxumPath(ScopedRecordPath { workspace_id, id }),
             Json(request),
         )
@@ -10471,6 +10493,7 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn ticket_ready(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         id: String,
         request: server_api::TicketMarkReadyRequest,
@@ -10482,6 +10505,7 @@ impl server_api::ServerApi for ServerApiContractService {
         };
         let Json(response) = scoped_mark_ticket_ready_from_browser(
             State(self.workspace_api()?.clone()),
+            contract_request_headers(&context)?,
             AxumPath(ScopedRecordPath { workspace_id, id }),
             Json(request),
         )
@@ -10508,12 +10532,14 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn ticket_queue(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         id: String,
         request: server_api::BrowserQueueTicketRequest,
     ) -> std::result::Result<server_api::TicketQueueResponse, server_api::RepositoryApiError> {
         let Json(response) = scoped_queue_ticket(
             State(self.workspace_api()?.clone()),
+            contract_request_headers(&context)?,
             AxumPath(ScopedRecordPath { workspace_id, id }),
             Json(request),
         )
@@ -10524,12 +10550,14 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn ticket_close(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         id: String,
         request: server_api::BrowserCloseTicketRequest,
     ) -> std::result::Result<server_api::TicketDetail, server_api::RepositoryApiError> {
         let Json(response) = scoped_close_ticket(
             State(self.workspace_api()?.clone()),
+            contract_request_headers(&context)?,
             AxumPath(ScopedRecordPath { workspace_id, id }),
             Json(request),
         )
@@ -13707,12 +13735,10 @@ impl ticket::TicketTargetAuthority for WorkspaceTicketTargetAuthority {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .or(repository.default_ref.as_deref())
-            .ok_or_else(|| {
-                ticket::TicketError::MissingTargetSelector(repository.repository_key.clone())
-            })?;
+            .map(str::to_owned);
         Ok(ticket::ResolvedTicketTarget {
             repository_key: repository.repository_key,
-            ref_selector: selector.to_owned(),
+            ref_selector: selector,
             access: TicketTargetAccess::ReadOnly,
         })
     }
@@ -13787,47 +13813,46 @@ async fn scoped_edit_ticket_item(
     browser_ticket_detail(&api, &path.id)
 }
 
-async fn scoped_transition_ticket_state(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRecordPath>,
-    Json(request): Json<server_api::BrowserTransitionTicketStateRequest>,
-) -> ApiResult<Json<TicketDetail>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    let state = match request.state {
+fn browser_ticket_workflow_state(
+    state: server_api::BrowserTicketWorkflowState,
+) -> TicketWorkflowState {
+    match state {
         server_api::BrowserTicketWorkflowState::Planning => TicketWorkflowState::Planning,
         server_api::BrowserTicketWorkflowState::Ready => TicketWorkflowState::Ready,
         server_api::BrowserTicketWorkflowState::Queued => TicketWorkflowState::Queued,
         server_api::BrowserTicketWorkflowState::Inprogress => TicketWorkflowState::InProgress,
         server_api::BrowserTicketWorkflowState::Done => TicketWorkflowState::Done,
         server_api::BrowserTicketWorkflowState::Closed => TicketWorkflowState::Closed,
+    }
+}
+
+async fn scoped_transition_ticket_state(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath(path): AxumPath<ScopedRecordPath>,
+    Json(request): Json<server_api::BrowserTransitionTicketStateRequest>,
+) -> ApiResult<Json<TicketDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let state = browser_ticket_workflow_state(request.state);
+    let reason = match request.body.filter(|body| !body.is_empty()) {
+        Some(body) => format!("{}\n\n{body}", request.reason),
+        None => request.reason,
     };
-    if state == TicketWorkflowState::Done {
-        return Err(Error::TicketAssignmentConflict(
-            "done is guarded by CompleteMergeRequest with an approved exact source ref and operation_id".to_string(),
-        ).into());
-    }
-    let current = api.authority.ticket(&path.id)?;
-    if state == TicketWorkflowState::InProgress
-        && current.state != TicketWorkflowState::InProgress.as_str()
-    {
-        return Err(Error::TicketAssignmentConflict(
-            "generic Ticket state mutation cannot enter inprogress; use Queue acceptance or atomic ready-state Coder assignment"
-                .to_string(),
-        )
-        .into());
-    }
-    let mut change = TicketStateChange::new(
-        current.state,
-        state.as_str(),
-        request
-            .reason
-            .unwrap_or_else(|| "state changed from Web Ticket API".to_owned()),
-        request.body.unwrap_or_default(),
-    );
-    change.author = request.author;
-    browser_ticket_backend(&api)?
-        .set_workflow_state(TicketIdOrSlug::Id(path.id.clone()), change)
-        .map_err(Error::from)?;
+    let _ = scoped_ticket_state_update(
+        State(api.clone()),
+        headers,
+        AxumPath((path.workspace_id.clone(), path.id.clone())),
+        Json(ticket::TicketStateUpdate {
+            state,
+            operation_key: request.operation_key,
+            expected_item_revision: request.expected_item_revision,
+            expected_state: browser_ticket_workflow_state(request.expected_state),
+            reason,
+            references: Vec::new(),
+            author: Some("workspace-user".into()),
+        }),
+    )
+    .await?;
     browser_ticket_detail(&api, &path.id)
 }
 
@@ -13855,26 +13880,24 @@ async fn scoped_append_ticket_event(
 
 async fn scoped_mark_ticket_ready_from_browser(
     State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
     AxumPath(path): AxumPath<ScopedRecordPath>,
     Json(request): Json<InternalTicketMarkReadyRequest>,
 ) -> ApiResult<Json<TicketDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    browser_ticket_backend(&api)?
-        .mark_ready(
-            TicketIdOrSlug::Id(path.id.clone()),
-            ticket::TicketMarkReady {
-                operation_key: request.operation_key,
-                reason: request.reason,
-                author: Some("web".to_owned()),
-                intake_summary: None,
-            },
-        )
-        .map_err(Error::from)?;
+    let _ = scoped_mark_ticket_ready(
+        State(api.clone()),
+        AxumPath((path.workspace_id.clone(), path.id.clone())),
+        headers,
+        Json(request),
+    )
+    .await?;
     browser_ticket_detail(&api, &path.id)
 }
 
 async fn scoped_queue_ticket(
     State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
     AxumPath(path): AxumPath<ScopedRecordPath>,
     Json(_request): Json<server_api::BrowserQueueTicketRequest>,
 ) -> ApiResult<Json<ticket::TicketQueueOutcome>> {
@@ -13882,7 +13905,7 @@ async fn scoped_queue_ticket(
     let result = execute_ticket_rest_operation(
         &api,
         &path.workspace_id,
-        HeaderMap::new(),
+        headers,
         TicketBackendOperation::QueueReady {
             id: TicketIdOrSlug::Id(path.id.clone()),
             queued_by: "workspace-web".to_string(),
@@ -13897,16 +13920,26 @@ async fn scoped_queue_ticket(
 
 async fn scoped_close_ticket(
     State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
     AxumPath(path): AxumPath<ScopedRecordPath>,
     Json(request): Json<server_api::BrowserCloseTicketRequest>,
 ) -> ApiResult<Json<TicketDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    browser_ticket_backend(&api)?
-        .close(
-            TicketIdOrSlug::Id(path.id.clone()),
-            MarkdownText::new(request.resolution),
-        )
-        .map_err(Error::from)?;
+    let _ = scoped_ticket_state_update(
+        State(api.clone()),
+        headers,
+        AxumPath((path.workspace_id.clone(), path.id.clone())),
+        Json(ticket::TicketStateUpdate {
+            state: TicketWorkflowState::Closed,
+            operation_key: request.operation_key,
+            expected_item_revision: request.expected_item_revision,
+            expected_state: browser_ticket_workflow_state(request.expected_state),
+            reason: request.resolution,
+            references: Vec::new(),
+            author: Some("workspace-user".into()),
+        }),
+    )
+    .await?;
     browser_ticket_detail(&api, &path.id)
 }
 
@@ -13917,28 +13950,6 @@ fn generic_ticket_state_change(operation: &TicketBackendOperation) -> Option<&Ti
         | TicketBackendOperation::AddStateChanged { change, .. } => Some(change),
         _ => None,
     }
-}
-
-fn reject_unguarded_ticket_start(operation: &TicketBackendOperation) -> Result<()> {
-    if generic_ticket_state_change(operation)
-        .is_some_and(|change| change.to == "inprogress" && change.from != "inprogress")
-    {
-        return Err(Error::TicketAssignmentConflict(
-            "inprogress is guarded by Queue acceptance or atomic ready-state Coder assignment"
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn reject_unguarded_ticket_completion(operation: &TicketBackendOperation) -> Result<()> {
-    reject_unguarded_ticket_start(operation)?;
-    if generic_ticket_state_change(operation).is_some_and(|change| change.to == "done") {
-        return Err(Error::TicketAssignmentConflict(
-            "done is guarded by CompleteMergeRequest with an approved exact source ref and operation_id".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 fn validate_ticket_target_repository_keys(
@@ -14106,9 +14117,26 @@ async fn execute_ticket_rest_operation(
     // calls carry source headers; when either header is present, the complete pair is required
     // and authenticated before source attribution is attached.
     let source = optional_worker_mutation_source(api, workspace_id, &headers)?;
-    reject_unguarded_ticket_completion(&operation)?;
     validate_ticket_repository_operation(api, &operation)?;
     let before = target.as_ref().and_then(|id| backend.show(id.clone()).ok());
+    if let Some(source) = source.as_ref()
+        && (generic_ticket_state_change(&operation).is_some()
+            || matches!(
+                operation,
+                TicketBackendOperation::Close { .. }
+                    | TicketBackendOperation::QueueReady { .. }
+                    | TicketBackendOperation::MarkReady { .. }
+            ))
+    {
+        let context = worker_ticket_source_context(api, workspace_id, source, before.as_ref());
+        let is_orchestrator =
+            find_workspace_orchestrator(api).is_some_and(|worker| worker.worker == *source);
+        if context.actor_role != "coder" && !is_orchestrator {
+            return Err(Error::WorkspacePermissionDenied(
+                "Ticket state decisions require the assigned Worker or registered Workspace Orchestrator".into(),
+            ).into());
+        }
+    }
     let mut ticket_item_check = source
         .as_ref()
         .cloned()
@@ -14125,41 +14153,11 @@ async fn execute_ticket_rest_operation(
                     .to_string(),
             )
         })?;
-        let dependency_check = backend
-            .dependency_check(TicketIdOrSlug::Id(ticket.meta.id.clone()))
-            .map_err(Error::from)?;
-        if !dependency_check.queue_guard.can_queue_for_orchestrator {
-            let reason = dependency_check
-                .queue_guard
-                .blocked_reason
-                .or(dependency_check.queue_guard.reason)
-                .unwrap_or_else(|| "Queue dependency validation failed".to_string());
-            return Err(Error::TicketAssignmentConflict(reason).into());
-        }
-        let candidates = dependency_check.queue_tickets;
         let mut assignment_ids = BTreeMap::new();
-        for ticket_id in candidates {
-            if api
-                .store
-                .get_active_ticket_role_assignment(
-                    workspace_id,
-                    &ticket_id,
-                    TicketAssignmentRole::Coder,
-                )?
-                .is_some()
-            {
-                return Err(Error::TicketAssignmentConflict(format!(
-                    "Queue rejects Ticket {ticket_id} while a Coder assignment is active"
-                ))
-                .into());
-            }
-            let assignment = active_orchestrator_assignment(api, workspace_id, &ticket_id)?
-                .ok_or_else(|| {
-                    Error::TicketAssignmentConflict(format!(
-                        "Queue requires role=orchestrator assignment for Ticket {ticket_id}"
-                    ))
-                })?;
-            assignment_ids.insert(ticket_id, assignment.assignment_id);
+        if let Some(assignment) =
+            active_orchestrator_assignment(api, workspace_id, &ticket.meta.id)?
+        {
+            assignment_ids.insert(ticket.meta.id.clone(), assignment.assignment_id);
         }
         let assignment_json = serde_json::to_string(&assignment_ids).map_err(|error| {
             Error::Config(format!("failed to encode Queue assignment fence: {error}"))
@@ -14173,11 +14171,10 @@ async fn execute_ticket_rest_operation(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
+        if !assignment_ids.is_empty() {
+            event_attributes.insert("queue_orchestrator_assignments".into(), assignment_json);
+        }
         event_attributes.extend([
-            (
-                "queue_orchestrator_assignments".to_string(),
-                assignment_json,
-            ),
             (
                 "routing_principal".to_string(),
                 "workspace-orchestrator".to_string(),
@@ -14194,6 +14191,55 @@ async fn execute_ticket_rest_operation(
     }
     if !event_attributes.is_empty() {
         backend = backend.with_event_attributes(event_attributes);
+    }
+
+    // Older transport-shaped state/close calls are adapters to the same Ticket
+    // decision boundary, never alternative completion authorities.
+    if let Some(before) = before.as_ref() {
+        let decision = match &operation {
+            TicketBackendOperation::SetWorkflowState { change, .. }
+            | TicketBackendOperation::AddStateChanged { change, .. } => Some((
+                TicketWorkflowState::parse(&change.to)
+                    .ok_or_else(|| Error::InvalidInput("invalid Ticket state".into()))?,
+                TicketWorkflowState::parse(&change.from)
+                    .ok_or_else(|| Error::InvalidInput("invalid expected Ticket state".into()))?,
+                if change.body.as_str().is_empty() {
+                    change.reason.clone()
+                } else {
+                    format!("{}\n\n{}", change.reason, change.body.as_str())
+                },
+                change.author.clone(),
+                change.references.clone(),
+            )),
+            TicketBackendOperation::Close { resolution, .. } => Some((
+                TicketWorkflowState::Closed,
+                before.meta.workflow_state,
+                resolution.as_str().to_string(),
+                source
+                    .as_ref()
+                    .map(|source| format!("worker:{}/{}", source.runtime_id, source.worker_id))
+                    .or_else(|| Some("workspace-user".into())),
+                Vec::new(),
+            )),
+            _ => None,
+        };
+        if let Some((state, expected_state, reason, author, references)) = decision {
+            backend
+                .update_state(
+                    &before.meta.id,
+                    ticket::TicketStateUpdate {
+                        operation_key: new_id("tdecision"),
+                        expected_item_revision: ticket::ticket_item_revision(before),
+                        expected_state,
+                        state,
+                        reason,
+                        author,
+                        references,
+                    },
+                )
+                .map_err(Error::from)?;
+            return Ok(TicketBackendOperationResult::Unit);
+        }
     }
 
     let (result, created_ticket) = match operation {
@@ -14387,15 +14433,6 @@ async fn scoped_create_ticket_record(
     headers: HeaderMap,
     Json(input): Json<ticket::NewTicket>,
 ) -> ApiResult<Json<ticket::TicketRef>> {
-    if input
-        .workflow_state
-        .is_some_and(|state| state != TicketWorkflowState::Planning)
-    {
-        return Err(settings_bad_request(
-            "ticket_create_state_bypass",
-            "Ticket creation must start in planning; use guarded workflow operations for later states",
-        ));
-    }
     let result = execute_ticket_rest_operation(
         &api,
         &path.workspace_id,
@@ -14474,19 +14511,16 @@ async fn scoped_add_ticket_state_change(
     State(api): State<WorkspaceApi>,
     AxumPath((workspace_id, id)): AxumPath<(String, String)>,
     headers: HeaderMap,
-    Json(change): Json<TicketStateChange>,
+    Json(request): Json<ticket::TicketStateUpdate>,
 ) -> ApiResult<StatusCode> {
-    let result = execute_ticket_rest_operation(
-        &api,
-        &workspace_id,
+    let _ = scoped_ticket_state_update(
+        State(api),
         headers,
-        TicketBackendOperation::AddStateChanged {
-            id: TicketIdOrSlug::Query(id),
-            change,
-        },
+        AxumPath((workspace_id, id)),
+        Json(request),
     )
     .await?;
-    ticket_rest_unit(result)
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn scoped_add_ticket_intake_summary(
@@ -14521,39 +14555,35 @@ async fn scoped_set_ticket_state_field(
     State(api): State<WorkspaceApi>,
     AxumPath((workspace_id, id, field)): AxumPath<(String, String, String)>,
     headers: HeaderMap,
-    Json(change): Json<TicketStateChange>,
+    Json(request): Json<ticket::TicketStateUpdate>,
 ) -> ApiResult<StatusCode> {
-    let result = execute_ticket_rest_operation(
-        &api,
-        &workspace_id,
+    if field != "state" {
+        return Err(Error::InvalidInput("unsupported Ticket state field".into()).into());
+    }
+    let _ = scoped_ticket_state_update(
+        State(api),
         headers,
-        TicketBackendOperation::SetStateField {
-            id: TicketIdOrSlug::Query(id),
-            field,
-            change,
-        },
+        AxumPath((workspace_id, id)),
+        Json(request),
     )
     .await?;
-    ticket_rest_unit(result)
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn scoped_set_ticket_workflow_state(
     State(api): State<WorkspaceApi>,
     AxumPath((workspace_id, id)): AxumPath<(String, String)>,
     headers: HeaderMap,
-    Json(change): Json<TicketStateChange>,
+    Json(request): Json<ticket::TicketStateUpdate>,
 ) -> ApiResult<StatusCode> {
-    let result = execute_ticket_rest_operation(
-        &api,
-        &workspace_id,
+    let _ = scoped_ticket_state_update(
+        State(api),
         headers,
-        TicketBackendOperation::SetWorkflowState {
-            id: TicketIdOrSlug::Query(id),
-            change,
-        },
+        AxumPath((workspace_id, id)),
+        Json(request),
     )
     .await?;
-    ticket_rest_unit(result)
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn scoped_mark_ticket_ready(
@@ -15158,20 +15188,6 @@ fn public_merge_event(event: merge_request::MergeEvent) -> server_api::MergeEven
         strategy: public_merge_strategy(event.strategy),
         resolution: public_conflict_resolution(event.resolution),
         merged_by: public_merge_request_worker_identity(event.merged_by),
-        created_at: event.created_at.to_rfc3339(),
-    }
-}
-
-fn public_ticket_completion_event(
-    event: merge_request::TicketCompletionEvent,
-) -> server_api::TicketCompletionEvent {
-    server_api::TicketCompletionEvent {
-        operation_id: event.operation_id,
-        ticket_id: event.ticket_id,
-        item_revision: event.item_revision,
-        merge_request_ids: event.merge_request_ids,
-        requirement_approval_event_id: event.requirement_approval_event_id,
-        completed_by: public_merge_request_worker_identity(event.completed_by),
         created_at: event.created_at.to_rfc3339(),
     }
 }
@@ -16154,38 +16170,74 @@ async fn scoped_complete_ticket(
     headers: HeaderMap,
     AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
     Json(input): Json<server_api::CompleteTicketRequest>,
-) -> ApiResult<Json<server_api::TicketCompletionEvent>> {
-    let workspace_id = parse_workspace_id(&workspace_id)?;
+) -> ApiResult<Json<ticket::Ticket>> {
+    scoped_ticket_state_update(
+        State(api),
+        headers,
+        AxumPath((workspace_id, ticket_id)),
+        Json(ticket::TicketStateUpdate {
+            operation_key: input.operation_key,
+            expected_item_revision: input.expected_item_revision,
+            expected_state: input.expected_state,
+            state: TicketWorkflowState::Done,
+            reason: input.reason,
+            references: input.references,
+            author: None,
+        }),
+    )
+    .await
+}
+
+async fn scoped_ticket_state_update(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    Json(mut request): Json<ticket::TicketStateUpdate>,
+) -> ApiResult<Json<ticket::Ticket>> {
+    validate_workspace_scope(&api, &workspace_id)?;
     let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
-    require_workspace_access(&workspace_id, &api)?;
-    let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
-    require_online_workspace_orchestrator_source(&api, &source)?;
-    // No active assignment is expected after completion. The store checks an
-    // exact recorded-operation replay before live authority, including its actor
-    // and evidence fingerprint; an empty identity cannot authorize new completion.
-    let assignment_id = api
-        .store
-        .get_active_ticket_worker_assignment(&workspace_id, &ticket_id)?
-        .map(|assignment| assignment.assignment_id)
-        .unwrap_or_default();
-    let event = merge_request_store(&api, &workspace_id)?.complete_ticket(
-        merge_request::CompleteTicket {
-            ticket_id,
-            operation_id: input.operation_id,
-            item_revision: input.item_revision,
-            merge_request_ids: input.merge_request_ids,
-            requirement_approval_event_id: input.requirement_approval_event_id,
-            auth: merge_request::MergeRequestAuth {
-                workspace_id,
-                repository_id: String::new(),
-                runtime_id: source.runtime_id,
-                worker_id: source.worker_id,
-                assignment_id,
-            },
-            now: Utc::now(),
-        },
-    )?;
-    Ok(Json(public_ticket_completion_event(event)))
+    let mut backend = browser_ticket_backend(&api)?;
+    let before = backend
+        .show(TicketIdOrSlug::Id(ticket_id.clone()))
+        .map_err(Error::from)?;
+    if let Some(source) = optional_worker_mutation_source(&api, &workspace_id, &headers)? {
+        let author = format!("worker:{}/{}", source.runtime_id, source.worker_id);
+        let replay_event = before.events.iter().find(|event| {
+            event.author.as_deref() == Some(author.as_str())
+                && event.attributes.get("operation_key") == Some(&request.operation_key)
+                && event.attributes.get("source_runtime_id") == Some(&source.runtime_id)
+                && event.attributes.get("source_worker_id") == Some(&source.worker_id)
+        });
+        let replay = replay_event.is_some();
+        let context = worker_ticket_source_context(&api, &workspace_id, &source, Some(&before));
+        let is_orchestrator =
+            find_workspace_orchestrator(&api).is_some_and(|worker| worker.worker == source);
+        if !replay && context.actor_role != "coder" && !is_orchestrator {
+            return Err(Error::WorkspacePermissionDenied(
+                "Ticket state decisions require the assigned Worker or registered Workspace Orchestrator".into(),
+            ).into());
+        }
+        request.author = Some(author);
+        let attributes = if let Some(event) = replay_event {
+            // Replay authenticates the same actor, but retains the receipt's
+            // original work identity. Completion/reopen never revives that grant.
+            event
+                .attributes
+                .iter()
+                .filter(|(key, _)| key.starts_with("source_"))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        } else {
+            context.attributes("state_update")
+        };
+        backend = backend.with_event_attributes(attributes);
+    } else {
+        request.author = Some("workspace-user".into());
+    }
+    let ticket = backend
+        .update_state(&ticket_id, request)
+        .map_err(Error::from)?;
+    Ok(Json(ticket))
 }
 
 fn reject_non_browser_reopen_auth(headers: &HeaderMap) -> Result<()> {
@@ -16199,19 +16251,24 @@ async fn scoped_close_ticket_record(
     State(api): State<WorkspaceApi>,
     AxumPath((workspace_id, id)): AxumPath<(String, String)>,
     headers: HeaderMap,
-    Json(resolution): Json<MarkdownText>,
+    Json(request): Json<ticket::TicketCompletion>,
 ) -> ApiResult<StatusCode> {
-    let result = execute_ticket_rest_operation(
-        &api,
-        &workspace_id,
+    let _ = scoped_ticket_state_update(
+        State(api),
         headers,
-        TicketBackendOperation::Close {
-            id: TicketIdOrSlug::Query(id),
-            resolution,
-        },
+        AxumPath((workspace_id, id)),
+        Json(ticket::TicketStateUpdate {
+            state: TicketWorkflowState::Closed,
+            operation_key: request.operation_key,
+            expected_item_revision: request.expected_item_revision,
+            expected_state: request.expected_state,
+            reason: request.reason,
+            references: request.references,
+            author: request.author,
+        }),
     )
     .await?;
-    ticket_rest_unit(result)
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn scoped_record_ticket_relation(
@@ -31909,6 +31966,7 @@ impl From<Error> for ApiError {
                     ticket::TicketError::Locked { .. } => "ticket_locked",
                     ticket::TicketError::Conflict(_)
                     | ticket::TicketError::StaleWorkflowState { .. }
+                    | ticket::TicketError::StaleItemRevision { .. }
                     | ticket::TicketError::InvalidWorkflowTransition { .. }
                     | ticket::TicketError::BlockingRelations(_)
                     | ticket::TicketError::OperationFingerprintMismatch { .. } => "ticket_conflict",
@@ -32025,7 +32083,10 @@ fn api_error_status(error: &Error) -> StatusCode {
         Error::Ticket(
             ticket::TicketError::Ambiguous { .. }
             | ticket::TicketError::Locked { .. }
-            | ticket::TicketError::Conflict(_),
+            | ticket::TicketError::Conflict(_)
+            | ticket::TicketError::StaleItemRevision { .. }
+            | ticket::TicketError::StaleWorkflowState { .. }
+            | ticket::TicketError::OperationFingerprintMismatch { .. },
         ) => StatusCode::CONFLICT,
         Error::Ticket(
             ticket::TicketError::InvalidPathComponent(_)
@@ -35665,43 +35726,6 @@ mod tests {
     }
 
     #[test]
-    fn generic_worker_state_change_cannot_enter_inprogress() {
-        for from in ["planning", "ready", "queued"] {
-            let change = || {
-                TicketStateChange::new(
-                    from,
-                    "inprogress",
-                    "worker-tool",
-                    "bypass assignment-aware start",
-                )
-            };
-            let operations = [
-                TicketBackendOperation::SetWorkflowState {
-                    id: TicketIdOrSlug::Query("T1".to_string()),
-                    change: change(),
-                },
-                TicketBackendOperation::SetStateField {
-                    id: TicketIdOrSlug::Query("T1".to_string()),
-                    field: "state".to_string(),
-                    change: change(),
-                },
-                TicketBackendOperation::AddStateChanged {
-                    id: TicketIdOrSlug::Query("T1".to_string()),
-                    change: change(),
-                },
-            ];
-            for operation in operations {
-                let error = reject_unguarded_ticket_completion(&operation).unwrap_err();
-                assert!(
-                    error
-                        .to_string()
-                        .contains("atomic ready-state Coder assignment")
-                );
-            }
-        }
-    }
-
-    #[test]
     fn feature_completion_api_conversions_preserve_nonce_and_context_for_aba_requests() {
         for nonce in ["first", "second", "first"] {
             let json = serde_json::json!({"kind":"feature_argument", "prefix":"資料/", "request_id":nonce,
@@ -35725,36 +35749,6 @@ mod tests {
                 serde_json::to_value(result.context).unwrap(),
                 json["context"]
             );
-        }
-    }
-
-    #[test]
-    fn flow_or_generic_worker_state_change_is_not_ticket_completion_authority() {
-        let change = || {
-            TicketStateChange::new(
-                "inprogress",
-                "done",
-                "flow reached terminal state",
-                "terminal flow state",
-            )
-        };
-        for operation in [
-            TicketBackendOperation::SetWorkflowState {
-                id: TicketIdOrSlug::Query("T1".to_string()),
-                change: change(),
-            },
-            TicketBackendOperation::SetStateField {
-                id: TicketIdOrSlug::Query("T1".to_string()),
-                field: "state".to_string(),
-                change: change(),
-            },
-            TicketBackendOperation::AddStateChanged {
-                id: TicketIdOrSlug::Query("T1".to_string()),
-                change: change(),
-            },
-        ] {
-            let error = reject_unguarded_ticket_completion(&operation).unwrap_err();
-            assert!(error.to_string().contains("CompleteMergeRequest"));
         }
     }
 
@@ -46747,7 +46741,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_ready_accepts_registered_remote_target_and_closes_lifecycle_bypasses() {
+    async fn progress_and_target_editing_accept_registered_remote_assets_without_git() {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api_with_remote_repository(dir.path()).await;
         let backend = browser_ticket_backend(&api).unwrap();
@@ -46793,11 +46787,11 @@ mod tests {
                 .count(),
             1
         );
-        assert!(matches!(
-            backend.edit_item(
-                TicketIdOrSlug::Id(ticket_ref.id.clone()),
-                ticket::TicketItemEdit {
-                    targets: Some(ticket::TicketTargetsEdit::Set {
+        let edited = backend
+            .edit_item(
+                ticket_ref.id.clone().into(),
+                TicketItemEdit {
+                    targets: Some(TicketTargetsEdit::Set {
                         targets: vec![test_ticket_target(
                             "test-repository",
                             "other",
@@ -46806,20 +46800,67 @@ mod tests {
                     }),
                     ..Default::default()
                 },
-            ),
-            Err(ticket::TicketError::Conflict(_))
-        ));
-
+            )
+            .unwrap();
+        assert_eq!(edited.meta.workflow_state, TicketWorkflowState::Ready);
+        assert_eq!(
+            edited.meta.targets[0].ref_selector.as_deref(),
+            Some("other")
+        );
         let mut missing = ticket::NewTicket::new("Missing target");
         set_test_ticket_target(&mut missing, "unknown", "develop");
         assert!(backend.create(missing).is_err());
-        assert!(matches!(
-            backend.set_workflow_state(
-                TicketIdOrSlug::Id(ticket_ref.id),
-                TicketStateChange::new("ready", "queued", "bypass", "must use TicketQueue",),
-            ),
-            Err(ticket::TicketError::InvalidWorkflowTransition { .. })
-        ));
+        backend
+            .set_workflow_state(
+                ticket_ref.id.into(),
+                TicketStateChange::new(
+                    "ready",
+                    "inprogress",
+                    "Direct progress judgment",
+                    "No Worker start implied",
+                ),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_accepts_read_only_catalog_reference_without_default_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api_with_remote_repository(dir.path()).await;
+        let mut repository = api
+            .store
+            .get_repository_by_key(TEST_WORKSPACE_ID, "test-repository")
+            .unwrap()
+            .unwrap();
+        repository.repository_id = "reference-without-default".into();
+        repository.repository_key = "reference".into();
+        repository.default_ref = None;
+        api.store.upsert_repository(&repository).unwrap();
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut input = ticket::NewTicket::new("Reference only; no checkout decision yet");
+        input.targets = vec![ticket::TicketTarget {
+            repository_key: "reference".into(),
+            ref_selector: None,
+            access: TicketTargetAccess::ReadOnly,
+        }];
+        let reference = backend.create(input).unwrap();
+        let ready = backend
+            .mark_ready(
+                reference.id.clone().into(),
+                ticket::TicketMarkReady {
+                    operation_key: "reference-ready".into(),
+                    reason: Some("Research ready".into()),
+                    author: Some("workspace-user".into()),
+                    intake_summary: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(ready.meta.workflow_state, TicketWorkflowState::Ready);
+        assert_eq!(ready.meta.targets[0].ref_selector, None);
+        assert!(
+            validated_ticket_implementation_targets(&api, &reference.id).is_err(),
+            "asset operations still require their own grants and selectors"
+        );
     }
 
     #[tokio::test]
@@ -46998,7 +47039,7 @@ mod tests {
             },
         ];
         for operation in preparatory_operations {
-            execute_ticket_rest_operation(&api, TEST_WORKSPACE_ID, source_headers(), operation)
+            execute_ticket_rest_operation(&api, TEST_WORKSPACE_ID, HeaderMap::new(), operation)
                 .await
                 .unwrap();
         }
@@ -47117,158 +47158,131 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_ticket_api_replays_done_operation_without_reviving_assignment_authority() {
+    async fn ticket_decisions_reject_other_workers_and_browser_route_source_bypasses() {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
         let backend = browser_ticket_backend(&api).unwrap();
-        let mut input = ticket::NewTicket::new("Completed operation replay");
+        let mut input = ticket::NewTicket::new("Assigned investigation");
         input.workflow_state = Some(TicketWorkflowState::InProgress);
-        let ticket = backend.create(input).unwrap();
-        let coder = seed_live_test_coder_assignment(&api, &ticket.id, "completed-coder").await;
-        let Json(started) = scoped_start_workspace_orchestrator(
+        let ticket = backend.create(input.clone()).unwrap();
+        let _owner = seed_live_test_coder_assignment(&api, &ticket.id, "owner").await;
+        let other_ticket = backend.create(input).unwrap();
+        let other = seed_live_test_coder_assignment(&api, &other_ticket.id, "other").await;
+        let before = backend.show(ticket.id.clone().into()).unwrap();
+        let request = server_api::CompleteTicketRequest {
+            operation_key: "forged".into(),
+            expected_item_revision: ticket::ticket_item_revision(&before),
+            expected_state: TicketWorkflowState::InProgress,
+            reason: "Not my task".into(),
+            references: Vec::new(),
+        };
+        let response = scoped_complete_ticket(
             State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            ticket_check_headers(&other),
+            AxumPath((TEST_WORKSPACE_ID.into(), ticket.id.clone())),
+            Json(request),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = scoped_transition_ticket_state(
+            State(api.clone()),
+            ticket_check_headers(&other),
+            AxumPath(ScopedRecordPath {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                id: ticket.id.clone(),
+            }),
+            Json(server_api::BrowserTransitionTicketStateRequest {
+                state: server_api::BrowserTicketWorkflowState::Done,
+                expected_state: server_api::BrowserTicketWorkflowState::Inprogress,
+                operation_key: "browser-forged".into(),
+                expected_item_revision: ticket::ticket_item_revision(&before),
+                reason: "Not human authority".into(),
+                body: None,
             }),
         )
         .await
-        .unwrap();
-        let orchestrator = started.worker.unwrap();
-        let orchestrator = RuntimeWorkerRef::new(orchestrator.runtime_id, orchestrator.worker_id);
-        let recorded = merge_request::TicketCompletionEvent {
-            operation_id: "recorded-ticket-completion".to_string(),
-            ticket_id: ticket.id.clone(),
-            item_revision: api.authority.ticket(&ticket.id).unwrap().item_revision,
-            merge_request_ids: vec!["merged-result".to_string()],
-            requirement_approval_event_id: "requirement-approval".to_string(),
-            completed_by: merge_request::WorkerIdentity {
-                runtime_id: orchestrator.runtime_id.clone(),
-                worker_id: orchestrator.worker_id.clone(),
-            },
-            created_at: Utc::now(),
+        .unwrap_err()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(backend.show(ticket.id.into()).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn assigned_coder_completion_without_mr_replays_and_rejects_changed_decisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut input = ticket::NewTicket::new("Research complete without repository");
+        input.workflow_state = Some(TicketWorkflowState::InProgress);
+        let reference = backend.create(input).unwrap();
+        let coder = seed_live_test_coder_assignment(&api, &reference.id, "completed-coder").await;
+        let before = backend.show(reference.id.clone().into()).unwrap();
+        let request = server_api::CompleteTicketRequest {
+            operation_key: "research-done".into(),
+            expected_item_revision: ticket::ticket_item_revision(&before),
+            expected_state: TicketWorkflowState::InProgress,
+            reason: "Investigation findings recorded in the Ticket thread".into(),
+            references: Vec::new(),
         };
-        // Seed the persisted completion boundary, not the review/integration flow:
-        // this test proves API replay authorization against an already-recorded result.
-        let conn = rusqlite::Connection::open(&api.config.database_path).unwrap();
-        crate::store::configure_sqlite(&conn).unwrap();
-        conn.execute(
-            "UPDATE typed_tickets SET workflow_state = 'done'
-             WHERE workspace_id = ?1 AND ticket_id = ?2",
-            rusqlite::params![TEST_WORKSPACE_ID, ticket.id],
-        )
-        .unwrap();
-        backend
-            .with_event_attributes(BTreeMap::from([
-                ("operation_id".to_string(), recorded.operation_id.clone()),
-                (
-                    "ticket_completion".to_string(),
-                    serde_json::to_string(&recorded).unwrap(),
-                ),
-            ]))
-            .add_event(
-                TicketIdOrSlug::Id(ticket.id.clone()),
-                NewTicketEvent::new(TicketEventKind::StateChanged, "Recorded completion"),
+        let call = |request| {
+            scoped_complete_ticket(
+                State(api.clone()),
+                ticket_check_headers(&coder),
+                AxumPath((TEST_WORKSPACE_ID.into(), reference.id.clone())),
+                Json(request),
             )
-            .unwrap();
-        let mut former_actor_record = recorded.clone();
-        former_actor_record.operation_id = "former-actor-completion".to_string();
-        former_actor_record.completed_by = merge_request::WorkerIdentity {
-            runtime_id: coder.runtime_id.clone(),
-            worker_id: coder.worker_id.clone(),
         };
-        browser_ticket_backend(&api)
-            .unwrap()
-            .with_event_attributes(BTreeMap::from([
-                (
-                    "operation_id".to_string(),
-                    former_actor_record.operation_id.clone(),
-                ),
-                (
-                    "ticket_completion".to_string(),
-                    serde_json::to_string(&former_actor_record).unwrap(),
-                ),
-            ]))
-            .add_event(
-                TicketIdOrSlug::Id(ticket.id.clone()),
-                NewTicketEvent::new(TicketEventKind::StateChanged, "Former actor completion"),
-            )
-            .unwrap();
-        let event_count = browser_ticket_backend(&api)
-            .unwrap()
-            .show(TicketIdOrSlug::Id(ticket.id.clone()))
-            .unwrap()
-            .events
-            .len();
-        let request = || server_api::CompleteTicketRequest {
-            operation_id: recorded.operation_id.clone(),
-            item_revision: recorded.item_revision.clone(),
-            merge_request_ids: recorded.merge_request_ids.clone(),
-            requirement_approval_event_id: recorded.requirement_approval_event_id.clone(),
-        };
-        let Json(replayed) = scoped_complete_ticket(
-            State(api.clone()),
-            ticket_check_headers(&orchestrator),
-            AxumPath((TEST_WORKSPACE_ID.to_string(), ticket.id.clone())),
-            Json(request()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            serde_json::to_value(replayed).unwrap(),
-            serde_json::to_value(public_ticket_completion_event(recorded.clone())).unwrap()
+        let Json(completed) = call(request.clone()).await.unwrap();
+        assert_eq!(completed.meta.workflow_state, TicketWorkflowState::Done);
+        assert!(
+            merge_request_store(&api, TEST_WORKSPACE_ID)
+                .unwrap()
+                .list_for_ticket(TEST_WORKSPACE_ID, &reference.id)
+                .unwrap()
+                .is_empty()
         );
-        for field in ["operation", "revision", "mr_set", "approval", "actor"] {
-            let mut changed = request();
+        let Json(replayed) = call(request.clone()).await.unwrap();
+        assert_eq!(replayed.events, completed.events);
+        for field in ["reason", "revision", "state", "references"] {
+            let mut changed = request.clone();
             match field {
-                "operation" => changed.operation_id = "new-completion-operation".to_string(),
-                "revision" => changed.item_revision = "different-revision".to_string(),
-                "mr_set" => changed.merge_request_ids = vec!["different-result".to_string()],
-                "approval" => {
-                    changed.requirement_approval_event_id = "different-approval".to_string();
-                }
-                "actor" => changed.operation_id = former_actor_record.operation_id.clone(),
+                "reason" => changed.reason = "different judgment".into(),
+                "revision" => changed.expected_item_revision = "stale".into(),
+                "state" => changed.expected_state = TicketWorkflowState::Planning,
+                "references" => changed.references.push(ticket::TicketReference {
+                    kind: "document".into(),
+                    target: "other".into(),
+                }),
                 _ => unreachable!(),
             }
-            let response = scoped_complete_ticket(
-                State(api.clone()),
-                ticket_check_headers(&orchestrator),
-                AxumPath((TEST_WORKSPACE_ID.to_string(), ticket.id.clone())),
-                Json(changed),
-            )
-            .await
-            .unwrap_err()
-            .into_response();
+            let response = call(changed).await.unwrap_err().into_response();
             let status = response.status();
             let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            let body = String::from_utf8_lossy(&bytes);
-            assert_eq!(status, StatusCode::CONFLICT, "field={field}: {body}");
-            let reason = if field == "operation" {
-                "Ticket must be inprogress"
-            } else {
-                "Ticket completion operation fingerprint mismatch"
-            };
-            assert!(body.contains(reason), "field={field}: {body}");
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "{field}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
         }
         assert!(
             api.store
-                .get_active_ticket_role_assignment_for_worker(TEST_WORKSPACE_ID, &coder)
+                .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &reference.id)
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(
+        assert!(
             api.store
-                .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &ticket.id)
+                .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &reference.id)
                 .unwrap()
-                .unwrap()
-                .assignment_id,
-            "completed-coder"
+                .is_some()
         );
-        let after = browser_ticket_backend(&api)
-            .unwrap()
-            .show(TicketIdOrSlug::Id(ticket.id))
-            .unwrap();
-        assert_eq!(after.meta.workflow_state, TicketWorkflowState::Done);
-        assert_eq!(after.events.len(), event_count);
+        let mut fresh = request;
+        fresh.operation_key = "unassigned-new-operation".into();
+        fresh.expected_state = TicketWorkflowState::Done;
+        assert!(call(fresh).await.is_err());
     }
 
     #[tokio::test]
@@ -47297,7 +47311,14 @@ mod tests {
             State(api.clone()),
             AxumPath((TEST_WORKSPACE_ID.to_string(), ticket.id.clone())),
             HeaderMap::new(),
-            Json(MarkdownText::new("Normal close ends implementation work")),
+            Json(ticket::TicketCompletion {
+                operation_key: "normal-close".into(),
+                expected_item_revision: api.authority.ticket(&ticket.id).unwrap().item_revision,
+                expected_state: TicketWorkflowState::InProgress,
+                reason: "Normal close ends implementation work".into(),
+                references: Vec::new(),
+                author: None,
+            }),
         )
         .await
         .unwrap();
@@ -47430,22 +47451,6 @@ mod tests {
         )
         .await
         .unwrap();
-        let response = scoped_queue_ticket_record(
-            State(api.clone()),
-            AxumPath((TEST_WORKSPACE_ID.to_string(), ticket.id.clone())),
-            HeaderMap::new(),
-        )
-        .await
-        .unwrap_err()
-        .into_response();
-        let status = response.status();
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8_lossy(&bytes);
-        assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert!(
-            body.contains("Queue requires role=orchestrator assignment"),
-            "{body}"
-        );
         assert!(execution.take_inputs().is_empty());
         let Json(assigned) = scoped_set_ticket_assignment(
             State(api.clone()),
@@ -47707,6 +47712,97 @@ mod tests {
                 .capabilities,
             workdir::WorkdirSessionCapabilities::READ_ONLY,
             "the restored live Worker must not retain its pre-assignment ALL capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_target_edits_do_not_expand_bound_grants_and_mismatch_fails_closed() {
+        let fixture = manual_coder_assignment_fixture().await;
+        let _ = scoped_set_ticket_assignment(
+            State(fixture.api.clone()),
+            AxumPath((
+                TEST_WORKSPACE_ID.into(),
+                fixture.ticket_id.clone(),
+                "coder".into(),
+            )),
+            Json(manual_coder_assignment_request(
+                &fixture,
+                "bind-original-grants",
+            )),
+        )
+        .await
+        .unwrap();
+        let backend = browser_ticket_backend(&fixture.api).unwrap();
+        let links = fixture
+            .api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
+            .unwrap();
+        let docs_link = links
+            .iter()
+            .find(|link| link.workdir_id == fixture.docs_workdir_id)
+            .unwrap();
+        let docs = fixture
+            .api
+            .store
+            .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.docs_workdir_id)
+            .unwrap()
+            .unwrap();
+        backend
+            .edit_item(
+                fixture.ticket_id.clone().into(),
+                TicketItemEdit {
+                    targets: Some(TicketTargetsEdit::Set {
+                        targets: vec![
+                            test_ticket_target(
+                                "test-repository",
+                                "develop",
+                                TicketTargetAccess::ReadWrite,
+                            ),
+                            test_ticket_target("docs", "develop", TicketTargetAccess::ReadWrite),
+                        ],
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            effective_worker_workdir_capabilities(
+                &fixture.api,
+                &fixture.worker,
+                &docs,
+                docs_link.capabilities
+            )
+            .unwrap(),
+            workdir::WorkdirSessionCapabilities::READ_ONLY
+        );
+        assert_eq!(
+            fixture
+                .runtime
+                .logical_attachments(&fixture.worker.worker_id)
+                .iter()
+                .find(|attachment| attachment.alias.as_str() == "docs")
+                .unwrap()
+                .capabilities,
+            workdir::WorkdirSessionCapabilities::READ_ONLY
+        );
+        backend
+            .edit_item(
+                fixture.ticket_id.into(),
+                TicketItemEdit {
+                    targets: Some(TicketTargetsEdit::Clear),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            effective_worker_workdir_capabilities(
+                &fixture.api,
+                &fixture.worker,
+                &docs,
+                docs_link.capabilities
+            )
+            .is_err()
         );
     }
 
@@ -48500,131 +48596,132 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_browser_state_mutation_cannot_bypass_assignment_start() {
+    async fn browser_progress_decisions_allow_direct_completion_and_reopen_with_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let backend = browser_ticket_backend(&api).unwrap();
+        let reference = backend
+            .create(ticket::NewTicket::new("No asset needed"))
+            .unwrap();
+        for (index, state) in [
+            server_api::BrowserTicketWorkflowState::Inprogress,
+            server_api::BrowserTicketWorkflowState::Done,
+            server_api::BrowserTicketWorkflowState::Closed,
+            server_api::BrowserTicketWorkflowState::Planning,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let before = backend.show(reference.id.clone().into()).unwrap();
+            let expected_state =
+                serde_json::from_value(serde_json::json!(before.meta.workflow_state.as_str()))
+                    .unwrap();
+            let request = server_api::BrowserTransitionTicketStateRequest {
+                state: state.clone(),
+                operation_key: format!("decision-{index}"),
+                expected_item_revision: ticket::ticket_item_revision(&before),
+                expected_state,
+                reason: "Human progress judgment".into(),
+                body: None,
+            };
+            let Json(after) = scoped_transition_ticket_state(
+                State(api.clone()),
+                HeaderMap::new(),
+                AxumPath(ScopedRecordPath {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                    id: reference.id.clone(),
+                }),
+                Json(request),
+            )
+            .await
+            .unwrap();
+            assert_eq!(after.state, browser_ticket_workflow_state(state).as_str());
+            assert!(
+                api.store
+                    .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &reference.id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let before = backend.show(reference.id.clone().into()).unwrap();
+        let response = scoped_transition_ticket_state(
+            State(api),
+            HeaderMap::new(),
+            AxumPath(ScopedRecordPath {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                id: reference.id,
+            }),
+            Json(server_api::BrowserTransitionTicketStateRequest {
+                state: server_api::BrowserTicketWorkflowState::Done,
+                operation_key: "stale".into(),
+                expected_item_revision: "stale-revision".into(),
+                expected_state: server_api::BrowserTicketWorkflowState::Planning,
+                reason: "Stale decision".into(),
+                body: None,
+            }),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(before.meta.workflow_state, TicketWorkflowState::Planning);
+    }
+
+    #[tokio::test]
+    async fn explicit_queue_without_assets_or_assignment_records_only_requested_work() {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
         let backend = browser_ticket_backend(&api).unwrap();
         let ticket = backend
-            .create(ticket::NewTicket::new("Generic transition guard"))
+            .create(ticket::NewTicket::new("Queue research"))
             .unwrap();
-        let path = ScopedRecordPath {
-            workspace_id: TEST_WORKSPACE_ID.to_string(),
-            id: ticket.id.clone(),
-        };
-
-        let planning = scoped_transition_ticket_state(
+        let Json(outcome) = scoped_queue_ticket_record(
             State(api.clone()),
-            AxumPath(path.clone()),
-            Json(server_api::BrowserTransitionTicketStateRequest {
-                state: server_api::BrowserTicketWorkflowState::Inprogress,
-                reason: None,
-                body: None,
-                author: None,
-            }),
-        )
-        .await
-        .unwrap_err()
-        .into_response();
-        assert_eq!(planning.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            backend
-                .show(ticket.id.clone().into())
-                .unwrap()
-                .meta
-                .workflow_state,
-            TicketWorkflowState::Planning
-        );
-
-        let mut ready_input = ticket::NewTicket::new("Ready transition guard");
-        ready_input.workflow_state = Some(TicketWorkflowState::Ready);
-        let ready = backend.create(ready_input).unwrap();
-        let ready_result = scoped_transition_ticket_state(
-            State(api.clone()),
-            AxumPath(ScopedRecordPath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                id: ready.id.clone(),
-            }),
-            Json(server_api::BrowserTransitionTicketStateRequest {
-                state: server_api::BrowserTicketWorkflowState::Inprogress,
-                reason: None,
-                body: None,
-                author: None,
-            }),
-        )
-        .await
-        .unwrap_err()
-        .into_response();
-        assert_eq!(ready_result.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            backend.show(ready.id.into()).unwrap().meta.workflow_state,
-            TicketWorkflowState::Ready
-        );
-    }
-
-    #[tokio::test]
-    async fn queue_requires_orchestrator_role_and_records_assignment_fence() {
-        let dir = tempfile::tempdir().unwrap();
-        init_clean_git_workspace(dir.path());
-        let api = test_api(dir.path()).await;
-        let backend = browser_ticket_backend(&api).unwrap();
-        let mut input = ticket::NewTicket::new("Queue role gate");
-        input.workflow_state = Some(TicketWorkflowState::Ready);
-        set_test_ticket_target(&mut input, "test-repository", "develop");
-        let ticket = backend.create(input).unwrap();
-        let path = (TEST_WORKSPACE_ID.to_string(), ticket.id.clone());
-
-        let legacy_missing = scoped_queue_ticket(
-            State(api.clone()),
-            AxumPath(ScopedRecordPath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                id: ticket.id.clone(),
-            }),
-            Json(server_api::BrowserQueueTicketRequest {}),
-        )
-        .await
-        .unwrap_err()
-        .into_response();
-        assert_eq!(legacy_missing.status(), StatusCode::CONFLICT);
-
-        let missing = scoped_queue_ticket_record(
-            State(api.clone()),
-            AxumPath(path.clone()),
+            AxumPath((TEST_WORKSPACE_ID.into(), ticket.id.clone())),
             HeaderMap::new(),
         )
         .await
-        .unwrap_err()
-        .into_response();
-        assert_eq!(missing.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            backend
-                .show(ticket.id.clone().into())
-                .unwrap()
-                .meta
-                .workflow_state,
-            TicketWorkflowState::Ready
-        );
-
-        assign_test_orchestrator(&api, &ticket.id);
-        let _ = scoped_queue_ticket_record(State(api.clone()), AxumPath(path), HeaderMap::new())
-            .await
-            .unwrap();
-        let queued = backend.show(ticket.id.into()).unwrap();
+        .unwrap();
+        assert_eq!(outcome.queued_tickets, vec![ticket.id.clone()]);
+        let queued = backend.show(ticket.id.clone().into()).unwrap();
         assert_eq!(queued.meta.workflow_state, TicketWorkflowState::Queued);
-        let event = queued.events.last().unwrap();
-        let expected_assignment_id = format!("orchestrator-{}", queued.meta.id);
-        assert_eq!(
-            event
+        assert!(
+            !queued
+                .events
+                .last()
+                .unwrap()
                 .attributes
-                .get("orchestrator_assignment_id")
-                .map(String::as_str),
-            Some(expected_assignment_id.as_str())
+                .contains_key("orchestrator_assignment_id")
+        );
+        assert!(
+            api.store
+                .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &ticket.id)
+                .unwrap()
+                .is_none()
+        );
+        // If an explicit routing identity exists, retain its fence for later claim.
+        let mut input = ticket::NewTicket::new("Fenced request");
+        input.workflow_state = Some(TicketWorkflowState::Ready);
+        let fenced = backend.create(input).unwrap();
+        assign_test_orchestrator(&api, &fenced.id);
+        let _ = scoped_queue_ticket_record(
+            State(api),
+            AxumPath((TEST_WORKSPACE_ID.into(), fenced.id.clone())),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let queued = backend.show(fenced.id.clone().into()).unwrap();
+        let event = queued.events.last().unwrap();
+        assert_eq!(
+            event.attributes.get("orchestrator_assignment_id"),
+            Some(&format!("orchestrator-{}", fenced.id))
         );
         assert!(event.attributes.contains_key("routing_operation_id"));
-        assert!(event.attributes.contains_key("routing_request_fingerprint"));
     }
 
     #[tokio::test]
-    async fn queue_reports_dependency_cycle_before_assignment_validation() {
+    async fn queue_keeps_cycle_diagnostics_without_submitting_other_tickets() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
@@ -48654,24 +48751,33 @@ mod tests {
                 .unwrap();
         }
 
-        let error = execute_ticket_rest_operation(
+        let outcome = execute_ticket_rest_operation(
             &api,
             TEST_WORKSPACE_ID,
             HeaderMap::new(),
             TicketBackendOperation::QueueReady {
-                id: TicketIdOrSlug::Id(first.id.clone()),
-                queued_by: "workspace-web".to_string(),
+                id: first.id.clone().into(),
+                queued_by: "workspace-web".into(),
             },
         )
         .await
-        .unwrap_err();
-        assert!(error.error.to_string().contains("cycle"));
-        for ticket_id in [first.id, second.id] {
-            assert_eq!(
-                backend.show(ticket_id.into()).unwrap().meta.workflow_state,
-                TicketWorkflowState::Ready
-            );
-        }
+        .unwrap();
+        let TicketBackendOperationResult::QueueOutcome(outcome) = outcome else {
+            panic!("queue result")
+        };
+        assert_eq!(outcome.queued_tickets, vec![first.id.clone()]);
+        assert_eq!(
+            backend.show(second.id.into()).unwrap().meta.workflow_state,
+            TicketWorkflowState::Ready
+        );
+        assert!(
+            backend
+                .dependency_check(first.id.into())
+                .unwrap()
+                .blockers
+                .iter()
+                .any(|blocker| blocker.reason_kind == "dependency_cycle")
+        );
     }
 
     #[tokio::test]
@@ -48711,96 +48817,19 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(outcome.queued_tickets, vec![root.id.clone()]);
         assert_eq!(
-            outcome.queued_tickets,
-            vec![dependency.id.clone(), root.id.clone()]
+            backend.show(root.id.into()).unwrap().meta.workflow_state,
+            TicketWorkflowState::Queued
         );
-        for ticket_id in [dependency.id, root.id] {
-            assert_eq!(
-                backend.show(ticket_id.into()).unwrap().meta.workflow_state,
-                TicketWorkflowState::Queued
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn queue_requires_assignments_for_every_ready_dependency() {
-        let dir = tempfile::tempdir().unwrap();
-        init_clean_git_workspace(dir.path());
-        let api = test_api(dir.path()).await;
-        let backend = browser_ticket_backend(&api).unwrap();
-        let mut dependency_input = ticket::NewTicket::new("Ready dependency");
-        dependency_input.workflow_state = Some(TicketWorkflowState::Ready);
-        set_test_ticket_target(&mut dependency_input, "test-repository", "develop");
-        let dependency = backend.create(dependency_input).unwrap();
-        let mut root_input = ticket::NewTicket::new("Queue root");
-        root_input.workflow_state = Some(TicketWorkflowState::Ready);
-        set_test_ticket_target(&mut root_input, "test-repository", "develop");
-        let root = backend.create(root_input).unwrap();
-        backend
-            .add_ticket_relation(
-                root.id.clone().into(),
-                ticket::NewTicketRelation {
-                    kind: ticket::TicketRelationKind::DependsOn,
-                    target: dependency.id.clone(),
-                    note: Some("must queue first".to_string()),
-                    author: Some("test".to_string()),
-                },
-            )
-            .unwrap();
-
-        assign_test_orchestrator(&api, &root.id);
-        let error = scoped_queue_ticket_record(
-            State(api.clone()),
-            AxumPath((TEST_WORKSPACE_ID.to_string(), root.id.clone())),
-            HeaderMap::new(),
-        )
-        .await
-        .unwrap_err()
-        .into_response();
-        assert_eq!(error.status(), StatusCode::CONFLICT);
         assert_eq!(
             backend
-                .show(root.id.clone().into())
+                .show(dependency.id.into())
                 .unwrap()
                 .meta
                 .workflow_state,
             TicketWorkflowState::Ready
         );
-        assert_eq!(
-            backend
-                .show(dependency.id.clone().into())
-                .unwrap()
-                .meta
-                .workflow_state,
-            TicketWorkflowState::Ready
-        );
-
-        assign_test_orchestrator(&api, &dependency.id);
-        let Json(outcome) = scoped_queue_ticket_record(
-            State(api.clone()),
-            AxumPath((TEST_WORKSPACE_ID.to_string(), root.id.clone())),
-            HeaderMap::new(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(outcome.requested_ticket, root.id);
-        assert_eq!(
-            outcome.queued_tickets,
-            vec![dependency.id.clone(), root.id.clone()]
-        );
-        for ticket_id in [dependency.id, root.id] {
-            let queued = backend.show(ticket_id.clone().into()).unwrap();
-            assert_eq!(queued.meta.workflow_state, TicketWorkflowState::Queued);
-            assert_eq!(
-                queued
-                    .events
-                    .last()
-                    .and_then(|event| event.attributes.get("orchestrator_assignment_id"))
-                    .cloned(),
-                Some(format!("orchestrator-{ticket_id}"))
-            );
-        }
     }
 
     #[tokio::test]
@@ -50280,6 +50309,7 @@ mod tests {
 
         let Json(ready) = scoped_mark_ticket_ready_from_browser(
             State(api.clone()),
+            HeaderMap::new(),
             AxumPath(path()),
             Json(InternalTicketMarkReadyRequest {
                 operation_key: "browser-ready".to_owned(),
@@ -50306,14 +50336,15 @@ mod tests {
 
         let Json(queue_outcome) = scoped_queue_ticket(
             State(api.clone()),
+            HeaderMap::new(),
             AxumPath(path()),
             Json(server_api::BrowserQueueTicketRequest {}),
         )
         .await
         .unwrap();
         assert_eq!(queue_outcome.requested_ticket, ticket_id);
-        assert_eq!(queue_outcome.queued_tickets.len(), 2);
-        assert!(queue_outcome.queued_tickets.contains(&related_ticket_id));
+        assert_eq!(queue_outcome.queued_tickets.len(), 1);
+        assert!(!queue_outcome.queued_tickets.contains(&related_ticket_id));
         assert!(queue_outcome.queued_tickets.contains(&ticket_id));
         let Json(queued) = scoped_get_ticket(State(api.clone()), AxumPath(path()))
             .await
@@ -50324,8 +50355,12 @@ mod tests {
         assert_eq!(queued.relations.blockers[0].reason_kind, "depends_on");
         let Json(closed) = scoped_close_ticket(
             State(api),
+            HeaderMap::new(),
             AxumPath(path()),
             Json(server_api::BrowserCloseTicketRequest {
+                operation_key: "browser-close".into(),
+                expected_item_revision: queued.item_revision.clone(),
+                expected_state: server_api::BrowserTicketWorkflowState::Queued,
                 resolution: "Closed through the Browser API.".to_string(),
             }),
         )

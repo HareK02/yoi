@@ -801,27 +801,6 @@ impl SqliteWorkspaceAuthority {
         let write_repository_keys = ticket_write_target_repository_keys(&targets);
         let has_target = !write_repository_keys.is_empty();
         let has_blockers = !ticket.relations.blockers.is_empty();
-        let mut queue_assignment_blockers = Vec::new();
-        for ticket_id in &dependency_check.queue_tickets {
-            let assignments = self
-                .store
-                .list_active_ticket_role_assignments(&self.workspace_id, ticket_id)?;
-            if !assignments
-                .iter()
-                .any(|assignment| assignment.role == TicketAssignmentRole::Orchestrator)
-            {
-                queue_assignment_blockers.push(format!(
-                    "Ticket {ticket_id} requires an active Orchestrator assignment"
-                ));
-            }
-            if assignments
-                .iter()
-                .any(|assignment| assignment.role == TicketAssignmentRole::Coder)
-            {
-                queue_assignment_blockers
-                    .push(format!("Ticket {ticket_id} has an active Coder assignment"));
-            }
-        }
         let mut assignment_diagnostics = Vec::new();
         if let Some(legacy_assignee) = ticket
             .meta
@@ -833,19 +812,7 @@ impl SqliteWorkspaceAuthority {
                 "legacy Ticket assignee `{legacy_assignee}` is not assignment authority"
             ));
         }
-        let mut action_blockers = Vec::new();
-        if !has_target {
-            action_blockers.push("Ticket target is required".to_string());
-        }
-        if !dependency_check.queue_guard.can_queue_for_orchestrator {
-            if let Some(reason) = dependency_check.queue_guard.blocked_reason.clone() {
-                action_blockers.push(reason);
-            } else if let Some(reason) = dependency_check.queue_guard.reason.clone() {
-                action_blockers.push(reason);
-            }
-        }
-        let queue_assignments_valid = queue_assignment_blockers.is_empty();
-        action_blockers.extend(queue_assignment_blockers);
+        let action_blockers = Vec::new();
         let action_eligibility = TicketActionEligibility {
             can_assign_orchestrator: matches!(
                 ticket.meta.workflow_state,
@@ -857,12 +824,7 @@ impl SqliteWorkspaceAuthority {
                     ticket.meta.workflow_state,
                     TicketWorkflowState::Planning | TicketWorkflowState::Ready
                 ),
-            can_queue: ticket.meta.workflow_state == TicketWorkflowState::Ready
-                && has_orchestrator
-                && !has_coder
-                && has_target
-                && dependency_check.queue_guard.can_queue_for_orchestrator
-                && queue_assignments_valid,
+            can_queue: true,
             can_start_manual_coder: ticket.meta.workflow_state == TicketWorkflowState::Ready
                 && !has_orchestrator
                 && !has_coder
@@ -1901,16 +1863,13 @@ fn ticket_requirement_approved(
 }
 
 fn ticket_evidence_summary(
-    ticket_write_repository_keys: &[&str],
+    _ticket_write_repository_keys: &[&str],
     merge_requests: &[TicketMergeRequestSummary],
     requirement_approved: bool,
 ) -> TicketEvidenceSummary {
     let relevant = merge_requests
         .iter()
-        .filter(|request| {
-            request.state != "closed"
-                && ticket_write_repository_keys.contains(&request.repository_key.as_str())
-        })
+        .filter(|request| request.state != "closed")
         .collect::<Vec<_>>();
     let has_merge_request = !relevant.is_empty();
     let has_current_subject_ref = has_merge_request
@@ -1956,9 +1915,6 @@ fn ticket_evidence_summary(
         Some("pending".into())
     };
     let mut missing = Vec::new();
-    if !has_merge_request {
-        missing.push("merge_request".into());
-    }
     if observation_unavailable {
         missing.push("source_ref_unavailable".into());
     }
@@ -1968,16 +1924,16 @@ fn ticket_evidence_summary(
     {
         missing.push("integration_evidence".into());
     }
-    if !has_current_subject_ref {
+    if has_merge_request && !has_current_subject_ref {
         missing.push("current_subject_ref".into());
     }
-    if !has_commit {
+    if has_merge_request && !has_commit {
         missing.push("commit".into());
     }
     if unresolved_request_changes {
         missing.push("unresolved_request_changes".into());
     }
-    if !approved_current_subject {
+    if has_merge_request && !approved_current_subject {
         missing.push("approved_current_subject".into());
     }
     if approved_current_subject && !requirement_approved {
@@ -1992,7 +1948,7 @@ fn ticket_evidence_summary(
         approved_current_subject,
         review_after_rescope,
         unresolved_request_changes,
-        complete_for_integration: missing.is_empty(),
+        complete_for_integration: has_merge_request && missing.is_empty(),
         missing,
     }
 }
@@ -2202,7 +2158,7 @@ fn ticket_attention_matches(
                     .iter()
                     .any(|reason| reason == "review_after_rescope")
         }
-        "missing_evidence" => !evidence.complete_for_integration,
+        "missing_evidence" => evidence.has_merge_request && !evidence.complete_for_integration,
         _ => false,
     }
 }
@@ -3227,7 +3183,7 @@ mod tests {
         assert!(
             ticket_evidence_summary(&["main", "other"], &summaries, true).complete_for_integration
         );
-        assert!(!ticket_evidence_summary(&["docs"], &summaries, true).has_merge_request);
+        assert!(ticket_evidence_summary(&["docs"], &summaries, true).has_merge_request);
         let mut closed = reviewed_merge_request(ReviewDecision::Approve, false);
         closed.state = MergeRequestState::Closed;
         assert!(
@@ -3413,19 +3369,16 @@ VALUES ('workspace-test', 'ticket', 4);
         assert_eq!(tickets.items[0].record_source, "sqlite_yoi_ticket");
         assert_eq!(tickets.items[0].id, "00000000001J2");
         assert_eq!(tickets.items[0].state, "ready");
-        assert_eq!(tickets.items[0].workspace_action_priority, "background");
+        assert_eq!(
+            tickets.items[0].workspace_action_priority,
+            "ready_for_queue"
+        );
         let ticket_by_key = authority.ticket(&tickets.items[0].resource_key).unwrap();
         assert_eq!(ticket_by_key.id, tickets.items[0].id);
 
         let ticket = authority.ticket("00000000001J2").unwrap();
-        assert!(!ticket.action_eligibility.can_queue);
-        assert!(
-            ticket
-                .action_eligibility
-                .blockers
-                .iter()
-                .any(|reason| reason.contains("00000000001J6"))
-        );
+        assert!(ticket.action_eligibility.can_queue);
+        assert!(ticket.action_eligibility.blockers.is_empty());
         assert!(ticket.body.contains("Ticket body"));
         assert!(ticket.body_truncated);
         assert!(!ticket.body.contains("Deep Ticket marker"));

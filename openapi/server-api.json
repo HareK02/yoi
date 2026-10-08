@@ -301,11 +301,23 @@
       "BrowserCloseTicketRequest": {
         "additionalProperties": false,
         "properties": {
+          "expected_item_revision": {
+            "type": "string"
+          },
+          "expected_state": {
+            "$ref": "#/components/schemas/BrowserTicketWorkflowState"
+          },
+          "operation_key": {
+            "type": "string"
+          },
           "resolution": {
             "type": "string"
           }
         },
         "required": [
+          "operation_key",
+          "expected_item_revision",
+          "expected_state",
           "resolution"
         ],
         "type": "object"
@@ -459,30 +471,34 @@
       "BrowserTransitionTicketStateRequest": {
         "additionalProperties": false,
         "properties": {
-          "author": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "body": {
             "type": [
               "string",
               "null"
             ]
           },
+          "expected_item_revision": {
+            "type": "string"
+          },
+          "expected_state": {
+            "$ref": "#/components/schemas/BrowserTicketWorkflowState"
+          },
+          "operation_key": {
+            "type": "string"
+          },
           "reason": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "state": {
             "$ref": "#/components/schemas/BrowserTicketWorkflowState"
           }
         },
         "required": [
-          "state"
+          "state",
+          "operation_key",
+          "expected_item_revision",
+          "expected_state",
+          "reason"
         ],
         "type": "object"
       },
@@ -1072,6 +1088,37 @@
           "target",
           "condition",
           "synthetic"
+        ],
+        "type": "object"
+      },
+      "CompleteTicketRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_item_revision": {
+            "type": "string"
+          },
+          "expected_state": {
+            "$ref": "#/components/schemas/TicketWorkflowState"
+          },
+          "operation_key": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "references": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/TicketReference"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "operation_key",
+          "expected_item_revision",
+          "expected_state",
+          "reason"
         ],
         "type": "object"
       },
@@ -10199,6 +10246,45 @@
         ],
         "type": "object"
       },
+      "TicketCompletion": {
+        "additionalProperties": false,
+        "description": "Audited completion independent of repositories, Git, or Merge Requests.",
+        "properties": {
+          "author": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expected_item_revision": {
+            "type": "string"
+          },
+          "expected_state": {
+            "$ref": "#/components/schemas/TicketWorkflowState"
+          },
+          "operation_key": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "references": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/TicketReference"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "expected_item_revision",
+          "expected_state",
+          "operation_key",
+          "reason"
+        ],
+        "type": "object"
+      },
       "TicketDependencyCheck": {
         "properties": {
           "blockers": {
@@ -12126,39 +12212,46 @@
           }
         ]
       },
-      "TicketStateChange": {
+      "TicketStateUpdate": {
+        "additionalProperties": false,
+        "description": "External state mutation with item/state CAS and an immutable operation receipt.\nExact replay returns the current authoritative Ticket without a new event or\nreapplying the recorded state, even after later edits or reopening.\nSetting `state` to Closed also stores `reason` as the resolution; reopening\nchanges Ticket metadata only and never revives released work identities.",
         "properties": {
           "author": {
+            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
-          "body": {
-            "$ref": "#/components/schemas/MarkdownText"
+          "expected_item_revision": {
+            "type": "string"
           },
-          "from": {
+          "expected_state": {
+            "$ref": "#/components/schemas/TicketWorkflowState"
+          },
+          "operation_key": {
             "type": "string"
           },
           "reason": {
             "type": "string"
           },
           "references": {
+            "default": [],
             "items": {
               "$ref": "#/components/schemas/TicketReference"
             },
             "type": "array"
           },
-          "to": {
-            "type": "string"
+          "state": {
+            "$ref": "#/components/schemas/TicketWorkflowState"
           }
         },
         "required": [
-          "from",
-          "to",
-          "reason",
-          "body",
-          "references"
+          "expected_item_revision",
+          "expected_state",
+          "state",
+          "operation_key",
+          "reason"
         ],
         "type": "object"
       },
@@ -15538,7 +15631,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:4f468e00efa86e6e33e8fa4f14deca93ee15b955071920facd56c59c3d2fefb8"
+    "x-yoi-source-digest": "sha256:ab4b109d99077a8b5af98923b77d8fc1b707f7ee9ad08304e26d497ccb3799f6"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -31998,6 +32091,143 @@
             },
             "description": "Error response"
           },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/tickets/{id}/complete": {
+      "post": {
+        "operationId": "ticket_complete",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompleteTicketRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ticket"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -33557,6 +33787,16 @@
             },
             "description": "Error response"
           },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -33607,7 +33847,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/TicketStateChange"
+                "$ref": "#/components/schemas/TicketStateUpdate"
               }
             }
           },
@@ -33658,6 +33898,16 @@
             "description": "Error response"
           },
           "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "422": {
             "content": {
               "application/json": {
                 "schema": {
@@ -33727,7 +33977,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/TicketStateChange"
+                "$ref": "#/components/schemas/TicketStateUpdate"
               }
             }
           },
@@ -33778,6 +34028,143 @@
             "description": "Error response"
           },
           "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/tickets/{id}/state-update": {
+      "post": {
+        "operationId": "ticket_state_update",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TicketStateUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ticket"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "422": {
             "content": {
               "application/json": {
                 "schema": {
@@ -33947,7 +34334,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/TicketStateChange"
+                "$ref": "#/components/schemas/TicketStateUpdate"
               }
             }
           },
@@ -33998,6 +34385,16 @@
             "description": "Error response"
           },
           "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "422": {
             "content": {
               "application/json": {
                 "schema": {
@@ -34057,7 +34454,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/MarkdownText"
+                "$ref": "#/components/schemas/TicketCompletion"
               }
             }
           },
@@ -34108,6 +34505,16 @@
             "description": "Error response"
           },
           "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "422": {
             "content": {
               "application/json": {
                 "schema": {

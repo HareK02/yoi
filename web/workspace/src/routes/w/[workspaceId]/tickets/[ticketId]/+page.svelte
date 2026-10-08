@@ -361,7 +361,10 @@
     if (
       await mutate("state", "/state", {
         state: nextState,
-        reason: transitionReason.trim() || null,
+        operation_key: crypto.randomUUID(),
+        expected_item_revision: ticket.item_revision,
+        expected_state: ticket.state,
+        reason: transitionReason.trim() || "Progress decision from the Ticket page",
       })
     ) transitionReason = "";
   }
@@ -381,7 +384,12 @@
     event.preventDefault();
     if (!resolution.trim()) return;
     if (
-      await mutate("close", "/close", { resolution: resolution.trim() })
+      await mutate("close", "/close", {
+        resolution: resolution.trim(),
+        operation_key: crypto.randomUUID(),
+        expected_item_revision: ticket.item_revision,
+        expected_state: ticket.state,
+      })
     ) resolution = "";
   }
 

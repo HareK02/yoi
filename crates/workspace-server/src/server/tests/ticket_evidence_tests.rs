@@ -4,10 +4,9 @@
 use super::*;
 
 use merge_request::{
-    CompleteMergeRequest, CompleteTicket, ConflictResolution, MergeRequestAuth,
-    MergeRequestReviewSubject, MergeRequestStore, MergeStrategy, OpenMergeRequest,
-    RegisterReviewerChildSession, RequestMergeRequestReview, ReviewDecision, ReviewEvent,
-    SubmitMergeRequestReview,
+    CompleteMergeRequest, ConflictResolution, MergeRequestAuth, MergeRequestReviewSubject,
+    MergeRequestStore, MergeStrategy, OpenMergeRequest, RegisterReviewerChildSession,
+    RequestMergeRequestReview, ReviewDecision, ReviewEvent, SubmitMergeRequestReview,
 };
 use rusqlite::{Connection, params};
 use server_api::{
@@ -192,15 +191,14 @@ impl EvidenceApiFixture {
             .unwrap()
     }
 
-    fn completion(&self, approval: &ReviewEvent) -> CompleteTicket {
-        CompleteTicket {
-            ticket_id: self.ticket_id.clone(),
-            operation_id: "evidence-ticket-completion".into(),
-            item_revision: self.revision(),
-            merge_request_ids: vec![EVIDENCE_MR.into()],
-            requirement_approval_event_id: approval.event_id.clone(),
-            auth: self.auth.clone(),
-            now: evidence_time(),
+    fn completion(&self, _approval: &ReviewEvent) -> ticket::TicketCompletion {
+        ticket::TicketCompletion {
+            operation_key: "evidence-ticket-completion".into(),
+            expected_item_revision: self.revision(),
+            expected_state: TicketWorkflowState::InProgress,
+            reason: "Implementation judged complete independently of MR attestation".into(),
+            references: Vec::new(),
+            author: Some("fixture".into()),
         }
     }
 
@@ -305,10 +303,10 @@ async fn done_merged_remote_ticket_uses_immutable_result_in_show_query_list_and_
     let merge = fixture.integrate(&approval);
     let revision = fixture.revision();
     let completion = fixture
-        .store
-        .complete_ticket(fixture.completion(&approval))
+        .backend
+        .complete(&fixture.ticket_id, fixture.completion(&approval))
         .unwrap();
-    assert_eq!(completion.item_revision, revision);
+    assert_eq!(ticket::ticket_item_revision(&completion), revision);
     assert!(
         fixture
             .api
@@ -398,16 +396,13 @@ async fn latest_postmerge_approval_requires_exact_revision_and_stored_source_res
     );
     fixture.assert_filters(false, true, true).await;
     let mut outdated_completion = fixture.completion(&integration);
-    outdated_completion.item_revision = integration.ticket_item_revision.clone();
-    assert!(matches!(
-        fixture.store.complete_ticket(outdated_completion),
-        Err(merge_request::MergeRequestError::Conflict(_))
-    ));
-    assert!(matches!(
-        fixture.store.complete_ticket(fixture.completion(&integration)),
-        Err(merge_request::MergeRequestError::NotReady(message))
-            if message == merge_request::MergeRequestEvidenceError::ItemRevisionMismatch.as_str()
-    ));
+    outdated_completion.expected_item_revision = integration.ticket_item_revision.clone();
+    assert!(
+        fixture
+            .backend
+            .complete(&fixture.ticket_id, outdated_completion)
+            .is_err()
+    );
     assert_eq!(fixture.show().await.state, "inprogress");
 
     let latest = fixture.approve("latest-revision");
@@ -425,11 +420,6 @@ async fn latest_postmerge_approval_requires_exact_revision_and_stored_source_res
         Some("Requirement approval integration")
     );
     fixture.assert_filters(true, false, false).await;
-    assert!(matches!(
-        fixture.store.complete_ticket(fixture.completion(&integration)),
-        Err(merge_request::MergeRequestError::NotReady(message))
-            if message == merge_request::MergeRequestEvidenceError::ApprovalNotEffective.as_str()
-    ));
     // A current revision alone is insufficient: simulate a stored attestation
     // against a different result set using typed serialized payloads in this
     // temporary fixture database, never a live Workspace database.
@@ -477,11 +467,6 @@ async fn latest_postmerge_approval_requires_exact_revision_and_stored_source_res
     assert!(wrong.evidence.approved_current_subject);
     assert!(!wrong.evidence.complete_for_integration);
     fixture.assert_filters(false, true, true).await;
-    assert!(matches!(
-        fixture.store.complete_ticket(fixture.completion(&latest)),
-        Err(merge_request::MergeRequestError::NotReady(message))
-            if message == merge_request::MergeRequestEvidenceError::SourceSnapshotMismatch.as_str()
-    ));
     assert_eq!(fixture.show().await.state, "inprogress");
 
     let repaired = fixture.approve("exact-snapshot");
@@ -502,11 +487,10 @@ async fn latest_postmerge_approval_requires_exact_revision_and_stored_source_res
     assert_eq!(detail.source.revision_ref.as_deref(), Some(EVIDENCE_SOURCE));
     assert_eq!(detail.target.revision_ref.as_deref(), Some(EVIDENCE_TARGET));
     let completion = fixture
-        .store
-        .complete_ticket(fixture.completion(&repaired))
+        .backend
+        .complete(&fixture.ticket_id, fixture.completion(&repaired))
         .unwrap();
-    assert_eq!(completion.item_revision, revision);
-    assert_eq!(completion.requirement_approval_event_id, repaired.event_id);
+    assert_eq!(ticket::ticket_item_revision(&completion), revision);
     assert_eq!(fixture.show().await.state, "done");
     fixture.assert_filters(true, false, false).await;
 }
@@ -650,4 +634,188 @@ fn source_observation_diagnostics_preserve_provider_failure_codes() {
             expected
         );
     }
+}
+
+#[tokio::test]
+async fn closing_ticket_with_open_unreviewed_mr_does_not_change_its_proof_or_state() {
+    let fixture = EvidenceApiFixture::new().await;
+    let before = fixture
+        .store
+        .get_by_id(TEST_WORKSPACE_ID, EVIDENCE_MR)
+        .unwrap();
+    fixture
+        .backend
+        .update_state(
+            &fixture.ticket_id,
+            ticket::TicketStateUpdate {
+                operation_key: "close-with-open-mr".into(),
+                expected_item_revision: fixture.revision(),
+                expected_state: TicketWorkflowState::InProgress,
+                state: TicketWorkflowState::Closed,
+                reason: "The request was withdrawn; no integration or approval is asserted".into(),
+                references: Vec::new(),
+                author: Some("workspace-user".into()),
+            },
+        )
+        .unwrap();
+    let after = fixture
+        .store
+        .get_by_id(TEST_WORKSPACE_ID, EVIDENCE_MR)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(after).unwrap(),
+        serde_json::to_value(before).unwrap()
+    );
+    let shown = fixture.show().await;
+    assert_eq!(shown.state, "closed");
+    assert!(!shown.evidence.approved_current_subject);
+    assert_eq!(shown.merge_requests[0].state, "open");
+}
+
+#[tokio::test]
+async fn mrless_completion_is_a_ticket_judgment_not_approved_or_missing_merge_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let api = test_api_with_remote_repository(temp.path()).await;
+    let backend = browser_ticket_backend(&api).unwrap();
+    let reference = backend
+        .create(ticket::NewTicket::new("Investigation with no repository"))
+        .unwrap();
+    let ticket = backend.show(reference.id.clone().into()).unwrap();
+    backend
+        .complete(
+            &reference.id,
+            ticket::TicketCompletion {
+                operation_key: "research-result".into(),
+                expected_item_revision: ticket::ticket_item_revision(&ticket),
+                expected_state: TicketWorkflowState::Planning,
+                reason: "Answer recorded in the Ticket thread".into(),
+                references: Vec::new(),
+                author: Some("workspace-user".into()),
+            },
+        )
+        .unwrap();
+    let app = build_inner_router(api);
+    let shown: TicketDetail = serde_json::from_value(
+        get_json(
+            app.clone(),
+            &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{}", reference.id),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(shown.state, "done");
+    assert!(!shown.evidence.has_merge_request);
+    assert!(!shown.evidence.approved_current_subject);
+    assert!(!shown.evidence.complete_for_integration);
+    assert!(shown.evidence.missing.is_empty());
+    assert!(shown.evidence.review_status.is_none());
+    for filter in [
+        json!({"attention":["missing_evidence"]}),
+        json!({"evidence":["approved_review"]}),
+    ] {
+        let query: TicketQueryResponse = serde_json::from_value(
+            request_json(
+                app.clone(),
+                "POST",
+                &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/query"),
+                Some(filter),
+                StatusCode::OK,
+            )
+            .await,
+        )
+        .unwrap();
+        assert!(query.items.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn all_public_state_and_close_routes_require_explicit_cas_and_operation_receipts() {
+    let temp = tempfile::tempdir().unwrap();
+    let api = test_api_with_remote_repository(temp.path()).await;
+    let backend = browser_ticket_backend(&api).unwrap();
+    let reference = backend
+        .create(ticket::NewTicket::new("Transport decisions"))
+        .unwrap();
+    let before = backend.show(reference.id.clone().into()).unwrap();
+    let app = build_inner_router(api);
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{}", reference.id);
+    for suffix in ["workflow-state", "state-changes", "state-fields/state"] {
+        request_json(
+            app.clone(),
+            "POST",
+            &format!("{path}/{suffix}"),
+            Some(json!({
+                "from":"planning","to":"done","reason":"old unguarded request","body":""
+            })),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+        .await;
+    }
+    request_json(
+        app.clone(),
+        "POST",
+        &format!("{path}/workflow/close"),
+        Some(json!("unguarded close")),
+        StatusCode::UNPROCESSABLE_ENTITY,
+    )
+    .await;
+    let close = json!({
+        "operation_key":"guarded-close","expected_item_revision":ticket::ticket_item_revision(&before),
+        "expected_state":"planning","reason":"No further work required","author":"spoofed-client-author"
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("{path}/workflow/close"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(close.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let closed = backend.show(reference.id.clone().into()).unwrap();
+    assert_eq!(closed.meta.workflow_state, TicketWorkflowState::Closed);
+    let receipt = closed.events.last().unwrap();
+    assert_eq!(receipt.author.as_deref(), Some("workspace-user"));
+    assert_eq!(receipt.from.as_deref(), Some("planning"));
+    assert_eq!(
+        receipt.attributes.get("operation_key"),
+        Some(&"guarded-close".to_string())
+    );
+    let reopen = json!({
+        "operation_key":"reopen","expected_item_revision":ticket::ticket_item_revision(&closed),
+        "expected_state":"closed","state":"planning","reason":"A new question arrived"
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("{path}/workflow-state"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(reopen.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    // Exact replay of the old close is a receipt lookup, not another close.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("{path}/workflow/close"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(close.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let reopened = backend.show(reference.id.into()).unwrap();
+    assert_eq!(reopened.meta.workflow_state, TicketWorkflowState::Planning);
+    assert_eq!(reopened.events.len(), closed.events.len() + 1);
 }

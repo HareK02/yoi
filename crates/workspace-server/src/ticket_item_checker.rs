@@ -89,14 +89,7 @@ impl TicketItemCheckFindingCategory {
 }
 
 pub fn item_revision(ticket: &ticket::Ticket) -> String {
-    ticket
-        .events
-        .iter()
-        .rev()
-        .find(|event| matches!(event.kind.as_str(), "create" | "item_edit"))
-        .and_then(|event| event.attributes.get("event_id").cloned())
-        .or_else(|| ticket.meta.updated_at.clone())
-        .unwrap_or_else(|| format!("{}:0", ticket.meta.id))
+    ticket::ticket_item_revision(ticket)
 }
 
 pub fn request(
