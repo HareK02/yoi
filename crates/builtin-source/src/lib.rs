@@ -76,6 +76,16 @@ pub const BUILTIN_PROFILE_RESOURCES: &[BuiltinProfileResource] = &[
         }],
     },
     BuiltinProfileResource {
+        selector: Some("builtin:ticket-worker"),
+        path: "profiles/ticket-worker.dcdl",
+        source: include_str!("../../../resources/profiles/ticket-worker.dcdl"),
+        description: "General Ticket work with typed progress and completion tools.",
+        imports: &[BuiltinProfileImport {
+            specifier: "./default.dcdl",
+            resolved_path: DEFAULT_PATH,
+        }],
+    },
+    BuiltinProfileResource {
         selector: Some("builtin:coder"),
         path: "profiles/coder.dcdl",
         source: include_str!("../../../resources/profiles/coder.dcdl"),
@@ -211,4 +221,49 @@ pub fn builtin_profile_entrypoints() -> impl Iterator<Item = &'static BuiltinPro
     BUILTIN_PROFILE_RESOURCES
         .iter()
         .filter(|resource| resource.selector.is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn ticket_worker_catalog_import_graph_includes_default_and_base() {
+        // This snapshot supplies the Runtime profile source archive. Follow its
+        // declared edges rather than resolving against every catalog source.
+        let catalog = builtin_profile_catalog_snapshot();
+        let entrypoint = catalog.entrypoints["builtin:ticket-worker"].clone();
+        assert_eq!(
+            catalog
+                .imports
+                .get(&format!("{entrypoint}\0./default.dcdl")),
+            Some(&DEFAULT_PATH.to_owned())
+        );
+        assert_eq!(
+            catalog.imports.get(&format!("{DEFAULT_PATH}\0./base.dcdl")),
+            Some(&BASE_PATH.to_owned())
+        );
+
+        let mut pending = vec![entrypoint.clone()];
+        let mut reachable = BTreeSet::new();
+        while let Some(path) = pending.pop() {
+            if !reachable.insert(path.clone()) {
+                continue;
+            }
+            assert!(catalog.sources.contains_key(&path), "missing source {path}");
+            let prefix = format!("{path}\0");
+            pending.extend(
+                catalog
+                    .imports
+                    .iter()
+                    .filter(|(request, _)| request.starts_with(&prefix))
+                    .map(|(_, resolved)| resolved.clone()),
+            );
+        }
+        assert_eq!(
+            reachable,
+            BTreeSet::from([entrypoint, DEFAULT_PATH.to_owned(), BASE_PATH.to_owned()])
+        );
+    }
 }

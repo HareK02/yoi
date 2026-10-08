@@ -484,7 +484,7 @@ pub(crate) fn worker_spawn_idempotency(
     let Some(assignment) = request.ticket_assignment.as_ref() else {
         return Ok(None);
     };
-    let encoded = serde_json::to_vec(request)
+    let encoded = serde_json::to_vec(&(request, request.resolved_workdir_attachments.as_slice()))
         .map_err(|error| format!("serialize Worker spawn idempotency input: {error}"))?;
     Ok(Some((
         assignment.operation_id.clone(),
@@ -578,7 +578,7 @@ pub enum WorkerSpawnIntent {
 pub enum TicketWorkerRole {
     Intake,
     Orchestrator,
-    Coder,
+    Worker,
     Reviewer,
 }
 
@@ -6456,7 +6456,7 @@ fn worker_spawn_intent_label(intent: &WorkerSpawnIntent) -> &'static str {
         WorkerSpawnIntent::TicketRole { role, .. } => match role {
             TicketWorkerRole::Intake => "ticket_intake",
             TicketWorkerRole::Orchestrator => "ticket_orchestrator",
-            TicketWorkerRole::Coder => "ticket_coder",
+            TicketWorkerRole::Worker => "ticket_worker",
             TicketWorkerRole::Reviewer => "ticket_reviewer",
         },
     }
@@ -6520,6 +6520,27 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    #[test]
+    fn ticket_worker_spawn_intent_uses_worker_wire_role() {
+        let intent = WorkerSpawnIntent::TicketRole {
+            ticket_id: "ticket".into(),
+            role: TicketWorkerRole::Worker,
+        };
+        let encoded = json!({"kind": "ticket_role", "ticket_id": "ticket", "role": "worker"});
+        assert_eq!(serde_json::to_value(&intent).unwrap(), encoded);
+        assert_eq!(
+            serde_json::from_value::<WorkerSpawnIntent>(encoded).unwrap(),
+            intent
+        );
+        assert!(
+            serde_json::from_value::<WorkerSpawnIntent>(
+                json!({"kind": "ticket_role", "ticket_id": "ticket", "role": "coder"})
+            )
+            .is_err()
+        );
+        assert_eq!(worker_spawn_intent_label(&intent), "ticket_worker");
+    }
 
     #[test]
     fn remote_restore_transport_failure_requires_reconciliation() {
@@ -7538,7 +7559,7 @@ mod tests {
         WorkerSpawnRequest {
             intent: WorkerSpawnIntent::TicketRole {
                 ticket_id: "00001KVZSGT0Q".to_string(),
-                role: TicketWorkerRole::Coder,
+                role: TicketWorkerRole::Worker,
             },
             requested_worker_name: None,
             singleton_key: None,
@@ -7827,7 +7848,7 @@ mod tests {
                 WorkerSpawnRequest {
                     intent: WorkerSpawnIntent::TicketRole {
                         ticket_id: "00001KVZSGT0Q".to_string(),
-                        role: TicketWorkerRole::Coder,
+                        role: TicketWorkerRole::Worker,
                     },
                     requested_worker_name: Some("friendly-name-is-not-authority".to_string()),
                     singleton_key: None,
@@ -7939,7 +7960,7 @@ mod tests {
                 WorkerSpawnRequest {
                     intent: WorkerSpawnIntent::TicketRole {
                         ticket_id: "00001KVZSGT0Q".to_string(),
-                        role: TicketWorkerRole::Coder,
+                        role: TicketWorkerRole::Worker,
                     },
                     requested_worker_name: None,
                     singleton_key: None,

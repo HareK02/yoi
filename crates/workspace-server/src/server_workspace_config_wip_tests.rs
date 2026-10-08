@@ -259,7 +259,7 @@ async fn assert_config_catalog(runtime: &worker::wip::WipRuntime, attached: &Att
 async fn workspace_config_real_selected_invoke_backend_wip_edit_create_delete_import_and_unknown() {
     use worker::feature::builtin::workspace_config::wip::mount_workspace_config_wip;
     use worker::feature::builtin::workspace_config::{CONTENT_ROOT, WorkspaceConfigFeature};
-    let mut fixture = manual_coder_assignment_fixture().await;
+    let mut fixture = manual_worker_assignment_fixture().await;
     let identity = RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id).unwrap();
     configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
     let granted = grant(&fixture.api, &fixture.worker, Access::ReadWrite).await;
@@ -706,7 +706,7 @@ async fn workspace_config_actual_remote_and_embedded_clients_use_authenticated_w
         decode_runtime_request_source_claims,
     };
     // Remote Runtime-owned HTTP adapter, including its real request signer.
-    let mut fixture = manual_coder_assignment_fixture().await;
+    let mut fixture = manual_worker_assignment_fixture().await;
     let identity = RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id).unwrap();
     configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
     let claims = Arc::new(Mutex::new(Vec::new()));

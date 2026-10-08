@@ -2360,7 +2360,7 @@ impl SqliteTicketBackend {
             .event_attributes
             .get("source_actor_role")
             .map(String::as_str)
-            != Some("coder")
+            != Some("ticket_worker")
             && !self.event_attributes.contains_key("source_assignment_id")
         {
             return Ok(());
@@ -5679,6 +5679,41 @@ mod tests {
     }
 
     #[test]
+    fn unassigned_worker_actor_is_distinct_from_ticket_worker_requiring_assignment() {
+        for role in ["worker", "ticket_worker"] {
+            let tmp = TempDir::new().unwrap();
+            let backend = backend(&tmp);
+            let (reference, ticket) = backend
+                .create_with_snapshot(NewTicket::new("Actor boundary"))
+                .unwrap();
+            let source = backend.clone().with_event_attributes(BTreeMap::from([
+                ("source_actor_role".into(), role.into()),
+                ("source_runtime_id".into(), "runtime".into()),
+                ("source_worker_id".into(), "worker".into()),
+            ]));
+            let result = source.complete(&reference.id, completion_request(&ticket, "complete"));
+            if role == "worker" {
+                let completed = result.unwrap();
+                assert_eq!(
+                    completed
+                        .events
+                        .last()
+                        .unwrap()
+                        .attributes
+                        .get("source_actor_role")
+                        .map(String::as_str),
+                    Some("worker")
+                );
+            } else {
+                assert!(result.is_err());
+                let reread = backend.show(reference.id.into()).unwrap();
+                assert_eq!(reread.meta.workflow_state, ticket.meta.workflow_state);
+                assert_eq!(reread.events.len(), ticket.events.len());
+            }
+        }
+    }
+
+    #[test]
     fn assignment_fence_accepts_exact_live_source_inside_state_and_close_transaction() {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
@@ -5686,7 +5721,7 @@ mod tests {
             .create_with_snapshot(NewTicket::new("Active source"))
             .unwrap();
         active_assignment_fixture(&backend, &reference.id);
-        let source = backend.clone().with_event_attributes(assignment_source("coder"))
+        let source = backend.clone().with_event_attributes(assignment_source("ticket_worker"))
             .with_mutation_hook(Arc::new(|conn, _| {
                 assert!(!conn.is_autocommit());
                 let count: i64 = conn.query_row("SELECT COUNT(*) FROM ticket_active_worker_assignments WHERE runtime_id = 'runtime-a' AND worker_id = 'worker-a' AND assignment_id = 'assignment-a'", [], |row| row.get(0)).map_err(sqlite_err)?;
@@ -5735,7 +5770,7 @@ mod tests {
             "source_worker_id",
             "source_assignment_id",
         ] {
-            let mut attrs = assignment_source("coder");
+            let mut attrs = assignment_source("ticket_worker");
             attrs.insert(key.to_owned(), "other".to_owned());
             let source = backend.clone().with_event_attributes(attrs);
             assert!(
@@ -5763,7 +5798,7 @@ mod tests {
             .unwrap();
         let source = backend
             .clone()
-            .with_event_attributes(assignment_source("coder"));
+            .with_event_attributes(assignment_source("ticket_worker"));
         assert!(
             source
                 .complete(&other.id, completion_request(&other_ticket, "complete"))
@@ -5777,7 +5812,7 @@ mod tests {
             .unwrap();
         let source = other_workspace
             .clone()
-            .with_event_attributes(assignment_source("coder"));
+            .with_event_attributes(assignment_source("ticket_worker"));
         assert!(
             source
                 .complete(&other.id, completion_request(&other_ticket, "complete"))
@@ -5798,7 +5833,7 @@ mod tests {
             "source_worker_id",
             "source_assignment_id",
         ] {
-            let mut attrs = assignment_source("coder");
+            let mut attrs = assignment_source("ticket_worker");
             attrs.remove(key);
             let source = backend.clone().with_event_attributes(attrs);
             assert!(
@@ -5809,7 +5844,7 @@ mod tests {
         }
         let source = backend
             .clone()
-            .with_event_attributes(assignment_source("coder"));
+            .with_event_attributes(assignment_source("ticket_worker"));
         assert!(
             source
                 .complete(&reference.id, completion_request(&ticket, "complete"))
@@ -5838,7 +5873,7 @@ mod tests {
         active_assignment_fixture(&backend, &reference.id);
         let source = backend
             .clone()
-            .with_event_attributes(assignment_source("coder"));
+            .with_event_attributes(assignment_source("ticket_worker"));
         let request = completion_request(&ticket, "complete");
         let completed = source.complete(&reference.id, request.clone()).unwrap();
         release_assignment_fixture(&backend);
@@ -5906,7 +5941,7 @@ mod tests {
         active_assignment_fixture(&backend, &reference.id);
         let source = backend
             .clone()
-            .with_event_attributes(assignment_source("coder"));
+            .with_event_attributes(assignment_source("ticket_worker"));
         let request = completion_request(&ticket, "complete");
         let completed = source.complete(&reference.id, request.clone()).unwrap();
         release_assignment_fixture(&backend);
@@ -5916,7 +5951,7 @@ mod tests {
             "source_assignment_id",
             "source_actor_role",
         ] {
-            let mut attrs = assignment_source("coder");
+            let mut attrs = assignment_source("ticket_worker");
             attrs.insert(key.to_owned(), "different-source".to_owned());
             let other_source = backend.clone().with_event_attributes(attrs);
             assert!(matches!(
@@ -6069,7 +6104,7 @@ mod tests {
         active_assignment_fixture(&backend, &reference.id);
         let source = backend
             .clone()
-            .with_event_attributes(assignment_source("coder"));
+            .with_event_attributes(assignment_source("ticket_worker"));
         let request = completion_request(&ticket, "complete");
         let completed = source.complete(&reference.id, request.clone()).unwrap();
         release_assignment_fixture(&backend);

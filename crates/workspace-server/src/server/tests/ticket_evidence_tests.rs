@@ -74,8 +74,8 @@ impl EvidenceApiFixture {
             .unwrap();
         let assignment_id = "evidence-assignment".to_string();
         api.store
-            .set_current_ticket_coder_assignment(
-                &TicketCoderAssignmentRecord {
+            .set_current_ticket_worker_assignment(
+                &TicketWorkerAssignmentRecord {
                     workspace_id: TEST_WORKSPACE_ID.into(),
                     ticket_id: ticket_id.clone(),
                     assignment_id: assignment_id.clone(),
@@ -319,7 +319,7 @@ async fn done_merged_remote_ticket_uses_immutable_result_in_show_query_list_and_
         fixture
             .api
             .store
-            .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
             .unwrap()
             .is_some()
     );
@@ -512,7 +512,7 @@ async fn open_source_without_runtime_is_typed_unavailable_not_stale_after_rescop
         fixture
             .api
             .store
-            .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
             .unwrap()
             .is_some()
     );

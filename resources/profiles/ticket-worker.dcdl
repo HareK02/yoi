@@ -1,0 +1,17 @@
+import "./default.dcdl" // {
+    slug = "ticket-worker";
+    description = "General Ticket work with typed progress and completion tools.";
+    engine = {
+        instruction = "role.ticket_worker";
+    };
+
+    feature = {
+        ticket = {
+            enabled = true;
+            authoring = false;
+            thread = true;
+            intake = false;
+            workflow = false;
+        };
+    };
+}

@@ -129,7 +129,7 @@ mod workspace_config_integration {
 
     #[tokio::test]
     async fn workspace_config_signed_editor_routes_cannot_bypass_wip_authority() {
-        let mut fixture = manual_coder_assignment_fixture().await;
+        let mut fixture = manual_worker_assignment_fixture().await;
         let identity = RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id).unwrap();
         configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
         let api = &fixture.api;
@@ -222,7 +222,7 @@ mod workspace_config_integration {
 
     #[tokio::test]
     async fn workspace_config_entrypoint_support_is_exact_and_canonical_mutations_stay_guarded() {
-        let fixture = manual_coder_assignment_fixture().await;
+        let fixture = manual_worker_assignment_fixture().await;
         let api = &fixture.api;
         grant(api, &fixture.worker, Access::ReadWrite).await;
         let attached = attach(api, &fixture.worker).await;
@@ -299,7 +299,7 @@ mod workspace_config_integration {
 
     #[tokio::test]
     async fn workspace_config_grants_owner_scope_and_signed_routes() {
-        let mut fixture = manual_coder_assignment_fixture().await;
+        let mut fixture = manual_worker_assignment_fixture().await;
         let identity = RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id).unwrap();
         configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
         let api = &fixture.api;
@@ -615,7 +615,7 @@ mod workspace_config_integration {
 
     #[tokio::test]
     async fn workspace_config_readonly_revoke_and_conditional_lifetime_fences() {
-        let fixture = manual_coder_assignment_fixture().await;
+        let fixture = manual_worker_assignment_fixture().await;
         let api = &fixture.api;
         let read_grant = grant(api, &fixture.worker, Access::ReadOnly).await;
         assert!(
@@ -827,7 +827,7 @@ mod workspace_config_integration {
 
     #[tokio::test]
     async fn workspace_config_two_workers_ui_cas_and_identical_virtual_replacement() {
-        let fixture = manual_coder_assignment_fixture().await;
+        let fixture = manual_worker_assignment_fixture().await;
         let api = &fixture.api;
         let second = second_worker(&fixture).await;
         grant(api, &fixture.worker, Access::ReadWrite).await;
@@ -982,7 +982,7 @@ mod workspace_config_integration {
 
     #[tokio::test]
     async fn workspace_config_invalid_bounds_and_failed_save_do_not_corrupt_tree() {
-        let fixture = manual_coder_assignment_fixture().await;
+        let fixture = manual_worker_assignment_fixture().await;
         let api = &fixture.api;
         grant(api, &fixture.worker, Access::ReadWrite).await;
         let attached = attach(api, &fixture.worker).await;
@@ -1114,7 +1114,7 @@ mod workspace_config_integration {
 
     #[tokio::test]
     async fn workspace_config_operation_and_revoke_share_the_detach_session_lock() {
-        let fixture = manual_coder_assignment_fixture().await;
+        let fixture = manual_worker_assignment_fixture().await;
         let api = &fixture.api;
         let granted = grant(api, &fixture.worker, Access::ReadWrite).await;
         let attached = attach(api, &fixture.worker).await;
@@ -1168,7 +1168,7 @@ mod workspace_config_integration {
     }
     #[tokio::test]
     async fn workspace_config_grant_restart_source_immutability_and_owner_acceptance_guard() {
-        let fixture = manual_coder_assignment_fixture().await;
+        let fixture = manual_worker_assignment_fixture().await;
         let api = &fixture.api;
         let granted = grant(api, &fixture.worker, Access::ReadWrite).await;
         let attached = attach(api, &fixture.worker).await;
@@ -1255,7 +1255,7 @@ mod workspace_config_integration {
 
     #[tokio::test]
     async fn workspace_config_auxiliary_secret_effects_are_unknown_not_false_rollback() {
-        let fixture = manual_coder_assignment_fixture().await;
+        let fixture = manual_worker_assignment_fixture().await;
         let api = &fixture.api;
         grant(api, &fixture.worker, Access::ReadWrite).await;
         let attached = attach(api, &fixture.worker).await;
@@ -1324,7 +1324,7 @@ mod workspace_config_integration {
     }
     #[tokio::test]
     async fn workspace_config_observe_node_limit_is_complete_or_error_not_silent_truncation() {
-        let fixture = manual_coder_assignment_fixture().await;
+        let fixture = manual_worker_assignment_fixture().await;
         let api = &fixture.api;
         grant(api, &fixture.worker, Access::ReadWrite).await;
         let attached = attach(api, &fixture.worker).await;

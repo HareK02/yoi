@@ -368,11 +368,9 @@ fn apply_profile_launch_policy(
             apply_scope_launch_defaults(&mut manifest.scope, default_scope);
             manifest.delegation_scope = ScopeConfig::default();
         }
-        Some(TicketRole::Coder) => {
-            let default_scope = workspace_scope(workspace_root, Permission::Write, &[]);
-            apply_scope_launch_defaults(&mut manifest.scope, default_scope);
-            manifest.delegation_scope = ScopeConfig::default();
-        }
+        // Work assignment is not a filesystem or delegation grant. The selected
+        // Profile and explicit resource bindings remain the authority.
+        Some(TicketRole::Worker) => {}
         None => {
             let worktree_root = workspace_root.join(".worktree");
             let default_scope = workspace_scope(
@@ -870,6 +868,41 @@ language = "override"
         assert_eq!(manifest.worker.name, "runtime-workspace");
         assert_ne!(manifest.engine.language, "override");
         assert_scope_contains(&manifest.scope.allow, &workspace, Permission::Write);
+    }
+
+    #[test]
+    fn ticket_worker_role_preserves_profile_scope_and_delegation_without_adding_grants() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let explicit_scope = ScopeConfig {
+            allow: vec![scope_rule(&workspace.join("documents"), Permission::Write)],
+            deny: vec![scope_rule(
+                &workspace.join("documents/private"),
+                Permission::Write,
+            )],
+        };
+        let explicit_delegation = ScopeConfig {
+            allow: vec![scope_rule(&workspace.join("reference"), Permission::Read)],
+            deny: vec![scope_rule(
+                &workspace.join("reference/private"),
+                Permission::Read,
+            )],
+        };
+        for (scope, delegation) in [
+            (ScopeConfig::default(), ScopeConfig::default()),
+            (explicit_scope, explicit_delegation),
+        ] {
+            let (mut manifest, _) = load_builtin_default_manifest("ticket-worker").unwrap();
+            manifest.scope = scope.clone();
+            manifest.delegation_scope = delegation.clone();
+
+            apply_profile_launch_policy(&mut manifest, &workspace, Some("worker")).unwrap();
+
+            assert_eq!(manifest.scope.allow, scope.allow);
+            assert_eq!(manifest.scope.deny, scope.deny);
+            assert_eq!(manifest.delegation_scope.allow, delegation.allow);
+            assert_eq!(manifest.delegation_scope.deny, delegation.deny);
+        }
     }
 
     #[test]
