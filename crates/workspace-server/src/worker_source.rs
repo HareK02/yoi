@@ -3,120 +3,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderMap;
 use worker_runtime::auth::{
-    RuntimeRequestSourceExpectation, WorkerMutationActorKind, WorkerMutationOperation,
-    WorkerMutationSourceClaims, WorkerMutationSourceExpectation,
-    decode_runtime_request_source_claims, decode_worker_mutation_source_claims,
-    verify_runtime_request_source, verify_worker_mutation_source_proof,
+    WorkerMutationActorKind, WorkerMutationOperation, WorkerMutationSourceClaims,
+    WorkerMutationSourceExpectation, decode_worker_mutation_source_claims,
+    verify_worker_mutation_source_proof,
 };
 use worker_runtime::worker_source::InProcessWorkerMutationProof;
 
 use crate::server::{ServerConfig, WorkspaceApi};
-use crate::store::ControlPlaneStore;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VerifiedRuntimeRequestSource {
-    pub runtime_id: String,
-    pub worker_id: Option<String>,
-}
-
-pub async fn verify_runtime_request_source_proof(
-    api: &WorkspaceApi,
-    proof: &str,
-    workspace_id: &str,
-    permission: &str,
-    method: &str,
-    path: &str,
-    body_digest: &str,
-) -> Result<VerifiedRuntimeRequestSource, WorkerMutationSourceProofError> {
-    verify_runtime_request_source_proof_with_store(
-        api.store.as_ref(),
-        &api.config,
-        proof,
-        workspace_id,
-        permission,
-        method,
-        path,
-        body_digest,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn verify_runtime_request_source_proof_with_store(
-    store: &dyn ControlPlaneStore,
-    config: &ServerConfig,
-    proof: &str,
-    workspace_id: &str,
-    permission: &str,
-    method: &str,
-    path: &str,
-    body_digest: &str,
-) -> Result<VerifiedRuntimeRequestSource, WorkerMutationSourceProofError> {
-    let unverified = decode_runtime_request_source_claims(proof)
-        .map_err(|_| WorkerMutationSourceProofError::Invalid)?;
-    let audience = remote_audience(config, workspace_id)?;
-    let trusted = store
-        .get_workspace_runtime_binding(workspace_id, &unverified.iss)
-        .await
-        .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?
-        .filter(|record| record.revoked_at.is_none())
-        .ok_or(WorkerMutationSourceProofError::RevokedRuntimeTrust)?;
-    let public_key = trusted.public_key.as_str();
-    let expected = RuntimeRequestSourceExpectation {
-        identity_id: &unverified.iss,
-        audience: audience.as_ref(),
-        workspace_id,
-        worker_id: unverified.worker_id.as_deref(),
-        permission,
-        method,
-        path,
-        body_digest,
-        now_unix: i64::try_from(unix_now_seconds()).unwrap_or(i64::MAX),
-    };
-    let claims =
-        verify_runtime_request_source(proof, public_key, &expected).map_err(map_auth_error)?;
-    let now_seconds = u64::try_from(expected.now_unix).unwrap_or(u64::MAX);
-    let expires_at = u64::try_from(claims.exp).unwrap_or(0);
-    let consumed_at = chrono::DateTime::from_timestamp(expected.now_unix, 0)
-        .ok_or(WorkerMutationSourceProofError::Expired)?
-        .to_rfc3339();
-    if !store
-        .consume_worker_mutation_source_jti(
-            workspace_id,
-            &claims.iss,
-            &claims.jti,
-            expires_at,
-            now_seconds,
-            &consumed_at,
-        )
-        .await
-        .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?
-    {
-        return Err(WorkerMutationSourceProofError::Replay);
-    }
-    if let Some(worker_id) = claims.worker_id.as_deref() {
-        let worker = worker_runtime::identity::RuntimeWorkerRef {
-            runtime_id: claims.iss.clone(),
-            worker_id: worker_id.to_owned(),
-        };
-        let member = store
-            .get_worker_registry(workspace_id, &worker)
-            .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?;
-        let reserved = store
-            .has_active_worker_create_reservation(workspace_id, &worker)
-            .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?;
-        if member.is_none() && !reserved {
-            return Err(WorkerMutationSourceProofError::WorkerCatalogMembership);
-        }
-        store
-            .require_current_worker_singleton_owner(workspace_id, &worker)
-            .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?;
-    }
-    Ok(VerifiedRuntimeRequestSource {
-        runtime_id: claims.iss,
-        worker_id: claims.worker_id,
-    })
-}
+mod runtime_request;
+pub use runtime_request::{
+    RuntimeRequestProofError, VerifiedRuntimeRequestSource, diagnostic_id_hash,
+    verify_runtime_request_source_proof, verify_runtime_request_source_proof_with_store,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PresentedWorkerMutationSourceProof<'a> {

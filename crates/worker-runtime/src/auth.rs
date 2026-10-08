@@ -42,7 +42,11 @@ pub enum RuntimeAuthError {
     #[error("runtime request proof contains an invalid `{0}` claim")]
     InvalidClaim(&'static str),
     #[error("runtime request proof does not match the HTTP request")]
-    ClaimMismatch,
+    ClaimMismatch(RuntimeRequestClaim),
+    #[error("runtime request proof was issued in the future")]
+    RequestIssuedInFuture { iat: i64, exp: i64, now: i64 },
+    #[error("runtime request proof has expired")]
+    RequestExpired { iat: i64, exp: i64, now: i64 },
     #[error("unknown token issuer `{0}`")]
     UnknownIssuer(String),
     #[error("invalid token signature")]
@@ -171,6 +175,19 @@ pub struct RuntimeAuthContext {
     pub expires_at: u64,
 }
 
+/// The first mismatching signed claim, in verification order. No input values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeRequestClaim {
+    Issuer,
+    Audience,
+    Workspace,
+    Worker,
+    Permission,
+    Method,
+    Path,
+    BodyDigest,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeRequestSourceClaims {
     pub iss: String,
@@ -293,19 +310,54 @@ pub fn verify_runtime_request_source(
         public_key,
     )?;
     let claims = signed.claims;
-    if claims.iss != expected.identity_id
-        || claims.aud != expected.audience
-        || claims.workspace_id != expected.workspace_id
-        || claims.worker_id.as_deref() != expected.worker_id
-        || claims.permission != expected.permission
-        || claims.method != expected.method
-        || claims.path != expected.path
-        || claims.body_digest != expected.body_digest
-    {
-        return Err(RuntimeAuthError::ClaimMismatch);
+    for (matches, claim) in [
+        (
+            claims.iss == expected.identity_id,
+            RuntimeRequestClaim::Issuer,
+        ),
+        (
+            claims.aud == expected.audience,
+            RuntimeRequestClaim::Audience,
+        ),
+        (
+            claims.workspace_id == expected.workspace_id,
+            RuntimeRequestClaim::Workspace,
+        ),
+        (
+            claims.worker_id.as_deref() == expected.worker_id,
+            RuntimeRequestClaim::Worker,
+        ),
+        (
+            claims.permission == expected.permission,
+            RuntimeRequestClaim::Permission,
+        ),
+        (
+            claims.method == expected.method,
+            RuntimeRequestClaim::Method,
+        ),
+        (claims.path == expected.path, RuntimeRequestClaim::Path),
+        (
+            claims.body_digest == expected.body_digest,
+            RuntimeRequestClaim::BodyDigest,
+        ),
+    ] {
+        if !matches {
+            return Err(RuntimeAuthError::ClaimMismatch(claim));
+        }
     }
-    if claims.iat > expected.now_unix || claims.exp < expected.now_unix {
-        return Err(RuntimeAuthError::Expired);
+    if claims.iat > expected.now_unix {
+        return Err(RuntimeAuthError::RequestIssuedInFuture {
+            iat: claims.iat,
+            exp: claims.exp,
+            now: expected.now_unix,
+        });
+    }
+    if claims.exp < expected.now_unix {
+        return Err(RuntimeAuthError::RequestExpired {
+            iat: claims.iat,
+            exp: claims.exp,
+            now: expected.now_unix,
+        });
     }
     Ok(claims)
 }
@@ -705,12 +757,191 @@ mod tests {
         };
         assert!(matches!(
             verify_runtime_request_source(&proof, &trusted.public_key, &changed_body),
-            Err(RuntimeAuthError::ClaimMismatch)
+            Err(RuntimeAuthError::ClaimMismatch(
+                RuntimeRequestClaim::BodyDigest
+            ))
         ));
         let spoofed = RuntimeIdentityMaterial::generate("runtime-main").unwrap();
         assert!(matches!(
             verify_runtime_request_source(&proof, &spoofed.public_key, &expected),
             Err(RuntimeAuthError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn runtime_request_proof_preserves_inclusive_time_bounds_and_reports_exact_rejections() {
+        let runtime = RuntimeIdentityMaterial::generate("runtime-main").unwrap();
+        let signer = RuntimeRequestSourceSigner::from_identity(&runtime);
+        let proof = signer
+            .issue(
+                "server",
+                "workspace",
+                None,
+                "permission",
+                "POST",
+                "/request",
+                b"{}",
+                90,
+                10,
+            )
+            .unwrap();
+        let digest = request_body_digest(b"{}");
+        let expected = RuntimeRequestSourceExpectation {
+            identity_id: "runtime-main",
+            audience: "server",
+            workspace_id: "workspace",
+            worker_id: None,
+            permission: "permission",
+            method: "POST",
+            path: "/request",
+            body_digest: &digest,
+            now_unix: 90,
+        };
+        for now in [90, 99, 100] {
+            assert!(
+                verify_runtime_request_source(
+                    &proof,
+                    &runtime.public_key,
+                    &RuntimeRequestSourceExpectation {
+                        now_unix: now,
+                        ..expected.clone()
+                    }
+                )
+                .is_ok()
+            );
+        }
+        for (now, future) in [(89, true), (101, false)] {
+            let error = verify_runtime_request_source(
+                &proof,
+                &runtime.public_key,
+                &RuntimeRequestSourceExpectation {
+                    now_unix: now,
+                    ..expected.clone()
+                },
+            )
+            .unwrap_err();
+            match error {
+                RuntimeAuthError::RequestIssuedInFuture {
+                    iat,
+                    exp,
+                    now: verified,
+                } if future => assert_eq!((iat, exp, verified), (90, 100, now)),
+                RuntimeAuthError::RequestExpired {
+                    iat,
+                    exp,
+                    now: verified,
+                } if !future => assert_eq!((iat, exp, verified), (90, 100, now)),
+                other => panic!("unexpected rejection: {other:?}"),
+            }
+        }
+        for (claim, expectation) in [
+            (
+                RuntimeRequestClaim::Issuer,
+                RuntimeRequestSourceExpectation {
+                    identity_id: "other",
+                    ..expected.clone()
+                },
+            ),
+            (
+                RuntimeRequestClaim::Audience,
+                RuntimeRequestSourceExpectation {
+                    audience: "other",
+                    ..expected.clone()
+                },
+            ),
+            (
+                RuntimeRequestClaim::Workspace,
+                RuntimeRequestSourceExpectation {
+                    workspace_id: "other",
+                    ..expected.clone()
+                },
+            ),
+            (
+                RuntimeRequestClaim::Worker,
+                RuntimeRequestSourceExpectation {
+                    worker_id: Some("other"),
+                    ..expected.clone()
+                },
+            ),
+            (
+                RuntimeRequestClaim::Permission,
+                RuntimeRequestSourceExpectation {
+                    permission: "other",
+                    ..expected.clone()
+                },
+            ),
+            (
+                RuntimeRequestClaim::Method,
+                RuntimeRequestSourceExpectation {
+                    method: "GET",
+                    ..expected.clone()
+                },
+            ),
+            (
+                RuntimeRequestClaim::Path,
+                RuntimeRequestSourceExpectation {
+                    path: "/other",
+                    ..expected.clone()
+                },
+            ),
+            (
+                RuntimeRequestClaim::BodyDigest,
+                RuntimeRequestSourceExpectation {
+                    body_digest: "other",
+                    ..expected.clone()
+                },
+            ),
+        ] {
+            assert!(
+                matches!(verify_runtime_request_source(&proof, &runtime.public_key, &expectation), Err(RuntimeAuthError::ClaimMismatch(actual)) if actual == claim)
+            );
+        }
+        assert!(matches!(
+            verify_runtime_request_source(
+                &proof,
+                &runtime.public_key,
+                &RuntimeRequestSourceExpectation {
+                    audience: "other",
+                    now_unix: 101,
+                    ..expected.clone()
+                }
+            ),
+            Err(RuntimeAuthError::ClaimMismatch(
+                RuntimeRequestClaim::Audience
+            ))
+        ));
+        let spoofed = RuntimeIdentityMaterial::generate("runtime-main").unwrap();
+        assert!(matches!(
+            verify_runtime_request_source(
+                &proof,
+                &spoofed.public_key,
+                &RuntimeRequestSourceExpectation {
+                    now_unix: 101,
+                    ..expected.clone()
+                }
+            ),
+            Err(RuntimeAuthError::InvalidSignature)
+        ));
+        let mut claims = decode_runtime_request_source_claims(&proof).unwrap();
+        claims.iat = 101;
+        claims.exp = 89;
+        let contradictory = sign_json_token(
+            RUNTIME_REQUEST_SOURCE_PROOF_PREFIX,
+            RUNTIME_REQUEST_SOURCE_SIGNING_INPUT_PREFIX,
+            &runtime.signing_key().unwrap(),
+            &claims,
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_runtime_request_source(
+                &contradictory,
+                &runtime.public_key,
+                &RuntimeRequestSourceExpectation {
+                    now_unix: 100,
+                    ..expected.clone()
+                }
+            ),
+            Err(RuntimeAuthError::RequestIssuedInFuture { .. })
         ));
     }
 
@@ -749,7 +980,9 @@ mod tests {
         };
         assert!(matches!(
             verify_runtime_request_source(&proof, &runtime.public_key, &wrong_workspace),
-            Err(RuntimeAuthError::ClaimMismatch)
+            Err(RuntimeAuthError::ClaimMismatch(
+                RuntimeRequestClaim::Workspace
+            ))
         ));
         let expired = RuntimeRequestSourceExpectation {
             now_unix: 101,
@@ -757,7 +990,11 @@ mod tests {
         };
         assert!(matches!(
             verify_runtime_request_source(&proof, &runtime.public_key, &expired),
-            Err(RuntimeAuthError::Expired)
+            Err(RuntimeAuthError::RequestExpired {
+                iat: 90,
+                exp: 100,
+                now: 101
+            })
         ));
     }
 }

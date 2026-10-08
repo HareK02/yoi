@@ -2632,34 +2632,30 @@ fn runtime_request_proof_rejection(
     method: &str,
     path: &str,
     workspace_id: &str,
-    error: &crate::worker_source::WorkerMutationSourceProofError,
+    error: &crate::worker_source::RuntimeRequestProofError,
 ) -> Response {
-    use crate::worker_source::WorkerMutationSourceProofError;
-
-    // Do not format the error itself: Authority and MissingPermission can carry
-    // internal or request-derived strings. Only emit allowlisted reason codes.
-    let reason = match error {
-        WorkerMutationSourceProofError::Missing => "missing",
-        WorkerMutationSourceProofError::Invalid => "invalid",
-        WorkerMutationSourceProofError::WrongAudience => "wrong_audience",
-        WorkerMutationSourceProofError::WrongWorkspace => "wrong_workspace",
-        WorkerMutationSourceProofError::WrongActor => "wrong_actor",
-        WorkerMutationSourceProofError::MissingPermission(_) => "missing_permission",
-        WorkerMutationSourceProofError::Expired => "expired",
-        WorkerMutationSourceProofError::RevokedRuntimeTrust => "runtime_trust_missing_or_revoked",
-        WorkerMutationSourceProofError::Replay => "replay",
-        WorkerMutationSourceProofError::WorkerCatalogMembership => "worker_catalog_membership",
-        WorkerMutationSourceProofError::Authority(_) => "authority_unavailable",
-    };
+    // Never format an error or raw claims. IDs are fixed-length fingerprints;
+    // verification labels describe proof-check progress, not authorization.
     let path = path.split('?').next().unwrap_or(path);
+    let log_path = bounded_auth_log_value(path, 512);
+    let method = bounded_auth_log_value(method, 32);
+    let workspace_id = bounded_auth_log_value(workspace_id, 128);
+    let request_id = uuid::Uuid::now_v7().to_string();
     tracing::warn!(
         target: "yoi::auth",
         event = "runtime_request_proof_rejected",
-        method,
-        path,
-        workspace_id,
+        method, path = log_path, workspace_id, request_id,
         status = 401,
-        reason,
+        reason = error.reason,
+        proof_verification = error.verification,
+        claimed_runtime_id_hash = error.runtime_id_hash.as_deref(),
+        claimed_worker_id_hash = error.worker_id_hash.as_deref(),
+        claimed_token_id_hash = error.token_id_hash.as_deref(),
+        issued_at_unix = error.iat,
+        expires_at_unix = error.exp,
+        verified_at_unix = error.now,
+        time_delta_seconds = error.time_delta_seconds,
+        time_tolerance_seconds = error.time_delta_seconds.map(|_| 0_u64),
         "Runtime request proof rejected",
     );
     repository_api_rejection(
@@ -2667,6 +2663,17 @@ fn runtime_request_proof_rejection(
         StatusCode::UNAUTHORIZED,
         "invalid runtime request proof",
     )
+}
+
+fn bounded_auth_log_value(value: &str, max_bytes: usize) -> String {
+    let mut result = String::new();
+    for ch in value.chars().filter(|ch| !ch.is_control()) {
+        if result.len() + ch.len_utf8() > max_bytes {
+            break;
+        }
+        result.push(ch);
+    }
+    result
 }
 
 /// Authored configuration editors are user-facing authority, not a generic
@@ -55527,7 +55534,10 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            Err(crate::worker_source::WorkerMutationSourceProofError::RevokedRuntimeTrust)
+            Err(crate::worker_source::RuntimeRequestProofError {
+                reason: "runtime_trust_missing_or_revoked",
+                ..
+            })
         ));
     }
 
@@ -55603,7 +55613,10 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            Err(crate::worker_source::WorkerMutationSourceProofError::WorkerCatalogMembership)
+            Err(crate::worker_source::RuntimeRequestProofError {
+                reason: "worker_catalog_membership",
+                ..
+            })
         ));
     }
 
