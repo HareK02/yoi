@@ -516,6 +516,11 @@ impl ReceivedResponse {
         serde_json::from_slice(&self.bytes).map_err(|_| ClientFailure::Decode { kind })
     }
 
+    /// Move the exact response bytes, already collected under the configured limit, into a body.
+    pub fn decode_binary(self) -> crate::BinaryBody {
+        self.bytes.into()
+    }
+
     pub fn require_empty(&self) -> Result<(), ClientFailure> {
         if self.bytes.is_empty() {
             Ok(())

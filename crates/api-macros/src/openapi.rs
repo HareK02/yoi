@@ -419,6 +419,25 @@ impl OpenApiOperation<'_> {
         )
     }
 
+    /// Describe an octet-stream response inline, without registering a JSON schema component.
+    pub fn binary_response(
+        &mut self,
+        status: u16,
+        description: &'static str,
+    ) -> Result<(), OpenApiError> {
+        self.insert_response(
+            status,
+            json!({
+                "description": description,
+                "content": {
+                    "application/octet-stream": {
+                        "schema": { "type": "string", "format": "binary" }
+                    }
+                },
+            }),
+        )
+    }
+
     pub fn empty_response(
         &mut self,
         status: u16,
