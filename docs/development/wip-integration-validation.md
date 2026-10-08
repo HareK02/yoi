@@ -115,10 +115,76 @@ permission identity and ToolOutput/attachments.
 - `WipMountRegistry::mount_interface` adds a separate static Interface namespace
   without replacing Object ownership or flattening same-named operations. It does
   not overlay stale registration metadata onto a live subtree provider.
-- FS indexable boundaries and directory.list remain provider policy. This change
-  deliberately does not implement the separate T-714 boundary/list migration.
-  Relevant transport/commit tests are `checkout_wip_tests.rs`,
-  `checkout_http_tests.rs`, and `checkout_race_tests.rs`.
+- FS indexable boundaries and directory.list are provider policy. T-714 now
+  implements entrance-only trees and bounded typed discovery (details below).
+  Transport/commit tests are `checkout_wip_tests.rs`, `checkout_http_tests.rs`,
+  and `checkout_race_tests.rs`.
 - Worldspace state is runtime-only. Historical opaque references in append-only
   session/tool history are not migrated into cache or parsed for a guessed scope;
   a restored Client starts with fresh observations and direct path Inspect.
+
+## T-714 checkout discovery validation
+
+Based on integrated T-713 at `f9d4c97f`, still using the exact released crates.io
+0.2.0 SDK and official renderer. No alternate wire, renderer or upstream version
+was introduced. The checkout projection design documents provider live pagination,
+its ordering/cursor/byte ceilings, special-entry policy and the distinction between
+indexable emptiness and empty filesystem directories.
+
+Focused regressions:
+
+```sh
+cargo test -p worker --lib checkout_wip
+cargo test -p worker --lib checkout::race_tests
+cargo test -p worker --lib checkout_http_tests
+cargo test -p worker --lib ancestor_tests
+cargo test -p tools --lib checkout_list
+cargo test -p fs-operation --test list_pagination
+cargo test -p workdir --test list_pagination
+```
+
+Host depth-zero omission / positive-depth `children: []`, empty/small/1100-entry
+folders, direct deep roots and zero provider content-List calls during observation
+are tested independently of Client output. Registered model tools exercise entrance
+self-scope and deep target ancestor-scope, paginated List/Glob/Grep typed entries,
+lazy selected Inspect with official signatures/path context, and Read without
+COMMAND. Acquired paths never become tree edges; a stalled result observation is
+never awaited and disappearance only fails a later explicit Inspect. Remote HTTP
+checks verify List continuation on the wire with no ordinary List fallback or
+response credentials/host-path leakage. Provider tests cover scoped External and
+nested cwd/output_root rebasing, nonrecursive enumeration/read authority, ignore
+policy, live mutations, byte bounds, cancellation and malicious cursor/result DTOs.
+
+`WipSubtreeProvider::interface_target` is a routing hint for target-qualified local
+names under ancestor scopes. The default retains self/shared-scope behavior. Host
+checks provider ownership and resolves **one** coherent current target/scope
+publication; it never treats the hint as authorization or fetches a scope in an
+independent mutable lookup. Focused Host tests reject forged/outside/prefix/missing
+hints, ref-less deletion and absent membership while preserving existing ancestor
+ref/validator and in-flight snapshots. Actual checkout tests reject sibling/prefix
+scopes, supplied refs when current publication has none and stale alias generations;
+ordinary content updates do not terminate the entrance Interface lifetime.
+
+Completion validation:
+
+- Root `cargo check` passed.
+- `cargo test -p fs-operation -p workdir -p tools -p worker` passed: FS **58 unit +
+  6 pagination**; Workdir **125 unit + 5 pagination**; Tools **84 unit + 39
+  integration + 1 doctest**; Worker **901 unit + 110 integration**.
+- `cargo test -p workdir --features http-client` passed (**125 + 5**).
+- `cargo test -p yoi-workspace-server` passed (**691 unit + 11 CLI**).
+- `cargo test -p server-api` passed (**83**, including checked-in OpenAPI/TypeScript
+  freshness). No generated API artifact changes were needed.
+- `node scripts/verify-wip-dependencies.mjs` confirmed one crates.io 0.2.0 Protocol
+  source and all four exact SDK packages. `cargo fmt --all -- --check` and
+  `git diff --check HEAD` passed.
+
+The first dependent Server test build exposed predecessor fixtures still using
+removed `discover`/opaque strings/private `call`. Those tests now select structured
+references from actual path Inspect and use public Tree/Inspect/Invoke; the complete
+Server suite above includes configuration integration and the typed Workdir proxy.
+Its dev-only Protocol dependency reuses the same locked SDK source; the resolved
+package/version set is unchanged.
+
+No full workspace test, full Nix/image build, deployment, target integration or
+live dogfood update is claimed. Target movement remains Orchestrator authority.

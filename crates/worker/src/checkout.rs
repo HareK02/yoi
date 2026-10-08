@@ -11,11 +11,12 @@ use manifest::{ToolPermissionAction, ToolPermissionConfig};
 use serde_json::{Value as Json, json};
 use sha2::{Digest, Sha256};
 use wip_protocol::{
-    Documentation, INTERFACE_FORMAT_V1, InterfaceDescriptor, Object, OperationDeclaration,
-    ParameterDeclaration, ProtocolError, ProtocolErrorCode, ReturnDeclaration, TypeExpr, Value,
+    Documentation, FieldDeclaration, INTERFACE_FORMAT_V1, InterfaceDescriptor, Object,
+    OperationDeclaration, ParameterDeclaration, ProtocolError, ProtocolErrorCode,
+    ReturnDeclaration, TypeExpr, Value,
 };
 use workdir::{
-    CheckoutObservation, EntryKind, ListRequest, WorkdirPath, WorkdirSessionCapability as Cap,
+    CheckoutObservation, EntryKind, WorkdirPath, WorkdirSessionCapability as Cap,
     WorkdirSessionRouter,
 };
 
@@ -126,11 +127,15 @@ impl Provider {
         }
         self.project(
             ROOT,
-            descriptor(vec![operation(
-                "list",
-                "List currently accessible checkouts",
-                vec![],
-            )]),
+            descriptor(vec![{
+                let mut op = operation(
+                    "list",
+                    "List accessible checkout entrances (not filesystem contents)",
+                    vec![],
+                );
+                op.returns.r#type = TypeExpr::Json;
+                op
+            }]),
             state.finalize().to_vec(),
             "collection",
             Arc::new(Collection {
@@ -169,8 +174,14 @@ impl Provider {
         }
     }
     async fn node(self: &Arc<Self>, path: &str) -> Result<Option<WipProjection>, ProtocolError> {
+        Ok(self.publication_inner(path).await?.map(|p| p.projection))
+    }
+    async fn publication_inner(
+        self: &Arc<Self>,
+        path: &str,
+    ) -> Result<Option<WipPublication>, ProtocolError> {
         if path == ROOT {
-            return Ok(Some(self.collection()));
+            return WipPublication::self_scoped(self.collection()).map(Some);
         }
         let Some((alias, target)) = self.parse(path) else {
             return Ok(None);
@@ -202,39 +213,86 @@ impl Provider {
         if observation.kind == EntryKind::File && !self.allowed("Read", &permission_input) {
             return Ok(None);
         }
+        let workdir = selected.session.workdir().id().as_str().to_owned();
+        let root = checkout_root(&alias);
+        // The router guard pins this connection across both observations. Root
+        // lifetime is attachment lifetime, not directory-content validator state.
+        let scope = if target.is_root() {
+            None
+        } else {
+            let root_observation =
+                match selected.session.checkout_observe(WorkdirPath::root()).await {
+                    Ok(o) => o,
+                    Err(_) => return Ok(None),
+                };
+            self.entry_projection(
+                &root,
+                &alias,
+                selected.generation,
+                &workdir,
+                WorkdirPath::root(),
+                root_observation,
+            )
+        };
+        let Some(projection) = self.entry_projection(
+            path,
+            &alias,
+            selected.generation,
+            &workdir,
+            target,
+            observation,
+        ) else {
+            return Ok(None);
+        };
+        if path == root {
+            return WipPublication::self_scoped(projection).map(Some);
+        }
+        let Some(scope) = scope else {
+            return Ok(None);
+        };
+        Ok(Some(WipPublication {
+            projection,
+            scope: Some(scope.object),
+        }))
+    }
+    fn entry_projection(
+        self: &Arc<Self>,
+        path: &str,
+        alias: &str,
+        generation: u64,
+        workdir: &str,
+        target: WorkdirPath,
+        observation: CheckoutObservation,
+    ) -> Option<WipProjection> {
         let ops = self.operations(&observation);
         if ops.is_empty() {
-            return Ok(None);
+            return None;
         }
         let kind = if observation.kind == EntryKind::File {
             "file"
         } else {
             "directory"
         };
-        let workdir = selected.session.workdir().id().as_str().to_owned();
-        let validator = self.wrap_validator(
-            &alias,
-            selected.generation,
-            &workdir,
-            &observation.validator,
-        );
+        let validator = self.wrap_validator(alias, generation, workdir, &observation.validator);
         let handler = Arc::new(FileHandler {
             provider: self.clone(),
-            alias,
-            generation: selected.generation,
-            workdir,
+            alias: alias.into(),
+            generation,
+            workdir: workdir.into(),
             target,
             observation,
         });
-        let family = format!("{kind}-g{}", selected.generation);
-        Ok(Some(self.project(
-            path,
-            descriptor(ops),
-            validator,
-            &family,
-            handler,
-        )))
+        let family = format!("{kind}-g{generation}");
+        let mut projection = self.project(path, descriptor(ops), validator, &family, handler);
+        // Keep path-qualified local names (permissions/capabilities may differ
+        // per target) while binding every content Interface to its live entrance.
+        projection.interface.scope = checkout_root(alias);
+        projection.interface.name.push_str("#target/");
+        projection.interface.name.push_str(&encode_identity(path));
+        projection.object.interfaces = vec![projection.interface.clone()];
+        Some(projection)
     }
+
     fn operations(&self, o: &CheckoutObservation) -> Vec<OperationDeclaration> {
         let mut ops = Vec::new();
         let has = |cap, name| o.capabilities.supports(cap) && self.may_allow(name);
@@ -261,6 +319,13 @@ impl Provider {
                 ));
             }
         } else {
+            if has(Cap::Read, "List") {
+                ops.push(operation(
+                    "list",
+                    "List direct contents, directories first then lexical path. Bounded live pages, not a snapshot; pass returned after to continue. Limit defaults to 100, maximum 1000. List permission and provider Read/enumeration authority apply. Includes hidden/ignored names per provider List policy, unlike Glob/Grep.",
+                    vec![parameter("limit", false, TypeExpr::Integer), parameter("after", false, cursor_type())],
+                ));
+            }
             if has(Cap::Glob, "Glob") {
                 ops.push(operation(
                     "glob",
@@ -288,6 +353,15 @@ impl Provider {
 
 #[async_trait]
 impl WipSubtreeProvider for Arc<Provider> {
+    fn interface_target(&self, reference: &wip_protocol::InterfaceReference) -> Option<String> {
+        if reference.scope == ROOT {
+            return Some(ROOT.into());
+        }
+        let (_, encoded) = reference.name.rsplit_once("#target/")?;
+        let path = decode_identity(encoded)?;
+        let (alias, _) = self.parse(&path)?;
+        (reference.scope == checkout_root(&alias)).then_some(path)
+    }
     async fn publication(&self, path: &str) -> Result<Option<WipPublication>, ProtocolError> {
         let _permit = tokio::time::timeout(self.deadline, self.permits.acquire())
             .await
@@ -298,7 +372,7 @@ impl WipSubtreeProvider for Arc<Provider> {
                 )
             })?
             .map_err(|_| error(ProtocolErrorCode::Internal, "checkout unavailable"))?;
-        tokio::time::timeout(self.deadline, self.node(path))
+        tokio::time::timeout(self.deadline, self.publication_inner(path))
             .await
             .map_err(|_| {
                 error(
@@ -306,7 +380,6 @@ impl WipSubtreeProvider for Arc<Provider> {
                     "checkout observation deadline",
                 )
             })?
-            .and_then(|projection| projection.map(WipPublication::self_scoped).transpose())
     }
     async fn children(&self, path: &str) -> Result<Vec<String>, ProtocolError> {
         let _permit = tokio::time::timeout(self.deadline, self.permits.acquire())
@@ -354,70 +427,9 @@ impl Provider {
             }
             return Ok(paths);
         }
-        let Some((alias, target)) = self.parse(path) else {
-            return Err(error(ProtocolErrorCode::NotFound, "checkout not published"));
-        };
-        let selected = self
-            .router
-            .resolve(Some(&alias))
-            .map_err(|_| error(ProtocolErrorCode::NotFound, "attachment expired"))?;
-        let o = selected
-            .session
-            .checkout_observe(target.clone())
-            .await
-            .map_err(|_| error(ProtocolErrorCode::NotFound, "checkout not published"))?;
-        if o.kind != EntryKind::Directory {
-            return Ok(Vec::new());
-        }
-        if !self.allowed(
-            "Glob",
-            &json!({"target_workdir":alias,"path":target.as_str(),"pattern":"*"}),
-        ) && !self.allowed(
-            "Grep",
-            &json!({"target_workdir":alias,"path":target.as_str(),"pattern":""}),
-        ) {
-            return Ok(Vec::new());
-        }
-        let listing = selected
-            .session
-            .checkout_search(workdir::CheckoutSearchRequest::new(
-                workdir::CheckoutSearchOperation::List(ListRequest {
-                    path: target,
-                    limit: MAX_NODES + 1,
-                }),
-            ))
-            .await
-            .map_err(|_| error(ProtocolErrorCode::Internal, "checkout listing unavailable"))?;
-        let workdir::CheckoutSearchResult::List(listing) = listing else {
-            return Err(error(
-                ProtocolErrorCode::Internal,
-                "mismatched checkout listing",
-            ));
-        };
-        if listing.truncated || listing.entries.len() > MAX_NODES {
-            return Err(error(
-                ProtocolErrorCode::ResourceLimitExceeded,
-                "directory observation exceeds node bound",
-            ));
-        }
-        let mut paths = Vec::new();
-        for entry in listing.entries {
-            let p = object_path(&alias, &entry.path);
-            if self.node(&p).await?.is_some() {
-                paths.push(p);
-            }
-        }
-        if !self
-            .router
-            .resolve(Some(&alias))
-            .is_ok_and(|current| current.generation == selected.generation)
-        {
-            return Err(error(
-                ProtocolErrorCode::ValidatorMismatch,
-                "attachment changed",
-            ));
-        }
-        Ok(paths)
+        // Contents are addressable, but never indexable. Host observe already
+        // resolves the requested Object; no provider content List is needed.
+        Ok(Vec::new())
     }
 }
 
@@ -501,6 +513,7 @@ impl WipOperationHandler for FileHandler {
         context: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
         let tool = match operation {
+            "list" => "List",
             "read" => "Read",
             "edit" => "Edit",
             "write" => "Write",
@@ -528,7 +541,34 @@ impl WipOperationHandler for FileHandler {
         }
         let mut permission_input = args.clone();
         permission_input.insert("target_workdir".into(), json!(self.alias));
-        if tool == "Glob" || tool == "Grep" {
+        if tool == "List" {
+            permission_input.insert("path".into(), json!(self.target.as_str()));
+            if let Some(after) = args.get_mut("after") {
+                let entry = after.get("entry").and_then(Json::as_str).ok_or_else(|| {
+                    protocol(
+                        ProtocolErrorCode::InvalidArguments,
+                        "after requires an entry",
+                    )
+                })?;
+                let Some((alias, path)) = self.provider.parse(entry) else {
+                    return Err(protocol(
+                        ProtocolErrorCode::InvalidArguments,
+                        "invalid continuation entry",
+                    ));
+                };
+                if alias != self.alias || object_path(&alias, &path) != entry {
+                    return Err(protocol(
+                        ProtocolErrorCode::InvalidArguments,
+                        "continuation must belong to this checkout",
+                    ));
+                }
+                let fields = after.as_object_mut().ok_or_else(|| {
+                    protocol(ProtocolErrorCode::InvalidArguments, "invalid continuation")
+                })?;
+                fields.remove("entry");
+                fields.insert("path".into(), json!(path.as_str()));
+            }
+        } else if tool == "Glob" || tool == "Grep" {
             let relative = args.get("path").and_then(Json::as_str).unwrap_or("");
             permission_input.insert("path".into(), json!(join_under(&self.target, relative)?));
         } else if tool == "Create" {
@@ -588,49 +628,49 @@ impl WipOperationHandler for FileHandler {
             }
         })?
         .map_err(map_tool_error)?;
-        let links = tokio::time::timeout_at(deadline, async {
-            let mut links = Vec::new();
-            self.check_connection()?;
-            for path in &result.paths {
-                let route = object_path(&self.alias, path);
-                // References are validated only against the captured live connection.
-                if self
-                    .provider
-                    .node(&route)
-                    .await
-                    .map_err(WipOperationError::Protocol)?
-                    .is_some()
-                {
-                    links.push(json!({"path":route}));
-                }
-                self.check_connection()?;
+        // Coordinates are not observations. Never prefetch unselected results;
+        // a vanished entry cannot fail a successful discovery Operation.
+        self.check_connection()?;
+        let mut fields = BTreeMap::from([("summary".into(), Value::String(result.output.summary))]);
+        if let Some(content) = result.output.content {
+            fields.insert("content".into(), Value::String(content));
+        }
+        let items = if let Some(listing) = result.listing {
+            fields.insert("truncated".into(), Value::Boolean(listing.truncated));
+            if let Some(after) = listing.next_after {
+                fields.insert("after".into(), cursor_value(&self.alias, &after));
             }
-            Ok::<_, WipOperationError>(links)
-        })
-        .await
-        .map_err(|_| {
-            if matches!(tool, "Write" | "Edit" | "Create") {
-                WipOperationError::OutcomeUnknown("completed operation response deadline".into())
-            } else {
-                protocol(
-                    ProtocolErrorCode::ResourceLimitExceeded,
-                    "checkout result deadline",
-                )
-            }
-        })?
-        .map_err(|e| {
-            if matches!(tool, "Write" | "Edit" | "Create") {
-                WipOperationError::OutcomeUnknown("completed operation response unavailable".into())
-            } else {
-                e
-            }
-        })?;
-        let value = json_to_wip(
-            &json!({"summary":result.output.summary,"content":result.output.content,"items":links}),
-        )
-        .map_err(|_| {
-            WipOperationError::OutcomeUnknown("invalid completed file operation result".into())
-        })?;
+            listing
+                .entries
+                .into_iter()
+                .map(|item| {
+                    Value::Record(BTreeMap::from([
+                        (
+                            "entry".into(),
+                            Value::String(object_path(&self.alias, &item.path)),
+                        ),
+                        ("kind".into(), Value::String(kind_name(item.kind).into())),
+                        (
+                            "size".into(),
+                            Value::Integer(i64::try_from(item.size).unwrap_or(i64::MAX)),
+                        ),
+                    ]))
+                })
+                .collect()
+        } else {
+            result
+                .paths
+                .iter()
+                .map(|path| {
+                    Value::Record(BTreeMap::from([(
+                        "entry".into(),
+                        Value::String(object_path(&self.alias, path)),
+                    )]))
+                })
+                .collect()
+        };
+        fields.insert("items".into(), Value::List(items));
+        let value = Value::Record(fields);
         if let Some(raw) = result.validator {
             Ok(WipOperationOutput::native_with_validator(
                 value,
@@ -693,9 +733,69 @@ fn operation(
         parameters,
         returns: ReturnDeclaration {
             documentation: None,
-            r#type: TypeExpr::Json,
+            r#type: result_type(name == "list"),
         },
     }
+}
+fn field(name: &str, required: bool, r#type: TypeExpr) -> FieldDeclaration {
+    FieldDeclaration {
+        name: name.into(),
+        required,
+        documentation: None,
+        r#type,
+    }
+}
+fn cursor_type() -> TypeExpr {
+    TypeExpr::Record {
+        fields: vec![
+            field("kind", true, TypeExpr::String),
+            field("entry", true, TypeExpr::Entry),
+        ],
+    }
+}
+fn result_type(list: bool) -> TypeExpr {
+    let mut item = vec![field("entry", true, TypeExpr::Entry)];
+    if list {
+        item.extend([
+            field("kind", true, TypeExpr::String),
+            field("size", true, TypeExpr::Integer),
+        ]);
+    }
+    let mut fields = vec![
+        field("summary", true, TypeExpr::String),
+        field("content", false, TypeExpr::String),
+        field(
+            "items",
+            true,
+            TypeExpr::List {
+                items: Box::new(TypeExpr::Record { fields: item }),
+            },
+        ),
+    ];
+    if list {
+        fields.extend([
+            field("truncated", true, TypeExpr::Boolean),
+            field("after", false, cursor_type()),
+        ]);
+    }
+    TypeExpr::Record { fields }
+}
+fn kind_name(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::Directory => "directory",
+        EntryKind::File => "file",
+        EntryKind::Symlink => "symlink",
+        EntryKind::Other => "other",
+    }
+}
+fn cursor_value(alias: &str, cursor: &workdir::ListCursor) -> Value {
+    Value::Record(BTreeMap::from([
+        ("kind".into(), Value::String(kind_name(cursor.kind).into())),
+        (
+            "entry".into(),
+            Value::String(object_path(alias, &cursor.path)),
+        ),
+    ]))
 }
 fn descriptor(operations: Vec<OperationDeclaration>) -> InterfaceDescriptor {
     InterfaceDescriptor{format:INTERFACE_FORMAT_V1.into(),documentation:Some(Documentation{summary:"AI-oriented attached Workdir operations".into(),details:Some("The route binds attachment and target. Line offsets are zero-based; text output numbers lines from one. Read-before-write and provider validators are both required. Paths are Worldspace references, never host paths.".into())}),types:Vec::new(),operations}

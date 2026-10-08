@@ -13,9 +13,9 @@ use tempfile::TempDir;
 use workdir::{
     CheckoutRequest, CheckoutResult, CommandHandle, CommandOutput, CommandOutputRequest,
     CommandRequest, CommandStatus, EditRequest, EditResult, GlobRequest, GlobResult, GrepRequest,
-    GrepResult, ListResult, LocalWorkdirSession, ReadBytesRequest, ReadBytesResult, ReadRequest,
-    ReadResult, StatRequest, StatResult, Workdir, WorkdirAttachmentAlias, WorkdirError,
-    WorkdirScopeAuthorizationRequest, WorkdirScopeOverlapRequest, WorkdirSession,
+    GrepResult, ListRequest, ListResult, LocalWorkdirSession, ReadBytesRequest, ReadBytesResult,
+    ReadRequest, ReadResult, StatRequest, StatResult, Workdir, WorkdirAttachmentAlias,
+    WorkdirError, WorkdirScopeAuthorizationRequest, WorkdirScopeOverlapRequest, WorkdirSession,
     WorkdirSessionCapabilities, WorkdirSessionHandle, WriteRequest, WriteResult,
 };
 
@@ -28,6 +28,7 @@ struct HookedSession {
     observe_hook: Mutex<Option<ObserveHook>>,
     stall_path: Mutex<Option<WorkdirPath>>,
     stalled_observations: AtomicUsize,
+    searches: AtomicUsize,
 }
 
 impl std::fmt::Debug for HookedSession {
@@ -52,6 +53,7 @@ impl HookedSession {
             observe_hook: Mutex::new(None),
             stall_path: Mutex::new(None),
             stalled_observations: AtomicUsize::new(0),
+            searches: AtomicUsize::new(0),
         })
     }
 
@@ -123,6 +125,7 @@ impl WorkdirSession for HookedSession {
         &self,
         request: workdir::CheckoutSearchRequest,
     ) -> Result<workdir::CheckoutSearchResult, WorkdirError> {
+        self.searches.fetch_add(1, Ordering::SeqCst);
         self.local.checkout_search(request).await
     }
 
@@ -484,7 +487,7 @@ async fn collection_list_and_root_enumeration_bound_stalled_observation_and_rele
 }
 
 #[tokio::test]
-async fn grep_post_search_link_observation_is_deadline_bounded_and_releases_permit() {
+async fn grep_returns_typed_entry_without_observing_stalled_result() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
     let session = HookedSession::new(&dir);
@@ -499,8 +502,8 @@ async fn grep_post_search_link_observation_is_deadline_bounded_and_releases_perm
     let root = checkout_root("main");
     let projection = p.node(&root).await.unwrap().unwrap();
 
-    // Directory observations and the normal local grep/checkout execution can
-    // complete. Only publishing the typed search result path gets stuck.
+    // Directory/search can complete. The result path must never be observed
+    // during result publication, even when it would block indefinitely.
     session.stall_observation(Some(WorkdirPath::new("a.txt").unwrap()));
     let arguments = BTreeMap::from([
         ("pattern".into(), Value::String("needle".into())),
@@ -514,13 +517,17 @@ async fn grep_post_search_link_observation_is_deadline_bounded_and_releases_perm
         projection.handler.call("grep", &arguments, context()),
     )
     .await
-    .expect("post-search link observations must share the operation deadline");
-    assert_deadline(result, "checkout result deadline");
-    assert_eq!(session.stalled_observations.load(Ordering::SeqCst), 1);
+    .expect("completed search must return without acquiring its entries");
+    let output = result.unwrap_or_else(|_| panic!("successful search must not observe each entry"));
+    assert_eq!(
+        wip_to_json(&output.value).unwrap()["items"],
+        json!([{"entry": format!("{root}/a.txt")}])
+    );
+    assert_eq!(session.stalled_observations.load(Ordering::SeqCst), 0);
     assert_permit_released(&p);
 
-    // A successful retry both checks cancellation cleanup and proves that the
-    // delegated search produces the typed path consumed by post-processing.
+    // A second explicit search produces the same typed coordinate, without
+    // acquiring it even when it could resolve successfully.
     session.stall_observation(None);
     let result = tokio::time::timeout(
         Duration::from_secs(2),
@@ -533,6 +540,33 @@ async fn grep_post_search_link_observation_is_deadline_bounded_and_releases_perm
         Err(_) => panic!("grep must succeed once the link observation is unstalled"),
     };
     let value = wip_to_json(&output.value).unwrap();
-    assert_eq!(value["items"], json!([{"path": format!("{root}/a.txt")}]));
+    assert_eq!(value["items"], json!([{"entry": format!("{root}/a.txt")}]));
     assert_permit_released(&p);
+}
+
+#[tokio::test]
+async fn checkout_content_children_never_call_provider_list_even_for_deep_paths() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("nested/deep")).unwrap();
+    for n in 0..1100 {
+        std::fs::write(dir.path().join(format!("file-{n}")), "fixture").unwrap();
+    }
+    let session = HookedSession::new(&dir);
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(
+            WorkdirAttachmentAlias::new("main").unwrap(),
+            session.clone(),
+        )
+        .unwrap();
+    let subtree = Arc::new(provider(router));
+    assert_eq!(
+        subtree.children(ROOT).await.unwrap(),
+        vec![checkout_root("main")]
+    );
+    for path in ["/checkouts/main", "/checkouts/main/nested/deep"] {
+        assert!(subtree.publication(path).await.unwrap().is_some());
+        assert!(subtree.children(path).await.unwrap().is_empty());
+    }
+    assert_eq!(session.searches.load(Ordering::SeqCst), 0);
 }
