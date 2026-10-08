@@ -45115,6 +45115,23 @@ mod tests {
             StatusCode::OK,
         )
         .await;
+        let non_owner_workspace = request_json_authenticated(
+            app.clone(),
+            "GET",
+            &format!("{scoped}/workspace"),
+            None,
+            &foreign,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(
+            non_owner_workspace["permissions"]["manage_repositories"],
+            false
+        );
+        assert_eq!(
+            non_owner_workspace["permissions"]["delete_workspace"],
+            false
+        );
         request_json(
             app.clone(),
             "GET",

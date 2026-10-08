@@ -47,8 +47,10 @@ a Repository, replay always returns `null`, even after other assets are added.
   Reopening and deletion use the usual Workspace authority and lifecycle guards;
   in particular, the last-accessible-Workspace deletion guard is unchanged.
 
-The existing authenticated non-owner viewing policy is unchanged by optional
-creation. Owner-only mutations and owner-scoped catalog discovery are retained;
-these are not a claim that authentication alone proves per-Workspace viewing
-permission. The T-717 viewing-policy decision remains separate from the creation
-contract.
+Optional creation preserves the existing owner/member responsibility split:
+settings are owner-controlled, while ordinary viewing and use are member-facing.
+Non-ownership alone is not a reason to deny ordinary viewing. Existing
+member-facing non-owner reads, owner-gated settings mutations, owner-scoped
+catalog discovery, authentication and operation-permission checks are unchanged.
+This creation change does not introduce a membership authority or an owner-only
+viewing filter.
