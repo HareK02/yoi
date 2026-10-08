@@ -3951,6 +3951,7 @@ fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static s
     }
     if path.ends_with("/input")
         || path.ends_with("/restore")
+        || path.ends_with("/restore/coordinate")
         || (path.contains("/attachments") && method != "GET")
         || path.contains("/workdir-attachments")
     {
@@ -6513,6 +6514,8 @@ pub fn placeholder_spawn_response(host_id: impl Into<String>) -> WorkerSpawnResu
 
 #[cfg(test)]
 mod tests {
+    mod restore_auth_tests;
+
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
