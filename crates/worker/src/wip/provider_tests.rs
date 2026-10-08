@@ -2,6 +2,9 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
+#[path = "ancestor_tests.rs"]
+mod ancestor_tests;
+
 struct ReadHandler(Arc<AtomicUsize>);
 #[async_trait]
 impl WipOperationHandler for ReadHandler {
@@ -464,7 +467,7 @@ impl WipOperationHandler for FrozenResultHandler {
 }
 #[async_trait]
 impl WipSubtreeProvider for ChangingProvider {
-    async fn projection(&self, path: &str) -> Result<Option<WipProjection>, ProtocolError> {
+    async fn publication(&self, path: &str) -> Result<Option<WipPublication>, ProtocolError> {
         if path != "/github" {
             return Ok(None);
         }
@@ -480,7 +483,7 @@ impl WipSubtreeProvider for ChangingProvider {
             release: self.release.clone(),
             calls: self.calls.clone(),
         });
-        Ok(Some(p))
+        WipPublication::self_scoped(p).map(Some)
     }
     async fn children(&self, _: &str) -> Result<Vec<String>, ProtocolError> {
         Ok(vec![])

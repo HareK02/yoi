@@ -1,8 +1,0 @@
-interface "/::example" {
-  type `string` = {
-    `表示名`: string,
-  };
-  operation `find-item`(
-    `search term`: string,
-  ) -> `string`;
-}

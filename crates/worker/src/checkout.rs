@@ -23,8 +23,8 @@ use crate::feature::builtin::manage_workdir::wip::{decode_identity, encode_ident
 use crate::permission::permission_action_for;
 use crate::wip::{
     WipCallContext, WipMountError, WipMountRegistry, WipOperationError, WipOperationHandler,
-    WipOperationOutput, WipProjection, WipProjectionKind, WipSubtreeMount, WipSubtreeProvider,
-    json_to_wip, wip_to_json,
+    WipOperationOutput, WipProjection, WipProjectionKind, WipPublication, WipSubtreeMount,
+    WipSubtreeProvider, json_to_wip, wip_to_json,
 };
 
 const ROOT: &str = "/checkouts";
@@ -288,7 +288,7 @@ impl Provider {
 
 #[async_trait]
 impl WipSubtreeProvider for Arc<Provider> {
-    async fn projection(&self, path: &str) -> Result<Option<WipProjection>, ProtocolError> {
+    async fn publication(&self, path: &str) -> Result<Option<WipPublication>, ProtocolError> {
         let _permit = tokio::time::timeout(self.deadline, self.permits.acquire())
             .await
             .map_err(|_| {
@@ -306,6 +306,7 @@ impl WipSubtreeProvider for Arc<Provider> {
                     "checkout observation deadline",
                 )
             })?
+            .and_then(|projection| projection.map(WipPublication::self_scoped).transpose())
     }
     async fn children(&self, path: &str) -> Result<Vec<String>, ProtocolError> {
         let _permit = tokio::time::timeout(self.deadline, self.permits.acquire())

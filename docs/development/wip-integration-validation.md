@@ -1,31 +1,37 @@
 # Scoped WIP integration validation
 
-Adoption: wip-rs `1cbe03b49e48dd7e0be28b76fbc3c932f8920a36`, canonical
-wip-reference `6086f3c5ef10aa1464ce9c824750d7f667217bfd`. See
-[`vendor/wip-rs/README.md`](../../vendor/wip-rs/README.md) for provenance and
-regeneration. All four WIP packages are committed path dependencies; Cargo
-metadata resolves exactly one Protocol type source and no old registry WIP package.
+## Released dependency and resolution
 
-## Executed checks
+The adopted Client, HTTP, Protocol and official Text View are **crates.io 0.2.0**,
+with exact `=0.2.0` workspace declarations and registry checksums in Cargo.lock.
+`cargo info <package>@0.2.0` confirmed all four published packages (Rust 1.88).
+`node scripts/verify-wip-dependencies.mjs` checks actual locked/offline Cargo
+resolution: all WIP packages use registry 0.2.0, each required package occurs
+once, and Protocol has one source. No path/Git override or attached checkout is
+used. The earlier unreleased 0.1.0 source snapshot and vendor verifier were
+removed when T-713 thread sequence 26 specified 0.2.0.
 
-- `cargo test -p worker --locked --offline`: **888 unit + 110 integration tests
+Canonical contract reference: wip-reference
+`6086f3c5ef10aa1464ce9c824750d7f667217bfd`. This reference documents the contract;
+Cargo resolves the release, not that checkout or an unreleased Rust revision.
+
+## Executed checks on registry 0.2.0
+
+- `cargo test -p worker --locked --offline`: **893 unit + 110 integration tests
   passed**, no ignored/failed tests. This includes ordinary Tools mode, Feature
   permission/revocation, restore, session/history and controller integration.
-- Narrow development checks: `wip::binding` (25), `wip::provider_tests` (6), existing
+- Narrow development checks: `wip::binding` (25), `wip::provider_tests` (11), existing
   `wip::tests` and workdir projection tests (43), checkout transports/providers
-  (20), workspace-config production/authority tests (19). These are also included
+  (20), workspace-config production/authority tests (19). These are included
   in the complete worker run.
-- Official packages, using `cargo test --offline --manifest-path
-  vendor/wip-rs/<package>/Cargo.toml --target-dir target/wip-upstream`:
-  Text View **16 public signature/token/golden tests + 4 doctests**;
-  Client **63 adapter/runtime tests**;
-  HTTP **38 tests + 1 doctest**;
-  Protocol **22 tests + 1 doctest**. Vendored source and tests are unmodified.
+- Published SDK tests via `cargo test -p wip-client -p wip-http -p wip-protocol
+  -p wip-text-view --locked --offline`: Text View **16 public signature/token/golden
+  tests + 4 doctests**; Client **63 adapter/runtime tests**; HTTP **38 tests + 1
+  doctest**; Protocol **22 tests + 1 doctest**. Tests run from the registry packages,
+  not substituted source or removed vendor directories.
 - Root `cargo check --locked --offline` passed, including normal TUI, CLI,
   Runtime and Workspace Server compile closure.
 - `cargo fmt --all -- --check` and `git diff --check HEAD` passed.
-- `node scripts/verify-wip-vendor.mjs`: all **43** Cargo-checksummed upstream files
-  passed. No custom renderer or lexer replaces official signatures.
 - `nix build --no-link .#yoi.cargoDeps` passed with the updated registry dependency
   hash. This validates credential-free dependency acquisition, not a full Nix
   binary/image build or deployment update.
@@ -49,6 +55,15 @@ InterfaceMismatch, reacquires without replay, and confirms direct NotFound ends
 safe Interface reuse. An in-flight operation survives descriptor refresh using
 its exact frozen Host and Client descriptors rather than the newer return type.
 
+`ancestor_tests.rs` covers the independent review finding P1_CURRENT_ANCESTOR_SCOPE:
+valid live ancestor refs that differ from registration placeholders, root `/` and
+intermediate provider-owned ancestors, ref-less and ref-bearing scope deletion
+without a prior scope Inspect, rejected cached dispatch and orphan observation,
+replacement/republication without restoring old Interface registrations,
+shape/target/Object-validator/Interface-mismatch precedence, and frozen in-flight
+ancestor Descriptor/handler/result validation after replacement. Valid Invoke
+makes one provider publication call for the target, not a separate scope lookup.
+
 Existing checkout tests retain commit-time captured Workdir/connection/validator
 checks, alias reuse/restore fencing, inode replacement rejection, authorization,
 shared prior-read tracking, exact post-operation validators, cooperative
@@ -59,19 +74,28 @@ permission identity and ToolOutput/attachments.
 
 ## Downstream provider seams
 
-- Public projection/contribution Interface fields now use
-  `wip_protocol::InterfaceReference { scope, name }`.
-- Contextual/self-scope references are explicit paths, not the old encoded `/@/`
-  suffix. Their fetch uses one live Object/descriptor/validator snapshot and its
-  optional Object ref. Checkout's ref-less publication remains legitimate; its
-  existing captured connection and provider validators still fence execution.
+- Public projection/contribution Interface fields use
+  `wip_protocol::InterfaceReference { scope, name }` from registry 0.2.0.
+- `WipSubtreeProvider::publication` returns a `WipPublication` that captures target,
+  current scope Object, Descriptor/validator and handler at one provider boundary.
+  Mutable ancestors must not be resolved independently after selecting a target.
+  `scope: None` ends usable publication, even without a public ref; it is not a
+  ref-less published Object. Host checks and observation never substitute the
+  root registration placeholder, and Interface fetch never falls back to retained
+  provider registrations. Old registrations must end when their scope lifetime
+  ends. Published ancestor scopes outside the subtree remain Host-owned.
+- Contextual/self-scope publishers use `WipPublication::self_scoped` on their exact
+  provider snapshot; references are explicit paths, not an encoded `/@/` suffix.
+  Checkout and Workspace Config retain their captured provider/Backend execution
+  and commit fences. Ref-less publication remains legitimate.
 - `WipRuntime::{tree, inspect, invoke}` is the object-centered integration seam.
   Inspect uses official summary-only signatures and typed rendering failures.
-- `WipMountRegistry::mount_interface` adds a separate Interface namespace without
-  replacing Object ownership or flattening same-named operations.
+- `WipMountRegistry::mount_interface` adds a separate static Interface namespace
+  without replacing Object ownership or flattening same-named operations. It does
+  not overlay stale registration metadata onto a live subtree provider.
 - FS indexable boundaries and directory.list remain provider policy. This change
   deliberately does not implement the separate T-714 boundary/list migration.
-  The relevant transport/commit tests are `checkout_wip_tests.rs`,
+  Relevant transport/commit tests are `checkout_wip_tests.rs`,
   `checkout_http_tests.rs`, and `checkout_race_tests.rs`.
 - Worldspace state is runtime-only. Historical opaque references in append-only
   session/tool history are not migrated into cache or parsed for a guessed scope;

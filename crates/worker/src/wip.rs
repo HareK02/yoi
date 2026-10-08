@@ -242,6 +242,37 @@ pub struct WipDynamicMount {
     pub resolver: Arc<dyn WipDynamicItemResolver>,
 }
 
+/// A provider-bound publication snapshot. The selected Object, Descriptor,
+/// validator, handler and ancestor scope Object must come from one publication
+/// boundary. `scope` is the current Object at `projection.interface.scope`, not
+/// registration metadata. Absence is legitimate (and rejects before dispatch),
+/// even when the scope has no public ref.
+///
+/// Providers must end old Interface registrations on scope deletion/replacement
+/// and stop publishing orphan descendants. A captured handler still revalidates
+/// authorization and domain preconditions at its existing execution/commit boundary.
+/// Scopes outside the subtree are supplied by the owning Host, not the provider.
+pub struct WipPublication {
+    pub projection: WipProjection,
+    pub scope: Option<Object>,
+}
+
+impl WipPublication {
+    /// Self scope uses the exact Object that supplied the Descriptor/handler.
+    pub fn self_scoped(projection: WipProjection) -> Result<Self, ProtocolError> {
+        if projection.interface.scope != projection.route {
+            return Err(protocol_error(
+                ProtocolErrorCode::Internal,
+                "ancestor scope requires a coherent provider publication snapshot",
+            ));
+        }
+        Ok(Self {
+            scope: Some(projection.object.clone()),
+            projection,
+        })
+    }
+}
+
 /// Explicit arbitrary-depth request-time subtree provider. Unlike item families,
 /// this resolves both files and directories and enumerates authorized children.
 #[async_trait]
@@ -253,7 +284,10 @@ pub trait WipSubtreeProvider: Send + Sync {
     fn max_nodes(&self) -> usize {
         1024
     }
-    async fn projection(&self, path: &str) -> Result<Option<WipProjection>, ProtocolError>;
+    /// Resolve target and scope together. Do not construct this by independently
+    /// looking up a mutable ancestor after resolving the target. Self-scoped
+    /// publishers can use `WipPublication::self_scoped` on their pinned snapshot.
+    async fn publication(&self, path: &str) -> Result<Option<WipPublication>, ProtocolError>;
     async fn children(&self, path: &str) -> Result<Vec<String>, ProtocolError>;
 }
 
@@ -478,10 +512,11 @@ impl WipMountRegistry {
                 });
             }
         }
-        if self.subtree_mounts.iter().any(|mount| {
-            projection.route == mount.root
-                || projection.route.starts_with(&format!("{}/", mount.root))
-        }) {
+        if self
+            .subtree_mounts
+            .iter()
+            .any(|mount| at_or_below(&projection.route, &mount.root))
+        {
             return Err(WipMountError::RouteCollision {
                 route: projection.route,
                 existing: "request-time subtree".into(),
@@ -676,9 +711,8 @@ impl WipMountRegistry {
             }
         })?;
         if self.subtree_mounts.iter().any(|m| {
-            m.root == mount.collection_route
-                || m.root.starts_with(&format!("{}/", mount.collection_route))
-                || mount.collection_route.starts_with(&format!("{}/", m.root))
+            at_or_below(&m.root, &mount.collection_route)
+                || at_or_below(&mount.collection_route, &m.root)
         }) {
             return Err(WipMountError::RouteCollision {
                 route: mount.collection_route,
@@ -750,7 +784,8 @@ impl WipMountRegistry {
     }
 
     /// Delegate an entire descendant namespace to one request-time provider.
-    /// The root Object remains registry-owned; nested/static/item collisions fail.
+    /// The registry reserves root ownership; its live Object is provider-owned.
+    /// Nested/static/item collisions fail.
     pub fn mount_subtree(&mut self, mount: WipSubtreeMount) -> Result<(), WipMountError> {
         let Some(root) = self.mounts.get(&mount.root) else {
             return Err(WipMountError::OperationTargetNotFound { route: mount.root });
@@ -761,11 +796,8 @@ impl WipMountRegistry {
                 message: "subtree requires a native root Object".into(),
             });
         }
-        let overlaps = |path: &str| {
-            path == mount.root
-                || path.starts_with(&format!("{}/", mount.root))
-                || mount.root.starts_with(&format!("{path}/"))
-        };
+        let overlaps =
+            |path: &str| at_or_below(path, &mount.root) || at_or_below(&mount.root, path);
         if self.subtree_mounts.iter().any(|m| overlaps(&m.root))
             || self
                 .dynamic_mounts
@@ -774,7 +806,7 @@ impl WipMountRegistry {
             || self
                 .mounts
                 .keys()
-                .any(|p| p != &mount.root && p.starts_with(&format!("{}/", mount.root)))
+                .any(|p| p != &mount.root && at_or_below(p, &mount.root))
         {
             return Err(WipMountError::RouteCollision {
                 route: mount.root,
@@ -1108,16 +1140,26 @@ impl WipHost {
         self.registry
             .subtree_mounts
             .iter()
-            .find(|m| path == m.root || path.starts_with(&format!("{}/", m.root)))
+            .find(|m| at_or_below(path, &m.root))
     }
 
-    async fn projection_live(&self, path: &str) -> Result<Option<WipProjection>, ProtocolError> {
+    fn static_publication(&self, projection: WipProjection) -> WipPublication {
+        let scope = if projection.interface.scope == projection.route {
+            Some(projection.object.clone())
+        } else {
+            self.object_at(&projection.interface.scope)
+        };
+        WipPublication { projection, scope }
+    }
+
+    async fn publication_live(&self, path: &str) -> Result<Option<WipPublication>, ProtocolError> {
         wip_protocol::validate_path(path).map_err(|_| unpublished_path_error(path))?;
         if let Some(mount) = self.subtree(path) {
-            let Some(projection) = mount.provider.projection(path).await? else {
+            let Some(mut publication) = mount.provider.publication(path).await? else {
                 return Ok(None);
             };
-            validate_projection(&projection).map_err(|_| {
+            let projection = &publication.projection;
+            validate_projection(projection).map_err(|_| {
                 protocol_error(
                     ProtocolErrorCode::Internal,
                     "subtree returned an invalid Object",
@@ -1133,20 +1175,56 @@ impl WipHost {
                     "subtree changed route or ownership",
                 ));
             }
-            return Ok(Some(projection));
+            let scope_path = &projection.interface.scope;
+            if self
+                .subtree(scope_path)
+                .is_some_and(|scope_owner| scope_owner.root == mount.root)
+            {
+                if let Some(scope) = &publication.scope {
+                    scope.validate_at_path(scope_path).map_err(|_| {
+                        protocol_error(
+                            ProtocolErrorCode::Internal,
+                            "subtree returned an invalid scope Object",
+                        )
+                    })?;
+                    if scope_path == path && scope != &projection.object {
+                        return Err(protocol_error(
+                            ProtocolErrorCode::Internal,
+                            "self scope differs from the selected Object snapshot",
+                        ));
+                    }
+                }
+            } else {
+                // The Host owns the pinned external ancestor (e.g. `/`). Never
+                // accept provider-supplied identity for somebody else's scope.
+                publication.scope = self.object_at(scope_path);
+            }
+            return Ok(Some(publication));
         }
-        Ok(self.projection(path))
+        Ok(self
+            .projection(path)
+            .map(|projection| self.static_publication(projection)))
     }
 
-    async fn projection_for_interface_live(
+    async fn projection_live(&self, path: &str) -> Result<Option<WipProjection>, ProtocolError> {
+        Ok(self
+            .publication_live(path)
+            .await?
+            .filter(|publication| publication.scope.is_some())
+            .map(|publication| publication.projection))
+    }
+
+    async fn publication_for_interface_live(
         &self,
         path: &str,
         reference: &InterfaceReference,
-    ) -> Result<Option<WipProjection>, ProtocolError> {
-        let Some(owner) = self.projection_live(path).await? else {
+    ) -> Result<Option<WipPublication>, ProtocolError> {
+        let Some(owner) = self.publication_live(path).await? else {
             return Ok(None);
         };
-        if owner.interface == *reference {
+        // A live provider owns all its publication metadata; static additional
+        // Interface registrations must not survive its scope lifetime changes.
+        if owner.projection.interface == *reference || self.subtree(path).is_some() {
             return Ok(Some(owner));
         }
         if let Some(all) = self.registry.additional_interfaces.get(path) {
@@ -1154,36 +1232,13 @@ impl WipHost {
                 if let Some(mut selected) = self.project_current(other.clone(), false)
                     && selected.interface == *reference
                 {
-                    selected.object = owner.object;
-                    return Ok(Some(selected));
+                    selected.object = owner.projection.object;
+                    return Ok(Some(self.static_publication(selected)));
                 }
             }
         }
-        // Retain the owner so preconditions report InterfaceMismatch with target precedence.
+        // Retain the target so preconditions preserve target/validator precedence.
         Ok(Some(owner))
-    }
-
-    async fn descriptor_live(
-        &self,
-        reference: &InterfaceReference,
-    ) -> Result<Option<(InterfaceDescriptor, Option<Vec<u8>>)>, ProtocolError> {
-        if self.subtree(&reference.scope).is_some() {
-            return Ok(self
-                .projection_live(&reference.scope)
-                .await?
-                .filter(|p| p.interface == *reference)
-                .map(|p| (p.descriptor, p.interface_validator)));
-        }
-        // Never expose the static registration placeholder descriptor of a subtree.
-        if self
-            .registry
-            .subtree_mounts
-            .iter()
-            .any(|m| self.registry.mounts[&m.root].projection.interface == *reference)
-        {
-            return Ok(None);
-        }
-        Ok(self.descriptor(reference))
     }
 
     async fn fetch_interface_live(
@@ -1193,17 +1248,32 @@ impl WipHost {
         reference
             .validate()
             .map_err(|e| protocol_error(ProtocolErrorCode::InvalidRequest, e.to_string()))?;
-        if let Some(projection) = self
-            .projection_for_interface_live(&reference.scope, reference)
+        if let Some(publication) = self
+            .publication_for_interface_live(&reference.scope, reference)
             .await?
-            && projection.interface == *reference
+            && publication.projection.interface == *reference
+            && let Some(scope) = publication.scope
         {
             return Ok(FetchInterfaceResponse {
                 interface: reference.clone(),
-                scope_ref: projection.object.r#ref,
-                descriptor: projection.descriptor,
-                validator: projection.interface_validator,
+                scope_ref: scope.r#ref,
+                descriptor: publication.projection.descriptor,
+                validator: publication.projection.interface_validator,
             });
+        }
+        // A provider owns the whole live scope observation. Never fall back to
+        // its registration placeholder after it stops publishing a scope/name.
+        if self.subtree(&reference.scope).is_some()
+            || self
+                .registry
+                .subtree_mounts
+                .iter()
+                .any(|mount| self.registry.mounts[&mount.root].projection.interface == *reference)
+        {
+            return Err(protocol_error(
+                ProtocolErrorCode::InterfaceNotFound,
+                "interface is not published",
+            ));
         }
         // Shared static registrations belong to the pinned published scope, not
         // to an arbitrary target's identity. A missing scope ends publication.
@@ -1213,7 +1283,7 @@ impl WipHost {
                 "scope is not published",
             )
         })?;
-        let (descriptor, validator) = self.descriptor_live(reference).await?.ok_or_else(|| {
+        let (descriptor, validator) = self.descriptor(reference).ok_or_else(|| {
             protocol_error(
                 ProtocolErrorCode::InterfaceNotFound,
                 "interface is not published",
@@ -1289,7 +1359,7 @@ impl WipHost {
                 let paths = if let Some(mount) = self.subtree(path) {
                     mount.provider.children(path).await?
                 } else {
-                    self.children(path)
+                    self.children_live(path).await?
                 };
                 let mut values = Vec::new();
                 let mut seen = BTreeSet::new();
@@ -1513,6 +1583,16 @@ impl WipHost {
             .any(|route| route.starts_with(&prefix) && self.projection(route).is_some())
     }
 
+    async fn children_live(&self, path: &str) -> Result<Vec<String>, ProtocolError> {
+        let mut visible = Vec::new();
+        for child in self.children(path) {
+            if self.subtree(&child).is_none() || self.projection_live(&child).await?.is_some() {
+                visible.push(child);
+            }
+        }
+        Ok(visible)
+    }
+
     fn children(&self, path: &str) -> Vec<String> {
         let prefix = if path == WIP_ROOT {
             "/".to_string()
@@ -1593,7 +1673,7 @@ impl WipHost {
             ))
         })?;
         let projection = self
-            .projection_for_interface_live(&request.target.path, &request.interface.reference)
+            .publication_for_interface_live(&request.target.path, &request.interface.reference)
             .await
             .map_err(WipOperationError::Protocol)?
             .ok_or_else(|| {
@@ -1602,33 +1682,29 @@ impl WipHost {
         self.call_projection(projection, request, context).await
     }
 
-    // The deployment root is pinned; self-scoped interfaces use the exact same
-    // resolved Object snapshot as descriptor/handler selection, not an artifact lookup.
+    // Both self and ancestor scopes were frozen at the same publication boundary
+    // as target/Descriptor/handler selection. Never re-resolve a mutable scope here.
     fn scope_matches(
         &self,
-        projection: &WipProjection,
+        publication: &WipPublication,
         interface: &wip_protocol::InterfaceTarget,
-    ) -> Result<bool, ProtocolError> {
-        let scope = if interface.reference.scope == projection.route {
-            Some(projection.object.clone())
-        } else {
-            self.object_at(&interface.reference.scope)
-        };
-        Ok(scope.is_some_and(|scope| {
+    ) -> bool {
+        publication.scope.as_ref().is_some_and(|scope| {
             interface
                 .scope_ref
                 .as_ref()
                 .is_none_or(|expected| scope.r#ref.as_ref() == Some(expected))
-        }))
+        })
     }
 
     fn check_call_preconditions(
         &self,
-        projection: &WipProjection,
+        publication: &WipPublication,
         target: &wip_protocol::Target,
         interface: &wip_protocol::InterfaceTarget,
         operation_name: &str,
     ) -> Result<(), ProtocolError> {
+        let projection = &publication.projection;
         if let Some(actual) = target.validator.as_deref()
             && projection.object.validator.as_deref() != Some(actual)
         {
@@ -1640,7 +1716,7 @@ impl WipHost {
         if interface.reference.validate_for_path(&target.path).is_err()
             || interface.reference != projection.interface
             || !projection.object.interfaces.contains(&interface.reference)
-            || !self.scope_matches(projection, interface)?
+            || !self.scope_matches(publication, interface)
         {
             return Err(protocol_error(
                 ProtocolErrorCode::InterfaceMismatch,
@@ -1685,9 +1761,10 @@ impl WipHost {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn call_projection(
         &self,
-        projection: WipProjection,
+        projection: WipPublication,
         request: CallOperationRequest,
         context: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
@@ -1704,7 +1781,8 @@ impl WipHost {
             &request.operation,
         )
         .map_err(WipOperationError::Protocol)?;
-        self.execute_projection(projection, request, context).await
+        self.execute_projection(projection.projection, request, context)
+            .await
     }
 
     // Preconditions have already fixed publication; do not resolve target or
@@ -1729,6 +1807,10 @@ impl WipHost {
             .call(&request.operation, &request.arguments, context)
             .await
     }
+}
+
+fn at_or_below(path: &str, ancestor: &str) -> bool {
+    ancestor == "/" || path == ancestor || path.starts_with(&format!("{ancestor}/"))
 }
 
 fn unpublished_path_error(path: &str) -> ProtocolError {
@@ -2287,7 +2369,7 @@ impl WipRuntime {
         };
         let projection = match self
             .host
-            .projection_for_interface_live(&metadata.target.path, &metadata.interface.reference)
+            .publication_for_interface_live(&metadata.target.path, &metadata.interface.reference)
             .await
         {
             Ok(Some(projection)) => projection,
@@ -2302,6 +2384,7 @@ impl WipRuntime {
         ) {
             return rejected(error);
         }
+        let projection = projection.projection;
         let descriptor = projection.descriptor.clone();
         let target_validator = projection.object.validator.clone();
         let request_value =

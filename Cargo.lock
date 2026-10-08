@@ -6339,7 +6339,9 @@ dependencies = [
 
 [[package]]
 name = "wip-client"
-version = "0.1.0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "def7dc8d056477bf8cb7c12f2dc70cabdb3eee3527cf95ba6131a8a44519ed7b"
 dependencies = [
  "wip-http",
  "wip-protocol",
@@ -6347,7 +6349,9 @@ dependencies = [
 
 [[package]]
 name = "wip-http"
-version = "0.1.0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da1f6a0023c0c599cbdc5571e9b131c8bb6b113ef04c20467d77634d66b44a5a"
 dependencies = [
  "base64 0.22.1",
  "http",
@@ -6359,11 +6363,15 @@ dependencies = [
 
 [[package]]
 name = "wip-protocol"
-version = "0.1.0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a23ee0fe02badd2ef77847652cff241c6d868c8f162a911475500831ff348fe"
 
 [[package]]
 name = "wip-text-view"
-version = "0.1.0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c95fd8e3fba673de44084c2f89c11b50d744c6db73726c50e04975c974d2759c"
 dependencies = [
  "wip-protocol",
 ]

@@ -1,5 +1,0 @@
-object {
-  name: "123";
-  description: "Issue 123の公開操作。本文はOperationで取得する。";
-  interfaces: ["/::issue.read", "/::issue.lifecycle"];
-}
