@@ -1,30 +1,12 @@
 <script lang="ts">
-  import type { Snippet } from "svelte";
-
-  let {
-    href = "",
-    title,
-    children,
-  }: {
-    href?: string;
-    title?: string;
-    children?: Snippet;
-  } = $props();
-
-  let safeHref = $derived(httpHref(href));
-
-  function httpHref(value: string): string | undefined {
-    try {
-      const protocol = new URL(value).protocol.toLowerCase();
-      return protocol === "http:" || protocol === "https:" ? value : undefined;
-    } catch {
-      return undefined;
-    }
-  }
+  import { getContext, type Snippet } from 'svelte';
+  import { markdownLinkTarget, MARKDOWN_WORKSPACE_CONTEXT, type MarkdownWorkspace } from './link-policy.ts';
+  const workspace = getContext<MarkdownWorkspace | undefined>(MARKDOWN_WORKSPACE_CONTEXT);
+  let { href = '', title, children }: { href?: string; title?: string; children?: Snippet } = $props();
+  let target = $derived(markdownLinkTarget(href, workspace?.()));
 </script>
-
-{#if safeHref}
-  <a href={safeHref} {title} target="_blank" rel="noreferrer">
+{#if target}
+  <a href={target.href} {title} target={target.external ? '_blank' : undefined} rel={target.external ? 'noreferrer' : undefined}>
     {@render children?.()}
   </a>
 {:else}

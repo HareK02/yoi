@@ -4,12 +4,13 @@
   import MarkdownTable from "./MarkdownTable.svelte";
   import SafeMarkdown from "./SafeMarkdown.svelte";
 
-  let { text }: { text: string } = $props();
+  let { text, imageRenderer }: { text: string; imageRenderer?: Renderers['image'] } = $props();
 
-  const renderers = {
+  const renderers = $derived({
     code: DocumentCodeBlock,
     table: MarkdownTable,
-  } satisfies Partial<Renderers>;
+    ...(imageRenderer ? { image: imageRenderer } : {}),
+  } satisfies Partial<Renderers>);
 </script>
 
 <SafeMarkdown {text} class="document-markdown" {renderers} />

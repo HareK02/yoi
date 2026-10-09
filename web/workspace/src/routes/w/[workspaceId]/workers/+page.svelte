@@ -1,5 +1,6 @@
 <script lang="ts">
   import { untrack } from 'svelte';
+  import WorkerDriveGrants from '#lib/workspace/drive-grants/WorkerDriveGrants.svelte';
   import { canRestoreWorker, createRestoreRequest, restoreWorkspaceWorker, restoreNotice, restoreErrorNotice, type RestoreRequest } from '#lib/workspace/sidebar/worker-actions.ts';
   import { workspaceWorkersStore, refreshWorkspaceWorkers } from '#lib/workspace/sidebar/worker-subscription.ts';
   import { pushWorkspaceAlert } from '#lib/workspace/alerts/store.ts';
@@ -27,7 +28,7 @@
 
   let lifetime = 0;
   let cleanupEpoch = 0;
-  let catalogRefreshing = true;
+  let catalogRefreshing = $state(true);
   let catalogReady = $state(false);
 
   function actionScope() {
@@ -286,7 +287,8 @@
   {:else if workers.length === 0}
     <p class="section-state">No Workers are visible.</p>
   {:else}
-    <div class="table-wrap workers-table-wrap">
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex (Horizontal scroll regions must be keyboard-focusable.) -->
+    <div class="table-wrap workers-table-wrap" role="region" aria-label="Workers" tabindex="0">
       <table class="workers-table">
         <thead>
           <tr>
@@ -379,9 +381,31 @@
       </table>
     </div>
   {/if}
+
+  <WorkerDriveGrants
+    workspaceId={data.workspaceId}
+    {workers}
+    workersReady={catalogReady && !catalogRefreshing}
+    canManage={data.workspace?.permissions.manage_runtimes === true}
+  />
 </section>
 
 <style>
+  .workers-page {
+    min-width: 0;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .workers-table-wrap {
+    min-width: 0;
+    overflow-x: auto;
+  }
+
+  .workers-table-wrap:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
   .worker-title-link {
     color: inherit;
     text-decoration: none;

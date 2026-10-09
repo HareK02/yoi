@@ -32765,6 +32765,7 @@ mod tests {
     mod auth_logging_tests;
     mod drive_api_tests;
     mod drive_tests;
+    mod drive_web_roundtrip_tests;
     mod subject_spawn_tests;
     mod subjektiv_jobs_tests;
     mod ticket_evidence_tests;

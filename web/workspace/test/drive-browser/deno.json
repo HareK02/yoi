@@ -1,0 +1,15 @@
+{
+  "nodeModulesDir": "auto",
+  "imports": {
+    "#lib/": "../../src/lib/",
+    "@std/assert": "jsr:@std/assert@1.0.19",
+    "@std/path": "jsr:@std/path@1.1.4",
+    "playwright": "npm:playwright@1.59.1"
+  },
+  "lock": false,
+  "tasks": {
+    "test:fixture": "deno test --allow-read fixture-api.test.ts",
+    "test:browser": "deno test --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys drive.browser.test.ts",
+    "test:responsive": "deno test --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys responsive.browser.test.ts"
+  }
+}
