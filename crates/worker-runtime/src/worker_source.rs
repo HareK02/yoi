@@ -1,11 +1,13 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::workspace_request::{RuntimeWorkspaceRequest, RuntimeWorkspaceRequestClient};
+use crate::workspace_request::{
+    RuntimeWorkspaceRequest, RuntimeWorkspaceRequestClient, RuntimeWorkspaceRequestError,
+};
 use worker::{
-    WorkspaceClient, WorkspaceClientError, WorkspacePromptCatalogResolution,
-    WorkspacePromptProjection, WorkspaceRequest, WorkspaceRequestMethod, WorkspaceResponse,
-    WorkspaceServerOperation,
+    WorkspaceBinaryRequest, WorkspaceBinaryResponse, WorkspaceClient, WorkspaceClientError,
+    WorkspacePromptCatalogResolution, WorkspacePromptProjection, WorkspaceRequest,
+    WorkspaceRequestMethod, WorkspaceResponse, WorkspaceServerOperation,
 };
 
 use crate::auth::{
@@ -381,6 +383,64 @@ impl RuntimeOwnedWorkspaceClient {
         self
     }
 
+    fn execute_binary_with_optional_timeout(
+        &self,
+        request: WorkspaceBinaryRequest,
+        timeout: Option<Duration>,
+    ) -> Result<WorkspaceBinaryResponse, WorkspaceClientError> {
+        let method = match request.method {
+            WorkspaceRequestMethod::Get => reqwest::Method::GET,
+            WorkspaceRequestMethod::Post => reqwest::Method::POST,
+            WorkspaceRequestMethod::Put => reqwest::Method::PUT,
+            WorkspaceRequestMethod::Patch => reqwest::Method::PATCH,
+            WorkspaceRequestMethod::Delete => reqwest::Method::DELETE,
+        };
+        let mut headers = reqwest::header::HeaderMap::new();
+        if request.body.is_some() {
+            headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                reqwest::header::HeaderValue::from_static("application/octet-stream"),
+            );
+        }
+        let response = self
+            .request_client
+            .execute_binary_blocking(RuntimeWorkspaceRequest {
+                method,
+                path_and_query: request.path,
+                body: request.body.unwrap_or_default(),
+                headers,
+                permission: WORKSPACE_REQUEST_PERMISSION.to_string(),
+                worker_id: Some(self.worker_id.clone()),
+                timeout,
+                max_response_bytes: request.max_response_bytes,
+            })
+            .map_err(|error| {
+                // Never expose request URLs, signed proofs, or binary bodies in transport errors.
+                let message = match error {
+                    RuntimeWorkspaceRequestError::InvalidRequest(_) => {
+                        "invalid Workspace binary request"
+                    }
+                    RuntimeWorkspaceRequestError::Sign(_) => {
+                        "Workspace binary request authorization failed"
+                    }
+                    RuntimeWorkspaceRequestError::ResponseTooLarge { .. } => {
+                        "Workspace binary response exceeded limit"
+                    }
+                    RuntimeWorkspaceRequestError::Transport { timeout: true, .. } => {
+                        "Workspace binary request timed out"
+                    }
+                    RuntimeWorkspaceRequestError::Transport { .. } => {
+                        "Workspace binary request failed"
+                    }
+                };
+                WorkspaceClientError::Request(message.to_string())
+            })?;
+        Ok(WorkspaceBinaryResponse {
+            status: response.status.as_u16(),
+            body: response.body,
+        })
+    }
+
     fn execute_with_optional_timeout(
         &self,
         request: WorkspaceRequest,
@@ -479,6 +539,21 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
         request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         self.execute_with_optional_timeout(request, self.request_timeout)
+    }
+
+    fn execute_binary(
+        &self,
+        request: WorkspaceBinaryRequest,
+    ) -> Result<WorkspaceBinaryResponse, WorkspaceClientError> {
+        self.execute_binary_with_optional_timeout(request, self.request_timeout)
+    }
+
+    fn execute_binary_with_timeout(
+        &self,
+        request: WorkspaceBinaryRequest,
+        timeout: Duration,
+    ) -> Result<WorkspaceBinaryResponse, WorkspaceClientError> {
+        self.execute_binary_with_optional_timeout(request, Some(timeout))
     }
 
     fn execute_with_timeout(
@@ -788,6 +863,216 @@ mod tests {
         decode_runtime_request_source_claims, decode_worker_mutation_source_claims,
         request_body_digest, verify_worker_mutation_source_proof,
     };
+
+    fn binary_loopback(response: Vec<u8>) -> (String, std::thread::JoinHandle<(String, Vec<u8>)>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+                assert!(head.len() < 16 * 1024, "request headers too large");
+            }
+            let head = String::from_utf8(head).unwrap();
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).unwrap();
+            // Oversize-response tests may close the connection before all bytes are sent.
+            let _ = stream.write_all(&response);
+            (head, body)
+        });
+        (base_url, server)
+    }
+
+    #[test]
+    fn binary_roundtrip_signs_exact_query_method_worker_and_raw_body() {
+        use crate::auth::{RuntimeRequestSourceExpectation, verify_runtime_request_source};
+        let identity = RuntimeIdentityMaterial::generate("runtime-a").unwrap();
+        for (method, wire_method, body, reply) in [
+            (
+                WorkspaceRequestMethod::Get,
+                "GET",
+                None,
+                vec![0, 255, 128, 13],
+            ),
+            (
+                WorkspaceRequestMethod::Post,
+                "POST",
+                Some(vec![0, 255, 128, 13, 10]),
+                vec![255, 0],
+            ),
+            (
+                WorkspaceRequestMethod::Put,
+                "PUT",
+                Some(vec![255; 16 * 1024 * 1024]),
+                vec![0],
+            ),
+        ] {
+            let path = "/api/w/workspace-a/drive/entries/a/content?offset=0&limit=65536&name=a%2Fb";
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                reply.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&reply);
+            let (base_url, server) = binary_loopback(response);
+            let client =
+                RuntimeOwnedWorkspaceClient::new("workspace-a", base_url, "runtime-a", "worker-a")
+                    .with_runtime_request_source(&identity, "server-a");
+            let result = client
+                .execute_binary_with_timeout(
+                    WorkspaceBinaryRequest {
+                        method,
+                        path: path.into(),
+                        body: body.clone(),
+                        max_response_bytes: reply.len(),
+                    },
+                    Duration::from_secs(5),
+                )
+                .unwrap();
+            assert_eq!(result.status, 200);
+            assert_eq!(result.body, reply);
+            let (head, received) = server.join().unwrap();
+            assert_eq!(received, body.unwrap_or_default());
+            assert!(head.starts_with(&format!("{wire_method} {path} HTTP/1.1\r\n")));
+            let header = |name: &str| {
+                head.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case(name).then(|| value.trim())
+                })
+            };
+            assert_eq!(header("x-yoi-runtime-id"), Some("runtime-a"));
+            assert_eq!(header("x-yoi-worker-id"), Some("worker-a"));
+            assert_eq!(header("authorization"), None);
+            if method != WorkspaceRequestMethod::Get {
+                assert_eq!(header("content-type"), Some("application/octet-stream"));
+            }
+            let digest = request_body_digest(&received);
+            let expected = RuntimeRequestSourceExpectation {
+                identity_id: "runtime-a",
+                audience: "server-a",
+                workspace_id: "workspace-a",
+                worker_id: Some("worker-a"),
+                permission: WORKSPACE_REQUEST_PERMISSION,
+                method: wire_method,
+                path,
+                body_digest: &digest,
+                now_unix: unix_now_seconds() as i64,
+            };
+            let token = header(RUNTIME_REQUEST_SOURCE_PROOF_HEADER).unwrap();
+            verify_runtime_request_source(token, &identity.public_key, &expected).unwrap();
+            let altered = RuntimeRequestSourceExpectation {
+                body_digest: &request_body_digest(b"altered"),
+                ..expected.clone()
+            };
+            assert!(verify_runtime_request_source(token, &identity.public_key, &altered).is_err());
+            let altered = RuntimeRequestSourceExpectation {
+                path: "/api/w/workspace-a/drive/entries/a/content?offset=1",
+                ..expected
+            };
+            assert!(verify_runtime_request_source(token, &identity.public_key, &altered).is_err());
+        }
+    }
+
+    #[test]
+    fn binary_responses_enforce_declared_and_streamed_limits_with_fixed_errors() {
+        for response in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabcde".to_vec(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nab\r\n3\r\ncde\r\n0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 500 Error\r\nConnection: close\r\n\r\nabcde".to_vec(),
+        ] {
+            let (base_url, server) = binary_loopback(response);
+            let client = RuntimeOwnedWorkspaceClient::new("workspace-a", base_url, "runtime-a", "worker-a");
+            let error = client.execute_binary(WorkspaceBinaryRequest {
+                method: WorkspaceRequestMethod::Get,
+                path: "/api/w/workspace-a/drive/entries/a/content?private=secret".into(),
+                body: None, max_response_bytes: 4,
+            }).unwrap_err();
+            server.join().unwrap();
+            assert_eq!(error.to_string(), "workspace request failed: Workspace binary response exceeded limit");
+        }
+    }
+
+    #[test]
+    fn binary_redirect_returns_status_without_forwarding_authentication() {
+        let (base_url, server) = binary_loopback(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:1/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec());
+        let client =
+            RuntimeOwnedWorkspaceClient::new("workspace-a", base_url, "runtime-a", "worker-a");
+        let result = client
+            .execute_binary(WorkspaceBinaryRequest {
+                method: WorkspaceRequestMethod::Post,
+                path: "/api/w/workspace-a/drive/upload".into(),
+                body: Some(vec![0, 255]),
+                max_response_bytes: 0,
+            })
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(result.status, 307);
+        assert!(result.body.is_empty());
+    }
+
+    #[test]
+    fn binary_invalid_or_normalized_targets_fail_with_fixed_errors_before_http() {
+        let client = RuntimeOwnedWorkspaceClient::new(
+            "workspace-a",
+            "http://127.0.0.1:1",
+            "runtime-a",
+            "worker-a",
+        );
+        for path in [
+            "https://example.com/secret",
+            "//example.com/secret",
+            "/a/../secret",
+            "/a#secret",
+            "/a\\secret",
+            "/a b",
+        ] {
+            let error = client
+                .execute_binary(WorkspaceBinaryRequest {
+                    method: WorkspaceRequestMethod::Get,
+                    path: path.into(),
+                    body: None,
+                    max_response_bytes: 4,
+                })
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "workspace request failed: invalid Workspace binary request"
+            );
+        }
+        let error = client
+            .execute_binary_with_timeout(
+                WorkspaceBinaryRequest {
+                    method: WorkspaceRequestMethod::Post,
+                    path: "/secret?private=value".into(),
+                    body: Some(vec![255]),
+                    max_response_bytes: 4,
+                },
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "workspace request failed: Workspace binary request failed"
+        );
+    }
 
     #[test]
     fn current_prompt_projection_uses_the_shared_runtime_cache_without_http() {

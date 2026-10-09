@@ -143,8 +143,12 @@ pub struct FeatureConfig {
     pub workdir_catalog: FeatureFlagConfig,
     /// Opt-in WIP-only logical Workspace configuration feature. This flag is
     /// not an access grant; Backend-owned Worker grants remain authoritative.
-    #[serde(default, deserialize_with = "deserialize_workspace_config")]
+    #[serde(default, deserialize_with = "deserialize_activation_feature")]
     pub workspace_config: FeatureFlagConfig,
+    /// Opt-in Drive tools and native WIP surface. Activation grants no Drive
+    /// access: Backend-owned Worker grants are checked on every operation.
+    #[serde(default, deserialize_with = "deserialize_activation_feature")]
+    pub drive: FeatureFlagConfig,
     #[serde(default)]
     pub ticket: TicketFeatureConfig,
     #[serde(default)]
@@ -169,11 +173,11 @@ where
     })
 }
 
-fn deserialize_workspace_config<'de, D>(deserializer: D) -> Result<FeatureFlagConfig, D::Error>
+fn deserialize_activation_feature<'de, D>(deserializer: D) -> Result<FeatureFlagConfig, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(config::WorkspaceConfigFeatureConfigPartial::deserialize(deserializer)?.into())
+    Ok(config::ActivationFeatureConfigPartial::deserialize(deserializer)?.into())
 }
 
 impl Default for FeatureConfig {
@@ -192,6 +196,7 @@ impl Default for FeatureConfig {
             manage_workdir: FeatureFlagConfig::disabled(),
             workdir_catalog: default_workdir_catalog(),
             workspace_config: FeatureFlagConfig::disabled(),
+            drive: FeatureFlagConfig::disabled(),
             ticket: TicketFeatureConfig::default(),
             merge_request: MergeRequestFeatureConfig::default(),
             orchestration: FeatureFlagConfig::disabled(),

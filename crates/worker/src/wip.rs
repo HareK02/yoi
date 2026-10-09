@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex};
 use agen::Engine;
 use agen::llm_client::client::LlmClient;
 use agen::state::Mutable;
-use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
+use agen::tool::{
+    Attachment, Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput,
+};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -99,8 +101,8 @@ pub struct WipCallContext {
     pub security_context: String,
 }
 
-/// Successful operation value. Compatibility projections can retain an ordinary
-/// ToolOutput so images and pruning semantics remain on the existing Engine path.
+/// Successful operation value. Native attachments and compatibility ToolOutputs
+/// use the existing Engine side channel, separate from the validated WIP value.
 pub struct WipOperationOutput {
     pub value: Value,
     tool_output: Option<ToolOutput>,
@@ -125,6 +127,20 @@ impl WipOperationOutput {
         }
     }
 
+    /// Attach model-visible binary content without replacing the native result
+    /// or its exact post-operation validator. Invoke returns these attachments
+    /// through ToolOutput so Engine capture/history can persist their bytes.
+    pub fn with_attachments(mut self, attachments: Vec<Attachment>) -> Self {
+        self.tool_output
+            .get_or_insert_with(|| ToolOutput {
+                summary: String::new(),
+                content: None,
+                attachments: Vec::new(),
+            })
+            .attachments = attachments;
+        self
+    }
+
     fn compatibility(value: Value, output: ToolOutput) -> Self {
         Self {
             value,
@@ -132,6 +148,13 @@ impl WipOperationOutput {
             validator: None,
         }
     }
+}
+
+enum WipToolOutput {
+    /// Only binary attachments accompany the validated native completion.
+    Native(ToolOutput),
+    /// Existing compatibility/error output retains its summary and pruning policy.
+    Passthrough(Result<ToolOutput, ToolError>),
 }
 
 pub enum WipOperationError {
@@ -2255,15 +2278,22 @@ impl WipRuntime {
         guard.disarm();
         let completion = completion.map_err(client_tool_error)?;
         self.push_audit(prepared.id, path, operation, audit_outcome);
-        if let Some(result) = passthrough {
-            if result.is_ok() {
-                self.metrics
-                    .operation_successes
-                    .fetch_add(1, Ordering::Relaxed);
+        let mut attachments = Vec::new();
+        if let Some(passthrough) = passthrough {
+            match passthrough {
+                WipToolOutput::Passthrough(result) => {
+                    if result.is_ok() {
+                        self.metrics
+                            .operation_successes
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    return result;
+                }
+                WipToolOutput::Native(output) => attachments = output.attachments,
             }
-            return result;
         }
-        render_call_completion(completion).map(|output| {
+        render_call_completion(completion).map(|mut output| {
+            output.attachments = attachments;
             self.metrics
                 .operation_successes
                 .fetch_add(1, Ordering::Relaxed);
@@ -2366,14 +2396,7 @@ impl WipRuntime {
         &self,
         request: &Request<Vec<u8>>,
         execution: ToolExecutionContext,
-    ) -> Result<
-        (
-            Response<Vec<u8>>,
-            Option<Result<ToolOutput, ToolError>>,
-            WipAuditOutcome,
-        ),
-        ToolError,
-    > {
+    ) -> Result<(Response<Vec<u8>>, Option<WipToolOutput>, WipAuditOutcome), ToolError> {
         let rejected = |error: ProtocolError| -> Result<_, ToolError> {
             Ok((
                 encode_protocol_error_response(
@@ -2413,6 +2436,7 @@ impl WipRuntime {
             return rejected(error);
         }
         let projection = projection.projection;
+        let kind = projection.kind;
         let descriptor = projection.descriptor.clone();
         let target_validator = projection.object.validator.clone();
         let request_value =
@@ -2471,8 +2495,10 @@ impl WipRuntime {
                         .map_err(|error| ToolError::Internal(error.to_string()))?;
                         return Ok((
                             response,
-                            Some(Err(ToolError::ExecutionFailed(format!(
-                                "WIP operation outcome unknown; do not retry automatically: {message}"
+                            Some(WipToolOutput::Passthrough(Err(ToolError::ExecutionFailed(
+                                format!(
+                                    "WIP operation outcome unknown; do not retry automatically: {message}"
+                                ),
                             )))),
                             WipAuditOutcome::OutcomeUnknown,
                         ));
@@ -2480,7 +2506,10 @@ impl WipRuntime {
                 };
                 Ok((
                     response,
-                    output.tool_output.map(Ok),
+                    output.tool_output.map(|output| match kind {
+                        WipProjectionKind::Native => WipToolOutput::Native(output),
+                        WipProjectionKind::Compatibility => WipToolOutput::Passthrough(Ok(output)),
+                    }),
                     WipAuditOutcome::Success,
                 ))
             }
@@ -2505,7 +2534,9 @@ impl WipRuntime {
                 .map_err(|encode| ToolError::Internal(encode.to_string()))?;
                 Ok((
                     response,
-                    Some(Err(ToolError::Cancelled(output))),
+                    Some(WipToolOutput::Passthrough(Err(ToolError::Cancelled(
+                        output,
+                    )))),
                     WipAuditOutcome::Cancelled,
                 ))
             }
@@ -2521,7 +2552,9 @@ impl WipRuntime {
                 .map_err(|encode| ToolError::Internal(encode.to_string()))?;
                 Ok((
                     response,
-                    Some(Err(ToolError::Interrupted(output))),
+                    Some(WipToolOutput::Passthrough(Err(ToolError::Interrupted(
+                        output,
+                    )))),
                     WipAuditOutcome::Interrupted,
                 ))
             }
@@ -2534,8 +2567,10 @@ impl WipRuntime {
                 .map_err(|encode| ToolError::Internal(encode.to_string()))?;
                 Ok((
                     response,
-                    Some(Err(ToolError::ExecutionFailed(format!(
-                        "WIP operation outcome unknown; do not retry automatically: {message}"
+                    Some(WipToolOutput::Passthrough(Err(ToolError::ExecutionFailed(
+                        format!(
+                            "WIP operation outcome unknown; do not retry automatically: {message}"
+                        ),
                     )))),
                     WipAuditOutcome::OutcomeUnknown,
                 ))
@@ -5098,6 +5133,280 @@ mod tests {
             interface_validator: Some(vec![1]),
             handler: Arc::new(NativeTyped),
         }
+    }
+
+    struct NativeImage {
+        invalid_result: bool,
+    }
+
+    #[async_trait]
+    impl WipOperationHandler for NativeImage {
+        async fn call(
+            &self,
+            _operation: &str,
+            _arguments: &BTreeMap<String, Value>,
+            _context: WipCallContext,
+        ) -> Result<WipOperationOutput, WipOperationError> {
+            let value = if self.invalid_result {
+                Value::Integer(1)
+            } else {
+                Value::String("Attached native image".into())
+            };
+            Ok(
+                WipOperationOutput::native_with_validator(value, vec![7]).with_attachments(vec![
+                    Attachment::Image(agen::tool::ImageAttachment::new(
+                        "image/png",
+                        include_bytes!("../../tools/tests/fixtures/view-image/valid.png").to_vec(),
+                    )),
+                ]),
+            )
+        }
+    }
+
+    fn native_image_registry(invalid_result: bool) -> WipMountRegistry {
+        let mut registry = WipMountRegistry::new();
+        registry.allocate_namespace("native", "native").unwrap();
+        registry
+            .mount(WipProjection {
+                route: "/native/image".into(),
+                capability: "native:image".into(),
+                kind: WipProjectionKind::Native,
+                object: Object {
+                    name: "image".into(),
+                    description: None,
+                    interfaces: vec![root_reference("yoi.native/image/v1")],
+                    r#ref: Some("native:image".into()),
+                    validator: Some(vec![1]),
+                },
+                interface: root_reference("yoi.native/image/v1"),
+                descriptor: InterfaceDescriptor {
+                    format: INTERFACE_FORMAT_V1.into(),
+                    documentation: None,
+                    types: Vec::new(),
+                    operations: vec![OperationDeclaration {
+                        name: "view".into(),
+                        documentation: None,
+                        parameters: Vec::new(),
+                        returns: ReturnDeclaration {
+                            documentation: None,
+                            r#type: TypeExpr::String,
+                        },
+                    }],
+                },
+                interface_validator: Some(vec![1]),
+                handler: Arc::new(NativeImage { invalid_result }),
+            })
+            .unwrap();
+        registry
+    }
+
+    fn native_image_invoke() -> String {
+        json!({
+            "path":"/native/image",
+            "interface":{"scope":"/","name":"yoi.native/image/v1"},
+            "operation":"view",
+            "arguments":{}
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn native_invoke_returns_image_bytes_and_preserves_result_and_validator() {
+        let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
+        let runtime = install_wip_mode_with_mounts(
+            &mut engine,
+            None,
+            "worker-a".into(),
+            native_image_registry(false),
+        )
+        .unwrap();
+        let tools = engine.tool_server_handle();
+        tools.flush_pending();
+        tools
+            .call_tool(
+                "Inspect",
+                r#"{"path":"/native/image"}"#,
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        let output = tools
+            .call_tool(
+                "Invoke",
+                &native_image_invoke(),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.summary, "WIP operation completed");
+        assert_eq!(
+            serde_json::from_str::<Json>(output.content.as_deref().unwrap()).unwrap(),
+            json!("Attached native image")
+        );
+        let [Attachment::Image(image)] = output.attachments.as_slice() else {
+            panic!("Invoke must return an image, not a URL")
+        };
+        assert_eq!(image.mime_type(), "image/png");
+        assert_eq!(
+            image.data(),
+            include_bytes!("../../tools/tests/fixtures/view-image/valid.png")
+        );
+        let state = runtime.state.lock().unwrap();
+        let calls = state.client.call_history(&state.session).unwrap();
+        assert!(
+            matches!(&calls.back().unwrap().outcome, CallOutcome::Success(response) if response.result == Value::String("Attached native image".into()) && response.validator == Some(vec![7]))
+        );
+    }
+
+    #[tokio::test]
+    async fn native_attachments_do_not_bypass_return_value_validation() {
+        let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
+        install_wip_mode_with_mounts(
+            &mut engine,
+            None,
+            "worker-a".into(),
+            native_image_registry(true),
+        )
+        .unwrap();
+        let tools = engine.tool_server_handle();
+        tools.flush_pending();
+        tools
+            .call_tool(
+                "Inspect",
+                r#"{"path":"/native/image"}"#,
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        let error = tools
+            .call_tool(
+                "Invoke",
+                &native_image_invoke(),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("outcome unknown"), "{error}");
+    }
+
+    #[derive(Clone)]
+    struct NativeImageClient {
+        events: Arc<Mutex<VecDeque<Vec<agen::llm_client::event::Event>>>>,
+        requests: Arc<Mutex<Vec<LlmRequest>>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for NativeImageClient {
+        fn clone_boxed(&self) -> Box<dyn LlmClient> {
+            Box::new(self.clone())
+        }
+        async fn stream(&self, request: LlmRequest) -> Result<ResponseStream, ClientError> {
+            self.requests.lock().unwrap().push(request);
+            let events = self
+                .events
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected model request");
+            Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+        }
+    }
+
+    #[tokio::test]
+    async fn native_invoke_image_survives_engine_capture_and_durable_history_replay() {
+        use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
+        let completed = || {
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            })
+        };
+        let client = NativeImageClient {
+            events: Arc::new(Mutex::new(VecDeque::from([
+                vec![
+                    Event::tool_use_start(0, "native-image-call", "Invoke"),
+                    Event::tool_input_delta(0, &native_image_invoke()),
+                    Event::tool_use_stop(0),
+                    completed(),
+                ],
+                vec![completed()],
+            ]))),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut engine = Engine::new(client.clone());
+        install_wip_mode_with_mounts(
+            &mut engine,
+            None,
+            "worker-a".into(),
+            native_image_registry(false),
+        )
+        .unwrap();
+        let tools = engine.tool_server_handle();
+        tools.flush_pending();
+        tools
+            .call_tool(
+                "Inspect",
+                r#"{"path":"/native/image"}"#,
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        engine.on_history_append(move |item| {
+            sink.lock().unwrap().push(item.clone());
+            Ok(())
+        });
+        let mut history = agen::History::new();
+        assert!(matches!(
+            engine
+                .run(&mut history, "view the native image")
+                .await
+                .result,
+            agen::EngineRunExit::Finished
+        ));
+        let saved = history.items().find(|item| matches!(item, agen::Item::ToolResult { call_id, .. } if call_id == "native-image-call")).unwrap();
+        let agen::Item::ToolResult {
+            attachments,
+            is_error,
+            content,
+            ..
+        } = saved
+        else {
+            unreachable!()
+        };
+        assert!(!is_error);
+        let [Attachment::Image(image)] = attachments.as_slice() else {
+            panic!("durable Invoke result lost image")
+        };
+        assert_eq!(
+            image.data(),
+            include_bytes!("../../tools/tests/fixtures/view-image/valid.png")
+        );
+        assert_eq!(
+            serde_json::from_str::<Json>(content.as_deref().unwrap()).unwrap(),
+            json!("Attached native image")
+        );
+        assert!(captured.lock().unwrap().iter().any(|item| item == saved));
+        assert!(
+            client.requests.lock().unwrap()[1]
+                .items
+                .iter()
+                .any(|item| item == saved)
+        );
+        let log = session_store::LogEntry::AnnotatedToolResult {
+            ts: 1,
+            entry: session_store::LoggedHistoryEntry {
+                item: session_store::LoggedItem::from(saved),
+                metadata: session_store::LoggedSessionHistoryMetadata {
+                    entry_id: session_store::LoggedSessionHistoryEntryId::new(),
+                    origin: session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
+                    derivation: None,
+                },
+            },
+        };
+        let serialized = serde_json::to_string(&log).unwrap();
+        let restored: session_store::LogEntry = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(&session_store::collect_state(&[restored]).history[0], saved);
     }
 
     #[tokio::test]

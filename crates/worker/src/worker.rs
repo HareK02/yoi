@@ -639,6 +639,27 @@ impl WorkspaceRequest {
     }
 }
 
+/// Raw-byte request through a host-bound Workspace client, separate from JSON requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceBinaryRequest {
+    pub method: WorkspaceRequestMethod,
+    pub path: String,
+    pub body: Option<Vec<u8>>,
+    pub max_response_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceBinaryResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+impl WorkspaceBinaryResponse {
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceRequestMethod {
     Get,
@@ -859,6 +880,24 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
         self.execute(request)
     }
 
+    /// Binary transport is unavailable unless a host-bound implementation opts in.
+    fn execute_binary(
+        &self,
+        _request: WorkspaceBinaryRequest,
+    ) -> Result<WorkspaceBinaryResponse, WorkspaceClientError> {
+        Err(WorkspaceClientError::Unavailable(
+            "Workspace binary transport is unavailable".to_string(),
+        ))
+    }
+
+    fn execute_binary_with_timeout(
+        &self,
+        request: WorkspaceBinaryRequest,
+        _timeout: Duration,
+    ) -> Result<WorkspaceBinaryResponse, WorkspaceClientError> {
+        self.execute_binary(request)
+    }
+
     fn execute_server_operation(
         &self,
         operation: WorkspaceServerOperation,
@@ -959,6 +998,31 @@ impl WorkspaceClient for ReviewerChildWorkspaceClient {
         minimum_revision: Option<u64>,
     ) -> Result<Option<WorkspacePromptCatalogResolution>, WorkspaceClientError> {
         self.inner.current_prompt_projection(minimum_revision)
+    }
+
+    fn execute_binary(
+        &self,
+        request: WorkspaceBinaryRequest,
+    ) -> Result<WorkspaceBinaryResponse, WorkspaceClientError> {
+        if request.method != WorkspaceRequestMethod::Get {
+            return Err(WorkspaceClientError::Unavailable(
+                "Reviewer child binary Workspace authority is read-only".to_string(),
+            ));
+        }
+        self.inner.execute_binary(request)
+    }
+
+    fn execute_binary_with_timeout(
+        &self,
+        request: WorkspaceBinaryRequest,
+        timeout: Duration,
+    ) -> Result<WorkspaceBinaryResponse, WorkspaceClientError> {
+        if request.method != WorkspaceRequestMethod::Get {
+            return Err(WorkspaceClientError::Unavailable(
+                "Reviewer child binary Workspace authority is read-only".to_string(),
+            ));
+        }
+        self.inner.execute_binary_with_timeout(request, timeout)
     }
 
     fn execute(
@@ -1155,6 +1219,123 @@ mod reviewer_client_tests {
             },
             "secret".into(),
         )
+    }
+
+    #[test]
+    fn binary_transport_defaults_to_denial_without_json_fallback() {
+        let client = RecordingWorkspaceClient::default();
+        let request = WorkspaceBinaryRequest {
+            method: WorkspaceRequestMethod::Get,
+            path: "/api/w/ws/drive/entries/a/content".into(),
+            body: None,
+            max_response_bytes: 64 * 1024,
+        };
+        assert!(matches!(
+            client.execute_binary(request.clone()),
+            Err(WorkspaceClientError::Unavailable(_))
+        ));
+        assert!(matches!(
+            client.execute_binary_with_timeout(request, Duration::from_secs(1)),
+            Err(WorkspaceClientError::Unavailable(_))
+        ));
+        assert!(client.requests.lock().unwrap().is_empty());
+    }
+
+    #[derive(Debug, Default)]
+    struct BinaryRecordingClient {
+        requests: Mutex<Vec<(WorkspaceBinaryRequest, Option<Duration>)>>,
+    }
+
+    impl WorkspaceClient for BinaryRecordingClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("ws")
+        }
+        fn kind(&self) -> &str {
+            "binary-recording"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn execute(&self, _: WorkspaceRequest) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            panic!("binary request must not use JSON fallback")
+        }
+        fn execute_binary(
+            &self,
+            request: WorkspaceBinaryRequest,
+        ) -> Result<WorkspaceBinaryResponse, WorkspaceClientError> {
+            self.requests.lock().unwrap().push((request, None));
+            Ok(WorkspaceBinaryResponse {
+                status: 200,
+                body: vec![0, 255],
+            })
+        }
+        fn execute_binary_with_timeout(
+            &self,
+            request: WorkspaceBinaryRequest,
+            timeout: Duration,
+        ) -> Result<WorkspaceBinaryResponse, WorkspaceClientError> {
+            self.requests.lock().unwrap().push((request, Some(timeout)));
+            Ok(WorkspaceBinaryResponse {
+                status: 200,
+                body: vec![0, 255],
+            })
+        }
+    }
+
+    #[test]
+    fn reviewer_binary_get_preserves_request_limit_and_timeout() {
+        let inner = Arc::new(BinaryRecordingClient::default());
+        let client = reviewer_client(inner.clone());
+        let request = WorkspaceBinaryRequest {
+            method: WorkspaceRequestMethod::Get,
+            path: "/api/w/ws/drive/entries/a/content?offset=2&limit=4".into(),
+            body: None,
+            max_response_bytes: 4,
+        };
+        assert_eq!(
+            client.execute_binary(request.clone()).unwrap().body,
+            vec![0, 255]
+        );
+        let timeout = Duration::from_secs(2);
+        assert_eq!(
+            client
+                .execute_binary_with_timeout(request.clone(), timeout)
+                .unwrap()
+                .body,
+            vec![0, 255]
+        );
+        assert_eq!(
+            *inner.requests.lock().unwrap(),
+            vec![(request.clone(), None), (request, Some(timeout))]
+        );
+    }
+
+    #[test]
+    fn reviewer_binary_mutations_are_denied_even_for_attested_review_path() {
+        let inner = Arc::new(BinaryRecordingClient::default());
+        let client = reviewer_client(inner.clone());
+        for method in [
+            WorkspaceRequestMethod::Post,
+            WorkspaceRequestMethod::Put,
+            WorkspaceRequestMethod::Patch,
+            WorkspaceRequestMethod::Delete,
+        ] {
+            let request = WorkspaceBinaryRequest {
+                method,
+                path: "/api/w/ws/merge-requests/MR1/reviews".into(),
+                body: Some(vec![0, 255]),
+                max_response_bytes: 4,
+            };
+            assert!(matches!(
+                client.execute_binary(request.clone()),
+                Err(WorkspaceClientError::Unavailable(_))
+            ));
+            assert!(matches!(
+                client.execute_binary_with_timeout(request, Duration::from_secs(1)),
+                Err(WorkspaceClientError::Unavailable(_))
+            ));
+        }
+        assert!(inner.requests.lock().unwrap().is_empty());
     }
 
     #[test]

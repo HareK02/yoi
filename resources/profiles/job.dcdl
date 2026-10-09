@@ -9,6 +9,7 @@ engine = {
 };
 session = { record_event_trace = false; };
 feature = {
+    drive = { enabled = false; };
     task = { enabled = false; };
     memory = { enabled = false; staging_tools = false; };
     subjektiv = { enabled = false; consolidation_tools = false; extraction = { enabled = false; }; };

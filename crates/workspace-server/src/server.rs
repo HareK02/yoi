@@ -32736,6 +32736,7 @@ mod tests {
     mod ticket_worker_claim_tests;
     mod ticket_worker_launch_tests;
     mod value_profiles_tests;
+    mod worker_drive_tests;
     mod worker_operations_tests;
     include!("server_workspace_config_tests.rs");
     use super::*;

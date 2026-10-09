@@ -10,6 +10,7 @@ import "./base.dcdl" // {
     };
 
     feature = {
+        drive = { enabled = false; };
         task = { enabled = false; };
         memory = { enabled = false; };
         subjektiv = { enabled = false; extraction = { enabled = false; }; };
