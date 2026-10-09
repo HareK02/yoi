@@ -17775,9 +17775,15 @@ async fn scoped_attach_current_worker_workdir(
             code: "working_directory_not_found".to_string(),
             message: format!("unknown Workdir `{workdir_id}`"),
         })?;
-    if workdir.materialization_status != "present" {
+    // A failed removal must not prevent its owner from attaching a still usable
+    // repository checkout to resolve current blockers. Runtime binding validates
+    // the actual checkout; durable pending-removal reservations still fence this
+    // mutation. Other sources and missing/corrupted materializations stay denied.
+    let repository_retry = workdir.materialization_status == "pending"
+        && matches!(workdir.source, WorkdirRegistrySource::Repository { .. });
+    if workdir.materialization_status != "present" && !repository_retry {
         return Err(Error::WorkdirAttachmentConflict(format!(
-            "Workdir `{workdir_id}` is not active ({})",
+            "Workdir `{workdir_id}` is not available for attachment ({})",
             workdir.materialization_status
         ))
         .into());
@@ -53647,6 +53653,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn current_worker_can_reattach_usable_pending_checkout_after_failed_removal_but_not_during_attempt()
+     {
+        let mut fixture = manual_worker_assignment_fixture().await;
+        let identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id)
+                .unwrap();
+        configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
+        let api = &fixture.api;
+        api.store
+            .detach_worker_workdir(
+                TEST_WORKSPACE_ID,
+                &fixture.worker,
+                Some(&fixture.docs_workdir_id),
+                "release for removal",
+            )
+            .unwrap();
+        let mut record = api
+            .store
+            .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.docs_workdir_id)
+            .unwrap()
+            .unwrap();
+        record.materialization_status = "pending".into();
+        api.store.upsert_workdir_registry(&record).unwrap();
+        let intent =
+            workdir_removal_intent(&record, "account:owner", "remove docs checkout").unwrap();
+        let pending = api
+            .config_store
+            .reserve_workdir_removal_operation(&intent)
+            .unwrap();
+        let path = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-attachments");
+        let request = || {
+            runtime_source_request(
+                &identity,
+                Some(&fixture.worker.worker_id),
+                "POST",
+                &path,
+                serde_json::to_vec(
+                    &json!({ "alias": "docs", "working_directory_id": fixture.docs_workdir_id }),
+                )
+                .unwrap(),
+            )
+        };
+        let blocked = build_router(api.clone()).oneshot(request()).await.unwrap();
+        let blocked_status = blocked.status();
+        let blocked_body = to_bytes(blocked.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            blocked_status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&blocked_body)
+        );
+        api.config_store
+            .fail_workdir_removal_operation(&pending, "provider_unavailable", true)
+            .unwrap();
+        let attached = build_router(api.clone()).oneshot(request()).await.unwrap();
+        let attached_status = attached.status();
+        let attached_body = to_bytes(attached.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            attached_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&attached_body)
+        );
+        let attached: server_api::CurrentWorkerWorkdirAttachmentResponse =
+            serde_json::from_slice(&attached_body).unwrap();
+        assert!(attached.attached);
+        assert_eq!(attached.working_directory_id, fixture.docs_workdir_id);
+        assert_eq!(
+            api.store
+                .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.docs_workdir_id)
+                .unwrap()
+                .unwrap()
+                .materialization_status,
+            "pending"
+        );
+        assert!(
+            api.config_store
+                .workdir_removal_guards(&pending)
+                .unwrap()
+                .iter()
+                .any(|guard| guard.category == "active_attachment")
+        );
     }
 
     #[tokio::test]

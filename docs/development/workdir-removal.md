@@ -10,6 +10,11 @@ reported cause. Each attempt rechecks current attachments, attachment
 reservations, retention holds, materialization identity and current file changes.
 A previous clean observation is not permission to discard new changes. A dirty
 Workdir must be preserved or its changes resolved by its owner before deletion.
+When the same repository checkout is still usable, an authorized Worker may
+reattach it through normal `WorkdirAttach` to preserve or resolve changes, then
+detach and retry removal. An executing removal fences new attachments; a failed
+attempt does not permanently prevent reconnection. Missing or replaced checkout
+identity is not made usable by this permission.
 
 ## Interpreting a retained Workdir
 
