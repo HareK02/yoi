@@ -48049,7 +48049,8 @@ mod tests {
             operation_key: "research-done".into(),
             expected_item_revision: ticket::ticket_item_revision(&before),
             expected_state: TicketWorkflowState::InProgress,
-            reason: "Investigation findings recorded in the Ticket thread".into(),
+            reason: "## 完了理由\n\n日本語の長い検証結果を省略せず記録する。\n<!-- 完了 -->\n"
+                .repeat(1024),
             references: Vec::new(),
         };
         let call = |request| {
@@ -48062,6 +48063,13 @@ mod tests {
         };
         let Json(completed) = call(request.clone()).await.unwrap();
         assert_eq!(completed.meta.workflow_state, TicketWorkflowState::Done);
+        let event = completed.events.last().unwrap();
+        assert_eq!(event.reason.as_deref(), Some(request.reason.as_str()));
+        assert_eq!(event.body.as_str(), request.reason);
+        assert_eq!(
+            backend.show(reference.id.clone().into()).unwrap(),
+            completed
+        );
         assert!(
             merge_request_store(&api, TEST_WORKSPACE_ID)
                 .unwrap()

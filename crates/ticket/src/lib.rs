@@ -26,7 +26,6 @@ pub mod tool;
 
 pub use sqlite_schema::{migrate_sqlite_ticket_schema, verify_sqlite_ticket_schema};
 
-const MAX_STATE_CHANGE_REASON_BYTES: usize = 1024;
 const MAX_INTAKE_SUMMARY_BODY_BYTES: usize = 16 * 1024;
 const MAX_ORCHESTRATION_PLAN_TEXT_BYTES: usize = 16 * 1024;
 const MAX_ORCHESTRATION_PLAN_FIELD_BYTES: usize = 1024;
@@ -4293,11 +4292,12 @@ fn validate_required_event_value(label: &str, value: &str) -> Result<()> {
 fn validate_state_change(change: &TicketStateChange) -> Result<()> {
     validate_required_event_value("from", &change.from)?;
     validate_required_event_value("to", &change.to)?;
-    validate_required_event_value("reason", &change.reason)?;
-    if change.reason.len() > MAX_STATE_CHANGE_REASON_BYTES {
-        return Err(TicketError::Conflict(format!(
-            "state_changed reason exceeds {MAX_STATE_CHANGE_REASON_BYTES} bytes"
-        )));
+    // Reasons are persisted as SQLite text, not legacy thread-comment attributes.
+    // Preserve free-form Markdown without per-field length or single-line limits.
+    if change.reason.trim().is_empty() {
+        return Err(TicketError::Conflict(
+            "state_changed event requires non-empty reason".to_owned(),
+        ));
     }
     if let Some(author) = change.author.as_deref() {
         validate_required_event_value("author", author)?;
@@ -4305,11 +4305,6 @@ fn validate_state_change(change: &TicketStateChange) -> Result<()> {
     for reference in &change.references {
         validate_required_event_value("reference_kind", &reference.kind)?;
         validate_required_event_value("reference_target", &reference.target)?;
-    }
-    if change.body.as_str().len() > MAX_INTAKE_SUMMARY_BODY_BYTES {
-        return Err(TicketError::Conflict(format!(
-            "state_changed body exceeds {MAX_INTAKE_SUMMARY_BODY_BYTES} bytes"
-        )));
     }
     Ok(())
 }
@@ -6222,6 +6217,89 @@ mod tests {
     }
 
     #[test]
+    fn completion_preserves_long_and_multiline_reasons_across_reload_and_replay() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("tickets.db");
+        let backend = SqliteTicketBackend::open(&db, "workspace-test").unwrap();
+        for reason in [
+            "x".repeat(1025),
+            "日本語の完了理由を省略せず記録する。".repeat(1024),
+            "## 完了理由\r\n\n- 検証済み\n<!-- 詳細 -->\n".repeat(1024),
+        ] {
+            let (reference, ticket) = backend
+                .create_with_snapshot(NewTicket::new("Long completion reason"))
+                .unwrap();
+            let request = TicketCompletion {
+                reason: reason.clone(),
+                ..completion_request(&ticket, "complete")
+            };
+            let completed = backend.complete(&reference.id, request.clone()).unwrap();
+            assert_eq!(completed.meta.workflow_state, TicketWorkflowState::Done);
+            assert_eq!(completed.events.len(), ticket.events.len() + 1);
+            let event = completed.events.last().unwrap();
+            assert_eq!(event.reason.as_deref(), Some(reason.as_str()));
+            assert_eq!(event.body.as_str(), reason);
+
+            let reopened = SqliteTicketBackend::open(&db, "workspace-test").unwrap();
+            assert_eq!(
+                reopened.show(reference.id.clone().into()).unwrap(),
+                completed
+            );
+            assert_eq!(
+                reopened.complete(&reference.id, request.clone()).unwrap(),
+                completed
+            );
+            let changed = TicketCompletion {
+                reason: format!("{reason}追加の判断"),
+                ..request
+            };
+            assert!(matches!(
+                reopened.complete(&reference.id, changed),
+                Err(TicketError::OperationFingerprintMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn state_changes_and_close_preserve_long_markdown_reasons_and_bodies() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+        let (reference, _) = backend
+            .create_with_snapshot(NewTicket::new("Long state and close reasons"))
+            .unwrap();
+        let reason = "## 判断\n\n長文の理由を記録する。\n".repeat(1024);
+        let body = "## 検証結果\n\n本文も省略しない。\n".repeat(1024);
+        backend
+            .set_workflow_state(
+                reference.id.clone().into(),
+                TicketStateChange::new("planning", "inprogress", reason.clone(), body.clone()),
+            )
+            .unwrap();
+        let current = backend.show(reference.id.clone().into()).unwrap();
+        let event = current.events.last().unwrap();
+        assert_eq!(event.reason.as_deref(), Some(reason.as_str()));
+        assert_eq!(event.body.as_str(), body);
+        let request = TicketStateUpdate {
+            state: TicketWorkflowState::Closed,
+            reason: reason.clone(),
+            ..completion_request(&current, "close").into()
+        };
+        let closed = backend
+            .update_state(&reference.id, request.clone())
+            .unwrap();
+        assert_eq!(closed.meta.workflow_state, TicketWorkflowState::Closed);
+        assert_eq!(closed.resolution, Some(MarkdownText::new(&reason)));
+        assert_eq!(
+            closed.events.last().unwrap().reason.as_deref(),
+            Some(reason.as_str())
+        );
+        assert_eq!(
+            backend.update_state(&reference.id, request).unwrap(),
+            closed
+        );
+    }
+
+    #[test]
     fn completion_cas_rejects_stale_item_or_state_without_mutation() {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
@@ -6563,10 +6641,6 @@ mod tests {
                     kind: "report".to_owned(),
                     target: " \t ".to_owned(),
                 }],
-                ..request.clone()
-            },
-            TicketCompletion {
-                reason: "x".repeat(MAX_STATE_CHANGE_REASON_BYTES + 1),
                 ..request.clone()
             },
             TicketCompletion {
