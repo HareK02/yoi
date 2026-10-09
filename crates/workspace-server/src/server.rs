@@ -11927,10 +11927,6 @@ fn cleanup_workdir_cleanliness_from_runtime(value: Option<&str>) -> CleanupWorkd
         .unwrap_or(CleanupWorkdirCleanliness::Unknown)
 }
 
-fn cleanup_workdir_cleanliness_is_clean(value: CleanupWorkdirCleanliness) -> bool {
-    matches!(value, CleanupWorkdirCleanliness::Clean)
-}
-
 #[derive(Debug, Deserialize)]
 struct LogQuery {
     limit: Option<usize>,
@@ -17787,9 +17783,15 @@ async fn scoped_attach_current_worker_workdir(
             code: "working_directory_not_found".to_string(),
             message: format!("unknown Workdir `{workdir_id}`"),
         })?;
-    if workdir.materialization_status != "present" {
+    // A failed removal must not prevent its owner from attaching a still usable
+    // repository checkout to resolve current blockers. Runtime binding validates
+    // the actual checkout; durable pending-removal reservations still fence this
+    // mutation. Other sources and missing/corrupted materializations stay denied.
+    let repository_retry = workdir.materialization_status == "pending"
+        && matches!(workdir.source, WorkdirRegistrySource::Repository { .. });
+    if workdir.materialization_status != "present" && !repository_retry {
         return Err(Error::WorkdirAttachmentConflict(format!(
-            "Workdir `{workdir_id}` is not active ({})",
+            "Workdir `{workdir_id}` is not available for attachment ({})",
             workdir.materialization_status
         ))
         .into());
@@ -24527,15 +24529,85 @@ fn runtime_reports_workdir_not_found(result: &crate::hosts::RuntimeWorkingDirect
 fn classify_workdir_provider_error(error: &RuntimeRegistryError) -> (&'static str, bool) {
     match error {
         RuntimeRegistryError::UnknownRuntime(_) => ("runtime_unavailable", true),
-        RuntimeRegistryError::RuntimeOperationFailed { code, .. }
-            if code == "working_directory_unsupported" =>
-        {
-            ("unsupported_target", false)
+        RuntimeRegistryError::RuntimeOperationFailed { code, .. } => {
+            let category =
+                workdir_cleanup_diagnostic_category(code).unwrap_or("provider_unavailable");
+            (category, category != "unsupported_target")
         }
-        RuntimeRegistryError::RuntimeOperationFailed { .. } => ("provider_unavailable", true),
         RuntimeRegistryError::InvalidIdentifier { .. }
         | RuntimeRegistryError::UnknownHost(_)
         | RuntimeRegistryError::UnknownWorker { .. } => ("authority_invalid", false),
+    }
+}
+
+// Only bounded classifications cross the public removal boundary. Provider
+// messages may contain OS paths or credentials and are never persisted here.
+fn workdir_cleanup_failure_category(
+    result: &crate::hosts::RuntimeWorkingDirectoryResult,
+) -> &'static str {
+    result
+        .diagnostics
+        .iter()
+        .find_map(|diagnostic| workdir_cleanup_diagnostic_category(&diagnostic.code))
+        .unwrap_or("provider_cleanup_failed")
+}
+
+fn workdir_cleanup_diagnostic_category(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "working_directory_unsupported" => "unsupported_target",
+        "working_directory_cleanup_mount_present" => "mount_present",
+        "working_directory_cleanup_mount_check_unavailable" => "mount_check_unavailable",
+        "working_directory_cleanup_permission_denied" => "permission_denied",
+        "working_directory_cleanup_resource_busy" => "resource_busy",
+        "working_directory_cleanup_storage_unavailable" => "storage_unavailable",
+        "working_directory_cleanup_ownership_unknown" => "ownership_unknown",
+        "working_directory_cleanup_changes_present" => "changes_present",
+        "working_directory_cleanup_changes_unknown" => "changes_unknown",
+        "working_directory_cleanup_target_invalid"
+        | "working_directory_cleanup_escape_rejected" => "ownership_unknown",
+        _ => return None,
+    })
+}
+
+fn workdir_removal_failure_guidance(category: &str) -> &'static str {
+    match category {
+        "mount_present" => {
+            "A mount remains inside the Workdir. Confirm its owner and usage, have that owner safely release it, then retry deletion. Yoi does not unmount external resources."
+        }
+        "mount_check_unavailable" => {
+            "Runtime cannot inspect mount boundaries. Restore mount inspection before retrying deletion."
+        }
+        "permission_denied" => {
+            "Runtime lacks permission to remove the Workdir. Have its owner resolve access safely, then retry; do not force-clean or change shared resource permissions."
+        }
+        "resource_busy" => {
+            "A resource is busy. Have its owner stop or release it safely, then retry deletion."
+        }
+        "storage_unavailable" => {
+            "Runtime storage is unavailable. Restore storage access, then retry deletion."
+        }
+        "ownership_unknown" | "provider_identity_changed" | "authority_changed" => {
+            "Workdir identity or ownership could not be confirmed. Verify the target with its owner before retrying."
+        }
+        "changes_present" | "dirty_or_unknown" => {
+            "Current Workdir changes are protected. Preserve or resolve them before retrying deletion."
+        }
+        "changes_unknown" => {
+            "Runtime cannot verify remaining Workdir changes. Restore repository inspection or preserve remaining files before retrying."
+        }
+        "blocked_by_live_authority" => {
+            "Workdir has a current attachment, reservation or retention hold. Release the owning authority before retrying deletion."
+        }
+        "runtime_unavailable" | "provider_unavailable" => {
+            "Runtime is unavailable. Reconnect it, then retry deletion; the Workdir registry is retained."
+        }
+        "provider_observation_unknown" | "provider_cleanup_outcome_unknown" => {
+            "Runtime has not confirmed deletion. Retry to re-observe the target; the Workdir registry is retained."
+        }
+        "unsupported_target" => "This provider does not support Workdir deletion.",
+        _ => {
+            "Runtime cleanup failed. Inspect correlated Runtime diagnostics, resolve the cause, then retry deletion."
+        }
     }
 }
 
@@ -24741,17 +24813,46 @@ fn execute_reserved_workdir_removal_with_provider(
         return api.config_store.commit_workdir_removal_removed(&operation);
     }
     let Some(status) = observed.working_directory.as_ref() else {
+        let category = workdir_cleanup_failure_category(&observed);
+        let category = if category == "provider_cleanup_failed" {
+            "provider_observation_unknown"
+        } else {
+            category
+        };
         return api.config_store.fail_workdir_removal_operation(
             &operation,
-            "provider_observation_unknown",
-            true,
+            category,
+            category != "unsupported_target",
         );
     };
-    let corrupted = status.summary.status == WorkingDirectoryStatusKind::Corrupted;
-    if !corrupted
-        && (status.summary.cleanliness.as_deref() != Some("clean")
-            || status.summary.status != WorkingDirectoryStatusKind::Active)
+    // A provider summary is not permission to remove a different materialization.
+    // Unknown/corrupted metadata is delegated to Runtime's guarded cleanup, never
+    // repaired into a fabricated identity here.
+    let summary = &status.summary;
+    if summary.occupied_by.is_some() {
+        return api.config_store.complete_workdir_removal_retained(
+            &operation,
+            WorkdirRemovalDisposition::Retained,
+            "blocked_by_live_authority",
+        );
+    }
+    if summary.working_directory_id != operation.working_directory_id
+        || (summary.repository_id == "unknown"
+            && summary.status != WorkingDirectoryStatusKind::Corrupted)
+        || (summary.repository_id != "unknown"
+            && crate::workdir_removal::workdir_materialization_fingerprint(
+                &workdir_record_from_summary(api, &operation.runtime_id, summary),
+            ) != operation.materialization_fingerprint)
     {
+        return api.config_store.fail_workdir_removal_operation(
+            &operation,
+            "provider_identity_changed",
+            true,
+        );
+    }
+    // Past lifecycle failure is not a current dirtiness observation. Runtime
+    // must revalidate unknown/partial checkouts at the actual deletion boundary.
+    if summary.cleanliness.as_deref() == Some("dirty") {
         return api.config_store.complete_workdir_removal_retained(
             &operation,
             WorkdirRemovalDisposition::Retained,
@@ -24769,18 +24870,25 @@ fn execute_reserved_workdir_removal_with_provider(
                 .fail_workdir_removal_operation(&operation, category, retryable);
         }
     };
-    if deleted.state != InternalWorkerOperationState::Accepted
-        && !runtime_reports_workdir_not_found(&deleted)
-    {
-        let category = if deleted
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "working_directory_unsupported")
-        {
-            "unsupported_target"
+    let deletion_confirmed = runtime_reports_workdir_not_found(&deleted)
+        || (deleted.state == InternalWorkerOperationState::Accepted
+            && deleted.working_directory.as_ref().is_some_and(|status| {
+                status.summary.working_directory_id == operation.working_directory_id
+                    && status.summary.status == WorkingDirectoryStatusKind::NotFound
+            }));
+    if !deletion_confirmed {
+        let category = if deleted.state == InternalWorkerOperationState::Accepted {
+            "provider_cleanup_outcome_unknown"
         } else {
-            "provider_cleanup_failed"
+            workdir_cleanup_failure_category(&deleted)
         };
+        tracing::warn!(
+            workdir_id = %operation.working_directory_id,
+            operation_id = %operation.operation_id,
+            runtime_id = %operation.runtime_id,
+            category,
+            "Runtime did not confirm Workdir removal; registry retained"
+        );
         return api.config_store.fail_workdir_removal_operation(
             &operation,
             category,
@@ -25066,9 +25174,7 @@ fn build_runtime_cleanup_plan(
             .unwrap_or_else(|| cleanup_workdir_cleanliness_from_registry(&record.cleanliness));
         let action = if cleanup_workdir_file_status_is_record_only(file_status) {
             CleanupTargetKind::WorkdirRecordDelete
-        } else if cleanup_workdir_file_status_is_corrupted(file_status)
-            || cleanup_workdir_cleanliness_is_clean(cleanliness)
-        {
+        } else if !matches!(cleanliness, CleanupWorkdirCleanliness::Dirty) {
             CleanupTargetKind::WorkdirCleanCleanup
         } else {
             CleanupTargetKind::WorkdirDirtyDiscard
@@ -25096,12 +25202,12 @@ fn build_runtime_cleanup_plan(
             } else if cleanup_workdir_file_status_is_record_only(file_status) {
                 "Not-found Workdir record can be deleted from the Backend registry".to_string()
             } else if cleanup_workdir_file_status_is_corrupted(file_status) {
-                "Corrupted Workdir can be deleted from Runtime storage and Backend registry"
+                "Runtime will verify remaining files and removal authority for this incomplete Workdir"
                     .to_string()
             } else if matches!(cleanliness, CleanupWorkdirCleanliness::Dirty) {
-                "Dirty Workdir requires explicit discard confirmation before cleanup".to_string()
+                "Dirty Workdir is protected; preserve or resolve current changes before retrying".to_string()
             } else if matches!(cleanliness, CleanupWorkdirCleanliness::Unknown) {
-                "Workdir clean state is unknown; explicit discard confirmation is required"
+                "Runtime will recheck current changes, identity and removal blockers before deleting"
                     .to_string()
             } else {
                 "Clean Workdir can be manually cleaned up".to_string()
@@ -25303,7 +25409,12 @@ async fn execute_runtime_cleanup_with_context(
                     target_id: candidate.target_id.clone(),
                     action: candidate.action.clone(),
                     status: status.to_string(),
-                    message: message.to_string(),
+                    message: removal.failure_category.as_deref().map_or_else(
+                        || message.to_string(),
+                        |category| {
+                            format!("{category}: {}", workdir_removal_failure_guidance(category))
+                        },
+                    ),
                 });
             }
             CleanupTargetKind::WorkerDelete => {
@@ -53019,7 +53130,7 @@ mod tests {
         };
         let source_fingerprint = repository_source_fingerprint(&repository_source);
         for (workdir_id, _, _) in &fixtures {
-            runtime
+            let created = runtime
                 .create_working_directory(WorkingDirectoryRequest {
                     repository: WorkingDirectoryRepository {
                         id: "repo-test".to_string(),
@@ -53042,6 +53153,13 @@ mod tests {
                 "present",
                 "clean",
             );
+            api.store
+                .upsert_workdir_registry(&workdir_record_from_summary(
+                    &api,
+                    provider_runtime_id,
+                    &created.summary,
+                ))
+                .unwrap();
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let provider_base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -53589,6 +53707,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn current_worker_can_reattach_usable_pending_checkout_after_failed_removal_but_not_during_attempt()
+     {
+        let mut fixture = manual_worker_assignment_fixture().await;
+        let identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id)
+                .unwrap();
+        configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
+        let api = &fixture.api;
+        api.store
+            .detach_worker_workdir(
+                TEST_WORKSPACE_ID,
+                &fixture.worker,
+                Some(&fixture.docs_workdir_id),
+                "release for removal",
+            )
+            .unwrap();
+        let mut record = api
+            .store
+            .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.docs_workdir_id)
+            .unwrap()
+            .unwrap();
+        record.materialization_status = "pending".into();
+        api.store.upsert_workdir_registry(&record).unwrap();
+        let intent =
+            workdir_removal_intent(&record, "account:owner", "remove docs checkout").unwrap();
+        let pending = api
+            .config_store
+            .reserve_workdir_removal_operation(&intent)
+            .unwrap();
+        let path = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-attachments");
+        let request = || {
+            runtime_source_request(
+                &identity,
+                Some(&fixture.worker.worker_id),
+                "POST",
+                &path,
+                serde_json::to_vec(
+                    &json!({ "alias": "docs", "working_directory_id": fixture.docs_workdir_id }),
+                )
+                .unwrap(),
+            )
+        };
+        let blocked = build_router(api.clone()).oneshot(request()).await.unwrap();
+        let blocked_status = blocked.status();
+        let blocked_body = to_bytes(blocked.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            blocked_status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&blocked_body)
+        );
+        api.config_store
+            .fail_workdir_removal_operation(&pending, "provider_unavailable", true)
+            .unwrap();
+        let attached = build_router(api.clone()).oneshot(request()).await.unwrap();
+        let attached_status = attached.status();
+        let attached_body = to_bytes(attached.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            attached_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&attached_body)
+        );
+        let attached: server_api::CurrentWorkerWorkdirAttachmentResponse =
+            serde_json::from_slice(&attached_body).unwrap();
+        assert!(attached.attached);
+        assert_eq!(attached.working_directory_id, fixture.docs_workdir_id);
+        assert_eq!(
+            api.store
+                .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.docs_workdir_id)
+                .unwrap()
+                .unwrap()
+                .materialization_status,
+            "pending"
+        );
+        assert!(
+            api.config_store
+                .workdir_removal_guards(&pending)
+                .unwrap()
+                .iter()
+                .any(|guard| guard.category == "active_attachment")
+        );
     }
 
     #[tokio::test]
@@ -54272,6 +54475,18 @@ mod tests {
         }
     }
 
+    fn confirmed_workdir_cleanup_result() -> crate::hosts::RuntimeWorkingDirectoryResult {
+        workdir_removal_result(
+            InternalWorkerOperationState::Rejected,
+            None,
+            vec![RuntimeDiagnostic {
+                code: "working_directory_not_found".into(),
+                severity: HostDiagnosticSeverity::Warning,
+                message: "authoritatively absent".into(),
+            }],
+        )
+    }
+
     fn reserve_removal_fixture(
         api: &WorkspaceApi,
         working_directory_id: &str,
@@ -54312,7 +54527,7 @@ mod tests {
                 Some(clean_summary),
                 Vec::new(),
             ),
-            workdir_removal_result(InternalWorkerOperationState::Accepted, None, Vec::new()),
+            confirmed_workdir_cleanup_result(),
         );
         let removed = execute_reserved_workdir_removal_with_provider(
             &api,
@@ -54378,7 +54593,7 @@ mod tests {
                     message: "timeout".to_string(),
                 }],
             ),
-            workdir_removal_result(InternalWorkerOperationState::Accepted, None, Vec::new()),
+            confirmed_workdir_cleanup_result(),
         );
         let unknown = execute_reserved_workdir_removal_with_provider(
             &api,
@@ -54400,7 +54615,7 @@ mod tests {
                 Some(dirty_summary),
                 Vec::new(),
             ),
-            workdir_removal_result(InternalWorkerOperationState::Accepted, None, Vec::new()),
+            confirmed_workdir_cleanup_result(),
         );
         let dirty = execute_reserved_workdir_removal_with_provider(
             &api,
@@ -54418,7 +54633,7 @@ mod tests {
                 Some(clean_retry_summary),
                 Vec::new(),
             ),
-            workdir_removal_result(InternalWorkerOperationState::Accepted, None, Vec::new()),
+            confirmed_workdir_cleanup_result(),
         );
         let removed_after_retry = execute_reserved_workdir_removal_with_provider(
             &api,
@@ -54444,7 +54659,7 @@ mod tests {
                 Some(corrupted_summary),
                 Vec::new(),
             ),
-            workdir_removal_result(InternalWorkerOperationState::Accepted, None, Vec::new()),
+            confirmed_workdir_cleanup_result(),
         );
         let corrupted = execute_reserved_workdir_removal_with_provider(
             &api,
@@ -54493,6 +54708,297 @@ mod tests {
         assert_eq!(unsupported_provider.cleanup_calls(), 1);
     }
 
+    #[test]
+    fn workdir_cleanup_failure_classification_is_bounded_and_guides_normal_retry() {
+        for (code, category) in [
+            ("working_directory_cleanup_mount_present", "mount_present"),
+            (
+                "working_directory_cleanup_mount_check_unavailable",
+                "mount_check_unavailable",
+            ),
+            (
+                "working_directory_cleanup_permission_denied",
+                "permission_denied",
+            ),
+            ("working_directory_cleanup_resource_busy", "resource_busy"),
+            (
+                "working_directory_cleanup_storage_unavailable",
+                "storage_unavailable",
+            ),
+            (
+                "working_directory_cleanup_ownership_unknown",
+                "ownership_unknown",
+            ),
+            (
+                "working_directory_cleanup_changes_present",
+                "changes_present",
+            ),
+            (
+                "working_directory_cleanup_changes_unknown",
+                "changes_unknown",
+            ),
+            (
+                "arbitrary provider text /private/path",
+                "provider_cleanup_failed",
+            ),
+        ] {
+            let result = workdir_removal_result(
+                InternalWorkerOperationState::Rejected,
+                None,
+                vec![RuntimeDiagnostic {
+                    code: code.into(),
+                    severity: HostDiagnosticSeverity::Error,
+                    message: "secret /private/path".into(),
+                }],
+            );
+            assert_eq!(workdir_cleanup_failure_category(&result), category);
+            let guidance = workdir_removal_failure_guidance(category);
+            assert!(!guidance.contains("/private/path"));
+            assert!(!guidance.contains("secret"));
+            assert!(guidance.len() <= 500);
+            assert!(guidance.contains("retry"));
+        }
+    }
+
+    #[tokio::test]
+    async fn workdir_removal_retry_rechecks_pending_materialization_changes_and_attachments() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let (operation, mut summary) = reserve_removal_fixture(&api, "cleanup-retry");
+        let failed_provider = FakeWorkdirRemovalProvider::new(
+            workdir_removal_result(
+                InternalWorkerOperationState::Accepted,
+                Some(summary.clone()),
+                Vec::new(),
+            ),
+            workdir_removal_result(
+                InternalWorkerOperationState::Rejected,
+                None,
+                vec![RuntimeDiagnostic {
+                    code: "working_directory_cleanup_mount_present".into(),
+                    severity: HostDiagnosticSeverity::Error,
+                    message: "/private/mount credentials must not escape".into(),
+                }],
+            ),
+        );
+        let failed = execute_reserved_workdir_removal_with_provider(
+            &api,
+            operation,
+            false,
+            &failed_provider,
+        )
+        .unwrap();
+        assert!(failed.retryable);
+        assert_eq!(failed.failure_category.as_deref(), Some("mount_present"));
+        assert!(
+            api.store
+                .get_workdir_registry(TEST_WORKSPACE_ID, "cleanup-retry")
+                .unwrap()
+                .is_some()
+        );
+        assert!(!serde_json::to_string(&failed).unwrap().contains("/private"));
+
+        summary.status = WorkingDirectoryStatusKind::CleanupPending;
+        summary.cleanliness = Some("dirty".into());
+        let dirty_provider = FakeWorkdirRemovalProvider::new(
+            workdir_removal_result(
+                InternalWorkerOperationState::Accepted,
+                Some(summary.clone()),
+                Vec::new(),
+            ),
+            confirmed_workdir_cleanup_result(),
+        );
+        let dirty =
+            execute_reserved_workdir_removal_with_provider(&api, failed, false, &dirty_provider)
+                .unwrap();
+        assert_eq!(dirty.disposition, Some(WorkdirRemovalDisposition::Retained));
+        assert!(dirty.retryable);
+        assert_eq!(dirty_provider.cleanup_calls(), 0);
+
+        let worker = seed_cleanup_worker(&api, 731, "normal");
+        seed_cleanup_link(&api, &worker, "cleanup-retry");
+        let occupied_provider = FakeWorkdirRemovalProvider::new(
+            workdir_removal_result(
+                InternalWorkerOperationState::Accepted,
+                Some(summary.clone()),
+                Vec::new(),
+            ),
+            confirmed_workdir_cleanup_result(),
+        );
+        let occupied =
+            execute_reserved_workdir_removal_with_provider(&api, dirty, false, &occupied_provider)
+                .unwrap();
+        assert_eq!(
+            occupied.failure_category.as_deref(),
+            Some("blocked_by_live_authority")
+        );
+        assert!(occupied.retryable);
+        assert_eq!(occupied_provider.cleanup_calls(), 0);
+        api.store
+            .detach_worker_workdir(
+                TEST_WORKSPACE_ID,
+                &RuntimeWorkerRef::new("runtime-test", worker),
+                Some("cleanup-retry"),
+                "resolve retry attachment",
+            )
+            .unwrap();
+
+        // Unknown because checkout was partially removed is delegated to Runtime
+        // for current change/identity protection, not denied by the old state.
+        summary.cleanliness = Some("unknown".into());
+        let retry_provider = FakeWorkdirRemovalProvider::new(
+            workdir_removal_result(
+                InternalWorkerOperationState::Accepted,
+                Some(summary),
+                Vec::new(),
+            ),
+            confirmed_workdir_cleanup_result(),
+        );
+        let removed = execute_reserved_workdir_removal_with_provider(
+            &api,
+            occupied.clone(),
+            false,
+            &retry_provider,
+        )
+        .unwrap();
+        assert_eq!(removed.operation_id, occupied.operation_id);
+        assert_eq!(removed.attempt_count, 4);
+        assert_eq!(
+            removed.disposition,
+            Some(WorkdirRemovalDisposition::Removed)
+        );
+        assert_eq!(retry_provider.cleanup_calls(), 1);
+        assert!(
+            api.store
+                .get_workdir_registry(TEST_WORKSPACE_ID, "cleanup-retry")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            execute_reserved_workdir_removal_with_provider(
+                &api,
+                removed.clone(),
+                false,
+                &retry_provider
+            )
+            .unwrap(),
+            removed
+        );
+    }
+
+    #[tokio::test]
+    async fn workdir_observation_failure_preserves_bounded_os_cause_without_removing_registry() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        for (id, transport_error) in [
+            ("observation-denied", false),
+            ("rpc-observation-denied", true),
+        ] {
+            let (operation, _) = reserve_removal_fixture(&api, id);
+            let provider = FakeWorkdirRemovalProvider::new(
+                workdir_removal_result(
+                    InternalWorkerOperationState::Rejected,
+                    None,
+                    vec![RuntimeDiagnostic {
+                        code: "working_directory_cleanup_permission_denied".into(),
+                        severity: HostDiagnosticSeverity::Error,
+                        message: "permission denied /private/path".into(),
+                    }],
+                ),
+                confirmed_workdir_cleanup_result(),
+            );
+            if transport_error {
+                *provider.observation.lock().unwrap() =
+                    Some(Err(RuntimeRegistryError::RuntimeOperationFailed {
+                        runtime_id: "runtime-test".into(),
+                        code: "working_directory_cleanup_permission_denied".into(),
+                        message: "permission denied /private/path".into(),
+                    }));
+            }
+            let result =
+                execute_reserved_workdir_removal_with_provider(&api, operation, false, &provider)
+                    .unwrap();
+            assert_eq!(
+                result.failure_category.as_deref(),
+                Some("permission_denied")
+            );
+            assert!(result.retryable);
+            assert_eq!(provider.cleanup_calls(), 0);
+            assert!(
+                !serde_json::to_string(&result)
+                    .unwrap()
+                    .contains("/private/path")
+            );
+            assert!(
+                api.store
+                    .get_workdir_registry(TEST_WORKSPACE_ID, id)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn workdir_removal_keeps_registry_for_changed_identity_and_unknown_cleanup_outcome() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        for (id, changed_identity) in [("identity-mismatch", true), ("unknown-cleanup", false)] {
+            let (operation, mut summary) = reserve_removal_fixture(&api, id);
+            if changed_identity {
+                summary.repository_id = "another-repository".into();
+            }
+            let provider = FakeWorkdirRemovalProvider::new(
+                workdir_removal_result(
+                    InternalWorkerOperationState::Accepted,
+                    Some(summary),
+                    Vec::new(),
+                ),
+                workdir_removal_result(InternalWorkerOperationState::Accepted, None, Vec::new()),
+            );
+            let result =
+                execute_reserved_workdir_removal_with_provider(&api, operation, false, &provider)
+                    .unwrap();
+            assert!(result.retryable);
+            assert_eq!(
+                result.failure_category.as_deref(),
+                Some(if changed_identity {
+                    "provider_identity_changed"
+                } else {
+                    "provider_cleanup_outcome_unknown"
+                })
+            );
+            assert_eq!(provider.cleanup_calls(), usize::from(!changed_identity));
+            assert!(
+                api.store
+                    .get_workdir_registry(TEST_WORKSPACE_ID, id)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_plan_offers_normal_revalidation_for_prior_failure_and_unknown() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        for (id, state) in [
+            ("pending-retry", "pending"),
+            ("unknown-retry", "unknown"),
+            ("corrupt-retry", "corrupted"),
+        ] {
+            seed_cleanup_workdir(&api, id, state, "unknown");
+        }
+        let plan = build_runtime_cleanup_plan(&api, "runtime-test").unwrap();
+        for candidate in plan.workdirs {
+            assert_eq!(candidate.action, CleanupTargetKind::WorkdirCleanCleanup);
+            assert!(candidate.blocking_reason.is_none());
+        }
+    }
+
     #[tokio::test]
     async fn concurrent_orphan_recovery_runs_delayed_provider_cleanup_once() {
         let workspace = tempfile::tempdir().unwrap();
@@ -54518,7 +55024,7 @@ mod tests {
                     Some(clean_summary),
                     Vec::new(),
                 ),
-                workdir_removal_result(InternalWorkerOperationState::Accepted, None, Vec::new()),
+                confirmed_workdir_cleanup_result(),
             )
             .with_observation_delay(std::time::Duration::from_millis(100)),
         );

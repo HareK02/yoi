@@ -22,6 +22,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use workdir::WorkdirSessionResource;
 
+mod cleanup;
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use cleanup::tests::fail_once as fail_workdir_cleanup_once;
+
 const CHECKOUT_DIR: &str = "checkout";
 const MATERIALIZATION_RECORD: &str = "materialization.json";
 const REPOSITORY_ACCESS_DIR: &str = ".repository-access";
@@ -127,7 +132,11 @@ impl WorkingDirectoryBinding {
             working_directory.status = WorkingDirectoryStatusKind::Corrupted;
         }
         let mut summary = working_directory.status_summary();
-        summary.cleanliness = if summary.status == WorkingDirectoryStatusKind::Active {
+        summary.cleanliness = if matches!(
+            summary.status,
+            WorkingDirectoryStatusKind::Active | WorkingDirectoryStatusKind::CleanupPending
+        ) && binding_paths_are_available(self)
+        {
             let (current_selector, current_ref, current_tree) = binding_current_revision(self);
             summary.current_selector = current_selector;
             summary.current_ref = current_ref;
@@ -200,6 +209,24 @@ pub trait WorkingDirectoryMaterializer: Send + Sync + 'static {
         working_directory_id: &str,
         relative_cwd: Option<&str>,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic>;
+
+    /// Read-only bind validation: do not consume Repository credentials or open
+    /// session resources during restore preflight. Providers must opt in with
+    /// current usable-checkout validation to support non-active attachments.
+    fn preflight_bind_working_directory(
+        &self,
+        working_directory_id: &str,
+        _relative_cwd: Option<&str>,
+    ) -> Result<(), WorkingDirectoryDiagnostic> {
+        let current = self.working_directory_status(working_directory_id)?;
+        if current.summary.status != WorkingDirectoryStatusKind::Active {
+            return Err(WorkingDirectoryDiagnostic::new(
+                "working_directory_not_active",
+                "Persisted Workdir is not active and its provider cannot validate recovery binding",
+            ));
+        }
+        Ok(())
+    }
 
     fn list_working_directories(
         &self,
@@ -625,6 +652,29 @@ impl RuntimeGitMaterializer {
                 "failed to write working directory record; backend-private path details were omitted",
             )
         })
+    }
+
+    fn checked_binding(
+        &self,
+        working_directory_id: &str,
+        relative_cwd: Option<&str>,
+    ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
+        validate_working_directory_id(working_directory_id)?;
+        let binding = self.read_binding(working_directory_id)?;
+        if !matches!(
+            binding.working_directory.status,
+            WorkingDirectoryStatusKind::Active | WorkingDirectoryStatusKind::CleanupPending
+        ) {
+            return Err(WorkingDirectoryDiagnostic::new(
+                "working_directory_not_active",
+                "working directory working_directory is not active",
+            ));
+        }
+        if binding.working_directory.status == WorkingDirectoryStatusKind::CleanupPending {
+            cleanup::validate_recovery_binding(self, working_directory_id, &binding)?;
+        }
+        let cwd = validate_relative_cwd(binding.root(), relative_cwd)?;
+        Ok(WorkingDirectoryBinding { cwd, ..binding })
     }
 
     fn read_binding(
@@ -1137,17 +1187,17 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
         working_directory_id: &str,
         relative_cwd: Option<&str>,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
-        validate_working_directory_id(working_directory_id)?;
-        let binding = self.read_binding(working_directory_id)?;
-        if binding.working_directory.status != WorkingDirectoryStatusKind::Active {
-            return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_not_active",
-                "working directory working_directory is not active",
-            ));
-        }
-        let binding = self.bind_repository_access(working_directory_id, binding)?;
-        let cwd = validate_relative_cwd(binding.root(), relative_cwd)?;
-        Ok(WorkingDirectoryBinding { cwd, ..binding })
+        let binding = self.checked_binding(working_directory_id, relative_cwd)?;
+        self.bind_repository_access(working_directory_id, binding)
+    }
+
+    fn preflight_bind_working_directory(
+        &self,
+        working_directory_id: &str,
+        relative_cwd: Option<&str>,
+    ) -> Result<(), WorkingDirectoryDiagnostic> {
+        self.checked_binding(working_directory_id, relative_cwd)
+            .map(|_| ())
     }
 
     fn list_working_directories(
@@ -1178,6 +1228,10 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
             {
                 continue;
             }
+            if let Some(status) = cleanup::remaining_status(self, &working_directory_id) {
+                statuses.push(status);
+                continue;
+            }
             match self.read_binding(&working_directory_id) {
                 Ok(binding) => statuses.push(binding.status()),
                 Err(_) => statuses.push(self.corrupted_status(&working_directory_id)),
@@ -1197,11 +1251,24 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
     ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
         validate_working_directory_id(working_directory_id)?;
         let working_directory_root = self.working_directory_root(working_directory_id);
-        if !working_directory_root.exists() {
-            return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_not_found",
-                "working directory working_directory was not found",
-            ));
+        match fs::symlink_metadata(&working_directory_root) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(WorkingDirectoryDiagnostic::new(
+                    "working_directory_not_found",
+                    "Runtime working directory was not found",
+                ));
+            }
+            Err(error) => {
+                return Err(cleanup::os_failure(
+                    working_directory_id,
+                    "lookup_cleanup_root",
+                    error,
+                ));
+            }
+        }
+        if let Some(status) = cleanup::remaining_status(self, working_directory_id) {
+            return Ok(status);
         }
         match self.read_binding(working_directory_id) {
             Ok(binding) => Ok(binding.status()),
@@ -1214,80 +1281,13 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
         working_directory_id: &str,
     ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
         validate_working_directory_id(working_directory_id)?;
-        let status = self.working_directory_status(working_directory_id)?;
-        if status.summary.status == WorkingDirectoryStatusKind::Corrupted {
-            let working_directory_root = self.working_directory_root(working_directory_id);
-            if working_directory_root.exists() {
-                fs::remove_dir_all(&working_directory_root).map_err(|_| {
-                    WorkingDirectoryDiagnostic::new(
-                        "working_directory_corrupted_cleanup_failed",
-                        "failed to remove corrupted working directory; backend-private path details were omitted",
-                    )
-                })?;
-            }
-            let mut summary = status.summary;
-            summary.status = WorkingDirectoryStatusKind::NotFound;
-            return Ok(WorkingDirectoryStatus { summary });
-        }
-        let binding = self.read_binding(working_directory_id)?;
-        self.cleanup(&binding)?;
-        let mut summary = binding.working_directory.status_summary();
-        summary.status = WorkingDirectoryStatusKind::NotFound;
-        summary.cleanliness = Some("unknown".to_string());
-        if binding.working_directory_root.exists() {
-            fs::remove_dir_all(&binding.working_directory_root).map_err(|_| {
-                WorkingDirectoryDiagnostic::new(
-                    "working_directory_record_cleanup_failed",
-                    "failed to remove working directory record; backend-private path details were omitted",
-                )
-            })?;
-        }
-        Ok(WorkingDirectoryStatus { summary })
+        cleanup::remove(self, working_directory_id)
     }
 
     fn cleanup(&self, binding: &WorkingDirectoryBinding) -> Result<(), WorkingDirectoryDiagnostic> {
-        let mut working_directory = binding.working_directory.clone();
-        let working_directory_root = binding.working_directory_root.canonicalize().map_err(|_| {
-            WorkingDirectoryDiagnostic::new(
-                "working_directory_cleanup_target_invalid",
-                "working directory working directory root is unavailable; backend-private path details were omitted",
-            )
-        })?;
-        let root = binding.root.canonicalize().map_err(|_| {
-            WorkingDirectoryDiagnostic::new(
-                "working_directory_cleanup_target_invalid",
-                "working directory root is unavailable; backend-private path details were omitted",
-            )
-        })?;
-        if !root.starts_with(&working_directory_root) {
-            return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_cleanup_escape_rejected",
-                "working directory cleanup target is outside the working directory root",
-            ));
-        }
-        let remove_result = fs::remove_dir_all(&working_directory_root).map_err(|_| {
-            WorkingDirectoryDiagnostic::new(
-                "working_directory_cleanup_failed",
-                "failed to remove working directory; backend-private path details were omitted",
-            )
-        });
-        if remove_result.is_err() {
-            working_directory.status = WorkingDirectoryStatusKind::CleanupPending;
-            let updated = WorkingDirectoryBinding {
-                working_directory,
-                root: binding.root.clone(),
-                cwd: binding.cwd.clone(),
-                working_directory_root: binding.working_directory_root.clone(),
-                command_environment: BTreeMap::new(),
-                session_resources: Vec::new(),
-            };
-            let _ = self.write_record(&updated);
-        } else {
-            let _ = self
-                .repository_access
-                .remove_pending(&binding.working_directory.id);
-        }
-        remove_result
+        // Reload current authority rather than trusting a stale in-memory binding.
+        self.cleanup_working_directory(&binding.working_directory.id)
+            .map(|_| ())
     }
 }
 
@@ -2826,6 +2826,7 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     let output = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(repository_path)
         .args(args)
@@ -3094,7 +3095,7 @@ mod tests {
         assert!(scheduler_inner.upgrade().is_none());
     }
 
-    fn git(path: &Path, args: &[&str]) {
+    pub(super) fn git(path: &Path, args: &[&str]) {
         let status = Command::new("git")
             .arg("-C")
             .arg(path)
@@ -3104,7 +3105,7 @@ mod tests {
         assert!(status.success(), "git {:?} failed", args);
     }
 
-    fn create_clean_repo() -> tempfile::TempDir {
+    pub(super) fn create_clean_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         git(dir.path(), &["init"]);
         git(
@@ -3118,7 +3119,7 @@ mod tests {
         dir
     }
 
-    fn request(repo: &Path) -> WorkingDirectoryRequest {
+    pub(super) fn request(repo: &Path) -> WorkingDirectoryRequest {
         WorkingDirectoryRequest {
             repository: WorkingDirectoryRepository {
                 id: "repo-main".to_string(),
@@ -3678,6 +3679,8 @@ mod tests {
             .evidence
             .host_trust_revision = Some(1);
         materializer.write_record(&ssh_backed_binding).unwrap();
+        #[cfg(target_os = "linux")]
+        fail_workdir_cleanup_once(&materializer, &id);
         let mut session_materialization = initial_materialization.clone();
         let session_delivery_expiry = repository_access_now_epoch_seconds() + 1;
         session_materialization
@@ -3691,6 +3694,17 @@ mod tests {
                 materialization: session_materialization,
             })
             .unwrap();
+        // Restore preflight must validate without consuming this one-shot SSH
+        // delivery or creating agent/session resources needed by actual bind.
+        let record_before =
+            fs::read(runtime_root.path().join(&id).join(MATERIALIZATION_RECORD)).unwrap();
+        materializer
+            .preflight_bind_working_directory(&id, None)
+            .unwrap();
+        assert_eq!(
+            fs::read(runtime_root.path().join(&id).join(MATERIALIZATION_RECORD)).unwrap(),
+            record_before
+        );
         assert_eq!(materializer.list_working_directories().unwrap().len(), 1);
         assert_eq!(
             fs::read_dir(runtime_root.path().join(".repository-agents"))
@@ -3916,6 +3930,22 @@ mod tests {
             restored.bind_working_directory(&id, None).unwrap_err().code,
             "working_directory_remote_repository_access_required"
         );
+        #[cfg(target_os = "linux")]
+        {
+            // Real SSH reauthorization updated access evidence repeatedly, but
+            // did not replace this clean materialization or require manual recovery.
+            assert_eq!(
+                restored
+                    .working_directory_status(&id)
+                    .unwrap()
+                    .summary
+                    .cleanliness
+                    .as_deref(),
+                Some("clean")
+            );
+            restored.cleanup_working_directory(&id).unwrap();
+            assert!(!restored.working_directory_root(&id).exists());
+        }
     }
 
     #[test]
@@ -4393,7 +4423,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_working_directory_record_can_be_removed() {
+    fn corrupted_working_directory_without_removal_authority_is_retained() {
         let runtime_root = tempfile::tempdir().unwrap();
         let materializer = RuntimeGitMaterializer::new(runtime_root.path());
         let working_directory_id = "workdir-corrupted";
@@ -4406,11 +4436,11 @@ mod tests {
             .unwrap();
         assert_eq!(status.summary.status, WorkingDirectoryStatusKind::Corrupted);
 
-        let removed = materializer
+        let error = materializer
             .cleanup_working_directory(working_directory_id)
-            .unwrap();
-        assert_eq!(removed.summary.status, WorkingDirectoryStatusKind::NotFound);
-        assert!(!root.exists());
+            .unwrap_err();
+        assert_eq!(error.code, "working_directory_cleanup_ownership_unknown");
+        assert!(root.exists());
     }
 
     #[test]

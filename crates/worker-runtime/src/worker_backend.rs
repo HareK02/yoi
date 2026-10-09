@@ -19,7 +19,6 @@ use crate::catalog::{
     CreateWorkerRequest, ProfileSourceArchiveSource, RepositoryRefObservation,
     RepositoryRefObservationRequest, WorkingDirectoryAttachmentStatus,
     WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest, WorkingDirectoryStatus,
-    WorkingDirectoryStatusKind,
 };
 use crate::config_bundle::{ConfigBundle, workspace_config_etag};
 #[cfg(feature = "ws-server")]
@@ -3773,28 +3772,24 @@ where
                     )
                 })?;
             for previous in &request.previous_workdir_attachments {
-                let current = materializer
-                    .working_directory_status(
-                        &previous.working_directory.summary.working_directory_id,
-                    )
-                    .map_err(|message| {
-                        WorkerExecutionResult::rejected(
-                            WorkerExecutionOperation::Restore,
-                            format!(
-                                "Persisted Worker Workdir attachment `{}` is unavailable: {message}",
-                                previous.alias
-                            ),
-                        )
-                    })?;
-                if current.summary.status != WorkingDirectoryStatusKind::Active {
-                    return Err(WorkerExecutionResult::rejected(
+                let relative_cwd = request
+                    .request
+                    .workdir_attachments
+                    .iter()
+                    .find(|claim| claim.alias == previous.alias)
+                    .and_then(|claim| claim.relative_cwd.as_deref());
+                // Recovery attachments remain CleanupPending across restart.
+                // Validate current bindability/identity, not the old state name.
+                // Preflight is read-only; actual restore binds again below.
+                materializer.preflight_bind_working_directory(
+                    &previous.working_directory.summary.working_directory_id,
+                    relative_cwd,
+                ).map_err(|message| {
+                    WorkerExecutionResult::rejected(
                         WorkerExecutionOperation::Restore,
-                        format!(
-                            "Persisted Worker Workdir attachment `{}` is not active",
-                            previous.alias
-                        ),
-                    ));
-                }
+                        format!("Persisted Worker Workdir attachment `{}` is unavailable: {message}", previous.alias),
+                    )
+                })?;
             }
         }
         if request.previous_workdir_attachments.is_empty()
@@ -4637,7 +4632,7 @@ mod tests {
         ConfigBundleRef, CreateWorkerRequest, LogicalWorkdirAttachment, MaterializerKind,
         ProfileSelector, RepositorySelector, WorkingDirectoryAttachmentClaim,
         WorkingDirectoryAttachmentRequest, WorkingDirectoryRepository, WorkingDirectoryRequest,
-        WorkspaceApiRef,
+        WorkingDirectoryStatusKind, WorkspaceApiRef,
     };
     use crate::execution::WorkerExecutionContext;
     use crate::identity::WorkerId;
@@ -8917,6 +8912,160 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.payload, protocol::Event::TextDone { .. }))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pending_owner_restore_fixture() -> (
+        tempfile::TempDir,
+        WorkerRuntimeExecutionBackend<MockFactory>,
+        WorkerExecutionRestoreRequest,
+        PathBuf,
+        Arc<Mutex<Vec<PathBuf>>>,
+    ) {
+        use crate::working_directory::{WorkingDirectoryMaterializer, fail_workdir_cleanup_once};
+        let root = tempfile::tempdir().unwrap();
+        let repo = create_clean_repo();
+        let workdirs = root.path().join("workdirs");
+        let materializer = RuntimeGitMaterializer::new(&workdirs);
+        let binding = materializer
+            .create(&working_directory_request(repo.path()))
+            .unwrap();
+        let id = binding.working_directory.id.clone();
+        fail_workdir_cleanup_once(&materializer, &id);
+        // The cleanup owner has legitimately reattached to preserve these changes.
+        fs::write(binding.root.join("README.md"), "owner recovery in progress").unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let factory = || MockFactory {
+            client: MockClient::new(simple_text_events()),
+            runtime_base: root.path().join("runtime"),
+            cwd: root.path().to_path_buf(),
+            store_dir: root.path().join("sessions"),
+            worker_metadata_dir: root.path().join("workers"),
+            observed_cwds: observed.clone(),
+            observed_workspace_clients: Arc::new(Mutex::new(Vec::new())),
+        };
+        let backend = Arc::new(
+            WorkerRuntimeExecutionBackend::new(factory())
+                .unwrap()
+                .with_working_directory_materializer(materializer),
+        );
+        let runtime =
+            EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), backend.clone())
+                .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let mut request = create_request("cleanup-owner");
+        request.workdir_attachments = vec![WorkingDirectoryAttachmentClaim {
+            alias: WorkdirAttachmentAlias::new("checkout").unwrap(),
+            working_directory_id: id,
+            relative_cwd: None,
+            capabilities: WorkdirSessionCapabilities::ALL,
+        }];
+        let detail = runtime.create_worker(request.clone()).unwrap();
+        runtime.stop_worker(&detail.worker_ref, None).unwrap();
+        let restore = WorkerExecutionRestoreRequest {
+            operation_id: crate::execution::WorkerLifecycleOperationId::new(),
+            worker_ref: detail.worker_ref.clone(),
+            request,
+            workspace_scope: None,
+            context: test_execution_context(detail.worker_ref),
+            previous_workdir_attachments: detail.workdir_attachments,
+            logical_workdir_attachments: Vec::new(),
+            workdir_attachments: BTreeMap::new(),
+            config_bundle: None,
+        };
+        drop(runtime);
+        drop(backend);
+        // A fresh backend/materializer loads the durable pending identity evidence.
+        let restarted = WorkerRuntimeExecutionBackend::new(factory())
+            .unwrap()
+            .with_working_directory_materializer(RuntimeGitMaterializer::new(&workdirs));
+        (root, restarted, restore, binding.root, observed)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_pending_owner_restores_after_restart_with_validated_dirty_checkout() {
+        let (root, backend, request, checkout, observed) = pending_owner_restore_fixture();
+        let before = persisted_files(&root.path().join("workdirs"));
+        backend.preflight_restore(&request).unwrap();
+        assert_eq!(
+            persisted_files(&root.path().join("workdirs")),
+            before,
+            "preflight must not rewrite removal or Git authority"
+        );
+        let restored = match backend.restore_worker(request.clone()) {
+            WorkerExecutionSpawnResult::Connected {
+                workdir_attachments,
+                ..
+            } => workdir_attachments,
+            other => panic!("cleanup-owner restore failed: {other:?}"),
+        };
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored[0].working_directory.summary.status,
+            WorkingDirectoryStatusKind::CleanupPending
+        );
+        assert_eq!(
+            restored[0].working_directory.summary.cleanliness.as_deref(),
+            Some("dirty")
+        );
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            &[checkout.clone(), checkout.clone()]
+        );
+        assert_eq!(
+            fs::read_to_string(checkout.join("README.md")).unwrap(),
+            "owner recovery in progress"
+        );
+        assert!(backend.stop_worker(&request.worker_ref).is_accepted());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_pending_owner_restore_rejects_incomplete_replaced_and_raced_checkouts() {
+        for damage in ["missing_git", "replacement", "missing_after_preflight"] {
+            let (root, backend, request, checkout, observed) = pending_owner_restore_fixture();
+            if damage == "missing_after_preflight" {
+                backend.preflight_restore(&request).unwrap();
+            }
+            if damage == "replacement" {
+                fs::rename(&checkout, root.path().join("original-checkout")).unwrap();
+                fs::create_dir(&checkout).unwrap();
+                fs::create_dir(checkout.join(".git")).unwrap();
+            } else {
+                fs::remove_dir_all(checkout.join(".git")).unwrap();
+            }
+            let before = persisted_files(root.path());
+            let error = backend.preflight_restore(&request).unwrap_err();
+            assert_eq!(
+                error.outcome,
+                crate::execution::WorkerExecutionOutcome::Rejected,
+                "{damage}"
+            );
+            assert!(
+                error
+                    .message_or_default()
+                    .contains("working_directory_cleanup_"),
+                "{error:?}"
+            );
+            assert!(
+                matches!(
+                    backend.restore_worker(request),
+                    WorkerExecutionSpawnResult::Rejected(_)
+                ),
+                "{damage}"
+            );
+            assert_eq!(
+                observed.lock().unwrap().len(),
+                1,
+                "must not start a Controller on invalid checkout: {damage}"
+            );
+            assert_eq!(
+                persisted_files(root.path()),
+                before,
+                "must preserve damaged/replaced checkout: {damage}"
+            );
+        }
     }
 
     #[test]

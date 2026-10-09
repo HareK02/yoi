@@ -438,7 +438,9 @@ impl SqliteWorkspaceStore {
                 "retained completion cannot use removed disposition".to_string(),
             ));
         }
-        self.finish_workdir_removal_operation(operation, disposition, false, Some(category), false)
+        // Retention describes this attempt's current blockers, not a permanent
+        // ban. A subsequent normal request rechecks all live authority.
+        self.finish_workdir_removal_operation(operation, disposition, true, Some(category), false)
     }
 
     pub fn fail_workdir_removal_operation(
