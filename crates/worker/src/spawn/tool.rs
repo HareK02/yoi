@@ -28,6 +28,7 @@ use workdir::{
 
 use crate::PromptCatalogSource;
 use crate::controller::register_worker_tools;
+use crate::feature::builtin::drive::delegation::restrict_internal_child_drive;
 use crate::internal_worker::{
     EphemeralSessionStore, InternalWorkerSessionStatus, InternalWorkerVisibility,
     prepare_internal_worker_session,
@@ -327,6 +328,9 @@ pub struct SubWorkerSpawnTool {
     /// Compact selector list shared by tool description and diagnostics.
     available_profiles: AvailableProfiles,
     internal_client_override: Option<Box<dyn agen::llm_client::LlmClient>>,
+    #[cfg(test)]
+    installed_child_workspace_client:
+        std::sync::Mutex<Option<Arc<dyn crate::worker::WorkspaceClient>>>,
 }
 
 impl SubWorkerSpawnTool {
@@ -362,6 +366,8 @@ impl SubWorkerSpawnTool {
             prompt_loader,
             available_profiles,
             internal_client_override: None,
+            #[cfg(test)]
+            installed_child_workspace_client: std::sync::Mutex::new(None),
         }
     }
 }
@@ -482,6 +488,9 @@ impl Tool for SubWorkerSpawnTool {
         // Delegated children stay bound to their scoped session and cannot use
         // Workspace attachment tools to replace it with parent-level authority.
         child_manifest.feature.manage_workdir.enabled = false;
+        // Internal children (including Reviewers) have no Backend Drive identity or approved
+        // child scope. Profiles and the parent's current Drive grant cannot delegate it.
+        child_manifest.feature.drive.enabled = false;
         let reviewer_capability = input.review.as_ref().map(|review| {
             (
                 review.ticket_id.clone(),
@@ -523,6 +532,12 @@ impl Tool for SubWorkerSpawnTool {
             } else {
                 self.workspace_context.clone()
             };
+        let child_workspace_context = restrict_internal_child_drive(child_workspace_context);
+        #[cfg(test)]
+        {
+            *self.installed_child_workspace_client.lock().unwrap() =
+                Some(child_workspace_context.client_handle());
+        }
         let store = EphemeralSessionStore::default();
         let filesystem_authority = WorkerFilesystemAuthority::None;
         let mut child = Worker::<Box<dyn agen::llm_client::LlmClient>, EphemeralSessionStore>::from_internal_manifest_with_context(
@@ -1574,6 +1589,181 @@ enabled = false
         drop(tool);
         drop(registry);
         assert!(spawner_scope.snapshot().is_writable(&workspace_root));
+    }
+
+    #[derive(Debug, Default)]
+    struct DriveAllowingParentClient {
+        requests: Mutex<Vec<WorkspaceRequest>>,
+    }
+
+    impl WorkspaceClient for DriveAllowingParentClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace-test")
+        }
+        fn kind(&self) -> &str {
+            "drive-allowing-parent"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            request: WorkspaceRequest,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            self.requests.lock().unwrap().push(request);
+            Ok(WorkspaceResponse {
+                status: 200,
+                body: "{}".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_spawn_profiles_never_inherit_parent_drive_tools_or_client_authority() {
+        for (profile, review) in [
+            ("inherit", false),
+            ("default", false),
+            ("builtin:reviewer", true),
+        ] {
+            let runtime = TempDir::new().unwrap();
+            let workspace_root = runtime.path().join("project");
+            let bash_output_dir = runtime.path().join("bash-output");
+            let drive_profile =
+                format!("{INTERNAL_REVIEWER_PROFILE}\n[feature.drive]\nenabled = true\n");
+            let available_profiles = write_project_profile_registry(
+                &workspace_root,
+                Some("reviewer"),
+                &[("reviewer", "reviewer.toml", &drive_profile)],
+            );
+            let mut manifest = parent_manifest(&workspace_root, None);
+            manifest.feature.drive.enabled = true;
+            manifest
+                .scope
+                .allow
+                .push(abs_rule(&bash_output_dir, Permission::Read));
+            let spawner_scope = SharedScope::new(Scope::from_config(&manifest.scope).unwrap());
+            let registry =
+                SpawnedWorkerRegistry::new_internal("parent".into(), spawner_scope.clone());
+            let parent_client = Arc::new(DriveAllowingParentClient::default());
+            let drive_request = WorkspaceRequest::get("/api/w/workspace-test/drive/root");
+            assert!(
+                parent_client
+                    .execute(drive_request.clone())
+                    .unwrap()
+                    .is_success()
+            );
+            let workdir_tool_broker = workdir::WorkdirToolBrokerRouter::from_single(
+                workdir::WorkdirAttachmentAlias::new("workdir").unwrap(),
+                Arc::new(workdir::LocalWorkdirSession::materialized_bound(
+                    workdir::Workdir::new("test-workdir"),
+                    workspace_root.clone(),
+                    workspace_root.clone(),
+                    spawner_scope.clone(),
+                    workdir::WorkdirSessionCapabilities::ALL,
+                )),
+            )
+            .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let tool = SubWorkerSpawnTool::new(
+                "parent".into(),
+                crate::worker::WorkerWorkspaceContext::with_client(
+                    Some(WorkspaceId::new("workspace-test").unwrap()),
+                    parent_client.clone(),
+                ),
+                ParentNotificationTarget::Durable(Arc::new(|_| {})),
+                runtime.path().to_path_buf(),
+                bash_output_dir,
+                workspace_root.clone(),
+                Some(workdir_tool_broker),
+                registry.clone(),
+                manifest.clone(),
+                PromptCatalogSource::builtins_only(),
+                available_profiles,
+            )
+            .with_internal_client(Box::new(ScriptedInternalClient {
+                calls: calls.clone(),
+                parent_scope: spawner_scope,
+                delegated_path: workspace_root,
+                observed_parent_write_revoked: Arc::new(AtomicBool::new(false)),
+                observed_instruction_override: Arc::new(AtomicBool::new(false)),
+                fail_requests: Arc::new(AtomicBool::new(false)),
+            }));
+            let mut input = serde_json::json!({
+                "name": "child", "profile": profile, "instruction": "role.reviewer",
+                "task": "review", "scope": [{"target": ".", "permission": "write"}],
+                "command": true,
+            });
+            if review {
+                input["review"] = serde_json::json!({"ticket_id": "T1", "merge_request_id": "MR1"});
+            }
+            tool.execute(
+                &input.to_string(),
+                agen::tool::ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("profile={profile}: {error:?}"));
+            let record = registry.get_internal("child").unwrap();
+            assert_eq!(
+                record.session.wait_until_idle().await,
+                InternalWorkerSessionStatus::Idle
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(
+                manifest.feature.drive.enabled,
+                "parent must keep Drive enabled"
+            );
+            assert!(
+                !record
+                    .installed_tools
+                    .iter()
+                    .any(|name| name.starts_with("Drive")),
+                "profile={profile}, installed tools={:?}",
+                record.installed_tools
+            );
+            let child_client = tool
+                .installed_child_workspace_client
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap();
+            let before = parent_client.requests.lock().unwrap().len();
+            assert!(
+                matches!(child_client.execute(drive_request), Err(WorkspaceClientError::Unavailable(message)) if message.contains("Drive access denied")),
+                "profile={profile}"
+            );
+            assert_eq!(parent_client.requests.lock().unwrap().len(), before);
+            if review {
+                assert_eq!(
+                    child_client.reviewer_context(),
+                    Some(&ReviewerContext {
+                        ticket_id: "T1".into(),
+                        merge_request_id: "MR1".into(),
+                    })
+                );
+                child_client
+                    .execute(WorkspaceRequest::json(
+                        WorkspaceRequestMethod::Post,
+                        "/api/w/workspace-test/merge-requests/MR1/reviews",
+                        "{\"verdict\":\"approve\"}",
+                    ))
+                    .unwrap();
+                let requests = parent_client.requests.lock().unwrap();
+                let review_body: serde_json::Value =
+                    serde_json::from_str(requests.last().unwrap().body.as_ref().unwrap()).unwrap();
+                assert!(
+                    review_body["capability_token"]
+                        .as_str()
+                        .is_some_and(|token| !token.is_empty())
+                );
+                assert!(
+                    requests
+                        .iter()
+                        .any(|request| request.path.ends_with("/review-capabilities"))
+                );
+            }
+            record.session.stop().await.unwrap();
+            registry.remove_internal("child").await.unwrap();
+        }
     }
 
     #[tokio::test]

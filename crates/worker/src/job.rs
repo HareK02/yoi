@@ -284,6 +284,7 @@ fn validate_profile_with_grant(
         manage_workdir,
         workdir_catalog,
         workspace_config,
+        drive,
         ticket,
         merge_request,
         orchestration,
@@ -315,6 +316,7 @@ fn validate_profile_with_grant(
         ("feature.objective", objective.enabled),
         ("feature.manage_workdir", manage_workdir.enabled),
         ("feature.workspace_config", workspace_config.enabled),
+        ("feature.drive", drive.enabled),
         (
             "feature.ticket",
             ticket.enabled || ticket.authoring || ticket.thread || ticket.intake || ticket.workflow,

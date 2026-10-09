@@ -14,7 +14,7 @@ export type RunningProcess = {
 };
 
 async function appendOutput(
-  stream: ReadableStream<Uint8Array>,
+  stream: ReadableStream<BufferSource>,
   destination: string,
   secrets: string[],
 ): Promise<void> {

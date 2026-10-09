@@ -248,7 +248,7 @@ Deno.test("Worker launch options parser accepts the generated wire shape", () =>
       display_name: "Runtime A",
       built_in: false,
       worker_creation_available: true,
-      working_directory_required: true,
+      supports_workdir_attachments: true,
       status: "connected",
       diagnostics: [],
     }],

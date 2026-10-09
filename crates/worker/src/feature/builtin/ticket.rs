@@ -335,9 +335,9 @@ struct WorkspaceTicketCloseInput {
     references: Vec<ticket::TicketReference>,
 }
 
-const TICKET_CLOSE_DESCRIPTION: &str = "Close a Ticket with resolution, item/state CAS, and replay key. No Merge Request or enforced state sequence is required. Actor identity is transport-bound; this does not integrate Merge Requests or expand Workdir grants.";
-const COMPLETE_TICKET_DESCRIPTION: &str = "Record a Ticket completion decision with reason, item/state CAS, and replay key. Merge Requests and approvals are not prerequisites. The Backend authorizes the assigned Worker or registered Workspace Orchestrator; roles supplied by the model never grant authority.";
-const TICKET_STATE_UPDATE_DESCRIPTION: &str = "Update a Ticket progress-display state with reason, item/state CAS, and replay key. States need not follow an enforced sequence. This does not start Workers, queue dependencies, integrate Merge Requests, or enlarge live Workdir grants; the Backend validates actor authority.";
+const TICKET_CLOSE_DESCRIPTION: &str = "Record an authorized Ticket closure decision with resolution, item/state CAS, and replay key when the requested return path calls for closure. No Merge Request or enforced state sequence is required. Backend checks actor authority, not natural-language satisfaction; this does not integrate MRs, stop/remove Workers, clean attachments, or expand Workdir grants.";
+const COMPLETE_TICKET_DESCRIPTION: &str = "Record an authorized Ticket completion decision with reason, item/state CAS, and replay key when user intent calls for completion; return without conclusion need not call this tool. Merge Requests and approvals are not prerequisites. Backend checks assigned Worker/Workspace Orchestrator authority, not real judgment of natural-language satisfaction; model-supplied roles never grant authority. Conclusion ends unfinished work while retaining terminal responsibility for display; it does not grant review/merge authority or stop/remove Workers and attachments.";
+const TICKET_STATE_UPDATE_DESCRIPTION: &str = "Update a Ticket progress-display state with reason, item/state CAS, and replay key. States need not follow an enforced sequence. Backend checks actor authority, not natural-language satisfaction. This does not start/stop Workers, queue dependencies, integrate Merge Requests, clean attachments, or enlarge live Workdir grants.";
 
 #[derive(Clone, Copy)]
 enum WorkspaceTicketDecisionKind {
@@ -508,8 +508,7 @@ fn workspace_ticket_tool_description(name: &str) -> String {
 
 const FEATURE_ID: &str = "ticket";
 const FEATURE_NAME: &str = "Ticket tools";
-const FEATURE_DESCRIPTION: &str =
-    "Typed Ticket operations through the authoritative Workspace API.";
+const FEATURE_DESCRIPTION: &str = "Intent-led Ticket reads and authorized decisions through the Workspace API; no universal MR/approval gate, and no Backend judgment of natural-language satisfaction.";
 const TICKET_WORKFLOW_INSTRUCTION_ID: &str = "ticket.workflow";
 const TICKET_WORKFLOW_PROMPT_REF: &str = "common.tickets";
 pub const TICKET_SERVICE_ID: &str = "ticket.authority";
@@ -2943,6 +2942,27 @@ mod tests {
             );
             assert_eq!(client.requests.lock().unwrap().len(), 1);
         }
+    }
+
+    #[test]
+    fn native_ticket_decision_descriptions_preserve_intent_and_independent_lifecycle() {
+        let tools = native_ticket_tools(
+            decision_client(200, TicketWorkflowState::Ready),
+            TicketFeatureAccess::work_report(),
+        )
+        .unwrap();
+        let descriptor = ticket_descriptor(&tools, "Ticket", "bound").unwrap();
+        let complete = descriptor
+            .operations
+            .iter()
+            .find(|op| op.name == "complete")
+            .unwrap();
+        let summary = &complete.documentation.as_ref().unwrap().summary;
+        assert!(summary.contains("Merge Requests and approvals are not prerequisites"));
+        assert!(summary.contains("return without conclusion need not call this tool"));
+        assert!(summary.contains("not real judgment"));
+        assert!(summary.contains("retaining terminal responsibility"));
+        assert!(summary.contains("does not grant review/merge authority or stop/remove Workers"));
     }
 
     #[tokio::test]

@@ -108,6 +108,7 @@ pub(crate) async fn execute_read(
             attachments: Vec::new(),
         },
         paths: Vec::new(),
+        listing: None,
         validator,
     })
 }

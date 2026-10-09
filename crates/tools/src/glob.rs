@@ -93,6 +93,7 @@ pub(crate) async fn execute_glob(
             attachments: Vec::new(),
         },
         paths: result.paths,
+        listing: None,
         validator: None,
     })
 }

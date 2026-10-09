@@ -17,6 +17,7 @@
   import {
     relationLabel,
     TICKET_STATES,
+    ticketWorkerLaunchHref,
     type WorkspaceOrchestratorStatus,
   } from "#lib/workspace/tickets/ticket-panel.ts";
   import type { ApiResult } from "#lib/workspace/api/http.ts";
@@ -36,9 +37,7 @@
     access: TicketTargetAccess;
   };
 
-  const MUTABLE_TICKET_STATES = TICKET_STATES.filter((state) =>
-    state !== "done" && state !== "ready" && state !== "queued"
-  );
+  const MUTABLE_TICKET_STATES = TICKET_STATES;
 
   function editableTargets(targets: TicketTarget[]): EditableTicketTarget[] {
     return targets.map((target) => ({
@@ -81,6 +80,7 @@
   );
   let nextState = $state(loadedTicket.state);
   let transitionReason = $state("");
+  let progressBody = $state("");
   let threadRole = $state("comment");
   let threadBody = $state("");
   let resolution = $state("");
@@ -90,6 +90,7 @@
   let readyOperationKey = $state<string | null>(null);
   let manualRuntimeId = $state("");
   let manualWorkerId = $state("");
+  let manualBindings = $state<{ alias: string; working_directory_id: string; connection_id: string }[]>([]);
   let cancellationReason = $state("");
   let routeTicketSnapshot = `${initialData.ticketId}:${loadedTicket.item_revision}`;
   let routeGeneration = 0;
@@ -108,20 +109,19 @@
   }
 
   const targetCandidateValid = $derived.by(() => {
-    if (ticket.state !== "planning" || targetDrafts.length === 0) return false;
+
     const repositoryKeys = new Set<string>();
-    let readWriteCount = 0;
+
     for (const target of targetDrafts) {
       const repository = repositoryFor(target.repository_key);
       if (
         !target.repository_key || repository === null ||
-        !effectiveRefSelector(target) ||
         repositoryKeys.has(target.repository_key)
       ) return false;
       repositoryKeys.add(target.repository_key);
-      if (target.access === "read_write") readWriteCount += 1;
+
     }
-    return readWriteCount === 1;
+    return true;
   });
   const implementationStartEligible = $derived(
     ticket.action_eligibility.can_start_manual_worker,
@@ -146,6 +146,7 @@
     applyTicket(updatedTicket);
     editing = false;
     transitionReason = "";
+    progressBody = "";
     threadRole = "comment";
     threadBody = "";
     resolution = "";
@@ -155,6 +156,7 @@
     readyOperationKey = null;
     manualRuntimeId = "";
     manualWorkerId = "";
+    manualBindings = [];
     cancellationReason = "";
   }
 
@@ -171,6 +173,14 @@
       resetTicketView(incomingTicket);
     });
   });
+
+  function ticketMutationError(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/\(409\)/.test(message)) return `Update conflict. Refresh the Ticket and resolve the current revision or resource binding before retrying. ${message}`;
+    if (/\(401\)|\(403\)/.test(message)) return `Permission denied. This action did not grant access. ${message}`;
+    if (/\(404\)/.test(message)) return `Resource unavailable or not connected. Check the Ticket and authorized resource connection. ${message}`;
+    return `Outcome unknown or request rejected. Refresh before retrying; no success is inferred. ${message}`;
+  }
 
   async function mutate(
     action: string,
@@ -193,9 +203,25 @@
       return true;
     } catch (error) {
       if (generation === routeGeneration) {
-        errorMessage = error instanceof Error ? error.message : String(error);
+        errorMessage = ticketMutationError(error);
       }
       return false;
+    } finally {
+      if (generation === routeGeneration) busy = null;
+    }
+  }
+
+  async function refreshTicket(): Promise<void> {
+    if (busy) return;
+    const generation = routeGeneration;
+    busy = "refresh";
+    try {
+      const updated = await workspaceApiJson(ticketPath, parseTicketDetail, TICKET_BROWSER_API_MAX_RESPONSE_BYTES);
+      if (generation !== routeGeneration) return;
+      applyTicket(updated);
+      errorMessage = null;
+    } catch (error) {
+      if (generation === routeGeneration) errorMessage = ticketMutationError(error);
     } finally {
       if (generation === routeGeneration) busy = null;
     }
@@ -226,7 +252,7 @@
       applyTicket(updatedTicket);
     } catch (error) {
       if (generation === routeGeneration) {
-        errorMessage = error instanceof Error ? error.message : String(error);
+        errorMessage = ticketMutationError(error);
       }
     } finally {
       if (generation === routeGeneration) busy = null;
@@ -252,6 +278,7 @@
             operation_id: crypto.randomUUID(),
             principal,
             expected_assignment_id: null,
+            ...(role === "worker" ? { workdir_bindings: manualBindings } : {}),
           }),
         },
         parseTicketRoleAssignmentMutationResponse,
@@ -267,7 +294,7 @@
       applyTicket(updatedTicket);
     } catch (error) {
       if (generation === routeGeneration) {
-        errorMessage = error instanceof Error ? error.message : String(error);
+        errorMessage = ticketMutationError(error);
       }
     } finally {
       if (generation === routeGeneration) busy = null;
@@ -281,7 +308,7 @@
     });
   }
 
-  async function startManualWorker(event: SubmitEvent): Promise<void> {
+  async function assignExistingWorker(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     if (!manualRuntimeId.trim() || !manualWorkerId.trim()) return;
     await mutateAssignment("start-manual", "worker", {
@@ -314,12 +341,10 @@
   }
 
   function addTarget(access: TicketTargetAccess = "read_only"): void {
-    if (ticket.state !== "planning") return;
     targetDrafts.push({ repository_key: "", ref_selector: "", access });
   }
 
   function removeTarget(index: number): void {
-    if (ticket.state !== "planning") return;
     targetDrafts.splice(index, 1);
   }
 
@@ -338,12 +363,7 @@
   }
 
   async function markReady() {
-    if (!targetCandidateValid || busy) return;
-    const targets = normalizedTargets(targetDrafts);
-    if (JSON.stringify(ticket.targets) !== JSON.stringify(targets)) {
-      const saved = await mutate("target", "", targetEditBody(), "PATCH");
-      if (!saved) return;
-    }
+    if (ticket.state !== "planning" || busy) return;
     readyOperationKey ??= crypto.randomUUID();
     if (
       await mutate("ready", "/ready", {
@@ -364,9 +384,10 @@
         operation_key: crypto.randomUUID(),
         expected_item_revision: ticket.item_revision,
         expected_state: ticket.state,
-        reason: transitionReason.trim() || "Progress decision from the Ticket page",
+        reason: transitionReason.trim(),
+        body: progressBody.trim() || null,
       })
-    ) transitionReason = "";
+    ) { transitionReason = ""; progressBody = ""; }
   }
 
   async function appendThread(event: SubmitEvent) {
@@ -421,7 +442,7 @@
   </header>
 
   {#if errorMessage}
-    <div class="workspace-callout is-error" role="alert">{errorMessage}</div>
+    <div class="workspace-callout is-error" role="alert"><p>{errorMessage}</p><p>No success or approval is inferred. An uncertain response may already have applied; refresh the current Ticket before retrying.</p><button type="button" class="workspace-secondary-button" disabled={busy !== null} onclick={refreshTicket}>Refresh Ticket status</button></div>
   {/if}
 
   {#if queueMessage}
@@ -432,7 +453,7 @@
     <form class="ticket-editor" onsubmit={saveEdit}>
       <label>Title<input bind:value={editTitle} required /></label>
       <label>Body<textarea bind:value={editBody} rows="12"></textarea></label>
-      <button class="workspace-primary-button" type="submit" disabled={busy === "edit" || !editTitle.trim()}>
+      <button class="workspace-primary-button" type="submit" disabled={busy !== null || !editTitle.trim()}>
         {busy === "edit" ? "Saving…" : "Save changes"}
       </button>
     </form>
@@ -515,8 +536,9 @@
                 </header>
                 {#if event.author}<p class="ticket-event-author">{event.author}</p>{/if}
                 {#if event.from || event.to}<p>{event.from ?? "—"} → {event.to ?? "—"}</p>{/if}
-                {#if event.reason}<p>{event.reason}</p>{/if}
+                {#if event.reason}<RichMarkdown text={event.reason} />{/if}
                 {#if event.body}<RichMarkdown text={event.body} />{/if}
+                {#each event.references as reference}<p>{reference}</p>{/each}
               </div>
             </article>
           {:else}
@@ -527,6 +549,29 @@
     </main>
 
     <aside class="ticket-control-rail">
+      <section class="ticket-control-card">
+        <header><h2>Progress decision</h2></header>
+        <p class="workspace-empty-copy">State records progress only. It does not start or stop a Worker, grant access, approve review, or merge code. Reopening does not resume an old Worker.</p>
+        <form class="ticket-control-form" onsubmit={transition}>
+          <label>State
+            <select bind:value={nextState}>
+              {#each MUTABLE_TICKET_STATES as state}<option value={state}>{state}</option>{/each}
+            </select>
+          </label>
+          <label>Reason<input bind:value={transitionReason} placeholder="Completion, start, or reopening decision" required /></label>
+          <label>Result, references, and remaining work (optional)<textarea bind:value={progressBody} rows="3" placeholder="A comment can be the result. Add links and remaining questions here."></textarea></label>
+          <button class="workspace-secondary-button" type="submit" disabled={busy !== null || nextState === ticket.state || !transitionReason.trim()}>
+            {nextState === "done" ? "Complete Ticket" : ticket.state === "done" || ticket.state === "closed" ? "Reopen / apply state" : "Apply state"}
+          </button>
+        </form>
+        {#if ticket.state === "planning"}
+          <button class="workspace-secondary-button ticket-queue-button" type="button" disabled={busy !== null} onclick={markReady}>{busy === "ready" ? "Marking ready…" : "Mark ready"}</button>
+        {/if}
+        <button class="workspace-secondary-button ticket-queue-button" type="button" disabled={busy !== null || !ticket.action_eligibility.can_queue} onclick={() => void queueTicket()}>{busy === "queue" ? "Queueing…" : "Request Orchestrator (queue)"}</button>
+        <p class="workspace-empty-copy">Queue requests only this Ticket. Dependencies remain diagnostic information and are not automatically queued.</p>
+        {#each ticket.action_eligibility.blockers as blocker}<p class="workspace-callout">{blocker}</p>{/each}
+      </section>
+
       <section class="ticket-control-card ticket-worker-card">
         <header><h2>Role assignments</h2><span>Retained responsibility</span></header>
         <p class="workspace-empty-copy">Responsibility is retained after work ends and Worker removal; it does not indicate a running Worker or active work authority.</p>
@@ -561,24 +606,37 @@
           </button>
         {/if}
         {#if implementationStartEligible}
-          <form class="ticket-control-form" onsubmit={startManualWorker}>
+          <a class="workspace-secondary-button" href={ticketWorkerLaunchHref(data.workspaceId, ticket)}>Start a Ticket Worker</a>
+          <details><summary>Assign an existing Worker</summary>
+          <p class="workspace-empty-copy">Explicit assignment is separate from state. Backend validates the Worker and resource binding; a retained assignment is not execution authority.</p>
+          <form class="ticket-control-form" onsubmit={assignExistingWorker}>
             <label>Runtime ID<input bind:value={manualRuntimeId} required /></label>
             <label>Worker ID<input bind:value={manualWorkerId} required /></label>
+            <p class="workspace-empty-copy">Select only resources needed for this request. No selection binds no Workdirs; unrelated existing attachments are not inherited. Use authorized connection IDs for explicit rebind.</p>
+            {#each manualBindings as binding, index}
+              <fieldset class="ticket-target-row"><legend>Resource binding {index + 1}</legend>
+                <label>Alias<input bind:value={binding.alias} required /></label>
+                <label>Workdir ID<input bind:value={binding.working_directory_id} required /></label>
+                <label>Connection ID<input bind:value={binding.connection_id} required /></label>
+                <button type="button" class="workspace-secondary-button" disabled={busy !== null} onclick={() => manualBindings.splice(index, 1)}>Remove binding</button>
+              </fieldset>
+            {/each}
+            <button type="button" class="workspace-secondary-button" disabled={busy !== null} onclick={() => manualBindings.push({ alias: "", working_directory_id: "", connection_id: "" })}>Add resource binding</button>
             <button
               class="workspace-secondary-button"
               type="submit"
               disabled={busy !== null || !manualRuntimeId.trim() || !manualWorkerId.trim()}
             >
-              {busy === "start-manual" ? "Starting…" : "Assign Worker and start"}
+              {busy === "start-manual" ? "Assigning…" : "Assign Worker"}
             </button>
-          </form>
+          </form></details>
         {/if}
         {#if ticket.state === "inprogress" && workerAssignment}
           <details class="ticket-cancel-implementation">
             <summary>Cancel implementation</summary>
             <form class="ticket-control-form" onsubmit={cancelImplementation}>
               <p class="workspace-empty-copy">
-                Cancel the assigned Worker, remove its assignment, and return this Ticket to ready.
+                Cancel the assigned Worker’s unfinished work and return this Ticket to ready. Responsibility is retained. This does not delete the Worker or Workdir.
               </p>
               <label>Reason<textarea bind:value={cancellationReason} rows="3" required></textarea></label>
               <button
@@ -599,7 +657,9 @@
       </section>
 
       <section class="ticket-control-card">
-        <header><h2>Repository targets</h2><span>{targetDrafts.length}</span></header>
+        <header><h2>Repository resources (optional)</h2><span>{targetDrafts.length}</span></header>
+        <p class="workspace-empty-copy">Targets describe permitted resources, not connected attachments. Editing targets or the body does not expand live permissions. Changed resources require explicit reconnection; stale or unavailable connections are rejected by Backend.</p>
+        {#if data.repositories.error}<p class="workspace-callout is-error">Repository catalog unavailable: {data.repositories.error}</p>{/if}
         <form class="ticket-control-form" onsubmit={saveTarget}>
           <div class="ticket-target-list">
             {#each targetDrafts as target, index}
@@ -607,78 +667,41 @@
               <fieldset class="ticket-target-row">
                 <legend>Target {index + 1}</legend>
                 <label>Repository
-                  <select bind:value={target.repository_key} disabled={ticket.state !== "planning"} required>
+                  <select bind:value={target.repository_key} disabled={busy !== null} required>
                     <option value="">Choose repository</option>
                     {#each loadedRepositories?.items ?? [] as repository}
                       <option value={repository.repository_key}>{repository.repository_key}</option>
                     {/each}
                   </select>
                 </label>
-                <label>Ref selector<input bind:value={target.ref_selector} placeholder={selectedRepository?.default_selector ?? "branch, tag, or revision"} disabled={ticket.state !== "planning"} /></label>
+                <label>Ref selector<input bind:value={target.ref_selector} placeholder={selectedRepository?.default_selector ?? "branch, tag, or revision"} disabled={busy !== null} /></label>
                 <label>Access
-                  <select bind:value={target.access} disabled={ticket.state !== "planning"}>
+                  <select bind:value={target.access} disabled={busy !== null}>
                     <option value="read_write">Read and write</option>
                     <option value="read_only">Read only</option>
                   </select>
                 </label>
-                {#if ticket.state === "planning"}
                   <button class="workspace-secondary-button" type="button" onclick={() => removeTarget(index)}>Remove target</button>
-                {/if}
               </fieldset>
             {:else}
               <p class="workspace-empty-copy">No repository targets.</p>
             {/each}
           </div>
-          {#if ticket.state === "planning"}
             <button
               class="workspace-secondary-button"
               type="button"
-              onclick={() => addTarget(targetDrafts.some((target) => target.access === "read_write") ? "read_only" : "read_write")}
+              onclick={() => addTarget()}
             >Add target</button>
-          {/if}
-          <button class="workspace-secondary-button" type="submit" disabled={busy === "target" || ticket.state !== "planning"}>
+          <button class="workspace-secondary-button" type="submit" disabled={busy !== null || !targetCandidateValid}>
             {busy === "target" ? "Saving…" : "Save targets"}
           </button>
         </form>
       </section>
 
-      <section class="ticket-control-card">
-        <header><h2>Workflow</h2></header>
-        <form class="ticket-control-form" onsubmit={transition}>
-          <label>State
-            <select bind:value={nextState}>
-              {#each MUTABLE_TICKET_STATES as state}<option value={state}>{state}</option>{/each}
-            </select>
-          </label>
-          <label>Reason<input bind:value={transitionReason} placeholder="Optional decision context" /></label>
-          <button class="workspace-secondary-button" type="submit" disabled={busy === "state" || nextState === ticket.state}>
-            Apply state
-          </button>
-        </form>
-        {#if ticket.state === "planning"}
-          <button class="workspace-primary-button ticket-queue-button" type="button" disabled={busy !== null || !targetCandidateValid} onclick={markReady}>
-            {busy === "ready" ? "Marking ready…" : "Mark ready"}
-          </button>
-          {#if !targetCandidateValid}
-            <p class="workspace-empty-copy">Add unique registered repository targets with effective ref selectors and exactly one read-write target before marking ready.</p>
-          {/if}
-        {:else if ticket.state === "ready"}
-          <button class="workspace-primary-button ticket-queue-button" type="button" disabled={busy === "queue" || !ticket.action_eligibility.can_queue} onclick={() => void queueTicket()}>
-            {busy === "queue" ? "Queueing…" : `Queue ${ticket.action_eligibility.queue_tickets.length} Ticket(s)`}
-          </button>
-          {#if !ticket.action_eligibility.can_queue}
-            <p class="workspace-empty-copy">Queue requires a valid target, an active Orchestrator assignment, no active Worker assignment, and no dependency still in planning.</p>
-          {:else if ticket.action_eligibility.queue_tickets.length > 0}
-            <p class="workspace-empty-copy">This operation queues: {ticket.action_eligibility.queue_tickets.join(", ")}.</p>
-            {#if ticket.relations.blockers.length > 0}
-              <p class="workspace-empty-copy">Ready dependencies are queued atomically. Queued or in-progress dependencies remain unchanged for the Orchestrator to schedule.</p>
-            {/if}
-          {/if}
-        {/if}
-      </section>
+
 
       <details class="ticket-control-card">
-        <summary>Append timeline event</summary>
+        <summary>Record result or comment</summary>
         <form class="ticket-control-form" onsubmit={appendThread}>
           <label>Role<select bind:value={threadRole}>
             <option value="comment">Comment</option>
@@ -687,12 +710,13 @@
             <option value="implementation_report">Implementation report</option>
           </select></label>
           <label>Body<textarea bind:value={threadBody} rows="5" required></textarea></label>
-          <button class="workspace-secondary-button" type="submit" disabled={busy === "thread" || !threadBody.trim()}>Append event</button>
+          <button class="workspace-secondary-button" type="submit" disabled={busy !== null || !threadBody.trim()}>Append event</button>
         </form>
       </details>
 
+      {#if mergeRequests.length > 0}
       <section class="ticket-control-card">
-        <header><h2>Current requirement evidence</h2></header>
+        <header><h2>MR requirement evidence</h2></header>
         <p><strong>Current requirements:</strong> {ticket.evidence.complete_for_integration ? "satisfied for integration" : "not satisfied for integration"}.</p>
         <p><strong>Current requirement approval:</strong> {currentRequirementApprovalStatus(ticket.evidence)}.</p>
         {#if ticket.evidence.missing.length > 0}
@@ -700,14 +724,16 @@
             {#each ticket.evidence.missing as missing}<li>{missing}</li>{/each}
           </ul>
         {/if}
-        <p class="workspace-empty-copy">This evidence evaluates current Ticket requirements, separately from persisted integration approval.</p>
+        <p class="workspace-empty-copy">This evaluates linked MR requirements, separately from Ticket progress and persisted integration approval.</p>
         {#if ticket.state === "done"}
           <p class="workspace-empty-copy">This Ticket remains done. Incomplete current requirement evidence does not cancel recorded completion.</p>
         {/if}
       </section>
 
+      {/if}
       <section class="ticket-control-card">
         <header><h2>Merge Requests</h2></header>
+        <p class="workspace-empty-copy">Ticket completion is not MR approval or integration.</p>
         {#if mergeRequests.length > 0}
           {#each mergeRequests as mergeRequest (mergeRequest.merge_request_id)}
             <article class="ticket-control-card">
@@ -733,7 +759,7 @@
             </article>
           {/each}
         {:else}
-          <p class="workspace-empty-copy">The assigned Worker has not opened a Merge Request.</p>
+          <p class="workspace-empty-copy">No Merge Requests linked. A Ticket can be completed with a comment or document result.</p>
         {/if}
       </section>
 
@@ -742,7 +768,7 @@
           <summary>Close ticket</summary>
           <form class="ticket-control-form" onsubmit={closeTicket}>
             <label>Resolution<textarea bind:value={resolution} rows="5" required></textarea></label>
-            <button class="workspace-danger-button" type="submit" disabled={busy === "close" || !resolution.trim()}>Close ticket</button>
+            <button class="workspace-danger-button" type="submit" disabled={busy !== null || !resolution.trim()}>Close ticket</button>
           </form>
         </details>
       {:else if ticket.resolution}

@@ -1,6 +1,6 @@
 import "./default.dcdl" // {
     slug = "ticket-worker";
-    description = "General Ticket work with typed progress and completion tools.";
+    description = "General intent-led Ticket work with optional result recording and authorized conclusion decisions.";
     engine = {
         instruction = "role.ticket_worker";
     };

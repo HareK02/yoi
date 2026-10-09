@@ -21,7 +21,7 @@ mod grep;
 mod read;
 mod routing;
 mod search_target;
-mod view_image;
+pub mod view_image;
 mod web;
 mod write;
 
@@ -33,7 +33,9 @@ pub use glob::glob_tool;
 pub use grep::grep_tool;
 pub use read::read_tool;
 pub use tracker::{ChangeStat, Tracker};
-pub use view_image::{routed_view_image_tool, view_image_tool};
+pub use view_image::{
+    detect_image_mime, read_workdir_bytes, routed_view_image_tool, view_image_tool,
+};
 pub use web::{web_fetch_tool, web_search_tool};
 pub use write::write_tool;
 

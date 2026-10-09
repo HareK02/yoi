@@ -60,6 +60,7 @@ fn fixture() -> tempfile::TempDir {
 async fn verify_sparse(session: &dyn WorkdirSession) {
     let listed = session
         .list(ListRequest {
+            after: None,
             path: WorkdirPath::root(),
             limit: 100,
         })
@@ -75,6 +76,7 @@ async fn verify_sparse(session: &dyn WorkdirSession) {
     );
     let empty = session
         .list(ListRequest {
+            after: None,
             path: path("denied"),
             limit: 100,
         })
@@ -108,6 +110,7 @@ async fn verify_sparse(session: &dyn WorkdirSession) {
     let CheckoutSearchResult::List(native) = session
         .checkout_search(CheckoutSearchRequest::new(CheckoutSearchOperation::List(
             ListRequest {
+                after: None,
                 path: WorkdirPath::root(),
                 limit: 100,
             },
@@ -161,6 +164,7 @@ async fn checkout_search_nested_sparse_nonrecursive_scopes_rebase_and_exclude_co
             .tool_session()
             .checkout_search(CheckoutSearchRequest::new(CheckoutSearchOperation::List(
                 ListRequest {
+                    after: None,
                     path: WorkdirPath::root(),
                     limit: 100
                 }
@@ -196,6 +200,7 @@ async fn checkout_search_composes_actual_nested_wrappers_and_output_root() {
     let CheckoutSearchResult::List(result) = stacked
         .checkout_search(CheckoutSearchRequest::new(CheckoutSearchOperation::List(
             ListRequest {
+                after: None,
                 path: path("keep"),
                 limit: 100,
             },
@@ -229,6 +234,7 @@ async fn checkout_search_composes_actual_nested_wrappers_and_output_root() {
     let entries = second
         .tool_session()
         .list(ListRequest {
+            after: None,
             path: WorkdirPath::root(),
             limit: 100,
         })
@@ -246,6 +252,7 @@ async fn checkout_search_composes_actual_nested_wrappers_and_output_root() {
         second
             .tool_session()
             .list(ListRequest {
+                after: None,
                 path: path("deep"),
                 limit: 100
             })
@@ -292,6 +299,7 @@ async fn checkout_search_scope_layers_intersect_before_list_and_grep() {
         root.path().to_path_buf(),
     );
     let mut request = CheckoutSearchRequest::new(CheckoutSearchOperation::List(ListRequest {
+        after: None,
         path: path("child"),
         limit: 100,
     }));
@@ -325,6 +333,7 @@ async fn checkout_search_wire_dto_bounds_and_provider_capabilities() {
         root.path().to_path_buf(),
     );
     let request = CheckoutSearchRequest::new(CheckoutSearchOperation::List(ListRequest {
+        after: None,
         path: path("child/keep"),
         limit: 100,
     }));
@@ -795,6 +804,7 @@ async fn checkout_search_preserves_current_provider_scope_and_rejects_symlink_es
     let CheckoutSearchResult::List(result) = source
         .checkout_search(CheckoutSearchRequest {
             operation: CheckoutSearchOperation::List(ListRequest {
+                after: None,
                 path: path("child/denied"),
                 limit: 100,
             }),

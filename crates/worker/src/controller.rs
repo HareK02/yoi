@@ -1628,6 +1628,15 @@ where
         );
     }
     let wip_mode = worker.manifest().worker.mode == manifest::WorkerMode::Wip;
+    let drive_feature = crate::feature::builtin::drive::DriveFeature::configured(
+        worker.workspace_client_handle(),
+        feature_config.drive.enabled,
+        worker.workdir_sessions(),
+    )
+    .map(|feature| feature.with_permissions(worker.manifest().permissions.clone()));
+    if let Some(module) = &drive_feature {
+        feature_registry.add_module(module.clone());
+    }
     let workspace_config_feature =
         crate::feature::builtin::workspace_config::WorkspaceConfigFeature::configured(
             worker.workspace_client_handle(),
@@ -1728,6 +1737,15 @@ where
     let host_worker_observation_provider = worker.worker_observation_provider();
     let wip_permissions = worker.manifest().permissions.clone();
     let mut wip_mount_registry = crate::wip::WipMountRegistry::new();
+    if wip_mode && let Some(feature) = &drive_feature {
+        crate::feature::builtin::drive::wip::mount_drive_wip(&mut wip_mount_registry, feature)
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("mount Drive WIP projection: {error}"),
+                )
+            })?;
+    }
     if let Some(feature) = &workspace_config_feature {
         crate::feature::builtin::workspace_config::wip::mount_workspace_config_wip(
             &mut wip_mount_registry,
@@ -3963,6 +3981,149 @@ mod tests {
                     .pop_front()
                     .expect("unexpected LLM request");
                 Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+            }
+        }
+
+        #[derive(Debug)]
+        struct DriveWorkspaceHost {
+            available: bool,
+            workspace: Option<&'static str>,
+        }
+
+        impl crate::worker::WorkspaceClient for DriveWorkspaceHost {
+            fn workspace_id(&self) -> Option<&str> {
+                self.workspace
+            }
+            fn kind(&self) -> &str {
+                "drive-test"
+            }
+            fn is_available(&self) -> bool {
+                self.available
+            }
+            fn execute(
+                &self,
+                request: crate::worker::WorkspaceRequest,
+            ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError>
+            {
+                // Native discovery must not enumerate or perform any mutation.
+                assert_eq!(request.path, "/api/w/workspace-1/drive/root");
+                Ok(crate::worker::WorkspaceResponse { status: 200, body: serde_json::json!({
+                    "entry": {"workspace_id": "workspace-1", "node_id": "1"},
+                    "parent": null, "name": "", "kind": "folder", "revision": "1",
+                    "size": null, "content_type": null, "updated_by": "test",
+                    "updated_at": "2026-10-08T00:00:00Z",
+                    "latest_url": "/api/w/workspace-1/drive/download?entry_workspace_id=workspace-1&id=1"
+                }).to_string() })
+            }
+        }
+
+        #[tokio::test]
+        async fn drive_controller_wiring_requires_activation_and_workspace_host_in_both_modes() {
+            use crate::feature::FeatureModule as _;
+            for mode in [manifest::WorkerMode::Tools, manifest::WorkerMode::Wip] {
+                for (enabled, available, workspace) in [
+                    (false, true, Some("workspace-1")),
+                    (true, false, Some("workspace-1")),
+                    (true, true, None),
+                    (true, true, Some("workspace-1")),
+                ] {
+                    let root = TempDir::new().unwrap();
+                    let mut manifest = manifest::WorkerManifest::from_toml(
+                        "[worker]\nname = 'drive-wiring'\n[model]\nscheme = 'anthropic'\nmodel_id = 'test'\n[engine]\n[scope]\n"
+                    ).unwrap();
+                    manifest.worker.mode = mode;
+                    manifest.feature.drive.enabled = enabled;
+                    // Isolate Drive discovery from the independent Workspace catalog.
+                    manifest.feature.workdir_catalog.enabled = false;
+                    let client = ScriptedClient::new(vec![finished_response()]);
+                    let requests = client.requests.clone();
+                    let engine = Engine::<_, agen::state::Mutable, crate::SessionHistoryMetadata>::new_annotated(client);
+                    let store = session_store::CombinedStore::new(
+                        session_store::FsStore::new(root.path().join("sessions")).unwrap(),
+                        session_store::FsWorkerStore::new(root.path().join("workers")).unwrap(),
+                    );
+                    let host: Arc<dyn crate::worker::WorkspaceClient> =
+                        Arc::new(DriveWorkspaceHost {
+                            available,
+                            workspace,
+                        });
+                    let context = crate::worker::WorkerWorkspaceContext::with_client(
+                        workspace.map(|id| crate::worker::WorkspaceId::new(id).unwrap()),
+                        host.clone(),
+                    );
+                    let mut worker = Worker::new(
+                        manifest,
+                        engine,
+                        store,
+                        context,
+                        crate::worker::WorkerFilesystemAuthority::local(
+                            root.path().into(),
+                            root.path().into(),
+                        ),
+                        manifest::Scope::writable(root.path()).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                    worker.set_system_prompt_template(
+                        crate::SystemPromptTemplate::parse(
+                            "default",
+                            crate::PromptCatalogSource::builtins_only(),
+                        )
+                        .unwrap(),
+                    );
+                    let descriptor = crate::feature::builtin::drive::DriveFeature::new(
+                        host,
+                        worker.workdir_sessions(),
+                    )
+                    .descriptor();
+                    register_worker_tools(
+                        &mut worker,
+                        root.path().join("bash-output"),
+                        root.path().join("runtime"),
+                        SpawnedWorkerRegistry::new_for_internal_services(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    let configured = enabled && available && workspace.is_some();
+                    let tools = worker.engine().tool_server_handle();
+                    tools.flush_pending();
+                    for tool in &descriptor.tools {
+                        assert_eq!(
+                            tools.get_tool(&tool.name).is_some(),
+                            configured && mode == manifest::WorkerMode::Tools,
+                            "{mode:?}, enabled={enabled}, available={available}, workspace={workspace:?}, tool={}",
+                            tool.name
+                        );
+                    }
+                    if mode == manifest::WorkerMode::Wip {
+                        let (_, tree) = tools.get_tool("Tree").unwrap();
+                        let output = tree
+                            .execute(
+                                r#"{"path":"/drive","depth":1}"#,
+                                ToolExecutionContext::new("drive-wiring-tree", "batch", 0),
+                            )
+                            .await;
+                        assert_eq!(output.is_ok(), configured, "{output:?}");
+                        if let Ok(output) = output {
+                            let tree: serde_json::Value =
+                                serde_json::from_str(&output.content.unwrap()).unwrap();
+                            assert_eq!(tree["path"], "/drive");
+                            // A self-scoped entrance is an enumeration boundary,
+                            // not an observed empty Workspace hierarchy.
+                            assert_eq!(tree["children"], serde_json::Value::Null);
+                        }
+                    }
+                    worker.run_text("Inspect enabled features").await.unwrap();
+                    let requests = requests.lock().unwrap();
+                    let prompt = requests[0].system_prompt.as_deref().unwrap_or("");
+                    assert_eq!(
+                        prompt.contains("## Workspace Drive"),
+                        configured,
+                        "{mode:?}, enabled={enabled}, available={available}, workspace={workspace:?}"
+                    );
+                }
             }
         }
 

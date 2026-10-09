@@ -1,4 +1,4 @@
-import type { WorkerLaunchOptionsResponse } from "./types.ts";
+import type { WorkerLaunchOptionsResponse } from "../../generated/worker-launch-api.ts";
 
 export function emptyLaunchOptions(
   workspaceId: string,
@@ -12,7 +12,7 @@ export function emptyLaunchOptions(
         status: "active",
         worker_creation_available: true,
         built_in: true,
-        working_directory_required: false,
+        supports_workdir_attachments: false,
         diagnostics: [],
       },
       {
@@ -21,7 +21,7 @@ export function emptyLaunchOptions(
         status: "active",
         worker_creation_available: true,
         built_in: false,
-        working_directory_required: true,
+        supports_workdir_attachments: true,
         diagnostics: [],
       },
     ],

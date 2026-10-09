@@ -6,6 +6,7 @@ let
 defaultDocument = import "./default.md";
 commonLanguage = import "./common/language.md";
 commonGit = import "./common/git.md";
+commonDrive = import "./common/drive.md";
 commonMergeRequest = import "./common/merge-request.md";
 commonTickets = import "./common/tickets.md";
 commonToolUsage = import "./common/tool-usage.md";
@@ -44,6 +45,7 @@ in
     default_prompt = defaultDocument.content;
     common = {
         git = commonGit.content;
+        drive = commonDrive.content;
         language = commonLanguage.content;
         merge_request = commonMergeRequest.content;
         tickets = commonTickets.content;

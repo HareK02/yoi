@@ -10,18 +10,37 @@ declare const Deno: {
 };
 
 Deno.test("logical config attachments are never offered as process working directories", () => {
-  const config = { working_directory_id: "config-1", display_name: "Workspace config",
-    source: { kind: "workspace_config" as const, access: "read_write" as const, content_path: "/workspace-config", purpose: "Configuration" },
-    materializer_kind: "logical_workspace_config" as const, status: "active" as const, cleanliness: "clean" };
-  const form = defaultWorkerLaunchForm({ ...options, working_directories: [config] }, emptyForm({
-    workdir_attachments: [{ alias: "config", working_directory_id: "config-1", relative_cwd: "" }],
-  }));
-  if (form.workdir_attachments.some((attachment) => attachment.working_directory_id === "config-1")) {
+  const config = {
+    working_directory_id: "config-1",
+    display_name: "Workspace config",
+    source: {
+      kind: "workspace_config" as const,
+      access: "read_write" as const,
+      content_path: "/workspace-config",
+      purpose: "Configuration",
+    },
+    materializer_kind: "logical_workspace_config" as const,
+    status: "active" as const,
+    cleanliness: "clean",
+  };
+  const form = defaultWorkerLaunchForm(
+    { ...options, working_directories: [config] },
+    emptyForm({
+      workdir_attachments: [{
+        alias: "config",
+        working_directory_id: "config-1",
+        relative_cwd: "",
+      }],
+    }),
+  );
+  if (
+    form.workdir_attachments.some((attachment) => attachment.working_directory_id === "config-1")
+  ) {
     throw new Error("logical config was converted to a process cwd attachment");
   }
 });
 
-Deno.test("defaultWorkerLaunchForm uses the Backend-published defaults and initial Workdir", () => {
+Deno.test("defaultWorkerLaunchForm selects a Runtime without claiming a profile or Workdir", () => {
   const form = defaultWorkerLaunchForm(
     options,
     emptyForm({ initial_text: "hello" }),
@@ -29,14 +48,10 @@ Deno.test("defaultWorkerLaunchForm uses the Backend-published defaults and initi
 
   assertEquals(form.runtime_id, "remote");
   assertEquals(form.display_name, "Worker");
-  assertEquals(form.profile, "builtin:coder");
+  assertEquals(form.profile, "");
   assertEquals(form.initial_text, "hello");
-  assertEquals(form.workdir_attachments, [{
-    alias: "workdir",
-    working_directory_id: "wd-1-repo",
-    relative_cwd: "",
-  }]);
-  assertEquals(form.working_directory_repository_key, "repo");
+  assertEquals(form.workdir_attachments, []);
+  assertEquals(form.working_directory_repository_key, "");
   assertEquals(form.working_directory_selector, "HEAD");
 });
 
@@ -71,7 +86,7 @@ Deno.test("defaultWorkerLaunchForm preserves an available read-only External Wor
   }]);
 });
 
-Deno.test("defaultWorkerLaunchForm preserves an available Ticket role profile", () => {
+Deno.test("defaultWorkerLaunchForm does not turn a generic profile choice into trusted review", () => {
   const reviewerOptions = {
     ...options,
     profiles: [
@@ -95,10 +110,10 @@ Deno.test("defaultWorkerLaunchForm preserves an available Ticket role profile", 
     }),
   );
 
-  assertEquals(form.profile, "builtin:reviewer");
+  assertEquals(form.profile, "");
 });
 
-Deno.test("defaultWorkerLaunchForm skips occupied Workdirs and leaves an editable attachment", () => {
+Deno.test("defaultWorkerLaunchForm does not claim occupied Workdirs", () => {
   const form = defaultWorkerLaunchForm(
     {
       ...options,
@@ -115,11 +130,7 @@ Deno.test("defaultWorkerLaunchForm skips occupied Workdirs and leaves an editabl
     emptyForm({ initial_text: "hello" }),
   );
 
-  assertEquals(form.workdir_attachments, [{
-    alias: "workdir",
-    working_directory_id: "",
-    relative_cwd: "",
-  }]);
+  assertEquals(form.workdir_attachments, []);
 });
 
 Deno.test("defaultWorkerLaunchForm preserves a Ticket repository target", () => {
@@ -149,11 +160,7 @@ Deno.test("defaultWorkerLaunchForm preserves a Ticket repository target", () => 
     }),
   );
 
-  assertEquals(form.workdir_attachments, [{
-    alias: "workdir",
-    working_directory_id: "ticket-workdir",
-    relative_cwd: "",
-  }]);
+  assertEquals(form.workdir_attachments, []);
   assertEquals(form.working_directory_repository_key, "ticket-repo");
   assertEquals(form.working_directory_selector, "work/ticket");
 });
@@ -308,8 +315,7 @@ Deno.test("buildCreateWorkspaceWorkerRequest emits an empty attachment list for 
 });
 
 function emptyForm(
-  overrides: Partial<Parameters<typeof buildCreateWorkspaceWorkerRequest>[0]> =
-    {},
+  overrides: Partial<Parameters<typeof buildCreateWorkspaceWorkerRequest>[0]> = {},
 ): Parameters<typeof buildCreateWorkspaceWorkerRequest>[0] {
   return {
     runtime_id: "",
@@ -361,7 +367,7 @@ const options: WorkerLaunchOptionsResponse = {
       status: "active",
       worker_creation_available: true,
       built_in: false,
-      working_directory_required: true,
+      supports_workdir_attachments: true,
       diagnostics: [],
     },
     {
@@ -370,7 +376,7 @@ const options: WorkerLaunchOptionsResponse = {
       status: "active",
       worker_creation_available: true,
       built_in: true,
-      working_directory_required: false,
+      supports_workdir_attachments: false,
       diagnostics: [],
     },
   ],

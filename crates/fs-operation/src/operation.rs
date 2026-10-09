@@ -278,6 +278,22 @@ pub struct ListRequest {
     pub path: FsPath,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub limit: usize,
+    /// Exclusive live continuation in the same coordinates as returned entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<ListCursor>,
+}
+
+/// A List ordering key: directories first, then lexical path (all other kinds
+/// share one ordering group). The cursor need not still exist. Each page scans
+/// the live directory: insertions before the key are not revisited, insertions
+/// after it may appear, and removals disappear. Renames or kind changes can move
+/// an entry across the key and cause omission or repetition; no snapshot or
+/// cross-page consistency is promised. Scoped wrappers translate coordinates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListCursor {
+    pub kind: EntryKind,
+    pub path: FsPath,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -293,6 +309,11 @@ pub struct ListEntry {
 #[serde(deny_unknown_fields)]
 pub struct ListResult {
     pub entries: Vec<ListEntry>,
+    /// Last returned key when more entries follow. A zero-limit request has no
+    /// continuation even when truncated. Totals describe all visible entries
+    /// in this scan, including those at or before `after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<ListCursor>,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub total_entries: usize,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]

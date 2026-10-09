@@ -147,6 +147,7 @@ pub(crate) async fn execute_grep(
             attachments: Vec::new(),
         },
         paths: result.paths,
+        listing: None,
         validator: None,
     })
 }

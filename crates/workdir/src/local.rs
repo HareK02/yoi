@@ -2695,6 +2695,7 @@ mod tests {
         let listed = WorkdirSession::list(
             &workdir,
             ListRequest {
+                after: None,
                 path: WorkdirPath::new("notes").unwrap(),
                 limit: 10,
             },
@@ -3385,6 +3386,7 @@ mod tests {
         let list = WorkdirSession::list(
             &workdir,
             ListRequest {
+                after: None,
                 path: WorkdirPath::new("yoi.local").unwrap(),
                 limit: 10,
             },

@@ -18,6 +18,8 @@
     buildCreateWorkspaceWorkerRequest,
     defaultWorkerLaunchForm,
     workerLaunchAttachmentError,
+    genericLaunchProfiles,
+    workerLaunchOutcomeUnknown,
   } from '#lib/workspace/sidebar/worker-launch.ts';
   import type { WorkerLaunchAttachmentFormState } from '#lib/workspace/sidebar/worker-launch.ts';
   import type {
@@ -58,19 +60,11 @@
   let optionsError = $state<string | null>(null);
   let submitting = $state(false);
   let submitError = $state<DisplayError | null>(null);
-  let displayName = $state(
-    ticketContext
-      ? `${ticketContext.ticketTitle} · ${ticketContext.ticketRole || 'Worker'}`
-      : 'Worker',
-  );
+  let outcomeUnknown = $state(false);
+  let displayName = $state(ticketContext?.ticketTitle ?? 'Worker');
   let runtimeId = $state('');
-  let profile = $state(
-    ticketContext
-      ? ticketContext.ticketRole === 'reviewer'
-        ? 'builtin:reviewer'
-        : 'builtin:coder'
-      : '',
-  );
+  let profile = $state('');
+  let flow = $state('');
   let subjektivSubjectId = $state('');
   let subjects = $state<SubjektivSubjectResponse[]>([]);
   let subjectsLoading = $state(false);
@@ -82,24 +76,25 @@
   let initialText = $state(ticketContext?.initialInput ?? '');
   let workdirAttachments = $state<WorkerLaunchAttachmentFormState[]>([]);
   let workingDirectoryDisplayName = $state('');
-  let workingDirectoryRepositoryKey = $state(ticketContext?.repositoryKey ?? '');
-  let workingDirectorySelector = $state(ticketContext?.refSelector ?? 'HEAD');
+  let workingDirectoryRepositoryKey = $state('');
+  let workingDirectorySelector = $state('HEAD');
   let creatingWorkingDirectory = $state(false);
   let newWorkingDirectoryAttachmentIndex = $derived(
     workdirAttachments.findIndex((attachment) => attachment.working_directory_id === NEW_WORKING_DIRECTORY_VALUE),
   );
   let isNewWorkingDirectorySelected = $derived(newWorkingDirectoryAttachmentIndex >= 0);
   let selectedRuntime = $derived(options?.runtimes.find((runtime) => runtime.runtime_id === runtimeId));
-  let selectedProfile = $derived(options?.profiles.find((candidate) => candidate.id === profile));
+  let availableProfiles = $derived(genericLaunchProfiles(options?.profiles ?? []));
+  let selectedProfile = $derived(availableProfiles.find((candidate) => candidate.id === (profile || options?.default_profile)));
   let subjektivConnectionAvailable = $derived(selectedProfile?.feature_connections.subjektiv === true);
   let activeSubjects = $derived(subjects.filter((subject) => subject.state === 'active'));
   let selectedSubject = $derived(activeSubjects.find((subject) => subject.id === subjektivSubjectId));
-  let selectedRuntimeAllowsNoWorkdir = $derived(selectedRuntime?.working_directory_required === false);
+  let selectedRuntimeForbidsWorkdirAttachments = $derived(selectedRuntime?.supports_workdir_attachments === false);
   let availableWorkingDirectories = $derived(
-    selectedRuntimeAllowsNoWorkdir
+    selectedRuntimeForbidsWorkdirAttachments
       ? []
       : (options?.working_directories ?? []).filter((directory) =>
-        directory.status === 'active' &&
+        directory.status === 'active' && directory.source.kind !== 'workspace_config' &&
         (directory.source.kind === 'external_grant' || directory.cleanliness === 'clean') &&
         directory.occupied_by == null
       ),
@@ -110,11 +105,9 @@
       : workerLaunchAttachmentError(workdirAttachments),
   );
   let canStartWorker = $derived(Boolean(
-    runtimeId &&
-      profile &&
-      (selectedRuntimeAllowsNoWorkdir
-        ? workdirAttachments.length === 0
-        : workdirAttachments.length > 0 && !attachmentValidationError),
+    runtimeId && selectedRuntime?.worker_creation_available && !outcomeUnknown &&
+      !attachmentValidationError &&
+      (!selectedRuntimeForbidsWorkdirAttachments || workdirAttachments.length === 0),
   ));
 
   function workerApiPath(path: string): string {
@@ -133,14 +126,8 @@
   });
 
   $effect(() => {
-    if (selectedRuntimeAllowsNoWorkdir && workdirAttachments.length > 0) {
+    if (selectedRuntimeForbidsWorkdirAttachments && workdirAttachments.length > 0) {
       workdirAttachments = [];
-    } else if (selectedRuntime?.working_directory_required === true && workdirAttachments.length === 0) {
-      workdirAttachments = [{
-        alias: 'workdir',
-        working_directory_id: availableWorkingDirectories[0]?.working_directory_id ?? '',
-        relative_cwd: '',
-      }];
     }
   });
 
@@ -163,15 +150,9 @@
   }
 
   function addAttachment(): void {
-    const selectedWorkdirs = new Set(
-      workdirAttachments.map((attachment) => attachment.working_directory_id),
-    );
-    const available = availableWorkingDirectories.find((directory) =>
-      !selectedWorkdirs.has(directory.working_directory_id)
-    );
     workdirAttachments = [...workdirAttachments, {
       alias: nextAttachmentAlias(),
-      working_directory_id: available?.working_directory_id ?? '',
+      working_directory_id: '',
       relative_cwd: '',
     }];
   }
@@ -212,21 +193,7 @@
       displayName = form.display_name;
       profile = form.profile;
       subjektivSubjectId = form.subjektiv_subject_id;
-      const runtimeRequiresWorkdir = payload.runtimes.find((runtime) =>
-        runtime.runtime_id === form.runtime_id
-      )?.working_directory_required !== false;
       workdirAttachments = form.workdir_attachments;
-      if (
-        runtimeRequiresWorkdir &&
-        ticketContext?.repositoryKey &&
-        workdirAttachments.every((attachment) => !attachment.working_directory_id)
-      ) {
-        workdirAttachments = [{
-          alias: 'workdir',
-          working_directory_id: NEW_WORKING_DIRECTORY_VALUE,
-          relative_cwd: '',
-        }];
-      }
       workingDirectoryRepositoryKey = form.working_directory_repository_key;
       workingDirectorySelector = form.working_directory_selector;
     } catch (err) {
@@ -290,8 +257,8 @@
       submitError = { message: 'select a runtime before creating a workdir', diagnostics: [] };
       return;
     }
-    if (selectedRuntimeAllowsNoWorkdir) {
-      submitError = { message: 'embedded Runtime does not create workdirs', diagnostics: [] };
+    if (selectedRuntimeForbidsWorkdirAttachments) {
+      submitError = { message: 'the selected Runtime does not support Workdir attachments', diagnostics: [] };
       return;
     }
     if (!workingDirectoryRepositoryKey) {
@@ -342,16 +309,13 @@
   }
 
   async function createWorker() {
+    if (submitting || outcomeUnknown) return;
     if (!workspaceId) {
       submitError = { message: 'workspace id is unavailable', diagnostics: [] };
       return;
     }
-    if (selectedRuntimeAllowsNoWorkdir && workdirAttachments.length > 0) {
+    if (selectedRuntimeForbidsWorkdirAttachments && workdirAttachments.length > 0) {
       submitError = { message: 'the selected Runtime must start without Workdir attachments', diagnostics: [] };
-      return;
-    }
-    if (!selectedRuntimeAllowsNoWorkdir && workdirAttachments.length === 0) {
-      submitError = { message: 'add at least one Workdir attachment before starting a Worker; only embedded Runtime can start without one', diagnostics: [] };
       return;
     }
     if (attachmentValidationError) {
@@ -361,23 +325,31 @@
 
     submitError = null;
     submitting = true;
+    let dispatched = false;
     try {
+      const request = buildCreateWorkspaceWorkerRequest({
+        runtime_id: runtimeId,
+        display_name: displayName,
+        profile,
+        flow,
+        ticket_assignment: ticketContext
+          ? { ticket_id: ticketContext.ticketId, operation_id: crypto.randomUUID() }
+          : null,
+        subjektiv_subject_id: subjektivSubjectId,
+        initial_text: initialText,
+        workdir_attachments: workdirAttachments,
+        working_directory_repository_key: workingDirectoryRepositoryKey,
+        working_directory_selector: workingDirectorySelector,
+      });
+      dispatched = true;
       const response = await fetch(workerApiPath('/workers'), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(buildCreateWorkspaceWorkerRequest({
-          runtime_id: runtimeId,
-          display_name: displayName,
-          profile,
-          subjektiv_subject_id: subjektivSubjectId,
-          initial_text: initialText,
-          workdir_attachments: workdirAttachments,
-          working_directory_repository_key: workingDirectoryRepositoryKey,
-          working_directory_selector: workingDirectorySelector,
-        })),
+        body: JSON.stringify(request),
       });
       if (!response.ok) {
         submitError = await responseDisplayError(response, 'worker create failed');
+        outcomeUnknown = workerLaunchOutcomeUnknown({ error: submitError.message, message: '', diagnostics: submitError.diagnostics });
         return;
       }
       const payload = parseBrowserCreateWorkerResponse(
@@ -385,6 +357,7 @@
       );
       await goto(payload.console_href);
     } catch (err) {
+      outcomeUnknown = dispatched;
       submitError = exceptionDisplayError(err, 'worker create failed');
     } finally {
       submitting = false;
@@ -422,14 +395,14 @@
   <header class="worker-new-page-header">
     <div>
       <h1 id="new-worker-heading">New Worker</h1>
-      <p>Create a Worker on a selected Runtime. Workdir-less conversation Workers are only available on embedded Runtime.</p>
+      <p>Choose a Runtime and any resources needed for this request.</p>
     </div>
   </header>
 
   {#if ticketContext}
     <aside class="worker-ticket-context">
       <div>
-        <span>Ticket {ticketContext.ticketRole || 'Worker'}</span>
+        <span>Ticket assignment</span>
         <strong>{ticketContext.ticketTitle}</strong>
         <code>{ticketContext.ticketId}</code>
       </div>
@@ -461,7 +434,7 @@
           </select>
         </div>
 
-        {#if selectedRuntimeAllowsNoWorkdir}
+        {#if selectedRuntimeForbidsWorkdirAttachments}
           <p class="worker-workdir-note">No filesystem tools or Bash will be available without a Workdir.</p>
         {:else}
           <div class="worker-attachment-heading">
@@ -536,6 +509,7 @@
               <label>
                 <span>Repository</span>
                 <select bind:value={workingDirectoryRepositoryKey}>
+                  <option value="">Select repository</option>
                   {#if options?.repositories.length}
                     {#each options.repositories as repository}
                       <option value={repository.repository_key}>{repository.repository_key}</option>
@@ -565,15 +539,12 @@
             <input bind:value={displayName} required maxlength="80" autocomplete="off" />
           </label>
           <label>
-            <span>Profile</span>
-            <select bind:value={profile} required>
-              {#if options?.profiles.length}
-                {#each options.profiles as candidate}
-                  <option value={candidate.id}>{candidate.label}</option>
-                {/each}
-              {:else}
-                <option value="" disabled>No profile candidates</option>
-              {/if}
+            <span>Profile (optional)</span>
+            <select bind:value={profile} aria-label="Profile">
+              <option value="">Workspace default</option>
+              {#each availableProfiles as candidate}
+                <option value={candidate.id}>{candidate.label}</option>
+              {/each}
             </select>
           </label>
         </div>
@@ -627,7 +598,11 @@
           </div>
         {/if}
         <label>
-          <span>Initial text</span>
+          <span>Flow (optional)</span>
+          <input bind:value={flow} autocomplete="off" placeholder="Optional Flow selector" />
+        </label>
+        <label>
+          <span>Initial request</span>
           <textarea bind:value={initialText} rows="7" placeholder="Optional first instruction"></textarea>
         </label>
       </section>
@@ -635,6 +610,10 @@
       {#if submitError}
         <div class="section-state error worker-submit-error">
           <p>{submitError.message}</p>
+          {#if outcomeUnknown}
+            <p>The launch outcome is unknown. Check the Worker list or Ticket before starting another Worker.</p>
+            <a href={`/w/${workspaceId}/workers`}>Check Workers</a>
+          {/if}
           {#if submitError.diagnostics.length > 0}
             <ul class="worker-error-diagnostics">
               {#each submitError.diagnostics as diagnostic}

@@ -130,7 +130,7 @@ function runtimeOption(
       "display_name",
       "built_in",
       "worker_creation_available",
-      "working_directory_required",
+      "supports_workdir_attachments",
       "status",
       "diagnostics",
     ],
@@ -144,9 +144,9 @@ function runtimeOption(
       item.worker_creation_available,
       `${label}.worker_creation_available`,
     ),
-    working_directory_required: boolean(
-      item.working_directory_required,
-      `${label}.working_directory_required`,
+    supports_workdir_attachments: boolean(
+      item.supports_workdir_attachments,
+      `${label}.supports_workdir_attachments`,
     ),
     status: string(item.status, `${label}.status`),
     diagnostics: array(item.diagnostics, `${label}.diagnostics`, diagnostic),

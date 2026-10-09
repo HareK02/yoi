@@ -143,6 +143,7 @@ impl WorkerFsView {
                 .list(ListRequest {
                     path: logical.clone(),
                     limit: DIR_FILE_REF_ENTRY_LIMIT,
+                    after: None,
                 })
                 .await
                 .map_err(ToolsError::from)
@@ -222,6 +223,7 @@ impl WorkerFsView {
             .list(ListRequest {
                 path: parent,
                 limit: COMPLETION_LIMIT,
+                after: None,
             })
             .await
         else {

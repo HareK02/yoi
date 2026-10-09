@@ -79,7 +79,7 @@ pub const BUILTIN_PROFILE_RESOURCES: &[BuiltinProfileResource] = &[
         selector: Some("builtin:ticket-worker"),
         path: "profiles/ticket-worker.dcdl",
         source: include_str!("../../../resources/profiles/ticket-worker.dcdl"),
-        description: "General Ticket work with typed progress and completion tools.",
+        description: "General intent-led Ticket work with optional result recording and authorized conclusion decisions.",
         imports: &[BuiltinProfileImport {
             specifier: "./default.dcdl",
             resolved_path: DEFAULT_PATH,
@@ -89,7 +89,7 @@ pub const BUILTIN_PROFILE_RESOURCES: &[BuiltinProfileResource] = &[
         selector: Some("builtin:coder"),
         path: "profiles/coder.dcdl",
         source: include_str!("../../../resources/profiles/coder.dcdl"),
-        description: "Ticket implementation with direct Reviewer SubWorkers.",
+        description: "Code implementation with optional Git/MR review recipe; no universal Ticket conclusion gate.",
         imports: BASE_IMPORT,
     },
     BuiltinProfileResource {
@@ -117,7 +117,7 @@ pub const BUILTIN_PROFILE_RESOURCES: &[BuiltinProfileResource] = &[
         selector: Some("builtin:orchestrator"),
         path: "profiles/orchestrator.dcdl",
         source: include_str!("../../../resources/profiles/orchestrator.dcdl"),
-        description: "Workspace orchestration and Worker control.",
+        description: "Intent-led Ticket orchestration with separate guarded MR integration authority.",
         imports: BASE_IMPORT,
     },
     BuiltinProfileResource {

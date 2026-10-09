@@ -2632,34 +2632,30 @@ fn runtime_request_proof_rejection(
     method: &str,
     path: &str,
     workspace_id: &str,
-    error: &crate::worker_source::WorkerMutationSourceProofError,
+    error: &crate::worker_source::RuntimeRequestProofError,
 ) -> Response {
-    use crate::worker_source::WorkerMutationSourceProofError;
-
-    // Do not format the error itself: Authority and MissingPermission can carry
-    // internal or request-derived strings. Only emit allowlisted reason codes.
-    let reason = match error {
-        WorkerMutationSourceProofError::Missing => "missing",
-        WorkerMutationSourceProofError::Invalid => "invalid",
-        WorkerMutationSourceProofError::WrongAudience => "wrong_audience",
-        WorkerMutationSourceProofError::WrongWorkspace => "wrong_workspace",
-        WorkerMutationSourceProofError::WrongActor => "wrong_actor",
-        WorkerMutationSourceProofError::MissingPermission(_) => "missing_permission",
-        WorkerMutationSourceProofError::Expired => "expired",
-        WorkerMutationSourceProofError::RevokedRuntimeTrust => "runtime_trust_missing_or_revoked",
-        WorkerMutationSourceProofError::Replay => "replay",
-        WorkerMutationSourceProofError::WorkerCatalogMembership => "worker_catalog_membership",
-        WorkerMutationSourceProofError::Authority(_) => "authority_unavailable",
-    };
+    // Never format an error or raw claims. IDs are fixed-length fingerprints;
+    // verification labels describe proof-check progress, not authorization.
     let path = path.split('?').next().unwrap_or(path);
+    let log_path = bounded_auth_log_value(path, 512);
+    let method = bounded_auth_log_value(method, 32);
+    let workspace_id = bounded_auth_log_value(workspace_id, 128);
+    let request_id = uuid::Uuid::now_v7().to_string();
     tracing::warn!(
         target: "yoi::auth",
         event = "runtime_request_proof_rejected",
-        method,
-        path,
-        workspace_id,
+        method, path = log_path, workspace_id, request_id,
         status = 401,
-        reason,
+        reason = error.reason,
+        proof_verification = error.verification,
+        claimed_runtime_id_hash = error.runtime_id_hash.as_deref(),
+        claimed_worker_id_hash = error.worker_id_hash.as_deref(),
+        claimed_token_id_hash = error.token_id_hash.as_deref(),
+        issued_at_unix = error.iat,
+        expires_at_unix = error.exp,
+        verified_at_unix = error.now,
+        time_delta_seconds = error.time_delta_seconds,
+        time_tolerance_seconds = error.time_delta_seconds.map(|_| 0_u64),
         "Runtime request proof rejected",
     );
     repository_api_rejection(
@@ -2667,6 +2663,17 @@ fn runtime_request_proof_rejection(
         StatusCode::UNAUTHORIZED,
         "invalid runtime request proof",
     )
+}
+
+fn bounded_auth_log_value(value: &str, max_bytes: usize) -> String {
+    let mut result = String::new();
+    for ch in value.chars().filter(|ch| !ch.is_control()) {
+        if result.len() + ch.len_utf8() > max_bytes {
+            break;
+        }
+        result.push(ch);
+    }
+    result
 }
 
 /// Authored configuration editors are user-facing authority, not a generic
@@ -30511,7 +30518,7 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> ApiResult<WorkerLaunchO
                 display_name: runtime.label,
                 built_in,
                 worker_creation_available: runtime.worker_creation_available,
-                working_directory_required: !built_in,
+                supports_workdir_attachments: !built_in,
                 status: runtime.status,
                 diagnostics: runtime
                     .diagnostics
@@ -32764,6 +32771,7 @@ mod tests {
     mod ticket_worker_claim_tests;
     mod ticket_worker_launch_tests;
     mod value_profiles_tests;
+    mod worker_drive_tests;
     mod worker_operations_tests;
     include!("server_workspace_config_tests.rs");
     use super::*;
@@ -36780,7 +36788,12 @@ mod tests {
         assert_eq!(builtin.definition.name, "coder-review");
         assert_eq!(builtin.selector.to_string(), "builtin:coder-review");
         assert_eq!(builtin.flow_id, "builtin:coder-review");
-        assert_eq!(builtin.revision, 4);
+        assert_eq!(
+            builtin.revision,
+            flow::builtin_flow_source(flow::CODER_REVIEW_FLOW_SLUG)
+                .unwrap()
+                .revision
+        );
         assert_eq!(
             api.store
                 .list_flow_sources(&api.config.workspace_id)
@@ -54157,6 +54170,7 @@ mod tests {
             WorkdirSessionOperation::List(workdir::ListRequest {
                 path: workdir::WorkdirPath::root(),
                 limit: 10,
+                after: None,
             }),
         )
         .await
@@ -55565,7 +55579,10 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            Err(crate::worker_source::WorkerMutationSourceProofError::RevokedRuntimeTrust)
+            Err(crate::worker_source::RuntimeRequestProofError {
+                reason: "runtime_trust_missing_or_revoked",
+                ..
+            })
         ));
     }
 
@@ -55641,7 +55658,10 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            Err(crate::worker_source::WorkerMutationSourceProofError::WorkerCatalogMembership)
+            Err(crate::worker_source::RuntimeRequestProofError {
+                reason: "worker_catalog_membership",
+                ..
+            })
         ));
     }
 
@@ -56691,12 +56711,12 @@ mod tests {
             .iter()
             .find(|runtime| runtime["runtime_id"] == EMBEDDED_WORKER_RUNTIME_ID)
             .expect("embedded runtime launch option");
-        assert_eq!(embedded_runtime["working_directory_required"], false);
+        assert_eq!(embedded_runtime["supports_workdir_attachments"], false);
         let team_runtime = runtimes
             .iter()
             .find(|runtime| runtime["runtime_id"] == "team-runtime")
             .expect("team runtime launch option");
-        assert_eq!(team_runtime["working_directory_required"], true);
+        assert_eq!(team_runtime["supports_workdir_attachments"], true);
 
         let removal_request = serde_json::json!({
             "operation_id": "remove-team-runtime",

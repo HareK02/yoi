@@ -215,11 +215,7 @@
 <div class="workspace-page ticket-panel-page">
   <header class="workspace-page-header ticket-panel-header">
     <div>
-      <p class="workspace-eyebrow">Delivery</p>
       <h1>Tickets</h1>
-      <p class="workspace-page-lede">
-        Plan, route, review, and close work without leaving the workspace.
-      </p>
     </div>
     <div class="ticket-panel-controls">
       <button
@@ -235,7 +231,7 @@
         </div>
         {#if !orchestrator.data?.online}
           <button
-            class="workspace-primary-button"
+            class="workspace-secondary-button"
             type="button"
             disabled={orchestratorStarting}
             onclick={startOrchestrator}
@@ -261,7 +257,7 @@
       <label>Title<input bind:value={createTitle} required /></label>
       <label>Body<textarea bind:value={createBody} rows="8"></textarea></label>
       <div class="ticket-target-list">
-        <strong>Repository targets</strong>
+        <strong>Repository resources (optional)</strong>
         {#each createTargets as target, index}
           {@const selectedRepository = repositories.find((repository) => repository.repository_key === target.repository_key)}
           <fieldset class="ticket-target-row">
@@ -287,7 +283,7 @@
         <button class="workspace-secondary-button" type="button" onclick={addCreateTarget}>Add target</button>
       </div>
       {#if !createTargetsSavable}
-        <p class="workspace-empty-copy">Every target row must select a different repository. The exact one read-write target and selector requirements are enforced when the Ticket is marked ready.</p>
+        <p class="workspace-empty-copy">Each optional resource row must select a different registered repository. Empty or read-only resources are allowed.</p>
       {/if}
       <button class="workspace-primary-button" type="submit" disabled={createBusy || !createTitle.trim() || !createTargetsSavable}>
         {createBusy ? "Creating…" : "Create Ticket"}
@@ -301,7 +297,7 @@
     </p>
   {:else if !orchestrator.data?.online}
     <p class="workspace-callout">
-      Orchestration actions are unavailable until the embedded Orchestrator is online.
+      Orchestrator is offline. Requests can be queued; progress and results can still be recorded directly.
     </p>
   {/if}
 

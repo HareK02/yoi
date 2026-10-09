@@ -379,7 +379,7 @@ fn first_link(value: &Value) -> &str {
         panic!("expected typed link List")
     };
     assert_eq!(items.len(), 1);
-    let Value::String(path) = field(&items[0], "path") else {
+    let Value::String(path) = field(&items[0], "entry") else {
         panic!("expected typed link path")
     };
     path
@@ -668,4 +668,90 @@ async fn checkout_http_malformed_response_after_write_is_unknown_without_retry()
 #[tokio::test]
 async fn checkout_http_lost_response_after_write_is_unknown_without_retry() {
     watchdog(committed_write_unknown(WriteResponseFault::LostBody)).await;
+}
+
+#[tokio::test]
+async fn remote_checkout_list_pages_and_direct_inspect_read_use_provider_without_tree_enumeration()
+{
+    use super::checkout_wip_tests::{json_content, model_inspect, model_invoke, model_operation};
+    let fixture = HttpFixture::new(WorkdirSessionCapabilities::READ_ONLY).await;
+    std::fs::create_dir(fixture.dir.path().join("empty")).unwrap();
+    let remote = fixture.open(TOKEN).await.unwrap();
+    let (runtime, _) = native_runtime(Arc::new(remote));
+    let runtime = Arc::new(runtime);
+    let tree = json_content(
+        model_operation(
+            runtime.clone(),
+            "Tree",
+            json!({"path":"/checkouts", "depth":8}),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(tree["tree"]["children"][0]["children"], json!([]));
+    assert!(
+        !fixture
+            .state
+            .operations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|op| matches!(
+                op,
+                WorkdirSessionOperation::CheckoutSearch(_) | WorkdirSessionOperation::List(_)
+            ))
+    );
+    let entrance = model_inspect(runtime.clone(), "/checkouts/main").await;
+    let first = json_content(
+        model_invoke(runtime.clone(), &entrance, "list", json!({"limit":1}))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(first["items"][0]["entry"], "/checkouts/main/empty");
+    assert_eq!(first["items"][0]["kind"], "directory");
+    assert_eq!(first["truncated"], true);
+    let next = json_content(
+        model_invoke(
+            runtime.clone(),
+            &entrance,
+            "list",
+            json!({"limit":1,"after":first["after"]}),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(next["items"][0]["entry"], "/checkouts/main/src");
+    assert_eq!(next["truncated"], false);
+    let deep = model_inspect(runtime.clone(), "/checkouts/main/src/deep").await;
+    for (operation, args) in [
+        ("list", json!({})),
+        ("glob", json!({"pattern":"*.txt"})),
+        (
+            "grep",
+            json!({"pattern":"needle","output_mode":"files_with_matches"}),
+        ),
+    ] {
+        let found = json_content(
+            model_invoke(runtime.clone(), &deep, operation, args)
+                .await
+                .unwrap(),
+        );
+        let file = found["items"][0]["entry"].as_str().unwrap();
+        assert_eq!(file, "/checkouts/main/src/deep/a.txt");
+        let inspected = model_inspect(runtime.clone(), file).await;
+        let read = json_content(
+            model_invoke(runtime.clone(), &inspected, "read", json!({}))
+                .await
+                .unwrap(),
+        );
+        assert!(read["content"].as_str().unwrap().contains("needle"));
+        fixture.public_output(&found.to_string());
+    }
+    let operations = fixture.state.operations.lock().unwrap();
+    assert!(operations.iter().any(|op| matches!(op, WorkdirSessionOperation::CheckoutSearch(r) if matches!(&r.operation, CheckoutSearchOperation::List(l) if l.after.is_some()))));
+    assert!(
+        !operations
+            .iter()
+            .any(|op| matches!(op, WorkdirSessionOperation::List(_)))
+    );
 }

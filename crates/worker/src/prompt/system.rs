@@ -322,6 +322,154 @@ fn append_trailing_section(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature::FeatureRegistryBuilder;
+    use crate::feature::builtin::merge_request::MergeRequestFeature;
+    use crate::feature::builtin::ticket::{TicketFeature, TicketFeatureAccess};
+    use crate::hook::HookRegistryBuilder;
+    use crate::worker::TestWorkspaceHttpClient;
+    use manifest::MergeRequestFeatureConfig;
+
+    // These builtin resources are the model-visible workflow compatibility contract.
+    // Fixtures prove composition and tool descriptions, not an agent's real judgment.
+    fn ticket_workflow_fixture(
+        role: &str,
+        mr_config: MergeRequestFeatureConfig,
+    ) -> (String, Vec<agen::tool::ToolMeta>) {
+        let client = Arc::new(TestWorkspaceHttpClient::new("workspace", "http://unused"));
+        let mut tools = Vec::new();
+        let mut hooks = HookRegistryBuilder::default();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(TicketFeature::new(
+                client.clone(),
+                TicketFeatureAccess {
+                    thread: true,
+                    workflow: true,
+                    ..Default::default()
+                },
+            ))
+            .with_module(MergeRequestFeature::new(client, mr_config))
+            .install_into_pending(&mut tools, &mut hooks);
+        assert!(!report.has_errors(), "{}", report.error_message());
+        let metas: Vec<_> = tools.into_iter().map(|definition| definition().0).collect();
+        let instructions = report.installed_instruction_contributions();
+        let prompts = PromptCatalog::builtins_only().unwrap();
+        let scope = Scope::empty();
+        let rendered = SystemPromptTemplate::parse(role, PromptCatalogSource::builtins_only())
+            .unwrap()
+            .render(&SystemPromptContext {
+                now: DateTime::parse_from_rfc3339("2026-10-08T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                cwd: Cow::Borrowed("."),
+                language: "en",
+                scope: &scope,
+                tool_names: metas.iter().map(|meta| meta.name.clone()).collect(),
+                feature_instructions: &instructions,
+                agents_md: None,
+                resident_summary: None,
+                prompts: &prompts,
+            })
+            .unwrap();
+        (rendered, metas)
+    }
+
+    #[test]
+    fn effective_ticket_instructions_allow_review_not_required_without_mr_gate() {
+        let (prompt, tools) =
+            ticket_workflow_fixture("role.ticket_worker", MergeRequestFeatureConfig::default());
+        assert!(prompt.contains("No Merge Request or approval is a prerequisite"));
+        assert!(prompt.contains("optional Ticket comment"));
+        assert!(prompt.contains("optional Drive document/artifact"));
+        assert!(!prompt.contains("## Merge Request workflow"));
+        assert!(!tools.iter().any(|meta| meta.name == "ReviewMergeRequest"));
+        let complete = tools
+            .iter()
+            .find(|meta| meta.name == "CompleteTicket")
+            .unwrap();
+        assert!(
+            complete
+                .description
+                .contains("Merge Requests and approvals are not prerequisites")
+        );
+        assert!(complete.description.contains("not real judgment"));
+        assert!(
+            complete.input_schema["properties"]
+                .get("approval_event_id")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn effective_code_instructions_preserve_independent_review_before_merge() {
+        let (prompt, tools) = ticket_workflow_fixture(
+            "role.orchestrator",
+            MergeRequestFeatureConfig {
+                show: true,
+                readiness_check: true,
+                complete: true,
+                ..Default::default()
+            },
+        );
+        assert!(prompt.contains("Trusted Reviewer authority"));
+        assert!(
+            prompt.contains(
+                "Target integration and `CompleteMergeRequest` are Orchestrator authority"
+            )
+        );
+        assert!(
+            prompt.contains("does not bypass the guarded review requirements for MR integration")
+        );
+        assert!(prompt.contains("not a universal Ticket pipeline"));
+        assert!(!tools.iter().any(|meta| meta.name == "ReviewMergeRequest"));
+        let complete = tools
+            .iter()
+            .find(|meta| meta.name == "CompleteMergeRequest")
+            .unwrap();
+        assert!(
+            complete
+                .description
+                .contains("trusted exact-source approval")
+        );
+        assert!(
+            complete.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "approval_event_id")
+        );
+    }
+
+    #[test]
+    fn effective_ticket_instructions_allow_return_without_conclusion_and_separate_cleanup() {
+        for role in ["role.ticket_worker", "role.coder", "role.orchestrator"] {
+            let (prompt, tools) =
+                ticket_workflow_fixture(role, MergeRequestFeatureConfig::default());
+            assert!(prompt.contains("return without conclusion"), "{role}");
+            assert!(
+                prompt.contains(
+                    "a turn ending or a result report is not itself a completion decision"
+                ),
+                "{role}"
+            );
+            assert!(
+                prompt.contains("stopping a Worker alone does not end unfinished work"),
+                "{role}"
+            );
+            assert!(
+                prompt.contains("does not stop, remove, or clean up"),
+                "{role}"
+            );
+            let complete = tools
+                .iter()
+                .find(|meta| meta.name == "CompleteTicket")
+                .unwrap();
+            assert!(
+                complete
+                    .description
+                    .contains("return without conclusion need not call this tool")
+            );
+        }
+    }
 
     #[test]
     fn sub_worker_capabilities_follow_the_registered_canonical_control_tools() {

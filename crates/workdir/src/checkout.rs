@@ -167,6 +167,19 @@ impl CheckoutSearchRequest {
         }
         let valid = match &self.operation {
             CheckoutSearchOperation::List(r) => {
+                if let Some(after) = &r.after {
+                    validate_path(&after.path)?;
+                    if after.path.is_root()
+                        || std::path::Path::new(after.path.as_str()).parent()
+                            != std::path::Path::new(r.path.as_str())
+                                .strip_prefix(self.output_root.as_str())
+                                .ok()
+                    {
+                        return Err(WorkdirError::InvalidArgument(
+                            "List cursor must name a direct child of the listed directory".into(),
+                        ));
+                    }
+                }
                 r.limit <= crate::external::MAX_EXTERNAL_RESULT_ITEMS
             }
             CheckoutSearchOperation::Glob(r) => {
@@ -793,6 +806,7 @@ mod tests {
         for provider in [&local as &dyn WorkdirSession, &external] {
             let listed = provider
                 .list(ListRequest {
+                    after: None,
                     path: WorkdirPath::root(),
                     limit: 100,
                 })

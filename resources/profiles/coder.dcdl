@@ -1,6 +1,6 @@
 import "./base.dcdl" // {
     slug = "coder";
-    description = "Ticket implementation coder profile.";
+    description = "Code implementation with optional Git/MR review recipe; no universal Ticket conclusion gate.";
     scope = "workspace_write";
     model = { ref = "codex-oauth/gpt-6.1-sol"; };
     engine = {
@@ -9,6 +9,7 @@ import "./base.dcdl" // {
     };
 
     feature = {
+        drive = { enabled = true; };
         task = { enabled = true; };
         memory = { enabled = false; };
         subjektiv = { enabled = true; };

@@ -1005,6 +1005,9 @@ impl WorkdirSession for ScopedWorkdirSession {
             .await?;
         self.ensure_read(&path, request.operation.capability())?;
         *request.operation.path_mut() = path;
+        // List cursors stay output_root-relative, just like source results.
+        // Composing output_root below handles their coordinates without stat
+        // of a key that may have disappeared between live pages.
         request.output_root = self.resolve_path(&request.output_root)?;
         for layer in &mut request.scope_layers {
             for rule in layer {
@@ -1873,6 +1876,7 @@ mod tests {
         assert_eq!(
             parent
                 .list(ListRequest {
+                    after: None,
                     path: fs_path("child"),
                     limit: 100
                 })
@@ -1890,6 +1894,7 @@ mod tests {
             child
                 .tool_session()
                 .list(ListRequest {
+                    after: None,
                     path: FsPath::root(),
                     limit: 100
                 })
@@ -1901,6 +1906,7 @@ mod tests {
                 .tool_session()
                 .checkout_search(crate::CheckoutSearchRequest::new(
                     crate::CheckoutSearchOperation::List(ListRequest {
+                        after: None,
                         path: FsPath::root(),
                         limit: 100
                     })

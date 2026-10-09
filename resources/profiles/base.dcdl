@@ -25,6 +25,8 @@ compaction = {
 };
 
 feature = {
+    # Activation only; Backend Drive grants remain independent.
+    drive = { enabled = false; };
     task = { enabled = true; };
     memory = { enabled = false; staging_tools = false; };
     subjektiv = {

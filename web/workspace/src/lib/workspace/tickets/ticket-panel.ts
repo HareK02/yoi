@@ -14,7 +14,6 @@ export const TICKET_STATES = [
 ] as const;
 
 export type TicketState = (typeof TICKET_STATES)[number];
-export type TicketWorkerRole = "coder" | "reviewer";
 
 export type WorkspaceOrchestratorStatus = BrowserWorkspaceOrchestratorResponse;
 
@@ -98,36 +97,20 @@ export function ticketLanes(tickets: TicketCardSummary[]): TicketLane[] {
   }));
 }
 
-export function ticketWorkerMessage(
-  ticketId: string,
-  role: TicketWorkerRole,
-): string {
-  return `Work on Ticket ${ticketId} as its ${role}.`;
+export function ticketWorkerMessage(ticketId: string): string {
+  return `Work on Ticket ${ticketId}.`;
 }
 
 export function ticketWorkerLaunchHref(
   workspaceId: string,
-  ticket: Pick<TicketDetail, "id" | "title" | "targets">,
-  role: TicketWorkerRole,
+  ticket: Pick<TicketDetail, "id" | "title">,
+  request = ticketWorkerMessage(ticket.id),
 ): string {
-  const implementationTargets = ticket.targets.filter((target) =>
-    target.access === "read_write"
-  );
-  const implementationTarget = implementationTargets.length === 1
-    ? implementationTargets[0]
-    : null;
   const params = new URLSearchParams({
     ticketId: ticket.id,
     ticketTitle: ticket.title,
-    ticketRole: role,
-    initialInput: ticketWorkerMessage(ticket.id, role),
+    initialInput: request,
   });
-  if (implementationTarget) {
-    params.set("repositoryKey", implementationTarget.repository_key);
-    if (implementationTarget.ref_selector) {
-      params.set("refSelector", implementationTarget.ref_selector);
-    }
-  }
   return `/w/${
     encodeURIComponent(workspaceId)
   }/workers/new?${params.toString()}`;

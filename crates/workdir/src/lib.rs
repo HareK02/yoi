@@ -33,9 +33,9 @@ use tokio::sync::broadcast;
 
 pub use fs_operation::{
     BoundedReadLimits, ContentHash, EditRequest, EditResult, EntryKind, FsPath as WorkdirPath,
-    GlobRequest, GlobResult, GrepOutputMode, GrepRequest, GrepResult, ListEntry, ListRequest,
-    ListResult, ReadBytesRequest, ReadBytesResult, ReadRequest, ReadResult, StatRequest,
-    StatResult, WriteRequest, WriteResult,
+    GlobRequest, GlobResult, GrepOutputMode, GrepRequest, GrepResult, ListCursor, ListEntry,
+    ListRequest, ListResult, ReadBytesRequest, ReadBytesResult, ReadRequest, ReadResult,
+    StatRequest, StatResult, WriteRequest, WriteResult,
 };
 pub use http::dispatch_workdir_session_operation;
 pub use local::{

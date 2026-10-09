@@ -549,7 +549,7 @@ impl BackendWorkspaceProductClient {
         let runtime = options
             .runtimes
             .iter()
-            .find(|runtime| runtime.worker_creation_available && !runtime.working_directory_required)
+            .find(|runtime| runtime.worker_creation_available)
             .ok_or_else(|| {
                 BackendWorkspaceClientError::InvalidTarget(
                     "Backend has no spawn-capable Runtime that supports a Workdir-less Intake Worker"
@@ -1340,7 +1340,7 @@ mod tests {
         let (base_url, requests, handle) = response_sequence_server(vec![
             (
                 "200 OK",
-                r#"{"workspace_id":"workspace-a","runtimes":[{"runtime_id":"embedded","display_name":"Embedded","built_in":true,"worker_creation_available":true,"working_directory_required":false,"status":"connected","diagnostics":[]}],"default_profile":null,"profiles":[],"repositories":[],"working_directories":[],"diagnostics":[]}"#,
+                r#"{"workspace_id":"workspace-a","runtimes":[{"runtime_id":"embedded","display_name":"Embedded","built_in":true,"worker_creation_available":true,"supports_workdir_attachments":false,"status":"connected","diagnostics":[]}],"default_profile":null,"profiles":[],"repositories":[],"working_directories":[],"diagnostics":[]}"#,
             ),
             (
                 "200 OK",

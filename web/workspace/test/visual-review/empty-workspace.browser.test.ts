@@ -1,17 +1,13 @@
 import { assert, assertEquals } from "jsr:@std/assert@1.0.19";
 import { chromium } from "npm:playwright@1.59.1";
 import { loadScenario } from "../../../../tools/web-ux/src/scenario.ts";
-import {
-  startOwnedProcesses,
-  stopOwnedProcesses,
-} from "../../../../tools/web-ux/src/processes.ts";
+import { startOwnedProcesses, stopOwnedProcesses } from "../../../../tools/web-ux/src/processes.ts";
 import { creationResponse } from "../../src/lib/workspace/api/workspace-catalog.test-fixtures.ts";
 
 // Browser-only contract over the production static build and loopback API fixtures;
 // no actual Backend, Runtime, Worker, account or repository is created.
 Deno.test("production empty Workspace supports optional Git validation, reopening, and Workdir-less Worker submission at all review widths", async () => {
-  const scenarioPath =
-    new URL("./optional-repository.json", import.meta.url).pathname;
+  const scenarioPath = new URL("./optional-repository.json", import.meta.url).pathname;
   const scenario = await loadScenario(scenarioPath);
   async function freePort() {
     const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
@@ -28,8 +24,7 @@ Deno.test("production empty Workspace supports optional Git validation, reopenin
   scenario.processes![1].args![3] = String(proxyPort);
   scenario.processes![1].args![4] = `http://127.0.0.1:${upstreamPort}`;
   scenario.processes![1].readyUrl = `${scenario.baseUrl}/health`;
-  const output =
-    new URL("../../.svelte-kit/t717/browser/", import.meta.url).pathname;
+  const output = new URL("../../.svelte-kit/t717/browser/", import.meta.url).pathname;
   const processes = await startOwnedProcesses(
     scenario.processes!,
     scenarioPath,
@@ -138,8 +133,9 @@ Deno.test("production empty Workspace supports optional Git validation, reopenin
               .selectOption("remote");
             assert(
               await page.getByRole("button", { name: "Start Worker" })
-                .isDisabled(),
+                .isEnabled(),
             );
+            await page.getByRole("button", { name: "Add attachment", exact: true }).click();
             await page.getByLabel("Attachment 1 Workdir").selectOption(
               "__new_working_directory__",
             );

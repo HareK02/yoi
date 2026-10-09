@@ -9856,7 +9856,9 @@ pub struct WorkerLaunchRuntimeOption {
     pub display_name: String,
     pub built_in: bool,
     pub worker_creation_available: bool,
-    pub working_directory_required: bool,
+    /// Whether this Runtime supports explicitly selected Workdir attachments.
+    /// Workdirs are optional for generic launches; embedded Runtime does not support them.
+    pub supports_workdir_attachments: bool,
     pub status: String,
     pub diagnostics: Vec<Diagnostic>,
 }

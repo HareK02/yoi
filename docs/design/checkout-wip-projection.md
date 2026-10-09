@@ -14,9 +14,11 @@ is created.
 ├── workdirs                      identity/lifecycle
 ├── workdir-attachments           Backend connection lifetimes
 └── checkouts                     current accessible content entrances; list
-    └── <encoded alias>           directory; glob, grep, create_file
-        ├── README.md             file; read, edit, write
-        └── src                   directory; glob, grep, create_file
+    └── <encoded alias>           directory; list, glob, grep, create_file
+
+# Not indexable; resolve known paths directly or discover via Operations:
+/checkouts/<encoded alias>/README.md    file; read, edit, write
+/checkouts/<encoded alias>/src          directory; list, glob, grep, create_file
 ```
 
 Operations are Interface declarations, not children or `/features/...` routes.
@@ -42,7 +44,7 @@ validates every resolved projection's path/owner/descriptor and every enumerated
 child's immediate-parent relationship. Static and dynamic/subtree overlaps are
 rejected. Observe resolves only the requested depth; successful observations are
 complete through that depth, not partial trees masked as success. Directory
-listing and native search use the shared List/Glob/Grep engines through typed
+listing Operations and native search use the shared List/Glob/Grep engines through typed
 `CheckoutSearchRequest` forwarding. Scoped sessions append intersecting rule
 layers, translate their cwd, and require provider-side visibility checks before
 entry descent/content reads. Results retain session-logical coordinates, so a
@@ -50,6 +52,21 @@ SubWorker cwd does not duplicate a path prefix in its Object links. Unsupported
 providers fail closed rather than falling back to a broader source search.
 Direct resolution also uses current provider authority, not possession of a
 cached Interface.
+
+## Indexable boundary (T-714)
+
+Only `/checkouts` and accessible immediate attachment entrances are indexable.
+No directory content List runs during tree/observe, even at deep depth or when a
+known deep directory is the observation root. Empty, small and large directories
+all have the same boundary. Positive-depth content observations return
+`children: []` (no **indexable** children), not an omitted field and not
+an assertion that the directory is empty. At depth zero children are omitted;
+`observe("/checkouts", 1)` omits entrance children, depth 2 returns [] there.
+The Client retains discovered/inspected paths without adding indexable edges.
+
+Known authorized paths remain directly resolvable and operable. Use List/Glob/Grep
+for discovery, then Inspect only selected entry coordinates; no successful search
+is undone when an entry disappears before Inspect. Bash/COMMAND is unnecessary.
 
 ## Names and connection isolation
 
@@ -66,18 +83,27 @@ existence alone does not expose its content. Following a reference still require
 current scope/capability and an accessible filesystem projection.
 
 Objects have no shared inode `ref`: hard-linked names and different attachments
-must not be mistaken for one path-independent representation. Interface references
-are opaque, path-qualified and include a fresh projection incarnation and live
-attachment generation. Validators combine that namespace with the provider's
+must not be mistaken for one path-independent representation. Interface
+references are structured `(scope, name)`. Each entrance is its own
+scope; content Interfaces use that entrance as ancestor scope, irrespective of
+indexability. Local names bind target coordinates, projection incarnation and
+live attachment generation. The provider's target-qualified-name routing hint
+only selects a target; fetch re-resolves one coherent current publication and
+checks the exact Interface, Descriptor, validator and scope under the pinned
+router connection. It never turns a cached registration or name into authority.
+Validators combine that namespace with the provider's
 opaque identity/state validator. Restoring a Worker creates a fresh incarnation;
 detach/alias reuse changes the router generation. An old Interface, validator or
 read-history entry cannot retarget a new connection. No separate connection ledger
 is added. The existing router's active-operation exclusion and begin/finish/cancel
 detach paths remain authoritative; detach does not remove the Workdir/files.
 Collection enumeration rejects connection-set changes between sampling and
-publication instead of pairing old items with a new validator. Search-link
-publication checks the captured attachment generation, not merely a reused
-alias; response-side provider awaits are covered by the operation deadline.
+publication instead of pairing old items with a new validator. Result publication
+checks the captured attachment generation, not merely a
+reused alias. It maps typed provider paths without observing/statting every
+result. Provider awaits are covered by the operation deadline. Objects publish
+no scope_ref here; legitimate ref-less binding still checks membership,
+validators, current provider authority and attachment generation.
 
 ## AI Operation mapping
 
@@ -89,15 +115,20 @@ below are relative to the **bound directory**, not the Worldspace or endpoint.
 | Object | Operation | Arguments | Result |
 | --- | --- | --- | --- |
 | `/checkouts` | `list` | none | bounded `items` containing alias/slug/Workdir/generation/path |
-| directory | `glob` | `pattern`, optional `path` | normal bounded Glob text/summary plus same-checkout Object links |
-| directory | `grep` | `pattern`; optional `path`, `glob`, `type`, `case_insensitive`, `-A`, `-B`, `-C`, `multiline`, `output_mode`, `head_limit`, `offset` | normal Grep grouped/context/count text and typed provider search targets mapped to Object links |
+| directory | `list` | optional `limit` (default 100, 1..1000), `after` (returned `{kind, entry}`) | direct-content records `{kind, size, entry}`, `truncated`, optional `after` |
+| directory | `glob` | `pattern`, optional `path` | normal bounded Glob text/summary plus Descriptor-typed same-checkout `entry` coordinates |
+| directory | `grep` | `pattern`; optional `path`, `glob`, `type`, `case_insensitive`, `-A`, `-B`, `-C`, `multiline`, `output_mode`, `head_limit`, `offset` | normal Grep grouped/context/count text and typed provider search targets mapped to Descriptor-typed `entry` coordinates |
 | file | `read` | optional line `offset`, `limit` | line-numbered text and normal Read summary |
 | file | `edit` | `old_string`, `new_string`, optional `replace_all` | replacement count/summary and preview |
 | file | `write` | `content` | existing-file save summary; never creation |
 | directory | `create_file` | `path`, `content` | create-new summary and created-file link; permitted missing parents are created |
 
-Native operation results use a JSON record with `summary`, nullable `content` and
-`items` (`path` is an absolute WIP Object navigation coordinate, not an OS path).
+Native operation results declare a typed record with `summary`, optional `content`
+and `items`. Each item contains `entry: entry` in its Descriptor (an absolute
+Worldspace coordinate, encoded as a string in WIP Value), never a guessed ordinary
+string or an OS path. List additionally declares `kind`, byte `size`, `truncated`
+and optional `after: {kind: string, entry: entry}`. File operations have empty
+items except Create, which returns the new coordinate.
 Search links are constructed from **typed provider paths**, not by parsing Grep's
 rendered filenames/line delimiters. Provider scope remains authoritative for
 search output as well as links. Glob/Grep share normal provider ignore/pattern,
@@ -129,11 +160,46 @@ must not record history; successful mutations update hash/change statistics only
 after provider success. Create is strictly beneath the bound parent, creates only
 an absent file, and must not overwrite an existing destination or symlink.
 
-Manifest permission identities remain Read/Edit/Write/Glob/Grep; create_file uses
-Write. The Host reconstructs the same route-bound input for policy evaluation;
+Manifest permission identities are Read/Edit/Write/Glob/Grep plus **List** for
+native directory listing; create_file uses Write. List publication uses provider
+Read capability and potential List allow policy; execution reconstructs the bound
+directory's logical path for the exact List policy. Allowing Glob or COMMAND does
+not override a List deny/ask rule, and Interface scope validity grants no file
+access. Normal Tools mode is unchanged (no new top-level List tool). The Host reconstructs the same route-bound input for policy evaluation;
 provider read/write scope, capabilities and delegated leases are checked again.
 `ask` fails closed. Native replacement claims remove `/tools/Read`, `/tools/Edit`,
 `/tools/Write`, `/tools/Glob`, `/tools/Grep`, not unrelated Tools.
+
+## Directory List pagination
+
+List uses the existing provider List engine, **not** glob("*") or shell ls. It
+includes direct visible empty directories, hidden and ignored names: unlike
+Glob/Grep, provider List does not apply search ignore files. Existing Read scope,
+readability and can_enumerate_directory checks still gate names; no ancestor or
+nonrecursive enumeration permission is inferred from a known descendant.
+
+Order is directories first, then lexical canonical provider path, with every
+other kind in the second group. after is the last returned exclusive ordering
+key, rebased to a canonical Worldspace entry by the Host. Pass the returned record
+unchanged to continue on the same directory; a foreign checkout, non-direct child,
+absolute provider path or unknown field is rejected. No cursor stat is required:
+the key may have disappeared. This is **live pagination, not a snapshot**. New
+keys before the cursor are not revisited; later keys may appear, removals vanish,
+and renames/kind changes may omit or repeat an entry. Directory validators fence
+each call, not all pages; refresh Inspect after a stale rejection before issuing
+a new explicit call. Detach/reuse expires the old Interface and validator.
+
+Each page scans the live directory under provider cancellation/deadline and the
+existing traversal-entry ceiling, retaining at most limit+1 ordering candidates
+and the aggregate path-byte budget. It never retains the whole unbounded listing.
+The next ordering key is explicit whenever truncated; no next key means complete.
+Provider resource failures stay explicit failures, not silent truncation or retries.
+
+UTF-8 canonical names are retained verbatim; unrepresentable names are skipped by
+the existing provider. Native List may reject visible symlinks under the checked
+provider's no-follow policy. If a provider returns symlink/other kinds they remain
+classified path coordinates, not a promise of inspectable/operable Objects:
+direct checkout resolution only publishes authorized regular files/directories.
 
 ## Consistency, safety and resource policy
 
@@ -172,7 +238,7 @@ rediscover/reread. Do not report partially created parents as unchanged.
 
 Host observations are bounded to depth 32 and 1024 nodes with a 30-second total
 cooperative deadline. The checkout adapter permits at most 16 concurrent requests
-and bounds admission waiting and the complete operation (including result-link
+and bounds admission waiting and the complete operation (including bounded result
 publication) to 30 seconds each; provider path/depth, source/response,
 mutation/search and transport bounds apply too. No initial context expands an
 entire tree. Resource-limit errors do not turn incomplete observation into a
@@ -182,8 +248,9 @@ truncation under the existing search contract.
 ## Typical sequence
 
 1. Use Tree on `/checkouts` with depth 1; Inspect `/checkouts` directly and Invoke `list`.
-2. Inspect an entrance or a known deep directory directly; Invoke `glob`/`grep`.
-3. Follow a returned file `path`, Inspect that path and Invoke line `read`.
+2. Inspect an entrance or known deep directory directly; Invoke `list`/`glob`/`grep`.
+   For List, pass returned `after` with the next limit to obtain another live page.
+3. Follow a returned file `entry`, Inspect that path and Invoke line `read`.
 4. Call `edit` or `write`; Client-managed validators protect the exact observed
    object while the shared tracker enforces the prior Read.
 5. Rediscover after external changes; a stale rejection is not permission to skip
@@ -203,9 +270,14 @@ outside this feature.
 Run from the main repository, on Linux with `openat2` and `/proc/self/fd`:
 
 ```sh
-cargo check --workspace --all-targets
+cargo test -p worker --lib checkout_wip
+cargo test -p workdir --test list_pagination
+cargo check
 cargo test -p fs-operation -p workdir -p tools -p worker
-cargo test -p worker-runtime -p yoi-workspace-server
+# Workdir External/HTTP features and dependent server fixture:
+cargo test -p workdir --features http-client
+cargo test -p yoi-workspace-server --lib backend_workdir_session_proxy_executes_typed_operations
+node scripts/verify-wip-dependencies.mjs
 cargo fmt --all -- --check
 git diff --check
 ```

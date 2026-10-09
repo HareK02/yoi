@@ -85,6 +85,326 @@ impl Fixture {
     }
 }
 
+#[derive(Debug)]
+struct ListProvider {
+    workdir: workdir::Workdir,
+    capabilities: workdir::WorkdirSessionCapabilities,
+    result: workdir::CheckoutSearchResult,
+    change_validator: bool,
+    expected_after: Option<workdir::ListCursor>,
+    searched: std::sync::atomic::AtomicBool,
+}
+
+// This boundary adapter exposes only checked metadata/search. Any file content
+// read, ordinary list fallback, or command execution is a test failure.
+#[async_trait::async_trait]
+impl workdir::WorkdirSession for ListProvider {
+    fn workdir(&self) -> &workdir::Workdir {
+        &self.workdir
+    }
+    fn capabilities(&self) -> workdir::WorkdirSessionCapabilities {
+        self.capabilities
+    }
+    async fn checkout_observe(
+        &self,
+        path: WorkdirPath,
+    ) -> Result<workdir::CheckoutObservation, workdir::WorkdirError> {
+        assert_eq!(
+            path.as_str(),
+            "src",
+            "List observes only its bound directory"
+        );
+        Ok(workdir::CheckoutObservation {
+            path,
+            kind: workdir::EntryKind::Directory,
+            size: 0,
+            validator: vec![u8::from(
+                self.change_validator && self.searched.load(std::sync::atomic::Ordering::SeqCst),
+            )],
+            capabilities: self.capabilities,
+        })
+    }
+    async fn checkout_search(
+        &self,
+        request: workdir::CheckoutSearchRequest,
+    ) -> Result<workdir::CheckoutSearchResult, workdir::WorkdirError> {
+        let workdir::CheckoutSearchOperation::List(list) = request.operation else {
+            panic!("native List must dispatch a typed List request");
+        };
+        assert_eq!(list.after, self.expected_after);
+        assert!(
+            !self
+                .searched
+                .swap(true, std::sync::atomic::Ordering::SeqCst),
+            "List must not prefetch another page"
+        );
+        Ok(self.result.clone())
+    }
+    async fn stat(
+        &self,
+        _: workdir::StatRequest,
+    ) -> Result<workdir::StatResult, workdir::WorkdirError> {
+        panic!("native List must not call stat");
+    }
+    async fn read(
+        &self,
+        _: workdir::ReadRequest,
+    ) -> Result<workdir::ReadResult, workdir::WorkdirError> {
+        panic!("native List must not read file content");
+    }
+    async fn write(
+        &self,
+        _: workdir::WriteRequest,
+    ) -> Result<workdir::WriteResult, workdir::WorkdirError> {
+        panic!("native List must not write");
+    }
+    async fn edit(
+        &self,
+        _: workdir::EditRequest,
+    ) -> Result<workdir::EditResult, workdir::WorkdirError> {
+        panic!("native List must not edit");
+    }
+    async fn list(
+        &self,
+        _: workdir::ListRequest,
+    ) -> Result<workdir::ListResult, workdir::WorkdirError> {
+        panic!("native List must use checkout_search, not ordinary list");
+    }
+    async fn glob(
+        &self,
+        _: workdir::GlobRequest,
+    ) -> Result<workdir::GlobResult, workdir::WorkdirError> {
+        panic!("native List must not glob");
+    }
+    async fn grep(
+        &self,
+        _: workdir::GrepRequest,
+    ) -> Result<workdir::GrepResult, workdir::WorkdirError> {
+        panic!("native List must not grep");
+    }
+    async fn start_command(
+        &self,
+        _: workdir::CommandRequest,
+    ) -> Result<workdir::CommandHandle, workdir::WorkdirError> {
+        panic!("native List must not execute commands");
+    }
+    async fn command_status(
+        &self,
+        _: workdir::CommandHandle,
+    ) -> Result<workdir::CommandStatus, workdir::WorkdirError> {
+        panic!("native List must not use commands");
+    }
+    async fn command_output(
+        &self,
+        _: workdir::CommandOutputRequest,
+    ) -> Result<workdir::CommandOutput, workdir::WorkdirError> {
+        panic!("native List must not use commands");
+    }
+    async fn cancel_command(&self, _: workdir::CommandHandle) -> Result<(), workdir::WorkdirError> {
+        panic!("native List must not use commands");
+    }
+    async fn close(&self) -> Result<(), workdir::WorkdirError> {
+        Ok(())
+    }
+}
+
+async fn list_with_provider(
+    capabilities: workdir::WorkdirSessionCapabilities,
+    result: workdir::CheckoutSearchResult,
+    change_validator: bool,
+) -> Result<CheckoutToolOutput, ToolError> {
+    list_with_provider_after(capabilities, result, change_validator, None).await
+}
+
+async fn list_with_provider_after(
+    capabilities: workdir::WorkdirSessionCapabilities,
+    result: workdir::CheckoutSearchResult,
+    change_validator: bool,
+    after: Option<workdir::ListCursor>,
+) -> Result<CheckoutToolOutput, ToolError> {
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(
+            WorkdirAttachmentAlias::new("selected").unwrap(),
+            Arc::new(ListProvider {
+                workdir: workdir::Workdir::new("list-test"),
+                capabilities,
+                result,
+                change_validator,
+                expected_after: after.clone(),
+                searched: std::sync::atomic::AtomicBool::new(false),
+            }),
+        )
+        .unwrap();
+    let generation = router.resolve(Some("selected")).unwrap().generation;
+    execute_checkout_tool(
+        router,
+        Tracker::new(),
+        "selected",
+        generation,
+        WorkdirPath::new("src").unwrap(),
+        vec![0],
+        "List",
+        json!({"limit": 1, "after": after}),
+        Default::default(),
+    )
+    .await
+}
+
+fn list_page() -> workdir::ListResult {
+    workdir::ListResult {
+        entries: vec![workdir::ListEntry {
+            path: WorkdirPath::new("src/a.txt").unwrap(),
+            kind: workdir::EntryKind::File,
+            size: 5,
+        }],
+        total_entries: 2,
+        total_bytes: 10,
+        truncated: true,
+        next_after: Some(fs_operation::ListCursor {
+            kind: workdir::EntryKind::File,
+            path: WorkdirPath::new("src/a.txt").unwrap(),
+        }),
+    }
+}
+
+#[tokio::test]
+async fn checkout_list_uses_read_capability_and_checked_search_without_prefetch() {
+    let read_only = workdir::WorkdirSessionCapabilities::EMPTY.with(WorkdirSessionCapability::Read);
+    let page = list_page();
+    let result = list_with_provider(
+        read_only,
+        workdir::CheckoutSearchResult::List(page.clone()),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.listing, Some(page));
+    assert_eq!(result.validator, Some(vec![0]));
+    let no_read = workdir::WorkdirSessionCapabilities::EMPTY.with(WorkdirSessionCapability::Glob);
+    let error = list_with_provider(
+        no_read,
+        workdir::CheckoutSearchResult::List(list_page()),
+        false,
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(matches!(error, ToolError::InvalidArgument(_)));
+    assert!(error.to_string().contains("Read"));
+}
+
+#[tokio::test]
+async fn checkout_list_rejects_changed_post_search_directory_validator() {
+    let error = list_with_provider(
+        workdir::WorkdirSessionCapabilities::READ_ONLY,
+        workdir::CheckoutSearchResult::List(list_page()),
+        true,
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_checkout_stale(error);
+}
+
+#[tokio::test]
+async fn checkout_list_rejects_provider_pages_that_escape_or_exceed_bounds() {
+    let mut outside = list_page();
+    outside.entries[0].path = WorkdirPath::new("outside.txt").unwrap();
+    let mut nested = list_page();
+    nested.entries[0].path = WorkdirPath::new("src/nested/a.txt").unwrap();
+    let mut cursor_outside = list_page();
+    cursor_outside.next_after.as_mut().unwrap().path = WorkdirPath::new("outside.txt").unwrap();
+    let mut cursor_kind = list_page();
+    cursor_kind.next_after.as_mut().unwrap().kind = workdir::EntryKind::Directory;
+    let mut oversized = list_page();
+    oversized.entries.push(oversized.entries[0].clone());
+    for result in [
+        workdir::CheckoutSearchResult::List(outside),
+        workdir::CheckoutSearchResult::List(nested),
+        workdir::CheckoutSearchResult::List(cursor_outside),
+        workdir::CheckoutSearchResult::List(cursor_kind),
+        workdir::CheckoutSearchResult::List(oversized),
+        workdir::CheckoutSearchResult::Glob(workdir::GlobResult {
+            paths: vec![],
+            truncated: false,
+        }),
+    ] {
+        let error = list_with_provider(
+            workdir::WorkdirSessionCapabilities::READ_ONLY,
+            result,
+            false,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_checkout_code(error, "checkout_unavailable");
+    }
+}
+
+#[tokio::test]
+async fn checkout_list_special_entry_cursors_preserve_kind_and_continue_the_page() {
+    // Provider-only special entries stay path coordinates: the adapter forbids
+    // content reads and does not offer direct observations for these entries.
+    for kind in [workdir::EntryKind::Other, workdir::EntryKind::Symlink] {
+        let mut first_page = list_page();
+        first_page.entries[0].kind = kind;
+        first_page.next_after.as_mut().unwrap().kind = kind;
+        let first = list_with_provider(
+            workdir::WorkdirSessionCapabilities::READ_ONLY,
+            workdir::CheckoutSearchResult::List(first_page),
+            false,
+        )
+        .await
+        .unwrap()
+        .listing
+        .unwrap();
+        assert_eq!(first.entries[0].kind, kind);
+        let after = first.next_after.unwrap();
+        assert_eq!(after.kind, kind);
+        let mut second_page = list_page();
+        second_page.entries[0].path = WorkdirPath::new("src/z.txt").unwrap();
+        second_page.truncated = false;
+        second_page.next_after = None;
+        let second = list_with_provider_after(
+            workdir::WorkdirSessionCapabilities::READ_ONLY,
+            workdir::CheckoutSearchResult::List(second_page.clone()),
+            false,
+            Some(after),
+        )
+        .await
+        .unwrap()
+        .listing
+        .unwrap();
+        assert_eq!(second, second_page);
+    }
+}
+
+#[tokio::test]
+async fn checkout_list_rejects_missing_or_mismatched_truncated_continuations() {
+    let mut missing = list_page();
+    missing.next_after = None;
+    let mut empty = list_page();
+    empty.entries.clear();
+    let mut wrong_path = list_page();
+    wrong_path.next_after.as_mut().unwrap().path = WorkdirPath::new("src/z.txt").unwrap();
+    let mut wrong_group = list_page();
+    wrong_group.next_after.as_mut().unwrap().kind = workdir::EntryKind::Directory;
+    let mut untruncated = list_page();
+    untruncated.truncated = false;
+    for page in [missing, empty, wrong_path, wrong_group, untruncated] {
+        let error = list_with_provider(
+            workdir::WorkdirSessionCapabilities::READ_ONLY,
+            workdir::CheckoutSearchResult::List(page),
+            false,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_checkout_code(error, "checkout_unavailable");
+    }
+}
+
 fn assert_checkout_stale(error: ToolError) {
     assert_checkout_code(error, "checkout_stale");
 }
@@ -557,6 +877,183 @@ async fn checkout_search_typed_paths_and_normal_rendering() {
         let normal = fixture.normal("Grep", json!({"target_workdir": "main", "path": "src", "pattern": "hit", "output_mode": mode, "-C": 1})).await.unwrap();
         assert_eq!(grep.output.summary, normal.summary);
         assert_eq!(grep.output.content, normal.content);
+        assert!(grep.listing.is_none());
         assert!(!grep.output.content.unwrap().contains("outside.txt"));
+    }
+}
+
+#[tokio::test]
+async fn checkout_list_returns_one_typed_page_and_provider_coordinate_continuation() {
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.dir.path().join("src/nested")).unwrap();
+    std::fs::write(fixture.dir.path().join("src/a.txt"), "alpha").unwrap();
+    std::fs::write(fixture.dir.path().join("src/z.txt"), "z").unwrap();
+    std::fs::write(fixture.dir.path().join("outside.txt"), "outside").unwrap();
+    let (_, validator) = fixture.observation("main", "src").await;
+    let first = fixture
+        .native("main", "src", "List", json!({"limit": 1}))
+        .await
+        .unwrap();
+    assert!(first.paths.is_empty());
+    assert!(first.output.content.is_none());
+    assert!(first.output.summary.contains("Listed 1 of 3 entries"));
+    assert!(first.output.summary.contains("truncated"));
+    assert_eq!(first.validator, Some(validator));
+    let page = first.listing.unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].path.as_str(), "src/nested");
+    assert_eq!(page.entries[0].kind, workdir::EntryKind::Directory);
+    assert!(page.truncated);
+    let total_bytes = page.total_bytes;
+    assert!(total_bytes >= 6);
+    let cursor = page.next_after.unwrap();
+    assert_eq!(cursor.path.as_str(), "src/nested");
+    let second = fixture
+        .native("main", "src", "List", json!({"after": cursor}))
+        .await
+        .unwrap();
+    let page = second.listing.unwrap();
+    assert_eq!(
+        page.entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        ["src/a.txt", "src/z.txt"]
+    );
+    assert_eq!(page.total_entries, 3);
+    assert_eq!(page.total_bytes, total_bytes);
+    assert!(!page.truncated);
+    assert!(page.next_after.is_none());
+    assert_eq!(fixture.tracker.change_stat(), crate::ChangeStat::default());
+}
+
+#[tokio::test]
+async fn checkout_list_root_file_cursor_stays_on_selected_attachment() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.dir.path().join("a.txt"), "a").unwrap();
+    std::fs::write(fixture.dir.path().join("z.txt"), "z").unwrap();
+    let other = TempDir::new().unwrap();
+    std::fs::write(other.path().join("wrong.txt"), "wrong").unwrap();
+    fixture
+        .router
+        .attach(
+            WorkdirAttachmentAlias::new("other").unwrap(),
+            Arc::new(LocalWorkdirSession::new(
+                Scope::writable(other.path()).unwrap(),
+                other.path().to_path_buf(),
+            )),
+        )
+        .unwrap();
+    let first = fixture
+        .native("main", ".", "List", json!({"limit": 1}))
+        .await
+        .unwrap()
+        .listing
+        .unwrap();
+    let cursor = first.next_after.unwrap();
+    assert_eq!(cursor.kind, workdir::EntryKind::File);
+    assert_eq!(cursor.path.as_str(), "a.txt");
+    let second = fixture
+        .native("main", ".", "List", json!({"after": cursor}))
+        .await
+        .unwrap()
+        .listing
+        .unwrap();
+    assert_eq!(second.entries.len(), 1);
+    assert_eq!(second.entries[0].path.as_str(), "z.txt");
+    let other_page = fixture
+        .native("other", ".", "List", json!({}))
+        .await
+        .unwrap()
+        .listing
+        .unwrap();
+    assert_eq!(other_page.entries.len(), 1);
+    assert_eq!(other_page.entries[0].path.as_str(), "wrong.txt");
+}
+
+#[tokio::test]
+async fn checkout_list_defaults_to_100_and_accepts_both_limit_bounds() {
+    let fixture = Fixture::new();
+    for index in 0..101 {
+        std::fs::write(fixture.dir.path().join(format!("{index:03}.txt")), "").unwrap();
+    }
+    for (arguments, count, truncated) in [
+        (json!({}), 100, true),
+        (json!({"limit": 1}), 1, true),
+        (json!({"limit": 1000}), 101, false),
+    ] {
+        let result = fixture
+            .native("main", ".", "List", arguments)
+            .await
+            .unwrap();
+        let page = result.listing.unwrap();
+        assert_eq!(page.entries.len(), count);
+        assert_eq!(page.truncated, truncated);
+        assert_eq!(page.next_after.is_some(), truncated);
+    }
+}
+
+#[tokio::test]
+async fn checkout_list_rejects_route_overrides_malformed_limits_and_nonchild_cursors() {
+    let fixture = Fixture::new();
+    std::fs::create_dir(fixture.dir.path().join("src")).unwrap();
+    for arguments in [
+        json!({"path": "."}),
+        json!({"target_workdir": "other"}),
+        json!({"generation": 1}),
+        json!({"validator": []}),
+        json!({"limit": 0}),
+        json!({"limit": 1001}),
+        json!({"limit": -1}),
+        json!({"limit": 1.5}),
+        json!({"limit": "1"}),
+        json!({"limit": null}),
+        json!({"after": "src/a.txt"}),
+        json!({"after": {"path": "src/a.txt"}}),
+        json!({"after": {"kind": "file", "path": "src/a.txt", "extra": 1}}),
+        json!({"after": {"kind": "bogus", "path": "src/a.txt"}}),
+        json!({"after": {"kind": "file", "path": "src"}}),
+        json!({"after": {"kind": "directory", "path": "src/nested/deep"}}),
+        json!({"after": {"kind": "file", "path": "src-other/a.txt"}}),
+        json!({"after": {"kind": "file", "path": "a.txt"}}),
+        json!({"after": {"kind": "file", "path": "/src/a.txt"}}),
+        json!({"after": {"kind": "file", "path": "src/../a.txt"}}),
+        json!({"after": {"kind": "file", "path": "."}}),
+    ] {
+        let error = fixture
+            .native("main", "src", "List", arguments.clone())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, ToolError::InvalidArgument(_)),
+            "{arguments}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn checkout_list_requires_current_generation_and_directory_validator() {
+    let fixture = Fixture::new();
+    let (generation, validator) = fixture.observation("main", ".").await;
+    // No timing dependency: make the supplied observation explicitly stale.
+    let mut stale_validator = validator.clone();
+    stale_validator.push(0);
+    for (generation, validator) in [(generation, stale_validator), (generation + 1, validator)] {
+        let error = execute_checkout_tool(
+            fixture.router.clone(),
+            fixture.tracker.clone(),
+            "main",
+            generation,
+            WorkdirPath::root(),
+            validator,
+            "List",
+            json!({}),
+            Default::default(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_checkout_stale(error);
     }
 }

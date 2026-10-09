@@ -125,6 +125,7 @@ pub(crate) async fn execute_write(
             attachments: Vec::new(),
         },
         paths: create_path.into_iter().collect(),
+        listing: None,
         validator,
     })
 }

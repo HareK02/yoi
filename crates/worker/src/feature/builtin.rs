@@ -6,6 +6,7 @@
 
 pub mod backend_job_result;
 pub mod chat_invocation;
+pub mod drive;
 pub mod flow_transition;
 pub mod manage_workdir;
 pub mod manage_worker;

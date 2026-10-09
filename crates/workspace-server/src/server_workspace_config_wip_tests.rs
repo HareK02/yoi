@@ -139,26 +139,37 @@ impl worker::WorkspaceClient for ConfigRouterClient {
         Ok(response)
     }
 }
-fn config_interface(path: &str) -> String {
-    // Use the published contextual interface identity, not a model-managed validator.
-    let hex = path
-        .bytes()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("yoi.workspace-config/node/v1/@/{hex}")
+fn contextual_reference(base: &str, path: &str) -> wip_protocol::InterfaceReference {
+    wip_protocol::InterfaceReference {
+        scope: path.into(),
+        name: base.into(),
+    }
 }
-async fn config_discover(runtime: &worker::wip::WipRuntime, path: &str) {
-    let observed = runtime
-        .discover(path.into(), 0, true)
-        .await
-        .unwrap()
-        .content
-        .unwrap();
+fn config_interface(path: &str) -> wip_protocol::InterfaceReference {
+    // Use the published contextual interface identity, not a model-managed validator.
+    contextual_reference("yoi.workspace-config/node/v1", path)
+}
+async fn inspect_interface(runtime: &worker::wip::WipRuntime, path: &str, base: &str) -> Value {
+    let tree = runtime.tree(path.into(), 0, true).await.unwrap();
+    let tree: Value = serde_json::from_str(tree.content.as_deref().unwrap()).unwrap();
+    assert_eq!(tree["path"], path, "Object must come from live Tree: {tree}");
+    let output = runtime.inspect(path.into(), true).await.unwrap();
+    let observed: Value = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+    assert_eq!(observed["path"], path);
     assert!(
-        observed.contains(&config_interface(path)),
-        "interface must come from live discovery: {observed}"
+        observed["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|interface| {
+                interface["reference"] == json!({"scope": path, "name": base})
+            }),
+        "interface must come from live inspection: {observed}"
     );
-    runtime.inspect(config_interface(path), true).await.unwrap();
+    observed
+}
+async fn config_inspect(runtime: &worker::wip::WipRuntime, path: &str) -> Value {
+    inspect_interface(runtime, path, "yoi.workspace-config/node/v1").await
 }
 async fn config_call(
     runtime: &worker::wip::WipRuntime,
@@ -167,7 +178,7 @@ async fn config_call(
     args: Value,
 ) -> std::result::Result<agen::tool::ToolOutput, agen::tool::ToolError> {
     runtime
-        .call(
+        .invoke(
             path.into(),
             config_interface(path),
             operation.into(),
@@ -183,23 +194,11 @@ async fn catalog_call(
     base: &str,
     operation: &str,
 ) -> Value {
-    let hex = path
-        .bytes()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let interface = format!("{base}/@/{hex}");
-    let discovered = runtime
-        .discover(path.into(), 0, true)
-        .await
-        .unwrap()
-        .content
-        .unwrap();
-    assert!(discovered.contains(&interface), "{discovered}");
-    runtime.inspect(interface.clone(), true).await.unwrap();
+    inspect_interface(runtime, path, base).await;
     let output = runtime
-        .call(
+        .invoke(
             path.into(),
-            interface,
+            contextual_reference(base, path),
             operation.into(),
             json!({}),
             agen::tool::ToolExecutionContext::direct(),
@@ -378,7 +377,7 @@ async fn workspace_config_real_selected_invoke_backend_wip_edit_create_delete_im
             .connection_id,
         attached.connection_id
     );
-    config_discover(&wip, CONTENT_ROOT).await;
+    config_inspect(&wip, CONTENT_ROOT).await;
     config_call(
         &wip,
         CONTENT_ROOT,
@@ -388,15 +387,10 @@ async fn workspace_config_real_selected_invoke_backend_wip_edit_create_delete_im
     .await
     .unwrap();
     let path = "/workspace-config/notes/wip.md";
-    config_discover(&wip, path).await;
-    assert!(
-        config_call(&wip, path, "read", json!({}))
-            .await
-            .unwrap()
-            .content
-            .unwrap()
-            .contains("original note")
-    );
+    config_inspect(&wip, path).await;
+    let read = config_call(&wip, path, "read", json!({})).await.unwrap();
+    let read: Value = serde_json::from_str(read.content.as_deref().unwrap()).unwrap();
+    assert_eq!(read["content"], "original note");
     config_call(
         &wip,
         path,
@@ -422,7 +416,7 @@ async fn workspace_config_real_selected_invoke_backend_wip_edit_create_delete_im
     config_call(&wip, path, "write", json!({"content":"replacement note"}))
         .await
         .unwrap();
-    config_discover(&wip, CONTENT_ROOT).await;
+    config_inspect(&wip, CONTENT_ROOT).await;
     config_call(&wip,CONTENT_ROOT,"apply_changes",json!({"changes":[
         {"kind":"create","path":"fragments/prompts.dcdl","content_type":"decodal","content":"{ common = { language = \"CONFIG_WIP_E2E\"; }; }"},
         {"kind":"update","path":"main.dcdl","content":"{ prompts = import \"./fragments/prompts.dcdl\"; } as WorkspaceConfigSchema"}
@@ -436,7 +430,7 @@ async fn workspace_config_real_selected_invoke_backend_wip_edit_create_delete_im
         .unwrap();
     let prompts = crate::prompt_settings::project_prompts_from_workspace_config(&state).unwrap();
     assert_eq!(prompts.templates["common.language"], "CONFIG_WIP_E2E");
-    config_discover(&wip, path).await;
+    config_inspect(&wip, path).await;
     config_call(&wip, path, "delete", json!({})).await.unwrap();
     assert!(
         fixture
@@ -449,7 +443,7 @@ async fn workspace_config_real_selected_invoke_backend_wip_edit_create_delete_im
             .get(&config_source::VirtualPath::parse("notes/wip.md").unwrap())
             .is_none()
     );
-    config_discover(&wip, CONTENT_ROOT).await;
+    config_inspect(&wip, CONTENT_ROOT).await;
     let before = fixture
         .api
         .config_store
@@ -492,7 +486,7 @@ async fn workspace_config_real_selected_invoke_backend_wip_edit_create_delete_im
         dispatched + 1,
         "a lost response cannot trigger automatic retry"
     );
-    config_discover(&wip, CONTENT_ROOT).await;
+    config_inspect(&wip, CONTENT_ROOT).await;
     let readonly = workspace_config::attach(
         &fixture.api,
         &fixture.worker,
@@ -633,26 +627,26 @@ async fn assert_config_production_http_adapter(
     )
     .unwrap();
     assert_config_catalog(&wip, &attached).await;
-    config_discover(&wip, "/workspace-config/main.dcdl").await;
-    let main_interface = wip
-        .inspect(config_interface("/workspace-config/main.dcdl"), true)
-        .await
-        .unwrap()
-        .content
-        .unwrap();
+    let main_interface = config_inspect(&wip, "/workspace-config/main.dcdl").await;
     assert!(
-        !main_interface.contains("\"delete\""),
+        main_interface["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|interface| !interface["signature"].as_str().unwrap().contains("delete(")),
         "required entrypoint cannot advertise delete: {main_interface}"
     );
+    let main = config_call(&wip, "/workspace-config/main.dcdl", "read", json!({}))
+        .await
+        .unwrap();
+    let main: Value = serde_json::from_str(main.content.as_deref().unwrap()).unwrap();
     assert!(
-        config_call(&wip, "/workspace-config/main.dcdl", "read", json!({}))
-            .await
-            .unwrap()
-            .content
+        main["content"]
+            .as_str()
             .unwrap()
             .contains("WorkspaceConfigSchema")
     );
-    config_discover(&wip, "/workspace-config").await;
+    config_inspect(&wip, "/workspace-config").await;
     config_call(
         &wip,
         "/workspace-config",

@@ -40,7 +40,7 @@ let
             task = Flag; web = Flag; image = Flag; sub_worker = Flag; flow = Flag;
             worker = { enabled = Bool; direct_spawn = Bool; };
             workspace_worker_discovery = Flag; objective = Flag; manage_workdir = Flag;
-            workdir_catalog = Flag; workspace_config = Flag; orchestration = Flag;
+            workdir_catalog = Flag; workspace_config = Flag; drive = Flag; orchestration = Flag;
             ticket = { enabled = Bool; authoring = Bool; thread = Bool; intake = Bool; workflow = Bool; };
             merge_request = { show = Bool; open = Bool; review = Bool; readiness_check = Bool; complete = Bool; };
             memory = {

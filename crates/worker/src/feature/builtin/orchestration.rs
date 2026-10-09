@@ -21,6 +21,7 @@ use crate::feature::{
 
 const FEATURE_ID: &str = "orchestration";
 const TOOL_NAME: &str = "SpawnTicketWorker";
+const TOOL_DESCRIPTION: &str = "Spawn and atomically assign a generic Ticket Worker for the natural-language initial request. Profile is optional (defaults to builtin:ticket-worker); Flow and repository/Workdir attachments are optional. Results and return choices follow user intent, not a universal approval or MR gate. Backend validates claims and derives attachment access from Ticket targets; acceptance follows spawn, initial input, assignment, and resource finalization. Profile/Flow selection grants neither trusted review nor merge authority.";
 
 #[derive(Debug, Default)]
 pub struct OrchestrationFeature;
@@ -41,10 +42,7 @@ impl FeatureModule for OrchestrationFeature {
                 ServiceId::builtin(WORKER_LIFECYCLE_SERVICE_ID),
                 "SpawnTicketWorker requires Workspace Worker lifecycle authority",
             ))
-            .with_tool(ToolDeclaration::new(
-                TOOL_NAME,
-                "Spawn and atomically assign a configurable Worker for a Ticket. Supply a registered profile selector, an initial request, and optionally a Flow selector. Workdir attachments may be empty; Backend authority validates claims and derives each attachment's access from the Ticket targets. The guarded operation records acceptance only after spawn, initial input, assignment, and resource finalization. Selecting a profile or Flow does not grant review authority.",
-            ))
+            .with_tool(ToolDeclaration::new(TOOL_NAME, TOOL_DESCRIPTION))
     }
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
@@ -81,8 +79,10 @@ struct SpawnTicketWorkerWorkdirInput {
 struct SpawnTicketWorkerInput {
     ticket_id: String,
     runtime_id: String,
-    /// Registered profile selector. Backend resolves the profile and validates claims.
-    profile: String,
+    /// Optional registered profile selector; omitted/null selects builtin:ticket-worker.
+    /// Backend resolves the profile and validates claims, not natural-language satisfaction.
+    #[serde(default)]
+    profile: Option<String>,
     /// Initial user request delivered through the normal typed submission path.
     initial_request: String,
     /// Optional Flow selector, delivered as a typed Flow segment before the request.
@@ -116,7 +116,11 @@ impl Tool for SpawnTicketWorkerTool {
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
         let call_id = non_empty(ctx.call_id, "tool call_id")?;
         let runtime_id = authority_id(input.runtime_id, "runtime_id")?;
-        let profile = non_empty(input.profile, "profile")?;
+        let profile = input
+            .profile
+            .map(|profile| non_empty(profile, "profile"))
+            .transpose()?
+            .unwrap_or_else(|| "builtin:ticket-worker".into());
         let initial_request = non_empty(input.initial_request, "initial_request")?;
         let flow = input.flow.map(|flow| non_empty(flow, "flow")).transpose()?;
         let workdir_attachments = validate_workdir_attachments(input.workdir_attachments)?;
@@ -196,9 +200,7 @@ fn definition(
         let schema = serde_json::to_value(schemars::schema_for!(SpawnTicketWorkerInput))
             .unwrap_or_else(|_| serde_json::json!({}));
         let meta = ToolMeta::new(TOOL_NAME)
-            .description(
-                "Spawn and atomically assign a configurable Ticket Worker with a registered profile, initial request, optional typed Flow, and zero or more alias-keyed Workdir attachments. Backend validates claims and resources; profile and Flow selection do not grant review authority.",
-            )
+            .description(TOOL_DESCRIPTION)
             .input_schema(schema);
         let tool: Arc<dyn Tool> = Arc::new(SpawnTicketWorkerTool {
             ticket_service: ticket_service.clone(),
@@ -390,6 +392,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_ticket_worker_omitted_profile_uses_general_worker_without_flow_or_repository() {
+        let service = Arc::new(RecordingService::default());
+        let definition = definition(
+            Arc::new(FixedTicketService(TicketWorkflowState::Ready)),
+            service.clone(),
+        );
+        let (meta, tool) = definition();
+        let required = meta.input_schema["required"].as_array().unwrap();
+        assert!(!required.iter().any(|field| field == "profile"));
+        assert!(
+            meta.description
+                .contains("neither trusted review nor merge authority")
+        );
+        for profile in [None, Some(serde_json::Value::Null)] {
+            let mut input = input();
+            input.as_object_mut().unwrap().remove("profile");
+            if let Some(profile) = profile {
+                input["profile"] = profile;
+            }
+            input["initial_request"] = serde_json::json!(
+                "Research the question; review is not required. Return without concluding the Ticket."
+            );
+            tool.execute(
+                &input.to_string(),
+                ToolExecutionContext::new("call-default", "batch-1", 0),
+            )
+            .await
+            .unwrap();
+        }
+        for request in service.requests.lock().unwrap().iter() {
+            assert_eq!(request.profile, "builtin:ticket-worker");
+            assert!(request.workdir_attachments.is_empty());
+            assert_eq!(
+                request.initial_submit,
+                vec![Segment::text(
+                    "Research the question; review is not required. Return without concluding the Ticket."
+                )]
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn spawn_ticket_worker_defers_claim_eligibility_to_backend() {
         let service = Arc::new(RecordingService {
             response: Some(WorkspaceResponse {
@@ -519,7 +563,7 @@ mod tests {
                 "unexpected error for {field}: {error}"
             );
         }
-        for field in ["ticket_id", "runtime_id", "profile", "initial_request"] {
+        for field in ["ticket_id", "runtime_id", "initial_request"] {
             let mut input = input();
             input.as_object_mut().unwrap().remove(field);
             let error = tool
@@ -567,13 +611,13 @@ mod tests {
         let schema = serde_json::to_value(schemars::schema_for!(SpawnTicketWorkerInput)).unwrap();
         assert_eq!(schema["additionalProperties"], false);
         let required = schema["required"].as_array().unwrap();
-        for field in ["ticket_id", "runtime_id", "profile", "initial_request"] {
+        for field in ["ticket_id", "runtime_id", "initial_request"] {
             assert!(
                 required.contains(&serde_json::json!(field)),
                 "missing required field {field}"
             );
         }
-        for field in ["flow", "workdir_attachments"] {
+        for field in ["profile", "flow", "workdir_attachments"] {
             assert!(schema["properties"].get(field).is_some());
             assert!(!required.contains(&serde_json::json!(field)));
         }

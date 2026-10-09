@@ -101,6 +101,37 @@ Host generation reuse, native permission identity, read-history updates, model
 Operation publication, transport hosting (Runtime/Backend/External), and durable
 Ticket/MR review remain the parent integration's responsibilities.
 
+## Bounded live List pagination
+
+`ListRequest { path, limit, after: Option<ListCursor> }` accepts an exclusive
+ordering key `ListCursor { kind: EntryKind, path: FsPath }`. Directories sort
+first, then paths sort lexically within the directory/non-directory groups;
+File, Symlink and Other share the non-directory group. `ListResult.next_after`
+is the last returned key when another page remains. Reuse that key unchanged
+with the same directory and output root. Cursor paths must name a direct child
+in the result coordinate frame; they are not statted and need not still exist.
+The optional fields default to absent and are omitted from JSON when absent.
+
+The shared provider engine retains at most `limit + 1` candidates, additionally
+bounded by the 1 MiB aggregate path-response ceiling (including continuation),
+while scanning the directory once. It never stops merely because the page is
+full: enumeration order cannot determine the retained prefix. `total_entries`
+and `total_bytes` describe all visible entries in the current scan, including
+keys at/before `after`, not only the page or remaining suffix. A byte-bounded
+page may contain fewer than `limit` entries and still provide continuation.
+A zero-limit request returns totals and truncation but no continuation.
+List uses Read capability and read/enumeration scope, and **does not ignore-filter**
+`.gitignore`/`.ignore` entries or hide dotfiles; Glob/Grep keep their own policy.
+Cancellation and the 100,000-entry traversal ceiling apply to the complete scan,
+including excluded entries. External DTOs retain their existing item/path bounds
+and also validate cursor paths and continuation response bytes.
+
+Each page observes a live directory, not a snapshot, and no cross-page
+consistency is promised. Insertions after the cursor may appear; earlier keys
+are not revisited. Removed entries disappear, including the cursor entry.
+Renames or kind changes can move an entry across the cursor and cause omission
+or repetition. Even one scan is not transactional against external editors.
+
 ## Scoped checkout search boundary
 
 `CheckoutSearchRequest::new(CheckoutSearchOperation::{List, Glob, Grep}(request))`
@@ -110,7 +141,8 @@ are `scope_layers: Vec<Vec<WorkdirToolScopeRule>>` and `output_root: WorkdirPath
 Rules union within each layer; layers intersect with each other, the current
 provider authority, and the output-root boundary. Wrappers contribute their own
 scope; caller-supplied layers can only narrow, never replace it. Each wrapper
-translates all incoming coordinates once and forwards the composed output root.
+translates incoming provider coordinates once and forwards the composed output root.
+List cursors remain output-root-relative, just like result paths.
 Provider-rendered Grep text and every typed result path are already relative to
 that final root; wrappers must not prefix cwd onto returned paths again.
 

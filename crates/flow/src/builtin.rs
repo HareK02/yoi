@@ -24,7 +24,7 @@ pub fn builtin_flow_source(slug: &str) -> Option<BuiltinFlowSource> {
     match slug {
         CODER_REVIEW_FLOW_SLUG => Some(BuiltinFlowSource {
             slug: CODER_REVIEW_FLOW_SLUG,
-            revision: 4,
+            revision: 5,
             path: "builtin/flows/coder-review.dcdl",
             content: CODER_REVIEW_FLOW_SOURCE,
         }),
@@ -35,7 +35,7 @@ pub fn builtin_flow_source(slug: &str) -> Option<BuiltinFlowSource> {
 pub fn builtin_flow_sources() -> &'static [BuiltinFlowSource] {
     const SOURCES: &[BuiltinFlowSource] = &[BuiltinFlowSource {
         slug: CODER_REVIEW_FLOW_SLUG,
-        revision: 4,
+        revision: 5,
         path: "builtin/flows/coder-review.dcdl",
         content: CODER_REVIEW_FLOW_SOURCE,
     }];

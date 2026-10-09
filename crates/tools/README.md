@@ -38,6 +38,7 @@ capabilities remain authoritative. `Create` uses the `Write` capability/identity
 | Edit | `old_string`, `new_string`, `replace_all?` | Existing file; prior read/hash and provider validator required |
 | Write | `content` | Existing file only; prior read/hash and provider validator required |
 | Create | `path`, `content` | Bound parent directory; relative destination strictly below it; create-new, missing parents allowed |
+| List | `limit?` (1..1000, default 100), `after?` (`{kind, path}`) | Bound directory; Read capability; all typed `EntryKind` cursor values accepted, path is a direct child in checkout-root-relative provider coordinates |
 | Glob | `pattern`, `path?` | Bound directory; optional path relative beneath it |
 | Grep | `pattern`, `path?`, `glob?`, `type?`, `case_insensitive?`, `-B?`, `-A?`, `-C?`, `multiline?`, `output_mode?`, `head_limit?`, `offset?` | Bound directory; same provider search/options/rendering as Tool Grep |
 
@@ -54,6 +55,22 @@ Only native dispatch uses `CheckoutSearchRequest::new` and `checkout_search`.
 The constructor's empty scope layers/root output are refined by provider wrappers;
 Tools does not synthesize authority or parse/rebase rendered filenames. Ordinary
 Tool dispatch remains `session.glob`/`session.grep`, with its existing error mapping.
+
+List dispatches one bounded `checkout_search` page without Bash or entry prefetch.
+`CheckoutToolOutput.listing` preserves the typed `ListResult`, including
+`next_after`, for Host projection into canonical Worldspace entries and cursors.
+Its normal Tool output is a summary only, and `paths` is empty; every other
+Operation returns `listing: None`. The Host decodes canonical cursor paths before
+calling Tools, mapping the public `{kind, entry}` cursor into `{kind, path}`.
+Both returned entries and the continuation must stay directly inside the bound
+directory. Cursor kinds retain all typed values (`directory`, `file`, `symlink`,
+`other`); ordering groups directories first and all non-directories together,
+then compares paths. A truncated page must supply `next_after` matching its last
+entry's ordering key; an untruncated page has no continuation. Special typed
+listing entries are path coordinates, not checkout observations: direct checkout
+observation remains provider File/Directory-only. Pagination is live, not a
+cross-page snapshot; the same before/after bound-directory validator checks
+used for search apply to List.
 
 `CheckoutToolOutput.paths` contains typed checkout-root-relative search paths
 (from `GlobResult.paths` / `GrepResult.paths`) and the created path for Create.
