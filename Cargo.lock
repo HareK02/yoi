@@ -6574,6 +6574,7 @@ dependencies = [
  "flow",
  "fs4",
  "futures",
+ "libc",
  "manifest",
  "protocol",
  "reqwest",

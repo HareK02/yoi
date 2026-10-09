@@ -2486,6 +2486,8 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
             if matches!(
                 diagnostic.code.as_str(),
                 "repository_ref_provider_unavailable"
+                    | "working_directory_cleanup_mount_check_unavailable"
+                    | "working_directory_cleanup_storage_unavailable"
                     | "repository_ref_provider_timeout"
                     | "repository_access_provider_unavailable"
             ) =>
@@ -2501,6 +2503,23 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
                     | "repository_access_credential_unauthorized"
                     | "repository_access_credential_invalid"
             ) =>
+        {
+            StatusCode::FORBIDDEN
+        }
+        RuntimeError::WorkingDirectory(diagnostic)
+            if matches!(
+                diagnostic.code.as_str(),
+                "working_directory_cleanup_mount_present"
+                    | "working_directory_cleanup_resource_busy"
+                    | "working_directory_cleanup_ownership_unknown"
+                    | "working_directory_cleanup_changes_present"
+                    | "working_directory_cleanup_changes_unknown"
+            ) =>
+        {
+            StatusCode::CONFLICT
+        }
+        RuntimeError::WorkingDirectory(diagnostic)
+            if diagnostic.code == "working_directory_cleanup_permission_denied" =>
         {
             StatusCode::FORBIDDEN
         }
@@ -4320,6 +4339,37 @@ mod tests {
             "worker_delete_persistence_failed"
         );
         assert!(!error.to_string().contains('/'));
+    }
+
+    #[tokio::test]
+    async fn cleanup_cause_codes_survive_http_error_serialization() {
+        let cases = [
+            ("mount_present", StatusCode::CONFLICT),
+            ("mount_check_unavailable", StatusCode::SERVICE_UNAVAILABLE),
+            ("permission_denied", StatusCode::FORBIDDEN),
+            ("resource_busy", StatusCode::CONFLICT),
+            ("storage_unavailable", StatusCode::SERVICE_UNAVAILABLE),
+            ("ownership_unknown", StatusCode::CONFLICT),
+            ("changes_present", StatusCode::CONFLICT),
+            ("changes_unknown", StatusCode::CONFLICT),
+        ];
+        for (cause, status) in cases {
+            let code = format!("working_directory_cleanup_{cause}");
+            let diagnostic = crate::working_directory::WorkingDirectoryDiagnostic::rejected(
+                &code,
+                "Resolve the current blocker and retry removal.",
+            );
+            let response =
+                RuntimeHttpRestError::runtime(RuntimeError::WorkingDirectory(diagnostic))
+                    .into_response();
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), 2048)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"]["code"], code, "{json}");
+            assert!(json["error"]["message"].as_str().unwrap().contains("retry"));
+        }
     }
 
     #[test]

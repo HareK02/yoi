@@ -44,6 +44,21 @@ removal commits registry deletion only after Runtime confirms physical deletion
 or authoritative not-found. An unknown result leaves the registry in place so
 retry can reconcile the provider's current state.
 
+## Runtime safety boundary
+
+The Runtime keeps removal content/identity evidence outside the tree being
+removed. This is a factual witness for partial deletion, not a new recovery
+state or cleanup stage. Surviving files are rechecked against it; an intact,
+currently clean checkout can renew obsolete evidence without discarding newly
+ignored/untracked content. Do not edit this witness manually.
+
+Mount-safe removal currently requires Linux `openat2` and `/proc` inspection.
+Unavailable inspection fails closed with `mount_check_unavailable`; there is no
+fallback to recursive deletion across an unchecked filesystem boundary.
+Removal retains the Runtime occupancy mutex through its filesystem effect.
+Unrelated Runtime state operations can therefore wait during hashing/unlink;
+releasing it would require equivalent exclusion on all attachment paths.
+
 ## Diagnostics
 
 Public responses expose a bounded cause category and safe guidance, not arbitrary
