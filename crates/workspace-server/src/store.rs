@@ -10254,6 +10254,19 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.workdir_id, active.worker.runtime_id, active.worker.worker_id
                 )));
             }
+            // Direct attachments (including ordinary recovery/reconnection)
+            // must share the same atomic removal fence as reserved attachments.
+            let removal_pending: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workdir_removal_operations WHERE workspace_id=?1 AND workdir_id=?2 AND state='pending')",
+                params![record.workspace_id, record.workdir_id],
+                |row| row.get(0),
+            )?;
+            if removal_pending {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Workdir {} has a pending durable removal operation",
+                    record.workdir_id
+                )));
+            }
             let write = tx.execute(
                 r#"INSERT INTO worker_workdir_links (
                     workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id

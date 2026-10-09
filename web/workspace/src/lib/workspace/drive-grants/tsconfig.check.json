@@ -1,0 +1,9 @@
+{
+  "extends": "../../../../tsconfig.json",
+  "include": [
+    "WorkerDriveGrants.svelte",
+    "api.ts",
+    "WorkerDriveGrants.browser.spec.ts",
+    "../../../routes/w/[workspaceId]/workers/+page.svelte"
+  ]
+}

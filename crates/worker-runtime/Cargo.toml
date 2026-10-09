@@ -31,6 +31,7 @@ decodal.workspace = true
 flow = { path = "../flow" }
 fs4 = { workspace = true, optional = true }
 manifest.workspace = true
+libc.workspace = true
 protocol.workspace = true
 runtime-api.workspace = true
 serde = { workspace = true, features = ["derive"] }

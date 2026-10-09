@@ -1,0 +1,7 @@
+{
+  "nodeModulesDir": "none",
+  "lock": false,
+  "imports": {
+    "#lib/": "../../src/lib/"
+  }
+}

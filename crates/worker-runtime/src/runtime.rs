@@ -819,23 +819,30 @@ impl Runtime {
         &self,
         working_directory_id: &str,
     ) -> Result<CatalogWorkingDirectoryStatus, RuntimeError> {
-        let backend = {
-            let state = self.lock()?;
-            state.ensure_running()?;
-            if let Some(worker_id) = state.worker_id_for_workdir(working_directory_id) {
-                return Err(RuntimeError::InvalidRequest(format!(
-                    "working directory {working_directory_id} is assigned to worker {worker_id}"
-                )));
+        // Hold occupancy authority through the side effect, preventing an
+        // attachment from entering between the check and physical removal.
+        // This synchronous provider call must not reenter Runtime. The Git
+        // materializer does filesystem/Git work only. The global guard also
+        // delays unrelated state operations during hashing/unlink; releasing it
+        // would require equivalent per-workdir exclusion on ALL attachment paths,
+        // not just moving the occupied check before the provider call.
+        let state = self.lock()?;
+        state.ensure_running()?;
+        if let Some(worker_id) = state.worker_id_for_workdir(working_directory_id) {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "working directory {working_directory_id} is assigned to worker {worker_id}"
+            )));
+        }
+        let backend = state.execution_backend.clone().ok_or_else(|| {
+            RuntimeError::ExecutionBackendUnavailable {
+                message: "working directory cleanup requires an execution backend".to_string(),
             }
-            state.execution_backend.clone().ok_or_else(|| {
-                RuntimeError::ExecutionBackendUnavailable {
-                    message: "working directory cleanup requires an execution backend".to_string(),
-                }
-            })?
-        };
-        backend
+        })?;
+        let result = backend
             .cleanup_working_directory(working_directory_id)
-            .map_err(RuntimeError::from)
+            .map_err(RuntimeError::from);
+        drop(state);
+        result
     }
 
     fn annotate_working_directory_statuses(
@@ -7665,6 +7672,7 @@ mod tests {
         repository_accesses: Mutex<Vec<WorkingDirectoryRepositoryAccessRequest>>,
         repository_access_available: AtomicBool,
         working_directory_requests: Mutex<Vec<WorkingDirectoryRequest>>,
+        cleanup_occupancy_probe: Mutex<Option<Arc<Mutex<RuntimeState>>>>,
         preserve_submission_acknowledgement_id: AtomicBool,
         #[cfg(feature = "ws-server")]
         snapshots: Mutex<BTreeMap<WorkerId, protocol::Event>>,
@@ -7705,6 +7713,22 @@ mod tests {
     }
 
     impl WorkerExecutionBackend for TestExecutionBackend {
+        fn cleanup_working_directory(
+            &self,
+            _id: &str,
+        ) -> Result<CatalogWorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
+            if let Some(state) = self.cleanup_occupancy_probe.lock().unwrap().as_ref() {
+                assert!(
+                    matches!(state.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+                    "occupancy must remain exclusive during physical cleanup"
+                );
+            }
+            Err(WorkingDirectoryDiagnostic::rejected(
+                "working_directory_cleanup_resource_busy",
+                "Retry removal after releasing the resource",
+            ))
+        }
+
         fn backend_id(&self) -> &str {
             "test-execution-backend"
         }
@@ -8041,6 +8065,22 @@ mod tests {
             .build()
             .unwrap()
             .block_on(subscription.recv())
+    }
+
+    #[test]
+    fn workdir_removal_keeps_occupancy_exclusive_during_provider_side_effect() {
+        let (runtime, backend) = runtime_and_backend();
+        *backend.cleanup_occupancy_probe.lock().unwrap() = Some(runtime.inner.clone());
+        let error = runtime
+            .cleanup_working_directory("workdir-test")
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeError::WorkingDirectory(ref diagnostic)
+            if diagnostic.code == "working_directory_cleanup_resource_busy")
+        );
+        // The lock is released on failure, permitting normal attachment/retry.
+        assert!(runtime.inner.try_lock().is_ok());
+        *backend.cleanup_occupancy_probe.lock().unwrap() = None;
     }
 
     #[test]

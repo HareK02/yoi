@@ -734,8 +734,14 @@ impl WorkspaceHttpWorkdirBackend {
         ))?;
         workdir_output(
             format!(
-                "Workdir {workdir_id} removal disposition: {:?}",
-                response.disposition
+                "Workdir {workdir_id} removal disposition: {:?}. {}{}",
+                response.disposition,
+                removal_guidance(response.failure_category.as_deref()),
+                if response.retryable {
+                    " After resolving the cause, repeat this WorkdirDelete with the same id and reason; current safety conditions will be rechecked."
+                } else {
+                    ""
+                }
             ),
             &response,
         )
@@ -918,6 +924,48 @@ fn decode_response<T: for<'de> Deserialize<'de>>(
 
 fn decode_error(error: serde_json::Error) -> ToolError {
     ToolError::ExecutionFailed(format!("decode Workspace Workdir response: {error}"))
+}
+
+fn removal_guidance(category: Option<&str>) -> &'static str {
+    match category {
+        None => "",
+        Some("mount_present") => {
+            "A mount remains inside the Workdir. Confirm its owner and usage, and have that owner safely release it. Do not recursively delete mounted data or implicitly unmount external or unknown resources."
+        }
+        Some("mount_check_unavailable") => "Restore Runtime mount inspection before deletion.",
+        Some("changes_present" | "dirty_or_unknown") => {
+            "Current changes are protected; preserve or resolve them before deletion."
+        }
+        Some("changes_unknown") => {
+            "Restore checkout inspection or preserve remaining content so current changes can be verified."
+        }
+        Some(
+            "ownership_unknown"
+            | "provider_identity_changed"
+            | "authority_changed"
+            | "authority_invalid",
+        ) => {
+            "Confirm target identity and ownership with its owner; never remove a replacement or unknown resource."
+        }
+        Some("blocked_by_live_authority") => {
+            "Release current attachments, reservations and holds through their owning authority."
+        }
+        Some("permission_denied" | "resource_busy" | "storage_unavailable") => {
+            "Have the resource owner resolve access, usage or storage safely; do not force-clean or change shared resource permissions."
+        }
+        Some("runtime_unavailable" | "provider_unavailable") => {
+            "Restore the Runtime connection; the registry remains until deletion is confirmed."
+        }
+        Some("provider_observation_unknown" | "provider_cleanup_outcome_unknown") => {
+            "Deletion is not confirmed. Re-observe with normal removal after restoring provider access; the registry is retained."
+        }
+        Some("unsupported_target") => {
+            "Ask the owner for the provider's supported cleanup operation."
+        }
+        Some(_) => {
+            "Inspect correlated Runtime cleanup diagnostics with the owning operator and resolve the current cause."
+        }
+    }
 }
 
 fn workdir_output<T: Serialize>(summary: String, value: &T) -> Result<ToolOutput, ToolError> {
@@ -1216,6 +1264,45 @@ mod tests {
                 "linked_at": "2026-08-12T00:00:00Z"
             }
         })
+    }
+
+    #[test]
+    fn ordinary_workdir_delete_reports_safe_cause_and_exact_retry_guidance() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
+            "working_directory_id": "wd-retry",
+            "disposition": "attention_required",
+            "retryable": true,
+            "failure_category": "mount_present"
+        }))]));
+        let backend = WorkspaceHttpWorkdirBackend::new(client.clone());
+        let output = backend
+            .delete(WorkdirDeleteInput {
+                working_directory_id: "wd-retry".into(),
+                reason: "remove unused Workdir".into(),
+            })
+            .unwrap();
+        assert!(output.summary.contains("Confirm its owner"));
+        assert!(
+            output
+                .summary
+                .contains("Do not recursively delete mounted data")
+        );
+        assert!(output.summary.contains("same id and reason"));
+        assert!(output.summary.len() <= 600);
+        let content: serde_json::Value =
+            serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+        assert_eq!(content["failure_category"], "mount_present");
+        assert_eq!(content["retryable"], true);
+        let requests = client.requests();
+        assert_eq!(requests[0].method, WorkspaceRequestMethod::Delete);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(requests[0].body.as_deref().unwrap())
+                .unwrap()["reason"],
+            "remove unused Workdir"
+        );
+        let unknown = removal_guidance(Some("secret /private/provider/path"));
+        assert!(!unknown.contains("/private"));
+        assert!(!unknown.contains("secret"));
     }
 
     #[test]
