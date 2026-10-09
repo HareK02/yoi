@@ -45,6 +45,7 @@ use wip_protocol::{
 use crate::permission::permission_action_for;
 
 mod binding;
+mod compatibility_schema;
 #[cfg(test)]
 mod provider_tests;
 use binding::wip_tool_definitions;
@@ -2025,10 +2026,12 @@ fn compatibility_projection(
                 name: "input".into(),
                 required: true,
                 documentation: Some(Documentation {
-                    summary: "Original JSON tool arguments".into(),
+                    summary: format!(
+                        "Pass the original tool arguments unchanged as input. The WIP type is a structural guide; JSON-only shapes remain json, not tagged unions. Authoritative input JSON Schema (including all constraints and local definitions): {schema}"
+                    ),
                     details: Some(schema),
                 }),
-                r#type: TypeExpr::Json,
+                r#type: compatibility_schema::input_type(&meta.input_schema),
             }],
             returns: ReturnDeclaration {
                 documentation: Some(Documentation {
@@ -3087,7 +3090,12 @@ mod tests {
             ["Inspect", "Invoke", "Tree"]
         );
         let metrics = runtime.metrics();
-        assert!(metrics.ordinary_schema_bytes > metrics.wip_schema_bytes);
+        assert!(
+            metrics.ordinary_schema_bytes > metrics.wip_schema_bytes,
+            "ordinary={} WIP={}",
+            metrics.ordinary_schema_bytes,
+            metrics.wip_schema_bytes
+        );
     }
 
     #[tokio::test]
