@@ -188,3 +188,25 @@ package/version set is unchanged.
 
 No full workspace test, full Nix/image build, deployment, target integration or
 live dogfood update is claimed. Target movement remains Orchestrator authority.
+
+### Post-success connection-loss review regression
+
+The first independent source review identified `POST_COMMIT_CONNECTION_FENCE`:
+lazy result publication had propagated a connection mismatch as a pre-effect
+rejection even after successful Write/Edit/Create. The production result
+publication boundary now maps post-success connection loss for mutations to
+`OutcomeUnknown`, while Read/List/Glob/Grep keep their validator mismatch. Lazy
+entry mapping is unchanged; there is still no result-wide acquisition.
+
+`committed_checkout_mutation_losing_connection_is_unknown_not_rejected_or_replayed`
+executes real checked Tools/provider mutations, deterministically detaches after
+the routed execution guard finishes but before the same production publication
+boundary, then passes the error through WIP Invoke/Client. It checks committed
+file contents, unknown audit (not rejection), and exactly one dispatch for each
+Write/Edit/Create. `readonly_checkout_result_losing_connection_keeps_validator_mismatch`
+protects the non-mutating error policy. No sleep or production test hook is used.
+
+After this fix, all **9** checkout race tests and the complete Worker suite
+(**903 unit + 110 integration**) passed, as did root Cargo check, formatting,
+diff checks and released SDK resolution verification. The earlier **901** Worker
+count above describes the pre-review combined-crate run.

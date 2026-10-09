@@ -503,6 +503,76 @@ impl FileHandler {
             ))
         }
     }
+    /// Classify post-success publication failures separately from pre-effect
+    /// provider errors; result coordinates remain lazy for all operations.
+    fn publish_result(
+        &self,
+        tool: &str,
+        result: tools::CheckoutToolOutput,
+    ) -> Result<WipOperationOutput, WipOperationError> {
+        // Coordinates are not observations. Never prefetch unselected results;
+        // a vanished entry cannot fail a successful discovery Operation.
+        self.check_connection().map_err(|error| {
+            if matches!(tool, "Write" | "Edit" | "Create") {
+                // The provider has already succeeded: connection loss while
+                // publishing cannot prove that a committed effect was rejected.
+                WipOperationError::OutcomeUnknown(
+                    "completed file operation lost its attachment before result publication".into(),
+                )
+            } else {
+                error
+            }
+        })?;
+        let mut fields = BTreeMap::from([("summary".into(), Value::String(result.output.summary))]);
+        if let Some(content) = result.output.content {
+            fields.insert("content".into(), Value::String(content));
+        }
+        let items = if let Some(listing) = result.listing {
+            fields.insert("truncated".into(), Value::Boolean(listing.truncated));
+            if let Some(after) = listing.next_after {
+                fields.insert("after".into(), cursor_value(&self.alias, &after));
+            }
+            listing
+                .entries
+                .into_iter()
+                .map(|item| {
+                    Value::Record(BTreeMap::from([
+                        (
+                            "entry".into(),
+                            Value::String(object_path(&self.alias, &item.path)),
+                        ),
+                        ("kind".into(), Value::String(kind_name(item.kind).into())),
+                        (
+                            "size".into(),
+                            Value::Integer(i64::try_from(item.size).unwrap_or(i64::MAX)),
+                        ),
+                    ]))
+                })
+                .collect()
+        } else {
+            result
+                .paths
+                .iter()
+                .map(|path| {
+                    Value::Record(BTreeMap::from([(
+                        "entry".into(),
+                        Value::String(object_path(&self.alias, path)),
+                    )]))
+                })
+                .collect()
+        };
+        fields.insert("items".into(), Value::List(items));
+        let value = Value::Record(fields);
+        if let Some(raw) = result.validator {
+            Ok(WipOperationOutput::native_with_validator(
+                value,
+                self.provider
+                    .wrap_validator(&self.alias, self.generation, &self.workdir, &raw),
+            ))
+        } else {
+            Ok(WipOperationOutput::native(value))
+        }
+    }
 }
 #[async_trait]
 impl WipOperationHandler for FileHandler {
@@ -628,58 +698,7 @@ impl WipOperationHandler for FileHandler {
             }
         })?
         .map_err(map_tool_error)?;
-        // Coordinates are not observations. Never prefetch unselected results;
-        // a vanished entry cannot fail a successful discovery Operation.
-        self.check_connection()?;
-        let mut fields = BTreeMap::from([("summary".into(), Value::String(result.output.summary))]);
-        if let Some(content) = result.output.content {
-            fields.insert("content".into(), Value::String(content));
-        }
-        let items = if let Some(listing) = result.listing {
-            fields.insert("truncated".into(), Value::Boolean(listing.truncated));
-            if let Some(after) = listing.next_after {
-                fields.insert("after".into(), cursor_value(&self.alias, &after));
-            }
-            listing
-                .entries
-                .into_iter()
-                .map(|item| {
-                    Value::Record(BTreeMap::from([
-                        (
-                            "entry".into(),
-                            Value::String(object_path(&self.alias, &item.path)),
-                        ),
-                        ("kind".into(), Value::String(kind_name(item.kind).into())),
-                        (
-                            "size".into(),
-                            Value::Integer(i64::try_from(item.size).unwrap_or(i64::MAX)),
-                        ),
-                    ]))
-                })
-                .collect()
-        } else {
-            result
-                .paths
-                .iter()
-                .map(|path| {
-                    Value::Record(BTreeMap::from([(
-                        "entry".into(),
-                        Value::String(object_path(&self.alias, path)),
-                    )]))
-                })
-                .collect()
-        };
-        fields.insert("items".into(), Value::List(items));
-        let value = Value::Record(fields);
-        if let Some(raw) = result.validator {
-            Ok(WipOperationOutput::native_with_validator(
-                value,
-                self.provider
-                    .wrap_validator(&self.alias, self.generation, &self.workdir, &raw),
-            ))
-        } else {
-            Ok(WipOperationOutput::native(value))
-        }
+        self.publish_result(tool, result)
     }
 }
 

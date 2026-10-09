@@ -570,3 +570,200 @@ async fn checkout_content_children_never_call_provider_list_even_for_deep_paths(
     }
     assert_eq!(session.searches.load(Ordering::SeqCst), 0);
 }
+
+/// Deterministic adapter fixture for the production post-success publication
+/// boundary. Execute through the real provider/Tools, then detach after the
+/// routed operation guard has finished, before publishing the committed result.
+/// No race timing or production-only test hook is needed.
+struct DetachBeforePublication {
+    file: FileHandler,
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl WipOperationHandler for DetachBeforePublication {
+    async fn call(
+        &self,
+        operation: &str,
+        arguments: &BTreeMap<String, Value>,
+        context: WipCallContext,
+    ) -> Result<WipOperationOutput, WipOperationError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let tool = match operation {
+            "write" => "Write",
+            "edit" => "Edit",
+            "create_file" => "Create",
+            _ => panic!("mutation fixture only"),
+        };
+        let result = tools::execute_checkout_tool(
+            self.file.provider.router.clone(),
+            self.file.provider.tracker.clone(),
+            &self.file.alias,
+            self.file.generation,
+            self.file.target.clone(),
+            self.file.observation.validator.clone(),
+            tool,
+            wip_to_json(&Value::Record(arguments.clone())).unwrap(),
+            context.execution,
+        )
+        .await
+        .map_err(map_tool_error)?;
+        self.file
+            .provider
+            .router
+            .detach(&WorkdirAttachmentAlias::new(&self.file.alias).unwrap())
+            .await
+            .unwrap();
+        self.file.publish_result(tool, result)
+    }
+}
+
+#[tokio::test]
+async fn committed_checkout_mutation_losing_connection_is_unknown_not_rejected_or_replayed() {
+    use crate::wip::{WipAuditOutcome, WipRuntime};
+    for (operation, arguments, target, result_path, expected) in [
+        (
+            "write",
+            json!({"content":"saved\n"}),
+            "a.txt",
+            "a.txt",
+            "saved\n",
+        ),
+        (
+            "edit",
+            json!({"old_string":"old", "new_string":"changed"}),
+            "a.txt",
+            "a.txt",
+            "changed\n",
+        ),
+        (
+            "create_file",
+            json!({"path":"new.txt", "content":"created\n"}),
+            "dir",
+            "dir/new.txt",
+            "created\n",
+        ),
+    ] {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("dir")).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old\n").unwrap();
+        let router = Arc::new(WorkdirSessionRouter::new());
+        router
+            .attach(
+                WorkdirAttachmentAlias::new("main").unwrap(),
+                HookedSession::new(&dir),
+            )
+            .unwrap();
+        let p = provider(router.clone());
+        if operation != "create_file" {
+            p.node("/checkouts/main/a.txt")
+                .await
+                .unwrap()
+                .unwrap()
+                .handler
+                .call("read", &BTreeMap::new(), context())
+                .await
+                .unwrap_or_else(|_| panic!("prior Read failed"));
+        }
+        let selected = router.resolve(Some("main")).unwrap();
+        let target = WorkdirPath::new(target).unwrap();
+        let observation = selected
+            .session
+            .checkout_observe(target.clone())
+            .await
+            .unwrap();
+        let file = FileHandler {
+            provider: p.clone(),
+            alias: "main".into(),
+            generation: selected.generation,
+            workdir: selected.session.workdir().id().as_str().into(),
+            target,
+            observation,
+        };
+        drop(selected);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let route = object_path("main", &file.target);
+        let mut projection = p.node(&route).await.unwrap().unwrap();
+        let interface = projection.interface.clone();
+        projection.handler = Arc::new(DetachBeforePublication {
+            file,
+            calls: calls.clone(),
+        });
+        let mut registry = WipMountRegistry::new();
+        registry
+            .allocate_namespace("checkout", "checkouts")
+            .unwrap();
+        // Static observation metadata isolates the response boundary; real
+        // execution still uses checked provider authority and prior Read.
+        registry
+            .mount(p.node("/checkouts/main").await.unwrap().unwrap())
+            .unwrap();
+        registry.mount(projection).unwrap();
+        let runtime = WipRuntime::from_mounts(registry, "post-commit-test".into()).unwrap();
+        let error = runtime
+            .invoke(
+                route,
+                interface,
+                operation.into(),
+                arguments,
+                Default::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("outcome unknown"),
+            "{operation}: {error}"
+        );
+        assert_eq!(
+            runtime.audit().last().unwrap().outcome,
+            WipAuditOutcome::OutcomeUnknown
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(result_path)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "completed mutation must never replay"
+        );
+        assert_eq!(runtime.metrics().operation_round_trips, 1);
+    }
+}
+
+#[tokio::test]
+async fn readonly_checkout_result_losing_connection_keeps_validator_mismatch() {
+    let dir = TempDir::new().unwrap();
+    let router = Arc::new(WorkdirSessionRouter::new());
+    let alias = WorkdirAttachmentAlias::new("main").unwrap();
+    router
+        .attach(alias.clone(), HookedSession::new(&dir))
+        .unwrap();
+    let selected = router.resolve(Some("main")).unwrap();
+    let file = FileHandler {
+        provider: provider(router.clone()),
+        alias: "main".into(),
+        generation: selected.generation,
+        workdir: selected.session.workdir().id().as_str().into(),
+        target: WorkdirPath::root(),
+        observation: selected
+            .session
+            .checkout_observe(WorkdirPath::root())
+            .await
+            .unwrap(),
+    };
+    drop(selected);
+    router.detach(&alias).await.unwrap();
+    for tool in ["Read", "List", "Glob", "Grep"] {
+        let result = tools::CheckoutToolOutput {
+            output: agen::tool::ToolOutput {
+                summary: "finished".into(),
+                content: None,
+                attachments: vec![],
+            },
+            paths: vec![],
+            listing: None,
+            validator: None,
+        };
+        assert_validator_mismatch(file.publish_result(tool, result));
+    }
+}
