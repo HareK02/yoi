@@ -311,7 +311,10 @@ async fn current_self_scope_fetch_does_not_attach_a_new_ref_to_an_old_target_sna
         .unwrap();
     let runtime = WipRuntime::from_mounts(registry, "scope-test".into()).unwrap();
     let reference = contextual_reference("read", "/github/item");
-    runtime.inspect("/github/item".into(), false).await.unwrap();
+    runtime
+        .prepare_call_observations("/github/item".into(), false)
+        .await
+        .unwrap();
     assert_eq!(
         runtime
             .host
@@ -524,7 +527,8 @@ async fn in_flight_result_uses_frozen_host_and_client_descriptors_after_refresh(
     let update = async {
         started.notified().await;
         generation.store(1, Ordering::SeqCst);
-        let output = runtime.inspect("/github".into(), true).await.unwrap();
+        runtime.inspect("/github".into(), true).await.unwrap();
+        let output = runtime.inspect("/github::read".into(), true).await.unwrap();
         assert!(output.content.unwrap().contains("integer"));
         release.notify_one();
     };

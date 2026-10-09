@@ -31,10 +31,21 @@ The implementation uses the published **WIP 0.2.0** Client, HTTP, Protocol and o
 A WIP Worker exposes exactly these generic LLM tools instead of exposing every enabled ordinary tool twice:
 
 - `Tree(path, depth)`: retrieve the full indexable range within depth 0..8, or report incomplete/loading/failed/limited coverage as an error. Children at the requested boundary remain unobserved (null), not empty. Cached nonindexable paths are never included by prefix scanning Known Space.
-- `Inspect(path)`: directly acquire an Object, then every published Interface, and return complete official Object/Interface signatures in declaration order. It requires no prior Tree or manual descriptor fetching. The path is explicit JSON envelope context outside the path-free signature. Summaries are complete; runtime metadata and documentation details are not appended to signatures.
+- `Inspect(path)`: acquire and display exactly the selected entity. An Object path returns only its official Object signature and ordered Interface references (each with an explicit inspection path); it does not fetch Interface descriptors. An absolute `scope::name` Interface address returns only that Interface's complete official signature. Neither form requires a prior Tree or Inspect. The path is explicit JSON envelope context outside the path-free signature. Summaries are complete; runtime metadata and documentation details are not appended to signatures.
 - `Invoke(path, interface, operation, arguments)`: use a structured `{scope, name}` reference and named argument record. The Client owns validators and observed scope_ref. Missing/stale/failed observations are recovered with at most one pre-dispatch retrieval per subject. A dispatched operation is never automatically retried.
 
-Tree and Inspect accept explicit `refresh: true` for blocked observations. An ensure API returning None is never itself readiness evidence: freshness, complete edge coverage and retained data are checked. Loading and capacity pressure are reported rather than superseded or busy-looped.
+Tree and Inspect accept explicit `refresh: true` for blocked observations. Inspect refreshes only the selected Object or Interface, not referenced entities. An ensure API returning None is never itself readiness evidence: freshness, complete edge coverage and retained data are checked. Loading and capacity pressure are reported rather than superseded or busy-looped.
+
+The Yoi binding uses the Text View compact reference notation as an **input address**, not a parser for rendered signatures. For example:
+
+```json
+{"path":"/tickets"}
+{"path":"/::\"yoi.tool/Read/v1\""}
+```
+
+The first inspects an Object; the second inspects one root-scoped Interface. Object results contain `object_signature` and `interfaces: [{reference: {scope, name}, path}]`, without Interface signatures. Pass an entry's `path` directly to Inspect to obtain `{path, reference, interface_signature}`. This explicit per-entity display selection is a Yoi binding policy; it replaces the earlier automatic expansion of every Interface. Invoke continues to acquire missing observations automatically and accepts structured references, never a compact string.
+
+Reference components follow Text View quoting: scope allows unquoted `[A-Za-z0-9_./-]+`, name allows `[A-Za-z0-9_.-]+`; other components use JSON string quoting/escapes. There is no scope inference, normalization, relative resolution, or operation suffix. A literal Object path containing `::` must be JSON-quoted inside the `path` value (for example `{"path":"\"/literal::name\""}`) to distinguish it from an Interface address. Ordinary Object paths retain Protocol path syntax, including Unicode. Invalid or unavailable Interface addresses fail rather than falling back to Object lookup.
 
 The compatibility projection mounts enabled ordinary tools at:
 

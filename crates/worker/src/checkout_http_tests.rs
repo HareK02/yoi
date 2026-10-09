@@ -337,7 +337,10 @@ async fn observe_interface(runtime: &WipRuntime, path: &str) -> wip_protocol::In
             .interfaces[0]
             .clone()
     };
-    runtime.inspect(path.into(), true).await.unwrap();
+    runtime
+        .prepare_call_observations(path.into(), true)
+        .await
+        .unwrap();
     interface
 }
 

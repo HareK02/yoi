@@ -36,7 +36,9 @@ fn runtime(
 async fn interface(r: &WipRuntime, path: &str) -> wip_protocol::InterfaceReference {
     r.tree(path.into(), 0, true).await.unwrap();
     let p = r.host.projection_live(path).await.unwrap().unwrap();
-    r.inspect(path.into(), true).await.unwrap();
+    r.prepare_call_observations(path.into(), true)
+        .await
+        .unwrap();
     p.interface
 }
 async fn call(
@@ -764,8 +766,14 @@ async fn checkout_model_list_glob_grep_entries_are_lazy_and_never_become_tree_ed
         entrance["object_signature"],
         wip_text_view::render_object(&projection.object).unwrap()
     );
+    assert!(entrance["interfaces"][0].get("signature").is_none());
+    let definition = model_inspect(
+        r.clone(),
+        entrance["interfaces"][0]["path"].as_str().unwrap(),
+    )
+    .await;
     assert_eq!(
-        entrance["interfaces"][0]["signature"],
+        definition["interface_signature"],
         wip_text_view::render_interface(&wip_text_view::Interface {
             reference: &projection.interface,
             descriptor: &projection.descriptor
@@ -773,7 +781,7 @@ async fn checkout_model_list_glob_grep_entries_are_lazy_and_never_become_tree_ed
         .unwrap()
     );
     assert!(
-        entrance["interfaces"][0]["signature"]
+        definition["interface_signature"]
             .as_str()
             .unwrap()
             .contains("entry")

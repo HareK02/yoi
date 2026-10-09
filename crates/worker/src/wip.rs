@@ -2884,6 +2884,25 @@ pub(crate) fn wip_to_json(value: &Value) -> Result<Json, String> {
     }
 }
 
+// Low-level call() tests explicitly acquire both observation kinds. Unlike
+// Invoke, call() deliberately does not perform automatic retrieval.
+#[cfg(test)]
+impl WipRuntime {
+    pub(crate) async fn prepare_call_observations(
+        &self,
+        path: String,
+        refresh: bool,
+    ) -> Result<ToolOutput, ToolError> {
+        let output = self.inspect(path, refresh).await?;
+        let value: Json = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+        for interface in value["interfaces"].as_array().unwrap() {
+            self.inspect(interface["path"].as_str().unwrap().into(), refresh)
+                .await?;
+        }
+        Ok(output)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3092,8 +3111,19 @@ mod tests {
         assert_eq!(inspected["path"], "/tools/Echo");
         let interface = &inspected["interfaces"][0]["reference"];
         assert_eq!(interface, &json!({"scope":"/","name":"yoi.tool/Echo/v1"}));
+        assert!(inspected["interfaces"][0].get("signature").is_none());
+        let definition = transport_output_json(
+            tools
+                .call_tool(
+                    "Inspect",
+                    &json!({"path": inspected["interfaces"][0]["path"]}).to_string(),
+                    ToolExecutionContext::direct(),
+                )
+                .await
+                .unwrap(),
+        );
         assert!(
-            inspected["interfaces"][0]["signature"]
+            definition["interface_signature"]
                 .as_str()
                 .unwrap()
                 .contains("operation call(")
@@ -3197,7 +3227,10 @@ mod tests {
         )
         .unwrap();
         runtime.tree("/assets/A-1".into(), 0, true).await.unwrap();
-        runtime.inspect("/assets/A-1".into(), true).await.unwrap();
+        runtime
+            .prepare_call_observations("/assets/A-1".into(), true)
+            .await
+            .unwrap();
         let error = runtime
             .call(
                 "/assets/A-1".into(),
@@ -3569,7 +3602,7 @@ mod tests {
             .await
             .unwrap();
         old_runtime
-            .inspect(old_projection.route.clone(), false)
+            .prepare_call_observations(old_projection.route.clone(), false)
             .await
             .unwrap();
         let restored_host = WipHost::new(asset_registry(
@@ -3609,7 +3642,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         restored.tree("/assets/A-1".into(), 0, false).await.unwrap();
         restored
-            .inspect(current.route.clone(), false)
+            .prepare_call_observations(current.route.clone(), false)
             .await
             .unwrap();
         restored
@@ -4165,7 +4198,10 @@ mod tests {
         .unwrap();
         runtime.tree("/assets/A-1".into(), 0, false).await.unwrap();
         let interface = runtime.host.projection("/assets/A-1").unwrap().interface;
-        runtime.inspect("/assets/A-1".into(), false).await.unwrap();
+        runtime
+            .prepare_call_observations("/assets/A-1".into(), false)
+            .await
+            .unwrap();
         contributor.permitted.store(false, Ordering::SeqCst);
         // The Client still knows the old descriptor; the Host must independently
         // check its current filtered descriptor rather than trust Known Space.
@@ -4194,7 +4230,10 @@ mod tests {
         );
         assert_eq!(owner.calls.load(Ordering::SeqCst), 0);
         assert_eq!(contributor.calls.load(Ordering::SeqCst), 0);
-        runtime.inspect("/assets/A-1".into(), true).await.unwrap();
+        runtime
+            .prepare_call_observations("/assets/A-1".into(), true)
+            .await
+            .unwrap();
         runtime
             .call(
                 "/assets/A-1".into(),
@@ -4208,7 +4247,7 @@ mod tests {
         owner.visible.store(false, Ordering::SeqCst);
         assert!(runtime.host.fetch_interface(&interface).is_err());
         let error = runtime
-            .inspect("/assets/A-1".into(), true)
+            .prepare_call_observations("/assets/A-1".into(), true)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("NotFound"));
@@ -4370,7 +4409,10 @@ mod tests {
     }
 
     async fn observed_contextual_interface(runtime: &WipRuntime, path: &str) -> InterfaceReference {
-        runtime.inspect(path.into(), true).await.unwrap();
+        runtime
+            .prepare_call_observations(path.into(), true)
+            .await
+            .unwrap();
         let state = runtime.state.lock().unwrap();
         state
             .client
@@ -5418,11 +5460,20 @@ mod tests {
             WipRuntime::new(WipHost::new(registry), SecurityContext::new("worker-a"), 0).unwrap();
         runtime.tree("/".into(), 2, false).await.unwrap();
         let inspected = runtime
-            .inspect("/native/typed".into(), false)
+            .prepare_call_observations("/native/typed".into(), false)
             .await
             .unwrap();
         let inspected: Json = serde_json::from_str(inspected.content.as_deref().unwrap()).unwrap();
-        let signature = inspected["interfaces"][0]["signature"].as_str().unwrap();
+        let definition = runtime
+            .inspect(
+                inspected["interfaces"][0]["path"].as_str().unwrap().into(),
+                false,
+            )
+            .await
+            .unwrap();
+        let definition: Json =
+            serde_json::from_str(definition.content.as_deref().unwrap()).unwrap();
+        let signature = definition["interface_signature"].as_str().unwrap();
         assert!(signature.contains("type Payload"));
         assert!(signature.contains("red tag"));
         assert!(signature.contains("tags?: [enum"));
@@ -5476,7 +5527,10 @@ mod tests {
         let runtime = WipRuntime::new(host, SecurityContext::new("worker-a"), 4096).unwrap();
 
         runtime.tree("/".into(), 2, false).await.unwrap();
-        runtime.inspect("/tools/Echo".into(), false).await.unwrap();
+        runtime
+            .prepare_call_observations("/tools/Echo".into(), false)
+            .await
+            .unwrap();
         let output = runtime
             .call(
                 "/tools/Echo".into(),
@@ -5514,7 +5568,10 @@ mod tests {
         let host = WipHost::new(registry_with_tool("Echo", Arc::clone(&calls), None));
         let runtime = WipRuntime::new(host, SecurityContext::new("worker-a"), 0).unwrap();
         runtime.tree("/".into(), 2, false).await.unwrap();
-        runtime.inspect("/tools/Echo".into(), false).await.unwrap();
+        runtime
+            .prepare_call_observations("/tools/Echo".into(), false)
+            .await
+            .unwrap();
 
         let projection = runtime.host.projection("/tools/Echo").unwrap();
         let mut request = CallOperationRequest {
@@ -5963,7 +6020,10 @@ mod tests {
         assert!(!discovered.contains("/features"));
         assert!(!discovered.contains("/tools/QueryTicket"));
         assert!(!discovered.contains("/tools/TicketCreate"));
-        authoring.inspect("/tickets".into(), false).await.unwrap();
+        authoring
+            .prepare_call_observations("/tickets".into(), false)
+            .await
+            .unwrap();
         let collection = "/tickets";
         authoring
             .call(
@@ -5988,7 +6048,10 @@ mod tests {
         assert!(created.content.unwrap().contains("/tickets/T-9"));
         let item = "/tickets/T-9";
         authoring.tree(item.into(), 0, false).await.unwrap();
-        authoring.inspect(item.into(), false).await.unwrap();
+        authoring
+            .prepare_call_observations(item.into(), false)
+            .await
+            .unwrap();
         authoring
             .call(
                 item.into(),
@@ -6059,7 +6122,10 @@ mod tests {
         )
         .unwrap();
         workflow.tree(item.into(), 0, false).await.unwrap();
-        workflow.inspect(item.into(), false).await.unwrap();
+        workflow
+            .prepare_call_observations(item.into(), false)
+            .await
+            .unwrap();
         let result = workflow
             .call(
                 item.into(),
@@ -6163,7 +6229,7 @@ mod tests {
         assert!(!discovered.contains("/tools/OpenMergeRequest"));
         assert!(!discovered.contains("/tools/ShowMergeRequest"));
         coder
-            .inspect("/merge-requests".into(), false)
+            .prepare_call_observations("/merge-requests".into(), false)
             .await
             .unwrap();
         let collection = "/merge-requests";
@@ -6190,7 +6256,10 @@ mod tests {
         );
         let item = format!("{collection}/MR-1");
         coder.tree(item.clone(), 0, false).await.unwrap();
-        coder.inspect(item.clone(), false).await.unwrap();
+        coder
+            .prepare_call_observations(item.clone(), false)
+            .await
+            .unwrap();
         coder
             .call(
                 item.clone(),
@@ -6277,7 +6346,10 @@ mod tests {
         )
         .unwrap();
         reviewer.tree(item.clone(), 0, false).await.unwrap();
-        reviewer.inspect(item.clone(), false).await.unwrap();
+        reviewer
+            .prepare_call_observations(item.clone(), false)
+            .await
+            .unwrap();
         reviewer
             .call(
                 item.clone(),
@@ -6352,7 +6424,10 @@ mod tests {
         )
         .unwrap();
         orchestrator.tree(item.clone(), 0, false).await.unwrap();
-        orchestrator.inspect(item.clone(), false).await.unwrap();
+        orchestrator
+            .prepare_call_observations(item.clone(), false)
+            .await
+            .unwrap();
         orchestrator
             .call(
                 item.clone(),
@@ -6386,7 +6461,7 @@ mod tests {
             .await
             .unwrap();
         orchestrator
-            .inspect("/merge-requests".into(), false)
+            .prepare_call_observations("/merge-requests".into(), false)
             .await
             .unwrap();
         let rejected = orchestrator
@@ -6491,7 +6566,10 @@ mod tests {
         let discovered = discovered.content.unwrap();
         assert!(discovered.contains("/objectives"));
         assert!(!discovered.contains("/tools/QueryObjective"));
-        runtime.inspect("/objectives".into(), false).await.unwrap();
+        runtime
+            .prepare_call_observations("/objectives".into(), false)
+            .await
+            .unwrap();
         let collection_path = "/objectives";
         runtime
             .call(
@@ -6529,7 +6607,10 @@ mod tests {
 
         let item_path = "/objectives/O-3";
         runtime.tree(item_path.into(), 0, false).await.unwrap();
-        runtime.inspect(item_path.into(), false).await.unwrap();
+        runtime
+            .prepare_call_observations(item_path.into(), false)
+            .await
+            .unwrap();
         for (operation, arguments) in [
             ("read", json!({})),
             ("edit", json!({"title": "Changed"})),
@@ -6590,7 +6671,7 @@ mod tests {
             WipRuntime::new(WipHost::new(registry), SecurityContext::new("worker-a"), 0).unwrap();
         runtime.tree("/".into(), 2, false).await.unwrap();
         runtime
-            .inspect(format!("/tools/{name}"), false)
+            .prepare_call_observations(format!("/tools/{name}"), false)
             .await
             .unwrap();
         runtime
@@ -6754,7 +6835,10 @@ mod tests {
         let runtime =
             WipRuntime::new(WipHost::new(registry), SecurityContext::new("worker-a"), 0).unwrap();
         runtime.tree("/assets/A-1".into(), 0, false).await.unwrap();
-        runtime.inspect("/assets/A-1".into(), false).await.unwrap();
+        runtime
+            .prepare_call_observations("/assets/A-1".into(), false)
+            .await
+            .unwrap();
         let execution = ToolExecutionContext::direct();
         let call = runtime.call(
             "/assets/A-1".into(),
@@ -6893,7 +6977,10 @@ mod tests {
         ));
         let runtime = WipRuntime::new(host, SecurityContext::new("worker-a"), 0).unwrap();
         runtime.tree("/".into(), 2, false).await.unwrap();
-        runtime.inspect("/tools/Echo".into(), false).await.unwrap();
+        runtime
+            .prepare_call_observations("/tools/Echo".into(), false)
+            .await
+            .unwrap();
         let error = runtime
             .call(
                 "/tools/Echo".into(),
