@@ -2,6 +2,8 @@ import { extname, join, normalize } from "jsr:@std/path@1.1.4";
 import { dashboardFixture } from "../../../web/workspace/src/lib/workspace/home/dashboard.test-fixtures.ts";
 
 import { settingsFixtureHandler } from "../../../web/workspace/src/lib/workspace/settings/identity.test-fixtures.ts";
+import { workdirFixture } from "./workdir_fixture.ts";
+const workdirsFixture = workdirFixture();
 const settingsFixture = settingsFixtureHandler();
 
 const port = Number(Deno.args[0]);
@@ -30,6 +32,8 @@ const mime: Record<string, string> = {
 Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   const url = new URL(request.url);
   if (url.pathname === "/health") return new Response("ok");
+  const workdirsResponse = await workdirsFixture(request);
+  if (workdirsResponse) return workdirsResponse;
   const settingsResponse = await settingsFixture(request);
   if (settingsResponse) return settingsResponse;
   if (url.pathname === "/api/workspaces") {

@@ -7,6 +7,7 @@ import type {
   WorkingDirectoryDetailResponse,
   WorkingDirectoryListResponse,
   WorkingDirectoryOccupancy,
+  WorkingDirectoryRemovalResponse,
   WorkingDirectorySource,
   WorkingDirectorySummary,
 } from "../../generated/workdir-api";
@@ -60,6 +61,40 @@ export function parseWorkingDirectoryListResponse(
     workspace_id: stringField(record, "workspace_id"),
     items: arrayField(record, "items").map(parseWorkingDirectorySummary),
     diagnostics: arrayField(record, "diagnostics").map(parseDiagnostic),
+  };
+}
+
+export function parseWorkingDirectoryRemovalResponse(
+  value: unknown,
+): WorkingDirectoryRemovalResponse {
+  const record = exactRecord(
+    value,
+    new Set([
+      "working_directory_id",
+      "disposition",
+      "retryable",
+      "failure_category",
+    ]),
+    "Workdir removal response",
+  );
+  const working_directory_id = stringField(record, "working_directory_id");
+  const category = record.failure_category;
+  if (
+    working_directory_id.length > 128 ||
+    (category != null &&
+      (typeof category !== "string" || category.length > 128))
+  ) {
+    throw new Error("Invalid Workdir removal response");
+  }
+  return {
+    working_directory_id,
+    disposition: enumField(record, "disposition", [
+      "removed",
+      "retained",
+      "attention_required",
+    ]),
+    retryable: booleanField(record, "retryable", "Workdir removal response"),
+    failure_category: category as string | null | undefined,
   };
 }
 
@@ -178,13 +213,26 @@ export function parseWorkingDirectorySummary(
 function parseWorkingDirectorySource(value: unknown): WorkingDirectorySource {
   const source = exactRecord(
     value,
-    new Set(["kind", "repository_key", "grant_id", "grant_permissions", "access", "content_path", "purpose"]),
+    new Set([
+      "kind",
+      "repository_key",
+      "grant_id",
+      "grant_permissions",
+      "access",
+      "content_path",
+      "purpose",
+    ]),
     "Workdir source",
   );
   const kind = stringField(source, "kind");
   if (kind === "workspace_config") {
-    if (source.repository_key !== undefined || source.grant_id !== undefined || source.grant_permissions !== undefined) {
-      throw new Error("Logical config source must not contain repository or External authority");
+    if (
+      source.repository_key !== undefined || source.grant_id !== undefined ||
+      source.grant_permissions !== undefined
+    ) {
+      throw new Error(
+        "Logical config source must not contain repository or External authority",
+      );
     }
     const access = stringField(source, "access");
     if (access !== "read_only" && access !== "read_write") {
@@ -194,10 +242,20 @@ function parseWorkingDirectorySource(value: unknown): WorkingDirectorySource {
     if (content_path !== "/workspace-config") {
       throw new Error("Logical config must reference its WIP content entrance");
     }
-    return { kind, access, content_path, purpose: stringField(source, "purpose") };
+    return {
+      kind,
+      access,
+      content_path,
+      purpose: stringField(source, "purpose"),
+    };
   }
-  if (source.access !== undefined || source.content_path !== undefined || source.purpose !== undefined) {
-    throw new Error("Filesystem Workdir source must not contain logical config metadata");
+  if (
+    source.access !== undefined || source.content_path !== undefined ||
+    source.purpose !== undefined
+  ) {
+    throw new Error(
+      "Filesystem Workdir source must not contain logical config metadata",
+    );
   }
   if (kind === "repository") {
     if (

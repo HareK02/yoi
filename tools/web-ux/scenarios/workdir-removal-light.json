@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 1,
+  "id": "workdir-removal-light",
+  "title": "Ordinary Workdir removal and guarded retry",
+  "baseUrl": "http://127.0.0.1:15290",
+  "colorScheme": "light",
+  "reducedMotion": "reduce",
+  "personas": [
+    {
+      "id": "fixture",
+      "label": "Synthetic permission projections",
+      "auth": { "kind": "anonymous" }
+    }
+  ],
+  "viewports": [
+    { "label": "desktop", "width": 1440, "height": 900 },
+    { "label": "narrow", "width": 768, "height": 900 },
+    { "label": "mobile", "width": 390, "height": 844 }
+  ],
+  "routes": [
+    {
+      "id": "owner",
+      "label": "Owner removal",
+      "path": "/w/home-owner/settings/runtimes/fixture-runtime/workdirs",
+      "goal": "Remove a failed-cleanup Workdir using ordinary retry without enabling dirty or occupied removal.",
+      "dataState": "Pending/unknown retry plus dirty and occupied guards. First attempt finds a mount.",
+      "ready": { "kind": "selector", "selector": "main table tbody tr" },
+      "capturePoints": [
+        { "id": "initial", "label": "Current inventory" },
+        {
+          "id": "failed-attempt",
+          "label": "Removal blocked by mount",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": "button[aria-label='Delete retry-dir']"
+            }
+          ],
+          "ready": { "kind": "selector", "selector": "[role='alert']" }
+        }
+      ]
+    },
+    {
+      "id": "member",
+      "label": "No Runtime management permission",
+      "path": "/w/home-member/settings/runtimes/fixture-runtime/workdirs",
+      "goal": "Read inventory without owner-only removal controls.",
+      "dataState": "Management permission false.",
+      "ready": { "kind": "selector", "selector": "main table tbody tr" },
+      "capturePoints": [{ "id": "initial", "label": "Read only inventory" }]
+    },
+    {
+      "id": "empty",
+      "label": "Empty inventory",
+      "path": "/w/home-empty/settings/runtimes/fixture-runtime/workdirs",
+      "goal": "Recognize no remaining Workdirs.",
+      "dataState": "Empty list.",
+      "ready": {
+        "kind": "selector",
+        "selector": "main:has-text('No workdirs')"
+      },
+      "capturePoints": [{ "id": "initial", "label": "Empty inventory" }]
+    }
+  ],
+  "processes": [
+    {
+      "id": "workdir-fixture",
+      "command": "deno",
+      "cwd": "..",
+      "args": [
+        "run",
+        "--allow-net",
+        "--allow-read",
+        "browser-tests/workspace_home_fixture_server.ts",
+        "15290",
+        "../../web/workspace/build"
+      ],
+      "readyUrl": "http://127.0.0.1:15290/health"
+    }
+  ]
+}
