@@ -110,16 +110,45 @@ Deno.test("ordinary removal refreshes failed and successful inventory, supports 
             }).isDisabled(),
           );
           await noOverflow(page);
-          assert(
+          assertEquals(await page.locator("thead th").allTextContents(), [
+            "Workdir",
+            "Repository",
+            "Revision",
+            "Status",
+            "Cleanliness",
+            "Occupied by",
+            "Action",
+          ]);
+          assertEquals(await page.locator("tbody td:first-child button").count(), 0);
+          assertEquals(
+            await page.locator("tbody td").first().evaluate((cell) => ({
+              padding: getComputedStyle(cell).padding,
+              secondaryDisplay: getComputedStyle(cell.querySelector("small")!).display,
+            })),
+            { padding: "10px 8px", secondaryDisplay: "block" },
+            "Shared table density and secondary identity styling must remain applied",
+          );
+          assertEquals(await deletion.innerText(), "");
+          assertEquals(await deletion.locator("svg").count(), 1);
+          assertEquals(
             await deletion.evaluate((button) => {
               const r = button.getBoundingClientRect();
-              return r.left >= 0 && r.right <= innerWidth;
+              const rem = parseFloat(getComputedStyle(document.documentElement).fontSize);
+              return {
+                width: r.width / rem,
+                height: r.height / rem,
+                column: (button.closest("td") as HTMLTableCellElement).cellIndex,
+              };
             }),
-            "Delete is outside initial viewport",
+            { width: 2, height: 2, column: 6 },
+            "Delete must remain a compact icon in the dedicated Action column",
           );
           await page.screenshot({
             path: join(evidence, `${colorScheme}-${width}-initial.png`),
           });
+          // Narrow screens keep the table scrollable, rather than moving actions into the name.
+          await deletion.scrollIntoViewIfNeeded();
+          await noOverflow(page);
           // Hold the actual request boundary to verify duplicate gestures cannot dispatch another DELETE.
           let release!: () => void;
           const gate = new Promise<void>((resolve) => release = resolve);
@@ -137,10 +166,8 @@ Deno.test("ordinary removal refreshes failed and successful inventory, supports 
           );
           await deletion.focus();
           await page.keyboard.press("Enter");
-          await page.getByRole("button", {
-            name: "Delete retry-dir",
-            exact: true,
-          }).filter({ hasText: "Deleting…" }).waitFor();
+          await page.locator("button[aria-label='Delete retry-dir'][aria-busy='true'] .spinner")
+            .waitFor();
           assert(await deletion.isDisabled());
           await page.keyboard.press("Enter");
           await entered;
@@ -346,7 +373,7 @@ Deno.test("ordinary removal refreshes failed and successful inventory, supports 
       exact: true,
     }).waitFor();
     await changed.waitForFunction(() =>
-      document.querySelector(".workdir-identity .removal-guard")?.textContent
+      document.querySelector("button[aria-label='Retry Delete retry-dir']")?.getAttribute("title")
         ?.includes("Changes are protected")
     );
     assert(
@@ -356,7 +383,8 @@ Deno.test("ordinary removal refreshes failed and successful inventory, supports 
       }).isDisabled(),
     );
     assertStringIncludes(
-      await changed.locator("main").innerText(),
+      await changed.getByRole("button", { name: "Retry Delete retry-dir", exact: true })
+        .getAttribute("title") ?? "",
       "Changes are protected",
     );
     await changed.screenshot({

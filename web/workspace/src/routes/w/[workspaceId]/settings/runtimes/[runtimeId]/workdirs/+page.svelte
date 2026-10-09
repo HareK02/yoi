@@ -94,14 +94,20 @@
   <meta name="description" content="Runtime workdirs" />
 </svelte:head>
 
-<section class="workdirs-page" aria-labelledby="workdirs-heading" aria-busy={refreshing}>
+<section class="workdirs-page main-content" aria-labelledby="workdirs-heading" aria-busy={refreshing}>
   <header class="page-header-row">
     <div>
       <p class="breadcrumb"><a href={`/w/${data.workspaceId}/settings/runtimes`}>Runtimes</a> / {runtimeLabel}</p>
       <h1 id="workdirs-heading">Workdirs</h1>
       <p>Workdirs owned by <code>{data.runtimeId}</code>.</p>
     </div>
-    <button class="workdir-action" type="button" disabled={refreshing || cleanupBusyTarget !== null} onclick={refreshInventory}>{refreshing ? 'Refreshing…' : 'Refresh'}</button>
+    <button class="icon-action" type="button" disabled={refreshing || cleanupBusyTarget !== null} aria-label="Refresh" title="Refresh workdirs" onclick={refreshInventory}>
+      {#if refreshing}
+        <span class="spinner" aria-hidden="true"></span>
+      {:else}
+        <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M20 7v5h-5" /><path d="M4 17v-5h5" /><path d="M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 17.9 17" /></svg>
+      {/if}
+    </button>
   </header>
 
   {#if feedback}
@@ -121,28 +127,58 @@
     <!-- svelte-ignore a11y_no_noninteractive_tabindex (Horizontal inventory scroll must be keyboard-focusable.) -->
     <div class="table-wrap" role="region" aria-label="Workdir inventory" tabindex="0">
       <table class="workdirs-table">
-        <thead><tr><th>Workdir</th><th>Repository</th><th>Revision</th><th>Status</th><th>Cleanliness</th><th>Occupied by</th></tr></thead>
+        <thead>
+          <tr>
+            <th>Workdir</th>
+            <th>Repository</th>
+            <th>Revision</th>
+            <th>Status</th>
+            <th>Cleanliness</th>
+            <th>Occupied by</th>
+            <th>Action</th>
+          </tr>
+        </thead>
         <tbody>
           {#each workdirs as workdir (workdir.working_directory_id)}
             {@const cleanup = cleanupCandidate(workdir)}
             <tr>
-              <td class="workdir-identity">
+              <td>
                 <span>{workdir.display_name ?? '—'}</span>
                 <small><code>{workdir.working_directory_id}</code></small>
-                {#if canManage}
-                  <button class="workdir-action danger" type="button" disabled={isDeleteDisabled(workdir)}
-                    aria-label={`${feedback?.id === workdir.working_directory_id && feedback.retryable ? 'Retry Delete' : 'Delete'} ${workdir.working_directory_id}`}
-                    onclick={() => deleteWorkdir(workdir)}>
-                    {cleanupBusyTarget === workdir.working_directory_id ? 'Deleting…' : feedback?.id === workdir.working_directory_id && feedback.retryable ? 'Retry Delete' : 'Delete'}
-                  </button>
-                  {#if !canRemoveWorkdir(workdir, cleanup)}<p class="removal-guard">{removalGuard(workdir, cleanup)}</p>{/if}
-                {/if}
               </td>
               <td>{repositoryKey(workdir) ?? 'External'}</td>
               <td><code>{currentRevision(workdir)}</code></td>
               <td>{workdir.status}</td>
               <td>{workdir.cleanliness ?? 'unknown'}</td>
-              <td>{#if workdir.occupied_by}<span>{workdir.occupied_by.display_name}</span><small>{workdir.occupied_by.runtime_id}:{workdir.occupied_by.worker_id}</small>{:else}<span class="muted">—</span>{/if}</td>
+              <td>
+                {#if workdir.occupied_by}
+                  <span>{workdir.occupied_by.display_name}</span>
+                  <small>{workdir.occupied_by.runtime_id}:{workdir.occupied_by.worker_id}</small>
+                {:else}
+                  <span class="muted">—</span>
+                {/if}
+              </td>
+              <td>
+                {#if canManage}
+                  <button
+                    class="icon-action danger"
+                    type="button"
+                    disabled={isDeleteDisabled(workdir)}
+                    aria-label={`${feedback?.id === workdir.working_directory_id && feedback.retryable ? 'Retry Delete' : 'Delete'} ${workdir.working_directory_id}`}
+                    aria-busy={cleanupBusyTarget === workdir.working_directory_id}
+                    title={!canRemoveWorkdir(workdir, cleanup) ? removalGuard(workdir, cleanup) : feedback?.id === workdir.working_directory_id && feedback.retryable ? 'Retry Delete' : 'Delete Workdir'}
+                    onclick={() => deleteWorkdir(workdir)}
+                  >
+                    {#if cleanupBusyTarget === workdir.working_directory_id}
+                      <span class="spinner" aria-hidden="true"></span>
+                    {:else}
+                      <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /><path d="M3 6h18" /><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
+                    {/if}
+                  </button>
+                {:else}
+                  <span class="muted">—</span>
+                {/if}
+              </td>
             </tr>
           {/each}
         </tbody>
@@ -152,20 +188,70 @@
 </section>
 
 <style>
-  .workdirs-page { min-width: 0; }
-  .page-header-row { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: start; gap: var(--space-3); }
-  .table-wrap { max-width: 100%; overflow-x: auto; }
-  .workdirs-table { width: 100%; min-width: 54rem; border-collapse: collapse; }
-  th, td { padding: var(--space-3); text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
-  th { color: var(--text-muted); font-weight: 500; }
-  .workdir-identity { width: 18rem; min-width: 18rem; overflow-wrap: anywhere; }
-  td small { display: block; color: var(--text-muted); margin-block: var(--space-1); }
-  .workdir-action { display: inline-flex; align-items: center; justify-content: center; padding: var(--space-2) var(--space-3); border: 1px solid var(--line); border-radius: var(--radius-soft); background: var(--bg-raised); color: var(--text); cursor: pointer; white-space: nowrap; }
-  .workdir-action:hover:not(:disabled) { background: var(--interactive-hover); }
-  .workdir-action.danger { color: var(--danger); }
-  .workdir-action:disabled { cursor: not-allowed; opacity: 0.45; }
-  .removal-feedback { margin-block: var(--space-4); overflow-wrap: anywhere; }
-  .removal-feedback p { margin-block: var(--space-2); }
-  .removal-feedback.error strong { color: var(--danger); }
-  .removal-guard { margin-block: var(--space-2) 0; color: var(--text-muted); }
+  .workdirs-page,
+  .table-wrap {
+    min-width: 0;
+  }
+
+  .removal-feedback {
+    overflow-wrap: anywhere;
+  }
+
+  .removal-feedback p {
+    margin-block: var(--space-2);
+  }
+
+  .removal-feedback.error strong {
+    color: var(--danger);
+  }
+
+  .icon-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+    padding: 0;
+    border: 1px solid var(--line);
+    border-radius: 0.5rem;
+    background: var(--bg-raised);
+    color: var(--text);
+    cursor: pointer;
+  }
+
+  .icon-action.danger:hover:not(:disabled),
+  .icon-action.danger:focus-visible:not(:disabled) {
+    border-color: var(--danger, oklch(60% 0.18 30));
+    color: var(--danger, oklch(60% 0.18 30));
+  }
+
+  .icon-action:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+
+  .action-icon {
+    width: 1rem;
+    height: 1rem;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .spinner {
+    width: 1rem;
+    height: 1rem;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 999px;
+    animation: workdir-action-spin 0.8s linear infinite;
+  }
+
+  @keyframes workdir-action-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
 </style>
