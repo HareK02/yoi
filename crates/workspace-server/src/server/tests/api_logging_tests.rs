@@ -220,3 +220,162 @@ async fn legacy_api_errors_keep_their_log_metadata() {
             .contains("fixture invalid input")
     );
 }
+
+#[tokio::test]
+async fn generated_workdir_provider_errors_preserve_response_and_log_details() {
+    use workdir::http::WorkdirTransportErrorCode as Code;
+
+    let mut fixture = manual_worker_assignment_fixture().await;
+    let identity =
+        worker_runtime::auth::RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id)
+            .unwrap();
+    configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
+    let (sender, mut commands) = tokio::sync::mpsc::channel(1);
+    let session = Arc::new(ExternalProviderWorkdirSession::new(
+        Arc::new(ExternalProviderConnection {
+            grant_id: "logging-grant".to_string(),
+            workdir_id: fixture.main_workdir_id.clone(),
+            provider_instance_id: "logging-provider".to_string(),
+            generation: 1,
+            expires_at: None,
+            capabilities: workdir::WorkdirSessionCapabilities::ALL,
+            admission: Arc::new(tokio::sync::Semaphore::new(1)),
+            shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sender,
+        }),
+        None,
+    ));
+    // Seed an already registered command, without launching a real process.
+    let provider_handle = CommandHandle("logging-command".to_string());
+    session
+        .active_commands
+        .lock()
+        .await
+        .insert(provider_handle.0.clone(), provider_handle.clone());
+    let handle = fixture
+        .api
+        .workdir_sessions
+        .lock()
+        .unwrap()
+        .register_command(
+            fixture.worker.clone(),
+            "checkout".to_string(),
+            session,
+            provider_handle,
+        );
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-session/operations");
+    let request = || {
+        runtime_source_request(
+            &identity,
+            Some(&fixture.worker.worker_id),
+            "POST",
+            &format!("{path}?token=query-secret"),
+            serde_json::to_vec(&server_api::CurrentWorkerWorkdirOperationRequest {
+                target_workdir: "checkout".to_string(),
+                operation: WorkdirSessionOperation::CommandStatus(handle.clone()),
+            })
+            .unwrap(),
+        )
+    };
+    let app = build_router(fixture.api.clone());
+    for (code, status, message) in [
+        (Code::Denied, 403, "Workdir operation was denied"),
+        (Code::OutOfScope, 403, "Workdir path is out of scope"),
+        (
+            Code::SymlinkOutOfScope,
+            403,
+            "Workdir symlink target is out of scope",
+        ),
+        (Code::ReadOnly, 403, "Workdir path is read-only"),
+        (Code::UnknownCommand, 404, "Workdir command was not found"),
+        (Code::Unavailable, 503, "Workdir session is unavailable"),
+    ] {
+        let provider = async {
+            let Some(ExternalProviderCommand::Operation {
+                operation,
+                response,
+                ..
+            }) = commands.recv().await
+            else {
+                panic!("expected provider operation");
+            };
+            assert!(matches!(
+                operation,
+                WorkdirSessionOperation::CommandStatus(_)
+            ));
+            response
+                .send(Err(WorkdirTransportError {
+                    code,
+                    message: "body-secret /private/provider/path".to_string(),
+                }))
+                .unwrap();
+        };
+        let ((actual_status, body, events), ()) =
+            tokio::join!(request_with_logs(app.clone(), request()), provider,);
+        assert_eq!(actual_status.as_u16(), status);
+        assert_eq!(body, json!({ "code": code.as_str(), "message": message }));
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(
+            events[0]["kind"],
+            format!("workdir_session_operation_{}", code.as_str())
+        );
+        assert_eq!(events[0]["message"], message);
+        assert_eq!(events[0]["diagnostics"], "[]");
+        assert_eq!(events[0]["status"], status);
+        assert_eq!(events[0]["method"], "POST");
+        assert_eq!(events[0]["path"], path);
+    }
+    let provider = async {
+        let Some(ExternalProviderCommand::Operation { response, .. }) = commands.recv().await
+        else {
+            panic!("expected provider operation");
+        };
+        response
+            .send(Ok(WorkdirSessionOperationResult::CommandStatus(
+                workdir::CommandStatus::Running,
+            )))
+            .unwrap();
+    };
+    let ((status, _, events), ()) = tokio::join!(request_with_logs(app, request()), provider);
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        events.is_empty(),
+        "successful operation logged as failure: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn generated_workdir_api_errors_preserve_response_and_log_details() {
+    let mut fixture = manual_worker_assignment_fixture().await;
+    let identity =
+        worker_runtime::auth::RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id)
+            .unwrap();
+    configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-session/operations");
+    let body = serde_json::to_vec(&server_api::CurrentWorkerWorkdirOperationRequest {
+        target_workdir: "checkout".to_string(),
+        operation: WorkdirSessionOperation::CommandStatus(CommandHandle("body-secret".to_string())),
+    })
+    .unwrap();
+    // Valid Runtime proof, but no Worker identity: rejection is inside the generated service.
+    let request = runtime_source_request(
+        &identity,
+        None,
+        "POST",
+        &format!("{path}?token=query-secret"),
+        body,
+    );
+    let (status, body, events) =
+        request_with_logs(build_router(fixture.api.clone()), request).await;
+    let expected = ApiError::from(Error::WorkspacePermissionDenied(
+        "self Workdir requests require a Runtime-bound Worker identity".to_string(),
+    ))
+    .into_repository_api_error();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, serde_json::to_value(expected).unwrap());
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["kind"], "forbidden");
+    assert_eq!(events[0]["message"], body["message"]);
+    assert_eq!(events[0]["diagnostics"], "[]");
+    assert_eq!(events[0]["path"], path);
+}

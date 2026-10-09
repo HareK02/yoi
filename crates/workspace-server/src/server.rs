@@ -11730,7 +11730,13 @@ async fn log_failed_api_response(request: Request, next: Next) -> Response {
         let generated_error = response
             .extensions()
             .get::<Arc<server_api::RepositoryApiError>>()
-            .map(|error| ApiErrorLog::from_repository_error(error));
+            .map(|error| ApiErrorLog::from_repository_error(error))
+            .or_else(|| {
+                response
+                    .extensions()
+                    .get::<Arc<server_api::WorkdirOperationApiError>>()
+                    .map(|error| ApiErrorLog::from_workdir_operation_error(error, status))
+            });
         let error = response
             .extensions()
             .get::<ApiErrorLog>()
@@ -32458,6 +32464,29 @@ struct ApiErrorLog {
 }
 
 impl ApiErrorLog {
+    fn from_workdir_operation_error(
+        error: &server_api::WorkdirOperationApiError,
+        status: StatusCode,
+    ) -> Self {
+        if let Some(code) = error.code {
+            return Self {
+                kind: format!("workdir_session_operation_{}", code.as_str()),
+                message: sanitize_backend_error(&error.message),
+                diagnostics: Vec::new(),
+            };
+        }
+        Self::from_repository_error(&server_api::RepositoryApiError::new(
+            status.as_u16(),
+            error.error.as_deref().unwrap_or_else(|| {
+                status
+                    .canonical_reason()
+                    .unwrap_or("Workdir operation failed")
+            }),
+            &error.message,
+            error.diagnostics.clone().unwrap_or_default(),
+        ))
+    }
+
     fn from_repository_error(error: &server_api::RepositoryApiError) -> Self {
         Self {
             kind: error
