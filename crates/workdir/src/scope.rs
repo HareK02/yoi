@@ -994,6 +994,51 @@ impl WorkdirSession for ScopedWorkdirSession {
         self.capabilities
     }
 
+    async fn authorize_scope_path(
+        &self,
+        mut request: WorkdirScopeAuthorizationRequest,
+    ) -> Result<(), WorkdirError> {
+        let _scope_guard = self.scope_lock.lock().await;
+        // Like filesystem operations, requests use this session's coordinates.
+        // Keep every wrapper's attenuation before asking the provider to resolve
+        // symlinks; forwarding the caller's rules alone would discard our scope.
+        for rule in &mut request.rules {
+            rule.target = self.resolve_path(&rule.target)?;
+        }
+        self.validate_scope(&request.rules, false)?;
+        request.path = self
+            .resolve_operation_path(&request.path, request.permission)
+            .await?;
+        match request.permission {
+            WorkdirToolScopePermission::Read => {
+                self.ensure_read(&request.path, WorkdirSessionCapability::Read)?;
+            }
+            WorkdirToolScopePermission::Write => {
+                self.ensure_write(&request.path, WorkdirSessionCapability::Write)?;
+            }
+        }
+        self.source.authorize_scope_path(request).await?;
+        self.ensure_active()
+    }
+
+    async fn scope_rules_overlap(
+        &self,
+        mut request: WorkdirScopeOverlapRequest,
+    ) -> Result<bool, WorkdirError> {
+        let _scope_guard = self.scope_lock.lock().await;
+        // Comparing write rules is a read-only query, not a write authorization.
+        // In particular it must work while those paths are leased to children.
+        for rule in [&mut request.left, &mut request.right] {
+            rule.target = self
+                .resolve_operation_path(&rule.target, WorkdirToolScopePermission::Read)
+                .await?;
+            self.ensure_read(&rule.target, WorkdirSessionCapability::Read)?;
+        }
+        let overlaps = self.source.scope_rules_overlap(request).await?;
+        self.ensure_active()?;
+        Ok(overlaps)
+    }
+
     async fn checkout_search(
         &self,
         mut request: crate::CheckoutSearchRequest,
@@ -1711,6 +1756,8 @@ mod tests {
 
     use super::*;
     use crate::LocalWorkdirSession;
+
+    include!("scope_delegation_tests.rs");
 
     fn fs_path(path: &str) -> FsPath {
         FsPath::new(path).unwrap()
