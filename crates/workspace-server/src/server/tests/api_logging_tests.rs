@@ -454,10 +454,7 @@ async fn generated_workdir_api_errors_preserve_response_and_log_details() {
     assert_eq!(body, serde_json::to_value(expected).unwrap());
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0]["kind"], "workdir_session_operation_api_403");
-    assert_eq!(
-        events[0]["message"],
-        "Workdir operation was rejected before provider dispatch"
-    );
+    assert_eq!(events[0]["message"], "Workdir operation failed");
     assert_eq!(events[0]["operation"], "command_status");
     assert_eq!(events[0]["workdir_stage"], "worker_identity");
     assert_eq!(events[0]["runtime_id_hash"], Value::Null);
@@ -679,4 +676,104 @@ async fn self_workdir_session_open_refusals_keep_reason_before_registry_conversi
         assert!(!body.to_string().contains("body-secret"));
         assert!(!body.to_string().contains("/host/private"));
     }
+}
+
+#[tokio::test]
+async fn self_workdir_post_start_registration_failure_does_not_claim_pre_dispatch_refusal() {
+    let mut fixture = manual_worker_assignment_fixture().await;
+    let identity =
+        worker_runtime::auth::RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id)
+            .unwrap();
+    configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
+    let (sender, mut commands) = tokio::sync::mpsc::channel(1);
+    let connection = Arc::new(ExternalProviderConnection {
+        grant_id: "logging-grant".to_string(),
+        workdir_id: fixture.main_workdir_id.clone(),
+        provider_instance_id: "logging-provider".to_string(),
+        generation: 1,
+        expires_at: None,
+        capabilities: workdir::WorkdirSessionCapabilities::ALL,
+        admission: Arc::new(tokio::sync::Semaphore::new(1)),
+        shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        sender,
+    });
+    fixture.runtime.workdir_session_factory = Some(Arc::new(move |_| {
+        Ok(Arc::new(ExternalProviderWorkdirSession::new(
+            connection.clone(),
+            None,
+        )) as WorkdirSessionHandle)
+    }));
+    fixture
+        .api
+        .runtime
+        .register_or_replace(fixture.runtime.clone());
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-session/operations");
+    let request = runtime_source_request(
+        &identity,
+        Some(&fixture.worker.worker_id),
+        "POST",
+        &path,
+        serde_json::to_vec(&json!({
+            "target_workdir": "checkout",
+            "operation": {"operation": "command_start", "request": {
+                "command": "body-secret", "timeout_secs": 1, "output_limit": 1024,
+                "cwd": "", "spill_dir": null, "tool_call_id": "body-secret"
+            }}
+        }))
+        .unwrap(),
+    );
+    // Observe command dispatch, then lose only the fixture registry entry before
+    // completing start. No OS process is launched, no sleep or retry is needed.
+    let provider = async {
+        let Some(ExternalProviderCommand::Operation {
+            operation,
+            response,
+            ..
+        }) = commands.recv().await
+        else {
+            panic!("expected provider start operation");
+        };
+        assert!(matches!(
+            operation,
+            WorkdirSessionOperation::CommandStart(_)
+        ));
+        fixture
+            .api
+            .workdir_sessions
+            .lock()
+            .unwrap()
+            .remove_attachment(&fixture.worker)
+            .unwrap();
+        response
+            .send(Ok(WorkdirSessionOperationResult::CommandStart(
+                CommandHandle("fixture-provider-handle".into()),
+            )))
+            .unwrap();
+    };
+    let ((status, body, events), ()) = tokio::join!(
+        request_with_logs(build_router(fixture.api.clone()), request),
+        provider
+    );
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("workdir_session_registration_failed:")
+    );
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["operation"], "command_start");
+    assert_eq!(events[0]["workdir_stage"], "command_registration");
+    assert_eq!(events[0]["message"], "Workdir operation failed");
+    assert_eq!(events[0]["denial_reason"], Value::Null);
+    assert_workdir_log_identity(
+        &events[0],
+        &fixture,
+        "checkout",
+        Some(&fixture.main_workdir_id),
+    );
+    assert!(
+        commands.try_recv().is_err(),
+        "post-dispatch failure was retried"
+    );
 }

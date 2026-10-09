@@ -49,8 +49,10 @@ transport carries the enum to its consumer; it contains no free text or paths.
   edit, command_start/status/output/cancel, authorize_scope, scope_rules_overlap,
   checkout_search/observe/execute, stat/list/glob/grep). No operation Debug dump.
 - `workdir_stage`: workspace_scope, worker_identity, attachment_validation,
-  session_open, command_lookup, or provider_dispatch. API failures identify the
-  refusing stage without copying raw alias/handle/error text into the log.
+  session_open, command_lookup, provider_dispatch, or command_registration. API
+  failures identify the encountered stage without copying raw alias/handle/error
+  text into the log. Registration failures can follow successful command start;
+  they are not evidence of a pre-dispatch refusal or absence of effects.
 - `denial_reason`: optional closed reason reported by the provider/error chain.
   It describes the encountered refusing branch, not a permission grant and not
   an independent attestation of an external provider's explanation.
@@ -125,6 +127,14 @@ is never parsed into a reason.
 - The Server API boundary proves internal fields are absent from body/schema.
   Worker HTTP→WIP coverage verifies diagnostic wrappers do not change refusal
   classification or induce retries; tools retain established checkout codes.
+  Normal-tool JSON→transport→WorkdirError→ToolsError→ToolError coverage checks all
+  18 codes with no reason, a typed reason, and nested diagnostic wrappers. In
+  particular, OutcomeUnknown/Conflict remain execution failures with unchanged
+  display and inspection-before-retry guidance, not argument errors.
+- A signed real self-handler test observes command dispatch, then removes only
+  its fixture session-registration entry before returning the start handle.
+  The 502 remains a post-start `command_registration` failure with a neutral
+  safe log message; no process is launched and no retry is performed.
 
 These are hermetic Rust/API/protocol fixtures, not a full product-process E2E,
 not a deployed binary test, and not reproduction of the user's asset/request.

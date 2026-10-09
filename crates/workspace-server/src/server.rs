@@ -18354,6 +18354,7 @@ async fn scoped_execute_current_worker_workdir_operation(
                 .start_command(command)
                 .await
                 .map_err(workdir_operation_transport_error)?;
+            context.stage = "command_registration";
             let registered_source = api
                 .workdir_sessions
                 .lock()
@@ -32702,7 +32703,9 @@ impl ApiErrorLog {
             // Existing public API details are unchanged; do not copy request-derived
             // alias/handle text or session-open errors into operational diagnostics.
             log.kind = format!("workdir_session_operation_api_{}", status.as_u16());
-            log.message = "Workdir operation was rejected before provider dispatch".to_string();
+            // This can also fail after a command was dispatched. Do not claim
+            // a pre-dispatch refusal or absence of effects in the safe message.
+            log.message = "Workdir operation failed".to_string();
             log.diagnostics.clear();
         }
         log
