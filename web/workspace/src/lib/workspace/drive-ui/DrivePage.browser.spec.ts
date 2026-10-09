@@ -74,6 +74,9 @@ test("Refreshing metadata never silently rebases an open rename form onto anothe
           message: "Revision conflict",
         }, { status: 409 });
       }
+      if (url.pathname.endsWith("/list")) {
+        return Response.json({ entries: [], next_after: null });
+      }
       if (url.pathname.endsWith("/read-text")) {
         return Response.json({
           entry: entry("2", "alpha", revision),
@@ -125,4 +128,89 @@ test("Refreshing metadata never silently rebases an open rename form onto anothe
   expect((view.getByLabelText("Name") as HTMLInputElement).value).toBe(
     "my-name.txt",
   );
+});
+
+test("Folder picker blocks failed reads, filters files and self, and follows paged destinations", async () => {
+  let failList = true;
+  const mutations: DriveMutationRequest[] = [];
+  const folder = (id: string) => ({
+    ...entry(id, "alpha", "7", "folder"),
+    name: `Folder ${id}`,
+  });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), "http://localhost");
+      const id = url.searchParams.get("id") ?? "1";
+      if (url.pathname.endsWith("/mutate")) {
+        mutations.push(JSON.parse(String(init?.body)));
+        return Response.json({
+          code: "conflict",
+          classification: "not_committed",
+          message: "Revision conflict",
+        }, { status: 409 });
+      }
+      if (url.pathname.endsWith("/list")) {
+        if (id !== "1") return Response.json({ entries: [], next_after: null });
+        if (failList) {
+          return Response.json(
+            { code: "unavailable", message: "Unavailable" },
+            { status: 503 },
+          );
+        }
+        return Response.json(
+          url.searchParams.has("after")
+            ? { entries: [folder("5")], next_after: null }
+            : {
+              entries: [folder("2"), entry("3"), folder("4")],
+              next_after: "4",
+            },
+        );
+      }
+      return Response.json(folder(id));
+    }),
+  );
+  const view = render(DrivePage, { workspaceId: "alpha", nodeId: "2" });
+  await waitFor(() =>
+    expect(view.getByRole("button", { name: "Rename / move" })).toBeDefined()
+  );
+  await fireEvent.click(view.getByRole("button", { name: "Rename / move" }));
+  await waitFor(() =>
+    expect(view.getByRole("button", { name: "Retry folders" })).toBeDefined()
+  );
+  expect(
+    view.getByRole("button", { name: "Apply rename / move" }).hasAttribute(
+      "disabled",
+    ),
+  ).toBe(true);
+  expect(mutations).toHaveLength(0);
+  failList = false;
+  await fireEvent.click(view.getByRole("button", { name: "Retry folders" }));
+  await waitFor(() =>
+    expect(view.getByRole("button", { name: "Folder 4" })).toBeDefined()
+  );
+  expect(view.queryByRole("button", { name: "Folder 2" })).toBeNull();
+  expect(view.queryByRole("button", { name: "note.txt" })).toBeNull();
+  await fireEvent.click(view.getByRole("button", { name: "More folders" }));
+  await waitFor(() =>
+    expect(view.getByRole("button", { name: "Folder 5" })).toBeDefined()
+  );
+  await fireEvent.click(view.getByRole("button", { name: "Folder 5" }));
+  await waitFor(() =>
+    expect(
+      view.getByRole("button", { name: "Apply rename / move" }).hasAttribute(
+        "disabled",
+      ),
+    ).toBe(false)
+  );
+  await fireEvent.click(
+    view.getByRole("button", { name: "Apply rename / move" }),
+  );
+  await waitFor(() => expect(mutations).toHaveLength(1));
+  expect(mutations[0].mutation).toMatchObject({
+    operation: "relocate",
+    expected_revision: "7",
+    id: { workspace_id: "alpha", node_id: "2" },
+    parent: { workspace_id: "alpha", node_id: "5" },
+  });
 });

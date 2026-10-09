@@ -5,10 +5,14 @@ import { chromium, type Page, type Route } from "playwright";
 import { Buffer } from "node:buffer";
 import type { FixtureLog } from "../../../../tools/web-ux/drive-fixture/api.ts";
 const root = join(dirname(fromFileUrl(import.meta.url)), "../../../..");
-const ready = (page: Page) => page.locator('[data-drive-ready="true"]').waitFor();
-const button = (page: Page, name: string) => page.getByRole("button", { name, exact: true });
-const draft = (page: Page) => page.getByRole("textbox", { name: /^Draft \(expected revision/ });
-const preview = (page: Page) => page.getByRole("article", { name: "Current saved content" });
+const ready = (page: Page) =>
+  page.locator('[data-drive-ready="true"]').waitFor();
+const button = (page: Page, name: string) =>
+  page.getByRole("button", { name, exact: true });
+const draft = (page: Page) =>
+  page.getByRole("textbox", { name: /^Draft \(expected revision/ });
+const preview = (page: Page) =>
+  page.getByRole("article", { name: "Current saved content" });
 function gate() {
   let release!: () => void;
   const promise = new Promise<void>((resolve) => release = resolve);
@@ -180,7 +184,9 @@ Deno.test("production Drive two tabs retain losing CAS draft and never retry wit
         await draft(second).inputValue(),
         "Second actor unsaved draft",
       );
-      const casWrites = (await logs(origin)).filter((x) => x.path === "/mutate");
+      const casWrites = (await logs(origin)).filter((x) =>
+        x.path === "/mutate"
+      );
       assertEquals(casWrites.map((x) => [x.nodeId, x.expectedRevision]), [[
         "3",
         "1",
@@ -235,7 +241,7 @@ Deno.test("production Drive delayed old read cannot replace another file or work
       await ready(page);
       assert((await preview(page).textContent())!.includes("Second document"));
       assertEquals(
-        await page.locator("main .drive-url a").getAttribute("href"),
+        await page.locator(".drive-details dd a").getAttribute("href"),
         "/w/home-member/drive/4",
       );
     } finally {
@@ -321,7 +327,9 @@ Deno.test("production Drive delayed old save and status preserve destination dra
       await button(page, "Save").click();
       await page.getByText("Published — DB commit confirmed", { exact: false })
         .last().waitFor();
-      const pinnedWrites = (await logs(origin)).filter((x) => x.path === "/mutate");
+      const pinnedWrites = (await logs(origin)).filter((x) =>
+        x.path === "/mutate"
+      );
       assertEquals(pinnedWrites.map((x) => [x.nodeId, x.expectedRevision]), [
         ["3", "1"],
         ["4", "1"],
@@ -342,12 +350,15 @@ Deno.test("production Drive rename move delete recreate preserve stable identity
     try {
       await page.goto(`${origin}/w/home-owner/drive/3`);
       await ready(page);
+      await page.getByLabel("More actions", { exact: true }).click();
       await button(page, "Rename / move").click();
       await page.getByRole("textbox", { name: "Name", exact: true }).fill(
         "renamed.md",
       );
-      await page.getByRole("textbox", { name: "Destination folder node ID" })
-        .fill("2");
+      await page.getByRole("dialog").getByRole("button", {
+        name: "資料",
+        exact: true,
+      }).click();
       await button(page, "Apply rename / move").click();
       await page.getByRole("heading", { name: "renamed.md", exact: true })
         .waitFor();
@@ -361,6 +372,7 @@ Deno.test("production Drive rename move delete recreate preserve stable identity
       await ready(page);
       await page.getByRole("link", { name: "renamed.md", exact: true }).click();
       await ready(page);
+      await page.getByLabel("More actions", { exact: true }).click();
       await button(page, "Delete").click();
       await page.getByRole("alert").filter({ hasText: /not[_ ]found/i })
         .waitFor();
@@ -368,6 +380,8 @@ Deno.test("production Drive rename move delete recreate preserve stable identity
       await rootFolder(page);
       await page.getByRole("link", { name: "資料", exact: true }).click();
       await ready(page);
+      await page.locator(".drive-menu > summary").filter({ hasText: /^New$/ })
+        .click();
       await button(page, "New Markdown").click();
       await page.getByRole("textbox", { name: "Name", exact: true }).fill(
         "renamed.md",
@@ -445,6 +459,7 @@ Deno.test("production Drive upload response loss and navigation cancellation que
       await transmitted.promise;
       await button(page, "Cancel transfer / check outcome").click();
       await button(page, "Check request result").waitFor();
+      await button(page, "Cancel form").click();
       await page.getByRole("link", { name: "資料", exact: true }).click();
       await page.getByRole("heading", { name: "資料", exact: true }).waitFor();
       await ready(page);
@@ -607,20 +622,26 @@ Deno.test("production Drive denial empty pages truncation unsafe content and ima
       await page.getByText("This file type is download-only.", { exact: false })
         .waitFor();
       assertEquals(
-        await page.locator("main svg, main iframe, main object").count(),
+        await page.locator(
+          "main svg:not([aria-hidden]), main iframe, main object",
+        ).count(),
         0,
       );
       await page.goto(`${origin}/w/home-owner/drive/5`);
       await ready(page);
       await page.waitForFunction(() => {
         const image = document.querySelector("main .drive-image");
-        return image instanceof HTMLImageElement && image.complete && image.naturalWidth === 1200 &&
+        return image instanceof HTMLImageElement && image.complete &&
+          image.naturalWidth === 1200 &&
           image.naturalHeight === 800;
       });
       assertEquals(
-        await page.getByRole("img", { name: "landscape.png", exact: true }).evaluate((image) =>
-          image instanceof HTMLImageElement ? [image.naturalWidth, image.naturalHeight] : []
-        ),
+        await page.getByRole("img", { name: "landscape.png", exact: true })
+          .evaluate((image) =>
+            image instanceof HTMLImageElement
+              ? [image.naturalWidth, image.naturalHeight]
+              : []
+          ),
         [1200, 800],
       );
       await page.goto(`${origin}/w/home-owner/drive/7`);
@@ -711,5 +732,156 @@ Deno.test("production Drive Markdown safe image placeholders preserve each image
       assertEquals(await preview(page).locator("img").count(), 0);
     } finally {
       await page.close();
+    }
+  }));
+
+Deno.test("production Drive menus dialogs folder picker and search remain usable at every viewport", () =>
+  harness(async (origin, browser) => {
+    for (const colorScheme of ["light", "dark"] as const) {
+      for (const width of [1440, 768, 390, 320]) {
+        const context = await browser.newContext({
+          viewport: { width, height: 900 },
+          colorScheme,
+          reducedMotion: "reduce",
+        });
+        const page = await context.newPage();
+        const errors: string[] = [];
+        page.on("pageerror", (error) => errors.push(String(error)));
+        const capture = async (surface: string) => {
+          const geometry = await page.evaluate(() => {
+            const main = document.querySelector("main")!;
+            const dialog = document.querySelector("dialog[open]");
+            return {
+              viewport: innerWidth,
+              document: document.documentElement.scrollWidth,
+              main: main.clientWidth,
+              mainScroll: main.scrollWidth,
+              dialog: dialog?.clientWidth,
+              dialogScroll: dialog?.scrollWidth,
+            };
+          });
+          assert(geometry.document <= width, JSON.stringify(geometry));
+          assert(
+            geometry.mainScroll <= geometry.main + 1,
+            JSON.stringify(geometry),
+          );
+          if (geometry.dialog) {
+            assert(
+              geometry.dialogScroll! <= geometry.dialog + 1,
+              JSON.stringify(geometry),
+            );
+          }
+          await page.screenshot({
+            path: join(
+              root,
+              `web/workspace/.svelte-kit/drive-redesign/${surface}-${colorScheme}-${width}.png`,
+            ),
+          });
+        };
+        try {
+          const reset = await fetch(`${origin}/__fixture/reset`, {
+            method: "POST",
+          });
+          await reset.body?.cancel();
+          await page.goto(`${origin}/w/home-owner/drive`);
+          await ready(page);
+          const newMenu = page.locator(".drive-menu > summary").filter({
+            hasText: /^New$/,
+          });
+          assertEquals(await button(page, "New folder").isVisible(), false);
+          await capture("files");
+          await newMenu.press("Enter");
+          await button(page, "New folder").waitFor();
+          const menuBox = await page.locator(
+            ".drive-create-menu .drive-menu-panel",
+          ).boundingBox();
+          assert(
+            menuBox && menuBox.x >= 0 && menuBox.x + menuBox.width <= width,
+            JSON.stringify(menuBox),
+          );
+          await capture("menu");
+          await button(page, "New folder").click();
+          const dialog = page.getByRole("dialog", {
+            name: "New folder",
+            exact: true,
+          });
+          await dialog.waitFor();
+          assert(
+            await dialog.getByLabel("Name", { exact: true }).evaluate((el) =>
+              el === document.activeElement
+            ),
+          );
+          await capture("create");
+          for (let i = 0; i < 8; i++) {
+            await page.keyboard.press("Tab");
+            // Native dialogs may cycle through browser chrome (reported as body),
+            // but background page controls must stay inert.
+            assert(
+              await dialog.evaluate((el) =>
+                el.contains(document.activeElement) ||
+                document.activeElement === document.body
+              ),
+              "Modal must not focus background controls",
+            );
+          }
+          await page.keyboard.press("Escape");
+          await dialog.waitFor({ state: "hidden" });
+          await newMenu.locator(":scope:focus").waitFor();
+          await newMenu.press("Enter");
+          await button(page, "New folder").focus();
+          await page.keyboard.press("Escape");
+          assertEquals(await button(page, "New folder").isVisible(), false);
+          await newMenu.locator(":scope:focus").waitFor();
+          await newMenu.press("Enter");
+          await button(page, "New folder").click();
+          const folderName = `Created ${colorScheme} ${width}`;
+          await dialog.getByLabel("Name", { exact: true }).fill(folderName);
+          await button(page, "Create").click();
+          await dialog.waitFor({ state: "hidden" });
+          await page.getByRole("link", { name: folderName, exact: true })
+            .waitFor();
+          await page.getByRole("searchbox", { name: "Search Drive" }).fill(
+            folderName,
+          );
+          await button(page, "Search").click();
+          await button(page, "Show folder").waitFor();
+          await ready(page);
+          assertEquals(await page.locator(".drive-table tbody tr").count(), 1);
+          await button(page, "Show folder").click();
+          await ready(page);
+          await page.getByRole("link", { name: "README.md", exact: true })
+            .click();
+          await page.waitForURL("**/w/home-owner/drive/3");
+          await ready(page);
+          await preview(page).waitFor();
+          await capture("preview");
+          const more = page.getByLabel("More actions", { exact: true });
+          await more.click();
+          await button(page, "Rename / move").click();
+          const move = page.getByRole("dialog", {
+            name: "Rename / move",
+            exact: true,
+          });
+          await move.getByRole("button", { name: "資料", exact: true }).click();
+          await page.locator(".drive-folder-location strong").filter({
+            hasText: "資料",
+          }).waitFor();
+          await capture("move");
+          await button(page, "Parent folder").click();
+          await move.getByRole("button", { name: "資料", exact: true })
+            .waitFor();
+          assertEquals(
+            await move.getByRole("button", { name: "README.md", exact: true })
+              .count(),
+            0,
+          );
+          await page.keyboard.press("Escape");
+          await move.waitFor({ state: "hidden" });
+          await more.locator(":scope:focus").waitFor();
+          assertEquals(errors, []);
+        } finally {
+          await context.close();
+        }
+      }
     }
   }));

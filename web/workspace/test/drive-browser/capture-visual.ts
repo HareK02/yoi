@@ -68,6 +68,7 @@ for (const scheme of ["light", "dark"]) {
           label: "Rename / move pinned revision",
           fullPage: true,
           interaction: [
+            { action: "click", selector: '.drive-menu > summary[aria-label="More actions"]' },
             { action: "click", selector: '.drive-toolbar button:has-text("Rename / move")' },
             {
               action: "wait",
@@ -82,6 +83,7 @@ for (const scheme of ["light", "dark"]) {
           fullPage: true,
           interaction: [
             { action: "click", selector: '.drive-form button:has-text("Cancel form")' },
+            { action: "click", selector: '.drive-menu > summary[aria-label="More actions"]' },
             { action: "click", selector: '.drive-toolbar button:has-text("Replace file")' },
             {
               action: "wait",
@@ -244,6 +246,7 @@ for (const scheme of ["light", "dark"]) {
               label: "Member after typed write denial",
               fullPage: true,
               interaction: [
+                { action: "click", selector: '.drive-create-menu > summary' },
                 {
                   action: "click",
                   selector: '.drive-page button:has-text("New folder")',
@@ -261,12 +264,12 @@ for (const scheme of ["light", "dark"]) {
                   action: "wait",
                   ready: {
                     kind: "selector",
-                    selector: '.drive-page:has-text("Read only / access denied by Backend")',
+                    selector: '.drive-dialog:has-text("Read only / access denied by Backend")',
                   },
                 },
                 {
                   action: "press",
-                  selector: ".drive-heading button",
+                  selector: '.drive-dialog button[aria-label="Close dialog"]',
                   key: "Shift",
                 },
               ],
