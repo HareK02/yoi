@@ -68,6 +68,17 @@ The new test fails for the typed-reason case before the fix and passes all three
 forms after it. That source movement still needs fresh exact-source review, not
 reuse of the old review binding. The user-reported Workdir 403 remains unidentified.
 
+## Later registration observation
+
+A subsequent fresh binding on source
+`6ac87c885e58f11cb6dde0557c9229249f2c428e` successfully recorded request-changes:
+MR seq5 event `01a12114-771a-76b1-b0fb-2fde0d56e3e1` at
+`2026-10-09T14:32:31.769486531+00:00`, confirmed by parent MR reread. This proves
+that selected submission succeeded; it does not explain the earlier 401.
+No authentication, proof, capability, Backend, or running binary changes were
+made to obtain it. The remaining code finding and routine review evidence are
+on that MR, not an approval or Ticket conclusion in this report.
+
 ## Improvement proposal
 
 A verdict-registration rejection should expose a safe, bounded internal

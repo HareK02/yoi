@@ -716,10 +716,23 @@ mod client {
                     "mismatched response after checkout mutation".into(),
                 )),
                 Ok(_) => Err(Self::mismatch("checkout_execute")),
-                Err(WorkdirError::Unavailable(_) | WorkdirError::Transport(_)) if mutation => {
-                    Err(WorkdirError::OutcomeUnknown(
+                Err(error)
+                    if mutation
+                        && matches!(
+                            error.classification_source(),
+                            WorkdirError::Unavailable(_) | WorkdirError::Transport(_)
+                        ) =>
+                {
+                    let outcome = WorkdirError::OutcomeUnknown(
                         "checkout transport failed; effects may have occurred".into(),
-                    ))
+                    );
+                    Err(match error.denial_reason() {
+                        Some(reason) => WorkdirError::DenialContext {
+                            reason,
+                            source: Box::new(outcome),
+                        },
+                        None => outcome,
+                    })
                 }
                 Err(error) => Err(error),
             }

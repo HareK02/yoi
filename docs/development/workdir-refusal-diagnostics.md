@@ -137,6 +137,18 @@ is never parsed into a reason.
   provider: missing files are created identically without/with/nested reasons;
   denied/read-only/conflict/unknown-outcome stat failures never write or retry.
   This protects actual create control flow in addition to error conversion.
+- Real Remote HTTP and channel-backed External session dispatch tests cover
+  Read/Create/Write/Edit crossed with missing/typed reasons and five error codes.
+  After a dispatched mutation, Unavailable/Transport still become OutcomeUnknown
+  with the original reason preserved: forwarded 500 and inspect-before-retry
+  guidance are unchanged. Read and definite refusal/conflict controls retain
+  their existing codes. The External path also checks actual HTTP error body/
+  status conversion and absence of a new dispatch after the failure.
+- Fake-command JSON fixtures cover attachment detach and scoped-command close
+  without launching processes. Missing/typed/nested UnknownCommand all retain
+  disappearance/lease-release semantics. Unavailable remains a busy detach or
+  failed scope cleanup; scope close revokes new work immediately but retains the
+  write lease while cleanup is unresolved. Diagnostic data never grants cleanup.
 - A signed real self-handler test observes command dispatch, then removes only
   its fixture session-registration entry before returning the start handle.
   The 502 remains a post-start `command_registration` failure with a neutral

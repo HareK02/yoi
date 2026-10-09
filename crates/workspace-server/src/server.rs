@@ -1225,12 +1225,23 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
                 "mismatched checkout mutation response".into(),
             )),
             Ok(_) => Err(Self::mismatch("checkout_execute")),
-            Err(workdir::WorkdirError::Unavailable(_) | workdir::WorkdirError::Transport(_))
-                if mutation =>
+            Err(error)
+                if mutation
+                    && matches!(
+                        error.classification_source(),
+                        workdir::WorkdirError::Unavailable(_) | workdir::WorkdirError::Transport(_)
+                    ) =>
             {
-                Err(workdir::WorkdirError::OutcomeUnknown(
+                let outcome = workdir::WorkdirError::OutcomeUnknown(
                     "checkout provider response lost; inspect effects before retry".into(),
-                ))
+                );
+                Err(match error.denial_reason() {
+                    Some(reason) => workdir::WorkdirError::DenialContext {
+                        reason,
+                        source: Box::new(outcome),
+                    },
+                    None => outcome,
+                })
             }
             Err(error) => Err(error),
         }
@@ -33033,6 +33044,7 @@ mod tests {
     mod drive_api_tests;
     mod drive_tests;
     mod drive_web_roundtrip_tests;
+    mod external_checkout_tests;
     mod subject_spawn_tests;
     mod subjektiv_jobs_tests;
     mod ticket_evidence_tests;

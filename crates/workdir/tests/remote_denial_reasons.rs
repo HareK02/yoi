@@ -4,7 +4,7 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use workdir::{
     StatRequest, Workdir, WorkdirDenialReason as Reason, WorkdirPath, WorkdirSession,
@@ -15,7 +15,18 @@ use workdir::{
 };
 
 fn reply(listener: &TcpListener, status: &str, body: &str) {
-    let (mut stream, _) = listener.accept().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "fake provider accept timed out");
+                thread::yield_now();
+            }
+            Err(error) => panic!("fake provider accept failed: {error}"),
+        }
+    };
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -106,5 +117,102 @@ async fn remote_http_denials_forward_only_typed_reasons_and_old_missing_reason()
         assert!(!wire.contains("secret"));
         assert!(wire.len() < 256);
         server.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn remote_checkout_diagnostics_preserve_mutation_outcome_and_read_failures() {
+    use workdir::{CheckoutOperation as Op, CheckoutRequest, WorkdirSessionCapability};
+    for code in [
+        Code::Unavailable,
+        Code::Transport,
+        Code::Denied,
+        Code::Conflict,
+        Code::OutcomeUnknown,
+    ] {
+        for reason in [None, Some(Reason::ReadOnlySession)] {
+            for operation in [
+                Op::Read {
+                    offset: 0,
+                    limit: 1,
+                    max_bytes: 10,
+                },
+                Op::Create {
+                    path: WorkdirPath::new("new.txt").unwrap(),
+                    content: b"fixture".to_vec(),
+                },
+                Op::Write {
+                    content: b"fixture".to_vec(),
+                    expected_hash: [0; 32],
+                },
+                Op::Edit {
+                    old_string: "old".into(),
+                    new_string: "new".into(),
+                    replace_all: false,
+                    expected_hash: [0; 32],
+                },
+            ] {
+                let mutation = operation.capability() != WorkdirSessionCapability::Read;
+                let expected_code =
+                    if mutation && matches!(code, Code::Unavailable | Code::Transport) {
+                        Code::OutcomeUnknown
+                    } else {
+                        code
+                    };
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                let error = serde_json::json!({"code":code, "message":"/secret/host provider-secret", "denial_reason":reason});
+                let server = thread::spawn(move || {
+                    reply(
+                        &listener,
+                        "200 OK",
+                        r#"{"session_id":"s","workdir_id":"w","capabilities":{"bits":63}}"#,
+                    );
+                    reply(
+                        &listener,
+                        &format!("{} Fixture failure", code.http_status()),
+                        &error.to_string(),
+                    );
+                });
+                let remote = RemoteWorkdirSession::open(
+                    reqwest::Client::builder()
+                        .no_proxy()
+                        .timeout(Duration::from_secs(5))
+                        .build()
+                        .unwrap(),
+                    format!("http://{address}").parse().unwrap(),
+                    "request-secret",
+                    Workdir::new("w").id().clone(),
+                    OpenWorkdirSessionRequest::default(),
+                )
+                .await
+                .unwrap();
+                let error = remote
+                    .checkout_execute(CheckoutRequest {
+                        target: WorkdirPath::root(),
+                        validator: vec![1],
+                        operation,
+                    })
+                    .await
+                    .unwrap_err();
+                server.join().unwrap();
+                let forwarded = WorkdirTransportError::from_workdir_error(&error);
+                assert_eq!(
+                    forwarded.code, expected_code,
+                    "{code:?}, {reason:?}, mutation={mutation}: {error:?}"
+                );
+                assert_eq!(error.denial_reason(), reason);
+                assert_eq!(forwarded.denial_reason, reason);
+                assert_eq!(forwarded.code.http_status(), expected_code.http_status());
+                if expected_code == Code::OutcomeUnknown {
+                    assert!(forwarded.message.contains("inspect before retrying"));
+                }
+                assert!(
+                    !serde_json::to_string(&forwarded)
+                        .unwrap()
+                        .contains("secret")
+                );
+            }
+        }
     }
 }

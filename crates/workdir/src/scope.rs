@@ -240,8 +240,18 @@ impl WorkdirScopeLease {
                         .expect("scoped command set mutex poisoned")
                         .remove(&command_id);
                 }
-                (Ok(()), Err(WorkdirError::UnknownCommand(_)))
-                | (Err(WorkdirError::UnknownCommand(_)), Err(WorkdirError::UnknownCommand(_))) => {
+                (cancel, Err(error))
+                    if matches!(
+                        error.classification_source(),
+                        WorkdirError::UnknownCommand(_)
+                    ) && match &cancel {
+                        Ok(()) => true,
+                        Err(error) => matches!(
+                            error.classification_source(),
+                            WorkdirError::UnknownCommand(_)
+                        ),
+                    } =>
+                {
                     self.broker.authority.publish_terminal_if_missing(
                         &command_id,
                         CommandStatus::Cancelled,
