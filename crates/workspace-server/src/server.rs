@@ -24521,12 +24521,11 @@ fn runtime_reports_workdir_not_found(result: &crate::hosts::RuntimeWorkingDirect
 fn classify_workdir_provider_error(error: &RuntimeRegistryError) -> (&'static str, bool) {
     match error {
         RuntimeRegistryError::UnknownRuntime(_) => ("runtime_unavailable", true),
-        RuntimeRegistryError::RuntimeOperationFailed { code, .. }
-            if code == "working_directory_unsupported" =>
-        {
-            ("unsupported_target", false)
+        RuntimeRegistryError::RuntimeOperationFailed { code, .. } => {
+            let category =
+                workdir_cleanup_diagnostic_category(code).unwrap_or("provider_unavailable");
+            (category, category != "unsupported_target")
         }
-        RuntimeRegistryError::RuntimeOperationFailed { .. } => ("provider_unavailable", true),
         RuntimeRegistryError::InvalidIdentifier { .. }
         | RuntimeRegistryError::UnknownHost(_)
         | RuntimeRegistryError::UnknownWorker { .. } => ("authority_invalid", false),
@@ -24538,24 +24537,28 @@ fn classify_workdir_provider_error(error: &RuntimeRegistryError) -> (&'static st
 fn workdir_cleanup_failure_category(
     result: &crate::hosts::RuntimeWorkingDirectoryResult,
 ) -> &'static str {
-    for diagnostic in &result.diagnostics {
-        let category = match diagnostic.code.as_str() {
-            "working_directory_unsupported" => "unsupported_target",
-            "working_directory_cleanup_mount_present" => "mount_present",
-            "working_directory_cleanup_mount_check_unavailable" => "mount_check_unavailable",
-            "working_directory_cleanup_permission_denied" => "permission_denied",
-            "working_directory_cleanup_resource_busy" => "resource_busy",
-            "working_directory_cleanup_storage_unavailable" => "storage_unavailable",
-            "working_directory_cleanup_ownership_unknown" => "ownership_unknown",
-            "working_directory_cleanup_changes_present" => "changes_present",
-            "working_directory_cleanup_changes_unknown" => "changes_unknown",
-            "working_directory_cleanup_target_invalid"
-            | "working_directory_cleanup_escape_rejected" => "ownership_unknown",
-            _ => continue,
-        };
-        return category;
-    }
-    "provider_cleanup_failed"
+    result
+        .diagnostics
+        .iter()
+        .find_map(|diagnostic| workdir_cleanup_diagnostic_category(&diagnostic.code))
+        .unwrap_or("provider_cleanup_failed")
+}
+
+fn workdir_cleanup_diagnostic_category(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "working_directory_unsupported" => "unsupported_target",
+        "working_directory_cleanup_mount_present" => "mount_present",
+        "working_directory_cleanup_mount_check_unavailable" => "mount_check_unavailable",
+        "working_directory_cleanup_permission_denied" => "permission_denied",
+        "working_directory_cleanup_resource_busy" => "resource_busy",
+        "working_directory_cleanup_storage_unavailable" => "storage_unavailable",
+        "working_directory_cleanup_ownership_unknown" => "ownership_unknown",
+        "working_directory_cleanup_changes_present" => "changes_present",
+        "working_directory_cleanup_changes_unknown" => "changes_unknown",
+        "working_directory_cleanup_target_invalid"
+        | "working_directory_cleanup_escape_rejected" => "ownership_unknown",
+        _ => return None,
+    })
 }
 
 fn workdir_removal_failure_guidance(category: &str) -> &'static str {
@@ -24802,10 +24805,16 @@ fn execute_reserved_workdir_removal_with_provider(
         return api.config_store.commit_workdir_removal_removed(&operation);
     }
     let Some(status) = observed.working_directory.as_ref() else {
+        let category = workdir_cleanup_failure_category(&observed);
+        let category = if category == "provider_cleanup_failed" {
+            "provider_observation_unknown"
+        } else {
+            category
+        };
         return api.config_store.fail_workdir_removal_operation(
             &operation,
-            "provider_observation_unknown",
-            true,
+            category,
+            category != "unsupported_target",
         );
     };
     // A provider summary is not permission to remove a different materialization.
@@ -54831,6 +54840,59 @@ mod tests {
             .unwrap(),
             removed
         );
+    }
+
+    #[tokio::test]
+    async fn workdir_observation_failure_preserves_bounded_os_cause_without_removing_registry() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        for (id, transport_error) in [
+            ("observation-denied", false),
+            ("rpc-observation-denied", true),
+        ] {
+            let (operation, _) = reserve_removal_fixture(&api, id);
+            let provider = FakeWorkdirRemovalProvider::new(
+                workdir_removal_result(
+                    InternalWorkerOperationState::Rejected,
+                    None,
+                    vec![RuntimeDiagnostic {
+                        code: "working_directory_cleanup_permission_denied".into(),
+                        severity: HostDiagnosticSeverity::Error,
+                        message: "permission denied /private/path".into(),
+                    }],
+                ),
+                confirmed_workdir_cleanup_result(),
+            );
+            if transport_error {
+                *provider.observation.lock().unwrap() =
+                    Some(Err(RuntimeRegistryError::RuntimeOperationFailed {
+                        runtime_id: "runtime-test".into(),
+                        code: "working_directory_cleanup_permission_denied".into(),
+                        message: "permission denied /private/path".into(),
+                    }));
+            }
+            let result =
+                execute_reserved_workdir_removal_with_provider(&api, operation, false, &provider)
+                    .unwrap();
+            assert_eq!(
+                result.failure_category.as_deref(),
+                Some("permission_denied")
+            );
+            assert!(result.retryable);
+            assert_eq!(provider.cleanup_calls(), 0);
+            assert!(
+                !serde_json::to_string(&result)
+                    .unwrap()
+                    .contains("/private/path")
+            );
+            assert!(
+                api.store
+                    .get_workdir_registry(TEST_WORKSPACE_ID, id)
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 
     #[tokio::test]
