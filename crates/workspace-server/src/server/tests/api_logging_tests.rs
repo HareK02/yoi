@@ -60,7 +60,7 @@ async fn generated_cancellation_errors_preserve_response_and_log_details() {
                 requested_worker_name: Some("logging-coder".to_string()),
                 intent: WorkerSpawnIntent::TicketRole {
                     ticket_id: "cancellation-logging".to_string(),
-                    role: TicketWorkerRole::Coder,
+                    role: TicketWorkerRole::Worker,
                 },
                 singleton_key: None,
                 acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
@@ -106,8 +106,8 @@ async fn generated_cancellation_errors_preserve_response_and_log_details() {
     input.workflow_state = Some(TicketWorkflowState::InProgress);
     let ticket = backend.create(input).unwrap();
     api.store
-        .set_current_ticket_coder_assignment(
-            &TicketCoderAssignmentRecord {
+        .set_current_ticket_worker_assignment(
+            &TicketWorkerAssignmentRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 ticket_id: ticket.id.clone(),
                 assignment_id: "logging-assignment".to_string(),
@@ -150,7 +150,7 @@ async fn generated_cancellation_errors_preserve_response_and_log_details() {
     assert_eq!(body["error"], "Bad Gateway");
     assert_eq!(
         body["message"],
-        "workspace_ticket_implementation_cancel_rejected: Runtime did not cancel the assigned Coder Worker"
+        "workspace_ticket_implementation_cancel_rejected: Runtime did not cancel the assigned Worker Worker"
     );
     assert!(
         !body["diagnostics"].as_array().unwrap().is_empty(),
