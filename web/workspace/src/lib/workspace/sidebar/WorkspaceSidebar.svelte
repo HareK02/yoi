@@ -8,6 +8,7 @@
   import MergeRequestsNavSection from './MergeRequestsNavSection.svelte';
   import TicketsNavSection from './TicketsNavSection.svelte';
   import WorkersNavSection from './WorkersNavSection.svelte';
+  import DriveNavSection from './DriveNavSection.svelte';
   import type { WorkspaceResponse } from './types';
 
   type Props = {
@@ -80,6 +81,7 @@
       <TicketsNavSection {currentPath} {workspaceId} />
       <ObjectivesNavSection {currentPath} {workspaceId} />
       <MergeRequestsNavSection {currentPath} {workspaceId} />
+      <DriveNavSection {currentPath} {workspaceId} />
       <MemoryNavSection {currentPath} {workspaceId} />
       <WorkersNavSection {currentPath} {workspaceId} />
     </nav>
