@@ -2350,6 +2350,7 @@ impl RuntimeHttpWorkdirError {
         Self {
             status,
             payload: WorkdirTransportError {
+                denial_reason: None,
                 code,
                 message: message.into(),
             },

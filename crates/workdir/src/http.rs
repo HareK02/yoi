@@ -269,6 +269,9 @@ impl WorkdirTransportErrorCode {
 pub struct WorkdirTransportError {
     pub code: WorkdirTransportErrorCode,
     pub message: String,
+    /// Internal provider diagnostics. Public response boundaries may omit this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denial_reason: Option<crate::WorkdirDenialReason>,
 }
 
 impl WorkdirTransportError {
@@ -276,6 +279,11 @@ impl WorkdirTransportError {
     pub fn from_workdir_error(error: &WorkdirError) -> Self {
         use WorkdirTransportErrorCode as Code;
         let (code, message) = match error {
+            WorkdirError::DenialContext { reason, source } => {
+                let mut transport = Self::from_workdir_error(source);
+                transport.denial_reason = Some(*reason);
+                return transport;
+            }
             WorkdirError::OutcomeUnknown(_) => (
                 Code::OutcomeUnknown,
                 "Workdir operation may have effects; inspect before retrying",
@@ -289,6 +297,7 @@ impl WorkdirTransportError {
                 return Self {
                     code: Code::Unsupported,
                     message: format!("Workdir capability {capability:?} is not available"),
+                    denial_reason: None,
                 };
             }
             WorkdirError::UnsupportedOperation(_) => {
@@ -346,12 +355,13 @@ impl WorkdirTransportError {
         Self {
             code,
             message: message.to_string(),
+            denial_reason: error.denial_reason(),
         }
     }
 
     pub fn into_workdir_error(self) -> WorkdirError {
         use WorkdirTransportErrorCode as Code;
-        match self.code {
+        let error = match self.code {
             Code::NotFound => WorkdirError::NotFound("<remote>".into()),
             Code::Conflict => WorkdirError::Conflict(self.message),
             Code::OutcomeUnknown => WorkdirError::OutcomeUnknown(
@@ -359,7 +369,11 @@ impl WorkdirTransportError {
             ),
             Code::Unsupported => WorkdirError::UnsupportedOperation(self.message),
             Code::InvalidRequest => WorkdirError::InvalidArgument(self.message),
-            Code::Denied => WorkdirError::Denied(self.message),
+            Code::Denied => WorkdirError::Denied(crate::WorkdirDenial {
+                reason: self.denial_reason,
+                // Provider-authored text is not trusted diagnostic data.
+                message: "Workdir operation was denied".into(),
+            }),
             Code::OutOfScope => WorkdirError::OutOfScope("<remote>".into()),
             Code::SymlinkOutOfScope => WorkdirError::SymlinkOutOfScope {
                 path: "<remote>".into(),
@@ -390,7 +404,18 @@ impl WorkdirTransportError {
             },
             Code::Transport => WorkdirError::Transport(self.message),
             Code::Internal => WorkdirError::OperationFailed,
+        };
+        // Preserve any supplied reason independently of the public classification.
+        // Without a reason, retain the existing classification's deliberate fallback.
+        if let Some(reason) = self.denial_reason {
+            if error.denial_reason() != Some(reason) {
+                return WorkdirError::DenialContext {
+                    reason,
+                    source: Box::new(error),
+                };
+            }
         }
+        error
     }
 }
 
@@ -949,6 +974,7 @@ mod tests {
         ] {
             let transport = WorkdirTransportError {
                 code,
+                denial_reason: None,
                 message: if code == WorkdirTransportErrorCode::Conflict {
                     "The target file's content or existence changed since it was last observed; read the file again before retrying"
                         .to_string()

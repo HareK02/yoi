@@ -422,6 +422,13 @@ fn checkout_known_refusals_have_typed_codes_without_changing_normal_tools() {
     let cases = [
         (WorkdirError::Denied("denied".into()), "checkout_denied"),
         (
+            WorkdirError::DenialContext {
+                reason: workdir::WorkdirDenialReason::OsPermissionDenied,
+                source: Box::new(WorkdirError::OutOfScope("outside".into())),
+            },
+            "checkout_denied",
+        ),
+        (
             WorkdirError::OutOfScope("outside".into()),
             "checkout_denied",
         ),
