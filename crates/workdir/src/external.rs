@@ -155,7 +155,11 @@ fn validate_external_operation(operation: &WorkdirSessionOperation) -> Result<()
                     <= MAX_EXTERNAL_SCOPE_RULES
                 && validate_external_operation(&match &request.operation {
                     crate::CheckoutSearchOperation::List(r) => {
-                        WorkdirSessionOperation::List(r.clone())
+                        // request.validate() checks the output_root-relative
+                        // cursor; validate the provider-coordinate path here.
+                        let mut list = r.clone();
+                        list.after = None;
+                        WorkdirSessionOperation::List(list)
                     }
                     crate::CheckoutSearchOperation::Glob(r) => {
                         WorkdirSessionOperation::Glob(r.clone())
@@ -212,7 +216,14 @@ fn validate_external_operation(operation: &WorkdirSessionOperation) -> Result<()
                     .contains(&request.max_bytes)
         }
         WorkdirSessionOperation::List(request) => {
-            is_root_relative(&request.path) && request.limit <= MAX_EXTERNAL_RESULT_ITEMS
+            is_root_relative(&request.path)
+                && request.limit <= MAX_EXTERNAL_RESULT_ITEMS
+                && request.after.as_ref().is_none_or(|after| {
+                    is_root_relative(&after.path)
+                        && !after.path.is_root()
+                        && Path::new(after.path.as_str()).parent()
+                            == Some(Path::new(request.path.as_str()))
+                })
         }
         WorkdirSessionOperation::Glob(request) => {
             is_root_relative(&request.path)
@@ -395,7 +406,20 @@ fn validate_external_result(result: &WorkdirSessionOperationResult) -> Result<()
                     .entries
                     .iter()
                     .all(|entry| is_root_relative(&entry.path))
-                && result_paths_fit(result.entries.iter().map(|entry| &entry.path))
+                && result.next_after.as_ref().is_none_or(|after| {
+                    is_root_relative(&after.path)
+                        && result.truncated
+                        && result.entries.last().is_some_and(|entry| {
+                            entry.kind == after.kind && entry.path == after.path
+                        })
+                })
+                && result_paths_fit(
+                    result
+                        .entries
+                        .iter()
+                        .map(|entry| &entry.path)
+                        .chain(result.next_after.iter().map(|after| &after.path)),
+                )
         }
         WorkdirSessionOperationResult::Glob(result) => {
             result.paths.len() <= MAX_EXTERNAL_RESULT_ITEMS
@@ -917,6 +941,7 @@ mod tests {
         assert!(serde_json::from_value::<ExternalWorkdirServerFrame>(nested).is_err());
 
         let unbounded = WorkdirSessionOperation::List(ListRequest {
+            after: None,
             path: WorkdirPath::root(),
             limit: MAX_EXTERNAL_RESULT_ITEMS + 1,
         });

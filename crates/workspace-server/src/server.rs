@@ -54126,6 +54126,7 @@ mod tests {
             WorkdirSessionOperation::List(workdir::ListRequest {
                 path: workdir::WorkdirPath::root(),
                 limit: 10,
+                after: None,
             }),
         )
         .await

@@ -941,6 +941,7 @@ mod tests {
         let list_error = run_list(
             &root,
             ListRequest {
+                after: None,
                 path: FsPath::new("selected-dir").unwrap(),
                 limit: 10,
             },
@@ -1008,6 +1009,7 @@ mod tests {
         let listed = run_list(
             &root,
             ListRequest {
+                after: None,
                 path: FsPath::new("notes").unwrap(),
                 limit: 10,
             },

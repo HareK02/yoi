@@ -13,9 +13,9 @@ use tempfile::TempDir;
 use workdir::{
     CheckoutRequest, CheckoutResult, CommandHandle, CommandOutput, CommandOutputRequest,
     CommandRequest, CommandStatus, EditRequest, EditResult, GlobRequest, GlobResult, GrepRequest,
-    GrepResult, ListResult, LocalWorkdirSession, ReadBytesRequest, ReadBytesResult, ReadRequest,
-    ReadResult, StatRequest, StatResult, Workdir, WorkdirAttachmentAlias, WorkdirError,
-    WorkdirScopeAuthorizationRequest, WorkdirScopeOverlapRequest, WorkdirSession,
+    GrepResult, ListRequest, ListResult, LocalWorkdirSession, ReadBytesRequest, ReadBytesResult,
+    ReadRequest, ReadResult, StatRequest, StatResult, Workdir, WorkdirAttachmentAlias,
+    WorkdirError, WorkdirScopeAuthorizationRequest, WorkdirScopeOverlapRequest, WorkdirSession,
     WorkdirSessionCapabilities, WorkdirSessionHandle, WriteRequest, WriteResult,
 };
 
@@ -28,6 +28,7 @@ struct HookedSession {
     observe_hook: Mutex<Option<ObserveHook>>,
     stall_path: Mutex<Option<WorkdirPath>>,
     stalled_observations: AtomicUsize,
+    searches: AtomicUsize,
 }
 
 impl std::fmt::Debug for HookedSession {
@@ -52,6 +53,7 @@ impl HookedSession {
             observe_hook: Mutex::new(None),
             stall_path: Mutex::new(None),
             stalled_observations: AtomicUsize::new(0),
+            searches: AtomicUsize::new(0),
         })
     }
 
@@ -123,6 +125,7 @@ impl WorkdirSession for HookedSession {
         &self,
         request: workdir::CheckoutSearchRequest,
     ) -> Result<workdir::CheckoutSearchResult, WorkdirError> {
+        self.searches.fetch_add(1, Ordering::SeqCst);
         self.local.checkout_search(request).await
     }
 
@@ -484,7 +487,7 @@ async fn collection_list_and_root_enumeration_bound_stalled_observation_and_rele
 }
 
 #[tokio::test]
-async fn grep_post_search_link_observation_is_deadline_bounded_and_releases_permit() {
+async fn grep_returns_typed_entry_without_observing_stalled_result() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
     let session = HookedSession::new(&dir);
@@ -499,8 +502,8 @@ async fn grep_post_search_link_observation_is_deadline_bounded_and_releases_perm
     let root = checkout_root("main");
     let projection = p.node(&root).await.unwrap().unwrap();
 
-    // Directory observations and the normal local grep/checkout execution can
-    // complete. Only publishing the typed search result path gets stuck.
+    // Directory/search can complete. The result path must never be observed
+    // during result publication, even when it would block indefinitely.
     session.stall_observation(Some(WorkdirPath::new("a.txt").unwrap()));
     let arguments = BTreeMap::from([
         ("pattern".into(), Value::String("needle".into())),
@@ -514,13 +517,17 @@ async fn grep_post_search_link_observation_is_deadline_bounded_and_releases_perm
         projection.handler.call("grep", &arguments, context()),
     )
     .await
-    .expect("post-search link observations must share the operation deadline");
-    assert_deadline(result, "checkout result deadline");
-    assert_eq!(session.stalled_observations.load(Ordering::SeqCst), 1);
+    .expect("completed search must return without acquiring its entries");
+    let output = result.unwrap_or_else(|_| panic!("successful search must not observe each entry"));
+    assert_eq!(
+        wip_to_json(&output.value).unwrap()["items"],
+        json!([{"entry": format!("{root}/a.txt")}])
+    );
+    assert_eq!(session.stalled_observations.load(Ordering::SeqCst), 0);
     assert_permit_released(&p);
 
-    // A successful retry both checks cancellation cleanup and proves that the
-    // delegated search produces the typed path consumed by post-processing.
+    // A second explicit search produces the same typed coordinate, without
+    // acquiring it even when it could resolve successfully.
     session.stall_observation(None);
     let result = tokio::time::timeout(
         Duration::from_secs(2),
@@ -533,6 +540,230 @@ async fn grep_post_search_link_observation_is_deadline_bounded_and_releases_perm
         Err(_) => panic!("grep must succeed once the link observation is unstalled"),
     };
     let value = wip_to_json(&output.value).unwrap();
-    assert_eq!(value["items"], json!([{"path": format!("{root}/a.txt")}]));
+    assert_eq!(value["items"], json!([{"entry": format!("{root}/a.txt")}]));
     assert_permit_released(&p);
+}
+
+#[tokio::test]
+async fn checkout_content_children_never_call_provider_list_even_for_deep_paths() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("nested/deep")).unwrap();
+    for n in 0..1100 {
+        std::fs::write(dir.path().join(format!("file-{n}")), "fixture").unwrap();
+    }
+    let session = HookedSession::new(&dir);
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(
+            WorkdirAttachmentAlias::new("main").unwrap(),
+            session.clone(),
+        )
+        .unwrap();
+    let subtree = Arc::new(provider(router));
+    assert_eq!(
+        subtree.children(ROOT).await.unwrap(),
+        vec![checkout_root("main")]
+    );
+    for path in ["/checkouts/main", "/checkouts/main/nested/deep"] {
+        assert!(subtree.publication(path).await.unwrap().is_some());
+        assert!(subtree.children(path).await.unwrap().is_empty());
+    }
+    assert_eq!(session.searches.load(Ordering::SeqCst), 0);
+}
+
+/// Deterministic adapter fixture for the production post-success publication
+/// boundary. Execute through the real provider/Tools, then detach after the
+/// routed operation guard has finished, before publishing the committed result.
+/// No race timing or production-only test hook is needed.
+struct DetachBeforePublication {
+    file: FileHandler,
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl WipOperationHandler for DetachBeforePublication {
+    async fn call(
+        &self,
+        operation: &str,
+        arguments: &BTreeMap<String, Value>,
+        context: WipCallContext,
+    ) -> Result<WipOperationOutput, WipOperationError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let tool = match operation {
+            "write" => "Write",
+            "edit" => "Edit",
+            "create_file" => "Create",
+            _ => panic!("mutation fixture only"),
+        };
+        let result = tools::execute_checkout_tool(
+            self.file.provider.router.clone(),
+            self.file.provider.tracker.clone(),
+            &self.file.alias,
+            self.file.generation,
+            self.file.target.clone(),
+            self.file.observation.validator.clone(),
+            tool,
+            wip_to_json(&Value::Record(arguments.clone())).unwrap(),
+            context.execution,
+        )
+        .await
+        .map_err(map_tool_error)?;
+        self.file
+            .provider
+            .router
+            .detach(&WorkdirAttachmentAlias::new(&self.file.alias).unwrap())
+            .await
+            .unwrap();
+        self.file.publish_result(tool, result)
+    }
+}
+
+#[tokio::test]
+async fn committed_checkout_mutation_losing_connection_is_unknown_not_rejected_or_replayed() {
+    use crate::wip::{WipAuditOutcome, WipRuntime};
+    for (operation, arguments, target, result_path, expected) in [
+        (
+            "write",
+            json!({"content":"saved\n"}),
+            "a.txt",
+            "a.txt",
+            "saved\n",
+        ),
+        (
+            "edit",
+            json!({"old_string":"old", "new_string":"changed"}),
+            "a.txt",
+            "a.txt",
+            "changed\n",
+        ),
+        (
+            "create_file",
+            json!({"path":"new.txt", "content":"created\n"}),
+            "dir",
+            "dir/new.txt",
+            "created\n",
+        ),
+    ] {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("dir")).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old\n").unwrap();
+        let router = Arc::new(WorkdirSessionRouter::new());
+        router
+            .attach(
+                WorkdirAttachmentAlias::new("main").unwrap(),
+                HookedSession::new(&dir),
+            )
+            .unwrap();
+        let p = provider(router.clone());
+        if operation != "create_file" {
+            p.node("/checkouts/main/a.txt")
+                .await
+                .unwrap()
+                .unwrap()
+                .handler
+                .call("read", &BTreeMap::new(), context())
+                .await
+                .unwrap_or_else(|_| panic!("prior Read failed"));
+        }
+        let selected = router.resolve(Some("main")).unwrap();
+        let target = WorkdirPath::new(target).unwrap();
+        let observation = selected
+            .session
+            .checkout_observe(target.clone())
+            .await
+            .unwrap();
+        let file = FileHandler {
+            provider: p.clone(),
+            alias: "main".into(),
+            generation: selected.generation,
+            workdir: selected.session.workdir().id().as_str().into(),
+            target,
+            observation,
+        };
+        drop(selected);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let route = object_path("main", &file.target);
+        let mut projection = p.node(&route).await.unwrap().unwrap();
+        let interface = projection.interface.clone();
+        projection.handler = Arc::new(DetachBeforePublication {
+            file,
+            calls: calls.clone(),
+        });
+        let mut registry = WipMountRegistry::new();
+        registry
+            .allocate_namespace("checkout", "checkouts")
+            .unwrap();
+        // Static observation metadata isolates the response boundary; real
+        // execution still uses checked provider authority and prior Read.
+        registry
+            .mount(p.node("/checkouts/main").await.unwrap().unwrap())
+            .unwrap();
+        registry.mount(projection).unwrap();
+        let runtime = WipRuntime::from_mounts(registry, "post-commit-test".into()).unwrap();
+        let error = runtime
+            .invoke(
+                route,
+                interface,
+                operation.into(),
+                arguments,
+                Default::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("outcome unknown"),
+            "{operation}: {error}"
+        );
+        assert_eq!(
+            runtime.audit().last().unwrap().outcome,
+            WipAuditOutcome::OutcomeUnknown
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(result_path)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "completed mutation must never replay"
+        );
+        assert_eq!(runtime.metrics().operation_round_trips, 1);
+    }
+}
+
+#[tokio::test]
+async fn readonly_checkout_result_losing_connection_keeps_validator_mismatch() {
+    let dir = TempDir::new().unwrap();
+    let router = Arc::new(WorkdirSessionRouter::new());
+    let alias = WorkdirAttachmentAlias::new("main").unwrap();
+    router
+        .attach(alias.clone(), HookedSession::new(&dir))
+        .unwrap();
+    let selected = router.resolve(Some("main")).unwrap();
+    let file = FileHandler {
+        provider: provider(router.clone()),
+        alias: "main".into(),
+        generation: selected.generation,
+        workdir: selected.session.workdir().id().as_str().into(),
+        target: WorkdirPath::root(),
+        observation: selected
+            .session
+            .checkout_observe(WorkdirPath::root())
+            .await
+            .unwrap(),
+    };
+    drop(selected);
+    router.detach(&alias).await.unwrap();
+    for tool in ["Read", "List", "Glob", "Grep"] {
+        let result = tools::CheckoutToolOutput {
+            output: agen::tool::ToolOutput {
+                summary: "finished".into(),
+                content: None,
+                attachments: vec![],
+            },
+            paths: vec![],
+            listing: None,
+            validator: None,
+        };
+        assert_validator_mismatch(file.publish_result(tool, result));
+    }
 }

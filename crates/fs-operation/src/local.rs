@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufReader, Read};
@@ -7,9 +9,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AtomicWriteMode, BoundedReadLimits, ContentHash, EditRequest, EditResult, EntryKind,
-    FsAccessPolicy, FsError, FsPath, ListEntry, ListRequest, ListResult, ReadBytesRequest,
-    ReadBytesResult, ReadRequest, ReadResult, StatRequest, StatResult, WriteRequest, WriteResult,
-    direct_symlink,
+    FsAccessPolicy, FsError, FsPath, ListCursor, ListEntry, ListRequest, ListResult,
+    ReadBytesRequest, ReadBytesResult, ReadRequest, ReadResult, StatRequest, StatResult,
+    WriteRequest, WriteResult, direct_symlink,
 };
 
 const READ_BUFFER_BYTES: usize = 16 * 1024;
@@ -437,12 +439,55 @@ pub fn run_edit(
     })
 }
 
+fn list_order(
+    left_kind: EntryKind,
+    left: &FsPath,
+    right_kind: EntryKind,
+    right: &FsPath,
+) -> Ordering {
+    (left_kind != EntryKind::Directory)
+        .cmp(&(right_kind != EntryKind::Directory))
+        .then_with(|| left.as_str().cmp(right.as_str()))
+}
+
+struct RetainedListEntry(ListEntry);
+
+impl PartialEq for RetainedListEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for RetainedListEntry {}
+impl Ord for RetainedListEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        list_order(self.0.kind, &self.0.path, other.0.kind, &other.0.path)
+    }
+}
+impl PartialOrd for RetainedListEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn list_entry_bytes(entry: &ListEntry) -> usize {
+    entry.path.as_str().len().saturating_add(64)
+}
+
 pub fn run_list(
     root: &Path,
     request: ListRequest,
     access: &dyn FsAccessPolicy,
 ) -> Result<ListResult, FsError> {
     let logical = request.path;
+    if let Some(after) = &request.after {
+        if after.path.is_root()
+            || Path::new(after.path.as_str()).parent() != Some(Path::new(logical.as_str()))
+        {
+            return Err(FsError::InvalidArgument(
+                "List cursor must name a direct child of the listed directory".into(),
+            ));
+        }
+    }
     access
         .check_cancelled()
         .map_err(|error| map_io(&logical, error))?;
@@ -462,11 +507,15 @@ pub fn run_list(
             total_entries: 0,
             total_bytes: 0,
             truncated: false,
+            next_after: None,
         });
     }
-    let mut entries = Vec::new();
+    let mut entries: BinaryHeap<RetainedListEntry> = BinaryHeap::new();
+    let mut retained_limit = request.limit.saturating_add(1);
     let mut retained_path_bytes = 0_usize;
-    let mut provider_truncated = false;
+    let mut total_entries = 0usize;
+    let mut total_bytes = 0u64;
+    let mut remaining_entries = 0usize;
     let read_dir = access
         .open_read_dir(&logical_base, &path)
         .map_err(|error| map_io(&logical, error))?;
@@ -513,34 +562,77 @@ pub fn run_list(
         let Ok(result_path) = FsPath::new(relative) else {
             continue;
         };
-        let retained = result_path.as_str().len().saturating_add(64);
-        if retained_path_bytes.saturating_add(retained) > crate::MAX_RESULT_PATH_BYTES {
-            provider_truncated = true;
-            break;
+        total_entries += 1;
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        if request.after.as_ref().is_some_and(|after| {
+            list_order(kind, &result_path, after.kind, &after.path) != Ordering::Greater
+        }) {
+            continue;
         }
-        retained_path_bytes = retained_path_bytes.saturating_add(retained);
-        entries.push(ListEntry {
+        remaining_entries += 1;
+        let candidate = RetainedListEntry(ListEntry {
             path: result_path,
             kind,
             size: metadata.len(),
         });
+        if entries.len() == retained_limit {
+            if candidate >= *entries.peek().expect("nonempty List retention") {
+                continue;
+            }
+            retained_path_bytes -= list_entry_bytes(&entries.pop().unwrap().0);
+        }
+        retained_path_bytes = retained_path_bytes.saturating_add(list_entry_bytes(&candidate.0));
+        entries.push(candidate);
+        // Evict greatest keys, never stop scanning: enumeration order is
+        // unspecified and a later entry may precede every retained key.
+        while retained_path_bytes > crate::MAX_RESULT_PATH_BYTES {
+            retained_path_bytes -= list_entry_bytes(&entries.pop().unwrap().0);
+            // Never grow cardinality again after a byte-bound eviction: a
+            // later short path must not leap over a discarded earlier key.
+            retained_limit = entries.len();
+        }
+        if retained_limit == 0 {
+            return Err(FsError::InvalidArgument(
+                "List entry exceeds provider response bound".into(),
+            ));
+        }
     }
-    entries.sort_by(|left, right| {
-        let left_dir = left.kind == EntryKind::Directory;
-        let right_dir = right.kind == EntryKind::Directory;
-        right_dir
-            .cmp(&left_dir)
-            .then_with(|| left.path.as_str().cmp(right.path.as_str()))
-    });
-    let total_entries = entries.len();
-    let total_bytes = entries.iter().map(|entry| entry.size).sum();
-    let truncated = provider_truncated || entries.len() > request.limit;
+    let mut entries: Vec<_> = entries
+        .into_sorted_vec()
+        .into_iter()
+        .map(|entry| entry.0)
+        .collect();
     entries.truncate(request.limit);
+    // Continuation duplicates the last path on the wire; include it in the
+    // aggregate provider response bound too.
+    let mut response_bytes: usize = entries.iter().map(list_entry_bytes).sum();
+    while remaining_entries > entries.len()
+        && entries.last().is_some_and(|last| {
+            response_bytes.saturating_add(list_entry_bytes(last)) > crate::MAX_RESULT_PATH_BYTES
+        })
+    {
+        response_bytes -= list_entry_bytes(&entries.pop().unwrap());
+    }
+    if request.limit > 0 && remaining_entries > 0 && entries.is_empty() {
+        return Err(FsError::InvalidArgument(
+            "List entry exceeds provider response bound".into(),
+        ));
+    }
+    let truncated = remaining_entries > entries.len();
+    let next_after = if truncated {
+        entries.last().map(|entry| ListCursor {
+            kind: entry.kind,
+            path: entry.path.clone(),
+        })
+    } else {
+        None
+    };
     Ok(ListResult {
         entries,
         total_entries,
         total_bytes,
         truncated,
+        next_after,
     })
 }
 

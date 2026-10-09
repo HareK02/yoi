@@ -113,7 +113,7 @@ async fn checkout_wip_search_preserves_root_and_nested_ignore_rules_and_links() 
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|item| item["path"].as_str().unwrap().to_string())
+                .map(|item| item["entry"].as_str().unwrap().to_string())
                 .collect::<Vec<_>>();
             // Grep retains traversal order; Glob sorts its result paths.
             paths.sort();
@@ -159,8 +159,8 @@ async fn checkout_wip_native_roundtrip_search_read_edit_write_create() {
     .await
     .unwrap();
     let grep_result: Json = serde_json::from_str(grep.content.as_deref().unwrap()).unwrap();
-    assert_eq!(grep_result["items"][0]["path"], file);
-    let followed = grep_result["items"][0]["path"].as_str().unwrap();
+    assert_eq!(grep_result["items"][0]["entry"], file);
+    let followed = grep_result["items"][0]["entry"].as_str().unwrap();
     assert_eq!(followed, file);
     assert!(
         call(
@@ -588,8 +588,9 @@ async fn checkout_wip_scoped_child_search_and_revoke_cannot_expose_siblings() {
         .observe_live("/checkouts/child", 2)
         .await
         .unwrap();
-    assert_eq!(observed.children.unwrap().len(), 1);
+    assert!(observed.children.unwrap().is_empty());
     for (op, args) in [
+        ("list", json!({"limit":1})),
         ("glob", json!({"pattern":"**/*"})),
         (
             "grep",
@@ -652,5 +653,341 @@ async fn checkout_wip_scoped_child_search_and_revoke_cannot_expose_siblings() {
     assert_eq!(
         std::fs::read_to_string(dir.path().join("child/a.txt")).unwrap(),
         "changed"
+    );
+}
+
+pub(super) fn json_content(output: ToolOutput) -> Json {
+    serde_json::from_str(output.content.as_deref().unwrap()).unwrap()
+}
+pub(super) async fn model_operation(
+    r: Arc<WipRuntime>,
+    name: &str,
+    args: Json,
+) -> Result<ToolOutput, ToolError> {
+    let (_, tool) = wip_tool_definitions(r)
+        .into_iter()
+        .map(|definition| definition())
+        .find(|(meta, _)| meta.name == name)
+        .unwrap();
+    tool.execute(&args.to_string(), Default::default()).await
+}
+pub(super) async fn model_inspect(r: Arc<WipRuntime>, path: &str) -> Json {
+    json_content(
+        model_operation(r, "Inspect", json!({"path":path}))
+            .await
+            .unwrap(),
+    )
+}
+pub(super) async fn model_invoke(
+    r: Arc<WipRuntime>,
+    inspected: &Json,
+    operation: &str,
+    arguments: Json,
+) -> Result<ToolOutput, ToolError> {
+    model_operation(r, "Invoke", json!({"path":inspected["path"], "interface":inspected["interfaces"][0]["reference"], "operation":operation, "arguments":arguments})).await
+}
+
+#[tokio::test]
+async fn checkout_depth_boundaries_are_independent_of_empty_small_or_large_contents() {
+    for count in [0, 2, 1100] {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("nested/deep")).unwrap();
+        for n in 0..count {
+            std::fs::write(dir.path().join(format!("file-{n}")), "fixture").unwrap();
+        }
+        let router = Arc::new(WorkdirSessionRouter::new());
+        router
+            .attach(
+                WorkdirAttachmentAlias::new("main").unwrap(),
+                session(&dir, true),
+            )
+            .unwrap();
+        let r = runtime(router, None);
+        let one = r.host.observe_live("/checkouts", 1).await.unwrap();
+        assert!(one.children.unwrap()[0].children.is_none());
+        for depth in [2, 32] {
+            let observation = r.host.observe_live("/checkouts", depth).await.unwrap();
+            let entrances = observation.children.unwrap();
+            assert_eq!(entrances.len(), 1);
+            assert_eq!(entrances[0].children, Some(vec![]));
+        }
+        let world = r.host.observe_live("/", 32).await.unwrap();
+        assert_eq!(
+            world.children.unwrap()[0].children.as_ref().unwrap()[0].children,
+            Some(vec![])
+        );
+        for path in ["/checkouts/main", "/checkouts/main/nested/deep"] {
+            assert!(
+                r.host
+                    .observe_live(path, 0)
+                    .await
+                    .unwrap()
+                    .children
+                    .is_none()
+            );
+            assert_eq!(
+                r.host.observe_live(path, 1).await.unwrap().children,
+                Some(vec![])
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn checkout_model_list_glob_grep_entries_are_lazy_and_never_become_tree_edges() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("empty")).unwrap();
+    std::fs::create_dir_all(dir.path().join("nested/deep")).unwrap();
+    std::fs::write(dir.path().join("nested/deep/a.txt"), "needle\n").unwrap();
+    std::fs::write(dir.path().join("z.txt"), "needle\n").unwrap();
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(
+            WorkdirAttachmentAlias::new("main").unwrap(),
+            session(&dir, true),
+        )
+        .unwrap();
+    let r = Arc::new(runtime(router, None));
+    let entrance = model_inspect(r.clone(), "/checkouts/main").await;
+    assert_eq!(entrance["path"], "/checkouts/main");
+    assert_eq!(
+        entrance["interfaces"][0]["reference"]["scope"],
+        "/checkouts/main"
+    );
+    let projection = r
+        .host
+        .projection_live("/checkouts/main")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        entrance["object_signature"],
+        wip_text_view::render_object(&projection.object).unwrap()
+    );
+    assert_eq!(
+        entrance["interfaces"][0]["signature"],
+        wip_text_view::render_interface(&wip_text_view::Interface {
+            reference: &projection.interface,
+            descriptor: &projection.descriptor
+        })
+        .unwrap()
+    );
+    assert!(
+        entrance["interfaces"][0]["signature"]
+            .as_str()
+            .unwrap()
+            .contains("entry")
+    );
+    let mut after = None;
+    let mut items = vec![];
+    loop {
+        let mut args = json!({"limit":1});
+        if let Some(cursor) = after {
+            args["after"] = cursor;
+        }
+        let page = json_content(
+            model_invoke(r.clone(), &entrance, "list", args)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        items.push(page["items"][0].clone());
+        if page["truncated"] == false {
+            assert!(page.get("after").is_none());
+            break;
+        }
+        after = Some(page["after"].clone());
+    }
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item["entry"].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            json!("/checkouts/main/empty"),
+            json!("/checkouts/main/nested"),
+            json!("/checkouts/main/z.txt")
+        ]
+    );
+    assert_eq!(items[0]["kind"], "directory");
+    assert_eq!(items[2]["kind"], "file");
+    let empty = model_inspect(r.clone(), items[0]["entry"].as_str().unwrap()).await;
+    assert_eq!(
+        json_content(
+            model_invoke(r.clone(), &empty, "list", json!({}))
+                .await
+                .unwrap()
+        )["items"],
+        json!([])
+    );
+    let deep = model_inspect(r.clone(), "/checkouts/main/nested/deep").await;
+    assert_eq!(
+        deep["interfaces"][0]["reference"]["scope"],
+        "/checkouts/main"
+    );
+    for (operation, args) in [
+        ("list", json!({})),
+        ("glob", json!({"pattern":"*.txt"})),
+        (
+            "grep",
+            json!({"pattern":"needle", "output_mode":"files_with_matches"}),
+        ),
+    ] {
+        let found = json_content(
+            model_invoke(r.clone(), &deep, operation, args)
+                .await
+                .unwrap(),
+        );
+        let path = found["items"][0]["entry"].as_str().unwrap();
+        assert_eq!(path, "/checkouts/main/nested/deep/a.txt");
+        // No result-wide eager acquisition by Host or Client.
+        if operation == "list" {
+            let state = r.state.lock().unwrap();
+            assert!(state.client.object(&state.session, path).is_none());
+        }
+        let inspected = model_inspect(r.clone(), path).await;
+        let read = json_content(
+            model_invoke(r.clone(), &inspected, "read", json!({}))
+                .await
+                .unwrap(),
+        );
+        assert!(read["content"].as_str().unwrap().contains("needle"));
+    }
+    let tree = json_content(
+        model_operation(r.clone(), "Tree", json!({"path":"/checkouts", "depth":8}))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(tree["tree"]["children"][0]["children"], json!([]));
+    std::fs::remove_file(dir.path().join("nested/deep/a.txt")).unwrap();
+    assert!(
+        model_operation(
+            r,
+            "Inspect",
+            json!({"path":"/checkouts/main/nested/deep/a.txt", "refresh":true})
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn checkout_list_permission_cannot_be_bypassed_with_glob_or_command_identity() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "fixture").unwrap();
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(
+            WorkdirAttachmentAlias::new("main").unwrap(),
+            session(&dir, true),
+        )
+        .unwrap();
+    let r = runtime(
+        router,
+        Some(ToolPermissionConfig {
+            default_action: ToolPermissionAction::Allow,
+            rules: vec![manifest::ToolPermissionRule {
+                tool: "List".into(),
+                pattern: "*".into(),
+                action: ToolPermissionAction::Deny,
+            }],
+        }),
+    );
+    let p = r
+        .host
+        .projection_live("/checkouts/main")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!p.descriptor.operations.iter().any(|op| op.name == "list"));
+    assert!(p.descriptor.operations.iter().any(|op| op.name == "glob"));
+    let denied = p
+        .handler
+        .call(
+            "list",
+            &BTreeMap::new(),
+            WipCallContext {
+                execution: Default::default(),
+                security_context: "fixture".into(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(denied, Err(WipOperationError::Protocol(e)) if e.code == ProtocolErrorCode::PermissionDenied)
+    );
+}
+
+#[tokio::test]
+async fn checkout_ancestor_scope_rejects_siblings_prefixes_refs_and_old_connection_before_read() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "same\n").unwrap();
+    let router = Arc::new(WorkdirSessionRouter::new());
+    let main = WorkdirAttachmentAlias::new("main").unwrap();
+    router.attach(main.clone(), session(&dir, true)).unwrap();
+    router
+        .attach(
+            WorkdirAttachmentAlias::new("main-extra").unwrap(),
+            session(&dir, true),
+        )
+        .unwrap();
+    let r = runtime(router.clone(), None);
+    let path = "/checkouts/main/a.txt";
+    let p = r.host.projection_live(path).await.unwrap().unwrap();
+    let fetched = r.host.fetch_interface_live(&p.interface).await.unwrap();
+    assert!(
+        fetched.scope_ref.is_none(),
+        "ref-less publication is legitimate"
+    );
+    // Ordinary content changes do not terminate the entrance's Interface lifetime.
+    std::fs::write(dir.path().join("new.txt"), "fixture").unwrap();
+    assert_eq!(
+        r.host
+            .fetch_interface_live(&p.interface)
+            .await
+            .unwrap()
+            .interface,
+        p.interface
+    );
+    let request = |reference, scope_ref| CallOperationRequest {
+        target: wip_protocol::Target {
+            path: path.into(),
+            validator: None,
+        },
+        interface: wip_protocol::InterfaceTarget {
+            reference,
+            scope_ref,
+            validator: None,
+        },
+        operation: "read".into(),
+        arguments: BTreeMap::new(),
+    };
+    for scope in ["/checkouts/main-extra", "/checkouts/main/a"] {
+        let mut wrong = p.interface.clone();
+        wrong.scope = scope.into();
+        assert!(r.host.fetch_interface_live(&wrong).await.is_err());
+        let forged = request(wrong, None);
+        let result = r
+            .host
+            .call(
+                forged,
+                WipCallContext {
+                    execution: Default::default(),
+                    security_context: "fixture".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(result,Err(WipOperationError::Protocol(e)) if e.code == ProtocolErrorCode::InterfaceMismatch)
+        );
+    }
+    let forged = request(p.interface.clone(), Some("old".into()));
+    assert!(
+        matches!(r.host.call(forged, WipCallContext { execution:Default::default(),security_context:"fixture".into() }).await, Err(WipOperationError::Protocol(e)) if e.code == ProtocolErrorCode::InterfaceMismatch)
+    );
+    router.detach(&main).await.unwrap();
+    router.attach(main, session(&dir, true)).unwrap();
+    let forged = request(p.interface.clone(), None);
+    assert!(
+        matches!(r.host.call(forged, WipCallContext { execution:Default::default(),security_context:"fixture".into() }).await, Err(WipOperationError::Protocol(e)) if e.code == ProtocolErrorCode::InterfaceMismatch)
     );
 }

@@ -110,6 +110,7 @@ pub(crate) async fn execute_edit(
             attachments: Vec::new(),
         },
         paths: Vec::new(),
+        listing: None,
         validator,
     })
 }
