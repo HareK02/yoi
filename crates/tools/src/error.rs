@@ -42,11 +42,7 @@ impl From<ToolsError> for ToolError {
                 // Diagnostic context is transparent to the established normal-tool
                 // classification. Preserve the original display, including unknown
                 // outcome guidance, while classifying through nested wrappers.
-                let mut classification = error;
-                while let workdir::WorkdirError::DenialContext { source, .. } = classification {
-                    classification = source.as_ref();
-                }
-                match classification {
+                match error.classification_source() {
                     workdir::WorkdirError::NotFound(_)
                     | workdir::WorkdirError::Io { .. }
                     | workdir::WorkdirError::Unavailable(_)

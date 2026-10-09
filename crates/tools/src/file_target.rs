@@ -139,12 +139,8 @@ impl FileTarget {
 
 pub(crate) fn checked_error(error: workdir::WorkdirError) -> ToolError {
     use workdir::WorkdirError;
-    if let WorkdirError::DenialContext { source, .. } = error {
-        // Diagnostic enrichment must not change the established tool classification.
-        return checked_error(*source);
-    }
-    let code = match &error {
-        WorkdirError::DenialContext { .. } => unreachable!("unwrapped above"),
+    let code = match error.classification_source() {
+        WorkdirError::DenialContext { .. } => unreachable!("diagnostic context unwrapped"),
         WorkdirError::Conflict(_) | WorkdirError::NotFound(_) => "checkout_stale",
         WorkdirError::Denied { .. }
         | WorkdirError::OutOfScope { .. }

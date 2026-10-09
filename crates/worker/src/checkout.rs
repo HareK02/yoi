@@ -194,12 +194,8 @@ impl Provider {
             Err(failure) => {
                 // Internal diagnostic enrichment is transparent to WIP's existing
                 // unavailable/refusal classification, including remote providers.
-                let mut classification = &failure;
-                while let workdir::WorkdirError::DenialContext { source, .. } = classification {
-                    classification = source.as_ref();
-                }
                 if matches!(
-                    classification,
+                    failure.classification_source(),
                     workdir::WorkdirError::Denied(_)
                         | workdir::WorkdirError::OutOfScope(_)
                         | workdir::WorkdirError::NotFound(_)

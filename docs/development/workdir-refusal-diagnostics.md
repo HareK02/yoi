@@ -131,6 +131,12 @@ is never parsed into a reason.
   18 codes with no reason, a typed reason, and nested diagnostic wrappers. In
   particular, OutcomeUnknown/Conflict remain execution failures with unchanged
   display and inspection-before-retry guidance, not argument errors.
+  Operational consumers share `WorkdirError::classification_source` to ignore
+  only diagnostic wrappers while retaining the original error for diagnostics.
+  Public Write tests cross JSON stat errors into the tool and the checked local
+  provider: missing files are created identically without/with/nested reasons;
+  denied/read-only/conflict/unknown-outcome stat failures never write or retry.
+  This protects actual create control flow in addition to error conversion.
 - A signed real self-handler test observes command dispatch, then removes only
   its fixture session-registration entry before returning the start handle.
   The 502 remains a post-start `command_registration` failure with a neutral

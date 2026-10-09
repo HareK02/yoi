@@ -515,6 +515,17 @@ pub enum WorkdirError {
 }
 
 impl WorkdirError {
+    /// The error used for operational classification, ignoring only diagnostic
+    /// context (including nested context). Keep the original error for display
+    /// and `denial_reason`: enrichment must not alter behavior or retry policy.
+    pub fn classification_source(&self) -> &Self {
+        let mut error = self;
+        while let Self::DenialContext { source, .. } = error {
+            error = source;
+        }
+        error
+    }
+
     pub fn denied(reason: WorkdirDenialReason, message: impl Into<String>) -> Self {
         Self::Denied(WorkdirDenial {
             reason: Some(reason),
