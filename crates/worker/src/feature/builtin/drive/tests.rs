@@ -294,6 +294,143 @@ async fn uncommitted_receipt_snapshot_does_not_turn_unknown_into_failure_or_retr
     assert_eq!(client.requests.lock().unwrap().len(), 2);
 }
 
+fn invalid_completions(id: &str) -> Vec<DriveMutationResponse> {
+    let mut invalid_entry = entry("2", "2");
+    invalid_entry.revision = "not-a-revision".into();
+    vec![
+        DriveMutationResponse {
+            request_id: "another-request".into(),
+            entry: Some(entry("2", "2")),
+        },
+        DriveMutationResponse {
+            request_id: id.into(),
+            entry: Some(invalid_entry),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn invalid_mutation_completion_recovers_from_original_receipt_without_resending() {
+    let context = ToolExecutionContext::new("write", "batch", 0);
+    let client = Client::new(vec![]);
+    let feature = feature(client.clone());
+    let id = feature.request_id(&context);
+    for completion in invalid_completions(&id) {
+        let committed = DriveMutationResponse {
+            request_id: id.clone(),
+            entry: Some(entry("2", "2")),
+        };
+        client.requests.lock().unwrap().clear();
+        client.responses.lock().unwrap().extend([
+            Ok(response(completion)),
+            Ok(response(DriveRequestStatusResponse {
+                request_id: id.clone(),
+                state: DriveRequestState::Committed,
+                response: Some(committed.clone()),
+            })),
+        ]);
+        feature.observe(entry("2", "1")).unwrap();
+        let output = feature
+            .execute(
+                "DriveWrite",
+                &json!({"entry":entry("2", "1").entry,"content":"new"}).to_string(),
+                &context,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.value["request_id"], id);
+        assert_eq!(output.value["entry"]["metadata"]["revision"], "2");
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].method,
+            crate::worker::WorkspaceRequestMethod::Post
+        );
+        assert_eq!(
+            requests[1].method,
+            crate::worker::WorkspaceRequestMethod::Get
+        );
+        assert!(requests[1].path.ends_with(&format!("/requests/{id}")));
+        let body: Value = serde_json::from_str(requests[0].body.as_ref().unwrap()).unwrap();
+        assert_eq!(body["request_id"], id);
+        assert_eq!(body["mutation"]["expected_revision"], "1");
+    }
+}
+
+#[tokio::test]
+async fn invalid_completion_and_unresolved_or_invalid_receipt_stay_unknown_after_one_query() {
+    let context = ToolExecutionContext::new("write", "batch", 0);
+    let client = Client::new(vec![]);
+    let feature = feature(client.clone());
+    let id = feature.request_id(&context);
+    let committed = DriveMutationResponse {
+        request_id: id.clone(),
+        entry: Some(entry("2", "2")),
+    };
+    let mut receipts = vec![
+        response(DriveRequestStatusResponse {
+            request_id: id.clone(),
+            state: DriveRequestState::Uncommitted,
+            response: None,
+        }),
+        response(DriveRequestStatusResponse {
+            request_id: id.clone(),
+            state: DriveRequestState::Committed,
+            response: None,
+        }),
+        response(DriveRequestStatusResponse {
+            request_id: "another-request".into(),
+            state: DriveRequestState::Committed,
+            response: Some(committed),
+        }),
+        WorkspaceResponse {
+            status: 200,
+            body: "invalid-json".into(),
+        },
+    ];
+    receipts.extend(invalid_completions(&id).into_iter().map(|completion| {
+        response(DriveRequestStatusResponse {
+            request_id: id.clone(),
+            state: DriveRequestState::Committed,
+            response: Some(completion),
+        })
+    }));
+    for completion in invalid_completions(&id) {
+        for receipt in &receipts {
+            client.requests.lock().unwrap().clear();
+            client
+                .responses
+                .lock()
+                .unwrap()
+                .extend([Ok(response(&completion)), Ok(receipt.clone())]);
+            feature.observe(entry("2", "1")).unwrap();
+            let result = feature
+                .execute(
+                    "DriveWrite",
+                    &json!({"entry":entry("2", "1").entry,"content":"new"}).to_string(),
+                    &context,
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(DriveError::OutcomeUnknown(ref observed)) if observed == &id)
+            );
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                requests[0].method,
+                crate::worker::WorkspaceRequestMethod::Post
+            );
+            assert_eq!(
+                requests[1].method,
+                crate::worker::WorkspaceRequestMethod::Get
+            );
+            assert!(requests[1].path.ends_with(&format!("/requests/{id}")));
+        }
+    }
+}
+
 #[tokio::test]
 async fn observation_eviction_never_substitutes_another_entry() {
     let feature = feature(Client::new(Vec::new()));

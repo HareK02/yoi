@@ -727,6 +727,80 @@ async fn unsafe_names_and_oversized_text_cannot_publish_and_reads_truncate_at_ut
 }
 
 #[tokio::test]
+async fn omitted_discovery_limits_use_backend_maximum_pages_in_tools_and_native_wip() {
+    let f = Fixture::new(["read_write", "read_only"]).await;
+    let mut expected = std::collections::BTreeSet::new();
+    for index in 0..201 {
+        let created = f
+            .create(&format!("default-page-{index:03}.md"), "bounded")
+            .await;
+        expected.insert(entry(&created)["node_id"].as_str().unwrap().to_owned());
+    }
+    let native = native_tools(&f.features[1]);
+    let root = value(
+        native_tool(&native, "Inspect", json!({"path":"/drive","refresh":true}))
+            .await
+            .unwrap(),
+    );
+    let reference = root["interfaces"][0]["reference"].clone();
+    for use_native in [false, true] {
+        for (name, operation, mut args, maximum) in [
+            (
+                "DriveList",
+                "list",
+                json!({}),
+                server_api::DRIVE_PAGE_MAX_LIMIT as usize,
+            ),
+            (
+                "DriveSearch",
+                "search",
+                json!({"query":"default-page-"}),
+                server_api::DRIVE_SEARCH_MAX_LIMIT as usize,
+            ),
+        ] {
+            let mut actual = Vec::new();
+            for page_index in 0..2 {
+                let output = if use_native {
+                    native_tool(&native, "Invoke", json!({"path":"/drive","interface":reference,"operation":operation,"arguments":args})).await
+                } else {
+                    tool(&f.features[1], name, args.clone()).await
+                };
+                let page = value(output.unwrap());
+                let entries = page["entries"].as_array().unwrap();
+                assert_eq!(
+                    entries.len(),
+                    if page_index == 0 {
+                        maximum
+                    } else {
+                        201 - maximum
+                    },
+                    "native={use_native} operation={operation}"
+                );
+                actual.extend(entries.iter().map(|e| {
+                    e["metadata"]["entry"]["node_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                }));
+                if page_index == 0 {
+                    assert!(page["next_after"].is_string());
+                    args["after"] = page["next_after"].clone();
+                } else {
+                    assert!(page["next_after"].is_null());
+                }
+            }
+            assert_eq!(actual.len(), expected.len());
+            assert_eq!(
+                actual
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                expected
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn list_and_search_pages_are_bounded_disjoint_and_cursors_follow_backend_scope() {
     let f = Fixture::new(["read_write", "read_only"]).await;
     let mut expected = Vec::new();

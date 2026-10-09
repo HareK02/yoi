@@ -172,7 +172,12 @@ impl DriveBackend {
                 },
             )
             .await?;
-        self.validate_page(&result, limit.unwrap_or(100).min(DRIVE_PAGE_MAX_LIMIT))?;
+        self.validate_page(
+            &result,
+            limit
+                .unwrap_or(DRIVE_PAGE_MAX_LIMIT)
+                .min(DRIVE_PAGE_MAX_LIMIT),
+        )?;
         if result
             .entries
             .iter()
@@ -186,7 +191,10 @@ impl DriveBackend {
         let result: DriveListResponse = self.get("/search", &query).await?;
         self.validate_page(
             &result,
-            query.limit.unwrap_or(100).min(DRIVE_SEARCH_MAX_LIMIT),
+            query
+                .limit
+                .unwrap_or(DRIVE_SEARCH_MAX_LIMIT)
+                .min(DRIVE_SEARCH_MAX_LIMIT),
         )?;
         Ok(result)
     }
@@ -276,25 +284,37 @@ impl DriveBackend {
         id: &str,
         result: Result<DriveMutationResponse, DriveError>,
     ) -> Result<DriveMutationResponse, DriveError> {
-        let response = match result {
+        // A parseable success can still be an invalid completion. Classify it
+        // before reconciliation so it also gets one original-request inquiry.
+        let result = result.and_then(|response| {
+            self.validate_completion(id, &response)
+                .map_err(|_| DriveError::OutcomeUnknown(id.into()))?;
+            Ok(response)
+        });
+        match result {
             Err(DriveError::OutcomeUnknown(_)) => match self.status(id).await {
                 Ok(DriveRequestStatusResponse {
                     state: DriveRequestState::Committed,
                     response: Some(response),
                     ..
-                }) => response,
-                _ => return Err(DriveError::OutcomeUnknown(id.into())),
+                }) => Ok(response), // status validates both IDs and entry metadata
+                _ => Err(DriveError::OutcomeUnknown(id.into())),
             },
-            other => other?,
-        };
+            other => other,
+        }
+    }
+    fn validate_completion(
+        &self,
+        id: &str,
+        response: &DriveMutationResponse,
+    ) -> Result<(), DriveError> {
         if response.request_id != id {
-            return Err(DriveError::OutcomeUnknown(id.into()));
+            return Err(DriveError::Unavailable);
         }
         if let Some(entry) = &response.entry {
-            self.validate_entry(entry)
-                .map_err(|_| DriveError::OutcomeUnknown(id.into()))?;
+            self.validate_entry(entry)?;
         }
-        Ok(response)
+        Ok(())
     }
     pub async fn mutate(
         &self,
@@ -371,12 +391,7 @@ impl DriveBackend {
             return Err(DriveError::Unavailable);
         }
         if let Some(result) = &response.response {
-            if result.request_id != request_id {
-                return Err(DriveError::Unavailable);
-            }
-            if let Some(entry) = &result.entry {
-                self.validate_entry(entry)?;
-            }
+            self.validate_completion(request_id, result)?;
         }
         Ok(response)
     }

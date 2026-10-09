@@ -63,7 +63,9 @@ authenticated latest URLs. Deleting/recreating the same name allocates a new ID.
 | `DriveSaveWorkdir` | explicit `target_workdir` alias, relative `path`, destination `parent`, `name`, optional `content_type` (octet-stream by default) |
 | `DriveRequestStatus` | `request_id` from an uncertain mutation |
 
-List/search are paged discovery only, not implicit mutation observations. Read or
+List/search are paged discovery only, not implicit mutation observations. Omitting
+`limit` uses the Backend maximum (200 for list, 128 for search) in both Tools and
+native WIP; use the returned `next_after` to continue. Read or
 metadata-inspect an entry before replacing, editing, moving or deleting it. The
 Tools adapter retains at most 256 observations, scoped to its injected Workspace.
 Eviction requires a new explicit observation; it never substitutes another entry.
@@ -120,9 +122,11 @@ latest and retry. Observe explicitly, reconsider the edit and submit a deliberat
 new operation. Native Client stale handling likewise does not replay dispatch.
 
 Timeout, lost response, oversized/invalid mutation response or invalid completion
-may mean **OutcomeUnknown**. The adapter queries the *same* request receipt once;
-if committed it returns that confirmed DB result. Otherwise it preserves unknown
-and the `request_id`. Query `DriveRequestStatus`; an `uncommitted` snapshot is not
+may mean **OutcomeUnknown**, including a completion with a mismatched request ID
+or invalid entry metadata. The adapter queries the *same* request receipt once;
+only a committed receipt with matching IDs and valid metadata returns confirmed
+DB success. Otherwise it preserves unknown and the `request_id`. Query
+`DriveRequestStatus`; an `uncommitted` snapshot is not
 proof that an in-flight request cannot later commit. Do not retry blindly with a
 fresh request ID. Backend grants also protect receipt lookup/replay. Safe typed
 Denied/NotFound/Conflict/Invalid/Limit/StorageUnavailable/OutcomeUnknown errors are
