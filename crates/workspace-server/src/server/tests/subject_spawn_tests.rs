@@ -38,12 +38,8 @@ async fn subject_session_callback_completes_while_create_and_deletion_are_waitin
         TEST_WORKSPACE_ID.to_string(),
         build_inner_router(api.clone()),
     );
-    let gate = server.mutation_lock(TEST_WORKSPACE_ID).await;
-    let create_path = format!("/api/w/{TEST_WORKSPACE_ID}/workers");
-    let create = gate
-        .request_lock(&Method::POST, &create_path, TEST_WORKSPACE_ID)
-        .lock()
-        .await;
+    let gate = server.admission_for_workspace(TEST_WORKSPACE_ID).await;
+    let create = gate.admit(false).unwrap();
     let mut deletion = Box::pin(gate.lock_deletion());
     assert!(futures::poll!(&mut deletion).is_pending());
     let app = workspace_server_router(server);
@@ -95,29 +91,32 @@ async fn subject_session_callback_completes_while_create_and_deletion_are_waitin
     let _deletion = tokio::time::timeout(std::time::Duration::from_secs(2), deletion)
         .await
         .unwrap();
-    assert!(gate.session_attributions.try_lock().is_err());
+    assert!(gate.admit(true).is_none());
 }
 
 #[tokio::test]
 async fn workspace_deletion_waits_for_session_attribution_and_fences_both_lanes() {
-    let gate = WorkspaceMutationGate::default();
-    let attribution = gate.session_attributions.lock().await;
+    let gate = Arc::new(WorkspaceAdmission::default());
+    let attribution = gate.admit(true).unwrap();
     let mut deletion = Box::pin(gate.lock_deletion());
     assert!(futures::poll!(&mut deletion).is_pending());
-    assert!(gate.requests.try_lock().is_err());
+    assert!(gate.admit(false).is_none());
+    assert!(gate.admit(true).is_none());
     drop(attribution);
     let deletion = deletion.await;
-    assert!(gate.requests.try_lock().is_err());
-    assert!(gate.session_attributions.try_lock().is_err());
+    assert!(gate.admit(false).is_none());
+    assert!(gate.admit(true).is_none());
     drop(deletion);
-    assert!(gate.requests.try_lock().is_ok());
-    assert!(gate.session_attributions.try_lock().is_ok());
+    assert!(gate.admit(false).is_some());
+    assert!(gate.admit(true).is_some());
 }
 
 #[tokio::test]
-async fn only_exact_session_attribution_posts_can_reenter_worker_creation() {
-    let gate = WorkspaceMutationGate::default();
-    let _create = gate.requests.lock().await;
+async fn only_exact_authenticated_callbacks_can_reenter_deletion_drain() {
+    let gate = Arc::new(WorkspaceAdmission::default());
+    let _create = gate.admit(false).unwrap();
+    let mut deletion = Box::pin(gate.lock_deletion());
+    assert!(futures::poll!(&mut deletion).is_pending());
     for (method, path) in [
         (Method::POST, "/api/w/workspace-a/subjektiv/sessions"),
         (Method::POST, "/api/w/workspace-a/subjektiv/memory"),
@@ -127,9 +126,8 @@ async fn only_exact_session_attribution_posts_can_reenter_worker_creation() {
         (Method::POST, "/api/w/workspace-a/workers"),
     ] {
         let available = gate
-            .request_lock(&method, path, "workspace-a")
-            .try_lock()
-            .is_ok();
+            .admit(workspace_request_is_callback(&method, path, "workspace-a"))
+            .is_some();
         assert_eq!(
             available,
             method == Method::POST && path == "/api/w/workspace-a/subjektiv/sessions",

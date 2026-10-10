@@ -1594,6 +1594,7 @@ pub struct WorkspaceApi {
     pub(crate) worker_projection: Arc<crate::worker_projection::WorkerProjectionService>,
     resource_broker: BackendResourceBroker,
     workdir_sessions: Arc<Mutex<WorkdirSessionRegistry>>,
+    memory_operation_lock: Arc<Mutex<()>>,
     external_workdir_providers: Arc<Mutex<ExternalProviderRegistry>>,
     external_workdir_expiry_tasks: Arc<Mutex<HashMap<String, ExternalWorkdirExpiryTask>>>,
     workdir_session_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
@@ -2164,36 +2165,8 @@ impl WorkerRemovalService {
     }
 }
 
-/// Session attribution is a synchronous callback from Worker create/restore.
-/// It must not wait for the request that is waiting for that callback. Deletion
-/// acquires both lanes, in request-first order, so it cannot fence out a callback
-/// needed by an in-flight create/restore while waiting for that request to finish.
-#[derive(Default)]
-struct WorkspaceMutationGate {
-    requests: AsyncMutex<()>,
-    session_attributions: AsyncMutex<()>,
-}
-
-impl WorkspaceMutationGate {
-    fn request_lock(&self, method: &Method, path: &str, workspace_id: &str) -> &AsyncMutex<()> {
-        if *method == Method::POST && path == format!("/api/w/{workspace_id}/subjektiv/sessions") {
-            &self.session_attributions
-        } else {
-            &self.requests
-        }
-    }
-
-    async fn lock_deletion(
-        &self,
-    ) -> (
-        tokio::sync::MutexGuard<'_, ()>,
-        tokio::sync::MutexGuard<'_, ()>,
-    ) {
-        let requests = self.requests.lock().await;
-        let attributions = self.session_attributions.lock().await;
-        (requests, attributions)
-    }
-}
+mod workspace_admission;
+use workspace_admission::WorkspaceAdmission;
 
 #[derive(Clone)]
 pub struct WorkspaceServerApi {
@@ -2203,19 +2176,20 @@ pub struct WorkspaceServerApi {
     signing_materials: Arc<dyn WorkspaceSigningMaterialStore>,
     routers: Arc<AsyncMutex<HashMap<String, Router>>>,
     apis: Arc<AsyncMutex<HashMap<String, WorkspaceApi>>>,
-    mutation_locks: Arc<AsyncMutex<HashMap<String, Arc<WorkspaceMutationGate>>>>,
+    admission_gates: Arc<AsyncMutex<HashMap<String, Arc<WorkspaceAdmission>>>>,
     running_deletions: Arc<AsyncMutex<HashSet<String>>>,
+    proof_clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     hook_handles: Arc<AsyncMutex<HashMap<String, tokio::task::AbortHandle>>>,
 }
 
-async fn workspace_mutation_lock(
-    locks: &Arc<AsyncMutex<HashMap<String, Arc<WorkspaceMutationGate>>>>,
+async fn workspace_admission_gate(
+    locks: &Arc<AsyncMutex<HashMap<String, Arc<WorkspaceAdmission>>>>,
     workspace_id: &str,
-) -> Arc<WorkspaceMutationGate> {
+) -> Arc<WorkspaceAdmission> {
     let mut locks = locks.lock().await;
     locks
         .entry(workspace_id.to_string())
-        .or_insert_with(|| Arc::new(WorkspaceMutationGate::default()))
+        .or_insert_with(|| Arc::new(WorkspaceAdmission::default()))
         .clone()
 }
 
@@ -2232,14 +2206,17 @@ impl WorkspaceServerApi {
             store,
             routers: Arc::new(AsyncMutex::new(HashMap::new())),
             apis: Arc::new(AsyncMutex::new(HashMap::new())),
-            mutation_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            admission_gates: Arc::new(AsyncMutex::new(HashMap::new())),
             running_deletions: Arc::new(AsyncMutex::new(HashSet::new())),
+            proof_clock: Arc::new(|| {
+                i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap_or(i64::MAX)
+            }),
             hook_handles: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
-    async fn mutation_lock(&self, workspace_id: &str) -> Arc<WorkspaceMutationGate> {
-        workspace_mutation_lock(&self.mutation_locks, workspace_id).await
+    async fn admission_for_workspace(&self, workspace_id: &str) -> Arc<WorkspaceAdmission> {
+        workspace_admission_gate(&self.admission_gates, workspace_id).await
     }
 
     async fn api_for_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceApi>> {
@@ -2479,7 +2456,7 @@ impl WorkspaceServerApi {
             handle.abort();
         }
         self.apis.lock().await.remove(&completed.workspace_id);
-        self.mutation_locks
+        self.admission_gates
             .lock()
             .await
             .remove(&completed.workspace_id);
@@ -2735,7 +2712,7 @@ async fn authorize_scoped_workspace_request(
         } else {
             worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION
         };
-        let source = crate::worker_source::verify_runtime_request_source_proof_with_store(
+        let source = crate::worker_source::verify_runtime_request_source_proof_with_clock(
             api.store.as_ref(),
             api.template.as_ref(),
             &proof,
@@ -2744,6 +2721,7 @@ async fn authorize_scoped_workspace_request(
             &method,
             &path,
             &digest,
+            api.proof_clock.as_ref(),
         )
         .await
         .map_err(|error| {
@@ -2757,23 +2735,7 @@ async fn authorize_scoped_workspace_request(
             ));
         }
         request.extensions_mut().insert(source);
-        if !matches!(
-            *request.method(),
-            Method::GET | Method::HEAD | Method::OPTIONS
-        ) && !api
-            .store
-            .get_workspace(workspace_id)
-            .await
-            .map_err(server_error_response)?
-            .is_some_and(|workspace| workspace.state == "active")
-        {
-            return Err(repository_api_rejection(
-                &request_path,
-                StatusCode::CONFLICT,
-                "Workspace is deleting and no longer accepts mutations",
-            ));
-        }
-        return Ok(());
+        return require_active_scoped_workspace(api, workspace_id, &request_path).await;
     }
 
     let actor = resolve_server_actor(api, request.headers())
@@ -2809,21 +2771,32 @@ async fn authorize_scoped_workspace_request(
         }
     }
     request.extensions_mut().insert(actor);
-    if mutating
-        && !api
-            .store
-            .get_workspace(workspace_id)
-            .await
-            .map_err(server_error_response)?
-            .is_some_and(|workspace| workspace.state == "active")
+    require_active_scoped_workspace(api, workspace_id, &request_path).await
+}
+
+async fn require_active_scoped_workspace(
+    api: &WorkspaceServerApi,
+    workspace_id: &str,
+    path: &str,
+) -> std::result::Result<(), Response> {
+    match api
+        .store
+        .get_workspace(workspace_id)
+        .await
+        .map_err(server_error_response)?
     {
-        return Err(repository_api_rejection(
-            &request_path,
+        Some(workspace) if workspace.state == "active" => Ok(()),
+        Some(_) => Err(repository_api_rejection(
+            path,
             StatusCode::CONFLICT,
-            "Workspace is deleting and no longer accepts mutations",
-        ));
+            "Workspace is deleting and no longer accepts requests",
+        )),
+        None => Err(repository_api_rejection(
+            path,
+            StatusCode::NOT_FOUND,
+            "workspace was not found",
+        )),
     }
-    Ok(())
 }
 
 async fn authorize_workspace_api_request(
@@ -3011,17 +2984,15 @@ async fn enforce_server_cookie_mutation_origin(
     next.run(request).await
 }
 
-fn workspace_request_requires_mutation_lock(
-    method: &Method,
-    path: &str,
-    workspace_id: &str,
-) -> bool {
-    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
-        return false;
-    }
-    // Fetching a one-time Runtime resource consumes only an in-memory broker handle. It is a
-    // callback required to finish an already-gated mutation, not a Workspace state mutation.
-    path != format!("/api/runtime/v1/workspaces/{workspace_id}/resources/fetch")
+fn workspace_request_is_callback(method: &Method, path: &str, workspace_id: &str) -> bool {
+    // Only these exact authenticated callback endpoints can reenter an admitted
+    // create/restore while deletion drains. They still hold a lifecycle lease.
+    (*method == Method::POST
+        && (path == format!("/api/w/{workspace_id}/subjektiv/sessions")
+            || path == format!("/api/runtime/v1/workspaces/{workspace_id}/resources/fetch")))
+        || (*method == Method::GET
+            && (path == format!("/api/w/{workspace_id}/runtime-config")
+                || path == format!("/api/w/{workspace_id}/worker-discovery/workers")))
 }
 
 async fn dispatch_workspace_request(
@@ -3030,19 +3001,25 @@ async fn dispatch_workspace_request(
 ) -> Response {
     let path = request.uri().path().to_owned();
     let workspace_id = scoped_workspace_id(&path);
-    let mutation_gate = if let Some(workspace_id) = workspace_id
-        && workspace_request_requires_mutation_lock(request.method(), &path, workspace_id)
-    {
-        Some((api.mutation_lock(workspace_id).await, workspace_id))
-    } else {
-        None
-    };
-    let _mutation_guard = if let Some((gate, workspace_id)) = mutation_gate.as_ref() {
-        Some(
-            gate.request_lock(request.method(), &path, workspace_id)
-                .lock()
-                .await,
-        )
+    // Admission is immediate, shared, and cancellation-safe. No resource or
+    // business-operation lock may precede proof validation. The lease covers
+    // authentication and dispatch, so deletion cannot race the state check.
+    let _request_lease = if let Some(workspace_id) = workspace_id {
+        let gate = api.admission_for_workspace(workspace_id).await;
+        match gate.admit(workspace_request_is_callback(
+            request.method(),
+            &path,
+            workspace_id,
+        )) {
+            Some(lease) => Some(lease),
+            None => {
+                return repository_api_rejection(
+                    &path,
+                    StatusCode::CONFLICT,
+                    "Workspace deletion is draining requests",
+                );
+            }
+        }
     } else {
         None
     };
@@ -3596,6 +3573,7 @@ impl WorkspaceApi {
             worker_projection,
             resource_broker,
             workdir_sessions: Arc::new(Mutex::new(WorkdirSessionRegistry::default())),
+            memory_operation_lock: Arc::new(Mutex::new(())),
             external_workdir_providers: Arc::new(Mutex::new(ExternalProviderRegistry::default())),
             external_workdir_expiry_tasks: Arc::new(Mutex::new(HashMap::new())),
             workdir_session_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -7372,8 +7350,8 @@ impl server_api::ServerApi for ServerApiContractService {
                 Vec::new(),
             )
         })?;
-        let mutation_lock = api.mutation_lock(&workspace_id).await;
-        let _mutation_guard = mutation_lock.lock_deletion().await;
+        let admission_for_workspace = api.admission_for_workspace(&workspace_id).await;
+        let _mutation_guard = admission_for_workspace.lock_deletion().await;
         let existing = api
             .store
             .workspace_deletion_operation(&actor.account_id, &request.operation_id)
@@ -18861,6 +18839,12 @@ async fn scoped_memory_backend_operation(
     Json(operation): Json<MemoryBackendOperation>,
 ) -> ApiResult<Json<MemoryBackendHttpResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
+    // The legacy memory document edit is a read/replace/write across store
+    // calls. Keep that resource atomic without serializing unrelated requests.
+    let _memory_guard = api
+        .memory_operation_lock
+        .lock()
+        .expect("Memory operation lock poisoned");
     let result = execute_memory_backend_operation_with_authority(&api.authority, operation);
     let response = match result {
         Ok(result) => MemoryBackendHttpResponse::Ok { result },
@@ -32915,6 +32899,7 @@ mod tests {
     mod workdir_delegation_tests;
     mod worker_drive_tests;
     mod worker_operations_tests;
+    mod workspace_admission_tests;
     include!("server_workspace_config_tests.rs");
     use super::*;
     use axum::body::{Body, to_bytes};
@@ -35177,6 +35162,7 @@ mod tests {
         repository_access_requests:
             Arc<Mutex<Vec<worker_runtime::catalog::WorkingDirectoryRepositoryAccessRequest>>>,
         reject_repository_access: Arc<Mutex<bool>>,
+        lifecycle_callback: Option<Arc<dyn Fn(&str) + Send + Sync>>,
         next_restore_outcome: Arc<Mutex<Option<server_api::WorkerRestoreState>>>,
         restore_attempts: Arc<Mutex<usize>>,
     }
@@ -35430,6 +35416,9 @@ mod tests {
                     }],
                 };
             }
+            if let Some(callback) = &self.lifecycle_callback {
+                callback(&binding.worker_id.to_string());
+            }
             assert!(request.workdir_attachment_requests.is_empty());
             assert!(request.resolved_workdir_attachment_requests.is_empty());
             let mut worker = Self::worker_summary(binding, &request);
@@ -35539,6 +35528,9 @@ mod tests {
             _request: runtime_api::WorkerRestoreRequest,
         ) -> InternalWorkerRestoreResult {
             *self.restore_attempts.lock().unwrap() += 1;
+            if let Some(callback) = &self.lifecycle_callback {
+                callback(worker_id);
+            }
             let worker = self.worker(worker_id).worker;
             InternalWorkerRestoreResult {
                 state: if let Some(outcome) = self.next_restore_outcome.lock().unwrap().take() {
@@ -35654,18 +35646,18 @@ mod tests {
     }
 
     #[test]
-    fn runtime_resource_fetch_bypasses_workspace_mutation_lock() {
-        assert!(!workspace_request_requires_mutation_lock(
+    fn runtime_resource_fetch_is_a_drained_workspace_callback() {
+        assert!(workspace_request_is_callback(
             &Method::POST,
             "/api/runtime/v1/workspaces/workspace-a/resources/fetch",
             "workspace-a"
         ));
-        assert!(workspace_request_requires_mutation_lock(
+        assert!(!workspace_request_is_callback(
             &Method::POST,
             "/api/w/workspace-a/working-directories",
             "workspace-a"
         ));
-        assert!(!workspace_request_requires_mutation_lock(
+        assert!(!workspace_request_is_callback(
             &Method::GET,
             "/api/w/workspace-a/working-directories",
             "workspace-a"
@@ -35675,11 +35667,11 @@ mod tests {
     #[tokio::test]
     async fn workspace_mutation_gate_serializes_deletion_with_active_mutations() {
         let locks = Arc::new(AsyncMutex::new(HashMap::new()));
-        let active_mutation = workspace_mutation_lock(&locks, "workspace-a").await;
-        let deletion = workspace_mutation_lock(&locks, "workspace-a").await;
+        let active_mutation = workspace_admission_gate(&locks, "workspace-a").await;
+        let deletion = workspace_admission_gate(&locks, "workspace-a").await;
         assert!(Arc::ptr_eq(&active_mutation, &deletion));
 
-        let active_guard = active_mutation.requests.lock().await;
+        let active_guard = active_mutation.admit(false).unwrap();
         let (acquired_tx, mut acquired_rx) = tokio::sync::oneshot::channel();
         let waiter = tokio::spawn(async move {
             let _deletion_guard = deletion.lock_deletion().await;
