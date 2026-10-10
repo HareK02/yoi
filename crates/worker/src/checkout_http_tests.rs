@@ -36,6 +36,7 @@ struct ProviderState {
     requests: Mutex<Vec<(String, String)>>,
     operations: Mutex<Vec<WorkdirSessionOperation>>,
     write_fault: Mutex<Option<WriteResponseFault>>,
+    observe_refusal: Mutex<bool>,
 }
 
 impl ProviderState {
@@ -49,6 +50,7 @@ impl ProviderState {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 AxumJson(WorkdirTransportError {
+                    denial_reason: None,
                     code: WorkdirTransportErrorCode::Denied,
                     message: "provider authorization denied".into(),
                 }),
@@ -140,6 +142,16 @@ async fn operate(
         .lock()
         .unwrap()
         .push(request.operation.clone());
+    if matches!(
+        &request.operation,
+        WorkdirSessionOperation::CheckoutObserve(_)
+    ) && *state.observe_refusal.lock().unwrap()
+    {
+        return provider_error(WorkdirError::DenialContext {
+            reason: workdir::WorkdirDenialReason::OsPermissionDenied,
+            source: Box::new(WorkdirError::OutOfScope("/private/provider/path".into())),
+        });
+    }
     let result =
         dispatch_workdir_session_operation(state.session.as_ref(), request.operation).await;
     match result {
@@ -225,6 +237,7 @@ impl HttpFixture {
             requests: Mutex::new(Vec::new()),
             operations: Mutex::new(Vec::new()),
             write_fault: Mutex::new(None),
+            observe_refusal: Mutex::new(false),
         });
         let app = Router::new()
             .route(
@@ -756,5 +769,32 @@ async fn remote_checkout_list_pages_and_direct_inspect_read_use_provider_without
         !operations
             .iter()
             .any(|op| matches!(op, WorkdirSessionOperation::List(_)))
+    );
+}
+
+#[tokio::test]
+async fn remote_checkout_diagnostic_context_keeps_wip_refusal_classification_without_retry() {
+    let fixture = HttpFixture::new(WorkdirSessionCapabilities::READ_ONLY).await;
+    *fixture.state.observe_refusal.lock().unwrap() = true;
+    let remote = fixture.open(TOKEN).await.unwrap();
+    let (runtime, _) = native_runtime(Arc::new(remote));
+    let failure = runtime
+        .inspect("/checkouts/main/src/deep/a.txt".into(), true)
+        .await
+        .unwrap_err();
+    let text = failure.to_string();
+    assert!(
+        !text.contains("checkout observation unavailable"),
+        "refusal became an internal error: {text}"
+    );
+    assert!(!text.contains("/private/provider/path"));
+    assert!(
+        text.contains("protocol failure (NotFound)"),
+        "expected unavailable Object: {text}"
+    );
+    assert_eq!(
+        fixture.state.operations.lock().unwrap().len(),
+        1,
+        "refusal was retried"
     );
 }

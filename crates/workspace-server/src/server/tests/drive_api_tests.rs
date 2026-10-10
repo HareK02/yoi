@@ -718,6 +718,7 @@ async fn drive_verified_upload_revoked_during_reception_cannot_commit_or_replay(
     let app = generated_workspace_contract_router(ServerApiContractService::Workspace(api.clone()))
         .layer(Extension(
             crate::worker_source::VerifiedRuntimeRequestSource {
+                token_id_hash: None,
                 runtime_id: workers[0].runtime_id.clone(),
                 worker_id: Some(workers[0].worker_id.clone()),
             },

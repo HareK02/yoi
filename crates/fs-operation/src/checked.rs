@@ -66,10 +66,7 @@ impl<'a> CheckedTarget<'a> {
         } else {
             policy.is_readable_paths(logical, logical)
         }) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "checkout target denied",
-            ));
+            return Err(crate::FsDenialReason::CheckoutTargetDenied.into_io_error());
         }
         let parent = if relative.as_os_str().is_empty() {
             None
@@ -294,10 +291,7 @@ impl FsAccessPolicy for CheckedCreate<'_, '_> {
             if components.peek().is_some()
                 && !self.target.policy.is_writable_paths(&parent, &parent)
             {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Create parent denied",
-                ));
+                return Err(crate::FsDenialReason::CheckoutCreateParentDenied.into_io_error());
             }
         }
         // Nested mkdir may have effects before failure; never auto-retry.

@@ -497,18 +497,24 @@ impl<'de> Deserialize<'de> for ExternalWorkdirOperationResult {
 #[serde(deny_unknown_fields)]
 pub struct ExternalWorkdirOperationError {
     code: crate::http::WorkdirTransportErrorCode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    denial_reason: Option<crate::WorkdirDenialReason>,
 }
 
 impl ExternalWorkdirOperationError {
-    /// Collapse provider failures to a closed error code. Provider-authored
-    /// diagnostics never cross the External Workdir trust boundary.
+    /// Keep only closed error codes and typed refusal reasons. Provider-authored
+    /// text never crosses the External Workdir trust boundary.
     pub fn from_transport_error(error: WorkdirTransportError) -> Self {
-        Self { code: error.code }
+        Self {
+            code: error.code,
+            denial_reason: error.denial_reason,
+        }
     }
 
     pub fn into_transport_error(self) -> WorkdirTransportError {
         WorkdirTransportError {
             code: self.code,
+            denial_reason: self.denial_reason,
             message: format!("External Workdir provider reported {}", self.code.as_str()),
         }
     }
@@ -720,9 +726,44 @@ mod tests {
     }
 
     #[test]
+    fn external_error_wire_forwards_allowlisted_reasons_without_provider_text() {
+        use crate::WorkdirDenialReason as Reason;
+        use crate::http::WorkdirTransportErrorCode as Code;
+        for reason in [
+            Some(Reason::ExternalScopeSymlink),
+            Some(Reason::OsPermissionDenied),
+            None,
+        ] {
+            let external =
+                ExternalWorkdirOperationError::from_transport_error(WorkdirTransportError {
+                    code: Code::Denied,
+                    message: "/home/operator/private provider-secret".repeat(4096),
+                    denial_reason: reason,
+                });
+            let wire = serde_json::to_string(&external).unwrap();
+            assert!(wire.len() < 128);
+            assert_no_provider_authority(&serde_json::from_str(&wire).unwrap());
+            let decoded: ExternalWorkdirOperationError = serde_json::from_str(&wire).unwrap();
+            let error = decoded.into_transport_error().into_workdir_error();
+            let forwarded = WorkdirTransportError::from_workdir_error(&error);
+            assert_eq!(forwarded.code, Code::Denied);
+            assert_eq!(forwarded.denial_reason, reason);
+            assert_eq!(forwarded.message, "Workdir operation was denied");
+        }
+        let old: ExternalWorkdirOperationError =
+            serde_json::from_str(r#"{"code":"denied"}"#).unwrap();
+        assert_eq!(old.into_transport_error().denial_reason, None);
+        for reason in ["/home/operator/private", &"provider-secret".repeat(4096)] {
+            let input = serde_json::json!({"code":"denied", "denial_reason":reason});
+            assert!(serde_json::from_value::<ExternalWorkdirOperationError>(input).is_err());
+        }
+    }
+
+    #[test]
     fn provider_failures_are_closed_and_drop_provider_authored_diagnostics() {
         let error = ExternalWorkdirOperationError::from_transport_error(WorkdirTransportError {
             code: crate::http::WorkdirTransportErrorCode::Internal,
+            denial_reason: None,
             message: "/home/operator/private provider-secret\ncontrol".to_string(),
         });
         let frame = ExternalWorkdirProviderFrame::current(

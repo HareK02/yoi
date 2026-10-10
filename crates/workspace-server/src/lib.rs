@@ -106,6 +106,11 @@ pub enum Error {
         code: String,
         message: String,
     },
+    #[error("runtime `{runtime_id}` operation failed (workdir_session_open_failed): {}", transport.message)]
+    WorkdirSessionOpenFailed {
+        runtime_id: String,
+        transport: workdir::http::WorkdirTransportError,
+    },
     #[error("runtime `{runtime_id}` does not support `{capability}`")]
     RuntimeCapabilityUnsupported {
         runtime_id: String,

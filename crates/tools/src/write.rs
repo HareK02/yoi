@@ -94,7 +94,9 @@ pub(crate) async fn execute_write(
             .await
         {
             Ok(_) => Some(tracker.expected_workdir_hash(path)?),
-            Err(WorkdirError::NotFound(_)) => None,
+            Err(error) if matches!(error.classification_source(), WorkdirError::NotFound(_)) => {
+                None
+            }
             Err(error) => return Err(ToolsError::from(error).into()),
         }
     };
@@ -188,6 +190,161 @@ mod tests {
             .unwrap();
         assert!(out.summary.contains("Created"));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello\n");
+    }
+
+    /// Stat crosses the real JSON transport boundary; mutations still use the
+    /// checked local provider, so the assertions cover durable tool effects.
+    #[derive(Debug)]
+    struct StatErrorSession {
+        local: LocalWorkdirSession,
+        code: &'static str,
+        depth: u8,
+        stats: std::sync::atomic::AtomicUsize,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl workdir::WorkdirSession for StatErrorSession {
+        fn workdir(&self) -> &workdir::Workdir {
+            self.local.workdir()
+        }
+        fn capabilities(&self) -> workdir::WorkdirSessionCapabilities {
+            self.local.capabilities()
+        }
+        async fn stat(&self, _: StatRequest) -> Result<workdir::StatResult, WorkdirError> {
+            use workdir::{WorkdirDenialReason as Reason, http::WorkdirTransportError};
+            self.stats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let wire = serde_json::json!({
+                "code": self.code,
+                "message": "safe fixture message",
+                "denial_reason": (self.depth > 0).then_some(Reason::OsPermissionDenied),
+            });
+            let mut error = serde_json::from_value::<WorkdirTransportError>(wire)
+                .unwrap()
+                .into_workdir_error();
+            if self.depth == 2 {
+                error = WorkdirError::DenialContext {
+                    reason: Reason::ReadOnlySession,
+                    source: Box::new(error),
+                };
+            }
+            Err(error)
+        }
+        async fn read(&self, r: workdir::ReadRequest) -> Result<workdir::ReadResult, WorkdirError> {
+            self.local.read(r).await
+        }
+        async fn write(
+            &self,
+            r: workdir::WriteRequest,
+        ) -> Result<workdir::WriteResult, WorkdirError> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.local.write(r).await
+        }
+        async fn edit(&self, r: workdir::EditRequest) -> Result<workdir::EditResult, WorkdirError> {
+            self.local.edit(r).await
+        }
+        async fn list(&self, r: workdir::ListRequest) -> Result<workdir::ListResult, WorkdirError> {
+            self.local.list(r).await
+        }
+        async fn glob(&self, r: workdir::GlobRequest) -> Result<workdir::GlobResult, WorkdirError> {
+            self.local.glob(r).await
+        }
+        async fn grep(&self, r: workdir::GrepRequest) -> Result<workdir::GrepResult, WorkdirError> {
+            self.local.grep(r).await
+        }
+        async fn start_command(
+            &self,
+            r: workdir::CommandRequest,
+        ) -> Result<workdir::CommandHandle, WorkdirError> {
+            self.local.start_command(r).await
+        }
+        async fn command_status(
+            &self,
+            r: workdir::CommandHandle,
+        ) -> Result<workdir::CommandStatus, WorkdirError> {
+            self.local.command_status(r).await
+        }
+        async fn command_output(
+            &self,
+            r: workdir::CommandOutputRequest,
+        ) -> Result<workdir::CommandOutput, WorkdirError> {
+            self.local.command_output(r).await
+        }
+        async fn cancel_command(&self, r: workdir::CommandHandle) -> Result<(), WorkdirError> {
+            self.local.cancel_command(r).await
+        }
+        async fn close(&self) -> Result<(), WorkdirError> {
+            self.local.close().await
+        }
+    }
+
+    fn stat_error_session(dir: &TempDir, code: &'static str, depth: u8) -> Arc<StatErrorSession> {
+        Arc::new(StatErrorSession {
+            local: LocalWorkdirSession::new(
+                Scope::writable(dir.path()).unwrap(),
+                dir.path().to_path_buf(),
+            ),
+            code,
+            depth,
+            stats: Default::default(),
+            writes: Default::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn write_not_found_diagnostics_preserve_create_behavior() {
+        for depth in [0, 1, 2] {
+            let dir = TempDir::new().unwrap();
+            let session = stat_error_session(&dir, "not_found", depth);
+            let (_, tool) = write_tool(session.clone(), Tracker::new())();
+            let output = tool
+                .execute(
+                    r#"{"file_path":"new.txt","content":"hello\n"}"#,
+                    Default::default(),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("depth {depth}: {error:?}"));
+            assert!(output.summary.contains("Created new.txt"), "{output:?}");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("new.txt")).unwrap(),
+                "hello\n"
+            );
+            assert_eq!(session.stats.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(session.writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn write_stat_failures_do_not_create_or_retry_with_diagnostics() {
+        for code in ["denied", "read_only", "conflict", "outcome_unknown"] {
+            for depth in [0, 1, 2] {
+                let dir = TempDir::new().unwrap();
+                let session = stat_error_session(&dir, code, depth);
+                let (_, tool) = write_tool(session.clone(), Tracker::new())();
+                let error = tool
+                    .execute(
+                        r#"{"file_path":"new.txt","content":"hello"}"#,
+                        Default::default(),
+                    )
+                    .await
+                    .unwrap_err();
+                if matches!(code, "conflict" | "outcome_unknown") {
+                    assert!(
+                        matches!(error, ToolError::ExecutionFailed(_)),
+                        "{code}, depth {depth}: {error:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(error, ToolError::InvalidArgument(_)),
+                        "{code}, depth {depth}: {error:?}"
+                    );
+                }
+                assert!(!dir.path().join("new.txt").exists());
+                assert_eq!(session.stats.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(session.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+            }
+        }
     }
 
     #[tokio::test]

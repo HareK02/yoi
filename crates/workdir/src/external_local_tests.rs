@@ -357,9 +357,17 @@ async fn external_local_provider_rejects_symlink_roots_and_traversal() {
         )
         .await
         .unwrap_err();
+        let classification = match &error {
+            WorkdirError::DenialContext { source, .. } => source.as_ref(),
+            error => error,
+        };
+        assert_ne!(
+            error.denial_reason(),
+            Some(crate::WorkdirDenialReason::OsPermissionDenied)
+        );
         assert!(
             matches!(
-                error,
+                classification,
                 WorkdirError::SymlinkOutOfScope { .. } | WorkdirError::OutOfScope(_)
             ),
             "unexpected error for {path}: {error:?}"
@@ -375,6 +383,10 @@ async fn external_local_provider_rejects_symlink_roots_and_traversal() {
         BoundedReadLimits::new(4096, 1024).unwrap(),
     )
     .unwrap_err();
+    assert_eq!(
+        error.denial_reason(),
+        Some(crate::WorkdirDenialReason::ExternalRootSymlink)
+    );
     assert!(matches!(error, WorkdirError::Denied(_)));
 }
 
@@ -408,9 +420,17 @@ async fn external_read_write_provider_rejects_symlink_mutation_escape() {
     )
     .await
     .unwrap_err();
+    let classification = match &error {
+        WorkdirError::DenialContext { source, .. } => source.as_ref(),
+        error => error,
+    };
+    assert_ne!(
+        error.denial_reason(),
+        Some(crate::WorkdirDenialReason::OsPermissionDenied)
+    );
     assert!(
         matches!(
-            error,
+            classification,
             WorkdirError::SymlinkOutOfScope { .. }
                 | WorkdirError::OutOfScope(_)
                 | WorkdirError::Denied(_)
@@ -559,7 +579,15 @@ async fn external_grep_honors_gitignore_above_a_nested_search_root() {
     )
     .await
     .unwrap_err();
-    assert!(matches!(symlink_error, WorkdirError::OutOfScope(_)));
+    let classification = match &symlink_error {
+        WorkdirError::DenialContext { source, .. } => source.as_ref(),
+        error => error,
+    };
+    assert!(matches!(classification, WorkdirError::OutOfScope(_)));
+    assert_ne!(
+        symlink_error.denial_reason(),
+        Some(crate::WorkdirDenialReason::OsPermissionDenied)
+    );
 }
 
 #[cfg(target_os = "linux")]

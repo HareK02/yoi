@@ -213,6 +213,51 @@ struct ScopeAccess {
     operation_guard: Option<OperationGuard>,
 }
 
+/// Policy refusals carried through FsAccessPolicy's I/O interface are not OS
+/// PermissionDenied. This marker contains only fixed text and a closed reason.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct PolicyPermissionDenied {
+    reason: crate::WorkdirDenialReason,
+    message: &'static str,
+}
+
+fn policy_permission_denied(
+    reason: crate::WorkdirDenialReason,
+    message: &'static str,
+) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        PolicyPermissionDenied { reason, message },
+    )
+}
+
+pub(crate) fn io_denial_reason(error: &std::io::Error) -> crate::WorkdirDenialReason {
+    use crate::WorkdirDenialReason as Reason;
+    if let Some(source) = error.get_ref() {
+        if let Some(denial) = source.downcast_ref::<PolicyPermissionDenied>() {
+            return denial.reason;
+        }
+        if let Some(denial) = source.downcast_ref::<fs_operation::FsDenialReason>() {
+            return match denial {
+                fs_operation::FsDenialReason::ProviderRootExceeded => Reason::ProviderRootExceeded,
+                fs_operation::FsDenialReason::ProviderSymlinkDenied => {
+                    Reason::ProviderSymlinkDenied
+                }
+                fs_operation::FsDenialReason::CheckoutTargetDenied => Reason::CheckoutTargetDenied,
+                fs_operation::FsDenialReason::CheckoutCreateParentDenied => {
+                    Reason::CheckoutCreateParentDenied
+                }
+            };
+        }
+    }
+    if error.raw_os_error().is_some() {
+        Reason::OsPermissionDenied
+    } else {
+        Reason::UnclassifiedPermissionDenied
+    }
+}
+
 impl ScopeAccess {
     fn new(
         scope: Arc<Scope>,
@@ -238,8 +283,8 @@ impl ScopeAccess {
             )
         })?;
         let relative = path.strip_prefix(&self.root).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
+            policy_permission_denied(
+                crate::WorkdirDenialReason::ProviderRootExceeded,
                 "path is outside provider root",
             )
         })?;
@@ -288,8 +333,8 @@ impl fs_operation::FsAccessPolicy for ScopeAccess {
         if logical.starts_with(&self.root) {
             Ok(logical.to_path_buf())
         } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
+            Err(policy_permission_denied(
+                crate::WorkdirDenialReason::ProviderRootExceeded,
                 "path is outside provider root",
             ))
         }
@@ -394,8 +439,8 @@ impl fs_operation::FsAccessPolicy for ScopeAccess {
             )
         })?;
         let relative = resolved.strip_prefix(&self.root).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
+            policy_permission_denied(
+                crate::WorkdirDenialReason::ProviderRootExceeded,
                 "path is outside provider root",
             )
         })?;
@@ -491,8 +536,8 @@ impl SearchAccess {
         if self.read_allowed(logical, resolved) {
             Ok(())
         } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
+            Err(policy_permission_denied(
+                crate::WorkdirDenialReason::CheckoutSearchPathDenied,
                 "checkout search path denied",
             ))
         }
@@ -545,8 +590,8 @@ impl fs_operation::FsAccessPolicy for SearchAccess {
     }
     fn open_read_dir(&self, logical: &Path, resolved: &Path) -> std::io::Result<std::fs::ReadDir> {
         if !self.enumeration_allowed(logical, resolved) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
+            return Err(policy_permission_denied(
+                crate::WorkdirDenialReason::CheckoutEnumerationDenied,
                 "checkout directory enumeration denied",
             ));
         }
@@ -648,7 +693,8 @@ impl ExternalWorkdirRoot {
         let selected_metadata = std::fs::symlink_metadata(directory)
             .map_err(|error| WorkdirError::io(Path::new("<external-root>"), error))?;
         if selected_metadata.file_type().is_symlink() {
-            return Err(WorkdirError::Denied(
+            return Err(WorkdirError::denied(
+                crate::WorkdirDenialReason::ExternalRootSymlink,
                 "External Workdir root must not be a symbolic link".to_string(),
             ));
         }
@@ -678,7 +724,8 @@ impl ExternalWorkdirRoot {
             if (selected_metadata.dev(), selected_metadata.ino())
                 != (opened_metadata.dev(), opened_metadata.ino())
             {
-                return Err(WorkdirError::Denied(
+                return Err(WorkdirError::denied(
+                    crate::WorkdirDenialReason::ExternalRootChanged,
                     "External Workdir root changed while it was being pinned".to_string(),
                 ));
             }
@@ -691,7 +738,8 @@ impl ExternalWorkdirRoot {
             let path = std::fs::read_link(format!("/proc/self/fd/{}", handle.as_raw_fd()))
                 .map_err(|error| WorkdirError::io(Path::new("<external-root>"), error))?;
             if !path.is_absolute() || path.to_string_lossy().ends_with(" (deleted)") {
-                return Err(WorkdirError::Denied(
+                return Err(WorkdirError::denied(
+                    crate::WorkdirDenialReason::ExternalRootMoved,
                     "External Workdir root moved while it was being pinned".to_string(),
                 ));
             }
@@ -1334,7 +1382,8 @@ impl WorkdirSession for LocalWorkdirSession {
         self.validate_operation_path(&request.path)?;
         let logical = self.inner.root.join(request.path.as_str());
         if self.inner.reject_symlinks && fs_operation::first_symlink(&logical).is_some() {
-            return Err(WorkdirError::Denied(
+            return Err(WorkdirError::denied(
+                crate::WorkdirDenialReason::ExternalScopeSymlink,
                 "External Workdir scope cannot traverse symbolic links".to_string(),
             ));
         }
@@ -1353,10 +1402,13 @@ impl WorkdirSession for LocalWorkdirSession {
             WorkdirToolScopePermission::Write => parent_permission == Some(Permission::Write),
         };
         if !parent_allows {
-            return Err(WorkdirError::Denied(format!(
-                "Workdir path `{}` exceeds the provider attachment scope",
-                request.path
-            )));
+            return Err(WorkdirError::denied(
+                crate::WorkdirDenialReason::AttachmentScopeExceeded,
+                format!(
+                    "Workdir path `{}` exceeds the provider attachment scope",
+                    request.path
+                ),
+            ));
         }
         let allowed = request.rules.iter().any(|rule| {
             if request.permission == WorkdirToolScopePermission::Write
@@ -1383,10 +1435,13 @@ impl WorkdirSession for LocalWorkdirSession {
         if allowed {
             Ok(())
         } else {
-            Err(WorkdirError::Denied(format!(
-                "Workdir path `{}` is outside the provider-resolved delegated scope",
-                request.path
-            )))
+            Err(WorkdirError::denied(
+                crate::WorkdirDenialReason::DelegatedScopeExceeded,
+                format!(
+                    "Workdir path `{}` is outside the provider-resolved delegated scope",
+                    request.path
+                ),
+            ))
         }
     }
 
@@ -1432,7 +1487,12 @@ impl WorkdirSession for LocalWorkdirSession {
         let logical = request.operation.path().clone();
         let relative = Path::new(logical.as_str())
             .strip_prefix(request.output_root.as_str())
-            .map_err(|_| WorkdirError::Denied("checkout search escaped output root".into()))?;
+            .map_err(|_| {
+                WorkdirError::denied(
+                    crate::WorkdirDenialReason::CheckoutOutputRootExceeded,
+                    "checkout search escaped output root",
+                )
+            })?;
         *request.operation.path_mut() = WorkdirPath::new(relative.to_str().ok_or_else(|| {
             WorkdirError::InvalidPath("checkout search path is not UTF8".into())
         })?)?;
@@ -2088,7 +2148,10 @@ fn sanitize_error(error: WorkdirError, logical: &WorkdirPath) -> WorkdirError {
         WorkdirError::Io { source, .. }
             if source.kind() == std::io::ErrorKind::PermissionDenied =>
         {
-            WorkdirError::OutOfScope(path)
+            WorkdirError::DenialContext {
+                reason: io_denial_reason(&source),
+                source: Box::new(WorkdirError::OutOfScope(path)),
+            }
         }
         WorkdirError::Io { source, .. } => WorkdirError::Unavailable(format!(
             "I/O operation failed for {logical}: {}",
@@ -2586,6 +2649,58 @@ mod tests {
     use manifest::{Permission, ScopeConfig, ScopeRule};
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn checkout_permission_mapping_distinguishes_provider_policy_from_os_without_reclassifying() {
+        use crate::WorkdirDenialReason as Reason;
+        use crate::http::{WorkdirTransportError, WorkdirTransportErrorCode as Code};
+        use fs_operation::FsAccessPolicy;
+        let root = tempfile::tempdir().unwrap();
+        let access = ScopeAccess::new(
+            Arc::new(Scope::writable(root.path()).unwrap()),
+            root.path(),
+            None,
+            true,
+            None,
+        );
+        // Exercise the actual policy boundary, not a string-based stand-in.
+        let policy = access
+            .resolve_access_path(Path::new("/outside/private-secret"))
+            .unwrap_err();
+        let os = std::io::Error::from_raw_os_error(libc::EACCES);
+        for (source, reason) in [
+            (policy, Reason::ProviderRootExceeded),
+            (os, Reason::OsPermissionDenied),
+        ] {
+            let error = sanitize_error(
+                WorkdirError::io(Path::new("/host/private-secret"), source),
+                &WorkdirPath::new("file").unwrap(),
+            );
+            assert_eq!(error.denial_reason(), Some(reason));
+            assert_eq!(error.to_string(), "path is outside allowed scope: file");
+            let transport = WorkdirTransportError::from_workdir_error(&error);
+            assert_eq!(transport.code, Code::OutOfScope);
+            assert_eq!(transport.message, "Workdir path is out of scope");
+            assert_eq!(transport.denial_reason, Some(reason));
+            assert_eq!(
+                WorkdirTransportError::from_workdir_error(&transport.clone().into_workdir_error()),
+                transport
+            );
+            assert!(
+                !serde_json::to_string(&transport)
+                    .unwrap()
+                    .contains("private-secret")
+            );
+        }
+        // Ordinary OS I/O remains the existing generic denied/403 classification.
+        let error = WorkdirError::io(
+            Path::new("/host/private-secret"),
+            std::io::Error::from_raw_os_error(libc::EACCES),
+        );
+        let transport = WorkdirTransportError::from_workdir_error(&error);
+        assert_eq!(transport.code, Code::Denied);
+        assert_eq!(transport.denial_reason, Some(Reason::OsPermissionDenied));
+    }
 
     #[test]
     fn checkout_error_mapping_distinguishes_absence_from_stale_execution_at_all_boundaries() {

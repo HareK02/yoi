@@ -1236,6 +1236,7 @@ mod tests {
         WorkspaceResponse {
             status,
             body: serde_json::to_string(&workdir::http::WorkdirTransportError {
+                denial_reason: None,
                 code,
                 message: message.to_string(),
             })

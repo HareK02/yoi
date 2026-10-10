@@ -240,8 +240,18 @@ impl WorkdirScopeLease {
                         .expect("scoped command set mutex poisoned")
                         .remove(&command_id);
                 }
-                (Ok(()), Err(WorkdirError::UnknownCommand(_)))
-                | (Err(WorkdirError::UnknownCommand(_)), Err(WorkdirError::UnknownCommand(_))) => {
+                (cancel, Err(error))
+                    if matches!(
+                        error.classification_source(),
+                        WorkdirError::UnknownCommand(_)
+                    ) && match &cancel {
+                        Ok(()) => true,
+                        Err(error) => matches!(
+                            error.classification_source(),
+                            WorkdirError::UnknownCommand(_)
+                        ),
+                    } =>
+                {
                     self.broker.authority.publish_terminal_if_missing(
                         &command_id,
                         CommandStatus::Cancelled,
@@ -595,9 +605,10 @@ impl ScopedWorkdirSession {
         if self.capabilities.supports(required) {
             Ok(())
         } else {
-            Err(WorkdirError::Denied(format!(
-                "scoped Workdir tools do not permit {operation}"
-            )))
+            Err(WorkdirError::denied(
+                crate::WorkdirDenialReason::ScopedCapabilityDenied,
+                format!("scoped Workdir tools do not permit {operation}"),
+            ))
         }
     }
 
@@ -612,9 +623,12 @@ impl ScopedWorkdirSession {
                 .iter()
                 .any(|rule| rule_allows_path(rule, path, permission))
             {
-                return Err(WorkdirError::Denied(format!(
-                    "logical workdir path `{path}` is outside the scoped {permission:?} scope"
-                )));
+                return Err(WorkdirError::denied(
+                    crate::WorkdirDenialReason::LogicalScopeExceeded,
+                    format!(
+                        "logical workdir path `{path}` is outside the scoped {permission:?} scope"
+                    ),
+                ));
             }
         }
         Ok(())
@@ -626,9 +640,17 @@ impl ScopedWorkdirSession {
         }
         let joined = Path::new(self.cwd.as_str()).join(path.as_str());
         let joined = joined.to_str().ok_or_else(|| {
-            WorkdirError::Denied("logical Workdir path is not valid UTF-8".into())
+            WorkdirError::denied(
+                crate::WorkdirDenialReason::InvalidScopedPath,
+                "logical Workdir path is not valid UTF-8",
+            )
         })?;
-        FsPath::new(joined).map_err(|error| WorkdirError::Denied(error.to_string()))
+        FsPath::new(joined).map_err(|error| {
+            WorkdirError::denied(
+                crate::WorkdirDenialReason::InvalidScopedPath,
+                error.to_string(),
+            )
+        })
     }
 
     fn ensure_read(
@@ -739,9 +761,10 @@ impl ScopedWorkdirSession {
                 })
                 .await?
             {
-                return Err(WorkdirError::Denied(format!(
-                    "path `{path}` is leased to child Workdir tools"
-                )));
+                return Err(WorkdirError::denied(
+                    crate::WorkdirDenialReason::ChildWriteLeaseConflict,
+                    format!("path `{path}` is leased to child Workdir tools"),
+                ));
             }
         }
         Ok(())
@@ -792,8 +815,9 @@ impl ScopedWorkdirSession {
     ) -> Result<WorkdirSessionCapabilities, WorkdirError> {
         self.ensure_active()?;
         if rules.is_empty() {
-            return Err(WorkdirError::Denied(
-                "workdir tool scope requires at least one logical scope rule".into(),
+            return Err(WorkdirError::denied(
+                crate::WorkdirDenialReason::EmptyScope,
+                "workdir tool scope requires at least one logical scope rule",
             ));
         }
         let writable = rules
@@ -804,22 +828,25 @@ impl ScopedWorkdirSession {
                 && (!self.capabilities.supports(WorkdirSessionCapability::Write)
                     || !self.capabilities.supports(WorkdirSessionCapability::Edit)))
         {
-            return Err(WorkdirError::Denied(
-                "parent Workdir session cannot scope the requested capabilities".into(),
+            return Err(WorkdirError::denied(
+                crate::WorkdirDenialReason::ParentCapabilityDenied,
+                "parent Workdir session cannot scope the requested capabilities",
             ));
         }
         if command {
             if !writable {
-                return Err(WorkdirError::Denied(
-                    "command execution requires a writable scoped path".into(),
+                return Err(WorkdirError::denied(
+                    crate::WorkdirDenialReason::CommandRequiresWritableScope,
+                    "command execution requires a writable scoped path",
                 ));
             }
             if !self
                 .capabilities
                 .supports(WorkdirSessionCapability::Command)
             {
-                return Err(WorkdirError::Denied(
-                    "parent Workdir session does not support Command".into(),
+                return Err(WorkdirError::denied(
+                    crate::WorkdirDenialReason::ParentCapabilityDenied,
+                    "parent Workdir session does not support Command",
                 ));
             }
         }
@@ -829,10 +856,13 @@ impl ScopedWorkdirSession {
                     .iter()
                     .any(|parent| rule_contains_rule(parent, requested))
                 {
-                    return Err(WorkdirError::Denied(format!(
-                        "logical workdir scope `{}` exceeds the parent tool scope",
-                        requested.target
-                    )));
+                    return Err(WorkdirError::denied(
+                        crate::WorkdirDenialReason::ParentScopeExceeded,
+                        format!(
+                            "logical workdir scope `{}` exceeds the parent tool scope",
+                            requested.target
+                        ),
+                    ));
                 }
             }
         }
@@ -866,10 +896,13 @@ impl ScopedWorkdirSession {
             .iter()
             .any(|rule| rule_allows_path(rule, &request.cwd, WorkdirToolScopePermission::Read))
         {
-            return Err(WorkdirError::Denied(format!(
-                "scoped tool cwd `{}` is outside the readable scope",
-                request.cwd
-            )));
+            return Err(WorkdirError::denied(
+                crate::WorkdirDenialReason::CwdOutsideReadableScope,
+                format!(
+                    "scoped tool cwd `{}` is outside the readable scope",
+                    request.cwd
+                ),
+            ));
         }
         self.ensure_scope_targets_are_authorized(&request.rules)
             .await?;
@@ -913,10 +946,13 @@ impl ScopedWorkdirSession {
                         })
                         .await?
                     {
-                        return Err(WorkdirError::Denied(format!(
-                            "scoped write path `{}` overlaps an active child scope after provider resolution",
-                            requested.target
-                        )));
+                        return Err(WorkdirError::denied(
+                            crate::WorkdirDenialReason::ChildWriteLeaseConflict,
+                            format!(
+                                "scoped write path `{}` overlaps an active child scope after provider resolution",
+                                requested.target
+                            ),
+                        ));
                     }
                 }
             }
@@ -1491,7 +1527,10 @@ impl WorkdirSession for ReadOnlyWorkdirSession {
         request: WorkdirScopeAuthorizationRequest,
     ) -> Result<(), WorkdirError> {
         if request.permission == WorkdirToolScopePermission::Write {
-            return Err(WorkdirError::Denied("read-only workdir session".into()));
+            return Err(WorkdirError::denied(
+                crate::WorkdirDenialReason::ReadOnlySession,
+                "read-only workdir session",
+            ));
         }
         self.inner.authorize_scope_path(request).await
     }
@@ -1554,11 +1593,17 @@ impl WorkdirSession for ReadOnlyWorkdirSession {
     }
 
     async fn write(&self, _request: WriteRequest) -> Result<WriteResult, WorkdirError> {
-        Err(WorkdirError::Denied("read-only workdir session".into()))
+        Err(WorkdirError::denied(
+            crate::WorkdirDenialReason::ReadOnlySession,
+            "read-only workdir session",
+        ))
     }
 
     async fn edit(&self, _request: EditRequest) -> Result<EditResult, WorkdirError> {
-        Err(WorkdirError::Denied("read-only workdir session".into()))
+        Err(WorkdirError::denied(
+            crate::WorkdirDenialReason::ReadOnlySession,
+            "read-only workdir session",
+        ))
     }
 
     async fn list(&self, request: ListRequest) -> Result<ListResult, WorkdirError> {
@@ -1574,22 +1619,34 @@ impl WorkdirSession for ReadOnlyWorkdirSession {
     }
 
     async fn start_command(&self, _request: CommandRequest) -> Result<CommandHandle, WorkdirError> {
-        Err(WorkdirError::Denied("read-only workdir session".into()))
+        Err(WorkdirError::denied(
+            crate::WorkdirDenialReason::ReadOnlySession,
+            "read-only workdir session",
+        ))
     }
 
     async fn command_status(&self, _handle: CommandHandle) -> Result<CommandStatus, WorkdirError> {
-        Err(WorkdirError::Denied("read-only workdir session".into()))
+        Err(WorkdirError::denied(
+            crate::WorkdirDenialReason::ReadOnlySession,
+            "read-only workdir session",
+        ))
     }
 
     async fn command_output(
         &self,
         _request: CommandOutputRequest,
     ) -> Result<CommandOutput, WorkdirError> {
-        Err(WorkdirError::Denied("read-only workdir session".into()))
+        Err(WorkdirError::denied(
+            crate::WorkdirDenialReason::ReadOnlySession,
+            "read-only workdir session",
+        ))
     }
 
     async fn cancel_command(&self, _handle: CommandHandle) -> Result<(), WorkdirError> {
-        Err(WorkdirError::Denied("read-only workdir session".into()))
+        Err(WorkdirError::denied(
+            crate::WorkdirDenialReason::ReadOnlySession,
+            "read-only workdir session",
+        ))
     }
 
     async fn close(&self) -> Result<(), WorkdirError> {
@@ -2273,7 +2330,7 @@ mod tests {
         assert!(matches!(
             child.read(read("link")).await,
             Err(WorkdirError::Denied(message))
-                if message.contains("provider-resolved delegated scope")
+                if message.message.contains("provider-resolved delegated scope")
         ));
     }
 
@@ -2299,7 +2356,7 @@ mod tests {
         assert!(matches!(
             child.read(read("escape")).await,
             Err(WorkdirError::Denied(message))
-                if message.contains("provider-resolved delegated scope")
+                if message.message.contains("provider-resolved delegated scope")
         ));
     }
 
@@ -2400,7 +2457,7 @@ mod tests {
                 .scope(request("alias-b", WorkdirToolScopePermission::Write))
                 .await,
             Err(WorkdirError::Denied(message))
-                if message.contains("overlaps an active child scope after provider resolution")
+                if message.message.contains("overlaps an active child scope after provider resolution")
         ));
         assert!(matches!(
             parent
@@ -2411,7 +2468,7 @@ mod tests {
                 })
                 .await,
             Err(WorkdirError::Denied(message))
-                if message.contains("leased to child Workdir tools")
+                if message.message.contains("leased to child Workdir tools")
         ));
     }
 
@@ -2430,7 +2487,7 @@ mod tests {
         assert!(matches!(
             child.scope(expanded).await,
             Err(WorkdirError::Denied(message))
-                if message.contains("exceeds the parent tool scope")
+                if message.message.contains("exceeds the parent tool scope")
         ));
     }
 
@@ -2499,7 +2556,7 @@ mod tests {
                 .write(write("secret/parent", "must-be-blocked"))
                 .await,
             Err(WorkdirError::Denied(message))
-                if message.contains("leased to child Workdir tools")
+                if message.message.contains("leased to child Workdir tools")
         ));
         assert_eq!(
             fs::read_to_string(root.path().join("secret/from-child")).unwrap(),

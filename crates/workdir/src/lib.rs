@@ -211,7 +211,8 @@ pub trait WorkdirSession: std::fmt::Debug + Send + Sync {
         }) {
             Ok(())
         } else {
-            Err(WorkdirError::Denied(
+            Err(WorkdirError::denied(
+                WorkdirDenialReason::ScopeResolutionUnavailable,
                 "Workdir provider cannot establish resolved scope authority".to_string(),
             ))
         }
@@ -221,7 +222,8 @@ pub trait WorkdirSession: std::fmt::Debug + Send + Sync {
         &self,
         _request: WorkdirScopeOverlapRequest,
     ) -> Result<bool, WorkdirError> {
-        Err(WorkdirError::Denied(
+        Err(WorkdirError::denied(
+            WorkdirDenialReason::ScopeComparisonUnavailable,
             "Workdir provider cannot compare resolved scope authority".to_string(),
         ))
     }
@@ -292,10 +294,125 @@ pub trait WorkdirSession: std::fmt::Debug + Send + Sync {
 
 pub type WorkdirSessionHandle = Arc<dyn WorkdirSession>;
 
+/// Closed diagnostic vocabulary: no request text, paths or secrets.
+/// A reason describes a refusing branch, not an authorization grant.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkdirDenialReason {
+    ScopeResolutionUnavailable,
+    ScopeComparisonUnavailable,
+    ScopedCapabilityDenied,
+    LogicalScopeExceeded,
+    InvalidScopedPath,
+    ChildWriteLeaseConflict,
+    EmptyScope,
+    ParentCapabilityDenied,
+    CommandRequiresWritableScope,
+    ParentScopeExceeded,
+    CwdOutsideReadableScope,
+    ReadOnlySession,
+    ExternalRootSymlink,
+    ExternalRootChanged,
+    ExternalRootMoved,
+    ExternalScopeSymlink,
+    AttachmentScopeExceeded,
+    DelegatedScopeExceeded,
+    CheckoutOutputRootExceeded,
+    ProviderRootExceeded,
+    ProviderSymlinkDenied,
+    CheckoutTargetDenied,
+    CheckoutCreateParentDenied,
+    CheckoutSearchPathDenied,
+    CheckoutEnumerationDenied,
+    PathOutOfScope,
+    SymlinkTargetOutOfScope,
+    PathReadOnly,
+    OsPermissionDenied,
+    /// PermissionDenied without a typed provider origin or an OS error code.
+    /// In particular, do not mislabel lower-layer synthetic refusals as OS errors.
+    UnclassifiedPermissionDenied,
+}
+
+impl WorkdirDenialReason {
+    /// Stable allowlisted label for internal diagnostics, matching the wire value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ScopeResolutionUnavailable => "scope_resolution_unavailable",
+            Self::ScopeComparisonUnavailable => "scope_comparison_unavailable",
+            Self::ScopedCapabilityDenied => "scoped_capability_denied",
+            Self::LogicalScopeExceeded => "logical_scope_exceeded",
+            Self::InvalidScopedPath => "invalid_scoped_path",
+            Self::ChildWriteLeaseConflict => "child_write_lease_conflict",
+            Self::EmptyScope => "empty_scope",
+            Self::ParentCapabilityDenied => "parent_capability_denied",
+            Self::CommandRequiresWritableScope => "command_requires_writable_scope",
+            Self::ParentScopeExceeded => "parent_scope_exceeded",
+            Self::CwdOutsideReadableScope => "cwd_outside_readable_scope",
+            Self::ReadOnlySession => "read_only_session",
+            Self::ExternalRootSymlink => "external_root_symlink",
+            Self::ExternalRootChanged => "external_root_changed",
+            Self::ExternalRootMoved => "external_root_moved",
+            Self::ExternalScopeSymlink => "external_scope_symlink",
+            Self::AttachmentScopeExceeded => "attachment_scope_exceeded",
+            Self::DelegatedScopeExceeded => "delegated_scope_exceeded",
+            Self::CheckoutOutputRootExceeded => "checkout_output_root_exceeded",
+            Self::ProviderRootExceeded => "provider_root_exceeded",
+            Self::ProviderSymlinkDenied => "provider_symlink_denied",
+            Self::CheckoutTargetDenied => "checkout_target_denied",
+            Self::CheckoutCreateParentDenied => "checkout_create_parent_denied",
+            Self::CheckoutSearchPathDenied => "checkout_search_path_denied",
+            Self::CheckoutEnumerationDenied => "checkout_enumeration_denied",
+            Self::PathOutOfScope => "path_out_of_scope",
+            Self::SymlinkTargetOutOfScope => "symlink_target_out_of_scope",
+            Self::PathReadOnly => "path_read_only",
+            Self::OsPermissionDenied => "os_permission_denied",
+            Self::UnclassifiedPermissionDenied => "unclassified_permission_denied",
+        }
+    }
+}
+
+/// Original local messages remain available, but are not diagnostic wire data.
+/// Missing reasons from older providers remain explicitly unknown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkdirDenial {
+    pub reason: Option<WorkdirDenialReason>,
+    pub message: String,
+}
+
+impl std::fmt::Display for WorkdirDenial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl From<String> for WorkdirDenial {
+    fn from(message: String) -> Self {
+        Self {
+            reason: None,
+            message,
+        }
+    }
+}
+impl From<&str> for WorkdirDenial {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WorkdirError {
     #[error("Workdir operation denied: {0}")]
-    Denied(String),
+    Denied(WorkdirDenial),
+
+    /// Retain the source's existing classification and display while attaching
+    /// a reason (including checkout's historical PermissionDenied mapping).
+    #[error("{source}")]
+    DenialContext {
+        reason: WorkdirDenialReason,
+        #[source]
+        source: Box<WorkdirError>,
+    },
 
     #[error("Workdir session is closed")]
     SessionClosed,
@@ -398,6 +515,40 @@ pub enum WorkdirError {
 }
 
 impl WorkdirError {
+    /// The error used for operational classification, ignoring only diagnostic
+    /// context (including nested context). Keep the original error for display
+    /// and `denial_reason`: enrichment must not alter behavior or retry policy.
+    pub fn classification_source(&self) -> &Self {
+        let mut error = self;
+        while let Self::DenialContext { source, .. } = error {
+            error = source;
+        }
+        error
+    }
+
+    pub fn denied(reason: WorkdirDenialReason, message: impl Into<String>) -> Self {
+        Self::Denied(WorkdirDenial {
+            reason: Some(reason),
+            message: message.into(),
+        })
+    }
+
+    /// Safe diagnostic data only; never infer a reason from arbitrary messages.
+    pub fn denial_reason(&self) -> Option<WorkdirDenialReason> {
+        use WorkdirDenialReason as Reason;
+        match self {
+            Self::Denied(denial) => denial.reason,
+            Self::DenialContext { reason, .. } => Some(*reason),
+            Self::OutOfScope(_) => Some(Reason::PathOutOfScope),
+            Self::SymlinkOutOfScope { .. } => Some(Reason::SymlinkTargetOutOfScope),
+            Self::ReadOnly(_) => Some(Reason::PathReadOnly),
+            Self::Io { source, .. } if source.kind() == std::io::ErrorKind::PermissionDenied => {
+                Some(local::io_denial_reason(source))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn io(path: &Path, source: std::io::Error) -> Self {
         Self::Io {
             path: path.to_path_buf(),

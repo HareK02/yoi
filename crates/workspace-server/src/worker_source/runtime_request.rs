@@ -12,6 +12,8 @@ use crate::store::ControlPlaneStore;
 pub struct VerifiedRuntimeRequestSource {
     pub runtime_id: String,
     pub worker_id: Option<String>,
+    /// Existing proof JTI correlation, retained only as a fixed-length diagnostic fingerprint.
+    pub token_id_hash: Option<String>,
 }
 
 /// Safe diagnostics only: never stores proof, raw claims, keys or store errors.
@@ -268,6 +270,7 @@ pub(crate) async fn verify_runtime_request_source_proof_with_clock(
             })?;
     }
     Ok(VerifiedRuntimeRequestSource {
+        token_id_hash: Some(diagnostic_id_hash(&claims.jti)),
         runtime_id: claims.iss,
         worker_id: claims.worker_id,
     })

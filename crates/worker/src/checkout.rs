@@ -191,15 +191,20 @@ impl Provider {
         };
         let observation = match selected.session.checkout_observe(target.clone()).await {
             Ok(o) => o,
-            Err(
-                workdir::WorkdirError::Denied(_)
-                | workdir::WorkdirError::OutOfScope(_)
-                | workdir::WorkdirError::NotFound(_)
-                | workdir::WorkdirError::SessionClosed
-                | workdir::WorkdirError::UnsupportedOperation(_)
-                | workdir::WorkdirError::Unsupported(_),
-            ) => return Ok(None),
-            Err(_) => {
+            Err(failure) => {
+                // Internal diagnostic enrichment is transparent to WIP's existing
+                // unavailable/refusal classification, including remote providers.
+                if matches!(
+                    failure.classification_source(),
+                    workdir::WorkdirError::Denied(_)
+                        | workdir::WorkdirError::OutOfScope(_)
+                        | workdir::WorkdirError::NotFound(_)
+                        | workdir::WorkdirError::SessionClosed
+                        | workdir::WorkdirError::UnsupportedOperation(_)
+                        | workdir::WorkdirError::Unsupported(_)
+                ) {
+                    return Ok(None);
+                }
                 return Err(error(
                     ProtocolErrorCode::Internal,
                     "checkout observation unavailable",

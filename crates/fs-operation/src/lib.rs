@@ -37,6 +37,26 @@ pub const MAX_RESULT_PATH_BYTES: usize = 1024 * 1024;
 /// Provider-side ceiling for aggregate grep source bytes per operation.
 pub const MAX_GREP_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Safe origin for a synthetic `PermissionDenied` from this crate.
+/// Contains no paths or provider-authored text; real OS errors are not wrapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum FsDenialReason {
+    #[error("path is outside provider root")]
+    ProviderRootExceeded,
+    #[error("symbolic links are not permitted by this provider")]
+    ProviderSymlinkDenied,
+    #[error("checkout target denied")]
+    CheckoutTargetDenied,
+    #[error("Create parent denied")]
+    CheckoutCreateParentDenied,
+}
+
+impl FsDenialReason {
+    pub fn into_io_error(self) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, self)
+    }
+}
+
 /// Open `path` beneath `root` without following any symbolic link. Linux uses
 /// `openat2` so resolution and open are one kernel-enforced operation. Other
 /// platforms fail closed rather than silently weakening an External grant.
@@ -91,10 +111,7 @@ pub fn open_beneath_no_symlinks_at(
     const RESOLVE_BENEATH: u64 = 0x08;
 
     if relative.is_absolute() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "path is outside provider root",
-        ));
+        return Err(crate::FsDenialReason::ProviderRootExceeded.into_io_error());
     }
     let relative = if relative.as_os_str().is_empty() {
         CString::new(".").expect("static path")
@@ -122,10 +139,7 @@ pub fn open_beneath_no_symlinks_at(
     if fd < 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::ELOOP) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "symbolic links are not permitted by this provider",
-            ));
+            return Err(crate::FsDenialReason::ProviderSymlinkDenied.into_io_error());
         }
         return Err(error);
     }
@@ -146,12 +160,9 @@ pub fn open_beneath_no_symlinks_at(
 
 #[cfg(target_os = "linux")]
 pub fn open_beneath_no_symlinks(root: &Path, path: &Path) -> std::io::Result<std::fs::File> {
-    let relative = path.strip_prefix(root).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "path is outside provider root",
-        )
-    })?;
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| crate::FsDenialReason::ProviderRootExceeded.into_io_error())?;
     let root = open_root_no_symlinks(root)?;
     open_beneath_no_symlinks_at(&root, relative)
 }
@@ -184,20 +195,14 @@ pub fn atomic_write_beneath_no_symlinks_at(
     use std::os::unix::ffi::OsStrExt;
 
     if relative.is_absolute() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "path is outside provider root",
-        ));
+        return Err(crate::FsDenialReason::ProviderRootExceeded.into_io_error());
     }
     let mut components = relative.components().peekable();
     let mut parent = root.try_clone()?;
     let mut file_name = None::<OsString>;
     while let Some(component) = components.next() {
         let std::path::Component::Normal(name) = component else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "path is outside provider root",
-            ));
+            return Err(crate::FsDenialReason::ProviderRootExceeded.into_io_error());
         };
         if components.peek().is_none() {
             file_name = Some(name.to_os_string());

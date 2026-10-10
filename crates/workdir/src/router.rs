@@ -166,7 +166,12 @@ impl RoutedSessionState {
         for handle in handles {
             match self.session.command_status(handle.clone()).await {
                 Ok(status) => self.mark_terminal(&handle, status),
-                Err(WorkdirError::UnknownCommand(_)) => {
+                Err(error)
+                    if matches!(
+                        error.classification_source(),
+                        WorkdirError::UnknownCommand(_)
+                    ) =>
+                {
                     self.active_commands
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)

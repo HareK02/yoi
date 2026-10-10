@@ -148,8 +148,9 @@ impl CheckoutSearchRequest {
         if !std::path::Path::new(self.operation.path().as_str())
             .starts_with(self.output_root.as_str())
         {
-            return Err(WorkdirError::Denied(
-                "checkout search must stay beneath its output root".into(),
+            return Err(WorkdirError::denied(
+                crate::WorkdirDenialReason::CheckoutOutputRootExceeded,
+                "checkout search must stay beneath its output root",
             ));
         }
         if self.scope_layers.len() > 16

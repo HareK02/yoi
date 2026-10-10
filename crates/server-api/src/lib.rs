@@ -98,6 +98,24 @@ pub struct WorkdirOperationApiError {
     pub diagnostics: Option<Vec<Diagnostic>>,
     #[serde(skip, default = "default_repository_error_status")]
     status: u16,
+    /// Server-local metadata retained by generated error response extensions, never the wire body.
+    #[serde(skip)]
+    pub workdir_log: Option<WorkdirOperationLogContext>,
+    #[serde(skip)]
+    pub denial_reason: Option<workdir::WorkdirDenialReason>,
+}
+
+/// Internal operational correlation. Producers supply fixed-length ID fingerprints and
+/// an allowlisted operation label, not request text, paths, commands or credentials.
+#[derive(Clone, Debug, Default)]
+pub struct WorkdirOperationLogContext {
+    pub operation: &'static str,
+    pub stage: &'static str,
+    pub workspace_id_hash: String,
+    pub runtime_id_hash: Option<String>,
+    pub worker_id_hash: Option<String>,
+    pub workdir_id_hash: Option<String>,
+    pub attachment_alias_hash: String,
 }
 
 impl WorkdirOperationApiError {
@@ -108,6 +126,8 @@ impl WorkdirOperationApiError {
             message: error.message,
             diagnostics: Some(error.diagnostics),
             status: error.status,
+            workdir_log: None,
+            denial_reason: None,
         }
     }
 
@@ -119,6 +139,8 @@ impl WorkdirOperationApiError {
             message: error.message,
             diagnostics: None,
             status,
+            workdir_log: None,
+            denial_reason: error.denial_reason,
         }
     }
 }
@@ -13982,5 +14004,36 @@ mod typescript_tests {
                 character => Some(character),
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod workdir_error_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn workdir_internal_diagnostics_never_enter_public_error_body_or_schema() {
+        let mut error = WorkdirOperationApiError::provider(workdir::http::WorkdirTransportError {
+            code: workdir::http::WorkdirTransportErrorCode::Denied,
+            message: "Workdir operation was denied".to_string(),
+            denial_reason: Some(workdir::WorkdirDenialReason::OsPermissionDenied),
+        });
+        error.workdir_log = Some(WorkdirOperationLogContext {
+            operation: "write",
+            workspace_id_hash: "internal-workspace-fingerprint".to_string(),
+            ..Default::default()
+        });
+        let wire = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"code": "denied", "message": "Workdir operation was denied"})
+        );
+        assert_eq!(api_macros::HttpError::status_code(&error), 403);
+        let decoded: WorkdirOperationApiError = serde_json::from_value(wire).unwrap();
+        assert!(decoded.denial_reason.is_none());
+        assert!(decoded.workdir_log.is_none());
+        let schema = serde_json::to_value(schemars::schema_for!(WorkdirOperationApiError)).unwrap();
+        assert!(schema["properties"].get("workdir_log").is_none());
+        assert!(schema["properties"].get("denial_reason").is_none());
     }
 }

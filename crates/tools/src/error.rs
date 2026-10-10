@@ -38,17 +38,24 @@ pub enum ToolsError {
 impl From<ToolsError> for ToolError {
     fn from(err: ToolsError) -> Self {
         match &err {
-            ToolsError::WorkdirSession(
-                workdir::WorkdirError::NotFound(_)
-                | workdir::WorkdirError::Io { .. }
-                | workdir::WorkdirError::Unavailable(_)
-                | workdir::WorkdirError::OperationFailed
-                | workdir::WorkdirError::Transport(_)
-                | workdir::WorkdirError::Conflict(_)
-                | workdir::WorkdirError::OutcomeUnknown(_),
-            ) => ToolError::ExecutionFailed(err.to_string()),
+            ToolsError::WorkdirSession(error) => {
+                // Diagnostic context is transparent to the established normal-tool
+                // classification. Preserve the original display, including unknown
+                // outcome guidance, while classifying through nested wrappers.
+                match error.classification_source() {
+                    workdir::WorkdirError::NotFound(_)
+                    | workdir::WorkdirError::Io { .. }
+                    | workdir::WorkdirError::Unavailable(_)
+                    | workdir::WorkdirError::OperationFailed
+                    | workdir::WorkdirError::Transport(_)
+                    | workdir::WorkdirError::Conflict(_)
+                    | workdir::WorkdirError::OutcomeUnknown(_) => {
+                        ToolError::ExecutionFailed(err.to_string())
+                    }
+                    _ => ToolError::InvalidArgument(err.to_string()),
+                }
+            }
             ToolsError::FileSystem(_)
-            | ToolsError::WorkdirSession(_)
             | ToolsError::NotRead(_)
             | ToolsError::ExternallyModified(_)
             | ToolsError::StringNotFound { .. }
@@ -131,6 +138,76 @@ mod tests {
                 "The target file's content or existence changed since it was last observed; read the file again before retrying: src/main.rs"
             ),
             other => panic!("expected execution failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transport_diagnostic_reasons_preserve_normal_tool_classification_and_display() {
+        use WorkdirTransportErrorCode as Code;
+        use workdir::{WorkdirDenialReason as Reason, WorkdirError};
+        for (code, execution_failure) in [
+            (Code::NotFound, true),
+            (Code::Conflict, true),
+            (Code::OutcomeUnknown, true),
+            (Code::Unsupported, false),
+            (Code::InvalidRequest, false),
+            (Code::Denied, false),
+            (Code::OutOfScope, false),
+            (Code::SymlinkOutOfScope, false),
+            (Code::BrokenSymlink, false),
+            (Code::SymlinkTargetIsDirectory, false),
+            (Code::ReadOnly, false),
+            (Code::IsDirectory, false),
+            (Code::SymlinkDirectoryNotTraversed, false),
+            (Code::UnknownCommand, false),
+            (Code::Unavailable, true),
+            (Code::Io, true),
+            (Code::Transport, true),
+            (Code::Internal, true),
+        ] {
+            // Wire data may carry a reason independently of its public code.
+            // Neither enrichment nor nested wrappers may change normal-tool behavior.
+            let baseline_message = serde_json::from_value::<WorkdirTransportError>(
+                serde_json::json!({"code": code, "message": "safe fixture message"}),
+            )
+            .unwrap()
+            .into_workdir_error()
+            .to_string();
+            for depth in [0, 1, 2] {
+                let wire = serde_json::json!({
+                    "code": code,
+                    "message": "safe fixture message",
+                    "denial_reason": (depth > 0).then_some(Reason::OsPermissionDenied),
+                });
+                let mut error = serde_json::from_value::<WorkdirTransportError>(wire)
+                    .unwrap()
+                    .into_workdir_error();
+                if depth == 2 {
+                    error = WorkdirError::DenialContext {
+                        reason: Reason::ReadOnlySession,
+                        source: Box::new(error),
+                    };
+                }
+                let expected_message = error.to_string();
+                assert_eq!(
+                    expected_message, baseline_message,
+                    "{code:?}, depth {depth}"
+                );
+                let tool_error = ToolError::from(ToolsError::from(error));
+                let (actual_execution_failure, actual_message) = match tool_error {
+                    ToolError::ExecutionFailed(message) => (true, message),
+                    ToolError::InvalidArgument(message) => (false, message),
+                    other => panic!("unexpected classification for {code:?}: {other:?}"),
+                };
+                assert_eq!(
+                    actual_execution_failure, execution_failure,
+                    "{code:?}, depth {depth}"
+                );
+                assert_eq!(actual_message, expected_message, "{code:?}, depth {depth}");
+                if code == Code::OutcomeUnknown {
+                    assert!(actual_message.contains("inspect before retrying"));
+                }
+            }
         }
     }
 

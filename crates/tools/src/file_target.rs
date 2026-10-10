@@ -139,7 +139,8 @@ impl FileTarget {
 
 pub(crate) fn checked_error(error: workdir::WorkdirError) -> ToolError {
     use workdir::WorkdirError;
-    let code = match &error {
+    let code = match error.classification_source() {
+        WorkdirError::DenialContext { .. } => unreachable!("diagnostic context unwrapped"),
         WorkdirError::Conflict(_) | WorkdirError::NotFound(_) => "checkout_stale",
         WorkdirError::Denied { .. }
         | WorkdirError::OutOfScope { .. }

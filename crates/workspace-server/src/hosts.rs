@@ -794,6 +794,10 @@ pub struct RuntimeSessionAttachment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeRegistryError {
+    WorkdirSessionOpenFailed {
+        runtime_id: String,
+        transport: workdir::http::WorkdirTransportError,
+    },
     InvalidIdentifier {
         kind: &'static str,
         value: String,
@@ -823,11 +827,19 @@ impl RuntimeRegistryError {
                 worker.worker_id, worker.runtime_id
             ),
             Self::RuntimeOperationFailed { message, .. } => message.clone(),
+            Self::WorkdirSessionOpenFailed { transport, .. } => transport.message.clone(),
         }
     }
 
     pub fn into_error(self) -> Error {
         match self {
+            Self::WorkdirSessionOpenFailed {
+                runtime_id,
+                transport,
+            } => Error::WorkdirSessionOpenFailed {
+                runtime_id,
+                transport,
+            },
             Self::InvalidIdentifier { kind, value } => Error::InvalidRuntimeIdentifier {
                 kind: kind.to_string(),
                 value,
@@ -1885,10 +1897,9 @@ impl RuntimeRegistry {
         runtime
             .open_workdir_session(working_directory_id, owner_worker_id)
             .await
-            .map_err(|error| RuntimeRegistryError::RuntimeOperationFailed {
+            .map_err(|error| RuntimeRegistryError::WorkdirSessionOpenFailed {
                 runtime_id: runtime_id.to_string(),
-                code: "workdir_session_open_failed".to_string(),
-                message: error.to_string(),
+                transport: workdir::http::WorkdirTransportError::from_workdir_error(&error),
             })
     }
 

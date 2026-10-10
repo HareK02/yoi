@@ -1225,12 +1225,23 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
                 "mismatched checkout mutation response".into(),
             )),
             Ok(_) => Err(Self::mismatch("checkout_execute")),
-            Err(workdir::WorkdirError::Unavailable(_) | workdir::WorkdirError::Transport(_))
-                if mutation =>
+            Err(error)
+                if mutation
+                    && matches!(
+                        error.classification_source(),
+                        workdir::WorkdirError::Unavailable(_) | workdir::WorkdirError::Transport(_)
+                    ) =>
             {
-                Err(workdir::WorkdirError::OutcomeUnknown(
+                let outcome = workdir::WorkdirError::OutcomeUnknown(
                     "checkout provider response lost; inspect effects before retry".into(),
-                ))
+                );
+                Err(match error.denial_reason() {
+                    Some(reason) => workdir::WorkdirError::DenialContext {
+                        reason,
+                        source: Box::new(outcome),
+                    },
+                    None => outcome,
+                })
             }
             Err(error) => Err(error),
         }
@@ -11436,6 +11447,15 @@ impl server_api::ServerApi for ServerApiContractService {
         server_api::CurrentWorkerWorkdirOperationResponse,
         server_api::WorkdirOperationApiError,
     > {
+        let fallback_log = server_api::WorkdirOperationLogContext {
+            operation: workdir_operation_label(&request.operation),
+            stage: "worker_identity",
+            workspace_id_hash: crate::worker_source::diagnostic_id_hash(&workspace_id),
+            attachment_alias_hash: crate::worker_source::diagnostic_id_hash(
+                &request.target_workdir,
+            ),
+            ..Default::default()
+        };
         let Json(response) = scoped_execute_current_worker_workdir_operation(
             State(
                 self.workspace_api()
@@ -11443,22 +11463,18 @@ impl server_api::ServerApi for ServerApiContractService {
                     .clone(),
             ),
             AxumPath(ScopedWorkspacePath { workspace_id }),
-            current_worker_contract_headers(&context)
-                .map_err(server_api::WorkdirOperationApiError::api)?,
+            current_worker_contract_headers(&context).map_err(|error| {
+                let mut error = server_api::WorkdirOperationApiError::api(error);
+                error.workdir_log = Some(fallback_log);
+                error
+            })?,
             Json(WorkspaceWorkdirSessionOperationRequest {
                 target_workdir: request.target_workdir,
                 operation: request.operation,
             }),
         )
         .await
-        .map_err(|error| match error {
-            InternalWorkdirOperationError::Api(error) => {
-                server_api::WorkdirOperationApiError::api(error.into_repository_api_error())
-            }
-            InternalWorkdirOperationError::Provider(error) => {
-                server_api::WorkdirOperationApiError::provider(error)
-            }
-        })?;
+        .map_err(InternalWorkdirOperationError::into_contract_error)?;
         Ok(server_api::CurrentWorkerWorkdirOperationResponse(response))
     }
 
@@ -11700,6 +11716,10 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
 async fn log_failed_api_response(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
+    let request_token_id_hash = request
+        .extensions()
+        .get::<crate::worker_source::VerifiedRuntimeRequestSource>()
+        .and_then(|source| source.token_id_hash.clone());
     let response = next.run(request).await;
     let status = response.status();
 
@@ -11720,11 +11740,23 @@ async fn log_failed_api_response(request: Request, next: Next) -> Response {
             .get::<ApiErrorLog>()
             .or(generated_error.as_ref());
         let event = api_failure_log_event(&method, &uri, status, error);
+        let context = error.and_then(|error| error.workdir_log.as_ref());
+        let workdir_path = context.map(|_| bounded_auth_log_value(uri.path(), 512));
+        let workdir_method = context.map(|_| bounded_auth_log_value(method.as_str(), 32));
         tracing::error!(
             target: "yoi::api",
             event = event.event,
-            method = event.method,
-            path = event.path,
+            method = workdir_method.as_deref().unwrap_or(event.method),
+            path = workdir_path.as_deref().unwrap_or(event.path),
+            operation = context.map(|ctx| ctx.operation),
+            workdir_stage = context.map(|ctx| ctx.stage),
+            workspace_id_hash = context.map(|ctx| ctx.workspace_id_hash.as_str()),
+            runtime_id_hash = context.and_then(|ctx| ctx.runtime_id_hash.as_deref()),
+            worker_id_hash = context.and_then(|ctx| ctx.worker_id_hash.as_deref()),
+            workdir_id_hash = context.and_then(|ctx| ctx.workdir_id_hash.as_deref()),
+            attachment_alias_hash = context.map(|ctx| ctx.attachment_alias_hash.as_str()),
+            request_token_id_hash = context.and(request_token_id_hash.as_deref()),
+            denial_reason = error.and_then(|error| error.denial_reason).map(|reason| reason.as_str()),
             status = event.status,
             kind = event.kind.unwrap_or("unknown"),
             message = event.message.unwrap_or(""),
@@ -17202,9 +17234,10 @@ fn ticket_notification_delivery_error_category(
         Err(RuntimeRegistryError::UnknownRuntime(_)) => Some("unknown_runtime"),
         Err(RuntimeRegistryError::UnknownHost(_)) => Some("unknown_host"),
         Err(RuntimeRegistryError::UnknownWorker { .. }) => Some("unknown_worker"),
-        Err(RuntimeRegistryError::RuntimeOperationFailed { .. }) => {
-            Some("runtime_operation_failed")
-        }
+        Err(
+            RuntimeRegistryError::WorkdirSessionOpenFailed { .. }
+            | RuntimeRegistryError::RuntimeOperationFailed { .. },
+        ) => Some("runtime_operation_failed"),
     }
 }
 
@@ -18195,6 +18228,33 @@ fn validated_current_worker_attachment(
 enum InternalWorkdirOperationError {
     Api(ApiError),
     Provider(WorkdirTransportError),
+    Contextual {
+        error: Box<InternalWorkdirOperationError>,
+        context: server_api::WorkdirOperationLogContext,
+    },
+}
+
+impl InternalWorkdirOperationError {
+    fn into_contract_error(self) -> server_api::WorkdirOperationApiError {
+        match self {
+            Self::Api(error) => {
+                let reason = match &error.error {
+                    Error::WorkdirSessionOpenFailed { transport, .. } => transport.denial_reason,
+                    _ => None,
+                };
+                let mut error =
+                    server_api::WorkdirOperationApiError::api(error.into_repository_api_error());
+                error.denial_reason = reason;
+                error
+            }
+            Self::Provider(error) => server_api::WorkdirOperationApiError::provider(error),
+            Self::Contextual { error, context } => {
+                let mut error = error.into_contract_error();
+                error.workdir_log = Some(context);
+                error
+            }
+        }
+    }
 }
 
 impl From<ApiError> for InternalWorkdirOperationError {
@@ -18217,21 +18277,35 @@ impl From<WorkdirTransportError> for InternalWorkdirOperationError {
 
 impl IntoResponse for InternalWorkdirOperationError {
     fn into_response(self) -> Response {
-        match self {
-            Self::Api(error) => error.into_response(),
-            Self::Provider(error) => {
-                let status = StatusCode::from_u16(error.code.http_status())
-                    .expect("Workdir transport error status is valid");
-                let log = ApiErrorLog {
-                    kind: format!("workdir_session_operation_{}", error.code.as_str()),
-                    message: error.message.clone(),
-                    diagnostics: Vec::new(),
-                };
-                let mut response = (status, Json(error)).into_response();
-                response.extensions_mut().insert(log);
-                response
-            }
-        }
+        let error = self.into_contract_error();
+        let status = StatusCode::from_u16(api_macros::HttpError::status_code(&error))
+            .expect("Workdir error status is valid");
+        let log = ApiErrorLog::from_workdir_operation_error(&error, status);
+        let mut response = (status, Json(error)).into_response();
+        response.extensions_mut().insert(log);
+        response
+    }
+}
+
+fn workdir_operation_label(operation: &WorkdirSessionOperation) -> &'static str {
+    match operation {
+        WorkdirSessionOperation::AuthorizeScope(_) => "authorize_scope",
+        WorkdirSessionOperation::ScopeRulesOverlap(_) => "scope_rules_overlap",
+        WorkdirSessionOperation::CheckoutSearch(_) => "checkout_search",
+        WorkdirSessionOperation::CheckoutObserve(_) => "checkout_observe",
+        WorkdirSessionOperation::CheckoutExecute(_) => "checkout_execute",
+        WorkdirSessionOperation::Stat(_) => "stat",
+        WorkdirSessionOperation::Read(_) => "read",
+        WorkdirSessionOperation::ReadBytes(_) => "read_bytes",
+        WorkdirSessionOperation::Write(_) => "write",
+        WorkdirSessionOperation::Edit(_) => "edit",
+        WorkdirSessionOperation::List(_) => "list",
+        WorkdirSessionOperation::Glob(_) => "glob",
+        WorkdirSessionOperation::Grep(_) => "grep",
+        WorkdirSessionOperation::CommandStart(_) => "command_start",
+        WorkdirSessionOperation::CommandStatus(_) => "command_status",
+        WorkdirSessionOperation::CommandOutput(_) => "command_output",
+        WorkdirSessionOperation::CommandCancel(_) => "command_cancel",
     }
 }
 
@@ -18241,19 +18315,35 @@ async fn scoped_execute_current_worker_workdir_operation(
     headers: HeaderMap,
     Json(request): Json<WorkspaceWorkdirSessionOperationRequest>,
 ) -> std::result::Result<Json<WorkdirSessionOperationResult>, InternalWorkdirOperationError> {
+    let mut context = server_api::WorkdirOperationLogContext {
+        operation: workdir_operation_label(&request.operation),
+        workspace_id_hash: crate::worker_source::diagnostic_id_hash(&path.workspace_id),
+        attachment_alias_hash: crate::worker_source::diagnostic_id_hash(&request.target_workdir),
+        ..Default::default()
+    };
+    let result = async {
+    context.stage = "workspace_scope";
     validate_workspace_scope(&api, &path.workspace_id)?;
+    context.stage = "worker_identity";
     let worker = current_worker_identity(&api, &path.workspace_id, &headers)?;
+    context.runtime_id_hash = Some(crate::worker_source::diagnostic_id_hash(&worker.runtime_id));
+    context.worker_id_hash = Some(crate::worker_source::diagnostic_id_hash(&worker.worker_id));
     let target_workdir = request.target_workdir;
     let result = match request.operation {
         WorkdirSessionOperation::CommandStart(command) => {
             let session_lock = current_worker_session_lock(&api, &worker);
             let _session_guard = session_lock.lock().await;
+            context.stage = "attachment_validation";
             let link = validated_current_worker_attachment(&api, &worker, &target_workdir)?;
+            context.workdir_id_hash = Some(crate::worker_source::diagnostic_id_hash(&link.workdir_id));
+            context.stage = "session_open";
             let source = open_current_worker_workdir_session_locked(&api, &worker, &link).await?;
+            context.stage = "provider_dispatch";
             let provider_handle = source
                 .start_command(command)
                 .await
-                .map_err(|error| current_worker_workdir_operation_error(&worker, error))?;
+                .map_err(workdir_operation_transport_error)?;
+            context.stage = "command_registration";
             let registered_source = api
                 .workdir_sessions
                 .lock()
@@ -18279,31 +18369,31 @@ async fn scoped_execute_current_worker_workdir_operation(
         }
         WorkdirSessionOperation::CommandStatus(external_handle) => {
             let (session, provider_handle) =
-                current_worker_command_session(&api, &worker, &target_workdir, &external_handle)?;
+                current_worker_command_session(&api, &worker, &target_workdir, &external_handle, &mut context)?;
             session
                 .command_status(provider_handle)
                 .await
                 .map(WorkdirSessionOperationResult::CommandStatus)
-                .map_err(|error| current_worker_workdir_operation_error(&worker, error))?
+                .map_err(workdir_operation_transport_error)?
         }
         WorkdirSessionOperation::CommandOutput(mut output) => {
             let (session, provider_handle) =
-                current_worker_command_session(&api, &worker, &target_workdir, &output.handle)?;
+                current_worker_command_session(&api, &worker, &target_workdir, &output.handle, &mut context)?;
             output.handle = provider_handle;
             session
                 .command_output(output)
                 .await
                 .map(WorkdirSessionOperationResult::CommandOutput)
-                .map_err(|error| current_worker_workdir_operation_error(&worker, error))?
+                .map_err(workdir_operation_transport_error)?
         }
         WorkdirSessionOperation::CommandCancel(external_handle) => {
             let (session, provider_handle) =
-                current_worker_command_session(&api, &worker, &target_workdir, &external_handle)?;
+                current_worker_command_session(&api, &worker, &target_workdir, &external_handle, &mut context)?;
             session
                 .cancel_command(provider_handle)
                 .await
                 .map(|()| WorkdirSessionOperationResult::CommandCancel)
-                .map_err(|error| current_worker_workdir_operation_error(&worker, error))?
+                .map_err(workdir_operation_transport_error)?
         }
         operation @ (WorkdirSessionOperation::AuthorizeScope(_)
         | WorkdirSessionOperation::ScopeRulesOverlap(_)
@@ -18320,14 +18410,23 @@ async fn scoped_execute_current_worker_workdir_operation(
         | WorkdirSessionOperation::Grep(_)) => {
             let session_lock = current_worker_session_lock(&api, &worker);
             let _session_guard = session_lock.lock().await;
+            context.stage = "attachment_validation";
             let link = validated_current_worker_attachment(&api, &worker, &target_workdir)?;
+            context.workdir_id_hash = Some(crate::worker_source::diagnostic_id_hash(&link.workdir_id));
+            context.stage = "session_open";
             let source = open_current_worker_workdir_session_locked(&api, &worker, &link).await?;
+            context.stage = "provider_dispatch";
             execute_workdir_session_operation(&source, operation)
                 .await
-                .map_err(|error| current_worker_workdir_operation_error(&worker, error))?
+                .map_err(workdir_operation_transport_error)?
         }
     };
     Ok(Json(result))
+    }.await;
+    result.map_err(|error| InternalWorkdirOperationError::Contextual {
+        error: Box::new(error),
+        context,
+    })
 }
 
 fn current_worker_command_session(
@@ -18335,26 +18434,27 @@ fn current_worker_command_session(
     worker: &RuntimeWorkerRef,
     target_workdir: &str,
     external_handle: &CommandHandle,
+    context: &mut server_api::WorkdirOperationLogContext,
 ) -> std::result::Result<(WorkdirSessionHandle, CommandHandle), InternalWorkdirOperationError> {
-    let _link = validated_current_worker_attachment(api, worker, target_workdir)?;
+    context.stage = "attachment_validation";
+    let link = validated_current_worker_attachment(api, worker, target_workdir)?;
+    context.workdir_id_hash = Some(crate::worker_source::diagnostic_id_hash(&link.workdir_id));
+    context.stage = "command_lookup";
     let command = api
         .workdir_sessions
         .lock()
         .expect("Workdir session registry lock poisoned")
         .command(worker, target_workdir, external_handle)
         .ok_or_else(|| {
-            InternalWorkdirOperationError::Provider(current_worker_workdir_operation_error(
-                worker,
+            InternalWorkdirOperationError::Provider(workdir_operation_transport_error(
                 workdir::WorkdirError::UnknownCommand(external_handle.0.clone()),
             ))
         })?;
+    context.stage = "provider_dispatch";
     Ok((command.source, command.provider_handle))
 }
 
-fn current_worker_workdir_operation_error(
-    _worker: &RuntimeWorkerRef,
-    error: workdir::WorkdirError,
-) -> WorkdirTransportError {
+fn workdir_operation_transport_error(error: workdir::WorkdirError) -> WorkdirTransportError {
     WorkdirTransportError::from_workdir_error(&error)
 }
 
@@ -23453,6 +23553,7 @@ async fn serve_external_workdir_provider(
                 Some(ExternalProviderCommand::Operation { operation_id, operation, response }) => {
                     if revoking {
                         let _ = response.send(Err(WorkdirTransportError {
+                            denial_reason: None,
                             code: workdir::http::WorkdirTransportErrorCode::Unavailable,
                             message: "External Workdir provider shutdown is in progress".to_string(),
                         }));
@@ -23460,6 +23561,7 @@ async fn serve_external_workdir_provider(
                     }
                     if pending.len() >= 16 {
                         let _ = response.send(Err(WorkdirTransportError {
+                            denial_reason: None,
                             code: workdir::http::WorkdirTransportErrorCode::Unavailable,
                             message: "External Workdir provider is at its in-flight operation limit".to_string(),
                         }));
@@ -23470,6 +23572,7 @@ async fn serve_external_workdir_provider(
                         Ok(operation) => operation,
                         Err(message) => {
                             let _ = response.send(Err(WorkdirTransportError {
+                                denial_reason: None,
                                 code: workdir::http::WorkdirTransportErrorCode::InvalidRequest,
                                 message,
                             }));
@@ -23526,6 +23629,7 @@ async fn serve_external_workdir_provider(
                                             Err(error.into_transport_error())
                                         }
                                         ExternalWorkdirOperationOutcome::Cancelled => Err(WorkdirTransportError {
+                                            denial_reason: None,
                                             code: workdir::http::WorkdirTransportErrorCode::Unavailable,
                                             message: "External Workdir operation was cancelled".to_string(),
                                         }),
@@ -24006,6 +24110,9 @@ fn workdir_runtime_failure_code(error: &RuntimeRegistryError) -> String {
     match error {
         RuntimeRegistryError::UnknownRuntime(_) | RuntimeRegistryError::UnknownHost(_) => {
             "runtime_unavailable".to_string()
+        }
+        RuntimeRegistryError::WorkdirSessionOpenFailed { .. } => {
+            "workdir_session_open_failed".to_string()
         }
         RuntimeRegistryError::RuntimeOperationFailed { code, .. } => code.clone(),
         RuntimeRegistryError::InvalidIdentifier { .. } => "invalid_runtime".to_string(),
@@ -24518,6 +24625,7 @@ fn runtime_reports_workdir_not_found(result: &crate::hosts::RuntimeWorkingDirect
 
 fn classify_workdir_provider_error(error: &RuntimeRegistryError) -> (&'static str, bool) {
     match error {
+        RuntimeRegistryError::WorkdirSessionOpenFailed { .. } => ("provider_unavailable", true),
         RuntimeRegistryError::UnknownRuntime(_) => ("runtime_unavailable", true),
         RuntimeRegistryError::RuntimeOperationFailed { code, .. } => {
             let category =
@@ -32556,6 +32664,8 @@ struct ApiErrorLog {
     kind: String,
     message: String,
     diagnostics: Vec<RuntimeDiagnostic>,
+    workdir_log: Option<server_api::WorkdirOperationLogContext>,
+    denial_reason: Option<workdir::WorkdirDenialReason>,
 }
 
 impl ApiErrorLog {
@@ -32568,9 +32678,11 @@ impl ApiErrorLog {
                 kind: format!("workdir_session_operation_{}", code.as_str()),
                 message: sanitize_backend_error(&error.message),
                 diagnostics: Vec::new(),
+                workdir_log: error.workdir_log.clone(),
+                denial_reason: error.denial_reason,
             };
         }
-        Self::from_repository_error(&server_api::RepositoryApiError::new(
+        let mut log = Self::from_repository_error(&server_api::RepositoryApiError::new(
             status.as_u16(),
             error.error.as_deref().unwrap_or_else(|| {
                 status
@@ -32579,11 +32691,25 @@ impl ApiErrorLog {
             }),
             &error.message,
             error.diagnostics.clone().unwrap_or_default(),
-        ))
+        ));
+        log.workdir_log = error.workdir_log.clone();
+        log.denial_reason = error.denial_reason;
+        if log.workdir_log.is_some() {
+            // Existing public API details are unchanged; do not copy request-derived
+            // alias/handle text or session-open errors into operational diagnostics.
+            log.kind = format!("workdir_session_operation_api_{}", status.as_u16());
+            // This can also fail after a command was dispatched. Do not claim
+            // a pre-dispatch refusal or absence of effects in the safe message.
+            log.message = "Workdir operation failed".to_string();
+            log.diagnostics.clear();
+        }
+        log
     }
 
     fn from_repository_error(error: &server_api::RepositoryApiError) -> Self {
         Self {
+            workdir_log: None,
+            denial_reason: None,
             kind: error
                 .diagnostics
                 .first()
@@ -32616,6 +32742,11 @@ impl From<merge_request::MergeRequestError> for ApiError {
 impl From<Error> for ApiError {
     fn from(error: Error) -> Self {
         let diagnostics = match &error {
+            Error::WorkdirSessionOpenFailed { transport, .. } => vec![RuntimeDiagnostic {
+                code: "workdir_session_open_failed".to_string(),
+                severity: HostDiagnosticSeverity::Error,
+                message: transport.message.clone(),
+            }],
             Error::RuntimeOperationFailed { code, message, .. } => vec![RuntimeDiagnostic {
                 code: code.clone(),
                 severity: HostDiagnosticSeverity::Error,
@@ -32834,13 +32965,18 @@ fn api_error_status(error: &Error) -> StatusCode {
             StatusCode::SERVICE_UNAVAILABLE
         }
         Error::WorkspaceSigningIdentity { .. } => StatusCode::SERVICE_UNAVAILABLE,
-        Error::RuntimeOperationFailed { .. } => StatusCode::BAD_GATEWAY,
+        Error::WorkdirSessionOpenFailed { .. } | Error::RuntimeOperationFailed { .. } => {
+            StatusCode::BAD_GATEWAY
+        }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
 fn api_error_response_message(error: &Error) -> String {
     match error {
+        Error::WorkdirSessionOpenFailed { transport, .. } => {
+            format!("workdir_session_open_failed: {}", transport.message)
+        }
         Error::RuntimeOperationFailed { code, message, .. } => {
             format!("{code}: {}", sanitize_backend_error(message))
         }
@@ -32853,6 +32989,8 @@ impl IntoResponse for ApiError {
         let status = api_error_status(&self.error);
         let response_message = api_error_response_message(&self.error);
         let log = ApiErrorLog {
+            workdir_log: None,
+            denial_reason: None,
             kind: self
                 .diagnostics
                 .first()
@@ -32890,6 +33028,7 @@ mod tests {
     mod drive_api_tests;
     mod drive_tests;
     mod drive_web_roundtrip_tests;
+    mod external_checkout_tests;
     mod subject_spawn_tests;
     mod subjektiv_jobs_tests;
     mod ticket_evidence_tests;
@@ -33155,6 +33294,7 @@ mod tests {
         assert!(matches!(operation, WorkdirSessionOperation::Read(_)));
         response
             .send(Err(WorkdirTransportError {
+                denial_reason: None,
                 code: workdir::http::WorkdirTransportErrorCode::NotFound,
                 message: "logical file was not found".to_string(),
             }))
@@ -35153,6 +35293,13 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct WorkdirlessFixtureRuntime {
+        workdir_session_factory: Option<
+            Arc<
+                dyn Fn(&str) -> std::result::Result<WorkdirSessionHandle, workdir::WorkdirError>
+                    + Send
+                    + Sync,
+            >,
+        >,
         input_requests: Arc<Mutex<Vec<WorkerInputRequest>>>,
         workers: Arc<Mutex<Vec<InternalWorkerSummary>>>,
         spawn_requests: Arc<Mutex<Vec<WorkerSpawnRequest>>>,
@@ -35291,6 +35438,27 @@ mod tests {
     }
 
     impl crate::hosts::WorkspaceWorkerRuntime for WorkdirlessFixtureRuntime {
+        fn open_workdir_session<'a>(
+            &'a self,
+            working_directory_id: &'a str,
+            _owner_worker_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<WorkdirSessionHandle, workdir::WorkdirError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.workdir_session_factory.as_ref().ok_or_else(|| {
+                    workdir::WorkdirError::Unavailable(
+                        "Runtime does not expose Workdir operation sessions".to_string(),
+                    )
+                })?(working_directory_id)
+            })
+        }
+
         fn send_input(
             &self,
             worker_id: &str,
@@ -36446,6 +36614,8 @@ mod tests {
             .parse::<Uri>()
             .expect("valid URI");
         let error = ApiErrorLog {
+            workdir_log: None,
+            denial_reason: None,
             kind: "ticket_backend_error".to_string(),
             message: "sqlite error: FOREIGN KEY constraint failed".to_string(),
             diagnostics: vec![RuntimeDiagnostic {
@@ -36587,6 +36757,7 @@ mod tests {
             ),
         ] {
             let response = InternalWorkdirOperationError::Provider(WorkdirTransportError {
+                denial_reason: None,
                 code,
                 message: "safe provider message".to_string(),
             })
@@ -36606,14 +36777,11 @@ mod tests {
 
     #[tokio::test]
     async fn local_and_remote_validation_errors_share_workspace_classification() {
-        let worker = RuntimeWorkerRef::new("runtime", "worker");
-        let local = current_worker_workdir_operation_error(
-            &worker,
-            workdir::WorkdirError::InvalidGlob("[".to_string()),
-        );
-        let remote = current_worker_workdir_operation_error(
-            &worker,
+        let local =
+            workdir_operation_transport_error(workdir::WorkdirError::InvalidGlob("[".to_string()));
+        let remote = workdir_operation_transport_error(
             WorkdirTransportError {
+                denial_reason: None,
                 code: workdir::http::WorkdirTransportErrorCode::InvalidRequest,
                 message: "Workdir operation request is invalid".to_string(),
             }
@@ -36639,10 +36807,7 @@ mod tests {
             path: PathBuf::from("/host/private/worktree/secret.txt"),
             source: std::io::Error::other("token=secret"),
         };
-        let public = current_worker_workdir_operation_error(
-            &RuntimeWorkerRef::new("runtime", "worker"),
-            error,
-        );
+        let public = workdir_operation_transport_error(error);
         let response = InternalWorkdirOperationError::Provider(public).into_response();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
@@ -36651,10 +36816,7 @@ mod tests {
         let decoded: WorkdirTransportError = serde_json::from_str(&text).unwrap();
         assert_eq!(decoded.code, workdir::http::WorkdirTransportErrorCode::Io);
 
-        let remote = current_worker_workdir_operation_error(
-            &RuntimeWorkerRef::new("runtime", "worker"),
-            workdir::WorkdirError::OperationFailed,
-        );
+        let remote = workdir_operation_transport_error(workdir::WorkdirError::OperationFailed);
         let response = InternalWorkdirOperationError::Provider(remote).into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -38254,6 +38416,7 @@ mod tests {
                     .uri(format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers"))
                     // Unit fixture stands below proof middleware, so inject its verified subject.
                     .extension(crate::worker_source::VerifiedRuntimeRequestSource {
+                        token_id_hash: None,
                         runtime_id: fixture.controller.runtime_id.clone(),
                         worker_id: Some(fixture.controller.worker_id.clone()),
                     })
@@ -38577,6 +38740,7 @@ mod tests {
                     .method("POST")
                     .uri(format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers"))
                     .extension(crate::worker_source::VerifiedRuntimeRequestSource {
+                        token_id_hash: None,
                         runtime_id: controller.runtime_id.clone(),
                         worker_id: Some(controller.worker_id.clone()),
                     })

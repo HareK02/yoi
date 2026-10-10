@@ -836,6 +836,7 @@ where
                                         .unwrap_or_else(|_| ExternalWorkdirOperationOutcome::Failed {
                                             error: ExternalWorkdirOperationError::from_transport_error(
                                                 WorkdirTransportError {
+                                                    denial_reason: None,
                                                     code: workdir::http::WorkdirTransportErrorCode::Internal,
                                                     message: "External Workdir operation executor failed".to_string(),
                                                 },
@@ -953,6 +954,7 @@ async fn execute_operation(
             Ok(result) => ExternalWorkdirOperationOutcome::Completed { result },
             Err(message) => ExternalWorkdirOperationOutcome::Failed {
                 error: ExternalWorkdirOperationError::from_transport_error(WorkdirTransportError {
+                    denial_reason: None,
                     code: workdir::http::WorkdirTransportErrorCode::InvalidRequest,
                     message,
                 }),

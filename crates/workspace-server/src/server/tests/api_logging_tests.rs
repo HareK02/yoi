@@ -17,6 +17,12 @@ impl Write for CapturedApiLog {
 }
 
 async fn request_with_logs(app: Router, request: Request<Body>) -> (StatusCode, Value, Vec<Value>) {
+    let token_hash = request
+        .headers()
+        .get(worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|proof| worker_runtime::auth::decode_runtime_request_source_claims(proof).ok())
+        .map(|claims| crate::worker_source::diagnostic_id_hash(&claims.jti));
     let logs = CapturedApiLog::default();
     let writer = logs.clone();
     let subscriber = tracing_subscriber::fmt()
@@ -32,18 +38,41 @@ async fn request_with_logs(app: Router, request: Request<Body>) -> (StatusCode, 
         .await
         .unwrap();
     let status = response.status();
-    assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+    let content_type = response.headers()[CONTENT_TYPE].clone();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        content_type,
+        "application/json",
+        "status={status}, body={}",
+        String::from_utf8_lossy(&body)
+    );
     let body: Value = serde_json::from_slice(&body).unwrap();
     let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-    for secret in ["query-secret", "bearer-secret", "body-secret"] {
+    for secret in [
+        "query-secret",
+        "bearer-secret",
+        "body-secret",
+        "/private/provider/path",
+        "/host/private",
+        "proof-secret",
+        "credential-secret",
+        "key-secret",
+    ] {
         assert!(!text.contains(secret), "log leaked request data: {text}");
     }
-    let events = text
+    let events: Vec<Value> = text
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .filter(|event| event["event"] == "api_error")
         .collect();
+    for event in &events {
+        if event.get("operation").is_some() && token_hash.is_some() {
+            assert_eq!(
+                event["request_token_id_hash"],
+                serde_json::to_value(&token_hash).unwrap()
+            );
+        }
+    }
     (status, body, events)
 }
 
@@ -278,17 +307,50 @@ async fn generated_workdir_provider_errors_preserve_response_and_log_details() {
         )
     };
     let app = build_router(fixture.api.clone());
-    for (code, status, message) in [
-        (Code::Denied, 403, "Workdir operation was denied"),
-        (Code::OutOfScope, 403, "Workdir path is out of scope"),
+    for (code, status, message, reason) in [
+        (Code::Denied, 403, "Workdir operation was denied", None),
+        (
+            Code::Denied,
+            403,
+            "Workdir operation was denied",
+            Some(workdir::WorkdirDenialReason::OsPermissionDenied),
+        ),
+        (
+            Code::Denied,
+            403,
+            "Workdir operation was denied",
+            Some(workdir::WorkdirDenialReason::ReadOnlySession),
+        ),
+        (
+            Code::OutOfScope,
+            403,
+            "Workdir path is out of scope",
+            Some(workdir::WorkdirDenialReason::PathOutOfScope),
+        ),
         (
             Code::SymlinkOutOfScope,
             403,
             "Workdir symlink target is out of scope",
+            Some(workdir::WorkdirDenialReason::SymlinkTargetOutOfScope),
         ),
-        (Code::ReadOnly, 403, "Workdir path is read-only"),
-        (Code::UnknownCommand, 404, "Workdir command was not found"),
-        (Code::Unavailable, 503, "Workdir session is unavailable"),
+        (
+            Code::ReadOnly,
+            403,
+            "Workdir path is read-only",
+            Some(workdir::WorkdirDenialReason::PathReadOnly),
+        ),
+        (
+            Code::UnknownCommand,
+            404,
+            "Workdir command was not found",
+            None,
+        ),
+        (
+            Code::Unavailable,
+            503,
+            "Workdir session is unavailable",
+            None,
+        ),
     ] {
         let provider = async {
             let Some(ExternalProviderCommand::Operation {
@@ -305,6 +367,7 @@ async fn generated_workdir_provider_errors_preserve_response_and_log_details() {
             ));
             response
                 .send(Err(WorkdirTransportError {
+                    denial_reason: reason,
                     code,
                     message: "body-secret /private/provider/path".to_string(),
                 }))
@@ -324,6 +387,22 @@ async fn generated_workdir_provider_errors_preserve_response_and_log_details() {
         assert_eq!(events[0]["status"], status);
         assert_eq!(events[0]["method"], "POST");
         assert_eq!(events[0]["path"], path);
+        assert_eq!(events[0]["operation"], "command_status");
+        assert_eq!(events[0]["workdir_stage"], "provider_dispatch");
+        assert_workdir_log_identity(
+            &events[0],
+            &fixture,
+            "checkout",
+            Some(&fixture.main_workdir_id),
+        );
+        assert_eq!(
+            events[0]["denial_reason"],
+            serde_json::to_value(reason).unwrap()
+        );
+        assert_eq!(
+            events[0]["request_token_id_hash"].as_str().unwrap().len(),
+            64
+        );
     }
     let provider = async {
         let Some(ExternalProviderCommand::Operation { response, .. }) = commands.recv().await
@@ -374,8 +453,358 @@ async fn generated_workdir_api_errors_preserve_response_and_log_details() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body, serde_json::to_value(expected).unwrap());
     assert_eq!(events.len(), 1, "{events:?}");
-    assert_eq!(events[0]["kind"], "forbidden");
-    assert_eq!(events[0]["message"], body["message"]);
+    assert_eq!(events[0]["kind"], "workdir_session_operation_api_403");
+    assert_eq!(events[0]["message"], "Workdir operation failed");
+    assert_eq!(events[0]["operation"], "command_status");
+    assert_eq!(events[0]["workdir_stage"], "worker_identity");
+    assert_eq!(events[0]["runtime_id_hash"], Value::Null);
+    assert_eq!(events[0]["worker_id_hash"], Value::Null);
+    assert_eq!(events[0]["workdir_id_hash"], Value::Null);
     assert_eq!(events[0]["diagnostics"], "[]");
     assert_eq!(events[0]["path"], path);
+}
+
+fn assert_workdir_log_identity(
+    event: &Value,
+    fixture: &ManualCoderAssignmentFixture,
+    alias: &str,
+    workdir_id: Option<&str>,
+) {
+    let hash = crate::worker_source::diagnostic_id_hash;
+    assert_eq!(event["workspace_id_hash"], hash(TEST_WORKSPACE_ID));
+    assert_eq!(event["runtime_id_hash"], hash(&fixture.worker.runtime_id));
+    assert_eq!(event["worker_id_hash"], hash(&fixture.worker.worker_id));
+    assert_eq!(event["attachment_alias_hash"], hash(alias));
+    assert_eq!(
+        event["workdir_id_hash"],
+        serde_json::to_value(workdir_id.map(hash)).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn self_workdir_provider_refusals_log_operation_identity_without_request_text() {
+    use workdir::{WorkdirDenialReason as Reason, WorkdirSessionCapabilities as Caps};
+    let mut fixture = manual_worker_assignment_fixture().await;
+    let root = tempfile::tempdir().unwrap();
+    let provider_root = root.path().to_path_buf();
+    // Fresh sessions exercise the real opening/broker/dispatch path on each request.
+    fixture.runtime.workdir_session_factory = Some(Arc::new(move |id| {
+        Ok(Arc::new(workdir::LocalWorkdirSession::materialized_bound(
+            workdir::Workdir::new(id),
+            provider_root.clone(),
+            provider_root.clone(),
+            manifest::SharedScope::new(manifest::Scope::writable(&provider_root).unwrap()),
+            Caps::READ_ONLY,
+        )) as WorkdirSessionHandle)
+    }));
+    fixture
+        .api
+        .runtime
+        .register_or_replace(fixture.runtime.clone());
+    let identity =
+        worker_runtime::auth::RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id)
+            .unwrap();
+    configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-session/operations");
+    let app = build_router(fixture.api.clone());
+    let secret = format!(
+        "body-secret credential-secret key-secret proof-secret{}",
+        "z".repeat(20_000)
+    );
+    let cases = [
+        (
+            json!({"operation": "read", "request": {"path": "/host/private/secret.txt", "offset": 0, "limit": 10, "max_bytes": 1024}}),
+            "read",
+            "out_of_scope",
+            Reason::PathOutOfScope,
+        ),
+        (
+            json!({"operation": "write", "request": {"path": "secret.txt", "content": secret.as_bytes()}}),
+            "write",
+            "denied",
+            Reason::ScopedCapabilityDenied,
+        ),
+        (
+            json!({"operation": "command_start", "request": {"command": secret, "timeout_secs": 1, "output_limit": 1024, "cwd": "", "tool_call_id": secret}}),
+            "command_start",
+            "denied",
+            Reason::ScopedCapabilityDenied,
+        ),
+        (
+            // Scoped forwarding validates this READ_ONLY parent's capabilities
+            // before provider resolution. Local now supports scope resolution;
+            // denying write rules is not a missing-resolver failure.
+            json!({"operation": "authorize_scope", "request": {"path": "secret.txt", "permission": "write", "rules": [{"target": "", "permission": "write", "recursive": true}]}}),
+            "authorize_scope",
+            "denied",
+            Reason::ParentCapabilityDenied,
+        ),
+    ];
+    for (operation, label, code, reason) in cases {
+        let _: WorkdirSessionOperation =
+            serde_json::from_value(operation.clone()).expect("valid operation fixture");
+        let request = runtime_source_request(
+            &identity,
+            Some(&fixture.worker.worker_id),
+            "POST",
+            &format!("{path}?token=query-secret"),
+            serde_json::to_vec(&json!({"target_workdir": "checkout", "operation": operation}))
+                .unwrap(),
+        );
+        let (status, body, events) = request_with_logs(app.clone(), request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], code, "{body}");
+        assert!(
+            body.get("denial_reason").is_none(),
+            "internal diagnostics leaked: {body}"
+        );
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["operation"], label);
+        assert_eq!(events[0]["workdir_stage"], "provider_dispatch");
+        assert_eq!(
+            events[0]["denial_reason"],
+            serde_json::to_value(reason).unwrap()
+        );
+        assert_workdir_log_identity(
+            &events[0],
+            &fixture,
+            "checkout",
+            Some(&fixture.main_workdir_id),
+        );
+        assert_eq!(
+            events[0]["request_token_id_hash"].as_str().unwrap().len(),
+            64
+        );
+        assert!(
+            events[0].to_string().len() < 2000,
+            "unbounded log: {events:?}"
+        );
+    }
+    // Control: the same READ_ONLY provider can authorize read rules through
+    // scoped forwarding and native resolution. Keep a capability refusal
+    // distinct from an unavailable scope resolver; successful authorization
+    // must not emit an api_error or mutate the filesystem.
+    let read_scope = runtime_source_request(
+        &identity,
+        Some(&fixture.worker.worker_id),
+        "POST",
+        &format!("{path}?token=query-secret"),
+        serde_json::to_vec(&json!({
+            "target_workdir": "checkout",
+            "operation": {"operation": "authorize_scope", "request": {
+                "path": "", "permission": "read",
+                "rules": [{"target": "", "permission": "read", "recursive": true}],
+            }},
+        }))
+        .unwrap(),
+    );
+    let (status, body, events) = request_with_logs(app, read_scope).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        serde_json::to_value(WorkdirSessionOperationResult::AuthorizeScope).unwrap(),
+    );
+    assert!(
+        events.is_empty(),
+        "successful scope authorization logged as failure: {events:?}"
+    );
+    assert!(
+        !root.path().join("secret.txt").exists(),
+        "refusal changed filesystem"
+    );
+}
+
+#[tokio::test]
+async fn self_workdir_attachment_rejection_hashes_oversized_alias_and_omits_unknown_workdir() {
+    let mut fixture = manual_worker_assignment_fixture().await;
+    let identity =
+        worker_runtime::auth::RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id)
+            .unwrap();
+    configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-session/operations");
+    let alias = format!(
+        "body-secret /host/private credential-secret key-secret proof-secret{}",
+        "あ".repeat(10_000)
+    );
+    let request = runtime_source_request(
+        &identity,
+        Some(&fixture.worker.worker_id),
+        "POST",
+        &path,
+        serde_json::to_vec(&json!({
+            "target_workdir": alias,
+            "operation": {"operation": "command_status", "request": "body-secret"}
+        }))
+        .unwrap(),
+    );
+    let (status, body, events) =
+        request_with_logs(build_router(fixture.api.clone()), request).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["workdir_stage"], "attachment_validation");
+    assert_eq!(events[0]["operation"], "command_status");
+    assert_workdir_log_identity(&events[0], &fixture, &alias, None);
+    assert_eq!(events[0]["denial_reason"], Value::Null);
+    assert!(
+        events[0].to_string().len() < 2000,
+        "unbounded log: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn self_workdir_session_open_refusals_keep_reason_before_registry_conversion() {
+    use workdir::WorkdirDenialReason as Reason;
+    for (reason, os_error) in [
+        (Reason::ReadOnlySession, false),
+        (Reason::OsPermissionDenied, true),
+    ] {
+        let mut fixture = manual_worker_assignment_fixture().await;
+        fixture.runtime.workdir_session_factory = Some(Arc::new(move |_| {
+            Err(if os_error {
+                workdir::WorkdirError::Io {
+                    path: PathBuf::from("/host/private/key-secret"),
+                    source: std::io::Error::from_raw_os_error(13),
+                }
+            } else {
+                workdir::WorkdirError::denied(reason, "body-secret credential-secret /host/private")
+            })
+        }));
+        fixture
+            .api
+            .runtime
+            .register_or_replace(fixture.runtime.clone());
+        let identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id)
+                .unwrap();
+        configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
+        let path = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-session/operations");
+        let request = runtime_source_request(&identity, Some(&fixture.worker.worker_id), "POST", &path, serde_json::to_vec(&json!({
+            "target_workdir": "checkout",
+            "operation": {"operation": "read", "request": {"path": "README.md", "offset": 0, "limit": 10, "max_bytes": 1024}}
+        })).unwrap());
+        let (status, body, events) =
+            request_with_logs(build_router(fixture.api.clone()), request).await;
+        // Opening retained its existing Registry HTTP meaning, not an operation's 403.
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(
+            body["message"],
+            "workdir_session_open_failed: Workdir operation was denied"
+        );
+        assert!(body.get("denial_reason").is_none(), "{body}");
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["workdir_stage"], "session_open");
+        assert_eq!(events[0]["operation"], "read");
+        assert_eq!(
+            events[0]["denial_reason"],
+            serde_json::to_value(reason).unwrap()
+        );
+        assert_workdir_log_identity(
+            &events[0],
+            &fixture,
+            "checkout",
+            Some(&fixture.main_workdir_id),
+        );
+        assert!(!body.to_string().contains("body-secret"));
+        assert!(!body.to_string().contains("/host/private"));
+    }
+}
+
+#[tokio::test]
+async fn self_workdir_post_start_registration_failure_does_not_claim_pre_dispatch_refusal() {
+    let mut fixture = manual_worker_assignment_fixture().await;
+    let identity =
+        worker_runtime::auth::RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id)
+            .unwrap();
+    configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
+    let (sender, mut commands) = tokio::sync::mpsc::channel(1);
+    let connection = Arc::new(ExternalProviderConnection {
+        grant_id: "logging-grant".to_string(),
+        workdir_id: fixture.main_workdir_id.clone(),
+        provider_instance_id: "logging-provider".to_string(),
+        generation: 1,
+        expires_at: None,
+        capabilities: workdir::WorkdirSessionCapabilities::ALL,
+        admission: Arc::new(tokio::sync::Semaphore::new(1)),
+        shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        sender,
+    });
+    fixture.runtime.workdir_session_factory = Some(Arc::new(move |_| {
+        Ok(Arc::new(ExternalProviderWorkdirSession::new(
+            connection.clone(),
+            None,
+        )) as WorkdirSessionHandle)
+    }));
+    fixture
+        .api
+        .runtime
+        .register_or_replace(fixture.runtime.clone());
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-session/operations");
+    let request = runtime_source_request(
+        &identity,
+        Some(&fixture.worker.worker_id),
+        "POST",
+        &path,
+        serde_json::to_vec(&json!({
+            "target_workdir": "checkout",
+            "operation": {"operation": "command_start", "request": {
+                "command": "body-secret", "timeout_secs": 1, "output_limit": 1024,
+                "cwd": "", "spill_dir": null, "tool_call_id": "body-secret"
+            }}
+        }))
+        .unwrap(),
+    );
+    // Observe command dispatch, then lose only the fixture registry entry before
+    // completing start. No OS process is launched, no sleep or retry is needed.
+    let provider = async {
+        let Some(ExternalProviderCommand::Operation {
+            operation,
+            response,
+            ..
+        }) = commands.recv().await
+        else {
+            panic!("expected provider start operation");
+        };
+        assert!(matches!(
+            operation,
+            WorkdirSessionOperation::CommandStart(_)
+        ));
+        fixture
+            .api
+            .workdir_sessions
+            .lock()
+            .unwrap()
+            .remove_attachment(&fixture.worker)
+            .unwrap();
+        response
+            .send(Ok(WorkdirSessionOperationResult::CommandStart(
+                CommandHandle("fixture-provider-handle".into()),
+            )))
+            .unwrap();
+    };
+    let ((status, body, events), ()) = tokio::join!(
+        request_with_logs(build_router(fixture.api.clone()), request),
+        provider
+    );
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("workdir_session_registration_failed:")
+    );
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["operation"], "command_start");
+    assert_eq!(events[0]["workdir_stage"], "command_registration");
+    assert_eq!(events[0]["message"], "Workdir operation failed");
+    assert_eq!(events[0]["denial_reason"], Value::Null);
+    assert_workdir_log_identity(
+        &events[0],
+        &fixture,
+        "checkout",
+        Some(&fixture.main_workdir_id),
+    );
+    assert!(
+        commands.try_recv().is_err(),
+        "post-dispatch failure was retried"
+    );
 }

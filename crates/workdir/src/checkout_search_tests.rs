@@ -751,7 +751,15 @@ async fn checkout_search_native_skips_symlinked_ignore_sources_without_outside_e
             )))
             .await
             .unwrap_err();
-        assert!(matches!(error, WorkdirError::OutOfScope(_)));
+        let classification = match &error {
+            WorkdirError::DenialContext { source, .. } => source.as_ref(),
+            error => error,
+        };
+        assert!(matches!(classification, WorkdirError::OutOfScope(_)));
+        assert_ne!(
+            error.denial_reason(),
+            Some(crate::WorkdirDenialReason::OsPermissionDenied)
+        );
     }
     for (relative, hidden) in [
         (".ignore", "root-ignore-visible.txt"),
