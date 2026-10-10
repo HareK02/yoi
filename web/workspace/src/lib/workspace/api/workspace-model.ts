@@ -135,7 +135,7 @@ function repositoryArray(value: unknown, path: string): unknown[] {
   return parsed;
 }
 
-function repositorySourceRevision(value: unknown, path: string): number {
+function nonnegativeSafeInteger(value: unknown, path: string): number {
   const parsed = integer(value, path);
   if (parsed < 0) {
     throw new Error(`${path} must be between 0 and Number.MAX_SAFE_INTEGER`);
@@ -833,7 +833,7 @@ export function parseRepositorySshConnectionProbeResponse(
 }
 
 const WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES = 128;
-const WORKSPACE_DELETION_MAX_REVISION_BYTES = 128;
+const WORKSPACE_DELETION_MAX_UPDATED_AT_BYTES = 128;
 const WORKSPACE_DELETION_MAX_BLOCKERS = 1024;
 const WORKSPACE_DELETION_MAX_CHILD_OPERATION_IDS = 4096;
 const WORKSPACE_DELETION_MAX_RESOURCE_VALUE_BYTES = 128;
@@ -872,7 +872,6 @@ const deletionStates = new Set<WorkspaceDeletionState>([
 ]);
 const deletionBlockerKinds = new Set<WorkspaceDeletionBlockerKind>([
   "last_accessible_workspace",
-  "revision_conflict",
   "dirty_workdir",
   "worker_removal_blocked",
   "workdir_removal_blocked",
@@ -981,7 +980,7 @@ export function parseWorkspaceDeletionPreflightResponse(
     expected_workspace_updated_at: deletionBoundedString(
       item.expected_workspace_updated_at,
       "Workspace deletion preflight.expected_workspace_updated_at",
-      WORKSPACE_DELETION_MAX_REVISION_BYTES,
+      WORKSPACE_DELETION_MAX_UPDATED_AT_BYTES,
     ),
     can_delete: boolean(
       item.can_delete,
@@ -1089,7 +1088,7 @@ export function parseHostListResponse(value: unknown): HostListResponse {
     ["workspace_id", "limit", "items", "source", "diagnostics"],
     "host list response",
   );
-  const limit = repositorySourceRevision(
+  const limit = nonnegativeSafeInteger(
     response.limit,
     "host list response.limit",
   );

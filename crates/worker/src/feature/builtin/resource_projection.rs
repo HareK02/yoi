@@ -841,7 +841,7 @@ mod tests {
         let projected = project_ticket_detail(json!({
             "id": "internal-ticket",
             "resource_key": "T-588",
-            "content_digest": "revision-1",
+            "content_digest": "ticket-content-digest",
             "title": "Queued Submit",
             "body": "Body",
             "state": "planning",
@@ -892,7 +892,7 @@ mod tests {
         .expect("current Ticket blocker shape must project");
 
         let projected = serde_json::to_value(projected).expect("serialize Ticket detail");
-        assert_eq!(projected["content_digest"], "revision-1");
+        assert_eq!(projected["content_digest"], "ticket-content-digest");
         assert_eq!(
             projected["relations"]["blockers"],
             json!([{
@@ -944,7 +944,7 @@ mod tests {
             });
             let projected = project_ticket_detail(json!({
                 "resource_key": "T-716",
-                "content_digest": "current-ticket-revision",
+                "content_digest": "current-ticket-content-digest",
                 "title": "Source evidence",
                 "body": "Body",
                 "state": if merged { "done" } else { "inprogress" },
@@ -982,7 +982,7 @@ mod tests {
                     Some(&json!(integration_error))
                 );
             }
-            assert_eq!(projected["content_digest"], "current-ticket-revision");
+            assert_eq!(projected["content_digest"], "current-ticket-content-digest");
             assert_eq!(projected["evidence"]["review_after_rescope"], attested);
             assert_eq!(projected["evidence"]["complete_for_integration"], merged);
         }

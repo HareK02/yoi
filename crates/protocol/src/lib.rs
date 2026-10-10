@@ -1142,7 +1142,8 @@ pub enum Event {
         notification_request_id: String,
         message: String,
     },
-    /// Revisioned FIFO replacement following enqueue, activation, cancel, or clear.
+    /// Complete FIFO replacement following enqueue, activation, cancel, or clear.
+    /// Clients replace their pending view in stream order; reconnect uses the snapshot.
     PendingSubmissionsChanged {
         pending: PendingSubmissionsSnapshot,
     },
@@ -2035,8 +2036,6 @@ mod tests {
                 }
             })
         );
-        assert!(value.get("execution_generation").is_none());
-        assert!(value.get("revision").is_none());
     }
 
     #[test]
@@ -2276,7 +2275,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_commands_reject_removed_nested_preconditions() {
+    fn lifecycle_commands_reject_unknown_nested_preconditions() {
         for method in ["pause", "cancel", "resume", "compact", "shutdown"] {
             let wire = serde_json::json!({
                 "method": method,
@@ -2284,16 +2283,12 @@ mod tests {
             });
             // Current commands are arrival-time operations, not Run-bound CAS.
             assert!(serde_json::from_value::<Method>(wire.clone()).is_ok());
-            for field in [
-                "expected_execution_generation",
-                "expected_worker_state_revision",
-            ] {
-                let mut old_command = wire.clone();
-                old_command["params"]["command"][field] = serde_json::json!(1);
-                let error = serde_json::from_value::<Method>(old_command)
-                    .expect_err("removed command preconditions must not be silently ignored");
-                assert!(error.to_string().contains(field), "{method}: {error}");
-            }
+            let field = "unexpected_state_guard";
+            let mut unknown_command = wire.clone();
+            unknown_command["params"]["command"][field] = serde_json::json!(1);
+            let error = serde_json::from_value::<Method>(unknown_command)
+                .expect_err("unknown command preconditions must not be silently ignored");
+            assert!(error.to_string().contains(field), "{method}: {error}");
         }
     }
 
@@ -2308,8 +2303,6 @@ mod tests {
             },
         ] {
             let json = serde_json::to_string(&method).unwrap();
-            assert!(!json.contains("expected_execution_generation"));
-            assert!(!json.contains("expected_worker_state_revision"));
             let decoded: Method = serde_json::from_str(&json).unwrap();
             match decoded {
                 Method::Pause { command } | Method::Compact { command } => {
@@ -2867,14 +2860,21 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["event"], "worker_state");
-        assert!(
-            parsed["data"]["snapshot"]
-                .get("execution_generation")
-                .is_none()
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "event": "worker_state",
+                "data": {
+                    "snapshot": {
+                        "last_command_id": 9,
+                        "state": {
+                            "kind": "busy",
+                            "state": { "kind": "run", "state": "running" }
+                        }
+                    }
+                }
+            })
         );
-        assert!(parsed["data"]["snapshot"].get("revision").is_none());
-        assert_eq!(parsed["data"]["snapshot"]["state"]["kind"], "busy");
 
         let decoded: Event = serde_json::from_str(&json).unwrap();
         assert!(matches!(

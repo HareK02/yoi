@@ -217,7 +217,7 @@ fn merged_skills(
                     source_diagnostic = Some(SkillDiagnostic::error(
                         "skill_source_mismatch",
                         format!(
-                            "Skill `{name}` must be the imported value of `{canonical_path}` in the active config revision"
+                            "Skill `{name}` must be the imported value of `{canonical_path}` in the active config snapshot"
                         ),
                         Some(format!("workspace:{name}")),
                     ));
@@ -233,7 +233,7 @@ fn merged_skills(
         } else {
             source_diagnostic = Some(SkillDiagnostic::error(
                 "missing_skill_source",
-                format!("Skill `{name}` requires `{canonical_path}` in the active config revision"),
+                format!("Skill `{name}` requires `{canonical_path}` in the active config snapshot"),
                 Some(format!("workspace:{name}")),
             ));
         }

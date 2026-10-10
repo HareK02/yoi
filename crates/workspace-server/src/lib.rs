@@ -42,7 +42,7 @@ mod workspace_subscription;
 
 pub use authority::{
     InternalMemoryStagingEntry, MemoryAuthority, MemoryDocument, MemoryStagingResolution,
-    ObjectiveAuthority, SqliteWorkspaceAuthority, TicketAuthority, TicketMergeRevisionSource,
+    ObjectiveAuthority, SqliteWorkspaceAuthority, TicketAuthority, TicketSourceCommitResolver,
     WorkspaceAuthority,
 };
 pub use config::{ResolvedWorkspaceBackendConfig, ServerHostConfigFile};

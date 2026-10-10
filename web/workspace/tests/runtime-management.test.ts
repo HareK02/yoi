@@ -199,10 +199,10 @@ Deno.test("Runtime validators reject unknown object keys and enum variants", () 
 });
 
 Deno.test("Runtime validators reject invalid binding identities and bounded collection overflow", () => {
-  const unsafeRevision = structuredClone(detail());
-  Object.assign(unsafeRevision.trust_key, { binding_id: 1 });
+  const invalidBinding = structuredClone(detail());
+  Object.assign(invalidBinding.trust_key, { binding_id: 1 });
   assertThrows(
-    () => parseWorkspaceRuntimeDetail(unsafeRevision),
+    () => parseWorkspaceRuntimeDetail(invalidBinding),
     "must be a string",
   );
 
@@ -506,11 +506,11 @@ Deno.test("Runtime trust replacement preserves binding conflicts without retryin
   }
 });
 
-Deno.test("Runtime trust replacement rejects legacy counter conflict responses", async () => {
+Deno.test("Runtime trust replacement rejects unknown fields and missing binding identity in conflict responses", async () => {
   const fetchImpl = (() => Promise.resolve(Response.json({
     error: "stale_binding",
     message: "Stale trust",
-    current_revision: 3,
+    unexpected_field: true,
   }, { status: 409 }))) as typeof fetch;
   try {
     await createRemoteRuntime("workspace-a", {

@@ -367,7 +367,7 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
         ).count(),
         1,
       );
-      assertEquals(await paginationPage.getByText("Store revision", { exact: true }).count(), 0);
+      assertEquals(await paginationPage.getByText("Memory fingerprint", { exact: true }).count(), 0);
       assert((await paginationPage.getByText("Not connected", { exact: true }).count()) > 0);
       assertEquals(await paginationPage.getByText("Subject on the next page").count(), 0);
       await paginationPage.getByRole("navigation", { name: "Subject pages" }).getByRole(

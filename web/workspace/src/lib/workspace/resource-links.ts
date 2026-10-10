@@ -1,6 +1,6 @@
 import type { DriveEntryRef } from "#lib/generated/drive-api.ts";
 
-/** Human-facing latest-only link: name, path, revision and bearer tokens are absent. */
+/** Human-facing latest-only link: name, path, content digest and bearer tokens are absent. */
 export function driveHref(entry: DriveEntryRef): string {
   if (
     !/^[1-9][0-9]{0,18}$/.test(entry.node_id) ||

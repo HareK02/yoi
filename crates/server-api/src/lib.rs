@@ -6022,7 +6022,6 @@ pub enum WorkspaceDeletionState {
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceDeletionBlockerKind {
     LastAccessibleWorkspace,
-    RevisionConflict,
     DirtyWorkdir,
     WorkerRemovalBlocked,
     WorkdirRemovalBlocked,
@@ -11845,7 +11844,6 @@ mod tests {
         let source: RepositorySource = serde_json::from_value(serde_json::json!({
             "kind": "http",
             "uri": "http://git.example.test/team/project.git",
-            "revision": 1,
         }))
         .unwrap();
 
@@ -11925,7 +11923,10 @@ mod tests {
         let decoded: SkillCatalogResponse =
             serde_json::from_str(&json).expect("deserialize Skill catalog");
         assert_eq!(decoded, response);
-        assert!(!json.contains("\"revision\""));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["projection"],
+            serde_json::json!({"tree_digest": "tree-digest"})
+        );
         assert!(!json.contains("\"tree_digest\":null"));
     }
 
@@ -12200,6 +12201,26 @@ mod tests {
 
     #[test]
     fn workspace_deletion_wire_contract_is_closed_and_typed() {
+        let categories = serde_json::to_value([
+            WorkspaceDeletionBlockerKind::LastAccessibleWorkspace,
+            WorkspaceDeletionBlockerKind::DirtyWorkdir,
+            WorkspaceDeletionBlockerKind::WorkerRemovalBlocked,
+            WorkspaceDeletionBlockerKind::WorkdirRemovalBlocked,
+            WorkspaceDeletionBlockerKind::RetentionHold,
+            WorkspaceDeletionBlockerKind::CleanupUnavailable,
+        ])
+        .unwrap();
+        assert_eq!(
+            categories,
+            serde_json::json!([
+                "last_accessible_workspace",
+                "dirty_workdir",
+                "worker_removal_blocked",
+                "workdir_removal_blocked",
+                "retention_hold",
+                "cleanup_unavailable"
+            ])
+        );
         let preflight = WorkspaceDeletionPreflightResponse {
             workspace_id: "workspace-test".to_string(),
             display_name: "Test".to_string(),
@@ -12221,7 +12242,7 @@ mod tests {
             preflight
         );
         let mut stale = value.as_object().unwrap().clone();
-        stale.insert("revision".to_string(), serde_json::json!(7));
+        stale.insert("unexpected".to_string(), serde_json::json!(7));
         assert!(
             serde_json::from_value::<WorkspaceDeletionPreflightResponse>(stale.into()).is_err()
         );
@@ -12516,16 +12537,14 @@ mod tests {
     }
 
     #[test]
-    fn repository_response_rejects_stale_field_aliases() {
-        let stale = serde_json::json!({
+    fn repository_response_rejects_unknown_item_fields() {
+        let valid = serde_json::json!({
             "workspace_id": "workspace-test",
             "items": [{
                 "repository_key": "main",
-                "display_name": "main",
                 "kind": "git",
                 "provider": "git",
                 "source": {"kind": "local_path", "uri": "/srv/project"},
-                "source_revision": 1,
                 "source_fingerprint": "sha256:test",
                 "observed_status": "ready",
                 "record_authority": "workspace-control-plane"
@@ -12533,8 +12552,10 @@ mod tests {
             "source": "workspace-control-plane",
             "diagnostics": []
         });
-
-        assert!(serde_json::from_value::<RepositoryListResponse>(stale).is_err());
+        serde_json::from_value::<RepositoryListResponse>(valid.clone()).unwrap();
+        let mut unknown = valid;
+        unknown["items"][0]["unexpected_state_guard"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<RepositoryListResponse>(unknown).is_err());
     }
 
     #[test]
@@ -12657,21 +12678,23 @@ mod tests {
         };
         round_trip(evidence.clone());
         let mut stale = serde_json::to_value(evidence).unwrap();
-        stale["workspace_identity_revision"] = serde_json::json!(1);
+        stale["unexpected_state_guard"] = serde_json::json!(1);
         assert!(serde_json::from_value::<RuntimeVerificationEvidenceSummary>(stale).is_err());
         round_trip(RevokeRuntimeTrustKeyRequest {
             expected_binding_id: "binding-observed".into(),
         });
         assert!(
             serde_json::from_value::<RevokeRuntimeTrustKeyRequest>(serde_json::json!({
-                "expected_revision": 1
+                "expected_binding_id": "binding-observed",
+                "unexpected_state_guard": 1
             }))
             .is_err()
         );
         assert!(
             serde_json::from_value::<RemoveRuntimeRequest>(serde_json::json!({
                 "operation_id": "remove-binding",
-                "expected_binding_revision": 1
+                "expected_binding_id": "binding-observed",
+                "unexpected_state_guard": 1
             }))
             .is_err()
         );
@@ -12683,6 +12706,14 @@ mod tests {
 
     #[test]
     fn repository_key_mutations_require_observed_key_fingerprints() {
+        round_trip(DeleteRepositorySshCredentialRequest {
+            operation_id: "delete-key".into(),
+            expected_public_key_fingerprint: "sha256:observed-key".into(),
+        });
+        round_trip(DeleteRepositorySshHostTrustRequest {
+            operation_id: "delete-trust".into(),
+            expected_fingerprint: "sha256:observed-host-key".into(),
+        });
         round_trip(RotateRepositorySshCredentialRequest {
             operation_id: "rotate-key".into(),
             expected_public_key_fingerprint: "sha256:observed-key".into(),
@@ -12700,14 +12731,16 @@ mod tests {
         assert!(
             serde_json::from_value::<DeleteRepositorySshCredentialRequest>(serde_json::json!({
                 "operation_id": "delete-key",
-                "expected_revision": 1
+                "expected_public_key_fingerprint": "sha256:observed-key",
+                "unexpected_state_guard": 1
             }))
             .is_err()
         );
         assert!(
             serde_json::from_value::<DeleteRepositorySshHostTrustRequest>(serde_json::json!({
                 "operation_id": "delete-trust",
-                "expected_revision": 1
+                "expected_fingerprint": "sha256:observed-host-key",
+                "unexpected_state_guard": 1
             }))
             .is_err()
         );
@@ -12763,7 +12796,7 @@ mod tests {
         assert!(output.contains("export type WorkspaceConfigTreeResponse ="));
         assert!(output.contains("export type ConfigCommitRequest ="));
         assert!(output.contains("export type ProfileSettingsResponse ="));
-        assert!(!output.contains("config_revision"));
+        assert!(output.contains("base_digest: string"));
         assert!(output.contains("provenance: WorkspaceProfileSourceProvenance"));
         assert!(output.contains(
             "export type WorkspaceProfileSourceProvenance = \"project_profile_source_tree\""

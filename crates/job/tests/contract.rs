@@ -15,7 +15,7 @@ fn request() -> JobRequest {
 }
 
 #[test]
-fn input_content_identity_is_computed_and_old_counter_is_not_accepted() {
+fn input_content_identity_is_computed_and_unknown_fields_are_rejected() {
     let original = request();
     let mut changed = original.clone();
     changed.input = json!({"title": "changed"});
@@ -28,9 +28,9 @@ fn input_content_identity_is_computed_and_old_counter_is_not_accepted() {
         changed.input_digest().unwrap(),
         fingerprint(&changed.input).unwrap()
     );
-    let mut old = serde_json::to_value(&original).unwrap();
-    old["input_revision"] = json!(7);
-    assert!(serde_json::from_value::<JobRequest>(old).is_err());
+    let mut unknown = serde_json::to_value(&original).unwrap();
+    unknown["unexpected_state_guard"] = json!(7);
+    assert!(serde_json::from_value::<JobRequest>(unknown).is_err());
 }
 
 #[test]

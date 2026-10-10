@@ -93,6 +93,19 @@ Deno.test("profile settings requests use scoped API and strictly validate respon
   }
 });
 
+Deno.test("profile source byte counts accept nonnegative safe integers and reject missing or malformed values", () => {
+  for (const sizeBytes of [0, 128, Number.MAX_SAFE_INTEGER]) {
+    const value = profileSettingsFixture();
+    (value.sources as Record<string, unknown>[])[0].size_bytes = sizeBytes;
+    assertEquals(parseProfileSettingsResponse(value).sources[0].size_bytes, sizeBytes);
+  }
+  for (const sizeBytes of [undefined, null, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, "128"]) {
+    const value = profileSettingsFixture();
+    (value.sources as Record<string, unknown>[])[0].size_bytes = sizeBytes;
+    assertThrows(() => parseProfileSettingsResponse(value), ProfileApiError);
+  }
+});
+
 Deno.test("workspace metadata requests use generated DTO shapes", async () => {
   const originalFetch = globalThis.fetch;
   const requests: Array<{ url: string; init?: RequestInit }> = [];
@@ -247,8 +260,7 @@ Deno.test("Workspace signing identity parser validates active and pending public
         value.private_material_ref = "must-not-be-accepted";
       },
       (value: Record<string, unknown>) => {
-        (value.identity as Record<string, unknown>).revision =
-          Number.MAX_SAFE_INTEGER + 1;
+        (value.identity as Record<string, unknown>).unexpected_field = true;
       },
       (value: Record<string, unknown>) => {
         (value.identity as Record<string, unknown>).public_key = "x".repeat(
@@ -287,7 +299,7 @@ Deno.test("workspace metadata parser rejects incomplete or stale response fields
         workspace_id: "workspace-test",
         display_name: "Workspace",
         created_at: "2026-01-01T00:00:00Z",
-        revision: "sha256:metadata",
+        updated_at: "2026-01-02T00:00:00Z",
         source: "workspace-config",
         diagnostics: [],
         workspace_path: "/legacy/path",

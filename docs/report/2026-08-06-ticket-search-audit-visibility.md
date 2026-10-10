@@ -2,6 +2,8 @@
 
 Tracking Ticket: `00001KZRNHB35`
 
+2026-10-10 編集注: 以下は当時の調査と提案の要旨であり、現行 API の仕様ではない。旧状態番号を含む仮の型名や逐語 schema は、対象 snapshot / Git commit / 履歴参照という目的別の説明へ整理した。新しい API 名が当時存在したという記録にはしない。
+
 ## 発生日
 
 2026-08-06
@@ -64,7 +66,7 @@ commit `e6a2da54`
 - test evidence
 - dirty state
 - assignment id
-- report対象revision
+- report対象の item snapshot
 
 Markdown headingや文言に依存した監査になる。
 
@@ -76,7 +78,7 @@ threadの`item_edit` eventは、変更fieldとreplacement countだけを返す�
 Ticket item updated: title, body. Body replacement applied to 10 occurrence(s).
 ```
 
-編集前title/body、編集後snapshot、item revision idを取得できない。Implementation reportがどのitem revisionを対象にしたかも記録されない。
+編集前title/body、編集後snapshot、item 履歴参照を取得できない。Implementation reportがどのitem snapshotを対象にしたかも記録されない。
 
 このため、「実装完了後にTicketが別scopeへrescopeされた」のか、「Implementation reportの読み違い」なのかをthreadだけから確実に判定できない。
 
@@ -89,7 +91,7 @@ Ticket item updated: title, body. Body replacement applied to 10 occurrence(s).
 - close後にunresolved request_changesが追加された
 - Implementation report後のmaterial rescope
 - report commitがcurrent repositoryで解決不能
-- MR current revisionとreview対象revisionが不一致
+- MR current commit と review 対象 commitが不一致
 
 ### relation削除operationがない
 
@@ -167,29 +169,20 @@ Markdown bodyに加えて、最低限次をtyped attributesとして保存する
 - `repository_id`
 - `base_commit`
 - `head_commit`
-- `merge_request_id` / `revision_id`
+- MR ID / 対象 Git commit の参照
 - validation evidence refs
 - dirty/untracked state
 - source Runtime/Worker identity
 
-reportは作成時のTicket item revisionを参照する。`QueryTicket.evidence`と`attention`はMarkdown headingをparseせず、このtyped authorityをqueryする。
+reportは作成時のTicket item snapshotを参照する。`QueryTicket.evidence`と`attention`はMarkdown headingをparseせず、このtyped authorityをqueryする。
 
-### retrievable item revisions
+### retrievable item snapshots
 
-`ShowTicket`のoptional revision selectorまたはbounded version projectionでitem historyを取得できるようにする。専用tool追加は、同じprojectionではsize/authorityを分離できない場合だけ検討する。
+`ShowTicket`のoptional history selectorまたはbounded version projectionでitem historyを取得できるようにする。専用tool追加は、同じprojectionではsize/authorityを分離できない場合だけ検討する。
 
-```text
-TicketItemRevision {
-  revision_id,
-  title,
-  body_digest,
-  body or bounded diff,
-  edited_at,
-  source,
-}
-```
+当時の提案は、編集前後の title、body digest、本文または bounded diff、編集時刻、source と、その内容を再取得できる履歴参照を一組として保存するものだった。ここでは当時の仮の型/schema 名は再掲せず、現行型名としても提示しない。
 
-Implementation report/review/close resolutionから対象item revisionを参照する。
+Implementation report/review/close resolutionから対象item snapshotを参照する。
 
 ### stable tool projection
 
@@ -199,7 +192,7 @@ Implementation report/review/close resolutionから対象item revisionを参照�
 
 relationのadd/remove、Queue、review、Close、item editなどはauthorization、precondition、idempotency、notification、compensation、audit/result型が異なるため、generic `MutateTicket`や`MutateObjective`へ統合しない。明示commandを維持し、model-facing tool数はprofile・role・Flow別catalog projectionで抑える。
 
-Implementation reportはtyped Ticket thread eventとして扱い、item revision参照とbounded query結果から監査可能にする。
+Implementation reportはtyped Ticket thread eventとして扱い、item snapshot参照とbounded query結果から監査可能にする。
 
 ## 推奨順序
 
@@ -213,7 +206,7 @@ Implementation reportはtyped Ticket thread eventとして扱い、item revision
 ## 期待する監査手順
 
 1. `QueryTicket(states=active, attention=implementation_report_not_closed)`で候補抽出。
-2. candidateごとに`ShowTicket`でcurrent item revision、report対象revision、latest reviewを取得。
+2. candidateごとに`ShowTicket`でcurrent item snapshot、report対象の item snapshot、latest reviewを取得。
 3. typed commit/MR evidenceをrepository authorityで検証。
 4. unresolved `request_changes`とdependencyを確認。
 5. User/Orchestratorが明示的にcloseする。

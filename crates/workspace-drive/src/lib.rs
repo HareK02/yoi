@@ -690,6 +690,9 @@ fn directory(c: &Connection, id: NodeId) -> Result<()> {
 // Called only inside the same IMMEDIATE transaction that publishes the mutation.
 // Compare the last successful request, not time: even identical bytes or a move
 // away and back cannot revive an old request. Receipts prevent request ID reuse.
+// A queued update/delete based on an older observation must not overwrite/delete
+// a newer commit merely because it arrives last; same-ms commits also rule out
+// timestamp comparison. The check precedes blob writes and node publication.
 fn changeable(c: &Transaction<'_>, id: NodeId, expected_mutation_id: &str) -> Result<Node> {
     let n = node(c, id)?;
     if n.parent_id.is_none() {

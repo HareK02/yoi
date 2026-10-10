@@ -1,5 +1,7 @@
 # Worker lifecycle, restore atomicity, and observation freshness
 
+Editorial note (2026-10-10): obsolete state terminology is summarized by purpose below; cited IDs, commits and validation results still describe the original investigation, not new executions.
+
 ## Scope
 
 This report records the state-model and crash-boundary problems found while investigating why one restored Worker appeared as `idle` in the Web client and `unknown` in the Runtime CLI. The display mismatch exposed a broader problem: lifecycle, controller state, observation freshness, restart intent, and recovery evidence are represented by overlapping fields without one enforced authority.
@@ -57,7 +59,7 @@ A concrete counterexample is:
 
 The persisted aggregate was not rolled back: its identity file has already changed while its execution file is old. This outcome must not be classified as a proven rollback. Identity, restore specification, execution binding, and recovery evidence need one atomic aggregate commit.
 
-A revision manifest is not preferable here. The store is single-writer, Worker records are bounded, and the existing same-directory temporary-file replacement already supports one aggregate `worker.json`. A manifest would add a second commit pointer and orphan cleanup without resolving Backend reconciliation.
+A manifest pointing to separate immutable aggregate snapshots is not preferable here. The store is single-writer, Worker records are bounded, and the existing same-directory temporary-file replacement already supports one aggregate `worker.json`. A manifest would add a second commit pointer and orphan cleanup without resolving Backend reconciliation.
 
 Even a single-file replacement has a commit-ambiguity boundary. `atomic_write_json` renames the temporary file and then syncs the parent directory. If rename succeeds but directory sync fails, the new record is already visible while crash durability is unknown. Persistence errors therefore need a phase-aware classification: failure before rename is definitely not committed; failure after rename is `CommitOutcomeUnknown` and must never be reported as a proven rollback.
 
@@ -187,7 +189,7 @@ Fault injection must target each persistence boundary. Same-process assertions a
 ## Implementation order
 
 1. Stop publishing stale unavailable snapshots as current REST `worker_state` and add projection regression coverage.
-2. Replace split identity/execution authority with an atomic aggregate record or revisioned aggregate commit while preserving validated migration input.
+2. Replace split identity/execution authority with an atomic aggregate record or immutable aggregate snapshot commit while preserving validated migration input.
 3. Introduce explicit durable reconciliation evidence and stable operation identity for Restore and Stop.
 4. Quarantine candidate execution observation until aggregate commit and make retry/restart converge on the recorded operation.
 5. Remove catalog foreground-state duplication and update clients to use current observed snapshots.

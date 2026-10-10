@@ -99,8 +99,8 @@ pub fn request_fingerprint_for_replay(
         return Ok(current);
     }
     if let Some(legacy) = persisted.strip_prefix("workdir-create-v86:") {
-        if let Some((revision, digest)) = legacy.split_once(':') {
-            if let Ok(revision) = revision.parse::<u64>() {
+        if let Some((legacy_counter, digest)) = legacy.split_once(':') {
+            if let Ok(legacy_counter) = legacy_counter.parse::<u64>() {
                 let mut hasher = request_hasher(
                     repository_id,
                     selector,
@@ -108,7 +108,7 @@ pub fn request_fingerprint_for_replay(
                     display_name,
                     repository_source_fingerprint,
                 );
-                hasher.update(revision.to_be_bytes());
+                hasher.update(legacy_counter.to_be_bytes());
                 if encode_request_digest(hasher) == digest {
                     return Ok(persisted.to_string());
                 }

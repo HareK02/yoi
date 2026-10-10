@@ -12,6 +12,7 @@ pub(super) static MIGRATIONS: &[FeatureMigration] = &[
         "bind_nodes_to_committed_requests",
         bind_committed_requests,
     ),
+    FeatureMigration::new(3, "name_legacy_replay_counter", name_legacy_replay_counter),
 ];
 fn create_original_schema(tx: &Transaction<'_>) -> feature_storage::Result<()> {
     tx.execute_batch("\
@@ -61,7 +62,7 @@ fn bind_committed_requests(tx: &Transaction<'_>) -> feature_storage::Result<()> 
             WHERE json_extract(result_json, '$.deleted') = 0 GROUP BY 1,2;
         CREATE TABLE drive_legacy_replays (
             request_id TEXT PRIMARY KEY REFERENCES drive_receipts(request_id) ON DELETE CASCADE,
-            expected_mutation_id TEXT NOT NULL, expected_revision TEXT NOT NULL);
+            expected_mutation_id TEXT NOT NULL, legacy_expected_counter TEXT NOT NULL);
         INSERT INTO drive_legacy_replays
             SELECT receipt.request_id, observed.request_id, CAST(observed.previous_counter AS TEXT)
             FROM drive_receipts AS receipt JOIN drive_observed_requests AS observed
@@ -85,6 +86,23 @@ fn bind_committed_requests(tx: &Transaction<'_>) -> feature_storage::Result<()> 
     Ok(())
 }
 
+fn name_legacy_replay_counter(tx: &Transaction<'_>) -> feature_storage::Result<()> {
+    // Already-deployed v2 databases used this column name. New v2 applications
+    // create the concrete name directly; both paths retain the same replay-only
+    // decimal strings and leave the original request digests untouched.
+    let old_column: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('drive_legacy_replays') WHERE name='expected_revision')",
+        [],
+        |row| row.get(0),
+    )?;
+    if old_column {
+        tx.execute_batch(
+            "ALTER TABLE drive_legacy_replays RENAME COLUMN expected_revision TO legacy_expected_counter;",
+        )?;
+    }
+    Ok(())
+}
+
 // Frozen pre-cutover typed payload encoding, including field order and decimal
 // strings. Never reconstruct a fingerprint from the result: compare the caller's
 // complete actor/payload against the original digest. Historical counters below
@@ -94,19 +112,22 @@ fn bind_committed_requests(tx: &Transaction<'_>) -> feature_storage::Result<()> 
 enum LegacyMutation<'a> {
     Update {
         id: NodeId,
-        expected_revision: &'a str,
+        #[serde(rename = "expected_revision")]
+        legacy_expected_counter: &'a str,
         content_type: &'a str,
         bytes: &'a [u8],
     },
     Relocate {
         id: NodeId,
-        expected_revision: &'a str,
+        #[serde(rename = "expected_revision")]
+        legacy_expected_counter: &'a str,
         parent: NodeId,
         name: &'a str,
     },
     Delete {
         id: NodeId,
-        expected_revision: &'a str,
+        #[serde(rename = "expected_revision")]
+        legacy_expected_counter: &'a str,
     },
 }
 
@@ -119,7 +140,7 @@ pub(super) fn matches_legacy_replay(
 ) -> crate::Result<bool> {
     let evidence = tx
         .query_row(
-            "SELECT expected_mutation_id,expected_revision FROM drive_legacy_replays WHERE request_id=?1",
+            "SELECT expected_mutation_id,legacy_expected_counter FROM drive_legacy_replays WHERE request_id=?1",
             [request_id],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )
@@ -139,7 +160,7 @@ pub(super) fn matches_legacy_replay(
             expected_mutation_id,
             LegacyMutation::Update {
                 id: *id,
-                expected_revision: &counter,
+                legacy_expected_counter: &counter,
                 content_type,
                 bytes,
             },
@@ -153,7 +174,7 @@ pub(super) fn matches_legacy_replay(
             expected_mutation_id,
             LegacyMutation::Relocate {
                 id: *id,
-                expected_revision: &counter,
+                legacy_expected_counter: &counter,
                 parent: *parent,
                 name,
             },
@@ -165,7 +186,7 @@ pub(super) fn matches_legacy_replay(
             expected_mutation_id,
             LegacyMutation::Delete {
                 id: *id,
-                expected_revision: &counter,
+                legacy_expected_counter: &counter,
             },
         ),
         Mutation::CreateFolder { .. } | Mutation::CreateFile { .. } => return Ok(false),
@@ -254,7 +275,10 @@ mod tests {
         let storage = FeatureStorage::new(&path).workspace("ws").unwrap();
         let registration = Drive::register(&storage).unwrap();
         let drive = Drive::open(&storage, &registration, &temp.path().join("blobs")).unwrap();
-        assert_eq!(drive.database.schema_version().unwrap(), 2);
+        assert_eq!(
+            drive.database.schema_version().unwrap(),
+            MIGRATIONS.last().unwrap().version()
+        );
         assert_eq!(drive.root().unwrap().last_mutation_id, "");
         let file = drive.metadata(NodeId(4)).unwrap();
         assert_eq!(file.last_mutation_id, "file-create");
@@ -395,6 +419,119 @@ mod tests {
     }
 
     #[test]
+    fn fresh_schema_uses_only_the_concrete_replay_counter_column() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = FeatureStorage::new(temp.path().join("metadata"))
+            .workspace("ws")
+            .unwrap();
+        let registration = Drive::register(&storage).unwrap();
+        let drive = Drive::open(&storage, &registration, &temp.path().join("blobs")).unwrap();
+        assert_current_replay_schema(&drive.database);
+    }
+
+    fn assert_current_replay_schema(database: &feature_storage::FeatureDatabase) {
+        assert_eq!(
+            database.schema_version().unwrap(),
+            MIGRATIONS.last().unwrap().version()
+        );
+        database
+            .try_with_connection::<_, feature_storage::FeatureStorageError>(|c| {
+                let mut columns = c.prepare(
+                    "SELECT name FROM pragma_table_info('drive_legacy_replays') ORDER BY cid",
+                )?;
+                let names = columns
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                assert_eq!(
+                    names,
+                    [
+                        "request_id",
+                        "expected_mutation_id",
+                        "legacy_expected_counter"
+                    ]
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn v2_replay_column_upgrade_preserves_evidence_digests_and_replay_after_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("metadata");
+        seed_update(&path, false);
+        let original = {
+            let storage = FeatureStorage::new(&path).workspace("ws").unwrap();
+            let registration = storage
+                .register(FeatureRegistration::new(
+                    "workspace-drive",
+                    &MIGRATIONS[..2],
+                ))
+                .unwrap();
+            let database = storage.open(&registration).unwrap();
+            // Actual deployed v2 schema: the old name is a frozen DB boundary,
+            // not the DDL used when applying v2 to a newly created database.
+            database
+                .transaction(|tx| {
+                    tx.execute_batch(
+                        "ALTER TABLE drive_legacy_replays RENAME COLUMN legacy_expected_counter TO expected_revision;",
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            fingerprints(&database)
+        };
+        let storage = FeatureStorage::new(&path).workspace("ws").unwrap();
+        let registration = Drive::register(&storage).unwrap();
+        let drive = Drive::open(&storage, &registration, &temp.path().join("blobs")).unwrap();
+        assert_current_replay_schema(&drive.database);
+        assert_eq!(fingerprints(&drive.database), original);
+        drive
+            .database
+            .try_with_connection::<_, feature_storage::FeatureStorageError>(|c| {
+                let mut rows = c.prepare(
+                    "SELECT request_id,expected_mutation_id,legacy_expected_counter FROM drive_legacy_replays ORDER BY request_id",
+                )?;
+                let evidence = rows
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                assert_eq!(
+                    evidence,
+                    vec![
+                        ("delete".into(), "create-deleted".into(), "1".into()),
+                        ("file-update".into(), "file-create".into(), "1".into()),
+                        ("move-0".into(), "create".into(), "1".into()),
+                    ]
+                );
+                Ok(())
+            })
+            .unwrap();
+        let nodes = drive.list(NodeId(1), None, 100).unwrap().nodes;
+        for (request, mutation) in changed_replays() {
+            let RequestStatus::Committed { result } = drive.request_status(request).unwrap() else {
+                panic!("lost {request}")
+            };
+            assert_eq!(drive.mutate(request, "actor", mutation).unwrap(), result);
+        }
+        assert_eq!(drive.list(NodeId(1), None, 100).unwrap().nodes, nodes);
+        assert_eq!(fingerprints(&drive.database), original);
+        drop(drive);
+        let drive = Drive::open(&storage, &registration, &temp.path().join("blobs")).unwrap();
+        assert_current_replay_schema(&drive.database);
+        assert_eq!(fingerprints(&drive.database), original);
+        assert_eq!(drive.list(NodeId(1), None, 100).unwrap().nodes, nodes);
+        for (request, mutation) in changed_replays() {
+            assert!(drive.mutate(request, "actor", mutation).is_ok());
+        }
+    }
+
+    #[test]
     fn upgrade_preserves_original_digests_and_never_uses_old_counters_for_new_mutations() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("metadata");
@@ -445,7 +582,10 @@ mod tests {
         let storage = FeatureStorage::new(&path).workspace("ws").unwrap();
         let registration = Drive::register(&storage).unwrap();
         let drive = Drive::open(&storage, &registration, &temp.path().join("blobs")).unwrap();
-        assert_eq!(drive.database.schema_version().unwrap(), 2);
+        assert_eq!(
+            drive.database.schema_version().unwrap(),
+            MIGRATIONS.last().unwrap().version()
+        );
         // Historical replay must not overwrite a newer committed mutation.
         for (id, expected) in [(NodeId(2), "move-0"), (NodeId(4), "file-update")] {
             drive

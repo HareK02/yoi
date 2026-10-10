@@ -65,7 +65,7 @@ impl<T: OpenApiSchema> OpenApiSchema for BTreeMap<String, T> {}
 pub struct OpenApiInfo<'a> {
     pub title: &'a str,
     pub version: &'a str,
-    /// Opaque digest of the source revision used to build the contract.
+    /// Source-content digest used to identify the exported contract's build inputs.
     pub source_digest: &'a str,
 }
 

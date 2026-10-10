@@ -14714,7 +14714,6 @@
         "description": "Stable category explaining why Workspace deletion cannot currently advance.",
         "enum": [
           "last_accessible_workspace",
-          "revision_conflict",
           "dirty_workdir",
           "worker_removal_blocked",
           "workdir_removal_blocked",
@@ -16136,7 +16135,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:07cfe53bfdd700cad76d00695a031255ffa76a6062110a05596fa8b64ae372c4"
+    "x-yoi-source-digest": "sha256:fc25104c077ab8c5c43f77611f505171585d2d40fd54c6538774ac17aae6cce3"
   },
   "openapi": "3.1.0",
   "paths": {

@@ -177,6 +177,8 @@ fn migrated_workdir_request_replays_and_retries_without_accepting_changed_displa
     )
     .unwrap();
     migrate_repository_keys_v86_to_v87(&conn).unwrap();
+    // The service consumes current receipt columns; unrelated schemas are not this fixture.
+    rename_saved_secret_receipt_counters(&conn).unwrap();
     let store = SqliteWorkspaceStore {
         conn: Arc::new(Mutex::new(conn)),
     };
@@ -358,6 +360,8 @@ fn deleted_successful_workdir_archives_verbatim_history_without_authorizing_retr
             .unwrap(),
         0
     );
+    // The service consumes current receipt columns; unrelated schemas are not this fixture.
+    rename_saved_secret_receipt_counters(&conn).unwrap();
     let store = Arc::new(SqliteWorkspaceStore {
         conn: Arc::new(Mutex::new(conn)),
     });
@@ -655,7 +659,7 @@ fn migrated_ssh_mutations_replay_complete_old_input_without_reexecution_or_recei
     let rotated_digest = frozen_credential_request_digest("rotate", "", 1, &next_private);
     let host_created_digest = frozen_host_request_digest("old.example.test", 0, &old_fp);
     let host_rotated_digest = frozen_host_request_digest("new.example.test", 1, &old_fp);
-    for (operation, digest, kind, resource, revision, timestamp, audit) in [
+    for (operation, digest, kind, resource, legacy_counter, timestamp, audit) in [
         (
             "create-key",
             &created_digest,
@@ -695,25 +699,25 @@ fn migrated_ssh_mutations_replay_complete_old_input_without_reexecution_or_recei
     ] {
         conn.execute(
             "INSERT INTO repository_secret_operations VALUES('space',?1,?2,?3,?4,?5,?6)",
-            params![operation, digest, kind, resource, revision, timestamp],
+            params![operation, digest, kind, resource, legacy_counter, timestamp],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO repository_secret_audit_events VALUES('space',?1,?2,?3,?4,'actor',?5)",
-            params![operation, audit, resource, revision, timestamp],
+            params![operation, audit, resource, legacy_counter, timestamp],
         )
         .unwrap();
     }
     conn.execute("INSERT INTO repository_ssh_credentials VALUES('space','key','Key','ssh-ed25519',?1,2,'active','2026-01-01','2026-01-02')",[&next_fp]).unwrap();
     let encryption_key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &[42; 32]).unwrap());
-    for (revision, fingerprint, private, timestamp) in [
+    for (legacy_counter, fingerprint, private, timestamp) in [
         (1u64, &old_fp, &old_private, "2026-01-01"),
         (2, &next_fp, &next_private, "2026-01-02"),
     ] {
-        conn.execute("INSERT INTO repository_ssh_credential_revisions VALUES('space','key',?1,'ssh-ed25519',?2,?3)",params![revision,fingerprint,timestamp]).unwrap();
-        let nonce = [revision as u8; 12];
+        conn.execute("INSERT INTO repository_ssh_credential_revisions VALUES('space','key',?1,'ssh-ed25519',?2,?3)",params![legacy_counter,fingerprint,timestamp]).unwrap();
+        let nonce = [legacy_counter as u8; 12];
         let mut ciphertext = private.as_bytes().to_vec();
-        let aad = format!("yoi/repository-secret/v1/space/key/{revision}/private_key");
+        let aad = format!("yoi/repository-secret/v1/space/key/{legacy_counter}/private_key");
         encryption_key
             .seal_in_place_append_tag(
                 Nonce::assume_unique_for_key(nonce),
@@ -721,16 +725,18 @@ fn migrated_ssh_mutations_replay_complete_old_input_without_reexecution_or_recei
                 &mut ciphertext,
             )
             .unwrap();
-        conn.execute("INSERT INTO server_secret_versions VALUES('space','key',?1,'private_key','aes-256-gcm-v1',?2,?3,?4)",params![revision,nonce.as_slice(),ciphertext,timestamp]).unwrap();
+        conn.execute("INSERT INTO server_secret_versions VALUES('space','key',?1,'private_key','aes-256-gcm-v1',?2,?3,?4)",params![legacy_counter,nonce.as_slice(),ciphertext,timestamp]).unwrap();
     }
     conn.execute("INSERT INTO repository_ssh_host_trusts VALUES('space','host','new.example.test',22,'ssh-ed25519',?1,?2,2,'2026-01-01','2026-01-02')",params![public,old_fp]).unwrap();
-    for (revision, hostname, timestamp) in [
+    for (legacy_counter, hostname, timestamp) in [
         (1, "old.example.test", "2026-01-01"),
         (2, "new.example.test", "2026-01-02"),
     ] {
-        conn.execute("INSERT INTO repository_ssh_host_trust_revisions VALUES('space','host',?1,?2,22,'ssh-ed25519',?3,?4,?5)",params![revision,hostname,public,old_fp,timestamp]).unwrap();
+        conn.execute("INSERT INTO repository_ssh_host_trust_revisions VALUES('space','host',?1,?2,22,'ssh-ed25519',?3,?4,?5)",params![legacy_counter,hostname,public,old_fp,timestamp]).unwrap();
     }
     migrate_repository_keys_v86_to_v87(&conn).unwrap();
+    // The service consumes current receipt columns; unrelated schemas are not this fixture.
+    rename_saved_secret_receipt_counters(&conn).unwrap();
     let store = Arc::new(SqliteWorkspaceStore {
         conn: Arc::new(Mutex::new(conn)),
     });
@@ -881,6 +887,8 @@ fn deleted_legacy_receipt_does_not_bind_to_later_reused_key_ordinal() {
         INSERT INTO repository_secret_operations VALUES('space','old-delete','intent','credential','key',7,'2025-01-01');
         INSERT INTO repository_secret_audit_events VALUES('space','old-delete-audit','credential_deleted','key',7,'actor','2025-01-01');").unwrap();
     migrate_repository_keys_v86_to_v87(&conn).unwrap();
+    // The service consumes current receipt columns; unrelated schemas are not this fixture.
+    rename_saved_secret_receipt_counters(&conn).unwrap();
     let store = Arc::new(SqliteWorkspaceStore {
         conn: Arc::new(Mutex::new(conn)),
     });

@@ -19,7 +19,7 @@ const EVIDENCE_SOURCE: &str = "immutable-approved-source";
 const EVIDENCE_TARGET: &str = "immutable-target-result";
 
 // Deliberately freeze review dates: freshness must follow the exact item
-// revision and source/result snapshot, not a comparison of wall-clock dates.
+// content digest and source/result snapshot, not a comparison of wall-clock dates.
 fn evidence_time() -> chrono::DateTime<Utc> {
     "2000-01-01T00:00:00Z".parse().unwrap()
 }
@@ -121,7 +121,7 @@ impl EvidenceApiFixture {
         }
     }
 
-    fn revision(&self) -> String {
+    fn content_digest(&self) -> String {
         ticket_item_checker::content_digest(
             &self.backend.show(self.ticket_id.clone().into()).unwrap(),
         )
@@ -150,7 +150,7 @@ impl EvidenceApiFixture {
             .request_review(RequestMergeRequestReview {
                 merge_request_id: EVIDENCE_MR.into(),
                 ticket_id: self.ticket_id.clone(),
-                ticket_content_digest: self.revision(),
+                ticket_content_digest: self.content_digest(),
                 ticket_merge_request_subjects: self.subjects(),
                 subject_ref: EVIDENCE_SOURCE.into(),
                 child_session_id,
@@ -194,7 +194,7 @@ impl EvidenceApiFixture {
     fn completion(&self, _approval: &ReviewEvent) -> ticket::TicketCompletion {
         ticket::TicketCompletion {
             operation_key: "evidence-ticket-completion".into(),
-            expected_content_digest: self.revision(),
+            expected_content_digest: self.content_digest(),
             expected_state: TicketWorkflowState::InProgress,
             reason: "Implementation judged complete independently of MR attestation".into(),
             references: Vec::new(),
@@ -287,7 +287,7 @@ impl EvidenceApiFixture {
                 self.ticket_id.clone().into(),
                 TicketItemEdit {
                     body: Some(MarkdownText::new(
-                        "Revised requirements require a fresh exact-revision approval.",
+                        "Revised requirements require a fresh exact-content approval.",
                     )),
                     ..Default::default()
                 },
@@ -301,12 +301,12 @@ async fn done_merged_remote_ticket_uses_immutable_result_in_show_query_list_and_
     let fixture = EvidenceApiFixture::new().await;
     let approval = fixture.approve("integration");
     let merge = fixture.integrate(&approval);
-    let revision = fixture.revision();
+    let content_digest = fixture.content_digest();
     let completion = fixture
         .backend
         .complete(&fixture.ticket_id, fixture.completion(&approval))
         .unwrap();
-    assert_eq!(ticket::ticket_content_digest(&completion), revision);
+    assert_eq!(ticket::ticket_content_digest(&completion), content_digest);
     assert!(
         fixture
             .api
@@ -326,7 +326,7 @@ async fn done_merged_remote_ticket_uses_immutable_result_in_show_query_list_and_
 
     let shown = fixture.show().await;
     assert_eq!(shown.state, "done");
-    assert_eq!(shown.content_digest, revision);
+    assert_eq!(shown.content_digest, content_digest);
     assert!(
         shown.evidence.complete_for_integration,
         "{:?}",
@@ -376,13 +376,13 @@ async fn done_merged_remote_ticket_uses_immutable_result_in_show_query_list_and_
 }
 
 #[tokio::test]
-async fn latest_postmerge_approval_requires_exact_revision_and_stored_source_result_snapshot() {
+async fn latest_postmerge_approval_requires_exact_content_and_stored_source_result_snapshot() {
     let fixture = EvidenceApiFixture::new().await;
     let integration = fixture.approve("integration");
     let merge = fixture.integrate(&integration);
     fixture.rescope();
-    let revision = fixture.revision();
-    assert_ne!(integration.ticket_content_digest, revision);
+    let content_digest = fixture.content_digest();
+    assert_ne!(integration.ticket_content_digest, content_digest);
 
     let stale = fixture.show().await;
     assert!(stale.evidence.approved_current_subject); // integration proof survives
@@ -405,9 +405,9 @@ async fn latest_postmerge_approval_requires_exact_revision_and_stored_source_res
     );
     assert_eq!(fixture.show().await.state, "inprogress");
 
-    let latest = fixture.approve("latest-revision");
+    let latest = fixture.approve("latest-content");
     assert_eq!(latest.created_at, integration.created_at);
-    assert_eq!(latest.ticket_content_digest, revision);
+    assert_eq!(latest.ticket_content_digest, content_digest);
     assert_eq!(latest.ticket_merge_request_subjects, fixture.subjects());
     let fresh = fixture.show().await;
     assert!(
@@ -420,7 +420,7 @@ async fn latest_postmerge_approval_requires_exact_revision_and_stored_source_res
         Some("Requirement approval integration")
     );
     fixture.assert_filters(true, false, false).await;
-    // A current revision alone is insufficient: simulate a stored attestation
+    // A current Ticket content digest alone is insufficient: simulate a stored attestation
     // against a different result set using typed serialized payloads in this
     // temporary fixture database, never a live Workspace database.
     let mut wrong_snapshot = latest.clone();
@@ -490,7 +490,7 @@ async fn latest_postmerge_approval_requires_exact_revision_and_stored_source_res
         .backend
         .complete(&fixture.ticket_id, fixture.completion(&repaired))
         .unwrap();
-    assert_eq!(ticket::ticket_content_digest(&completion), revision);
+    assert_eq!(ticket::ticket_content_digest(&completion), content_digest);
     assert_eq!(fixture.show().await.state, "done");
     fixture.assert_filters(true, false, false).await;
 }
@@ -649,7 +649,7 @@ async fn closing_ticket_with_open_unreviewed_mr_does_not_change_its_proof_or_sta
             &fixture.ticket_id,
             ticket::TicketStateUpdate {
                 operation_key: "close-with-open-mr".into(),
-                expected_content_digest: fixture.revision(),
+                expected_content_digest: fixture.content_digest(),
                 expected_state: TicketWorkflowState::InProgress,
                 state: TicketWorkflowState::Closed,
                 reason: "The request was withdrawn; no integration or approval is asserted".into(),

@@ -74,7 +74,7 @@ Deno.test("Repository Access distinguishes permission, conflict, field, and miss
     repositoryAccessRequestError(409, "rotate the key").message.includes(
       "Reload",
     ),
-    "409 should explain revision recovery",
+    "409 should explain conflict recovery",
   );
   assert(
     repositoryAccessRequestError(422, "rotate the key").message.includes(

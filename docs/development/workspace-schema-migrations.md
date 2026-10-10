@@ -15,7 +15,7 @@ The current retained Workspace chain is:
 
 1. schema 50: `workspace schema baseline`
 2. schema 51: `workspace runtime bindings`
-3. schema 52: `workspace Runtime binding revision and audit`
+3. schema 52: Runtime-binding counter and audit (historical migration purpose; the persisted migration name remains frozen).
 4. schema 53: `durable Workspace deletion operations`
 
 A database may begin at any retained baseline. Its following history rows must be the exact prefix

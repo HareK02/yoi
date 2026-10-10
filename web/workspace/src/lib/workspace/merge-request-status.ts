@@ -92,7 +92,7 @@ export function sourceReviewFreshness(
   return `Fresh source review required: no effective verdict exists for ${source}.`;
 }
 
-// Source/integration approval can survive rescope; only this exact revision
+// Source/integration approval can survive rescope; only this exact item snapshot
 // and linked-result attestation approves the current Ticket requirements.
 export function currentRequirementApprovalStatus(
   evidence: TicketEvidenceSummary,

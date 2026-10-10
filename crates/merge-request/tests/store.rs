@@ -164,11 +164,11 @@ fn v12_migration_revokes_old_grants_preserves_integration_and_requires_fresh_con
     assert_eq!(grants[1].0, "old-issued");
     assert_eq!(grants[1].1, "revoked");
     assert!(grants[1].2.is_some());
-    let legacy_terms: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM merge_request_thread_events WHERE payload_json LIKE '%ticket_item_revision%'",
+    let invalid_content_attestations: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM merge_request_thread_events WHERE kind IN ('review_requested','review') AND json_extract(payload_json, '$.ticket_content_digest') IS NOT ''",
         [], |row| row.get(0),
     ).unwrap();
-    assert_eq!(legacy_terms, 0);
+    assert_eq!(invalid_content_attestations, 0);
     let saved = store.get_by_id("W", "MR").unwrap();
     assert_eq!(saved.merged_result().unwrap(), &merged);
     let integration = saved.integration_approval().unwrap();
@@ -1314,7 +1314,7 @@ fn historical_ticket_completion_payload_remains_readable_and_unchanged_on_migrat
     let payload = r#"{
         "operation_id": "historical-operation",
         "ticket_id": "T",
-        "item_revision": "historical-revision",
+        "item_revision": "historical-item-marker",
         "merge_request_ids": ["MR-2", "MR"],
         "requirement_approval_event_id": "historical-review",
         "completed_by": {"runtime_id": "runtime", "worker_id": "coder"},
@@ -1350,6 +1350,7 @@ fn historical_ticket_completion_payload_remains_readable_and_unchanged_on_migrat
     assert_eq!(body, "historical body");
     assert_eq!(state, "done");
     let historical: TicketCompletionEvent = serde_json::from_str(&saved_payload).unwrap();
+    assert_eq!(historical.legacy_item_marker, "historical-item-marker");
     assert_eq!(
         serde_json::to_value(&historical).unwrap(),
         serde_json::from_str::<serde_json::Value>(payload).unwrap()

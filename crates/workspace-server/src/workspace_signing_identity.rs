@@ -357,7 +357,8 @@ mod frozen_material_v1 {
         version: u32,
         workspace_id: String,
         key_id: String,
-        revision: u64,
+        #[serde(rename = "revision")]
+        legacy_counter: u64,
         private_key: String,
     }
 
@@ -369,7 +370,7 @@ mod frozen_material_v1 {
 
     pub(super) fn decode(bytes: &[u8]) -> Option<WorkspaceSigningPrivateMaterial> {
         let old: Material = serde_json::from_slice(bytes).ok()?;
-        if old.version != 1 || old.revision != 1 {
+        if old.version != 1 || old.legacy_counter != 1 {
             return None;
         }
         Some(WorkspaceSigningPrivateMaterial {
@@ -415,8 +416,8 @@ mod frozen_material_v1 {
             let material = WorkspaceSigningPrivateMaterial::generate("ws-1", "WK-1").unwrap();
             let mut old = serde_json::to_value(material).unwrap();
             old["version"] = 1.into();
-            for revision in [0, 2, u64::MAX] {
-                old["revision"] = revision.into();
+            for legacy_counter in [0, 2, u64::MAX] {
+                old["revision"] = legacy_counter.into();
                 assert!(decode_private_material(&serde_json::to_vec(&old).unwrap()).is_err());
             }
             old["revision"] = 1.into();

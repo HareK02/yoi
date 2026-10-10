@@ -53,9 +53,9 @@ Deno.test("Git Workdir with a selector shows selector at current ref", () => {
 Deno.test("non-Git Workdir does not receive Git hash formatting", () => {
   assertEquals(
     formatCurrentWorkdirCheckout(
-      workdir("snapshot", "revision-value"),
+      workdir("snapshot", "snapshot-id"),
       "archive",
     ),
-    "snapshot · revision-value",
+    "snapshot · snapshot-id",
   );
 });

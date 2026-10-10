@@ -314,11 +314,13 @@ mod tests {
         let old = r#"{"kind":"subject_behavior_refresh","body":"exact archived body","behavior_revision":7}"#;
         let item: SystemItem = serde_json::from_str(old).unwrap();
         assert_eq!(item.history_text(), "exact archived body");
-        assert!(
-            serde_json::to_value(item)
-                .unwrap()
-                .get("behavior_revision")
-                .is_none()
+        assert_eq!(
+            serde_json::to_value(item).unwrap(),
+            serde_json::json!({
+                "kind": "subject_behavior_refresh",
+                "body": "exact archived body",
+                "behavior_md": ""
+            })
         );
     }
 

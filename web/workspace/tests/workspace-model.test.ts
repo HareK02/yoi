@@ -45,7 +45,7 @@ Deno.test("workspace creation rejects missing and malformed repository response 
   for (
     const value of [undefined, false, {}, {
       ...currentInitialRepository,
-      source_revision: -1,
+      source_fingerprint: -1,
     }]
   ) {
     assertThrows(
@@ -152,13 +152,13 @@ Deno.test("stale repository aliases fail closed at the JSON boundary", () => {
   );
 });
 
-Deno.test("repository JSON rejects removed source revision counters", () => {
+Deno.test("repository JSON rejects unknown fields", () => {
   const stale = structuredClone(repositoryList) as Record<string, unknown>;
   const items = stale.items as Array<Record<string, unknown>>;
-  items[0].source_revision = 1;
+  items[0].unexpected_field = 1;
   assertThrows(
     () => parseRepositoryListResponse(stale),
-    ".source_revision is not part of the wire contract",
+    ".unexpected_field is not part of the wire contract",
   );
 });
 
@@ -322,6 +322,21 @@ Deno.test("Workspace deletion DTOs fail closed and preserve durable operation st
       }),
     "unexpected is not part",
   );
+  assertThrows(
+    () =>
+      parseWorkspaceDeletionPreflightResponse({
+        ...preflight,
+        expected_workspace_updated_at: "x".repeat(129),
+      }),
+    ".expected_workspace_updated_at is too long",
+  );
+  for (const parse of [parseWorkspaceDeletionPreflightResponse, parseWorkspaceDeletionOperationResponse]) {
+    const value = parse === parseWorkspaceDeletionPreflightResponse ? preflight : operation;
+    assertThrows(
+      () => parse({ ...value, blockers: [{ ...operation.blockers[0], kind: "unknown_blocker" }] }),
+      ".kind is invalid",
+    );
+  }
   assertThrows(
     () =>
       parseWorkspaceDeletionOperationResponse({

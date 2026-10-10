@@ -97,7 +97,7 @@ function optionalBoundedString(
   return boundedStringValue(value, context, maxBytes);
 }
 
-function optionalRevision(
+function optionalByteCount(
   value: unknown,
   context: string,
 ): number | null | undefined {
@@ -250,7 +250,7 @@ function parseWorkspaceProfileSourceSummary(
       502,
     );
   }
-  const sizeBytes = optionalRevision(item.size_bytes, "Profile source catalog");
+  const sizeBytes = optionalByteCount(item.size_bytes, "Profile source catalog");
   if (sizeBytes === undefined || sizeBytes === null) {
     throw new ProfileApiError(
       "Profile source catalog returned an invalid response.",

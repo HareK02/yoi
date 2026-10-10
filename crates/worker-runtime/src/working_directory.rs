@@ -62,8 +62,9 @@ pub struct WorkingDirectoryEvidence {
     pub host_key_fingerprint: Option<String>,
 }
 
-// Frozen persisted evidence reader. Legacy counters only mark that SSH
-// access is required; they are never converted to key identity or grants.
+// Frozen persisted evidence reader. At decode time, reject zero legacy counters
+// and use their presence only to require fresh SSH access before session opening.
+// They never identify keys or grant access; live authority checks fingerprints.
 #[derive(Deserialize)]
 struct FrozenEvidenceRead {
     repository_id: String,
@@ -76,19 +77,21 @@ struct FrozenEvidenceRead {
     public_key_fingerprint: Option<String>,
     host_key_fingerprint: Option<String>,
     repository_access_required: Option<bool>,
-    credential_revision: Option<u64>,
-    host_trust_revision: Option<u64>,
+    #[serde(rename = "credential_revision")]
+    legacy_credential_counter: Option<u64>,
+    #[serde(rename = "host_trust_revision")]
+    legacy_host_trust_counter: Option<u64>,
 }
 
 impl TryFrom<FrozenEvidenceRead> for WorkingDirectoryEvidence {
     type Error = &'static str;
     fn try_from(wire: FrozenEvidenceRead) -> Result<Self, Self::Error> {
-        if wire.credential_revision == Some(0) || wire.host_trust_revision == Some(0) {
+        if wire.legacy_credential_counter == Some(0) || wire.legacy_host_trust_counter == Some(0) {
             return Err("legacy SSH evidence contains an invalid authority marker");
         }
         let repository_access_required = wire.repository_access_required.unwrap_or(false)
-            || wire.credential_revision.is_some()
-            || wire.host_trust_revision.is_some()
+            || wire.legacy_credential_counter.is_some()
+            || wire.legacy_host_trust_counter.is_some()
             || wire.public_key_fingerprint.is_some()
             || wire.host_key_fingerprint.is_some();
         Ok(Self {
@@ -3284,6 +3287,8 @@ mod tests {
         let evidence = record["working_directory"]["evidence"]
             .as_object_mut()
             .unwrap();
+        let mut expected_evidence = evidence.clone();
+        expected_evidence.insert("repository_access_required".into(), serde_json::json!(true));
         evidence.remove("repository_access_required");
         evidence.insert("credential_revision".into(), serde_json::json!(3));
         evidence.insert("host_trust_revision".into(), serde_json::json!(2));
@@ -3299,10 +3304,7 @@ mod tests {
         let migrated: serde_json::Value =
             serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
         let evidence = &migrated["working_directory"]["evidence"];
-        assert_eq!(evidence["repository_access_required"], true);
-        assert!(evidence.get("credential_revision").is_none());
-        assert!(evidence.get("host_trust_revision").is_none());
-        assert!(evidence.get("public_key_fingerprint").is_none());
+        assert_eq!(evidence, &serde_json::json!(expected_evidence));
         drop(materializer);
         assert_eq!(
             RuntimeGitMaterializer::new(runtime.path())
@@ -4771,8 +4773,8 @@ mod tests {
             .join(MATERIALIZATION_RECORD);
         let mut legacy: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        legacy["working_directory"]["evidence"]["repository_source_revision"] =
-            serde_json::json!(7);
+        let expected_evidence = legacy["working_directory"]["evidence"].clone();
+        legacy["working_directory"]["evidence"]["obsolete_test_attribute"] = serde_json::json!(7);
         let original = serde_json::to_vec_pretty(&legacy).unwrap();
         fs::write(&path, &original).unwrap();
 
@@ -4788,10 +4790,9 @@ mod tests {
         materializer.read_binding(id).unwrap();
         let canonical: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert!(
-            canonical["working_directory"]["evidence"]
-                .get("repository_source_revision")
-                .is_none()
+        assert_eq!(
+            canonical["working_directory"]["evidence"],
+            expected_evidence
         );
         materializer.cleanup_working_directory(id).unwrap();
         assert!(!binding.working_directory_root().exists());

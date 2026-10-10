@@ -371,7 +371,7 @@ fn content_cutover_keeps_each_evaluation_provenance_and_deduplicates_only_identi
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("content.db");
     let (conn, _) = legacy_content_database(&path);
-    for (revision, toolchain, projection, schema) in [
+    for (legacy_counter, toolchain, projection, schema) in [
         (4, "new-toolchain", "projection", "schema-2"),
         (5, "toolchain", "new-projection", "schema-1"),
     ] {
@@ -379,7 +379,7 @@ fn content_cutover_keeps_each_evaluation_provenance_and_deduplicates_only_identi
             "INSERT INTO workspace_config_tree_revisions
             SELECT workspace_id,?1,tree_digest,?2,?3,manifest_json,'later',?4
             FROM workspace_config_tree_revisions WHERE revision=1",
-            params![revision, toolchain, projection, schema],
+            params![legacy_counter, toolchain, projection, schema],
         )
         .unwrap();
     }

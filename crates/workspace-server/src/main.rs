@@ -160,7 +160,7 @@ fn load_skill_workspace_config(
     let store = SqliteWorkspaceStore::open(ServerConfig::default_server_database_path())?;
     store.load_workspace_config(workspace_id)?.ok_or_else(|| {
         Box::new(CliError(format!(
-            "Workspace `{workspace_id}` has no active config revision"
+            "Workspace `{workspace_id}` has no active config snapshot"
         ))) as Box<dyn std::error::Error>
     })
 }
@@ -655,7 +655,7 @@ fn print_migrate_help() {
 
 fn print_skills_help() {
     println!(
-        "yoi-server skills\n\nUsage:\n  yoi-server skills list --workspace <WORKSPACE_ID>\n  yoi-server skills lint --workspace <WORKSPACE_ID>\n  yoi-server skills show <NAME> --workspace <WORKSPACE_ID>\n\nDescription:\n  Reads the active Server DB virtual-config revision. Catalog output is lightweight and omits imported Markdown content; detail output includes that content. allowed-tools and scripts are diagnostics only.\n\nOptions:\n      --workspace <WORKSPACE_ID>  Workspace id in the Server DB (required)\n  -h, --help                      Print help"
+        "yoi-server skills\n\nUsage:\n  yoi-server skills list --workspace <WORKSPACE_ID>\n  yoi-server skills lint --workspace <WORKSPACE_ID>\n  yoi-server skills show <NAME> --workspace <WORKSPACE_ID>\n\nDescription:\n  Reads the active Server DB virtual-config snapshot. Catalog output is lightweight and omits imported Markdown content; detail output includes that content. allowed-tools and scripts are diagnostics only.\n\nOptions:\n      --workspace <WORKSPACE_ID>  Workspace id in the Server DB (required)\n  -h, --help                      Print help"
     );
 }
 

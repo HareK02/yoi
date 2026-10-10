@@ -438,7 +438,7 @@ async fn value_profiles_save_project_and_runtime_consume_the_same_content() {
             "omission must remain omission in the Profile value"
         );
         let mut snapshot = serde_json::to_value(&resolved).unwrap();
-        snapshot.as_object_mut().unwrap().remove("profile"); // revision-specific provenance only
+        snapshot.as_object_mut().unwrap().remove("profile"); // snapshot-specific provenance only
         manifests.push(snapshot);
         if index == 0 {
             saved_manifest =
@@ -785,7 +785,7 @@ async fn value_profiles_legacy_source_config_requires_explicit_lossless_migratio
             old_schema,
         )
         .unwrap();
-    // Fixture simulates a previously persisted v1 schema/revision.
+    // Fixture simulates a previously persisted v1 schema/config snapshot.
     let legacy = api
         .config_store
         .commit_evaluated_workspace_config(TEST_WORKSPACE_ID, &candidate)

@@ -434,7 +434,7 @@ impl WorkspaceWorker {
         })
     }
 
-    /// The caller owns the full cleanup-plan revision/digest check. The removal service
+    /// The caller owns the full cleanup-plan digest check. The removal service
     /// rechecks live assignment/retention/use at its existing commit boundary.
     pub(super) async fn delete_from_plan(
         &self,

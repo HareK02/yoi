@@ -56,7 +56,7 @@ fn legacy_flow_database(path: &Path) -> Connection {
         params![alpha, alpha_definition.content_digest],
     )
     .unwrap();
-    for (revision, content, definition, created_at) in [
+    for (legacy_counter, content, definition, created_at) in [
         (1, &alpha, &alpha_definition, "first"),
         (2, &beta, &beta_definition, "second"),
         (3, &alpha, &alpha_definition, "third"),
@@ -64,7 +64,7 @@ fn legacy_flow_database(path: &Path) -> Connection {
         conn.execute(
             "INSERT INTO flow_source_revisions VALUES('space','flow',?1,?2,?3,?4,?5)",
             params![
-                revision,
+                legacy_counter,
                 content,
                 definition.content_digest,
                 serde_json::to_string_pretty(definition).unwrap(),

@@ -1141,7 +1141,8 @@ struct LegacyMemoryConfig {
     _query_excerpt_lines: Option<usize>,
     inject_summary: Option<bool>,
     workspace_id: Option<String>,
-    settings_revision: Option<u64>,
+    #[serde(rename = "settings_revision")]
+    legacy_settings_counter: Option<u64>,
     language: Option<String>,
     extract_model: Option<ModelManifest>,
     extract_threshold: Option<u64>,
@@ -1241,8 +1242,9 @@ fn validate_persisted_worker_manifest(
     Ok(manifest)
 }
 
-/// Frozen migration for schema 2/3 resolved manifests. Keep actual Workspace
-/// identity and language unchanged; the obsolete sequence has no execution role.
+/// Frozen migration for schema 2/3 resolved manifests. During persisted snapshot
+/// decoding, reject an invalid old counter; do not compare it for execution freshness.
+/// Keep actual Workspace identity and language unchanged; the sequence has no execution role.
 fn migrate_legacy_memory_settings_counter(
     manifest: &mut serde_json::Value,
 ) -> Result<(), serde_json::Error> {
@@ -1342,14 +1344,16 @@ fn migrate_legacy_resolved_manifest_snapshot(
         serde_json::from_value(legacy_memory.unwrap_or_else(|| serde_json::json!({})))?;
     let mut workspace_settings = match (
         legacy_memory.workspace_id,
-        legacy_memory.settings_revision,
+        legacy_memory.legacy_settings_counter,
         legacy_memory.language,
     ) {
-        (Some(workspace_id), Some(settings_revision), Some(language)) => Some(serde_json::json!({
-            "workspace_id": workspace_id,
-            "settings_revision": settings_revision,
-            "language": language,
-        })),
+        (Some(workspace_id), Some(legacy_settings_counter), Some(language)) => {
+            Some(serde_json::json!({
+                "workspace_id": workspace_id,
+                "settings_revision": legacy_settings_counter,
+                "language": language,
+            }))
+        }
         (None, None, None) => None,
         _ => {
             return Err(serde_json::Error::io(std::io::Error::new(
@@ -1891,10 +1895,10 @@ model_id = "claude-sonnet-4-20250514"
     }
 
     #[test]
-    fn current_settings_snapshot_rejects_removed_counter_outside_migration() {
+    fn current_settings_snapshot_rejects_unknown_fields_and_invalid_language() {
         assert!(
             serde_json::from_value::<WorkspaceMemorySettingsSnapshot>(serde_json::json!({
-                "workspace_id": "workspace-1", "language": "English", "settings_revision": 9
+                "workspace_id": "workspace-1", "language": "English", "unexpected_state_guard": 9
             }))
             .is_err()
         );

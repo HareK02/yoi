@@ -2111,15 +2111,7 @@ mod tests {
         for field in ["runtime_id", "worker_id", "reason"] {
             assert!(schema.contains(field));
         }
-        for forbidden in [
-            "expected_worker_revision",
-            "proof",
-            "actor",
-            "workspace_id",
-            "policy",
-            "plan",
-            "stage",
-        ] {
+        for forbidden in ["proof", "actor", "workspace_id", "policy", "plan", "stage"] {
             assert!(!schema.contains(forbidden), "schema leaked {forbidden}");
         }
     }
@@ -2149,23 +2141,28 @@ mod tests {
                 .await
                 .unwrap_err();
         }
-        let _error = tool
-            .execute(
-                &serde_json::json!({
-                    "subject": {
-                        "kind": "runtime_worker",
-                        "runtime_id": "runtime-1",
-                        "worker_id": "worker-7",
-                    },
-                    "expected_worker_revision": "revision-1",
-                    "reason": "retire",
-                    "source_proof": "caller-controlled"
-                })
-                .to_string(),
-                ToolExecutionContext::new("call-spoof", "batch-remove", 0),
-            )
-            .await
-            .unwrap_err();
+        // Unknown authority fields must be rejected individually, before mutation.
+        for (field, value) in [
+            ("unexpected_state_guard", "caller-controlled"),
+            ("source_proof", "caller-controlled"),
+        ] {
+            let mut input = serde_json::json!({
+                "subject": {
+                    "kind": "runtime_worker",
+                    "runtime_id": "runtime-1",
+                    "worker_id": "worker-7",
+                },
+                "reason": "retire",
+            });
+            input[field] = serde_json::json!(value);
+            let _error = tool
+                .execute(
+                    &input.to_string(),
+                    ToolExecutionContext::new("call-spoof", "batch-remove", 0),
+                )
+                .await
+                .unwrap_err();
+        }
         assert!(client.removals.lock().unwrap().is_empty());
     }
 

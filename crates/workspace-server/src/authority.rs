@@ -174,8 +174,11 @@ impl merge_request::RepositorySource for AuthorityMergeRequestSource {
     }
 }
 
-pub trait TicketMergeRevisionSource: Send + Sync {
-    fn resolve_subject_ref(
+/// Resolve an open Merge Request source selector to its provider-published Git commit.
+/// Ticket detail/query calls this for open requests only; merged requests use their
+/// immutable recorded source/result commits and need no mutable branch observation.
+pub trait TicketSourceCommitResolver: Send + Sync {
+    fn resolve_source_commit(
         &self,
         ticket_id: &str,
         repository_id: &str,
@@ -183,10 +186,10 @@ pub trait TicketMergeRevisionSource: Send + Sync {
     ) -> std::result::Result<String, server_api::MergeRequestRefDiagnostic>;
 }
 
-struct UnresolvedTicketMergeRevisionSource;
+struct UnresolvedTicketSourceCommitResolver;
 
-impl TicketMergeRevisionSource for UnresolvedTicketMergeRevisionSource {
-    fn resolve_subject_ref(
+impl TicketSourceCommitResolver for UnresolvedTicketSourceCommitResolver {
+    fn resolve_source_commit(
         &self,
         _ticket_id: &str,
         _repository_id: &str,
@@ -205,7 +208,7 @@ pub struct SqliteWorkspaceAuthority {
     store: SqliteWorkspaceStore,
     ticket_backend: SqliteTicketBackend,
     merge_request_store: Arc<MergeRequestStore>,
-    merge_revision_source: Arc<dyn TicketMergeRevisionSource>,
+    source_commit_resolver: Arc<dyn TicketSourceCommitResolver>,
 }
 
 impl SqliteWorkspaceAuthority {
@@ -231,15 +234,15 @@ impl SqliteWorkspaceAuthority {
                 )
                 .map_err(|error| Error::Store(error.to_string()))?,
             ),
-            merge_revision_source: Arc::new(UnresolvedTicketMergeRevisionSource),
+            source_commit_resolver: Arc::new(UnresolvedTicketSourceCommitResolver),
         })
     }
 
-    pub fn with_merge_revision_source(
+    pub fn with_source_commit_resolver(
         mut self,
-        merge_revision_source: Arc<dyn TicketMergeRevisionSource>,
+        source_commit_resolver: Arc<dyn TicketSourceCommitResolver>,
     ) -> Self {
-        self.merge_revision_source = merge_revision_source;
+        self.source_commit_resolver = source_commit_resolver;
         self
     }
 
@@ -843,7 +846,7 @@ impl SqliteWorkspaceAuthority {
                             })
                         },
                         |selector| {
-                            self.merge_revision_source.resolve_subject_ref(
+                            self.source_commit_resolver.resolve_source_commit(
                                 id,
                                 &request.repository_id,
                                 selector,
@@ -1883,7 +1886,9 @@ fn ticket_evidence_summary(
             server_api::TicketSourceRefObservation::Unavailable { .. }
         )
     });
-    // Exact revision/snapshot attestation, not a timestamp heuristic.
+    // Evaluated on every Ticket detail/query: approval must bind the current Ticket
+    // content digest and every relevant MR source/result commit. Later timestamps
+    // or last-arriving approvals cannot attest to different content.
     let review_after_rescope = approved_current_subject && requirement_approved;
     let review_status = if !has_merge_request {
         None
@@ -2778,7 +2783,7 @@ mod tests {
                 event_id: "request-1".to_string(),
                 sequence: 1,
                 subject_ref: "commit-1".to_string(),
-                ticket_content_digest: "revision-1".to_string(),
+                ticket_content_digest: "ticket-content-1".to_string(),
                 ticket_merge_request_subjects: vec![merge_request::MergeRequestReviewSubject {
                     merge_request_id: "mr-1".to_string(),
                     subject_ref: "commit-1".to_string(),
@@ -2792,7 +2797,7 @@ mod tests {
                 sequence: 2,
                 request_event_id: "request-1".to_string(),
                 subject_ref: "commit-1".to_string(),
-                ticket_content_digest: "revision-1".to_string(),
+                ticket_content_digest: "ticket-content-1".to_string(),
                 ticket_merge_request_subjects: vec![merge_request::MergeRequestReviewSubject {
                     merge_request_id: "mr-1".to_string(),
                     subject_ref: "commit-1".to_string(),
@@ -2884,7 +2889,7 @@ mod tests {
 
     fn project_evidence(
         requests: &[MergeRequest],
-        revision: &str,
+        content_digest: &str,
         observations: &[std::result::Result<String, server_api::MergeRequestRefDiagnostic>],
     ) -> (Vec<TicketMergeRequestSummary>, TicketEvidenceSummary) {
         let summaries = requests
@@ -2898,7 +2903,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let approved = ticket_requirement_approved(requests, &summaries, revision);
+        let approved = ticket_requirement_approved(requests, &summaries, content_digest);
         let evidence = ticket_evidence_summary(&["main", "other"], &summaries, approved);
         (summaries, evidence)
     }
@@ -2919,7 +2924,7 @@ mod tests {
         ] {
             let (summaries, evidence) = project_evidence(
                 &[reviewed_merge_request(decision, revoked)],
-                "revision-1",
+                "ticket-content-1",
                 &[Ok(source.into())],
             );
             assert_eq!(evidence.complete_for_integration, approved);
@@ -2941,7 +2946,7 @@ mod tests {
         )];
         let (summaries, evidence) = project_evidence(
             &[reviewed_merge_request(ReviewDecision::Approve, false)],
-            "revision-2",
+            "ticket-content-2",
             &[unavailable_source("source_ref_provider_timeout")],
         );
         assert!(
@@ -2976,7 +2981,7 @@ mod tests {
             unavailable_source("source_ref_runtime_unavailable"),
         ] {
             let (summaries, evidence) =
-                project_evidence(&[merged_request()], "revision-1", &[observation]);
+                project_evidence(&[merged_request()], "ticket-content-1", &[observation]);
             assert_eq!(
                 summaries[0].current_subject_ref.as_deref(),
                 Some("commit-1")
@@ -3032,7 +3037,7 @@ mod tests {
             }
             let (summaries, evidence) = project_evidence(
                 &[request],
-                "revision-1",
+                "ticket-content-1",
                 &[unavailable_source("source_ref_not_found")],
             );
             assert!(summaries[0].integration_evidence_error.is_some(), "{case}");
@@ -3047,7 +3052,7 @@ mod tests {
 
     fn approve_snapshot(
         request: &mut MergeRequest,
-        revision: &str,
+        content_digest: &str,
         subjects: Vec<merge_request::MergeRequestReviewSubject>,
     ) {
         let sequence = request
@@ -3063,14 +3068,14 @@ mod tests {
                 MergeRequestThreadEvent::ReviewRequested(review) => {
                     review.event_id = format!("request-{sequence}");
                     review.sequence = sequence;
-                    review.ticket_content_digest = revision.into();
+                    review.ticket_content_digest = content_digest.into();
                     review.ticket_merge_request_subjects = subjects.clone();
                 }
                 MergeRequestThreadEvent::Review(review) => {
                     review.event_id = format!("review-{sequence}");
                     review.request_event_id = format!("request-{sequence}");
                     review.sequence = sequence + 1;
-                    review.ticket_content_digest = revision.into();
+                    review.ticket_content_digest = content_digest.into();
                     review.ticket_merge_request_subjects = subjects.clone();
                 }
                 _ => unreachable!(),
@@ -3080,7 +3085,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_revision_and_multi_result_snapshot_require_fresh_attestation_not_later_dates() {
+    fn exact_ticket_content_and_multi_result_snapshot_require_fresh_attestation_not_later_dates() {
         let mut requests = vec![
             merged_request(),
             reviewed_merge_request(ReviewDecision::Approve, false),
@@ -3091,7 +3096,7 @@ mod tests {
             unavailable_source("source_ref_not_found"),
             Ok("commit-1".into()),
         ];
-        let (_, stale) = project_evidence(&requests, "revision-1", &observations);
+        let (_, stale) = project_evidence(&requests, "ticket-content-1", &observations);
         assert!(stale.approved_current_subject);
         assert!(!stale.review_after_rescope); // linked set grew, even though dates did not change
         assert!(!ticket_evidence_matches(&stale, "approved_review"));
@@ -3105,12 +3110,12 @@ mod tests {
                 subject_ref: "commit-1".into(),
             },
         ];
-        approve_snapshot(&mut requests[0], "revision-2", snapshot);
-        let (summaries, fresh) = project_evidence(&requests, "revision-2", &observations);
+        approve_snapshot(&mut requests[0], "ticket-content-2", snapshot);
+        let (summaries, fresh) = project_evidence(&requests, "ticket-content-2", &observations);
         assert!(fresh.complete_for_integration);
         assert_eq!(summaries[0].review_excerpt.as_deref(), Some("review body"));
         assert!(
-            !project_evidence(&requests, "revision-3", &observations)
+            !project_evidence(&requests, "ticket-content-3", &observations)
                 .1
                 .complete_for_integration
         );
@@ -3123,12 +3128,12 @@ mod tests {
         }
         requests[1].state = MergeRequestState::Merged;
         assert!(
-            project_evidence(&requests, "revision-2", &observations)
+            project_evidence(&requests, "ticket-content-2", &observations)
                 .1
                 .complete_for_integration
         );
         assert!(
-            !project_evidence(&requests[..1], "revision-2", &observations[..1])
+            !project_evidence(&requests[..1], "ticket-content-2", &observations[..1])
                 .1
                 .complete_for_integration
         );
@@ -3137,7 +3142,7 @@ mod tests {
             "2026-01-01T00:00:00Z",
             Some("body"),
         )];
-        let stale = project_evidence(&requests, "revision-3", &observations).1;
+        let stale = project_evidence(&requests, "ticket-content-3", &observations).1;
         assert!(ticket_attention_matches(
             "done",
             &stale,
@@ -3163,7 +3168,7 @@ mod tests {
         );
         let (summaries, _) = project_evidence(
             &[merged_request()],
-            "revision-1",
+            "ticket-content-1",
             &[unavailable_source("unused")],
         );
         assert!(
@@ -3173,7 +3178,7 @@ mod tests {
         let mut closed = reviewed_merge_request(ReviewDecision::Approve, false);
         closed.state = MergeRequestState::Closed;
         assert!(
-            !project_evidence(&[closed], "revision-1", &[Ok("commit-1".into())])
+            !project_evidence(&[closed], "ticket-content-1", &[Ok("commit-1".into())])
                 .1
                 .complete_for_integration
         );

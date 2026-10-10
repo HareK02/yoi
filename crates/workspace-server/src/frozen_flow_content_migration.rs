@@ -18,11 +18,11 @@ fn migrate_flow_content_v84_to_v85(conn: &Connection) -> Result<()> {
             while let Some(row) = rows.next()? {
                 let workspace_id: String = row.get(0)?;
                 let flow_id: String = row.get(1)?;
-                let revision: i64 = row.get(2)?;
+                let legacy_counter: i64 = row.get(2)?;
                 let content: String = row.get(3)?;
                 let stored_digest: String = row.get(4)?;
                 let definition_json: String = row.get(5)?;
-                let identity = format!("{workspace_id}/{flow_id} revision {revision}");
+                let identity = format!("{workspace_id}/{flow_id} legacy counter {legacy_counter}");
                 let source_digest = format!(
                     "sha256:{}",
                     Sha256::digest(content.as_bytes())

@@ -38,10 +38,10 @@ function attachmentLabel(attachment: SidebarWorkdirAttachment): string {
   const repository = workdir?.source.kind === "repository"
     ? clean(workdir.source.repository_key)
     : clean(attachment.repository_key);
-  return `${repository ?? "unknown-repo"}:${revisionLabel(attachment)}`;
+  return `${repository ?? "unknown-repo"}:${checkoutLabel(attachment)}`;
 }
 
-function revisionLabel(attachment: SidebarWorkdirAttachment): string {
+function checkoutLabel(attachment: SidebarWorkdirAttachment): string {
   const workdir = attachment.working_directory;
   if (!workdir) {
     return `unknown@${shortReference(attachment.working_directory_id)}`;
@@ -66,7 +66,7 @@ function revisionLabel(attachment: SidebarWorkdirAttachment): string {
   const creationReference = clean(workdir.creation_ref);
   if (creationSelector || creationReference) {
     return explicitReferenceFallback(
-      "revision",
+      "creation-ref",
       creationReference ?? creationSelector,
     );
   }
@@ -84,7 +84,7 @@ function branchName(selector: string | null): string | null {
 }
 
 function explicitReferenceFallback(
-  kind: "detached" | "revision",
+  kind: "detached" | "creation-ref",
   reference: string | null,
 ): string {
   return reference ? `${kind}@${shortReference(reference)}` : kind;

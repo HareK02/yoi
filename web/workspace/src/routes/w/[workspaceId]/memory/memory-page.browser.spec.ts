@@ -75,7 +75,7 @@ test("renders the subject index as the Memory product entry", () => {
     .toBeNull();
   expect(screen.getByText("subject-1")).not.toBeNull();
   expect(screen.getByText("Not connected")).not.toBeNull();
-  expect(screen.queryByText("Store revision", { exact: true })).toBeNull();
+  expect(screen.queryByText("Memory fingerprint", { exact: true })).toBeNull();
   expect(screen.getByText("1 shown · more available")).not.toBeNull();
   expect(screen.getByRole("link", { name: "First page" }).getAttribute("href"))
     .toBe("/w/workspace-1/memory");

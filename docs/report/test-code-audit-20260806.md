@@ -1,5 +1,7 @@
 # Test code audit — 2026-08-06
 
+Editorial note (2026-10-10): obsolete state terminology is summarized by purpose below; cited IDs, commits and validation results still describe the original investigation, not new executions.
+
 ## Conclusion
 
 The repository has a large test corpus and many high-value authority/state tests, but it is not currently a reliable repository-wide quality gate. Test quantity is not outgrowing production code, yet test bodies are becoming larger and are concentrated in a few inline modules. The Rust workspace suite does not currently compile, the tracked repository has no CI workflow that runs it, and part of the Web UI suite checks source text instead of behavior.
@@ -127,7 +129,7 @@ The repository documentation describes tests as required, but the repository its
 The strongest tests use real SQLite stores, in-process routers, Runtime brokers, WASM artifacts, or lifecycle state and verify externally meaningful authority boundaries. Representative examples include:
 
 - `workspace-server/config_source.rs::invalid_candidate_is_never_persisted`;
-- `workspace-server/config_source.rs::stale_expected_revision_is_rejected`;
+- the then-existing config-source test rejecting a stale expected state (historical test purpose, not a current test identifier);
 - `workspace-server/store.rs::schema_v27_rebuild_rejects_cross_workspace_assignment_repository_drift`;
 - `workspace-server/store.rs::worker_spawn_operation_retry_allows_same_reserved_workdir`;
 - `workspace-server/server.rs::ticket_assignment_spawn_requires_inprogress_before_runtime_side_effects`;
@@ -138,7 +140,7 @@ The strongest tests use real SQLite stores, in-process routers, Runtime brokers,
 - `web/workspace/test/config-source/wasm-parity.test.ts`;
 - `web/workspace/src/lib/workspace/sidebar/worker-subscription.test.ts`.
 
-These tests protect state ordering, idempotency, workspace isolation, migration atomicity, stale-revision rejection, and information disclosure. They make a real contribution to quality.
+These tests protect state ordering, idempotency, workspace isolation, migration atomicity, stale-state rejection, and information disclosure. They make a real contribution to quality.
 
 ### Low-value and brittle tests
 

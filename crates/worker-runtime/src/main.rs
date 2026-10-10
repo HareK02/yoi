@@ -640,6 +640,9 @@ struct RuntimeAuthFile {
     identity: Option<RuntimeIdentityMaterial>,
     #[serde(default)]
     workspace_issuers: Vec<WorkspaceIssuerTrustRecord>,
+    /// Frozen pre-ID issuer records, retained as TOML history only, never as authority.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    archived_legacy_issuers: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -938,6 +941,7 @@ fn read_runtime_auth_file(path: &Path) -> Result<RuntimeAuthFile, ProcessError> 
     let mut document: toml::Value = toml::from_str(&contents)
         .map_err(|_| ProcessError::auth("runtime auth store is corrupt"))?;
     let mut migrated = false;
+    let mut archived_legacy_issuers = Vec::new();
     if let Some(records) = document
         .get_mut("workspace_issuers")
         .and_then(toml::Value::as_array_mut)
@@ -951,6 +955,9 @@ fn read_runtime_auth_file(path: &Path) -> Result<RuntimeAuthFile, ProcessError> 
                         legacy,
                     )
                     .map_err(|_| ProcessError::auth("runtime legacy trust store is corrupt"))?;
+                archived_legacy_issuers.push(toml::to_string(&*value).map_err(|_| {
+                    ProcessError::auth("runtime auth history serialization failed")
+                })?);
                 *value = toml::Value::try_from(record).map_err(|_| {
                     ProcessError::auth("runtime auth migration serialization failed")
                 })?;
@@ -958,9 +965,10 @@ fn read_runtime_auth_file(path: &Path) -> Result<RuntimeAuthFile, ProcessError> 
             }
         }
     }
-    let auth: RuntimeAuthFile = document
+    let mut auth: RuntimeAuthFile = document
         .try_into()
         .map_err(|_| ProcessError::auth("runtime auth store is corrupt"))?;
+    auth.archived_legacy_issuers.extend(archived_legacy_issuers);
     validate_workspace_issuer_trust_records(&auth.workspace_issuers)
         .map_err(|_| ProcessError::auth("runtime Workspace issuer trust store is corrupt"))?;
     if migrated {
@@ -1638,6 +1646,54 @@ mod tests {
     }
 
     #[test]
+    fn pre_id_issuer_migration_retains_history_without_restoring_authority() {
+        use sha2::{Digest as _, Sha256};
+
+        let identity = RuntimeIdentityMaterial::generate("WK-legacy").unwrap();
+        let public_key = decode_public_key(&identity.public_key).unwrap();
+        let fingerprint = format!(
+            "sha256:{}",
+            Sha256::digest(public_key)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        for state in ["active", "revoked"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("runtime-auth.toml");
+            // These frozen field spellings prove the persisted pre-ID boundary.
+            let legacy = serde_json::json!({
+                "workspace_id": "workspace-1",
+                "backend_url": "https://backend.example.test",
+                "key_id": "WK-legacy",
+                "algorithm": "ed25519",
+                "public_key": identity.public_key,
+                "public_key_fingerprint": fingerprint,
+                "identity_revision": 7,
+                "trust_generation": 9,
+                "state": state,
+                "registered_at_unix": 10,
+                "updated_at_unix": 20,
+            });
+            let original_record = toml::Value::try_from(&legacy).unwrap();
+            let document = serde_json::json!({"workspace_issuers": [legacy]});
+            std::fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+
+            let migrated = read_runtime_auth_file(&path).unwrap();
+            assert_eq!(
+                migrated.workspace_issuers[0].state,
+                worker_runtime::workspace_issuer::WorkspaceIssuerTrustState::Revoked
+            );
+            assert_eq!(migrated.archived_legacy_issuers.len(), 1);
+            let archived: toml::Value =
+                toml::from_str(&migrated.archived_legacy_issuers[0]).unwrap();
+            assert_eq!(archived, original_record);
+            write_runtime_auth_file(&path, &migrated).unwrap();
+            assert_eq!(read_runtime_auth_file(&path).unwrap(), migrated);
+        }
+    }
+
+    #[test]
     fn oversized_runtime_auth_store_fails_closed_before_parsing() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("runtime-auth.toml");
@@ -1691,6 +1747,7 @@ mod tests {
             &RuntimeAuthFile {
                 identity: Some(identity),
                 workspace_issuers: Vec::new(),
+                archived_legacy_issuers: Vec::new(),
             },
         )
         .unwrap();

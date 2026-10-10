@@ -1,5 +1,7 @@
 # T-724 validation evidence
 
+Editorial note (2026-10-10): obsolete state terminology is summarized by purpose below; cited IDs, commits and validation results still describe the original investigation, not new executions.
+
 Scope: `T-724`, authoritative item `00001M4D5ZN6P:4`, resume instruction thread
 sequence 7. Baseline: `c79506b60f1abcb3d8698d01491f2b6e644170d0` (clean detached
 checkout). Source branch: `work/T-724-workspace-drive`. T-717/T-722 are integrated;
@@ -12,9 +14,9 @@ T-723 Tools/WIP and T-714 implementation are not modified.
 | Shared Workspace asset, no Repository/Git prerequisite | Workspace sidebar Drive; optional-node route; real `/api/workspaces` repositoryless bootstrap, zero repository records/config, folder/Markdown/PNG/empty-file and Worker artifact roundtrip. |
 | DB hierarchy, stable string node URL | `driveHref`, strict decimal/ref/metadata parsers; root/list/parent-chain APIs only; rename/move/delete/recreate lifecycle in real adapter and production browser. No blob path or second persisted tree. |
 | Paged folder list, metadata and mutations | Service cursors, bounded pages, breadcrumb, search, creation, native binary download, replace, relocate, empty-folder delete; real and fixture roundtrips. |
-| CAS and draft retention | Per-Workspace/node draft with read revision; 2-account real concurrent CAS (one success/one conflict), 2-tab browser drafts, explicit refresh vs discard; component regression proves open rename form does not silently rebase on refresh. |
-| Identity/revision fences | Controller selection/write/page epochs; saved tuple, scoped receipts and separate cancel generation; delayed old read/save/status/workspace browser gates; keyed image decode events and URL revocation component regression. |
-| Safe Markdown/raster/binary | Existing raw-HTML-rejecting renderer; same-Workspace explicit resource navigation and credential-free external HTTP(S), no automatic inline image requests; real revision-bound PNG transfer, 256 KiB raster bound, HTML/SVG download-only, failed image/truncated/empty browser states. |
+| CAS and draft retention | Per-Workspace/node draft with observed node state at read time; 2-account real concurrent CAS (one success/one conflict), 2-tab browser drafts, explicit refresh vs discard; component regression proves open rename form does not silently rebase on refresh. |
+| Identity/content-condition fences | Controller selection/write/page epochs; saved tuple, scoped receipts and separate cancel generation; delayed old read/save/status/workspace browser gates; keyed image decode events and URL revocation component regression. |
+| Safe Markdown/raster/binary | Existing raw-HTML-rejecting renderer; same-Workspace explicit resource navigation and credential-free external HTTP(S), no automatic inline image requests; real node-content-bound PNG transfer, 256 KiB raster bound, HTML/SVG download-only, failed image/truncated/empty browser states. |
 | Upload publication / errors / OutcomeUnknown | Raw Blob ≤16 MiB + SHA-256; transfer receipt vs DB-published acknowledgment; cancellation/loss preserve request ID and query current-authorized result, no unconditional reupload; typed name/CAS/limit/denied/storage failures. |
 | Backend current permission and Worker grants | Existing authoritative Worker catalog; owner setting flag; explicit read_only/read_write, separate Profile enablement, complete paged grants, revoke; real signed read-only Worker denial/revoke and exact Web grant-adapter owner/member HTTP boundaries; component and browser grant interactions. |
 | Latest only / no added workflow | Explicit replacement/history warning; no versions, approval/publication workflow, public share links or recursive folder delete. |
@@ -61,7 +63,7 @@ Reproduce using `web/workspace/test/drive-real-api/README.md` or
 - Web `deno task test`: **566 passed**, including 36 content/controller boundary
   tests and 2 preview/link-policy tests.
 - Web `deno task test:component`: **302 passed / 32 files**, including actual
-  Markdown rendering/alt labels, late decode fences, pinned form revision, grant
+  Markdown rendering/alt labels, late decode fences, pinned observed form condition, grant
   administration, and dependent existing Worker/Console/Markdown surfaces.
 - Separate fixture-client compatibility tests: **4 passed**. These prove mock
   wire compatibility, not real storage or authorization.
@@ -95,7 +97,7 @@ Production rebuild and implementer-owned visual acceptance completed on
   runner correctly reports `completed-with-errors` for injected failures; visual
   acceptance is the implementer's review, not that exit/status label.
 - Visual result: **pass**, no unresolved new visual regression. Artifacts use
-  baseline source revision plus dirty context; production source is frozen by
+  baseline source commit plus dirty context; production source is frozen by
   the subsequent commit (only test formatting/documentation changed afterward).
 
 A final grant regression also proves catalog readiness toggles cannot abandon an
@@ -124,7 +126,7 @@ Intermediate visual review found and fixed:
   actual `text` prop; retain no automatic image loading. Component and production
   browser regressions protect this.
 - Parent semantic review additionally fixed late image-decode event identity and
-  open rename/replacement revision pinning, with focused component tests.
+  open rename/replacement observed-condition pinning, with focused component tests.
 
 Injected permission/storage/list errors and superseded aborted breadcrumb reads
 remain in official context with explicit dispositions. A successful capture exit

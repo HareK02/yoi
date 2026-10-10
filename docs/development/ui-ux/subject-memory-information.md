@@ -1,10 +1,10 @@
 # Subject / Memory information audit (T-692)
 
-This document records T-692's UI decisions and validation at the commits cited below. Its counter labels and fixture values describe that historical implementation, not the current API. Current Memory uses opaque `change_id` references, `memory_fingerprint` and `built_from_memory_fingerprint`; see [the current store contract](../../design/subjektiv-store.md). Historical observations and test results below are retained unchanged.
+This document records T-692's UI decisions and validation at the commits cited below. Its counter values describe that historical implementation, not the current API. Obsolete UI labels are paraphrased by purpose below, not quoted as current copy. Current Memory uses immutable `change_id` references, `memory_fingerprint` and `built_from_memory_fingerprint`; see [the current store contract](../../design/subjektiv-store.md). Historical validation results are not new executions.
 
 ## Decision and scope
 
-The previous Subjects index exposed `Store revision` alongside identity, state and
+The previous Subjects index exposed a committed-Memory update counter alongside identity, state and
 update time; Subject detail led with technical metadata and raw surface states.
 These numbers require implementation knowledge before they help a user choose a
 Subject or understand what is available. The revised hierarchy starts with
@@ -23,22 +23,22 @@ surface does not attest what is already in any running Worker's history.
 | --- | --- | --- |
 | Subject role and ID | Normal identification. Similar or identical roles need a stable identifier for selection and comparison. | Keep role as heading and the complete wrapping ID visible in index and detail. |
 | Subject active/retired state | Normal operation decision: whether a new Worker connection can use the Subject. | Replace raw `active` with `Available`; keep `Retired`. Detail explains connection eligibility, not an assertion that a Worker is running. |
-| Current Worker | Normal connection decision, derived from the existing Backend singleton projection. | Promote `Connected` / `Not connected` and display name. Do not infer ownership from store revision or claim all Workers received current Memory. Worker start remains the ordinary launch form. |
-| Committed-Memory presence | Normal reading decision, independent from surface generation or candidates. | Show `Available` / `None` only on the successful first bounded page. On later pages say `N on this page`; errors say `Unavailable`. Never infer counts from revision or scan all pages. |
+| Current Worker | Normal connection decision, derived from the existing Backend singleton projection. | Promote `Connected` / `Not connected` and display name. Do not infer ownership from historical store counter or claim all Workers received current Memory. Worker start remains the ordinary launch form. |
+| Committed-Memory presence | Normal reading decision, independent from surface generation or candidates. | Show `Available` / `None` only on the successful first bounded page. On later pages say `N on this page`; errors say `Unavailable`. Never infer counts from an update counter or scan all pages. |
 | List counts | Normal navigation context, not a store-wide statistic. | Label `N shown` and `more available`, preserving existing bounded cursor pagination. |
 | Resident availability | Normal context decision. A missing surface is not missing committed Memory. | `Ready to use`, `Ready, no context`, `Not generated`, `Needs refresh`, `Generation failed`, and request `Unavailable` are distinct. These describe the current generated store artifact, not content truth or Worker-history propagation. |
 | Resident body and generated time | Normal content/read freshness context. | Keep the shared Markdown renderer, generated date and exact snapshot reference count. Ready-empty explains that a valid snapshot has no body; stale/failed do not display a partial or old snapshot. |
-| Subject store revision | Diagnostic only: internal committed-Memory change number, not record count, schema version or quality score. | Remove it from the index's normal columns. Retain the exact value under detail's `Technical details`, with its meaning explained. Backend comparisons are untouched. |
+| Historical Subject store counter | Diagnostic only: internal committed-Memory change number, not record count, schema version or quality score. | Remove it from the index's normal columns. Retain the exact value under detail's `Technical details`, with its meaning explained. Backend comparisons are untouched. |
 | Subject update time | Secondary metadata; not a context-injection or generation completion timestamp. | Label `Last changed`; on detail put it with Subject diagnostics rather than competing with the availability summary. |
-| Snapshot ID and built-from revision | Diagnostic correlation, distinct from per-Memory revisions. | Retain under `Surface sources and diagnostics`, labelled `Generated from Subject revision` and explained. |
-| Surface Memory references | Detailed audit/reachability. | Preserve reference IDs, immutable revision values and Memory links in the disclosure. |
+| Snapshot ID and historical built-from counter | Diagnostic correlation, distinct from individual Memory history entries. | Retain under `Surface sources and diagnostics`, labelled the historical generated-from counter label and explained. |
+| Surface Memory references | Detailed audit/reachability. | Preserve reference IDs, immutable history references and Memory links in the disclosure. |
 | Memory claim, kind, lifecycle state, excerpt and body | Normal content decision. Active, resolved and retracted are not interchangeable. | Retain list scanning and body reading. Keep the Markdown renderer and current/historical distinction. |
-| Individual Memory revision and history | Detailed content comparison, also useful for identifying a selected version. | Explicit `Memory revision` labels, separate from Subject counters. Preserve immutable history, selected revision links and revision pagination. |
-| Candidate provenance, evidence, origin, source refs and derivations | Detailed audit, required to understand why a record exists. | Retain IDs, ranges, summaries, excerpts, origins and derived-revision links. Counts say `shown` except where the API provides exact per-candidate totals. Preserve body and evidence continuation links. |
-| Raw field names / duplicated general revision terminology | Unnecessary in the normal hierarchy; multiple unrelated counters are misleading. | Replace bare revision labels and raw surface enums with purpose-specific labels. Do not delete API fields, stored information, diagnostics or their detailed access. |
+| Individual Memory history entries | Detailed content comparison, also useful for identifying a selected version. | The historical UI labelled each Memory history entry separately from Subject counters. Preserve immutable history, selected history-entry links and history pagination. |
+| Candidate provenance, evidence, origin, source refs and derivations | Detailed audit, required to understand why a record exists. | Retain IDs, ranges, summaries, excerpts, origins and derived-history-entry links. Counts say `shown` except where the API provides exact per-candidate totals. Preserve body and evidence continuation links. |
+| Raw field names / duplicated general update-counter terminology | Unnecessary in the normal hierarchy; multiple unrelated counters are misleading. | Replace bare counter labels and raw surface enums with purpose-specific labels. Do not delete API fields, stored information, diagnostics or their detailed access. |
 
 No diagnostic datum was removed from Subject detail, surface detail or Memory
-provenance/history. The index no longer shows a store revision, but the exact
+provenance/history. The index no longer shows a historical store counter, but the exact
 value remains one click away in Subject detail. No invented regeneration,
 editing or recovery action was added; `Needs refresh` does not mean an update job
 is running. Creation still creates only a Subject, and selection still uses the
@@ -55,7 +55,7 @@ The existing real-store regression
 stages a candidate and attempts an invalid apply. It asserts the candidate has no
 resolution and the committed Memory list remains empty. The component regression
 `candidate-only Subjects show no committed Memories, not an inferred candidate count`
-uses that read projection (store revision 0, ungenerated surface, empty successful
+uses that read projection (historical store counter 0, ungenerated surface, empty successful
 committed list) and checks `None`, `No committed Memories yet.`, `Not connected`
 and `Not generated`, with no resident body. Thus a staged candidate does not turn
 into a committed-Memory count or a claim that context has been generated.
@@ -99,7 +99,7 @@ supplement does not change rendered markup, styling, copy or data contracts.
 - The focused production-shell browser test proves main-owned vertical scrolling
   with wheel/keyboard/touch, 320px/mobile shell behavior, no page-wide overflow,
   local table/code scroll, Markdown safety, creation/launch separation, bounded
-  pagination and Memory/source/revision reachability.
+  pagination and Memory/source/history-entry reachability.
 
 Independent review at source `4cf6c130` ran root `cargo check`,
 `cargo fmt --all -- --check`, diff hygiene, Web check (0 errors/warnings), 12

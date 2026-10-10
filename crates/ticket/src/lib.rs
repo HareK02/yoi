@@ -2523,6 +2523,10 @@ impl SqliteTicketBackend {
         // Exact recorded replay is independent of today's live role/assignment.
         // Parent transport authenticates identity before restoring receipt context.
         self.require_active_source_assignment(conn, ticket_id)?;
+        // Compare content and workflow state before any state/audit write, using
+        // the snapshot read in this same write transaction. Acceptance criteria
+        // may change without a state change, so a late completion must not win
+        // solely by arrival order. Equal timestamps do not prove equal content.
         let actual = ticket_content_digest(&previous);
         if actual != request.expected_content_digest {
             return Err(TicketError::StaleContent {

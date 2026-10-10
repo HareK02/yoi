@@ -47,7 +47,7 @@ function attachment(
   };
 }
 
-Deno.test("logical config sidebar label is not fabricated as a repository revision", () => {
+Deno.test("logical config sidebar label is not fabricated as a repository checkout", () => {
   const meta = sidebarWorkdirMeta([attachment("workspace-config", {
     display_name: "Workspace configuration",
     source: { kind: "workspace_config", access: "read_write", content_path: "/workspace-config", purpose: "Configuration" },
@@ -85,6 +85,17 @@ Deno.test("Worker sidebar Workdir label uses the creation branch before observat
   ]);
 
   assertEquals(meta.text, "main:develop");
+});
+
+Deno.test("Worker sidebar Workdir label shows the creation ref before a current checkout is observed", () => {
+  const meta = sidebarWorkdirMeta([
+    attachment("checkout", {
+      creation_selector: "refs/tags/release",
+      creation_ref: "0123456789abcdef0123456789abcdef01234567",
+    }),
+  ]);
+
+  assertEquals(meta.text, "main:creation-ref@0123456789ab");
 });
 
 Deno.test("Worker sidebar Workdir label marks detached HEAD instead of reusing creation branch", () => {

@@ -177,7 +177,7 @@ Deno.test("Merge Request routes distinguish recorded approval from live source o
     ),
   );
   assertEquals(detail.includes("Recorded integration approval"), true);
-  assertEquals(detail.includes("Live source revision"), true);
+  assertEquals(detail.includes("Live source ref"), true);
   assertEquals(detail.includes("Source observation error"), true);
 });
 

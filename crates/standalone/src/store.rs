@@ -426,6 +426,10 @@ impl StandaloneWorkerStore {
             // The create-new commit marker excludes other writers across this
             // comparison and replacement. Compare the observed metadata itself,
             // including its manifest, pointer and lifecycle state, not a counter.
+            // Before replacing the file, reject an update based on metadata from
+            // before another writer stopped/resumed the Worker or changed its
+            // session pointer. Those changes may share a timestamp; arrival-order
+            // wins would silently restore an old lifecycle/pointer.
             if serde_json::to_value(&current).map_err(StandaloneStoreError::Json)?
                 != serde_json::to_value(expected).map_err(StandaloneStoreError::Json)?
             {
@@ -961,7 +965,7 @@ permission = "write"
         write_worker_record(&mut encoded, &migrated).unwrap();
         let saved: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         assert!(saved.get("revision").is_none());
-        assert_eq!(saved["schema_version"], 2);
+        assert_eq!(saved["schema_version"], SCHEMA_VERSION);
         let resumed = store
             .update_active_pointer(
                 &migrated,
@@ -974,7 +978,7 @@ permission = "write"
         )
         .unwrap();
         assert!(disk.get("revision").is_none());
-        assert_eq!(disk["schema_version"], 2);
+        assert_eq!(disk["schema_version"], SCHEMA_VERSION);
         assert_eq!(resumed.subject, record.subject);
         assert_eq!(resumed.active_segment_id, record.active_segment_id);
     }

@@ -63,7 +63,6 @@ export type WorkspaceDeletionState =
 
 export type WorkspaceDeletionBlockerKind =
   | "last_accessible_workspace"
-  | "revision_conflict"
   | "dirty_workdir"
   | "worker_removal_blocked"
   | "workdir_removal_blocked"

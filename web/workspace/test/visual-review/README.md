@@ -43,7 +43,7 @@ capture error is expected. To repeat dark captures, use a scenario copy with
 
 ## Implementer-owned visual review
 
-- Baseline revision: `e939cd4e4b1f6b63b81411fd7766062f2d69ad0d`.
+- Baseline commit: `e939cd4e4b1f6b63b81411fd7766062f2d69ad0d`.
 - Before: `.svelte-kit/t717/visual/before-final-light` and `before-dark`.
   These use an isolated build under `.svelte-kit/t717/baseline-source`, with the
   changed production form, catalog API, model, and CSS restored from baseline

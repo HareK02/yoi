@@ -1,0 +1,2186 @@
+[
+  {
+    "path": "AGENTS.md",
+    "kind": "naming_policy",
+    "reason": "命名禁止の原語を明示する規則そのもの。消すと大小文字・複合語を含む禁止対象が曖昧になる。現行状態モデルの名称ではない。",
+    "lines": [
+      {
+        "sha256": "b24c8ab3aabb18044f1011eda6cab552a47c735e6d6bc9ebf52df32a39eb6d2c",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/manifest/src/lib.rs",
+    "kind": "saved_data",
+    "reason": "read_persisted_worker_manifest_snapshot の無version・schema 2/3 readerが旧Memory設定keyを検証してschema 4へ変換するための綴りとそのfixture。削除するとWorkspace identity・language・実行設定を持つ既存Worker manifestを復元できず、部分設定やmixed authorityの拒否検証も失う。現行manifestのwriterは旧keyを出さない。",
+    "lines": [
+      {
+        "sha256": "895bf9a35a75911f2ee00873cee8216858b19d28c331be7363d5d92905e20463",
+        "count": 1
+      },
+      {
+        "sha256": "44642e3fb83c8cf5e7c24f3b9d7af519667c9d27cbb0bae27fadd91411f8aa42",
+        "count": 1
+      },
+      {
+        "sha256": "9da6d5e4d2c8a31faa9f8acb6c9ce0295532fa0822446f630d25d30d6777e8f2",
+        "count": 1
+      },
+      {
+        "sha256": "a553b91a997ed3b135abf3baef1ae2a4362320f813c231ca115b94e4fb8377f6",
+        "count": 1
+      },
+      {
+        "sha256": "d7699cd6473a4a80e8826b302e5906fdf9b29ca8ae9d3c66d736747551496752",
+        "count": 2
+      },
+      {
+        "sha256": "aff9330758edaa811259d84e5ebea60cdb7bbdfbd318acfa478af3e395b8fabb",
+        "count": 2
+      }
+    ]
+  },
+  {
+    "path": "crates/merge-request/src/lib.rs",
+    "kind": "saved_data",
+    "reason": "TicketCompletionEventの歴史的payload reader/writerは保存済みTicket completion属性を同じJSONで保持する。v12移行は旧review keyを取り除く前に原文をimmutable archiveへ保存し旧grantをrevokeする。綴りを変えると古い完了payloadの読取/roundtripか旧reviewの移行を失う。live completion/readinessの根拠には使わない。",
+    "lines": [
+      {
+        "sha256": "0ad13adedc96d68be7f53aee2486a27f67a4f46a6b611c23d8e8a07a0385b808",
+        "count": 1
+      },
+      {
+        "sha256": "c4e2e113ea3005dda9175c98951118186742b9aa6235c9c592b791c19bcc7b1c",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/merge-request/tests/store.rs",
+    "kind": "saved_data",
+    "reason": "freeze_v12_review_payloads とhistorical completion fixtureは旧reviewの原文archive・grant失効・統合結果保持、および保存済みTicket completion属性のbyte/JSON roundtripを検証する。旧keyを任意語に変えると実在した保存形式を通る保証を失う。",
+    "lines": [
+      {
+        "sha256": "c9691d0873568a9b67b760d8f3d28c108ae2529cb56a19155627a3d83f1d390c",
+        "count": 1
+      },
+      {
+        "sha256": "29b401ff2dd21a5cbaa1803e7159b18bdfe02d4efe2d63aac01852e5cc9778c6",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/session-store/src/system_item.rs",
+    "kind": "saved_data",
+    "reason": "frozen_subject_behavior_log_reads_old_counter_without_republishing_itの保存済みSystemItem fixture。旧JSONを読んでもexact archived bodyを維持することを証明する。削除すると過去Session log形式の読取回帰を検出できない。",
+    "lines": [
+      {
+        "sha256": "5b5998029cfed30634e8b063b759aefd70e30dab3d02ce9defe9086977fc9811",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/standalone/src/job_store/legacy_migrations.rs",
+    "kind": "saved_data",
+    "reason": "JobStore::openがschema 1/2 DBを移行する際の旧attempt列・request key、およびその実データfixture。原request/fingerprint/attemptをimmutable archiveへ退避して内容digestを再計算し、receipt・failure・grant・replayを保持する。削除すると既存Jobsを開けず、rollback時の旧binding保持検証も失う。",
+    "lines": [
+      {
+        "sha256": "91b31d4f17e2c3b826887aa989655998930699db07190ae182cab69479b4157b",
+        "count": 1
+      },
+      {
+        "sha256": "95afb0c8b156e3d2bed11671f1c35f9f74d1589fc20d540f4b16c8d7c887f2ec",
+        "count": 1
+      },
+      {
+        "sha256": "869701cd7b0975f2837f6d9e61fddd0c9b6da36b0250cd77653aee9ca6343c01",
+        "count": 1
+      },
+      {
+        "sha256": "16cb51c05f2f830669af2440ba1e92b1d10f1aff6fa2933cebb36f055a28f926",
+        "count": 1
+      },
+      {
+        "sha256": "0a183581dadfa685bb2b3a58bd300883f2649816e1a63b4e90f903b6494036e0",
+        "count": 1
+      },
+      {
+        "sha256": "af70f24d3b73b08f64576a21ecfe31b605cbf9ba4bd3b3c446fb0d921e949bd9",
+        "count": 1
+      },
+      {
+        "sha256": "a37ba64e23c033ccac9057cec0c881c4826616e154d5a60dbeeae3c6a97f0dbd",
+        "count": 1
+      },
+      {
+        "sha256": "f555731b0a9a79e6be6307d196f1eea1247ecb0f24c8c49c26492cf64d1a0f78",
+        "count": 1
+      },
+      {
+        "sha256": "7aa68b52c228a072d05fa14a37d238736291b76177ad9a2e0c38cfe0d6d7f426",
+        "count": 1
+      },
+      {
+        "sha256": "4768381600ae71cb90f054f8cba748a4b3273194250bba05f3acedab56b480e2",
+        "count": 1
+      },
+      {
+        "sha256": "0e576b0e9502be2d0c26d4707d2703bc660513a97b6a2e7782de67731fae0823",
+        "count": 1
+      },
+      {
+        "sha256": "06ece4e9cdf7ff9d0db0982d037ec3f9a97490a879b51b847ef03289e039e5d4",
+        "count": 1
+      },
+      {
+        "sha256": "3579e071aaf8beea6580b3701356b31277181ea5bf1e76c017170b3643951672",
+        "count": 1
+      },
+      {
+        "sha256": "58e1d6ca58f896a644dd2b95be1e7a2afde9f62ede07fea2fff6ced2c145d68b",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/standalone/src/store.rs",
+    "kind": "rejection_test",
+    "reason": "移行後・現行出力から旧key/column/tableが消失したことを具体的な綴りで検証する負のassertion。削除すると旧名の再出力/残存を検出できなくなる。関連する保存境界: decode_worker_recordのschema-1保存JSON adapterとそのfixture。旧counterだけ除き、manifest・Subject・Session pointer・停止metadataを保持して現行保存形式へ変換する。削除すると既存Standalone Workerを復元する互換境界とその検証を失う。",
+    "lines": [
+      {
+        "sha256": "0072170c5ddd7379585f851b2ee9929420877246a82d1a6b99c351dd0653ebfa",
+        "count": 1
+      },
+      {
+        "sha256": "3e802d52e870906c99c486b5e83d7bb6e37b80b6599f2fea10322488d90a1742",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/standalone/src/store.rs",
+    "kind": "saved_data",
+    "reason": "decode_worker_recordのschema-1保存JSON adapterとそのfixture。旧counterだけ除き、manifest・Subject・Session pointer・停止metadataを保持して現行保存形式へ変換する。削除すると既存Standalone Workerを復元する互換境界とその検証を失う。",
+    "lines": [
+      {
+        "sha256": "4bcd12d150cb01ab0f50e7dfa96e8ca3f0128e975ae63e0f4bc431490369d32b",
+        "count": 1
+      },
+      {
+        "sha256": "c66ee75622bc5ecda6ef14c07e9cd693cd1ab8335bb13bb9f5735275f2ac8f34",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/subjektiv/src/legacy_migrations.rs",
+    "kind": "saved_data",
+    "reason": "FeatureStorageのschema 1..6移行とremove_state_numbers/convert_jsonが既存DB列・履歴表・JSON参照を識別する綴り、および投入fixture。全recordの原文をarchiveし、Memory change/predecessor・candidate/derivation edges・decision receipt・surface provenanceを新identityへ対応付ける。削除するとSubject/Memory履歴・参照・replayの復元が壊れる。旧surfaceをfresh扱いしない検証も必要。単なる旧名のエラーメッセージは承認対象外。",
+    "lines": [
+      {
+        "sha256": "5ec82b793d313dc5f6df05ee3a05146536e81235a44869a5254e7a7ba1665ead",
+        "count": 3
+      },
+      {
+        "sha256": "e2cc80185594b9f8849ebb75fdf74c159ef3df1300320cfef3324c48440a365e",
+        "count": 1
+      },
+      {
+        "sha256": "db61f8d62fc843a87e0f023e1018ce12d1d4779e7e9cf5cde4d2582572002901",
+        "count": 1
+      },
+      {
+        "sha256": "4a671ca3a159258ef8c9014a26be1907094f205a7f8d31cb4619d90236f53a89",
+        "count": 1
+      },
+      {
+        "sha256": "83244d33dce1d9862b866b86c8ad0be4756576aef94157acd79ba506df040159",
+        "count": 1
+      },
+      {
+        "sha256": "ff90c702561070763ed3cab8223f1e8af35943f32bac77ede934b04c4621e89c",
+        "count": 1
+      },
+      {
+        "sha256": "1498bf243a4fd6bde42a72947b7c188d10e2ca06dbed5bfe858f1d043a7e9d36",
+        "count": 2
+      },
+      {
+        "sha256": "f1b1b26fd35f6522181d6bef45cee09256a01595cfe77af82acdd248eee2c9b0",
+        "count": 1
+      },
+      {
+        "sha256": "d961bead14c98f33705dd7fd6056d68d1d701865c921f881a0080f3c08ea3f6a",
+        "count": 5
+      },
+      {
+        "sha256": "a16ee03e21ad95fdd0b5c54a2382b19d4aa61fa6c319311ee68d214f8f3d52a2",
+        "count": 1
+      },
+      {
+        "sha256": "1bf54107893da3f0cbb7da1cf7a994d1c691df30daa71312a153258890f5589a",
+        "count": 5
+      },
+      {
+        "sha256": "ff84e5199326de2ecac61d68f1debb2b46f8cbecafcf97f8bed49402ce5bb692",
+        "count": 2
+      },
+      {
+        "sha256": "a3b5561da66361e3111077a84e3b015384d1b33217401f70e80863857e5875fa",
+        "count": 1
+      },
+      {
+        "sha256": "77a625492e8aa959ed6e106e0e918a49be174e26e4e65e253fac32389fe86f9c",
+        "count": 1
+      },
+      {
+        "sha256": "7221ecd8ecee22e3bdd1d9cdc3337664f88618d7448060c7cce576d68c4d833d",
+        "count": 1
+      },
+      {
+        "sha256": "f5deffa9d43630fd36569961435eba8ca78530033f13b528deac641069cb3110",
+        "count": 1
+      },
+      {
+        "sha256": "3b696d655272df49121d747a2fb5228fb9e0eca110ce7761b2927608fd863a08",
+        "count": 4
+      },
+      {
+        "sha256": "0441cd4a2a1b4cad1be421d24cdfd2342a4ad815dadc5f73973d9a12bcc769d0",
+        "count": 1
+      },
+      {
+        "sha256": "cdc551145ca509666559a29495293dbe2a02adfb881c50e0f35063e5191254fc",
+        "count": 1
+      },
+      {
+        "sha256": "51c74d51580634a5e3f985284702fc4dbe0a00cd9636c4f4d6f8fa3ca01ff9b7",
+        "count": 1
+      },
+      {
+        "sha256": "6219b56470370ff004103d291bd512fc2a94410fcbaf842dbba85ca3bad5ec92",
+        "count": 1
+      },
+      {
+        "sha256": "c50ff3a5c9b1038553a84cf40949813af13bdc18ec7d0ae71913f08e6692d6c7",
+        "count": 1
+      },
+      {
+        "sha256": "8be535a7848b73a6cef1ca78b08b5734626f8db9fdc94376ed315a31fc652404",
+        "count": 2
+      },
+      {
+        "sha256": "fd6c91c450ae7876e4b82945061570730da6f12caf4aba911e36cf29702b8608",
+        "count": 2
+      },
+      {
+        "sha256": "d2c56adcd7aea8968a38f16d9069391edbc22522cea857ef8d64c6164ea55798",
+        "count": 1
+      },
+      {
+        "sha256": "fbd43f49ec5e665fa54de1f29015861c9d7a113edccbeaf5b48917098901c9a6",
+        "count": 1
+      },
+      {
+        "sha256": "a7ff0a428fd72fdaaa5b8b1b107926c4236c031517ad130c5fba95e3e0303d17",
+        "count": 1
+      },
+      {
+        "sha256": "44015a4c6260db6199a010e43d728e74fb6170ef53a51c0e3816bbfa0d503fd8",
+        "count": 1
+      },
+      {
+        "sha256": "d9f75cbe1fc0df0412a505d2d5f2eac0906cee7dfc66c24cabbf57ca40fbc50c",
+        "count": 1
+      },
+      {
+        "sha256": "e4047ff3d831bbfdb41a1e8285cd7a41ff4f70cf34ef5f09f45cd493c040eaa2",
+        "count": 1
+      },
+      {
+        "sha256": "6104685e6f2217d328db51daf9dca18576068264c84ac41c2ef101cd8509de7c",
+        "count": 1
+      },
+      {
+        "sha256": "ee9d0ba29789b6292853bb4fbbfb5795aefc42418a041bf79cc77eefa37beaaa",
+        "count": 1
+      },
+      {
+        "sha256": "596aaeaf61e6d59520839a6aabfb394e3069d8e6a141b9cb6fe1268c6ef178b9",
+        "count": 1
+      },
+      {
+        "sha256": "c9495213b8554fa87f9583d0731f4cbe5166225746b1a60033dfecadd7620b56",
+        "count": 1
+      },
+      {
+        "sha256": "59604dc68d1fc436ab381abe2dbb32fe95f8755a18201082a111125d80cc9ee6",
+        "count": 1
+      },
+      {
+        "sha256": "94cddbb48c5aab0172bbe96f2907dcde70dabecfc4ead49795d94e649c98f58c",
+        "count": 1
+      },
+      {
+        "sha256": "fe40dee1b513165d59faa31e462dcf81b93c4bdab57214bf8185d1a3c65c0e9b",
+        "count": 1
+      },
+      {
+        "sha256": "bc56670cbdc6c51e23e635a5d7ce8dd22e602cc907bb02603a61be87f54eb819",
+        "count": 1
+      },
+      {
+        "sha256": "23155664866e894f478307c2e52e64818d06380248577a89a3c0baef24721437",
+        "count": 1
+      },
+      {
+        "sha256": "eafc5bbeace185e30564c38b60f7c7d70a000316b827cec737d8ed0fc8ed738f",
+        "count": 1
+      },
+      {
+        "sha256": "e8b7d218732c804d6d4a421e681c32c1af1236b25bfb84a2dbc8846ecd90a6f9",
+        "count": 1
+      },
+      {
+        "sha256": "bec0a876835f1139ebf4814a7f363d04515af77faba760bb6d5e9b934ee941ae",
+        "count": 1
+      },
+      {
+        "sha256": "fdf6a8ef67154c0bf56cbf0e2bca59abfe6323c0e694d6465179c5af67492bc2",
+        "count": 1
+      },
+      {
+        "sha256": "7cbca1c52c2956e02b71f96279bf07141edf0c3ecd2837a6697a336b4b2d415c",
+        "count": 1
+      },
+      {
+        "sha256": "03631aeb6c631d791dac4907f68fe31c1043294a75add1175462784ad17b24ab",
+        "count": 1
+      },
+      {
+        "sha256": "724e77ccadc159936eb409b9559e965a3e743d863d653c9f8fce7f7884e1d955",
+        "count": 1
+      },
+      {
+        "sha256": "e63ba0c9adb8b4630daee8aba359385667d0f874ba38de9869b9fe03e93eb627",
+        "count": 1
+      },
+      {
+        "sha256": "2fc45636fc8893eb77ac3508b202aecf399458de74ff2c690ca00f1641c28293",
+        "count": 1
+      },
+      {
+        "sha256": "2fa3b93393abaa48a5e5fe036407416c9eb3ba942638d3c2d23e504a3495f6e1",
+        "count": 1
+      },
+      {
+        "sha256": "b89d417690410f74dd2acb0dd68e28407b4bda70879cc965b8a5ff646287f27f",
+        "count": 1
+      },
+      {
+        "sha256": "bf227ba847c24ab8cb591d4d8c43e184c53a824f316863aa47f9486afa62b4b3",
+        "count": 1
+      },
+      {
+        "sha256": "eef72e24ea058464497f595bd5498b15eafa12bf4a3701d861ee4d77b72011ef",
+        "count": 1
+      },
+      {
+        "sha256": "12467910594102acfe56e4a422775ae6cf88ca43ae4876bc450fd7296fad88b4",
+        "count": 1
+      },
+      {
+        "sha256": "c32f259beb2a52f17437edc1b353b0f3e476e6a5073919eb58a034a55c829b02",
+        "count": 1
+      },
+      {
+        "sha256": "e61edb1e37216b0841487519efaad5322af689e886369a4a8169d352f181b633",
+        "count": 1
+      },
+      {
+        "sha256": "4483536f462c4f3b7c8bf91c1ce2f4fa20a10883dad53e51e37978c1de79fb25",
+        "count": 1
+      },
+      {
+        "sha256": "b21b714ee01a74237762019ec70a26b0854525ceace84cca239e2601d7b46fca",
+        "count": 1
+      },
+      {
+        "sha256": "99078511a45c6998fecbdbea406ec44503ee54ff36abed9b203e5e7e4617570b",
+        "count": 1
+      },
+      {
+        "sha256": "e0a2560e419f20a299596463282c49235bec92e7f349865b80df901adec31e84",
+        "count": 1
+      },
+      {
+        "sha256": "c44589f8227e67ba87754f3b7b2600a2b0d0019fca8df61a5d0ebd481229624d",
+        "count": 1
+      },
+      {
+        "sha256": "529bfcfc490276654971aedcbd96f8ea211a8af6e13a8f36683a275d6e006d7e",
+        "count": 1
+      },
+      {
+        "sha256": "a3577068d4351c5f6b5a5b6256a28db9226a57ce55a26febe90e74a306912110",
+        "count": 1
+      },
+      {
+        "sha256": "d4a057bb0019067f3ffab88f1b835c949df570e7f75e717c784bc3f1d4766895",
+        "count": 1
+      },
+      {
+        "sha256": "2c25b36a6762710da11d032ebb0b998200b088567dbcb101c772ede488c08ce3",
+        "count": 1
+      },
+      {
+        "sha256": "7b417bb0f62c7b7a1f674e219630a9b58790b9fd401ade40ea8c3133c19f0110",
+        "count": 1
+      },
+      {
+        "sha256": "de8301e068fdb96e622eb2ec75bf7ff01351c778d655ab73a2909da0d737a62d",
+        "count": 1
+      },
+      {
+        "sha256": "4fb088b34b28c71a5b9566043e13da7622fefbf24311300f295c7c75ed2bbab0",
+        "count": 1
+      },
+      {
+        "sha256": "e27eba1ed5ece48cd7493eec033de58616351e06eeec711fbd5cbf9ac9482ec9",
+        "count": 1
+      },
+      {
+        "sha256": "92727f0405d30eaf54b9432a0434af03bc1f8bf73e92c467e43ad4ae89da6ba1",
+        "count": 1
+      },
+      {
+        "sha256": "672920d9c1f6a6eda286cab0c39ede05c27732a99c9319b8731acba62dd1948b",
+        "count": 1
+      },
+      {
+        "sha256": "f2ee44ddbaa8e5a4a48d90cd33f3b35edd4069fee81b16c6548f4526edbc71c9",
+        "count": 1
+      },
+      {
+        "sha256": "0935123d8eca4b70c3a3b1b19a552f750a414cc53687655cc0598958a83a36ab",
+        "count": 1
+      },
+      {
+        "sha256": "e75b06f355d5c0261e0e5e60a3cb8e37725582575e38ac4bc840842d9a47e364",
+        "count": 1
+      },
+      {
+        "sha256": "f3ac630723e44932a71b356ae9c3c805638e6d6ddf2ce77fb66587e05abb2b40",
+        "count": 1
+      },
+      {
+        "sha256": "30f0d94a494f8a6d91d43eb2710fe5b523f7cdfdac6c29e6032aa13c587a9c5a",
+        "count": 1
+      },
+      {
+        "sha256": "d1927a3057e5bad0d1c1ddc5945faf84563f6e608ea47167511cc9b8c4b10aca",
+        "count": 1
+      },
+      {
+        "sha256": "6dbb16341df981e8df275f81267a134e6c15d2f4a9d8ab76100754da10428806",
+        "count": 1
+      },
+      {
+        "sha256": "f6d4cfe9a245d9ca77eea50a2a57c6fa9561fadccca4dfa4279bc100ae7d9333",
+        "count": 2
+      },
+      {
+        "sha256": "c0a80b23acc183e12503f829d88dae1808e48e5fb406aff975c292c9dc21d35a",
+        "count": 2
+      },
+      {
+        "sha256": "64e26d2fda77af14128a81886b0808616de520797c356e1b5ca8cba69392421b",
+        "count": 1
+      },
+      {
+        "sha256": "e248729ce44c98f37f3f4396c6be12c4c72424058fcd7c28bc60ae69340ca82e",
+        "count": 1
+      },
+      {
+        "sha256": "b241f3eb4890ac180cb0ab471d37e6dd073edb6065e13171f6446c8bede470f5",
+        "count": 1
+      },
+      {
+        "sha256": "c82e01bcd5d7a8113d8697e1a539d2fc52456a14ad96953e4d2cbe7dd58fa96b",
+        "count": 1
+      },
+      {
+        "sha256": "ec2dc651a1ca77077d879fee5b0f26b97fcbe4e8831c611284e6ffa55c30973c",
+        "count": 1
+      },
+      {
+        "sha256": "b8f5bfcac251b3cde53a617dfba362b61829c72bffb7d0e5f76c135d9e3d8c81",
+        "count": 1
+      },
+      {
+        "sha256": "a65cb819ddb1b9c447b937ee88a49f35c171103c248ce607f1115a53c8a4b582",
+        "count": 1
+      },
+      {
+        "sha256": "7676b529d2ff24d90c3a6a784f33e3d67caf81af2f3530a4808a5515480278df",
+        "count": 1
+      },
+      {
+        "sha256": "c981a8f6d160ec986f3e63665b9dddb83761ca2f2672a504030de10e23dde7aa",
+        "count": 1
+      },
+      {
+        "sha256": "bc34dccc0a3048e62ab5553ac86ba041409b60d8a8259e8e7225bf2818fc04e7",
+        "count": 1
+      },
+      {
+        "sha256": "b2b0a489ea02acc1e4b17066c6e0503ee184ccdb2adb6eed4bf04e221d6bbebd",
+        "count": 1
+      },
+      {
+        "sha256": "209cc6be2f272bfcebbba5d5aa3962462dc8b5ebf9a602c0dfb67317c5aadae9",
+        "count": 1
+      },
+      {
+        "sha256": "6f5c7c6d382c941151d22c190303a7f6859fe67efb99b345ef1eace54973adce",
+        "count": 1
+      },
+      {
+        "sha256": "20be9a312619e1049b019f01a8a89adb4b1efbe8a6b014026460a97eafa64539",
+        "count": 1
+      },
+      {
+        "sha256": "1f0cfa646323098172225890c40729af0d7f56d79123699fe1dfef6f6c03d1cd",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/ticket/src/lib.rs",
+    "kind": "saved_data",
+    "reason": "frozen_counter_receipts_remain_immutable_and_cannot_be_reinterpreted_as_content_requestsの旧completion receipt属性fixture。保存済み旧fingerprintを新content requestの証拠に昇格せず、移行後も履歴を不変に保つ保証。keyを任意語に変えると実在したreceipt形式での回帰検出を失う。",
+    "lines": [
+      {
+        "sha256": "060994ddcd0e463815b01cd11b19723fd3652bd4c741fccdb33628e97691f092",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/worker-runtime/src/fs_store.rs",
+    "kind": "saved_data",
+    "reason": "Runtime store schema 6..9 request migrationの旧Job/Memory/source/config/SSH key綴りと実形式fixture。Job/attempt identity、操作owner、source/config digest、language、保存済みRestore evidenceを保持し、未知のSSH fingerprintを捏造しない。削除すると既存Runtime storeの起動移行またはfail-closed evidence変換が壊れる。",
+    "lines": [
+      {
+        "sha256": "2b4cc5ad537c224f32ac1a46acaf0f5d29fc9389277b94b942c909b3f2f063dc",
+        "count": 1
+      },
+      {
+        "sha256": "3040b1409539446054d5469283fdf59e658ada23c7aafd032787624a7a9f4e48",
+        "count": 1
+      },
+      {
+        "sha256": "7b7eb0bd2fca79a47895167ff8d639781f1db38c8641cdad70802e5ecccdec56",
+        "count": 1
+      },
+      {
+        "sha256": "a6ce0f1cc7c588908d25c6592049e5a27fde5287f90d6ee5eb2ffd08dccccc82",
+        "count": 1
+      },
+      {
+        "sha256": "eb760e10f595fef48a66369d13f6c347012860c7cbc0de654c6178ec31cc367f",
+        "count": 1
+      },
+      {
+        "sha256": "b4085b2b779ea47ca6be1cd9fb314a90893c61804263abb6c46ad5060b5b6ef6",
+        "count": 1
+      },
+      {
+        "sha256": "2f0d053e0f4bdea85dfdc476022acb82312a860635e68b6a3a1827fdc5d43829",
+        "count": 1
+      },
+      {
+        "sha256": "ee8ae2910e73987003bf663a5278a2f8ef09884d671020b574c8723c0691323d",
+        "count": 1
+      },
+      {
+        "sha256": "4bcd12d150cb01ab0f50e7dfa96e8ca3f0128e975ae63e0f4bc431490369d32b",
+        "count": 1
+      },
+      {
+        "sha256": "70a6066e5e8a244bb7f0002a658ab1b61e4a6cca0e3bd118a171830b9feb943c",
+        "count": 1
+      },
+      {
+        "sha256": "55c515a690366b81e4312edbeb41b6bc3bb95c3ff2c7c5f90f7ee88708ef6b81",
+        "count": 1
+      },
+      {
+        "sha256": "a5a73937b3d995980680274358e53d18507b726ef7bf76381c4f7248f194081a",
+        "count": 1
+      },
+      {
+        "sha256": "d7cdf8e8fa660126e12e1faab46c47158110333aa1021e5276dbc39cd390b603",
+        "count": 1
+      },
+      {
+        "sha256": "8a22728573a86efaa96d522309789a0e2a85f2d59b71c2aa91da6c9fc08f85b7",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/worker-runtime/src/main.rs",
+    "kind": "saved_data",
+    "reason": "read_runtime_auth_fileが旧issuer enrollment TOMLを識別し、原文をarchived_legacy_issuersへ保存してrevokedなtrustへdurably変換するkeyとfixture。削除すると既存auth storeを読むか、旧issuerの原文保持・自動再承認禁止の検証が壊れる。",
+    "lines": [
+      {
+        "sha256": "9709bec9500027b885d3d43edf626f896c2d1623b36bc851cc5df309473082ef",
+        "count": 1
+      },
+      {
+        "sha256": "1da94bf8dcdd38aea77361276331f795c820dd8bcaee492410ba92d6023c05a5",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/worker-runtime/src/working_directory.rs",
+    "kind": "saved_data",
+    "reason": "FrozenEvidenceReadが旧SSH evidenceのkey存在を使ってrepository_access_requiredを必ず立てるためのrenameとfixture。削除すると既存materializationがSSH evidenceを無視してfresh access無しでsessionを開く回帰を検出できない。旧counterはkey identityでもlive authorityでもない。任意unknown-field normalizationの旧名fixtureは承認対象外。",
+    "lines": [
+      {
+        "sha256": "fd6f43942d27a6fa2c7c26002d723e1c27da23d0d25c78fa9e13b500bc4f0118",
+        "count": 1
+      },
+      {
+        "sha256": "4fe12d081ab4c6aeed50a51aa90b543f7d5ba72f15f64126f6aa2367c77d9993",
+        "count": 1
+      },
+      {
+        "sha256": "4fa68e5b0d78bdf4e7514850d7d0f4ccf12c6f8a59aeff360b092f176f7ef526",
+        "count": 1
+      },
+      {
+        "sha256": "f5ef6820fbb7fc871b1a9fc9f532ef2ad314decb35938fe39baa35e07369d175",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/worker-runtime/src/workspace_issuer.rs",
+    "kind": "saved_data",
+    "reason": "LegacyWorkspaceIssuerTrustRecord/LegacyVerificationDocumentの保存済みenrollment・verification keyとfixture。旧trustをrevokedへ移行し、旧verification bytesをarchiveするがlive recordsを空にするconsumerがある。削除すると既存記録を読めないか、旧capabilityを再承認なしに復活させない移行検証を失う。",
+    "lines": [
+      {
+        "sha256": "56e399dc4e828e66677d4ad09b4c66a9c09658322b3886a06b4ae688c63dfc84",
+        "count": 1
+      },
+      {
+        "sha256": "ea16c387d0048571bd0a5576f1358af32acf63f8ee5ebe08c262da83c5a04d88",
+        "count": 1
+      },
+      {
+        "sha256": "bfd48831eb694b879a2859d42dba00fe74a4a817177acc61a44795cbd19b1056",
+        "count": 1
+      },
+      {
+        "sha256": "94af0abdfb45c712e9cd1949ac6a15d1a21c3b271f004c9282f81b5fd5ae4f5d",
+        "count": 1
+      },
+      {
+        "sha256": "d099e3a7216349c0ef30026967b8fe344e3b08b58a77bad6437468502b56bf71",
+        "count": 1
+      },
+      {
+        "sha256": "bed791d41faa85b38602c238d30460681e6d9ebbe56c4c08b843dd1971a589b2",
+        "count": 1
+      },
+      {
+        "sha256": "ce36822c65f785f330e42b7d37241062d994dc4e1c18abaa327b7996da5b6521",
+        "count": 1
+      },
+      {
+        "sha256": "5f4aed5ed50f2bbf54bbb9293948c3294eb2d30086d0fbe7cb07899efb5c96ba",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-drive/src/migrations.rs",
+    "kind": "rejection_test",
+    "reason": "移行後・現行出力から旧key/column/tableが消失したことを具体的な綴りで検証する負のassertion。削除すると旧名の再出力/残存を検出できなくなる。関連する保存境界: Drive::registerのschema 1..3旧node列・receipt JSONと、matches_legacy_replayのpre-cutover typed serialization key。actor/payload全体の元fingerprintはfield綴り・順序・decimal string込みなので変更不能。保存済みblob/deletion result・request_status・同一request replayを失わず、live node CASには旧counterを使わない移行/fixtureに限定する。",
+    "lines": [
+      {
+        "sha256": "280c5eb3d4fcec6360653c3347f14d7a5753ade824ebf3f687c26f7c0fbb403b",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-drive/src/migrations.rs",
+    "kind": "saved_data",
+    "reason": "Drive::registerのschema 1..3旧node列・receipt JSONと、matches_legacy_replayのpre-cutover typed serialization key。actor/payload全体の元fingerprintはfield綴り・順序・decimal string込みなので変更不能。保存済みblob/deletion result・request_status・同一request replayを失わず、live node CASには旧counterを使わない移行/fixtureに限定する。",
+    "lines": [
+      {
+        "sha256": "7aecfb51a37d21c8203ebd0d672839bf2e13b4a303f47bb6b7267794dfc886d3",
+        "count": 1
+      },
+      {
+        "sha256": "2be5a8b7dad838014cf460f9b1d9183a5cde7bdcf90217f2e36fb8d4406cf808",
+        "count": 1
+      },
+      {
+        "sha256": "9dc8e4e9a87ab0e3079f181d4384ed13a1ebe47f1c4b426a7bbbac118dcc4020",
+        "count": 1
+      },
+      {
+        "sha256": "4d7b2f7184c36b2ae51f9bb6bc2b43067cccb93df2b0a3494e92aa18dbe1cf86",
+        "count": 1
+      },
+      {
+        "sha256": "97be6f18534df4cd8b59acccc051ba461245deeab4e80c601d75ced613587830",
+        "count": 1
+      },
+      {
+        "sha256": "799ae6c3205366b580a6df511657bb0c5dfbd85515a77aa12585b007419e7d21",
+        "count": 1
+      },
+      {
+        "sha256": "6fa43834f63b7af3157ff18eb4ded16c8fc5970dc46db30d2585c4b227b9f8bd",
+        "count": 1
+      },
+      {
+        "sha256": "487b08b4e378baffe0a20946c59fc1b4c66d79e85720809b7bde737d9d43e0f8",
+        "count": 1
+      },
+      {
+        "sha256": "f49d7aaa1f8ab6e1b2177b0ca5714049124b20f026cb28d902e3b03b3cb3b192",
+        "count": 1
+      },
+      {
+        "sha256": "c01d2954d66dc3772e7099f43ed53ebb4a5e4c687744358bf7a23f5fc4409475",
+        "count": 3
+      },
+      {
+        "sha256": "7beca5582e5896612b580e094e966410086eef5c5b21c06393deb80ee5e01c4b",
+        "count": 1
+      },
+      {
+        "sha256": "98bebc15fa006d467ff78761d113c60a9c6b45e3cdfbc23ad9c3cef783ddf88e",
+        "count": 1
+      },
+      {
+        "sha256": "da9f42a8350fbdda2397135e280c172b1795eadb93559b2e4341f40c3b41e64d",
+        "count": 1
+      },
+      {
+        "sha256": "8d97c8eb4b9b254e2dff76e77129a11e5032970e4084a6ade391c7c785171ce8",
+        "count": 1
+      },
+      {
+        "sha256": "bb71b541ab42da958c1f1e4a1eecffb3bd2804d56431722f9051f494d60f43e5",
+        "count": 1
+      },
+      {
+        "sha256": "fb11ae85237de2308262a9e2008022c98d35662a61d1350e1aaaa0d984e107b1",
+        "count": 1
+      },
+      {
+        "sha256": "d7f2368d7fff552b539242e53e0a5fb76511ea8613a10b357527df43a58b803c",
+        "count": 1
+      },
+      {
+        "sha256": "ddd3eed2cb34bf550b0583ed1cbf321afa026665fe73fb3af9a18dc0264f421b",
+        "count": 1
+      },
+      {
+        "sha256": "843b0f4eeb69d6b16b92701f6927d3fba831343314341b3c5570f6466bb8266a",
+        "count": 1
+      },
+      {
+        "sha256": "9a4c2e2ddbfced4fc95c88a1b5e3f46a46ab96441a0b94909c3783f519b8aa99",
+        "count": 1
+      },
+      {
+        "sha256": "748d815cbb47ed37dea132e7657fcb9a8f3002dd5f050261578354acfe1d262b",
+        "count": 1
+      },
+      {
+        "sha256": "5fd04443f2b03ba3826735bef99cafc7be7624e1b78043d8d9fcd4949902c916",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/frozen_content_state_migration.rs",
+    "kind": "saved_data",
+    "reason": "schema 85から86への旧config history/Memory/reservation/Job列とJSON key、および実在したCHECK句。既存config評価provenanceとFK/constraint、language、Job結果/cleanupを保持しながら新content契約へ移すconsumer。旧DDLを任意置換すると既存DBを開けず、追加constraintや未確定Jobの安全な失効を損なう。",
+    "lines": [
+      {
+        "sha256": "0a419ed7e40d38ac8cf7c49ee2238fc92a469499aacec6e4b26045e5a2eb9f84",
+        "count": 1
+      },
+      {
+        "sha256": "6d41393ee6a57abaf20a861ab83832ae0fc1d3b1119f499c557ee7d1795df655",
+        "count": 1
+      },
+      {
+        "sha256": "52c965431aaa4499e603bffbac286747d8ad6b88db596494b3bbd40fee00c33d",
+        "count": 1
+      },
+      {
+        "sha256": "b230ab364be3cd794f1a84188e54a20aa1a1b2be70dde948971e327dc4af3de5",
+        "count": 1
+      },
+      {
+        "sha256": "8c9d03c26d103840737d723f7be92eecb02a04eb868bc7c7882684f2ae21e8f5",
+        "count": 1
+      },
+      {
+        "sha256": "784b16a1adf7a2304e91d0adc9338f9145241775aa6787ac8719a2869574ece0",
+        "count": 1
+      },
+      {
+        "sha256": "70ffe9e4da6367bce90f54fbb2c9444298cf25187a2ebdacb103fb08a6e111ac",
+        "count": 1
+      },
+      {
+        "sha256": "b494acebce40eacc29412386dc5263861f9e5557d98fbcc1b6d7dc91b9b06e30",
+        "count": 1
+      },
+      {
+        "sha256": "7fd1848c94fb89b6137de5c3256c9c0c32f4e36f7bbd641bb23becdc2fb983e0",
+        "count": 1
+      },
+      {
+        "sha256": "b0fe075b83cf002cd547b7420c45f0aa92ee7b60252468448ccca647852d395c",
+        "count": 1
+      },
+      {
+        "sha256": "869701cd7b0975f2837f6d9e61fddd0c9b6da36b0250cd77653aee9ca6343c01",
+        "count": 1
+      },
+      {
+        "sha256": "c1d44bc9022b1cf7a03f750fec939849f07184d6d695257d6b78876b19fe3807",
+        "count": 1
+      },
+      {
+        "sha256": "48359a7475d203d6bbc5964d765baae50fe0475b4cd22735f9e87fc83bfe418f",
+        "count": 1
+      },
+      {
+        "sha256": "1f0a5b4cf38de0c02a057437d710904ba1a1295c03c93575e33e55e2e971dcb7",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/frozen_content_state_tests.rs",
+    "kind": "rejection_test",
+    "reason": "移行成功後の旧config history table・Memory/reservation列の消失を検証する。共通のtrim行は成功後の旧reservation列消失3箇所と移行失敗rollback後の旧列保持1箇所で合計4回使用するため、一つのhash/countに束ねる。削除すると旧名の残存か失敗時のデータ保持違反を検出できなくなる。fixture投入SQLそのものはsaved_dataの別rule。",
+    "lines": [
+      {
+        "sha256": "78ed8457dcb80799f2b147acb7c28f3418e9b004ccd1fdeaba5a4f8a0d75ae79",
+        "count": 4
+      },
+      {
+        "sha256": "9ca76066ca5c617b36529a3e49a03b8e5642913548519c9f367d477200149e71",
+        "count": 1
+      },
+      {
+        "sha256": "7cd1fb7e3506840602f1e8bac503429a8d278fd3847ef2e8ce52721c872a058b",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/frozen_content_state_tests.rs",
+    "kind": "saved_data",
+    "reason": "legacy_content_databaseのschema-85/歴史的reservation CHECK/Job fixtureと成功・rollback検証。実在した旧列・history tableへのSQLで、評価provenance、言語、FK/独自制約、Job receipt/cleanupの保持を証明する。旧SQLを現行名に置換すると本物の移行を検証しなくなる。ローカル変数名は承認しない。",
+    "lines": [
+      {
+        "sha256": "84a2b10f5704cacc2ba8f66d5c19bc06de4be928cf3fadb07a267121b07ae1b4",
+        "count": 1
+      },
+      {
+        "sha256": "b3872190a49a0abe3c5e6775ead9ef3e49a6e27f3878c4322c63024a6666311b",
+        "count": 1
+      },
+      {
+        "sha256": "517220f3c4b1fb8cc19a5f2f7e2999397f8a64c76cb7ec5c1c05db0e9ffcde91",
+        "count": 1
+      },
+      {
+        "sha256": "349c4083e977573516cb47bbd28da863c543c747c2f98459f77138f6bebb1404",
+        "count": 1
+      },
+      {
+        "sha256": "c98c143de4c6a1aaf685aba1cf0b76e6149c835b8bc7558119842ae0b2bc319d",
+        "count": 1
+      },
+      {
+        "sha256": "c451b6dc8faf17f023ae3377ecd22f572cc455c4c038f94bde77eee55c7a20b8",
+        "count": 1
+      },
+      {
+        "sha256": "b8a27e915c1b047ad48a9a52b3ad151861cb5e60abbad3ce20911d78bd784be0",
+        "count": 1
+      },
+      {
+        "sha256": "b31c9b0b8005479afe039cb3848bfafe7154c02b25112e573fdc32ed056be9b4",
+        "count": 1
+      },
+      {
+        "sha256": "c992210b40f6b0880dcd7c81221d31f38e2a0d478676a4e871887d421ad293ca",
+        "count": 1
+      },
+      {
+        "sha256": "48359a7475d203d6bbc5964d765baae50fe0475b4cd22735f9e87fc83bfe418f",
+        "count": 1
+      },
+      {
+        "sha256": "cf0038fa42b01492373824c612bf36d0ee853dadff7ad6739639d1badcde00cc",
+        "count": 1
+      },
+      {
+        "sha256": "5b26c004c724dbfe2ed4bb02ac31ebfdd802d8fafd5609d57bb49430c6838e2d",
+        "count": 1
+      },
+      {
+        "sha256": "cf7c43c092d1999ec7bada7d525309f3bedc883bed60fc36b07bd81411744294",
+        "count": 1
+      },
+      {
+        "sha256": "374e26146eb7dddcd4f174aaa27d19f274aeedc3b4cc0ba020f395c0d30dc0b4",
+        "count": 1
+      },
+      {
+        "sha256": "8ac4fd694ab95064ecff9d611d9cf8a5086691e5c8c3699ddd88ac0f57042414",
+        "count": 1
+      },
+      {
+        "sha256": "8c7451c92bc8b816e56633614bc046e7ffe9d5f28736ab1f7f4f50c5f1189661",
+        "count": 1
+      },
+      {
+        "sha256": "fbd5cc28857a27f4d8adc7ecdabdf51174067cb1ed675fb363e2121b22cbe326",
+        "count": 1
+      },
+      {
+        "sha256": "0c08edc6ed33a35ecfe27252f0f2380f97c0f912cdada13c7abd85bc27319f9d",
+        "count": 2
+      },
+      {
+        "sha256": "f2530e2a4d831c23f9804044553770cb6532a066b225c026cd4c1f6c8dba1810",
+        "count": 1
+      },
+      {
+        "sha256": "b3990dea33d6c0deb4dd2c98a53074c4d8ff739d86645cb5b903c0a7544070bc",
+        "count": 1
+      },
+      {
+        "sha256": "697bbac33d1cce1a0684f4ffac80f178e2c555d89dcb9083a0df344ba7c87990",
+        "count": 2
+      },
+      {
+        "sha256": "c350fcc80c30db06ae8f8da64fb6062ff6e19e3f3462b1ba72a9e28554c0a33f",
+        "count": 1
+      },
+      {
+        "sha256": "7192c80c7b19816ba6c22356ffc6865938bccb5f676507cd159bcf151a11f9bd",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/frozen_flow_content_migration.rs",
+    "kind": "saved_data",
+    "reason": "schema 84から85への旧Flow source/history列・table。元source digestと保存済みcompiled definitionを検証して内容identityへ変換し、再compileせず履歴を保持する。綴りを消すと既存Flow DBが読めず、過去definitionの意味を失う。",
+    "lines": [
+      {
+        "sha256": "37a0315ef387422ee62e1b2fa5f1a1fbd0e7e42014bb5ae7e81995dcb35a530b",
+        "count": 1
+      },
+      {
+        "sha256": "65e322294908a20e2fb2647a1c014f0cb6c736f66076642982f80314df58d6af",
+        "count": 1
+      },
+      {
+        "sha256": "8cfe9a56a054ab9e4e339ad274e61bf1faf5327695cb14ec53e6fecdd4e483c9",
+        "count": 1
+      },
+      {
+        "sha256": "a690d894a299fd5a79c074361f2ecd7c013e36f4ce8a263099266ea0b2720450",
+        "count": 1
+      },
+      {
+        "sha256": "9c24460ba6885edbc9896326dcac39f064e0768e10980db8f2b03798ece9d642",
+        "count": 1
+      },
+      {
+        "sha256": "156637b0842538569f031ed7c476a23585458ae7e7edd3da40b4f6eadb816832",
+        "count": 1
+      },
+      {
+        "sha256": "282bf6b865f78d5ae98b57326a05b5ef9cce3b5c33ef44fa2251d6af278a6afb",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/frozen_flow_content_tests.rs",
+    "kind": "rejection_test",
+    "reason": "移行後・現行出力から旧key/column/tableが消失したことを具体的な綴りで検証する負のassertion。削除すると旧名の再出力/残存を検出できなくなる。関連する保存境界: legacy_flow_databaseが旧source/historyを作るSQLと、保存済みdefinition・rollback確認SQL。compiler変更後も実在した旧履歴を再compileせず保持し、不整合時に旧DBを原状保持する検証。ローカル変数名は保存データと無関係なので承認しない。",
+    "lines": [
+      {
+        "sha256": "f9b267228d51e8314a384d05d28eb27574b8b62ef86f6539d77453692a4ceb93",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/frozen_flow_content_tests.rs",
+    "kind": "saved_data",
+    "reason": "legacy_flow_databaseが旧source/historyを作るSQLと、保存済みdefinition・rollback確認SQL。compiler変更後も実在した旧履歴を再compileせず保持し、不整合時に旧DBを原状保持する検証。ローカル変数名は保存データと無関係なので承認しない。",
+    "lines": [
+      {
+        "sha256": "d4267c846f643567c9817616d85ec0aa52e2c82fdc779fa8afaa9d261ed1e388",
+        "count": 1
+      },
+      {
+        "sha256": "8b529cbf9e2e58d4693f556910e2470969b0d5d3891c938f55b4972843330803",
+        "count": 1
+      },
+      {
+        "sha256": "eb701565f75aff75fac860b7481148c364446cdec4e1d97930ea74dbfd7b89d6",
+        "count": 1
+      },
+      {
+        "sha256": "26bcf7da66fec7cf066c6379e406aed25bb8eae32d01dc54d2456b7300cd7be9",
+        "count": 1
+      },
+      {
+        "sha256": "50660f1b721341901121f0bdf70c05fe454592429d9a691d6954acc83d8dd5e6",
+        "count": 1
+      },
+      {
+        "sha256": "b10583baa394ca694e5c4c2c51d79c58ee8461aa9907b3054afef2f2716f7027",
+        "count": 1
+      },
+      {
+        "sha256": "efd0cf6947c01ccea8323edb4c37483f1729a73d88462a13a7356d4cda228d07",
+        "count": 1
+      },
+      {
+        "sha256": "4e276b26f542cb0f2871638b15e756d570bdfe5ae1998b5aa3c62dbffa418735",
+        "count": 1
+      },
+      {
+        "sha256": "f0fcfbeb48ac3747428e3d37940c523fda70ee61f645b23de7a47d7ed0a65859",
+        "count": 1
+      },
+      {
+        "sha256": "903d8aeedf333fb3544708c9ca845b72a3c52292d1a3d4092c3bbc766ba26f03",
+        "count": 2
+      },
+      {
+        "sha256": "28d6d00549f2296aa4a37da1d03677f53f34a6e608d602cff1745117a243986d",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/frozen_legacy_migrations.rs",
+    "kind": "saved_data",
+    "reason": "store.rsのMIGRATIONSが既存schema 50..84 DBを順に移行するfrozen SQL。旧column/table/index/FK名は投入済み旧schemaに一致し、後続content・SSH key・binding cutoverの入力になる。消すとretained versionからのupgrade chain、Job/reservation、SSH retention、binding/audit履歴の保持が壊れる。現行latest_schemaの定義ではない。",
+    "lines": [
+      {
+        "sha256": "1d670129ea61b5ea4ef0e4da9ae7be90ddcbc98415847d4e54c071d8f57a660a",
+        "count": 1
+      },
+      {
+        "sha256": "5bdf53adf2183def9a44f31ff09eac335e3bdb9644c352e96d8721b9196923f6",
+        "count": 2
+      },
+      {
+        "sha256": "13305075edd2c979164ef976902d1ccecb7a8f4c55e32f9edea53387799f76d0",
+        "count": 2
+      },
+      {
+        "sha256": "4c0efa2442009257a9ba47581868d57d59fafa68d16121c83a9f4ea53b49a2df",
+        "count": 1
+      },
+      {
+        "sha256": "cbce4bab74e1125a910764375a27983814d0bb1d4c066835a546b82c2fce318c",
+        "count": 1
+      },
+      {
+        "sha256": "83de28233408d4dcaa91ceab082e2db7b857a6b29bfe86e2d0126461657c846c",
+        "count": 1
+      },
+      {
+        "sha256": "d5c05fb43b325cd6602344ae13be1c6fc208841ec92e982c88cadf7dbe1c7aee",
+        "count": 1
+      },
+      {
+        "sha256": "6af31648cd0b249d74d5dfb143f62fb55c5a6790022c455706a0e03128c0c8a5",
+        "count": 1
+      },
+      {
+        "sha256": "3387c61794eafb0666b3d635b1e51562cf43e048b2a3c2ab551c3f60c3ae9687",
+        "count": 1
+      },
+      {
+        "sha256": "b6cf61c11bf278355e0dfc66219abdefd64c29621883836875221b8cd9ede2ef",
+        "count": 1
+      },
+      {
+        "sha256": "4c0ac49313881803b75dd94d847b41845da3637d37245becbd4e7f205b8a9255",
+        "count": 1
+      },
+      {
+        "sha256": "7fafaedcd53827ec04b1d5b2c8be7415d91e84549af55dbdef264ec76f528cab",
+        "count": 1
+      },
+      {
+        "sha256": "14167f46caa13763193ee2e17a07d48d61035b1f8567bd300818dc810eefdf48",
+        "count": 1
+      },
+      {
+        "sha256": "1e4e225a217adf9e3fff1451a11fcfa83ebbee4f6a1d9641378dbe2eb5c0eeb3",
+        "count": 3
+      },
+      {
+        "sha256": "5b18fe230a31a55b5ac1053f9056a8cc6812f918e10d4baa86a719f344dc618c",
+        "count": 3
+      },
+      {
+        "sha256": "95f172e8946c24dfbf4670006f56aed62ece902e3177d7f4dd602bb2949625e7",
+        "count": 1
+      },
+      {
+        "sha256": "d6285c57719b6a136aa393a4742918bbef97b2d19c7ba9218f33122e5f5aa85f",
+        "count": 1
+      },
+      {
+        "sha256": "09961c87f0c14a0f21486ab86ae17d7067ac2308b99c61d2ef9084bb8af200b4",
+        "count": 3
+      },
+      {
+        "sha256": "c22bd9dd606eff6de7bb8b4ceb3891a45295e57e0f8437448b65abc691b08837",
+        "count": 1
+      },
+      {
+        "sha256": "2ea5dbdeea039958b7048994a21f4f981eb0d1c5bd6085fe2310639ddca79bd6",
+        "count": 1
+      },
+      {
+        "sha256": "22c91e2bbd5adca75ae55d3f204e6724d6573610aaf0e181295310aa082bd384",
+        "count": 1
+      },
+      {
+        "sha256": "699132813295c9855958ed2dccceafab661a2a948e8dacd50d9837daf2d7e983",
+        "count": 1
+      },
+      {
+        "sha256": "1a52753288a74f60309d6e31fd22298547961c7d90c10f8e18f83f3a77b50aa8",
+        "count": 1
+      },
+      {
+        "sha256": "9315bb8b7f04e016a55a6e66aa45b64531130e8450cd2b4d342218aa87936176",
+        "count": 1
+      },
+      {
+        "sha256": "762a7ad6693e20ce7649d8c713d118539bcdc080d49909cb813fb12b724695ff",
+        "count": 1
+      },
+      {
+        "sha256": "04b8eefb961ceca200de40764f913dfaac4f3c751b439b8309d282c7a87890e1",
+        "count": 1
+      },
+      {
+        "sha256": "76d6931874a606a551bf1ea071cd61fbe72f6fcc0b4b83a68645cff6e2ae84e1",
+        "count": 1
+      },
+      {
+        "sha256": "21fc7b45772630b55972294bcae08c63fad1723e6413fe9b09d95ca9216b9baf",
+        "count": 1
+      },
+      {
+        "sha256": "b80515c50a007075bcde4268cd5362d4f03e8e1b768b3f5d7d9400b408252de1",
+        "count": 3
+      },
+      {
+        "sha256": "9873ec338873990d85f0c69285e626113a550cc55b6f4a8ddf753fb7185261b0",
+        "count": 1
+      },
+      {
+        "sha256": "427469b8b3e7840cadfb1a97f539b2c75660f131375cedeed00ac42ef071a7f1",
+        "count": 1
+      },
+      {
+        "sha256": "afd15214fdd8b86d5c0f6feabf6a4f6a890afcf04cf3f03bbdac32dadfbac749",
+        "count": 1
+      },
+      {
+        "sha256": "fa4806ac18201dc5ab2f257c4083f208c07c2cc519041a1313afce3f97d1ae5f",
+        "count": 1
+      },
+      {
+        "sha256": "68e09fe0ac794e1a4c0566c2d5271b01a1bb914ed5a458c84039b9fda190f7bf",
+        "count": 1
+      },
+      {
+        "sha256": "8e4824ebd2f8e0191ac757aad0ec483fd100c9b14b9c98a02003f4a73f034df2",
+        "count": 1
+      },
+      {
+        "sha256": "56a8591983c44127575b19cf5036a0fc41d375a9013351e7baa8f185b36ff9bd",
+        "count": 1
+      },
+      {
+        "sha256": "4b6cf0ac319dac976c1e101486315b1176ca2de0189941c2f01636651fad0c55",
+        "count": 1
+      },
+      {
+        "sha256": "e11c9337adf209a59a7de01e6fe48a4c2103dcb190235fe20547f02dc41de94f",
+        "count": 1
+      },
+      {
+        "sha256": "da34d8146a8213980633d0faafcc73b6ba6d934e614f7c475db45445b0b122d1",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/frozen_repository_key_migration.rs",
+    "kind": "saved_data",
+    "reason": "schema 86から87の旧SSH key/secret/operation/retention/source列名。旧secret AADと暗号化payloadを開き新key identityへresealし、元operation fingerprint・retention・auditを対応付けるconsumerがある。削除すると既存秘密鍵を復号できず、SSH retry/retentionやauditを失う。曖昧な対応はrollbackし原文archiveを保持する。",
+    "lines": [
+      {
+        "sha256": "95284617f203ea22df2ba1fe49903db531a0dd68dbf8654981505516a07dfcce",
+        "count": 3
+      },
+      {
+        "sha256": "62ef848caa92101e5d51b885c78edd1449617a6d2a2765bc25baf9a34475002b",
+        "count": 3
+      },
+      {
+        "sha256": "196005be206e6f21f3ab1c19a187d85d82de45f0e45710c4e3894ffaa5dfb4ce",
+        "count": 1
+      },
+      {
+        "sha256": "87a8b267ec5d0d1f0bda8a5c6fc8b78808dabdcc10444b947a5e811a9388c37b",
+        "count": 1
+      },
+      {
+        "sha256": "a73c9b9f90f3bf0b514d3c19ef5aedfd1c232fd20db16b7132738a20d6004939",
+        "count": 1
+      },
+      {
+        "sha256": "052ece41bdf100b1949c629b51c8ace6d0fae53df33ad48bf5c930df5cb6cc9d",
+        "count": 1
+      },
+      {
+        "sha256": "e095d3724c151ba99e860558dd834f9b3e1aea400882670240997b49141473a9",
+        "count": 1
+      },
+      {
+        "sha256": "82f0618b3d0faf95927ea8f0b1e8ca4ea81c8638bbea6f3ca06dc836b3582018",
+        "count": 1
+      },
+      {
+        "sha256": "5d8ac6dffcd0146f53adbc3b4cf20c198dbdbab8e2ce4d381400085cf36d44ed",
+        "count": 1
+      },
+      {
+        "sha256": "da0e88b3a157465b924076143bc4b924324d8e4ebb84fe8408efbca868724b5d",
+        "count": 1
+      },
+      {
+        "sha256": "b24b0439e7d718b772cc11c46570ae4dd3f67aa878119ddfe7d8e79dc8239a20",
+        "count": 1
+      },
+      {
+        "sha256": "0bb8732a39df8acb7f63a8be5e4abbaf4f40b18297afecf02021377d058082ac",
+        "count": 1
+      },
+      {
+        "sha256": "b36de8d8455b3774fd2cf0730f06732075ec9732761c1a8792d5e4d066606a0d",
+        "count": 2
+      },
+      {
+        "sha256": "900d76b744bb316196326261bd42f9c80593035d52b423be51e3d68cc4cf2cff",
+        "count": 1
+      },
+      {
+        "sha256": "338850a9bfecff4b022425c9ae72825ab783a5c2ea413a655cf889018069b19c",
+        "count": 1
+      },
+      {
+        "sha256": "36110ee72fd1410ee7f477ae5233e900dfdf85a826925ce2a6b0c2975161967c",
+        "count": 1
+      },
+      {
+        "sha256": "786969a32f56a53d4af226b0b01be353bb55fedf0ce2a1a72633abfd23f10fe3",
+        "count": 1
+      },
+      {
+        "sha256": "5b34bd84600fed51846e6790eb84d50839c97e4a8b4db84750a952e7866b4d30",
+        "count": 1
+      },
+      {
+        "sha256": "dd7d9fcaf04ee29e42d3f5f8688ac9368a02756a9f1e78df3b16a73ab2e5e8f1",
+        "count": 1
+      },
+      {
+        "sha256": "35b50395095c8fe03e85ca1f26e6ece7aa8ef9015f76686d187d7338d44539f5",
+        "count": 1
+      },
+      {
+        "sha256": "5fdf5a0ea447257be21c71420dd1168303a377afc59418cca7c063125b1403ea",
+        "count": 1
+      },
+      {
+        "sha256": "4f5206406bd3263d41f5e16a914d8c9ff467c45bb7eb900089f955da01109316",
+        "count": 1
+      },
+      {
+        "sha256": "09c3565cb5d873b3e0ef80a354835665618aab8e1342656f8528d3364d2c0556",
+        "count": 1
+      },
+      {
+        "sha256": "7799fb1e28c774e846e4e830bb31df56f600d150d68d86b3e8f14a2ed8463aad",
+        "count": 1
+      },
+      {
+        "sha256": "d1829663286f049ee67715a1649f4af0205ce1a16486a68603febd144b1b7d3e",
+        "count": 1
+      },
+      {
+        "sha256": "302cbd2e9dbe3871a663a7aaeec1139d977108c5cc684353ec0888ecf74a044f",
+        "count": 1
+      },
+      {
+        "sha256": "8cf8692688205f6b268bccc193f2d8329565c67b8189a96a0d36400ea601cd78",
+        "count": 1
+      },
+      {
+        "sha256": "6f4968cf8c4e4da551b6fefb7c7fcf6048e867684189af3f9854e652d4331f3e",
+        "count": 1
+      },
+      {
+        "sha256": "1d9c89812a12ce4e7d3d9bc87231c76c077e38f69a9a8e22f11608494d0eb97c",
+        "count": 1
+      },
+      {
+        "sha256": "8948263f582419232838423d99d269c423dee4b21c8189d97fde3de97afc2104",
+        "count": 1
+      },
+      {
+        "sha256": "9b2d38cea48eaf100fdcd2444036da17a0a8104090b429e6c64e56255d45d9c0",
+        "count": 1
+      },
+      {
+        "sha256": "f8333763f67f3a40ae3e245f523e2b0dca6a7b6c1b42d5aa61273bcbf649c5f2",
+        "count": 1
+      },
+      {
+        "sha256": "26631275a8d296889f3ef0dd43f6038b23bbaf5e65886f28b3815854be9890b1",
+        "count": 1
+      },
+      {
+        "sha256": "f59825e59e5e4b4c9857915c0551b61428073e2024edd6e27cb109e10cd97b97",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/frozen_repository_key_schema.sql",
+    "kind": "saved_data",
+    "reason": "schema-87 cutoverが作成済みの旧legacy receipt counter列2行。schema-89 legacy_evidence_column_migrationが実在したこの保存列を改名する入力DDL。消すとschema 87/88既存DBとretained upgrade chainの整合性・元SSH操作fingerprintのreplay evidenceを失う。最終current schemaは具体的なlegacy counter名を使用する。",
+    "lines": [
+      {
+        "sha256": "4126d49032f3c39aa5f9965b585797efa1cc98d3839df08a16bbcfc232e0dc5b",
+        "count": 1
+      },
+      {
+        "sha256": "3dc5216d749d382221ef335bfe012b1bd1a2c58b36be8c60e7583671381a5bf1",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/frozen_repository_key_tests.rs",
+    "kind": "rejection_test",
+    "reason": "移行後・現行出力から旧key/column/tableが消失したことを具体的な綴りで検証する負のassertion。削除すると旧名の再出力/残存を検出できなくなる。関連する保存境界: legacy_repository_keysの旧SSH key/暗号secret/operation/retention/Workdir fixtureとrollback SQL。旧AADを本当に開いてresealし、元fingerprintでのreplay、retention、audit、不可逆な旧Workdirのarchiveを保持することを検証する。綴りを変えると既存secretの復号可能性と不整合rollbackの検証を失う。",
+    "lines": [
+      {
+        "sha256": "844ccca7b5306efc14510327930a38a22e957f043ca5a58bfcb1211b3c7819d0",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/frozen_repository_key_tests.rs",
+    "kind": "saved_data",
+    "reason": "legacy_repository_keysの旧SSH key/暗号secret/operation/retention/Workdir fixtureとrollback SQL。旧AADを本当に開いてresealし、元fingerprintでのreplay、retention、audit、不可逆な旧Workdirのarchiveを保持することを検証する。綴りを変えると既存secretの復号可能性と不整合rollbackの検証を失う。",
+    "lines": [
+      {
+        "sha256": "a62f153e1748caa20f7cb81656b8c6b29d32b01bf533a3ffaf36fb5be9a5ae3b",
+        "count": 1
+      },
+      {
+        "sha256": "de6b3a38afad3d08bc4bcb534c1374446ae59b28ed08235643fd61c3b42992fd",
+        "count": 1
+      },
+      {
+        "sha256": "7b82d25a130f540b608ce5f2e18d7e0a5ebba80486a8a9b701f45b19348acfc8",
+        "count": 1
+      },
+      {
+        "sha256": "e40c8ebda44bef3b5285be6937bb1d3264907044e8cbdb000557de1c5033cbf8",
+        "count": 1
+      },
+      {
+        "sha256": "78b1ca52067ac1cd03627a7efde38da5d89c463cd12a5118c27404500b28b0d2",
+        "count": 1
+      },
+      {
+        "sha256": "af41b9c5edf66189130020a79568cad6b86b56835935e06969d34a4cc0569e93",
+        "count": 1
+      },
+      {
+        "sha256": "9ec9ccf2b8e304c1cb1ef9b755a5cfe4d203879a9787394a9c6edca59c6fddca",
+        "count": 1
+      },
+      {
+        "sha256": "2e4c58e55d4b3043c9b48762ca6d58123cebc985736af8b518560833b618b675",
+        "count": 1
+      },
+      {
+        "sha256": "ca209d9c4fa92f98d6bf531ae2f83309c6916cee50b81dce2f8e73a60746b61a",
+        "count": 1
+      },
+      {
+        "sha256": "cbdf372850ccc0ec2e3e967a2fa9985f8dba62c711fd7a86aca9b8243bd166cc",
+        "count": 1
+      },
+      {
+        "sha256": "e2a097bb7eb84411dbb616f2928039dfbc863228cbdf0d81f8d5cc5c0b274a39",
+        "count": 1
+      },
+      {
+        "sha256": "7a909fc5eaf8121eeeee22d55808f8a0a5a27f0d33c4b606f9d586cb777e40f7",
+        "count": 1
+      },
+      {
+        "sha256": "e374241ea87cad8b2776eabf0685f5ff3952f411b06be4fd401df884789f3997",
+        "count": 1
+      },
+      {
+        "sha256": "76b4ffcfe57946f1099948aecf1fe89d9be2be86edef929b1b4af80e342e23c2",
+        "count": 1
+      },
+      {
+        "sha256": "887a03dea6a8ffcf9898b3e2fd2d0e7a873baa9bdef4f4f5a7bd3794bdf70930",
+        "count": 1
+      },
+      {
+        "sha256": "5ff35122a026eeff7fbabd6f0baab871f353d71661bc6eb973e26103bcec375c",
+        "count": 1
+      },
+      {
+        "sha256": "4293204365d78e56ed8b75221aecca5860068739b254bc83da956f66c7de126f",
+        "count": 1
+      },
+      {
+        "sha256": "b2495afb6d5b32f13e77eb7a7fa4866f12531d3ed059aa44288ccb69d0fa4e26",
+        "count": 1
+      },
+      {
+        "sha256": "4492c6d6d4434fa4f866261f243faafb4a2c6e6d7c6943bc72d749ed2357d58e",
+        "count": 1
+      },
+      {
+        "sha256": "4a4ea05d99ba512fbe0ecb7c31d176a08c59bb6e8b1156624bee907ad4dfc103",
+        "count": 1
+      },
+      {
+        "sha256": "ff1f9c06c6d8764dc1e7e60e384d394d63208336e6094ec1dceb31037731b04e",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/frozen_runtime_binding_migration.rs",
+    "kind": "saved_data",
+    "reason": "schema 87から88の旧binding/signing/provisioning/policy/removal列、歴史的existing-workspace operation key、旧index変換と移行postcondition。元鍵material・予約owner・completed receipt・policy contentとbinding対応を保持し、旧provisioning fingerprintを検証する。削除すると既存署名鍵/予約receiptを再利用できず、retention/removal履歴かmixed旧schema拒否を失う。単なる診断文は承認しない。",
+    "lines": [
+      {
+        "sha256": "47490ba8a96c01b6e1a316d667dcc5b504e11697770f55910ba478ae512e17a3",
+        "count": 1
+      },
+      {
+        "sha256": "e481815ee163b317b2ffb5a3f54cd26b6793c788dc9c250307e04737f14b0cde",
+        "count": 1
+      },
+      {
+        "sha256": "beadbcef395555b3c4ca3b73d53846d33de0a6fb3b6265f64df340bc4a69bd3a",
+        "count": 1
+      },
+      {
+        "sha256": "ae18c4b89c1aa214aff69647718e275fff4a4a1e3e268f9ab67b1e9784bd9f9f",
+        "count": 2
+      },
+      {
+        "sha256": "aba4dfa1f810920ee92a9024f21f6003f2ecd0c31f6f4ef89ade9e23f15cdac8",
+        "count": 1
+      },
+      {
+        "sha256": "22f7df3c22cf0e2c5419634532974abca088ab94c9f291f6369a2d0e0424709e",
+        "count": 2
+      },
+      {
+        "sha256": "5c02f21d72146fb9aaa7d3e710627f46cf1ebf70ab17ffc14c41e4e42119b6c4",
+        "count": 1
+      },
+      {
+        "sha256": "7eda139936b6f0dd04981ce1e7e49d508965a50744ec56942f296ed9eb5fe7b8",
+        "count": 4
+      },
+      {
+        "sha256": "26b8cf27100d8b07d45a13bda2d76e4da4167fa2e2928fc57704bf5ec1a7b1ce",
+        "count": 1
+      },
+      {
+        "sha256": "b40db8d9b2b98d628ff8080b3a52da09da725bdea95cf75f1de415483c843890",
+        "count": 1
+      },
+      {
+        "sha256": "246a632a6e1a981f7b20f3475ac8ada00b3b67c12219c746afe9af5e7291d664",
+        "count": 1
+      },
+      {
+        "sha256": "76a0ab871227a8c7f56806f764c58bbbbc105ffcaff8531fc060b61b9df1087b",
+        "count": 1
+      },
+      {
+        "sha256": "bc6acd2a01dfbd2a9ea0b678ca1828d7f247484d1b2b1ea34100e543ff359c22",
+        "count": 1
+      },
+      {
+        "sha256": "186f1c6eb7b2b87121c8988be4385a13b6dfa9863343668f4bf7ced7be85c659",
+        "count": 1
+      },
+      {
+        "sha256": "f329951dfca0cfd266b55dcd1790c97b5c4cdc6425862220812ba41d124b2cee",
+        "count": 1
+      },
+      {
+        "sha256": "4154334813ad850dcce125e5b7e41a27309bee5b4a2a440c4eed9bfc484cb534",
+        "count": 1
+      },
+      {
+        "sha256": "b99a045c5960a52a5e37880f04c26dfbd0dd48e231679906560c99d3d7656174",
+        "count": 1
+      },
+      {
+        "sha256": "c20d51c77aafd4deecf5f3f0d9282cd1ea22f0b9593c1a79f37652331723ffa8",
+        "count": 1
+      },
+      {
+        "sha256": "886f2dbc219514fc1a1e9144499003a61ba2bc0ff0359a987848935c60eb0ce4",
+        "count": 1
+      },
+      {
+        "sha256": "98ec9d7c4c7dc52fc6975df54883916091a0ca3f2e6843e74c143ed4455b0b8f",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/frozen_runtime_binding_tests.rs",
+    "kind": "saved_data",
+    "reason": "schema-87 binding/signing/retention/provisioning fixtureとrollback確認。元private material・historical provisioning operation key/fingerprint・完了receipt・binding/policyの対応を保持する検証で、旧列/keyを任意語に変えると旧DBの実データを通る保証とinvalid receipt時の原状保持を失う。",
+    "lines": [
+      {
+        "sha256": "2778ef022a505aa159010d0aff7011daf7e74b9048435ef53b529bd472e9c5f2",
+        "count": 1
+      },
+      {
+        "sha256": "84cfa725c61bcb6a725632bb6d9832be9e822cd9f5a7622cd75365ff13df4e0d",
+        "count": 1
+      },
+      {
+        "sha256": "ae0ddbb9e0e640aad99ea7da7c71d98fa84dbef5c9ccf28079c5c1e53f91a24d",
+        "count": 1
+      },
+      {
+        "sha256": "de902791b0eff241b2856d511ad7aad3e3c4ccdfa220266c554351e9caa1c6de",
+        "count": 1
+      },
+      {
+        "sha256": "7ba61cebc84db2b9d735ad7abb93a9f9451d309f8be1f3a7817d849d5fbf51a6",
+        "count": 1
+      },
+      {
+        "sha256": "56ae4fd1efb8448d14a2dfcfbd16d876ca212dd5e8f80630e4a52c4725c68364",
+        "count": 1
+      },
+      {
+        "sha256": "20b7128d3726c445a5d03ef6902ee232643b7884316fdc399a7d8db3c03e57cc",
+        "count": 1
+      },
+      {
+        "sha256": "9a89c16bfd87af5b15605db20226de54b261482a73a7b0609efa5c3e95dbe39a",
+        "count": 1
+      },
+      {
+        "sha256": "5d0e90538d1694cea2d1dc01c9df632e457baa0398e3fc2360fd029b1ebdbcd7",
+        "count": 1
+      },
+      {
+        "sha256": "6696c19535c04ec87f1ca3648d9bbfc9c10f3f6bb113d3474938f445e6d0c087",
+        "count": 1
+      },
+      {
+        "sha256": "9055bdf1c693bc537b33fd10345acacdf1384eb27c7643c94d7bc612a053ce73",
+        "count": 1
+      },
+      {
+        "sha256": "3d8b103d690cfba64a5a79948a3048c3309cdd88c9279b54cbb9b8e43c8190b9",
+        "count": 1
+      },
+      {
+        "sha256": "86ef2bc8aa0637ce55e8a030d71833e79209b74dc89bbc0a9ec7144fb3140e9c",
+        "count": 1
+      },
+      {
+        "sha256": "97c89dacec64e0da68c3a8eaee10f8cb470694f831e570e8a4dac5eccd47c9e9",
+        "count": 1
+      },
+      {
+        "sha256": "d4a057bb0019067f3ffab88f1b835c949df570e7f75e717c784bc3f1d4766895",
+        "count": 2
+      },
+      {
+        "sha256": "d3910a305b4accb75029b08ae34f5691ec97c722c06267ac998994091b27fb7a",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/frozen_schema_v85.sql",
+    "kind": "saved_data",
+    "reason": "create_frozen_schema_v85とprepare_retained_schema等のmigration testsが読む凍結schema。実際の旧列/PK/FK/INDEX/default policyを持つDBを作り、旧versionからlatestへupgradesとcanonical schema equivalenceを検証する。消すとfixtureが現行schemaになり、実在した旧DBへの互換性・data preservationを証明できなくなる。",
+    "lines": [
+      {
+        "sha256": "693d241ddfa319622435176fb7e90d1d75c5052ffb8f72fa81185e349b01499a",
+        "count": 1
+      },
+      {
+        "sha256": "36690eb724a0caee2f369ef4ea5807f6e2e54b826bf44e84599de14e2e20bef7",
+        "count": 1
+      },
+      {
+        "sha256": "09961c87f0c14a0f21486ab86ae17d7067ac2308b99c61d2ef9084bb8af200b4",
+        "count": 7
+      },
+      {
+        "sha256": "7bda5d7b0f84c834598135329e08ef42c7b14a2d85439580c64a7898bc05b5f4",
+        "count": 1
+      },
+      {
+        "sha256": "6a4ddc37708b139e19e303a6475c0567b4a3c29d2c2dcfa9e57dbd7ee7c9705c",
+        "count": 1
+      },
+      {
+        "sha256": "b66062c70153691dfb0732304d4470a04cf0cf966f5e93141626bd0b399816fc",
+        "count": 1
+      },
+      {
+        "sha256": "2dd882eccc49e69fd4b8fe007439e2484025b95cd0d21cefd4a4f26e97e635ab",
+        "count": 2
+      },
+      {
+        "sha256": "ce04bd741e26b92f959fd6e67cb7ad78bede071ce9d64a2c976eccad022178f5",
+        "count": 1
+      },
+      {
+        "sha256": "c32304e27f138a84e14154b735200d2e1b5e80a4135585ddd8179b6a843975d0",
+        "count": 1
+      },
+      {
+        "sha256": "576783f2d4c59046de213f2faae297e571270fbb055e5e9eb929dd8241dc23cf",
+        "count": 1
+      },
+      {
+        "sha256": "917d90ebdcbc335140511513da39dc4ad15a7b1a80c9a57013ab587d9444e7e9",
+        "count": 1
+      },
+      {
+        "sha256": "c8ca2642aee239c3b76301080498a8550da176ab6776d0cb3fd7923373bac64b",
+        "count": 1
+      },
+      {
+        "sha256": "2ea5dbdeea039958b7048994a21f4f981eb0d1c5bd6085fe2310639ddca79bd6",
+        "count": 1
+      },
+      {
+        "sha256": "1a52753288a74f60309d6e31fd22298547961c7d90c10f8e18f83f3a77b50aa8",
+        "count": 1
+      },
+      {
+        "sha256": "9315bb8b7f04e016a55a6e66aa45b64531130e8450cd2b4d342218aa87936176",
+        "count": 1
+      },
+      {
+        "sha256": "762a7ad6693e20ce7649d8c713d118539bcdc080d49909cb813fb12b724695ff",
+        "count": 1
+      },
+      {
+        "sha256": "d5c05fb43b325cd6602344ae13be1c6fc208841ec92e982c88cadf7dbe1c7aee",
+        "count": 1
+      },
+      {
+        "sha256": "6af31648cd0b249d74d5dfb143f62fb55c5a6790022c455706a0e03128c0c8a5",
+        "count": 1
+      },
+      {
+        "sha256": "3387c61794eafb0666b3d635b1e51562cf43e048b2a3c2ab551c3f60c3ae9687",
+        "count": 1
+      },
+      {
+        "sha256": "21fc7b45772630b55972294bcae08c63fad1723e6413fe9b09d95ca9216b9baf",
+        "count": 2
+      },
+      {
+        "sha256": "ce87e56cbe02ea1b7ca2194852488774f3fb08704b0241dbd9b871cae5072320",
+        "count": 1
+      },
+      {
+        "sha256": "afd15214fdd8b86d5c0f6feabf6a4f6a890afcf04cf3f03bbdac32dadfbac749",
+        "count": 1
+      },
+      {
+        "sha256": "fa4806ac18201dc5ab2f257c4083f208c07c2cc519041a1313afce3f97d1ae5f",
+        "count": 1
+      },
+      {
+        "sha256": "68e09fe0ac794e1a4c0566c2d5271b01a1bb914ed5a458c84039b9fda190f7bf",
+        "count": 1
+      },
+      {
+        "sha256": "8e4824ebd2f8e0191ac757aad0ec483fd100c9b14b9c98a02003f4a73f034df2",
+        "count": 1
+      },
+      {
+        "sha256": "56a8591983c44127575b19cf5036a0fc41d375a9013351e7baa8f185b36ff9bd",
+        "count": 1
+      },
+      {
+        "sha256": "4b6cf0ac319dac976c1e101486315b1176ca2de0189941c2f01636651fad0c55",
+        "count": 1
+      },
+      {
+        "sha256": "e11c9337adf209a59a7de01e6fe48a4c2103dcb190235fe20547f02dc41de94f",
+        "count": 1
+      },
+      {
+        "sha256": "da34d8146a8213980633d0faafcc73b6ba6d934e614f7c475db45445b0b122d1",
+        "count": 1
+      },
+      {
+        "sha256": "f105c6900b87409afce4d441d1fe31a54ccad660f0cabbdcf056e1b71dfba524",
+        "count": 1
+      },
+      {
+        "sha256": "a139b5f2bf73afd5afe83f52f7534ed66a95324bacff7baddd68bd336082354e",
+        "count": 1
+      },
+      {
+        "sha256": "b80515c50a007075bcde4268cd5362d4f03e8e1b768b3f5d7d9400b408252de1",
+        "count": 2
+      },
+      {
+        "sha256": "8803cc39ca81b9873833e1f9eb451b37fe2b4a9b48f1e47a68c317a87f013eaa",
+        "count": 1
+      },
+      {
+        "sha256": "935499fee2527ff3336dd4de5cc33a8b9f36c286f75fb96d94b9e7ed4050f4f4",
+        "count": 1
+      },
+      {
+        "sha256": "4f00de51edead8669dd93bd041570b208636a3d452f484846e825f1d9c1b39e8",
+        "count": 1
+      },
+      {
+        "sha256": "ca5bb19a46ab52ecb4a092584034818e7b78a35c42b6715bb0953911c9ba12be",
+        "count": 1
+      },
+      {
+        "sha256": "cd15c452b4911ea61fe955a03027a00c691cbabd052cb98eb23a453d16a68187",
+        "count": 1
+      },
+      {
+        "sha256": "d961bead14c98f33705dd7fd6056d68d1d701865c921f881a0080f3c08ea3f6a",
+        "count": 1
+      },
+      {
+        "sha256": "f0af9bf524d55a5fd4cba0a8562f3e4d5bd28f7357fc5595d6f2c0916c29da1a",
+        "count": 1
+      },
+      {
+        "sha256": "21e25b32009d462bf78cf5be6f45f5f640f192a28bd4d0dca5dab50f2f8044c7",
+        "count": 1
+      },
+      {
+        "sha256": "de515c1db929f95f66607e75ab41698f204391e9c9c988b133b10eda9d963763",
+        "count": 1
+      },
+      {
+        "sha256": "f14296b81ab632430d60237b9225297b7edd2b2a05b08a0e200c5860ce310c9c",
+        "count": 1
+      },
+      {
+        "sha256": "3a259298c89107cb34aee20ec478dff4e56de2bc878fca599eb146b0e1bb9247",
+        "count": 1
+      },
+      {
+        "sha256": "7b9a74c040d20c2f92113f5c08cf10d47b815fb2404e8f028ca6d0a7cf222c05",
+        "count": 1
+      },
+      {
+        "sha256": "f91720769b7c27ebfc1d034f99d0423ea3bbb54731cb228348b9c8f8533c1cf6",
+        "count": 1
+      },
+      {
+        "sha256": "2f902da45627710a200615c53dbbb51f77d21d37e0628154264079b3fd638df3",
+        "count": 1
+      },
+      {
+        "sha256": "76d6931874a606a551bf1ea071cd61fbe72f6fcc0b4b83a68645cff6e2ae84e1",
+        "count": 1
+      },
+      {
+        "sha256": "d6285c57719b6a136aa393a4742918bbef97b2d19c7ba9218f33122e5f5aa85f",
+        "count": 1
+      },
+      {
+        "sha256": "9f388464faf3a798adf48eeb14b991d16d40cc8ccdcefeaea8bbae8befadf128",
+        "count": 1
+      },
+      {
+        "sha256": "ecd0455df827ac00a55634644181273a1e487f2a0198908f6fb539198e698dcd",
+        "count": 1
+      },
+      {
+        "sha256": "dc1a01e48d7b6ff8b43c7d57fe935016541911736ca6cf36a9852d9d4e5674fb",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/legacy_evidence_column_migration.rs",
+    "kind": "saved_data",
+    "reason": "schema 88から89で旧artifact source列とSSH legacy receipt counter列をALTER RENAMEする綴り。既存artifact source value、元operation fingerprintと旧counter replay evidenceをそのまま保持する。消すと既存DBを移行できずartifact由来情報や同じSSH操作の再送判断を失う。",
+    "lines": [
+      {
+        "sha256": "a9ea3b7d1f16ff91f84b1b7eaaaa32644a1debaedaaff6dc81898e07049cf166",
+        "count": 1
+      },
+      {
+        "sha256": "77abd49b48090370b92df090f8c38f4f5cc9c3b5a6943e34952fd757e94e6da7",
+        "count": 1
+      },
+      {
+        "sha256": "cf525bc1fa010f19227fc85c75c948f2364600c053b4fbdf5e1f629c835f7754",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/legacy_evidence_column_tests.rs",
+    "kind": "rejection_test",
+    "reason": "移行後・現行出力から旧key/column/tableが消失したことを具体的な綴りで検証する負のassertion。削除すると旧名の再出力/残存を検出できなくなる。関連する保存境界: schema-88 artifact fixtureは旧source列に元由来情報を保存してschema-89 upgrade後も値が保たれることを検証する。現行列に置換すると実在した旧列を改名する移行での値保持を証明できない。",
+    "lines": [
+      {
+        "sha256": "564de34f3f1ffc45547581c8c6031e1408177ba2ca604022204778bc8d8a7b0c",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/legacy_evidence_column_tests.rs",
+    "kind": "saved_data",
+    "reason": "schema-88 artifact fixtureは旧source列に元由来情報を保存してschema-89 upgrade後も値が保たれることを検証する。現行列に置換すると実在した旧列を改名する移行での値保持を証明できない。",
+    "lines": [
+      {
+        "sha256": "b9648425b02b56c6649eaaddd3a029ee4602ec8c48cf74de1d7b0d25860282ee",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/migration_entrypoint_tests.rs",
+    "kind": "saved_data",
+    "reason": "schema-87 retention/removal policyとschema-86 SSH key fixture。public migrate_database/open entrypointが旧DBのpolicy binding・terminal worker evidence・暗号鍵を移すことを検証する。旧SQLを現行名へ変えると公開入口を通る実データ保持/rollbackの証明を失う。",
+    "lines": [
+      {
+        "sha256": "2a4cb9f8dacaf637103fe369c8ce5106bbb442097e644483c3900cdd98fade81",
+        "count": 1
+      },
+      {
+        "sha256": "507a9c7b394d2f53ec23cf7f61895882e6c36437f20984831d2d3e4de8082e61",
+        "count": 1
+      },
+      {
+        "sha256": "c62a95b51f929de93f0623206e571b88596f0cd6b2e8dffdbb62db6d7c6a3dd8",
+        "count": 1
+      },
+      {
+        "sha256": "eccb98cd2b351f242f42f7a06d3e527745e3fcb5c46ea005d7658c4e3b3b1479",
+        "count": 1
+      },
+      {
+        "sha256": "de6b3a38afad3d08bc4bcb534c1374446ae59b28ed08235643fd61c3b42992fd",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/store.rs",
+    "kind": "rejection_test",
+    "reason": "移行後・現行出力から旧key/column/tableが消失したことを具体的な綴りで検証する負のassertion。削除すると旧名の再出力/残存を検出できなくなる。関連する保存境界: 旧schema validation/readersとretained version fixtureの実在した列/表/PK/FK名。既存Runtime binding・Signing identity・reservation/Job/Memory・Worker projection/assignment/removal evidenceを順次移す入力を識別する。さらに既存migration名2行はverify_schema_historyがDBの__yoi_schema_migrations.nameと完全一致を要求するため変更すると既存DBを開けなくなる。削除検証は別kind、単なる診断文は承認対象外。",
+    "lines": [
+      {
+        "sha256": "83028c3e174d647bc3ea5c0e2f7c3e97cca338285cbde0ea19718db6a9ad0755",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/store.rs",
+    "kind": "saved_data",
+    "reason": "旧schema validation/readersとretained version fixtureの実在した列/表/PK/FK名。既存Runtime binding・Signing identity・reservation/Job/Memory・Worker projection/assignment/removal evidenceを順次移す入力を識別する。さらに既存migration名2行はverify_schema_historyがDBの__yoi_schema_migrations.nameと完全一致を要求するため変更すると既存DBを開けなくなる。削除検証は別kind、単なる診断文は承認対象外。",
+    "lines": [
+      {
+        "sha256": "878e5fd4a93e5163766b210e1e503103f68146da7c9dbf83eb89794e759c9239",
+        "count": 1
+      },
+      {
+        "sha256": "9570f606a1221dee4316dd6036d4dda2a4091e77a5ad33724bb278a48a35019f",
+        "count": 1
+      },
+      {
+        "sha256": "f329951dfca0cfd266b55dcd1790c97b5c4cdc6425862220812ba41d124b2cee",
+        "count": 3
+      },
+      {
+        "sha256": "aaa7464d13769b4d9b00eb2c53dcd70b691727ac45831da391fa1c3bf9a2aef0",
+        "count": 1
+      },
+      {
+        "sha256": "4154334813ad850dcce125e5b7e41a27309bee5b4a2a440c4eed9bfc484cb534",
+        "count": 1
+      },
+      {
+        "sha256": "7d80cfa16f8a18d2a6775f1fab976c9607f7135963dede5eab567cbea9f60135",
+        "count": 1
+      },
+      {
+        "sha256": "886f2dbc219514fc1a1e9144499003a61ba2bc0ff0359a987848935c60eb0ce4",
+        "count": 3
+      },
+      {
+        "sha256": "a0b32e9f70d84bcb5c9d052cec88bcd4243ec0e5fe6eee4cdb0b756b45ddef87",
+        "count": 1
+      },
+      {
+        "sha256": "f5645cbf1f50cac540864023ceec67965a38f5cdfba60df75b15877e21c1feb4",
+        "count": 1
+      },
+      {
+        "sha256": "22c91e2bbd5adca75ae55d3f204e6724d6573610aaf0e181295310aa082bd384",
+        "count": 1
+      },
+      {
+        "sha256": "d91d3d971f14e37f791ba52bedb3d149100a8f414f56c10af41f0fa10a1997b3",
+        "count": 1
+      },
+      {
+        "sha256": "1d670129ea61b5ea4ef0e4da9ae7be90ddcbc98415847d4e54c071d8f57a660a",
+        "count": 1
+      },
+      {
+        "sha256": "5bdf53adf2183def9a44f31ff09eac335e3bdb9644c352e96d8721b9196923f6",
+        "count": 2
+      },
+      {
+        "sha256": "13305075edd2c979164ef976902d1ccecb7a8f4c55e32f9edea53387799f76d0",
+        "count": 2
+      },
+      {
+        "sha256": "3f93039bbfa4c4ade8337810e904f82facbad95dfab83e74ac72be5eb76308e4",
+        "count": 1
+      },
+      {
+        "sha256": "cbce4bab74e1125a910764375a27983814d0bb1d4c066835a546b82c2fce318c",
+        "count": 1
+      },
+      {
+        "sha256": "6624a892d7c32e89297e67c66c708c6b41c8c13889ea13c2e9f7c118eef38cb0",
+        "count": 1
+      },
+      {
+        "sha256": "a62938ecd34f5323ac9bcbdc504bcc53f6d9592f112702e8b957b7f399e67664",
+        "count": 2
+      },
+      {
+        "sha256": "014fbe1da6d426eae007a7b979abf527e7e7649de6e42fc23a5105184c0d690f",
+        "count": 1
+      },
+      {
+        "sha256": "b6cf61c11bf278355e0dfc66219abdefd64c29621883836875221b8cd9ede2ef",
+        "count": 1
+      },
+      {
+        "sha256": "14167f46caa13763193ee2e17a07d48d61035b1f8567bd300818dc810eefdf48",
+        "count": 2
+      },
+      {
+        "sha256": "b5722ee6d03aadc482f0b29d00f386c1687c1cfb2b5a331b53bc9c1a05755724",
+        "count": 1
+      },
+      {
+        "sha256": "922889bab7a01f5d44ea5bb7a8abda99f6f5a60db23993d7df275be3f032b615",
+        "count": 1
+      },
+      {
+        "sha256": "8fa169a3a546ba7a010b17daeece10b00cdbb7f26f4c23db06bb790b9a9d6eb1",
+        "count": 1
+      },
+      {
+        "sha256": "7f7443ec5c59aade3fa0e02690c94fd6807abbcc5a56195ae53861dcb23ea2c0",
+        "count": 2
+      },
+      {
+        "sha256": "ae000893ab03e20304b5731ffa3c8051d8929f41c6833c67199b9a03f4a9742a",
+        "count": 2
+      },
+      {
+        "sha256": "5745fa9e0f217df83a2819b2447fde8cb3e7d090e292b0467aeab5a15378026b",
+        "count": 1
+      },
+      {
+        "sha256": "bb4ca69f4259cd5851b4e303ef27a51abfe4709e328f786539139b1399ee12f3",
+        "count": 1
+      },
+      {
+        "sha256": "d88c1648e2af05898f7db0a4bc2fc39a63798ea9a9521b26cb18a8d122995650",
+        "count": 1
+      },
+      {
+        "sha256": "f5c8c53aa4f3f4c109074f4ea70a4dfcb7ddff3bab486f6003c6d6cb613e89d7",
+        "count": 1
+      },
+      {
+        "sha256": "9b7c06dfe2c25363ca496902607ffa2232d31b4233cd41ce144c2e0a63c44bdb",
+        "count": 1
+      },
+      {
+        "sha256": "034d664553027aa4176f4ade827a14a1542758898b3c33da152c46b9e9673c0c",
+        "count": 1
+      },
+      {
+        "sha256": "cb940026cb3081247c9f8d488492032ee210242e891297b49b81590826eacde0",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/workspace_signing_identity.rs",
+    "kind": "rejection_test",
+    "reason": "移行後・現行出力から旧key/column/tableが消失したことを具体的な綴りで検証する負のassertion。削除すると旧名の再出力/残存を検出できなくなる。関連する保存境界: frozen_material_v1が既存version-1 private-material JSONをdecodeする旧keyとfixture。元private keyを同じWorkspace/key identityのまま現行materialへ復元する。綴りを消すと既存Workspace署名鍵をloadできず、新規鍵生成によるidentity変更か署名不能を招く。現行writerには旧keyが無い。",
+    "lines": [
+      {
+        "sha256": "065b3bab89655a7c0f60973678da18e5768d04e5c572f9ae5eab6fdec3ffe09b",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/workspace_signing_identity.rs",
+    "kind": "saved_data",
+    "reason": "frozen_material_v1が既存version-1 private-material JSONをdecodeする旧keyとfixture。元private keyを同じWorkspace/key identityのまま現行materialへ復元する。綴りを消すと既存Workspace署名鍵をloadできず、新規鍵生成によるidentity変更か署名不能を招く。現行writerには旧keyが無い。",
+    "lines": [
+      {
+        "sha256": "39d1e108e0ca0565e38b4a9fbb59ed320bd70cf84f33883c479751694b6934c5",
+        "count": 1
+      },
+      {
+        "sha256": "97c89dacec64e0da68c3a8eaee10f8cb470694f831e570e8a4dac5eccd47c9e9",
+        "count": 2
+      },
+      {
+        "sha256": "e1c0aca0a4c23507d9f068607bef95f50a8907482db3a9435c5d01831b061e8d",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "docs/report/2026-10-10-compaction-user-directive-loss.md",
+    "kind": "naming_policy",
+    "reason": "別作業のユーザー命名禁止指示とcompact後の指示脱落を記録する原文証拠8行。ユーザーが改変を禁止している。語を置換すると元指示・縮小された完了判断の証拠を失う。現行状態契約の命名ではない。",
+    "lines": [
+      {
+        "sha256": "be07543630f736159a176c85edf595169abed6a4398732b2954d9c07708bb3e3",
+        "count": 1
+      },
+      {
+        "sha256": "ee0add78ff03ede4f9dce20b12bf420bb4e3be56f490c9c0f0fc0f758961d44e",
+        "count": 1
+      },
+      {
+        "sha256": "58f8ba7f469176805b055b4b2f089f972f73e21775430ad1ac5ac44128a42e34",
+        "count": 1
+      },
+      {
+        "sha256": "e80d72f0aa5df11c66d3a2219c4c945e0f539bd2362b97c4c1258d029bd15697",
+        "count": 1
+      },
+      {
+        "sha256": "84ae8a6dcffd845305e4460c9aaa489d7df92a77ce0e692dcda81af3810ebdc4",
+        "count": 1
+      },
+      {
+        "sha256": "78b4c1ec00cbebfb5f1964b84adf73a41fd65a87d73a15c36286f2f9effeda56",
+        "count": 1
+      },
+      {
+        "sha256": "e1a923653f21a65378f5a9071167cea6f417f3446b1dfd400ddd020d31218141",
+        "count": 1
+      },
+      {
+        "sha256": "499677378465b65c47b836f4b9f4cb63adb28b898a269e76c2e05dad0bc07508",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "tools/check-state-contract-names.ts",
+    "kind": "naming_policy",
+    "reason": "findNames がcase-insensitiveに検出する禁止語の定義一行。削除すると新規導入・既存例外の追加/改変を検出できなくなる。SHA-256は検索回避でなくtrim行の変更証拠であり、pathと出現回数も固定する。",
+    "lines": [
+      {
+        "sha256": "edad9af3a2d7cecad990c8908ea38a496fb7413a707c8b6acd72d1ab660e2806",
+        "count": 1
+      }
+    ]
+  }
+]

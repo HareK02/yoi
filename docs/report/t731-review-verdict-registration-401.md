@@ -1,8 +1,10 @@
 # T-731 independent review verdict registration rejected
 
+Editorial note (2026-10-10): obsolete state terminology is summarized by purpose below; cited IDs, commits and validation results still describe the original investigation, not new executions.
+
 ## Confirmed observation
 
-- Ticket: T-731, item revision `00001M4G6PHJQ:0`.
+- Ticket: T-731, historical item reference `00001M4G6PHJQ:0`.
 - Selected MR: `01a120d6-36fb-7673-92ce-a4cd50ba0d7d`, repository `main`.
 - Selectors: `work/T-731-workdir-denial-diagnostics` → `develop`.
 - First reviewed source: `f9d70e2ae2c1b226fd5832dfa13102b9f1b6ac4c`.
@@ -45,7 +47,7 @@ in this Ticket.
 - Reviewed source after the first forward fix:
   `10c55874e3cc4c3562f608e10c56ff1c4c2a4d3c`.
 - Fresh request: MR seq3 event `01a120f4-6c90-7791-a36f-69d52e2cbd4b`,
-  `2026-10-09T13:57:31.897275884+00:00`, same Ticket revision and sole MR.
+  `2026-10-09T13:57:31.897275884+00:00`, same Ticket item snapshot and sole MR.
 - Independent review found a second operational regression: normal Write's
   bare NotFound match failed to create files for typed/nested diagnostic context.
   A public-tool harness reproduced it despite 59 focused tests passing.

@@ -1628,6 +1628,10 @@ impl SubjektivStore {
                         "unknown generation `{generation_id}` for subject `{subject_id}`"
                     ))
                 })?;
+            // Before publication, compare the generation's frozen Memory input
+            // with live input in this same IMMEDIATE transaction. An older job
+            // can finish after Memory changes; first/last arrival and timestamps
+            // cannot make its summary describe the newer input.
             if current_fingerprint != memory_fingerprint {
                 return Err(SubjektivError::SurfaceGenerationConflict(format!(
                     "generation input {memory_fingerprint} is stale; current Memory input fingerprint is {}",
@@ -2167,6 +2171,10 @@ fn write_memory_change(
         .optional()?;
     let current = current_raw.map(|raw| parse_memory(&raw)).transpose()?;
 
+    // Compare the observed Memory change before appending history or replacing
+    // current state, under this same IMMEDIATE transaction. A late decision based
+    // on old content must not overwrite a newer accepted change. Timestamps can
+    // tie, and arrival order does not prove which Memory the decision examined.
     let (change_id, created_at) = match (current.as_ref(), expected_change_id) {
         (None, None) => (issued_id("memory-change"), now()),
         (None, Some(_)) => return Err(SubjektivError::MemoryNotFound(memory_id.to_string())),

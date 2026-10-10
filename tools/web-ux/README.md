@@ -214,7 +214,7 @@ confirmation. Interaction screenshots are saved under `target/web-ux/settings-in
 `queue`, `notifications`, `legacy`, or `empty`. Each state includes a task for typography comparison.
 It captures 1440px, 768px, and 390px; `browser-tests/console_pending_shell_test.ts` additionally checks
 320px and both themes, independent group visibility, full-width single groups, uniform 16px rows,
-monospace inheritance, truncation, and retained-session cancellation gating. Live revision-fenced
+monospace inheritance, truncation, and retained-session cancellation gating. Live ordered-FIFO-content-fenced
 cancellation and state transitions are covered by Console component tests. No real Worker is used.
 
 ## Console live Feature invocation fixture

@@ -1,5 +1,7 @@
 # Repository secret delivery expiry deletes a live Workdir helper and blocks restore
 
+Editorial note (2026-10-10): obsolete state terminology is summarized by purpose below; cited IDs, commits and validation results still describe the original investigation, not new executions.
+
 ## Symptom
 
 The `workspace:wip` T-3 Coder completed a clean local commit but could not publish it:
@@ -112,7 +114,7 @@ Server-issued operation: runtime:read
 Runtime expectation:      workers:input
 ```
 
-The exact 401 text is `WorkspaceCapabilityVerificationError::WrongOperation`. Verification had already accepted token shape, Workspace trust/signature, Workspace, Runtime, binding revision, and Worker identity. Method, path, body-digest, and expiry checks occur later and were not reached.
+The exact 401 text is `WorkspaceCapabilityVerificationError::WrongOperation`. Verification had already accepted token shape, Workspace trust/signature, Workspace, Runtime, the historical binding counter, and Worker identity. Method, path, body-digest, and expiry checks occur later and were not reached.
 
 Retrying the same restore without correcting the Server classifier deterministically returns the same 401.
 

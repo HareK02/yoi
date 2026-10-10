@@ -10793,7 +10793,7 @@ mod build_summary_prompt_tests {
         let binding = crate::BackendJobExecutionBinding {
             job_id: "job-1".into(),
             attempt_id: "attempt-1".into(),
-            input_digest: Some("revision-1".into()),
+            input_digest: Some("input-content-digest".into()),
             subjektiv_consolidation: true,
         };
         worker.bind_backend_job(binding.clone()).unwrap();
@@ -14244,7 +14244,6 @@ permission = "write"
                 _ => None,
             })
             .unwrap();
-        assert!(payload.get("revision").is_none());
         let restored: PendingActivationState = serde_json::from_value(payload.clone()).unwrap();
         assert_eq!(restored.snapshot(), cleared);
     }

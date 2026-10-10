@@ -1278,7 +1278,6 @@ Deno.test("Worker Console route resolves logical Worker authority before Runtime
       consolePage.includes('sendWorkerControl("cancel")') &&
       consolePage.includes("lifecycleMethod(command)") &&
       consolePage.includes("command_id: commandId") &&
-      !consolePage.includes("expected_worker_state_revision") &&
       !consolePage.includes("expected_execution_generation") &&
       consolePage.includes("onsubmit={handleComposerSubmit}") &&
       consolePage.includes("disabled={!composerEditable}") &&

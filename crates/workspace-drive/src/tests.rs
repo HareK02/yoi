@@ -20,7 +20,10 @@ fn create(parent: NodeId, name: &str) -> Mutation {
 fn migration_enforces_workspace_parent_and_unique_names() {
     let t = tempfile::tempdir().unwrap();
     let d = fixture(&t);
-    assert_eq!(d.database.schema_version().unwrap(), 2);
+    assert_eq!(
+        d.database.schema_version().unwrap(),
+        MIGRATIONS.last().unwrap().version()
+    );
     let root = d.root().unwrap();
     d.mutate("a", "actor", create(root.id, "a")).unwrap();
     assert!(matches!(

@@ -393,9 +393,16 @@ mod tests {
         )));
         let parsed: serde_json::Value = serde_json::from_str(&state.status_json()).unwrap();
         assert_eq!(parsed["state"], "running");
-        assert!(parsed["worker_state"].get("execution_generation").is_none());
-        assert!(parsed["worker_state"].get("revision").is_none());
-        assert_eq!(parsed["worker_state"]["state"]["kind"], "busy");
+        assert_eq!(
+            parsed["worker_state"],
+            json!({
+                "last_command_id": 0,
+                "state": {
+                    "kind": "busy",
+                    "state": { "kind": "maintenance", "state": "compacting" }
+                }
+            })
+        );
         assert_eq!(parsed["worker_name"], "test-worker");
         assert!(parsed["segment_id"].is_string());
     }

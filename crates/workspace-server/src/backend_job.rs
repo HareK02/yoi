@@ -564,9 +564,9 @@ mod tests {
 
     fn request() -> BackendJobRequest {
         BackendJobRequest {
-            job_id: "ticket-check:T-1:r7".to_string(),
+            job_id: "ticket-check:T-1:content-7".to_string(),
             purpose: "ticket_item_check".to_string(),
-            input_ref: "ticket://T-1/revisions/7".to_string(),
+            input_ref: "ticket://T-1/contents/content-7".to_string(),
             input: serde_json::json!({"title": "Check me"}),
             instruction: "Check this immutable Ticket snapshot.".to_string(),
             profile: "builtin:backend-job".to_string(),
@@ -591,8 +591,8 @@ mod tests {
             },
             "attempt": {
                 "workspace_id": "workspace-a",
-                "job_id": "ticket-check:T-1:r7",
-                "attempt_id": "ticket-check:T-1:r7:attempt:2",
+                "job_id": "ticket-check:T-1:content-7",
+                "attempt_id": "ticket-check:T-1:content-7:attempt:2",
                 "attempt": 2,
                 "input_digest": "7",
                 "state": "reserved",
@@ -687,7 +687,7 @@ mod tests {
             job::JobOutcome {
                 job_id: reservation.job.request.job_id.clone(),
                 input_digest: "7".into(),
-                attempt_id: "ticket-check:T-1:r7:attempt:2".into(),
+                attempt_id: "ticket-check:T-1:content-7:attempt:2".into(),
                 attempt: 2,
                 state: job::JobState::Pending,
                 attempt_state: job::JobAttemptState::Reserved,
@@ -766,11 +766,11 @@ mod tests {
         let encoded = serde_json::to_string(&request).unwrap();
         assert_eq!(
             encoded,
-            r#"{"job_id":"ticket-check:T-1:r7","purpose":"ticket_item_check","input_ref":"ticket://T-1/revisions/7","input":{"title":"Check me"},"instruction":"Check this immutable Ticket snapshot.","profile":"builtin:backend-job","source_worker":{"runtime_id":"runtime-a","worker_id":"worker-a"},"notification_target":{"runtime_id":"runtime-a","worker_id":"worker-a"},"limits":{"max_concurrent_jobs":8,"timeout_seconds":120,"max_result_bytes":16384,"max_attempts":2}}"#
+            r#"{"job_id":"ticket-check:T-1:content-7","purpose":"ticket_item_check","input_ref":"ticket://T-1/contents/content-7","input":{"title":"Check me"},"instruction":"Check this immutable Ticket snapshot.","profile":"builtin:backend-job","source_worker":{"runtime_id":"runtime-a","worker_id":"worker-a"},"notification_target":{"runtime_id":"runtime-a","worker_id":"worker-a"},"limits":{"max_concurrent_jobs":8,"timeout_seconds":120,"max_result_bytes":16384,"max_attempts":2}}"#
         );
         assert_eq!(
             request.fingerprint().unwrap(),
-            "sha256:250b626572e954d2aa2228364274c946d9f6b176eb0f0a205157e55031581147"
+            "sha256:d7a3eb420eb1404e1a0aacd198726ce7f23b84a00b5d81a1b15d002b3075b8b0"
         );
         let neutral = request.to_job_request();
         neutral.validate().unwrap();
@@ -784,7 +784,7 @@ mod tests {
         );
         assert_eq!(
             request.worker_input("attempt-1").unwrap(),
-            "Check this immutable Ticket snapshot.\n\nBackend Job envelope (immutable):\njob_id: ticket-check:T-1:r7\nattempt_id: attempt-1\ninput_digest: sha256:7d0f26b7fc612e982fd7acf2b64f29d2e8f65c7e1292683e36d7dcac38905c50\ninput_ref: ticket://T-1/revisions/7\ninput_json: {\"title\":\"Check me\"}\n\nReturn success only through the structured Backend Job result capability. Final prose and Worker Idle/Stopped state are not result authority."
+            "Check this immutable Ticket snapshot.\n\nBackend Job envelope (immutable):\njob_id: ticket-check:T-1:content-7\nattempt_id: attempt-1\ninput_digest: sha256:7d0f26b7fc612e982fd7acf2b64f29d2e8f65c7e1292683e36d7dcac38905c50\ninput_ref: ticket://T-1/contents/content-7\ninput_json: {\"title\":\"Check me\"}\n\nReturn success only through the structured Backend Job result capability. Final prose and Worker Idle/Stopped state are not result authority."
         );
     }
 

@@ -103,7 +103,8 @@ mod tests {
         let mut original = serde_json::to_value(request("done")).unwrap();
         original["input_revision"] = json!("old-token");
         let original = serde_json::to_string_pretty(&original).unwrap();
-        let receipt = "{\"accepted\":true,\"input_revision\":\"receipt-domain-data\"}".to_string();
+        // A Job result is opaque domain data, not a legacy attempt binding.
+        let receipt = "{\"accepted\":true,\"receipt_tag\":\"receipt-domain-data\"}".to_string();
         let digest = job::result_digest(
             &serde_json::from_str(&receipt).unwrap(),
             job::ABSOLUTE_MAX_RESULT_BYTES,

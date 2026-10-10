@@ -606,8 +606,10 @@ pub struct CompleteMergeRequest {
 pub struct TicketCompletionEvent {
     pub operation_id: String,
     pub ticket_id: String,
-    /// Frozen historical payload only; not a content attestation or live API.
-    pub item_revision: String,
+    /// Frozen historical marker, read only to preserve archived completion payloads.
+    /// It is never checked for readiness, content attestation, or live completion.
+    #[serde(rename = "item_revision")]
+    pub legacy_item_marker: String,
     pub merge_request_ids: Vec<String>,
     pub requirement_approval_event_id: String,
     pub completed_by: WorkerIdentity,

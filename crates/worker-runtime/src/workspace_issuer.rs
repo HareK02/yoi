@@ -92,21 +92,25 @@ struct LegacyWorkspaceIssuerTrustRecord {
     algorithm: String,
     public_key: String,
     public_key_fingerprint: String,
-    identity_revision: u64,
-    trust_generation: u64,
+    #[serde(rename = "identity_revision")]
+    legacy_identity_counter: u64,
+    #[serde(rename = "trust_generation")]
+    legacy_trust_counter: u64,
     state: WorkspaceIssuerTrustState,
     registered_at_unix: i64,
     updated_at_unix: i64,
 }
 
-/// Migrate a pre-ID enrollment as revoked. Only an explicit operator replacement
-/// can accept new trust; no legacy capability can authorize its own migration.
+/// Migrate a pre-ID enrollment as revoked. At persisted-data decode, legacy counters
+/// must be positive but are never compared with current identity or trust.
+/// Only an explicit operator replacement can accept new trust; no legacy
+/// capability can authorize its own migration.
 pub fn migrate_legacy_workspace_issuer_trust_record(
     value: serde_json::Value,
 ) -> Result<WorkspaceIssuerTrustRecord, WorkspaceIssuerTrustError> {
     let legacy: LegacyWorkspaceIssuerTrustRecord =
         serde_json::from_value(value).map_err(|_| WorkspaceIssuerTrustError::InvalidIdentifier)?;
-    if legacy.identity_revision == 0 || legacy.trust_generation == 0 {
+    if legacy.legacy_identity_counter == 0 || legacy.legacy_trust_counter == 0 {
         return Err(WorkspaceIssuerTrustError::InvalidIdentifier);
     }
     let mut record = WorkspaceIssuerTrustRecord::from_bundle(
@@ -474,6 +478,9 @@ struct WorkspaceRuntimeVerificationDocument {
     records: Vec<WorkspaceRuntimeVerificationRecord>,
     #[serde(default)]
     pending: Vec<WorkspaceRuntimeVerificationChallenge>,
+    /// Exact pre-ID document retained only as history; never used to authorize requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    archived_legacy_document: Option<String>,
 }
 
 // Frozen verification evidence from before trust/binding IDs. Never promote
@@ -490,12 +497,16 @@ struct LegacyVerificationDocument {
 struct LegacyVerificationRecord {
     workspace_id: String,
     runtime_id: String,
-    binding_revision: u64,
+    #[serde(rename = "binding_revision")]
+    legacy_binding_counter: u64,
     workspace_key_id: String,
-    workspace_identity_revision: u64,
-    workspace_trust_generation: u64,
+    #[serde(rename = "workspace_identity_revision")]
+    legacy_workspace_identity_counter: u64,
+    #[serde(rename = "workspace_trust_generation")]
+    legacy_workspace_trust_counter: u64,
     runtime_public_key_fingerprint: String,
-    runtime_identity_revision: u64,
+    #[serde(rename = "runtime_identity_revision")]
+    legacy_runtime_identity_counter: u64,
     verified_at: i64,
 }
 
@@ -507,6 +518,9 @@ impl FileWorkspaceRuntimeVerificationAuthority {
         }
     }
 
+    // No pre-ID acknowledgement is live authority. Keep its exact source bytes
+    // in the persisted archive while new challenges populate only current records.
+    // Neither read(), get(), nor capability verification consults that archive.
     fn read(
         &self,
     ) -> Result<WorkspaceRuntimeVerificationDocument, WorkspaceCapabilityVerificationError> {
@@ -531,6 +545,9 @@ impl FileWorkspaceRuntimeVerificationAuthority {
                         version: 2,
                         records: Vec::new(),
                         pending: Vec::new(),
+                        archived_legacy_document: Some(String::from_utf8(bytes).map_err(|_| {
+                            WorkspaceCapabilityVerificationError::VerificationAuthorityUnavailable
+                        })?),
                     };
                     self.write(&migrated)?;
                     return Ok(migrated);
@@ -575,6 +592,7 @@ impl FileWorkspaceRuntimeVerificationAuthority {
                     version: 2,
                     records: Vec::new(),
                     pending: Vec::new(),
+                    archived_legacy_document: None,
                 })
             }
             Err(_) => Err(WorkspaceCapabilityVerificationError::VerificationAuthorityUnavailable),
@@ -1993,7 +2011,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_verification_file_is_invalidated_durably() {
+    fn frozen_verification_file_is_invalidated_durably_without_losing_archived_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("verification.json");
         fs::write(&path, serde_json::to_vec(&serde_json::json!({"version":1,"records":[{
@@ -2001,17 +2019,49 @@ mod tests {
             "workspace_key_id":"WK-1","workspace_identity_revision":1,"workspace_trust_generation":1,
             "runtime_public_key_fingerprint":"sha256:old","runtime_identity_revision":1,"verified_at":10
         }]})).unwrap()).unwrap();
+        let original_bytes = fs::read(&path).unwrap();
         let authority = FileWorkspaceRuntimeVerificationAuthority::new(&path);
         assert!(authority.get("workspace-1", "runtime-1").unwrap().is_none());
         let migrated: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(migrated["version"], 2);
         assert_eq!(migrated["records"], serde_json::json!([]));
+        assert_eq!(
+            migrated["archived_legacy_document"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+            original_bytes
+        );
         assert!(
             FileWorkspaceRuntimeVerificationAuthority::new(&path)
                 .get("workspace-1", "runtime-1")
                 .unwrap()
                 .is_none()
+        );
+        let current = WorkspaceRuntimeVerificationRecord {
+            workspace_id: "workspace-1".into(),
+            runtime_id: "runtime-1".into(),
+            binding_id: "accepted-binding".into(),
+            workspace_key_id: "WK-1".into(),
+            workspace_public_key_fingerprint: format!("sha256:{}", "a".repeat(64)),
+            workspace_trust_id: "accepted-trust".into(),
+            runtime_public_key_fingerprint: format!("sha256:{}", "b".repeat(64)),
+            verified_at: 20,
+        };
+        authority.record(current.clone()).unwrap();
+        let restored = FileWorkspaceRuntimeVerificationAuthority::new(&path);
+        assert_eq!(
+            restored.get("workspace-1", "runtime-1").unwrap(),
+            Some(current)
+        );
+        let updated: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            updated["archived_legacy_document"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+            original_bytes
         );
     }
 

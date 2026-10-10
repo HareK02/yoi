@@ -700,15 +700,14 @@ Deno.test("Memory changes preserve server order without interpreting opaque iden
   assertEquals(parseSubjektivMemoryReadResponse({ ...detailFixture(), change_id: "z/earlier", current_change_id: "a/current" }).change_id, "z/earlier");
 });
 
-Deno.test("Memory identities reject numeric counters, empty and oversized strings, and legacy fields", () => {
+Deno.test("Memory identities reject numeric counters, empty and oversized strings, and unknown fields", () => {
   for (const value of [3, "", "x".repeat(513)]) {
     assertThrows(() => parseSubjektivMemoryReadResponse({ ...detailFixture(), change_id: value }), "bounded identifier");
     assertThrows(() => parseSubjektivMemoryReadResponse({ ...detailFixture(), current_change_id: value }), "bounded identifier");
     assertThrows(() => parseSubjektivSubjectResponse({ ...subject(), memory_fingerprint: value }), "bounded identifier");
   }
-  assertThrows(() => parseSubjektivMemoryReadResponse({ ...detailFixture(), revision: 2 }), "unknown field");
-  assertThrows(() => parseSubjektivSubjectResponse({ ...subject(), behavior_revision: 2 }), "unknown field");
-  assertThrows(() => parseSubjektivSubjectResponse({ ...subject(), store_revision: 12 }), "unknown field");
+  assertThrows(() => parseSubjektivMemoryReadResponse({ ...detailFixture(), unexpected_field: true }), "unknown field");
+  assertThrows(() => parseSubjektivSubjectResponse({ ...subject(), unexpected_field: true }), "unknown field");
 });
 
 Deno.test("Behavior CAS sends the observed text byte-for-byte including empty content", async () => {

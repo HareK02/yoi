@@ -458,7 +458,7 @@ async fn pending_manual_worker_claim_reconciles_same_runtime_restore_and_commits
             ),
         )
         .unwrap();
-    let admitted_revision = api.authority.ticket(&ticket_id).unwrap().content_digest;
+    let admitted_content_digest = api.authority.ticket(&ticket_id).unwrap().content_digest;
     let request = server_api::SetTicketRoleAssignmentRequest {
         operation_id: "claim-runtime-reconciliation".into(),
         principal: server_api::TicketAssignmentPrincipal::Worker {
@@ -515,7 +515,7 @@ async fn pending_manual_worker_claim_reconciles_same_runtime_restore_and_commits
         .get_ticket_claim_recovery(TEST_WORKSPACE_ID, &request.operation_id)
         .unwrap()
         .unwrap();
-    assert_eq!(recovery.content_digest, admitted_revision);
+    assert_eq!(recovery.content_digest, admitted_content_digest);
     assert!(recovery.selected.is_empty());
     assert!(recovery.original_links.is_empty());
     assert!(recovery.effective_links.is_empty());
@@ -572,7 +572,7 @@ async fn pending_manual_worker_claim_reconciles_same_runtime_restore_and_commits
     );
     assert_eq!(
         api.authority.ticket(&ticket_id).unwrap().content_digest,
-        admitted_revision
+        admitted_content_digest
     );
     assert_eq!(
         api.config_store

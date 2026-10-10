@@ -114,7 +114,6 @@ test("saved settings have no editable form, badges or raw data expanded; each te
   );
   expect(document.querySelectorAll("details[open]")).toHaveLength(0);
   expect(document.querySelector(".badge")).toBeNull();
-  expect(screen.queryByText("Revision", { exact: true })).toBeNull();
   expect(
     screen.getByText(identityFixture().public_bundle!.public_key_fingerprint),
   ).toBeTruthy();

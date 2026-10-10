@@ -1,5 +1,7 @@
 # Flow verifier uses a stale committed-session capture
 
+Editorial note (2026-10-10): obsolete state terminology is summarized by purpose below; cited IDs, commits and validation results still describe the original investigation, not new executions.
+
 Date: 2026-08-11
 Ticket: `00001KZPQW4GJ`
 Flow instance: `019ff243-d4df-71f2-beb3-cbc360f58c34`
@@ -33,7 +35,7 @@ Independent read-only Reviewer verdict:
 
 > APPROVE — I found no blocker/high security or correctness issue in commits `8ae930c5` + `f60c2d58`.
 
-The Reviewer explicitly confirmed the constrained four-field tool input, proof-only destructive boundary, exact Runtime-result Worker revision binding, successful recovery after registry purge, and failed-operation re-entry through the authoritative prepare/executing fence.
+The Reviewer explicitly confirmed the constrained four-field tool input, proof-only destructive boundary, exact Runtime-result Worker-state binding used at the time, successful recovery after registry purge, and failed-operation re-entry through the authoritative prepare/executing fence.
 
 ## Impact
 
@@ -41,7 +43,7 @@ A correct, tested, independently approved implementation cannot advance from `im
 
 ## Suggested fix
 
-Before evaluating a transition, refresh the verifier's session capture from the latest committed Worker history revision and include stable references to:
+Before evaluating a transition, refresh the verifier's session capture from the latest committed Worker history snapshot and include stable references to:
 
 - the current branch and commit,
 - bounded validation command results,

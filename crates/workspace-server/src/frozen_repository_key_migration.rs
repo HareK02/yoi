@@ -32,8 +32,8 @@ fn migrate_repository_keys_v86_to_v87_with_secret_source(
         tx.execute_batch(
             "CREATE TEMP TABLE repository_key_cutover (
             workspace_id TEXT NOT NULL, kind TEXT NOT NULL, resource_id TEXT NOT NULL,
-            legacy_revision INTEGER NOT NULL, operation_id TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at TEXT NOT NULL,
-            PRIMARY KEY(workspace_id,kind,resource_id,legacy_revision));",
+            legacy_counter INTEGER NOT NULL, operation_id TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(workspace_id,kind,resource_id,legacy_counter));",
         )?;
         for (table, kind, id, fingerprint) in [
             (
@@ -65,10 +65,10 @@ fn migrate_repository_keys_v86_to_v87_with_secret_source(
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             };
-            for (workspace, resource, revision, fingerprint, created) in rows {
+            for (workspace, resource, legacy_counter, fingerprint, created) in rows {
                 let mut statement = tx.prepare("SELECT operation_id FROM repository_secret_operations WHERE workspace_id=?1 AND resource_kind=?2 AND resource_id=?3 AND result_revision=?4 AND created_at=?5")?;
                 let matches = statement
-                    .query_map(params![workspace, kind, resource, revision, created], |r| {
+                    .query_map(params![workspace, kind, resource, legacy_counter, created], |r| {
                         r.get::<_, String>(0)
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -81,7 +81,7 @@ fn migrate_repository_keys_v86_to_v87_with_secret_source(
                         workspace,
                         kind,
                         resource,
-                        revision,
+                        legacy_counter,
                         matches[0],
                         fingerprint,
                         created
@@ -126,12 +126,12 @@ fn migrate_repository_keys_v86_to_v87_with_secret_source(
         tx.execute_batch("DROP INDEX idx_workdir_create_credential_candidates_revision;")?;
         tx.execute_batch(include_str!("frozen_repository_key_schema.sql"))?;
         tx.execute_batch("INSERT INTO repository_secret_operations SELECT workspace_id,operation_id,request_fingerprint,resource_kind,resource_id,operation_id,created_at FROM repository_secret_operations_v86;
-            INSERT INTO repository_ssh_credentials SELECT c.workspace_id,c.credential_id,c.name,c.public_key_algorithm,c.public_key_fingerprint,m.operation_id,c.status,c.created_at,c.rotated_at FROM repository_ssh_credentials_v86 c LEFT JOIN repository_key_cutover m ON m.workspace_id=c.workspace_id AND m.kind='credential' AND m.resource_id=c.credential_id AND m.legacy_revision=c.current_revision;
-            INSERT INTO repository_ssh_credential_keys SELECT c.workspace_id,c.credential_id,m.operation_id,c.public_key_algorithm,c.public_key_fingerprint,c.created_at FROM repository_ssh_credential_revisions_v86 c LEFT JOIN repository_key_cutover m ON m.workspace_id=c.workspace_id AND m.kind='credential' AND m.resource_id=c.credential_id AND m.legacy_revision=c.revision;
-            INSERT INTO repository_ssh_host_trusts SELECT c.workspace_id,c.host_trust_id,c.hostname,c.port,c.key_algorithm,c.host_key,c.fingerprint,m.operation_id,c.created_at,c.updated_at FROM repository_ssh_host_trusts_v86 c LEFT JOIN repository_key_cutover m ON m.workspace_id=c.workspace_id AND m.kind='host_trust' AND m.resource_id=c.host_trust_id AND m.legacy_revision=c.current_revision;
-            INSERT INTO repository_ssh_host_trust_keys SELECT c.workspace_id,c.host_trust_id,m.operation_id,c.hostname,c.port,c.key_algorithm,c.host_key,c.fingerprint,c.created_at FROM repository_ssh_host_trust_revisions_v86 c LEFT JOIN repository_key_cutover m ON m.workspace_id=c.workspace_id AND m.kind='host_trust' AND m.resource_id=c.host_trust_id AND m.legacy_revision=c.revision;")?;
+            INSERT INTO repository_ssh_credentials SELECT c.workspace_id,c.credential_id,c.name,c.public_key_algorithm,c.public_key_fingerprint,m.operation_id,c.status,c.created_at,c.rotated_at FROM repository_ssh_credentials_v86 c LEFT JOIN repository_key_cutover m ON m.workspace_id=c.workspace_id AND m.kind='credential' AND m.resource_id=c.credential_id AND m.legacy_counter=c.current_revision;
+            INSERT INTO repository_ssh_credential_keys SELECT c.workspace_id,c.credential_id,m.operation_id,c.public_key_algorithm,c.public_key_fingerprint,c.created_at FROM repository_ssh_credential_revisions_v86 c LEFT JOIN repository_key_cutover m ON m.workspace_id=c.workspace_id AND m.kind='credential' AND m.resource_id=c.credential_id AND m.legacy_counter=c.revision;
+            INSERT INTO repository_ssh_host_trusts SELECT c.workspace_id,c.host_trust_id,c.hostname,c.port,c.key_algorithm,c.host_key,c.fingerprint,m.operation_id,c.created_at,c.updated_at FROM repository_ssh_host_trusts_v86 c LEFT JOIN repository_key_cutover m ON m.workspace_id=c.workspace_id AND m.kind='host_trust' AND m.resource_id=c.host_trust_id AND m.legacy_counter=c.current_revision;
+            INSERT INTO repository_ssh_host_trust_keys SELECT c.workspace_id,c.host_trust_id,m.operation_id,c.hostname,c.port,c.key_algorithm,c.host_key,c.fingerprint,c.created_at FROM repository_ssh_host_trust_revisions_v86 c LEFT JOIN repository_key_cutover m ON m.workspace_id=c.workspace_id AND m.kind='host_trust' AND m.resource_id=c.host_trust_id AND m.legacy_counter=c.revision;")?;
         let secrets = {
-            let mut statement = tx.prepare("SELECT s.workspace_id,s.secret_id,s.revision,s.purpose,s.encryption_algorithm,s.nonce,s.ciphertext,s.created_at,m.operation_id FROM server_secret_versions_v86 s LEFT JOIN repository_key_cutover m ON m.workspace_id=s.workspace_id AND m.kind='credential' AND m.resource_id=s.secret_id AND m.legacy_revision=s.revision")?;
+            let mut statement = tx.prepare("SELECT s.workspace_id,s.secret_id,s.revision,s.purpose,s.encryption_algorithm,s.nonce,s.ciphertext,s.created_at,m.operation_id FROM server_secret_versions_v86 s LEFT JOIN repository_key_cutover m ON m.workspace_id=s.workspace_id AND m.kind='credential' AND m.resource_id=s.secret_id AND m.legacy_counter=s.revision")?;
             statement
                 .query_map([], |r| {
                     Ok((
@@ -148,7 +148,7 @@ fn migrate_repository_keys_v86_to_v87_with_secret_source(
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        for (workspace, id, revision, purpose, algorithm, nonce, ciphertext, created, operation) in
+        for (workspace, id, legacy_counter, purpose, algorithm, nonce, ciphertext, created, operation) in
             secrets
         {
             if algorithm != "aes-256-gcm-v1" {
@@ -164,7 +164,7 @@ fn migrate_repository_keys_v86_to_v87_with_secret_source(
                     database,
                     &workspace,
                     &id,
-                    revision,
+                    legacy_counter,
                     &operation,
                     &purpose,
                     &nonce,
@@ -201,7 +201,7 @@ fn migrate_repository_keys_v86_to_v87_with_secret_source(
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        for (workspace, event, kind, resource, revision, actor, created) in audits {
+        for (workspace, event, kind, resource, legacy_counter, actor, created) in audits {
             let resource_kind = if kind.starts_with("credential_") {
                 "credential"
             } else if kind.starts_with("host_trust_") {
@@ -212,7 +212,7 @@ fn migrate_repository_keys_v86_to_v87_with_secret_source(
             let mut statement=tx.prepare("SELECT operation_id FROM repository_secret_operations_v86 WHERE workspace_id=?1 AND resource_kind=?2 AND resource_id=?3 AND result_revision=?4 AND created_at=?5")?;
             let matches = statement
                 .query_map(
-                    params![workspace, resource_kind, resource, revision, created],
+                    params![workspace, resource_kind, resource, legacy_counter, created],
                     |r| r.get::<_, String>(0),
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -246,7 +246,7 @@ fn migrate_repository_keys_v86_to_v87_with_secret_source(
                 HAVING count(*)=1) AS mutation_kind FROM repository_secret_operations_v86 o) e
             LEFT JOIN repository_key_cutover m ON m.workspace_id=e.workspace_id AND m.kind=e.resource_kind AND m.resource_id=e.resource_id
                 AND m.created_at<=e.created_at
-                AND m.legacy_revision=CASE WHEN e.mutation_kind IN ('credential_rotated','host_trust_rotated') THEN e.result_revision-1
+                AND m.legacy_counter=CASE WHEN e.mutation_kind IN ('credential_rotated','host_trust_rotated') THEN e.result_revision-1
                     WHEN e.mutation_kind IN ('credential_deleted','host_trust_deleted') THEN e.result_revision END;
             INSERT INTO workdir_create_operations
             SELECT o.workspace_id,o.operation_id,'workdir-create-v86:' || COALESCE(CAST(o.source_revision AS TEXT),'unknown') || ':' || o.request_fingerprint,
@@ -257,14 +257,14 @@ fn migrate_repository_keys_v86_to_v87_with_secret_source(
                 CASE WHEN a.operation_id IS NULL THEN o.repository_access_mode END
             FROM workdir_create_operations_v86 o
             LEFT JOIN workdir_terminal_archive_cutover a ON a.workspace_id=o.workspace_id AND a.operation_id=o.operation_id
-            LEFT JOIN repository_key_cutover c ON c.workspace_id=o.workspace_id AND c.kind='credential' AND c.resource_id=o.credential_id AND c.legacy_revision=o.credential_revision AND c.created_at<=o.updated_at
-            LEFT JOIN repository_key_cutover h ON h.workspace_id=o.workspace_id AND h.kind='host_trust' AND h.resource_id=o.host_trust_id AND h.legacy_revision=o.host_trust_revision AND h.created_at<=o.updated_at;
+            LEFT JOIN repository_key_cutover c ON c.workspace_id=o.workspace_id AND c.kind='credential' AND c.resource_id=o.credential_id AND c.legacy_counter=o.credential_revision AND c.created_at<=o.updated_at
+            LEFT JOIN repository_key_cutover h ON h.workspace_id=o.workspace_id AND h.kind='host_trust' AND h.resource_id=o.host_trust_id AND h.legacy_counter=o.host_trust_revision AND h.created_at<=o.updated_at;
             INSERT INTO workdir_create_credential_candidates
             SELECT c.workspace_id,c.operation_id,c.ordinal,c.role,c.credential_id,m.fingerprint
             FROM workdir_create_credential_candidates_v86 c JOIN workdir_create_operations_v86 o ON o.workspace_id=c.workspace_id AND o.operation_id=c.operation_id LEFT JOIN repository_key_cutover m
-                ON m.workspace_id=c.workspace_id AND m.kind='credential' AND m.resource_id=c.credential_id AND m.legacy_revision=c.credential_revision AND m.created_at<=o.updated_at
+                ON m.workspace_id=c.workspace_id AND m.kind='credential' AND m.resource_id=c.credential_id AND m.legacy_counter=c.credential_revision AND m.created_at<=o.updated_at
             WHERE NOT EXISTS(SELECT 1 FROM workdir_terminal_archive_cutover a WHERE a.workspace_id=c.workspace_id AND a.operation_id=c.operation_id);
-            INSERT INTO workdir_create_credential_retentions SELECT c.workspace_id,c.operation_id,c.ordinal,c.credential_id,m.fingerprint,m.operation_id FROM workdir_create_credential_revision_retentions_v86 c LEFT JOIN repository_key_cutover m ON m.workspace_id=c.workspace_id AND m.kind='credential' AND m.resource_id=c.credential_id AND m.legacy_revision=c.credential_revision;")?;
+            INSERT INTO workdir_create_credential_retentions SELECT c.workspace_id,c.operation_id,c.ordinal,c.credential_id,m.fingerprint,m.operation_id FROM workdir_create_credential_revision_retentions_v86 c LEFT JOIN repository_key_cutover m ON m.workspace_id=c.workspace_id AND m.kind='credential' AND m.resource_id=c.credential_id AND m.legacy_counter=c.credential_revision;")?;
         let missing:i64=tx.query_row("SELECT count(*) FROM workdir_create_operations WHERE (credential_id IS NOT NULL AND credential_fingerprint IS NULL) OR (host_trust_id IS NOT NULL AND host_trust_fingerprint IS NULL)",[],|r|r.get(0))?;
         if missing != 0 {
             return Err(Error::Store(

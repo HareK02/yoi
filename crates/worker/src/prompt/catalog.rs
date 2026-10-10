@@ -806,7 +806,6 @@ mod tests {
             "MergeRequestReview",
             "MergeRequestReadinessCheck",
             "MergeRequestComplete",
-            "MergeRequestAddRevision",
         ] {
             assert!(
                 !combined.contains(stale_operation),

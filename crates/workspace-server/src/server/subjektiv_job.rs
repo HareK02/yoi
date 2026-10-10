@@ -282,7 +282,7 @@ mod result_budget_tests {
         let result = serde_json::json!({
             "subject_id":"\\\"".repeat(128),"candidate_ids":batch,
             "candidate_dispositions":dispositions,
-            "surface":{"availability":"failed","generation_id":"g".repeat(100),"store_revision":u64::MAX,"reason_code":"\\\"".repeat(128)},
+            "surface":{"availability":"failed","generation_id":"g".repeat(100),"reason_code":"\\\"".repeat(128)},
         });
         assert!(
             serde_json::to_vec(&result).unwrap().len()

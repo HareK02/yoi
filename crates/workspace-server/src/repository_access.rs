@@ -308,7 +308,7 @@ impl RepositorySecretService {
             let Some((_,resource_kind,resource_id,result_operation_id))=read_operation(conn,workspace_id,&operation_id)? else { return Ok(None); };
             let created_at=conn.query_row("SELECT created_at FROM repository_secret_operations WHERE workspace_id=?1 AND operation_id=?2",params![workspace_id,operation_id],|r|r.get(0))?;
             let legacy: Option<(Option<String>,Option<i64>,Option<String>,Option<String>)>=conn.query_row(
-                "SELECT mutation_kind,expected_revision,expected_operation_id,expected_key_fingerprint FROM repository_secret_legacy_receipts WHERE workspace_id=?1 AND operation_id=?2",
+                "SELECT mutation_kind,legacy_expected_counter,expected_operation_id,expected_key_fingerprint FROM repository_secret_legacy_receipts WHERE workspace_id=?1 AND operation_id=?2",
                 params![workspace_id,operation_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
             ).optional()?;
             let (mutation_kind,legacy_precondition_proven)=if let Some((kind,counter,prior,key))=legacy {
@@ -1626,7 +1626,7 @@ fn matches_legacy_secret_replay(
     request: LegacySecretRequest<'_>,
 ) -> Result<bool> {
     let evidence: Option<(String,Option<String>,Option<i64>,Option<String>,Option<String>)> = conn.query_row(
-        "SELECT request_fingerprint,mutation_kind,expected_revision,expected_operation_id,expected_key_fingerprint FROM repository_secret_legacy_receipts WHERE workspace_id=?1 AND operation_id=?2 AND resource_id=?3",
+        "SELECT request_fingerprint,mutation_kind,legacy_expected_counter,expected_operation_id,expected_key_fingerprint FROM repository_secret_legacy_receipts WHERE workspace_id=?1 AND operation_id=?2 AND resource_id=?3",
         params![workspace_id,operation_id,resource_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
     ).optional()?;
     let Some((original, Some(mutation_kind), Some(counter), prior_operation, prior_key)) = evidence
@@ -2074,7 +2074,7 @@ pub(crate) fn migrate_legacy_repository_secret_envelope(
     database_path: &Path,
     workspace_id: &str,
     credential_id: &str,
-    legacy_revision: u64,
+    legacy_counter: u64,
     operation_id: &str,
     purpose: &str,
     nonce: &[u8],
@@ -2092,7 +2092,7 @@ pub(crate) fn migrate_legacy_repository_secret_envelope(
         Error::RegistryInconsistency("Repository secret migration nonce is invalid".to_string())
     })?;
     let old_aad = format!(
-        "yoi/repository-secret/v1/{workspace_id}/{credential_id}/{legacy_revision}/{purpose}"
+        "yoi/repository-secret/v1/{workspace_id}/{credential_id}/{legacy_counter}/{purpose}"
     );
     let mut plaintext = zeroize::Zeroizing::new(ciphertext.to_vec());
     let plaintext_len = key

@@ -187,7 +187,7 @@ WHEN EXISTS (
       AND memory_id = NEW.memory_id
       AND revision = NEW.revision
 ) BEGIN
-    SELECT RAISE(ABORT, 'subjektiv revision evidence is sealed');
+    SELECT RAISE(ABORT, 'subjektiv memory history evidence is sealed');
 END;
 CREATE TRIGGER memory_revision_derivations_no_late_insert
 BEFORE INSERT ON memory_revision_derivations
@@ -220,11 +220,11 @@ END;
 
 CREATE TRIGGER memory_revision_seals_no_update
 BEFORE UPDATE ON memory_revision_seals BEGIN
-    SELECT RAISE(ABORT, 'subjektiv revision seals are immutable');
+    SELECT RAISE(ABORT, 'subjektiv memory history seals are immutable');
 END;
 CREATE TRIGGER memory_revision_seals_no_delete
 BEFORE DELETE ON memory_revision_seals BEGIN
-    SELECT RAISE(ABORT, 'subjektiv revision seals are retained');
+    SELECT RAISE(ABORT, 'subjektiv memory history seals are retained');
 END;
 CREATE TRIGGER staging_resolution_seals_no_update
 BEFORE UPDATE ON staging_resolution_seals BEGIN
@@ -245,19 +245,19 @@ END;
 
 CREATE TRIGGER memory_revisions_no_update
 BEFORE UPDATE ON memory_revisions BEGIN
-    SELECT RAISE(ABORT, 'subjektiv memory revisions are immutable');
+    SELECT RAISE(ABORT, 'subjektiv memory history entries are immutable');
 END;
 CREATE TRIGGER memory_revisions_no_delete
 BEFORE DELETE ON memory_revisions BEGIN
-    SELECT RAISE(ABORT, 'subjektiv memory revisions are retained');
+    SELECT RAISE(ABORT, 'subjektiv memory history entries are retained');
 END;
 CREATE TRIGGER memory_revision_candidates_no_update
 BEFORE UPDATE ON memory_revision_candidates BEGIN
-    SELECT RAISE(ABORT, 'subjektiv revision evidence is immutable');
+    SELECT RAISE(ABORT, 'subjektiv memory history evidence is immutable');
 END;
 CREATE TRIGGER memory_revision_candidates_no_delete
 BEFORE DELETE ON memory_revision_candidates BEGIN
-    SELECT RAISE(ABORT, 'subjektiv revision evidence is retained');
+    SELECT RAISE(ABORT, 'subjektiv memory history evidence is retained');
 END;
 CREATE TRIGGER memory_revision_derivations_no_update
 BEFORE UPDATE ON memory_revision_derivations BEGIN
@@ -858,7 +858,8 @@ mod tests {
         subject_id: String,
         body_md: String,
         memory_refs: Vec<MemoryChangeRef>,
-        built_from_store_revision: u64,
+        #[serde(rename = "built_from_store_revision")]
+        legacy_memory_counter: u64,
         created_at: String,
     }
     static V1_MIGRATIONS: &[FeatureMigration] = &[FeatureMigration::new(
@@ -983,7 +984,7 @@ mod tests {
                 subject_id: subject_id.clone(),
                 body_md: "Legacy summary without generation-policy evidence.".into(),
                 memory_refs: Vec::new(),
-                built_from_store_revision: 0,
+                legacy_memory_counter: 0,
                 created_at: now(),
             };
             store
@@ -1010,7 +1011,7 @@ mod tests {
                         params![
                             subject_id,
                             snapshot.id,
-                            to_i64(snapshot.built_from_store_revision)?,
+                            to_i64(snapshot.legacy_memory_counter)?,
                             serde_json::to_string(&snapshot)?,
                             snapshot.created_at
                         ],

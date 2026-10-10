@@ -89,7 +89,7 @@ fn migrate_content_state_v85_to_v86(conn: &Connection) -> Result<()> {
             "worker_create_reservations",
             "memory_settings_revision",
         )? {
-            remove_legacy_reservation_memory_revision(&tx)?;
+            remove_legacy_reservation_memory_counter(&tx)?;
         }
         // Older retained chains rebuilt this table without the lookup index.
         // Converge on the canonical schema for both legacy creation paths.
@@ -169,7 +169,7 @@ fn migrate_content_state_v85_to_v86(conn: &Connection) -> Result<()> {
     result
 }
 
-fn remove_legacy_reservation_memory_revision(conn: &Connection) -> Result<()> {
+fn remove_legacy_reservation_memory_counter(conn: &Connection) -> Result<()> {
     // This is the exact table CHECK introduced by the frozen v52 -> v53
     // migration. Fresh v85 databases do not have it. Do not rewrite arbitrary
     // constraints: SQLite's DROP COLUMN must still reject unknown dependencies.

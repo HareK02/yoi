@@ -161,11 +161,11 @@ Deno.test("Skill parser fails closed on unknown fields and newer enum values", (
   );
 });
 
-Deno.test("Skill parser rejects removed revision fields and oversized collections or strings", () => {
-  const legacyRevision = catalogFixture();
-  (legacyRevision.projection as Record<string, unknown>).config_revision = 1;
+Deno.test("Skill parser rejects unknown projection fields and oversized collections or strings", () => {
+  const legacyCounter = catalogFixture();
+  (legacyCounter.projection as Record<string, unknown>).unexpected_field = 1;
   assertContractError(
-    () => parseSkillCatalogResponse(legacyRevision),
+    () => parseSkillCatalogResponse(legacyCounter),
     "unknown fields",
   );
 

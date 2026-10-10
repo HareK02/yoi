@@ -197,12 +197,12 @@ Deno.test("config source API rejects mismatched entry map paths", async () => {
   );
 });
 
-Deno.test("config source API rejects removed snapshot revision fields and oversized entry content", () => {
+Deno.test("config source API rejects unknown snapshot fields and oversized entry content", () => {
   assertThrows(
     () =>
       parseWorkspaceConfigTreeResponse({
         ...tree,
-        snapshot: { ...snapshot, revision: 7 },
+        snapshot: { ...snapshot, unexpected_field: true },
       }),
     ConfigSourceApiError,
     "invalid response",

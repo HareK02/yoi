@@ -155,7 +155,7 @@ use crate::auth::{
 };
 use crate::authority::{
     MemoryAuthority, ObjectiveAuthority, ObjectiveCreateInput, ObjectiveEditInput,
-    SqliteWorkspaceAuthority, TicketAuthority, TicketMergeRevisionSource, merge_request_summary,
+    SqliteWorkspaceAuthority, TicketAuthority, TicketSourceCommitResolver, merge_request_summary,
 };
 use crate::backend_job::{
     ABSOLUTE_MAX_CONCURRENT_JOBS, BackendJobAttemptRecord, BackendJobAttemptState,
@@ -3607,11 +3607,9 @@ impl WorkspaceApi {
         // The observer snapshot retains the unconfigured authority, not itself:
         // source observation uses Repository access + Runtime authority without a cycle.
         let observer_api = api.clone();
-        api.authority =
-            api.authority
-                .with_merge_revision_source(Arc::new(RuntimeTicketMergeRevisionSource {
-                    api: observer_api,
-                }));
+        api.authority = api.authority.with_source_commit_resolver(Arc::new(
+            RuntimeTicketSourceCommitResolver { api: observer_api },
+        ));
         if let Some(dispatcher) = worker_remove_dispatcher {
             dispatcher
                 .install_executor(Arc::new(
@@ -4635,7 +4633,7 @@ impl WorkspaceApi {
                         &self.config.workspace_id,
                         &delivery_id,
                         BackendJobDeliveryState::Failed,
-                        Some("current_revision_unavailable"),
+                        Some("current_ticket_content_unavailable"),
                         Some(&error.to_string()),
                         &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
                     );
@@ -4657,7 +4655,7 @@ impl WorkspaceApi {
                 }
                 Ok(ticket_item_checker::TicketItemCheckNotification::Stale) => {
                     let detail = format!(
-                        "checked revision {} is no longer current ({})",
+                        "checked Ticket content digest {} is no longer current ({})",
                         checker_input.content_digest,
                         ticket_item_checker::content_digest(&current_ticket)
                     );
@@ -4665,7 +4663,7 @@ impl WorkspaceApi {
                         &self.config.workspace_id,
                         &delivery_id,
                         BackendJobDeliveryState::Completed,
-                        Some("notification_suppressed_stale_revision"),
+                        Some("notification_suppressed_stale_ticket_content"),
                         Some(&detail),
                         &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
                     );
@@ -15190,12 +15188,12 @@ struct MergeRequestRepositorySource {
 }
 
 #[derive(Clone)]
-struct RuntimeTicketMergeRevisionSource {
+struct RuntimeTicketSourceCommitResolver {
     api: WorkspaceApi,
 }
 
-impl TicketMergeRevisionSource for RuntimeTicketMergeRevisionSource {
-    fn resolve_subject_ref(
+impl TicketSourceCommitResolver for RuntimeTicketSourceCommitResolver {
+    fn resolve_source_commit(
         &self,
         ticket_id: &str,
         repository_id: &str,
@@ -15357,6 +15355,9 @@ fn remap_source_ref_error(error: ApiError) -> ApiError {
     }
 }
 
+/// Observe the provider-published source commit through the assigned Runtime, not
+/// a Server-local checkout. Open/list/show/review/complete paths call this at the
+/// point they need current source evidence; provider failure remains unavailable.
 fn observe_published_source_ref(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -15368,6 +15369,10 @@ fn observe_published_source_ref(
         .map_err(remap_source_ref_error)
 }
 
+/// Before opening an MR or granting review of an open MR, re-read the current
+/// Coder attachments and require one clean checkout of the same Repository,
+/// normalized branch selector and provider-published HEAD commit. A newer
+/// observation time alone says nothing about which code is being reviewed.
 fn require_assigned_workdir_source(
     api: &WorkspaceApi,
     assignment: &crate::store::TicketWorkerAssignmentRecord,
@@ -15457,7 +15462,7 @@ fn validate_assigned_workdir_source(
     if !workdir_selector_matches || workdir.current_ref.as_deref() != Some(resolved_ref) {
         return Err(
             worker_runtime::working_directory::WorkingDirectoryDiagnostic {
-                code: "source_ref_revision_mismatch".to_string(),
+                code: "source_workdir_ref_mismatch".to_string(),
                 message: "Current Coder Workdir selector and HEAD do not match the provider-published source ref".to_string(),
             },
         );
@@ -18017,7 +18022,7 @@ fn list_current_worker_workdir_catalog_for_worker(
         workspace_id: api.config.workspace_id.clone(),
         items,
         next_cursor: page.next_cursor,
-        digest: page.revision,
+        digest: page.catalog_digest,
     })
 }
 
@@ -18033,7 +18038,7 @@ fn list_current_worker_workdir_attachments(
             Error::InvalidInput("attachment page limit must be 1..=100".to_string()).into(),
         );
     }
-    let (mut links, digest) = api.store.list_worker_workdir_links_page_with_revision(
+    let (mut links, digest) = api.store.list_worker_workdir_links_page_with_digest(
         &api.config.workspace_id,
         worker,
         limit + 1,
@@ -20839,7 +20844,7 @@ async fn scoped_subjektiv_memory_backend(
         ),
         Op::ValidateProposal(_) => (
             Some(SubjektivWorkerAuthority::Subject),
-            "revision proposal validation",
+            "Memory proposal validation",
         ),
         Op::ReceiptStatus(_) => (
             Some(SubjektivWorkerAuthority::Subject),
@@ -21289,7 +21294,7 @@ async fn scoped_list_skills(
         .load_workspace_config(&path.workspace_id)?
         .ok_or_else(|| {
             Error::RegistryInconsistency(format!(
-                "Workspace {} has no active config revision",
+                "Workspace {} has no active config snapshot",
                 path.workspace_id
             ))
         })?;
@@ -21306,7 +21311,7 @@ async fn scoped_lint_skills(
         .load_workspace_config(&path.workspace_id)?
         .ok_or_else(|| {
             Error::RegistryInconsistency(format!(
-                "Workspace {} has no active config revision",
+                "Workspace {} has no active config snapshot",
                 path.workspace_id
             ))
         })?;
@@ -21323,7 +21328,7 @@ async fn scoped_get_skill(
         .load_workspace_config(&path.workspace_id)?
         .ok_or_else(|| {
             Error::RegistryInconsistency(format!(
-                "Workspace {} has no active config revision",
+                "Workspace {} has no active config snapshot",
                 path.workspace_id
             ))
         })?;
@@ -21342,7 +21347,7 @@ async fn scoped_activate_skill(
         .load_workspace_config(&path.workspace_id)?
         .ok_or_else(|| {
             Error::RegistryInconsistency(format!(
-                "Workspace {} has no active config revision",
+                "Workspace {} has no active config snapshot",
                 path.workspace_id
             ))
         })?;
@@ -21611,7 +21616,7 @@ async fn scoped_confirm_repository_ssh_host_trust(
         })?;
     if request.expected_host_key_fingerprint != probe.expected_host_key_fingerprint {
         return Err(ApiError::from(Error::WorkspaceConfigConflict(
-            "SSH host trust revision changed after the connection test".to_string(),
+            "SSH host trust fingerprint changed after the connection test".to_string(),
         )));
     }
     let host_trust = api.repository_secrets.put_host_trust(
@@ -32899,9 +32904,7 @@ fn api_error_status(error: &Error) -> StatusCode {
             StatusCode::NOT_IMPLEMENTED
         }
         Error::RuntimeOperationFailed { code, .. }
-            if code == "profile_registry_revision_conflict"
-                || code == "profile_source_revision_conflict"
-                || code == "workspace_metadata_updated_at_conflict"
+            if code == "workspace_metadata_updated_at_conflict"
                 || code == "workspace_cleanup_plan_stale"
                 || code == "workspace_cleanup_worker_blocked"
                 || code == "workspace_cleanup_workdir_blocked"
@@ -35929,6 +35932,10 @@ mod tests {
         );
     }
 
+    // Architectural source check, run by the ordinary Server unit suite: route
+    // wiring must use Runtime/provider authority and capability validation must
+    // precede provider access. This is not a freshness proof; the boundary tests
+    // below and ticket_evidence_tests exercise commit/content equality directly.
     #[test]
     fn merge_request_http_paths_observe_refs_through_runtime_provider_authority() {
         let source = include_str!("server.rs");
@@ -36034,8 +36041,57 @@ mod tests {
                 "work/T-549",
                 "abc123"
             ),
-            Err(diagnostic) if diagnostic.code == "source_ref_revision_mismatch"
+            Err(diagnostic) if diagnostic.code == "source_workdir_ref_mismatch"
         ));
+
+        // A recent observation cannot excuse the wrong branch, a missing HEAD,
+        // another Repository or unobserved cleanliness. Each input isolates one
+        // externally observed source requirement.
+        workdir.current_ref = Some("abc123".into());
+        workdir.observed_at_epoch_seconds = Some(u64::MAX);
+        for (repository_id, selector, head, cleanliness, expected_code) in [
+            (
+                "other-repository",
+                "work/T-549",
+                Some("abc123"),
+                Some("clean"),
+                "source_workdir_repository_mismatch",
+            ),
+            (
+                "repository-1",
+                "other-branch",
+                Some("abc123"),
+                Some("clean"),
+                "source_workdir_ref_mismatch",
+            ),
+            (
+                "repository-1",
+                "work/T-549",
+                None,
+                Some("clean"),
+                "source_workdir_ref_mismatch",
+            ),
+            (
+                "repository-1",
+                "work/T-549",
+                Some("abc123"),
+                None,
+                "source_workdir_dirty",
+            ),
+        ] {
+            workdir.repository_id = repository_id.into();
+            workdir.current_selector = Some(selector.into());
+            workdir.current_ref = head.map(str::to_owned);
+            workdir.cleanliness = cleanliness.map(str::to_owned);
+            let diagnostic = validate_assigned_workdir_source(
+                &workdir,
+                "repository-1",
+                "refs/heads/work/T-549",
+                "abc123",
+            )
+            .unwrap_err();
+            assert_eq!(diagnostic.code, expected_code);
+        }
     }
 
     fn completed_upload_file(sha256: &str) -> protocol::UploadedFileRef {
@@ -40003,9 +40059,7 @@ mod tests {
             created["behavior_md"],
             "Prefer explicit evidence.\nAsk when uncertain."
         );
-        assert!(created.get("behavior_revision").is_none());
         assert_eq!(created["state"], "active");
-        assert!(created.get("store_revision").is_none());
         assert!(created.get("current_worker").is_none());
         let created_id = created["id"].as_str().unwrap();
         let persisted = store.subject(created_id).unwrap().unwrap();
@@ -40040,7 +40094,6 @@ mod tests {
         )
         .await;
         assert_eq!(updated["behavior_md"], "Updated without rewriting history.");
-        assert!(updated.get("behavior_revision").is_none());
         request_json_authenticated(
             app.clone(),
             "PATCH",
@@ -40066,7 +40119,6 @@ mod tests {
         )
         .await;
         assert_eq!(cleared["behavior_md"], "");
-        assert!(cleared.get("behavior_revision").is_none());
         assert!(
             api.store
                 .current_worker_singleton_owner(
@@ -42897,7 +42949,7 @@ mod tests {
         );
 
         let unknown_identity = RuntimeIdentityMaterial::generate("unknown-runtime").unwrap();
-        let unknown_revision = create_remote_runtime(
+        let unknown_key_generation = create_remote_runtime(
             State(api.clone()),
             Extension(test_owner_actor()),
             Json(CreateRemoteRuntimeRequest {
@@ -42914,7 +42966,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(
-            unknown_revision.into_response().status(),
+            unknown_key_generation.into_response().status(),
             StatusCode::CONFLICT
         );
 
@@ -44249,7 +44301,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_checker_burst_keeps_excess_revisions_durable_and_drains_them() {
+    async fn ticket_checker_burst_keeps_excess_content_checks_durable_and_drains_them() {
         let temp = tempfile::tempdir().unwrap();
         let (api, _execution) = test_api_with_recording_backend(temp.path()).await;
         let source = spawn_ticket_check_source(&api, "ticket-check-burst-author");
@@ -44318,7 +44370,7 @@ mod tests {
         );
 
         // Restart reconciliation is idempotent for running attempts and retains
-        // the queued revisions until a slot becomes available.
+        // the queued content checks until a slot becomes available.
         api.recover_backend_jobs().unwrap();
         let mut completed = std::collections::BTreeSet::new();
         for _ in 0..300 {
@@ -44421,7 +44473,7 @@ mod tests {
         ];
         let mut checked_inputs = Vec::new();
         for (ticket, source, expected_body) in snapshots {
-            let revision = ticket_item_checker::content_digest(&ticket);
+            let content_digest = ticket_item_checker::content_digest(&ticket);
             let mut jobs = ticket_check_jobs_for_snapshot(&api, &ticket);
             assert_eq!(
                 jobs.len(),
@@ -44430,7 +44482,7 @@ mod tests {
             );
             let job = jobs.pop().unwrap();
             let input = ticket_item_checker::parse_input(&job.request.input).unwrap();
-            assert_eq!(input.content_digest, revision);
+            assert_eq!(input.content_digest, content_digest);
             assert_eq!(input.body, expected_body);
             assert_eq!(job.request.source_worker.as_ref(), Some(&source));
             assert_eq!(job.request.notification_target.as_ref(), Some(&source));
@@ -44468,7 +44520,7 @@ mod tests {
         let source = spawn_ticket_check_source(&api, "ticket-check-editor");
         let backend = browser_ticket_backend(&api).unwrap();
         let ticket_ref = backend
-            .create(ticket::NewTicket::new("Checker revision fencing"))
+            .create(ticket::NewTicket::new("Checker content freshness"))
             .unwrap();
 
         let edit = |body: &str| TicketBackendOperation::EditItem {
@@ -44563,7 +44615,7 @@ mod tests {
         assert_eq!(stale_delivery.state, BackendJobDeliveryState::Completed);
         assert_eq!(
             stale_delivery.failure_category.as_deref(),
-            Some("notification_suppressed_stale_revision")
+            Some("notification_suppressed_stale_ticket_content")
         );
 
         api.accept_backend_job_result(
@@ -48559,11 +48611,11 @@ mod tests {
         );
         let Json(replayed) = call(request.clone()).await.unwrap();
         assert_eq!(replayed.events, completed.events);
-        for field in ["reason", "revision", "state", "references"] {
+        for field in ["reason", "content_digest", "state", "references"] {
             let mut changed = request.clone();
             match field {
                 "reason" => changed.reason = "different judgment".into(),
-                "revision" => changed.expected_content_digest = "stale".into(),
+                "content_digest" => changed.expected_content_digest = "stale".into(),
                 "state" => changed.expected_state = TicketWorkflowState::Planning,
                 "references" => changed.references.push(ticket::TicketReference {
                     kind: "document".into(),
@@ -49989,7 +50041,7 @@ mod tests {
             Json(server_api::BrowserTransitionTicketStateRequest {
                 state: server_api::BrowserTicketWorkflowState::Done,
                 operation_key: "stale".into(),
-                expected_content_digest: "stale-revision".into(),
+                expected_content_digest: "stale-content-digest".into(),
                 expected_state: server_api::BrowserTicketWorkflowState::Planning,
                 reason: "Stale decision".into(),
                 body: None,
@@ -52440,7 +52492,7 @@ mod tests {
                     .uri(format!("/api/w/{TEST_WORKSPACE_ID}/workers/remove"))
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"target_runtime_id":"runtime-target","target_worker_id":"target-worker","expected_worker_revision":"revision-1","reason":"retire target Worker","source_proof":"browser-controlled","actor":"orchestrator","policy":"purge"}"#,
+                        r#"{"target_runtime_id":"runtime-target","target_worker_id":"target-worker","reason":"retire target Worker","source_proof":"browser-controlled","actor":"orchestrator","policy":"purge"}"#,
                     ))
                     .unwrap(),
             )
@@ -54116,7 +54168,7 @@ mod tests {
             restarted
                 .workdir_catalog_page(TEST_WORKSPACE_ID, 100, None)
                 .unwrap()
-                .revision
+                .catalog_digest
         );
         let no_worker = runtime_source_request(&identity, None, "GET", &base, Vec::new());
         assert_eq!(
@@ -54559,7 +54611,7 @@ mod tests {
         assert_eq!(page.next_offset, None);
         assert_eq!(
             page.digest, first.digest,
-            "lookup does not narrow the collection revision"
+            "lookup does not narrow the collection digest"
         );
 
         let foreign_worker_id = seed_cleanup_worker(api, 902, "normal");
@@ -54621,7 +54673,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             unchanged, first,
-            "another caller's connection cannot change this revision"
+            "another caller's connection cannot change this digest"
         );
         api.store
             .detach_worker_workdir_connection(
@@ -54657,8 +54709,8 @@ mod tests {
         assert_eq!(capability_changed.items, reattached.items);
         assert_ne!(capability_changed.digest, reattached.digest);
         let restarted = SqliteWorkspaceStore::open(&api.config.database_path).unwrap();
-        let (restarted_page, restarted_revision) = restarted
-            .list_worker_workdir_links_page_with_revision(
+        let (restarted_page, restarted_digest) = restarted
+            .list_worker_workdir_links_page_with_digest(
                 TEST_WORKSPACE_ID,
                 &fixture.worker,
                 51,
@@ -54667,8 +54719,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(restarted_page.len(), 51);
-        assert_eq!(restarted_revision, capability_changed.digest);
-        // A SQLite backup restores the same authoritative content/revision, without a sync store.
+        assert_eq!(restarted_digest, capability_changed.digest);
+        // A SQLite backup restores the same authoritative content/digest, without a sync store.
         let source = rusqlite::Connection::open(&api.config.database_path).unwrap();
         let mut snapshot = rusqlite::Connection::open_in_memory().unwrap();
         rusqlite::backup::Backup::new(&source, &mut snapshot)
@@ -54678,7 +54730,7 @@ mod tests {
         let restored = SqliteWorkspaceStore::from_connection(snapshot).unwrap();
         assert_eq!(
             restored
-                .list_worker_workdir_links_page_with_revision(
+                .list_worker_workdir_links_page_with_digest(
                     TEST_WORKSPACE_ID,
                     &fixture.worker,
                     51,
@@ -54686,10 +54738,10 @@ mod tests {
                     None
                 )
                 .unwrap(),
-            (restarted_page, restarted_revision)
+            (restarted_page, restarted_digest)
         );
         // Independent SQLite connections race a last-row capability update against exact lookup.
-        // The page and complete revision must always describe the same snapshot, not two reads.
+        // The page and complete collection digest must always describe the same snapshot, not two reads.
         let mut read_write_links = api
             .store
             .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
@@ -54710,8 +54762,8 @@ mod tests {
                 &read_write_links,
             )
             .unwrap();
-        let (_, read_write_revision) = restarted
-            .list_worker_workdir_links_page_with_revision(
+        let (_, read_write_digest) = restarted
+            .list_worker_workdir_links_page_with_digest(
                 TEST_WORKSPACE_ID,
                 &fixture.worker,
                 1,
@@ -54719,7 +54771,7 @@ mod tests {
                 Some(&replacement.connection_id),
             )
             .unwrap();
-        assert_ne!(read_write_revision, capability_changed.digest);
+        assert_ne!(read_write_digest, capability_changed.digest);
         let reader = SqliteWorkspaceStore::open(&api.config.database_path).unwrap();
         let barrier = Arc::new(std::sync::Barrier::new(2));
         std::thread::scope(|scope| {
@@ -54743,8 +54795,8 @@ mod tests {
             });
             barrier.wait();
             for _ in 0..100 {
-                let (page, revision) = reader
-                    .list_worker_workdir_links_page_with_revision(
+                let (page, digest) = reader
+                    .list_worker_workdir_links_page_with_digest(
                         TEST_WORKSPACE_ID,
                         worker,
                         1,
@@ -54753,13 +54805,13 @@ mod tests {
                     )
                     .unwrap();
                 assert_eq!(page.len(), 1);
-                if revision == read_write_revision {
+                if digest == read_write_digest {
                     assert_eq!(
                         page[0].capabilities,
                         workdir::WorkdirSessionCapabilities::READ_WRITE
                     );
                 } else {
-                    assert_eq!(revision, capability_changed.digest);
+                    assert_eq!(digest, capability_changed.digest);
                     assert_eq!(
                         page[0].capabilities,
                         workdir::WorkdirSessionCapabilities::READ_ONLY
@@ -57895,7 +57947,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_removal_config_and_revision_guards_preserve_active_trust() {
+    async fn runtime_removal_config_and_binding_identity_guards_preserve_active_trust() {
         let root = tempfile::tempdir().unwrap();
         let api = test_api(root.path()).await;
         let original = register_test_runtime(&api, "guarded-runtime").await;
@@ -61450,14 +61502,14 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
         .await;
         let committed_digest = committed["snapshot"]["digest"].as_str().unwrap();
 
-        let revision_snapshot = get_json(
+        let config_snapshot = get_json(
             app.clone(),
             &format!("{source_tree_path}/history/{committed_digest}"),
         )
         .await;
-        assert_eq!(revision_snapshot["digest"], committed_digest);
+        assert_eq!(config_snapshot["digest"], committed_digest);
         assert_eq!(
-            revision_snapshot["entries"]["notes/readme.txt"]["content"],
+            config_snapshot["entries"]["notes/readme.txt"]["content"],
             "nested entry"
         );
 
@@ -61484,7 +61536,6 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
         let path = format!("/api/w/{TEST_WORKSPACE_ID}/settings/profiles");
         let settings = get_json(app.clone(), &path).await;
         assert_eq!(settings["default_profile"], "builtin:companion");
-        assert!(settings.get("config_revision").is_none());
         assert!(settings["tree_digest"].as_str().is_some());
         assert!(settings["projection_digest"].as_str().is_some());
         assert!(

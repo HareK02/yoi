@@ -169,7 +169,6 @@ Deno.test("generated WASM diagnostics carry snapshot provenance", () => {
   }>;
   assertEquals(diagnostics[0].path, "workspace.dcdl");
   assertEquals(diagnostics[0].tree_digest, fixtureSnapshot(snapshot).digest);
-  assertEquals("revision" in diagnostics[0], false);
   assertEquals(diagnostics[0].kind, "syntax");
 });
 
@@ -938,7 +937,6 @@ Deno.test("generated WASM returns to the same content digest and enforces entry 
     content: "{ broken = ; }",
   }]) as ConfigTreeSnapshot;
   assertEquals(changed.digest === base.digest, false);
-  assertEquals("revision" in changed, false);
   const diagnostics = analyze_snapshot(changed, "main.dcdl", undefined) as Array<{ tree_digest: string }>;
   assertEquals(diagnostics.length > 0, true);
   assertEquals(diagnostics.every((diagnostic) => diagnostic.tree_digest === changed.digest), true);

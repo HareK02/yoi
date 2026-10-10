@@ -62,7 +62,7 @@ fn migrate_runtime_bindings_v87_to_v88(conn: &Connection) -> Result<()> {
             )?;
             if unsupported {
                 return Err(Error::Store(
-                    "unsupported legacy Workspace signing identity revision".into(),
+                    "legacy Workspace signing identity counter must equal one".into(),
                 ));
             }
         }

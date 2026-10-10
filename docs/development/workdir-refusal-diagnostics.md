@@ -3,7 +3,7 @@
 This change improves the internal `api_error` record for
 `POST /api/w/{workspace_id}/workers/self/workdir-session/operations`.
 It does **not** identify or resolve the reported 2026-10-09 403: the running
-binary revision and actual request are still unverified. Fixture success is
+binary source commit and actual request are still unverified. Fixture success is
 not evidence about that incident. No deployment, live asset cleanup, privilege
 change, retry policy, or WIP dependency/version change is included (WIP remains
 0.2.0).

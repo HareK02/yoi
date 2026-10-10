@@ -28,7 +28,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 88;
+const LATEST_SCHEMA_VERSION: i64 = 89;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -275,6 +275,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 88,
         name: "Runtime binding identities and retention content contracts",
         apply: migrate_runtime_bindings_v87_to_v88,
+    },
+    Migration {
+        version: 89,
+        name: "descriptive legacy evidence columns",
+        apply: migrate_evidence_column_names_v88_to_v89,
     },
 ];
 
@@ -956,7 +961,7 @@ pub struct WorkdirRegistryRecord {
     pub updated_at: String,
 }
 
-/// Projection inputs captured together with the catalog revision in one SQLite snapshot.
+/// Projection inputs captured together with the catalog digest in one SQLite snapshot.
 #[derive(Debug, Clone)]
 pub struct WorkdirCatalogEntry {
     pub record: WorkdirRegistryRecord,
@@ -970,7 +975,9 @@ pub struct WorkdirCatalogEntry {
 pub struct WorkdirCatalogPage {
     pub entries: Vec<WorkdirCatalogEntry>,
     pub next_cursor: Option<String>,
-    pub revision: String,
+    /// SHA-256 of the full safe public catalog projection, independent of this page.
+    /// The entries and digest are read in one SQLite transaction.
+    pub catalog_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2126,7 +2133,7 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         offset: u32,
         connection_id: Option<&str>,
     ) -> Result<Vec<WorkerWorkdirLinkRecord>>;
-    fn list_worker_workdir_links_page_with_revision(
+    fn list_worker_workdir_links_page_with_digest(
         &self,
         workspace_id: &str,
         worker: &RuntimeWorkerRef,
@@ -6760,7 +6767,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{attempt_id}`")))?;
             if attempt.attempt != job.current_attempt || attempt.input_digest != job.request.input_digest()? {
                 return Err(Error::InvalidInput(
-                    "Backend Job attempt is stale for the current input revision".to_string(),
+                    "Backend Job attempt is stale for the current input digest".to_string(),
                 ));
             }
             if let Some(bound) = &attempt.worker {
@@ -6875,7 +6882,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 || attempt.attempt != job.current_attempt
             {
                 return Err(Error::InvalidInput(
-                    "Backend Job result is stale for the current attempt or input revision".to_string(),
+                    "Backend Job result is stale for the current attempt or input digest".to_string(),
                 ));
             }
             if attempt.worker.as_ref() != Some(source_worker) {
@@ -9369,7 +9376,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             Ok(WorkdirCatalogPage {
                 entries,
                 next_cursor,
-                revision: hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                catalog_digest: hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
             })
         })
     }
@@ -10421,7 +10428,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         offset: u32,
         connection_id: Option<&str>,
     ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
-        self.list_worker_workdir_links_page_with_revision(
+        self.list_worker_workdir_links_page_with_digest(
             workspace_id,
             worker,
             limit,
@@ -10431,7 +10438,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         .map(|(links, _)| links)
     }
 
-    fn list_worker_workdir_links_page_with_revision(
+    fn list_worker_workdir_links_page_with_digest(
         &self,
         workspace_id: &str,
         worker: &RuntimeWorkerRef,
@@ -12636,7 +12643,7 @@ struct FrozenWorkspaceRuntimeBinding {
     base_url: String,
     public_key: String,
     public_key_fingerprint: String,
-    binding_revision: u64,
+    legacy_counter: u64,
     state: WorkspaceRuntimeBindingState,
     authentication_mode: WorkspaceRuntimeAuthenticationMode,
     workspace_key_id: Option<String>,
@@ -12666,7 +12673,7 @@ fn read_frozen_workspace_runtime_binding(
         base_url: row.get(3)?,
         public_key: row.get(4)?,
         public_key_fingerprint: row.get(5)?,
-        binding_revision: row.get(6)?,
+        legacy_counter: row.get(6)?,
         state,
         authentication_mode,
         workspace_key_id: row.get(9)?,
@@ -12681,6 +12688,7 @@ include!("frozen_flow_content_migration.rs");
 include!("frozen_content_state_migration.rs");
 include!("frozen_repository_key_migration.rs");
 include!("frozen_runtime_binding_migration.rs");
+include!("legacy_evidence_column_migration.rs");
 
 fn prepare_connection(conn: &Connection) -> Result<()> {
     prepare_connection_with_secret_source(
@@ -12971,15 +12979,14 @@ fn verify_workspace_runtime_binding_schema(conn: &Connection) -> Result<()> {
             ));
         }
     }
-    let revision_default = conn.query_row(
+    let legacy_counter_default = conn.query_row(
         "SELECT dflt_value FROM pragma_table_info('workspace_runtime_bindings') WHERE name = 'binding_revision'",
         [],
         |row| row.get::<_, Option<String>>(0),
     )?;
-    if revision_default.as_deref() != Some("1") {
+    if legacy_counter_default.as_deref() != Some("1") {
         return Err(Error::Store(
-            "workspace_runtime_bindings binding_revision default does not match schema-52"
-                .to_string(),
+            "legacy Runtime binding counter default must equal one for schema-52".to_string(),
         ));
     }
     let sql = conn.query_row(
@@ -13072,7 +13079,7 @@ fn verify_workspace_runtime_binding_schema(conn: &Connection) -> Result<()> {
                 base_url: row.get(3)?,
                 public_key: row.get(4)?,
                 public_key_fingerprint: row.get(5)?,
-                binding_revision: row.get(6)?,
+                legacy_counter: row.get(6)?,
                 state: if row.get::<_, Option<String>>(9)?.is_some() {
                     WorkspaceRuntimeBindingState::Revoked
                 } else {
@@ -14647,7 +14654,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn schema_v74_migrates_historical_worker_projection_rows_without_revision_state() {
+    fn schema_v74_migrates_historical_worker_projection_rows_without_counter_state() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("workspace.db");
         drop(SqliteWorkspaceStore::open(&path).unwrap());
@@ -16326,6 +16333,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 
     include!("schema_equivalence_tests.rs");
     include!("migration_entrypoint_tests.rs");
+    include!("legacy_evidence_column_tests.rs");
 
     fn prepare_retained_schema(path: &Path, version: i64) {
         prepare_schema_v52(path);
@@ -16638,6 +16646,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     version: 88,
                     name: "Runtime binding identities and retention content contracts".to_string()
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 89,
+                    name: "descriptive legacy evidence columns".to_string()
+                },
             ]
         );
 
@@ -16736,6 +16748,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (86, "content-fenced config, Memory settings and Jobs".to_string()),
 (87, "Repository SSH key identities and encrypted operation objects".to_string()),
 (88, "Runtime binding identities and retention content contracts".to_string()),
+(89, "descriptive legacy evidence columns".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -16954,14 +16967,14 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 workspace_id, job_id, purpose, input_revision, input_ref, request_json,
                 intent_fingerprint, state, current_attempt, created_at, updated_at
             ) VALUES (
-                'workspace-a', 'job-a', 'check', 'revision-a', 'test://job-a', '{}',
+                'workspace-a', 'job-a', 'check', 'legacy-input-token', 'test://job-a', '{}',
                 'sha256:test', 'pending', 1, '1', '1'
             );
             INSERT INTO backend_job_attempts (
                 workspace_id, job_id, attempt_id, attempt, input_revision, state,
                 deadline_at, created_at, updated_at
             ) VALUES (
-                'workspace-a', 'job-a', 'job-a:attempt:1', 1, 'revision-a', 'reserved',
+                'workspace-a', 'job-a', 'job-a:attempt:1', 1, 'legacy-input-token', 'reserved',
                 '2', '1', '1'
             );
             INSERT INTO backend_job_deliveries (
@@ -17659,7 +17672,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     }
 
     #[test]
-    fn workspace_runtime_verification_is_revision_bound_and_restart_safe() {
+    fn workspace_runtime_verification_is_key_bound_and_restart_safe() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
         let store = SqliteWorkspaceStore::open(&path).unwrap();
@@ -18063,7 +18076,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     }
 
     #[test]
-    fn runtime_binding_key_mutations_are_revisioned_idempotent_and_audited() {
+    fn runtime_binding_key_mutations_are_identity_guarded_idempotent_and_audited() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
         store
             .with_conn(|conn| {
@@ -18444,7 +18457,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     }
 
     #[tokio::test]
-    async fn workspace_display_name_update_is_revision_guarded_and_preserves_identity() {
+    async fn workspace_display_name_update_is_timestamp_guarded_and_preserves_identity() {
         let dir = tempfile::tempdir().unwrap();
         let database_path = dir.path().join("server.db");
         let store = SqliteWorkspaceStore::open(&database_path).unwrap();
@@ -23188,7 +23201,7 @@ INSERT INTO worker_registry (
             let mut refresh = resource_job_request(
                 &format!("surface-{surface_state}"),
                 &subject,
-                "surface-revision",
+                "surface-generation",
             );
             refresh
                 .grants
@@ -23435,7 +23448,7 @@ INSERT INTO worker_registry (
         let request = BackendJobRequest {
             job_id: "check:T-1:r1".to_string(),
             purpose: "ticket_item_check".to_string(),
-            input_ref: "ticket://T-1/revisions/1".to_string(),
+            input_ref: "ticket://T-1/contents/content-1".to_string(),
             input: serde_json::json!({"title": "check"}),
             instruction: "Check the immutable input.".to_string(),
             profile: "builtin:backend-job".to_string(),

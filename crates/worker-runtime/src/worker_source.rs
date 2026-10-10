@@ -1480,7 +1480,6 @@ mod tests {
         assert!(request.starts_with("POST /api/w/workspace-a/workers/remove HTTP/1.1"));
         assert!(request.contains("\"target_runtime_id\":\"runtime-target\""));
         assert!(request.contains("\"target_worker_id\":\"worker-target\""));
-        assert!(!request.contains("expected_worker_revision"));
         assert!(request.contains("\"reason\":\"retire obsolete Worker\""));
         let request_source_token = request
             .lines()

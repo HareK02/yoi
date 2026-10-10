@@ -1,10 +1,12 @@
 # Reviewer SubWorkerがreview開始前に停止する
 
+Editorial note (2026-10-10): obsolete state terminology is summarized by purpose below; cited IDs, commits and validation results still describe the original investigation, not new executions.
+
 ## 状況
 
 T-698の公開済みMerge Requestに対して、`builtin:reviewer`を指定し、対象Ticket/Merge Request、writable delegated scope、command grantを明示してReviewer SubWorkerを3回起動した。
 
-いずれも`review_requested` eventは正しいsource refとTicket revisionを記録したが、SubWorkerは直後に`Stopped`となった。session observationには最初のuser taskだけが存在し、assistant output、tool call、typed review verdictは記録されなかった。Merge Request threadにもapprove/request_changesは追加されなかった。
+いずれも`review_requested` eventは正しいsource refと当時の Ticket item referenceを記録したが、SubWorkerは直後に`Stopped`となった。session observationには最初のuser taskだけが存在し、assistant output、tool call、typed review verdictは記録されなかった。Merge Request threadにもapprove/request_changesは追加されなかった。
 
 ## 障壁
 

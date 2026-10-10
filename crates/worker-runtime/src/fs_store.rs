@@ -3125,11 +3125,9 @@ mod tests {
         }});
         migrate_legacy_request_evidence(&mut document).unwrap();
         let request = &document["request"];
-        assert_eq!(request["memory_settings"]["language"], "English");
-        assert!(
-            request["memory_settings"]
-                .get("settings_revision")
-                .is_none()
+        assert_eq!(
+            request["memory_settings"],
+            serde_json::json!({"workspace_id": "workspace-a", "language": "English"})
         );
         assert_eq!(
             request["repository"]["source_fingerprint"],

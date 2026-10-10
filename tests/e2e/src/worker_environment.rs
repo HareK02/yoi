@@ -422,6 +422,21 @@ impl WorkerE2eEnvironment {
             false,
         )?;
 
+        let enrollment = self.run_command(
+            &runtime_binary,
+            &[
+                "trust-workspace",
+                "show",
+                "--workspace-id",
+                &workspace_id,
+                "--fs-root",
+                self.runtime_data_dir.to_string_lossy().as_ref(),
+            ],
+            false,
+        )?;
+        let enrollment: Value = serde_json::from_slice(&enrollment.stdout)?;
+        let workspace_trust_id = json_string(&enrollment, "/trust_id")?;
+
         let mut command = self.isolated_command(&runtime_binary);
         command.args([
             "--bind",
@@ -449,9 +464,9 @@ impl WorkerE2eEnvironment {
                 .post(format!("{server_url}/api/w/{workspace_id}/runtimes"))
                 .json(&serde_json::json!({
                     "public_bundle": runtime_identity,
+                    "workspace_trust_id": workspace_trust_id,
                     "display_name": format!("E2E {}", self.runtime_id),
-                    "endpoint": runtime_url,
-                    "expected_revision": null
+                    "endpoint": runtime_url
                 })),
             "register Runtime",
         )?;

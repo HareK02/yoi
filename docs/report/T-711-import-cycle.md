@@ -5,7 +5,7 @@ Status: fixed at the snapshot import-loader boundary; regression coverage retain
 
 ## Dogfooding problem
 
-During T-711 builtin-import validation, a nested import cycle in a lazy object caused a stack overflow instead of a recoverable configuration diagnostic. A configuration author could therefore terminate evaluation while writing an invalid recipe, rather than receive an error and keep the active revision. This report records the implementation-session failure and the guard added by the parent config-source implementation; it is not a recommendation to rerun the crashing version inside a live Yoi Worker.
+During T-711 builtin-import validation, a nested import cycle in a lazy object caused a stack overflow instead of a recoverable configuration diagnostic. A configuration author could therefore terminate evaluation while writing an invalid recipe, rather than receive an error and keep the active configuration snapshot. This report records the implementation-session failure and the guard added by the parent config-source implementation; it is not a recommendation to rerun the crashing version inside a live Yoi Worker.
 
 ## Minimal reproducer
 
@@ -59,7 +59,7 @@ cargo test -p config-source --lib builtin_values_do_not_bypass_cycle_or_path_lim
 cargo test -p config-source --lib snapshot_import_depth_is_checked_before_evaluation_recurses
 ```
 
-The server follow-up test `value_profiles_builtin_http_config_tree_is_read_only_and_never_falls_back` separately exercises authenticated HTTP commits: reserved builtin mutations and unknown imports are rejected without changing the active revision, even when a Workspace file exists at the unknown builtin's suffix. Editor import completions remain covered by the WASM editor tests; no server completion endpoint was introduced.
+The server follow-up test `value_profiles_builtin_http_config_tree_is_read_only_and_never_falls_back` separately exercises authenticated HTTP commits: reserved builtin mutations and unknown imports are rejected without changing the active configuration snapshot, even when a Workspace file exists at the unknown builtin's suffix. Editor import completions remain covered by the WASM editor tests; no server completion endpoint was introduced.
 
 ## Operational lesson
 
