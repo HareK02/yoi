@@ -725,7 +725,9 @@ fn public_provenance(origin: &WorkerHistoryProvenance) -> SessionEntryProvenance
         }
         WorkerHistoryProvenance::ModelOutput { .. } => SessionEntryProvenance::ModelOutput,
         WorkerHistoryProvenance::ToolOutput { .. } => SessionEntryProvenance::ToolOutput,
-        WorkerHistoryProvenance::DerivedSummary => SessionEntryProvenance::DerivedSummary,
+        WorkerHistoryProvenance::CompactionSummary | WorkerHistoryProvenance::DerivedSummary => {
+            SessionEntryProvenance::DerivedSummary
+        }
         WorkerHistoryProvenance::LegacyUnknown => SessionEntryProvenance::LegacyUnknown,
     }
 }
@@ -876,6 +878,60 @@ mod tests {
             after.evidence_for(expected_ref.as_str()).unwrap().entry_ref,
             expected_ref
         );
+    }
+
+    #[test]
+    fn host_summary_remains_private_to_compaction_not_observation_or_memory_evidence() {
+        let entries = [
+            (
+                Item::system_message("host-summary-secret"),
+                WorkerHistoryProvenance::CompactionSummary,
+            ),
+            (
+                Item::system_message("other-derived-secret"),
+                WorkerHistoryProvenance::DerivedSummary,
+            ),
+            (
+                Item::system_message("raw-system-secret"),
+                WorkerHistoryProvenance::LegacyUnknown,
+            ),
+            (
+                Item::reasoning("reasoning-secret"),
+                WorkerHistoryProvenance::LegacyUnknown,
+            ),
+        ]
+        .into_iter()
+        .map(|(item, origin)| crate::session_history::history_entry(item, origin))
+        .collect::<Vec<_>>();
+        let refs = entries
+            .iter()
+            .map(|entry| SessionEntryRef::from_history_entry_id(&entry.annotation.entry_id))
+            .collect::<Vec<_>>();
+        let capture = SessionCapture::from_history_entries("segment", entries);
+        assert!(capture.overview().is_empty());
+        assert!(
+            capture
+                .search(&SearchOptions {
+                    query: "secret".into(),
+                    ..SearchOptions::default()
+                })
+                .is_empty()
+        );
+        assert!(
+            capture
+                .read(ReadSelector::EntryRange([0, 3]), ReadOptions::default())
+                .entries
+                .is_empty()
+        );
+        for reference in refs {
+            assert!(capture.evidence_for(reference.as_str()).is_none());
+            assert!(
+                capture
+                    .read(ReadSelector::Id(reference.as_str()), ReadOptions::default())
+                    .entries
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

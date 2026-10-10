@@ -31,7 +31,7 @@ closeは案件の実作業拘束を終える一方、T-715の終端担当責任�
 
 ## 旧保存データの移行
 
-独立T-739 sourceではTicket component schema7→9、Workspace schema89→90を使用する。component6からの既存移行も維持する。
+T-739 sourceではTicket component schema7→9を使用する。Workspaceは現developのauth/runtime connection移行89→90をそのまま保持し、案件移行90→91を追加する。旧89からはauth→案件の順に進み、現90からは案件移行だけを行う。component6からの既存移行も維持する。
 
 | 旧workflow state | 現行案件状態 | 終了理由 |
 | --- | --- | --- |

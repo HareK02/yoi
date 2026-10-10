@@ -376,6 +376,7 @@ impl SubjektivSurfaceLifecycleTask {
                 input,
                 cache_key: None,
                 max_turns: Some(EDITOR_MAX_TURNS),
+                compaction_budget: None,
                 engine_configurator: None,
                 features,
                 required_tools: &["SubmitMemorySurface"],

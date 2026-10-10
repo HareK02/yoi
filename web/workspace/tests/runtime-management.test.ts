@@ -2,6 +2,8 @@ declare const Deno: {
   test(name: string, fn: () => void | Promise<void>): void;
 };
 
+import type { RepositoryApiError } from "../src/lib/generated/repository-api.ts";
+import type { RuntimeManagementApiError } from "../src/lib/generated/runtime-api.ts";
 import {
   createRemoteRuntime,
   parseRuntimeRemovalOperationResponse,
@@ -14,6 +16,7 @@ import {
   revokeRuntimeTrustKey,
   RuntimeRemovalAttempt,
   RuntimeTrustConflictError,
+  RuntimeTrustRequestError,
   RuntimeTrustRouteFence,
   updateRemoteRuntime,
 } from "../src/lib/workspace/api/runtime-management.ts";
@@ -44,21 +47,8 @@ function runtime() {
       endpoint_configured: true,
       token_ref_configured: false,
       binding: {
-        state: "verified",
-        connection_state: "verified",
         binding_id: "binding-3",
-        workspace_key_id: "WK-1",
-        workspace_trust_id: "trust-1",
-        verification: {
-          verified_at: "2026-09-01T13:00:00Z",
-          last_checked_at: "2026-09-01T13:00:00Z",
-          last_outcome: "verified",
-          binding_id: "binding-3",
-          workspace_key_id: "WK-1",
-          workspace_public_key_fingerprint: "sha256:workspace-key",
-          workspace_trust_id: "trust-1",
-          runtime_public_key_fingerprint: "SHA256:current",
-        },
+        revoked_at: null,
       },
     },
     runtime_id: "arcadia",
@@ -117,8 +107,8 @@ Deno.test("Runtime list and detail parsers return generated Runtime DTO shapes",
   );
 
   assert(
-    list.items[0]?.management.binding?.state === "verified",
-    "binding state was not preserved",
+    list.items[0]?.management.binding?.binding_id === "binding-3",
+    "binding identity was not preserved",
   );
 
   const parsed = parseWorkspaceRuntimeDetail(detail());
@@ -142,9 +132,7 @@ Deno.test("Runtime list parser accepts the built-in Runtime's internal binding",
   const binding = embedded.management.binding as Partial<
     typeof embedded.management.binding
   >;
-  delete binding.workspace_key_id;
-  delete binding.workspace_trust_id;
-  delete binding.verification;
+  delete binding.revoked_at;
 
   const list = parseWorkspaceRuntimeList({
     workspace_id: "workspace-a",
@@ -154,23 +142,51 @@ Deno.test("Runtime list parser accepts the built-in Runtime's internal binding",
     diagnostics: [],
   });
   assert(
-    list.items[0]?.management.binding?.connection_state === "verified",
+    list.items[0]?.management.binding?.revoked_at === null,
     "built-in Runtime binding was not preserved",
   );
 });
 
-Deno.test("Runtime management parser rejects Workspace identity bindings without key metadata", () => {
-  const payload = detail();
-  const binding = payload.runtime.management.binding as Partial<
-    typeof payload.runtime.management.binding
+Deno.test("Runtime list accepts migrated remote bindings without Workspace identity metadata", () => {
+  const migrated = runtime();
+  const binding = migrated.management.binding as Partial<
+    typeof migrated.management.binding
   >;
-  delete binding.workspace_key_id;
-  delete binding.workspace_trust_id;
-  binding.state = "configured";
-  assertThrows(
-    () => parseWorkspaceRuntimeDetail(payload),
-    "requires Workspace signing key identity metadata",
+  delete binding.revoked_at;
+  const list = parseWorkspaceRuntimeList({
+    workspace_id: "workspace-a",
+    limit: 200,
+    items: [migrated],
+    source: "fixture",
+    diagnostics: [],
+  });
+  assert(
+    list.items[0]?.management.binding?.binding_id === "binding-3",
+    "migrated binding was rejected",
   );
+  assert(
+    list.items[0]?.management.binding?.revoked_at === null,
+    "missing revocation should remain unrevoked",
+  );
+});
+
+Deno.test("Runtime binding rejects cached approval and copied Workspace identity fields", () => {
+  for (
+    const field of [
+      "state",
+      "connection_state",
+      "verification",
+      "workspace_key_id",
+      "workspace_trust_id",
+    ]
+  ) {
+    const payload = detail();
+    Object.assign(payload.runtime.management.binding, { [field]: "obsolete" });
+    assertThrows(
+      () => parseWorkspaceRuntimeDetail(payload),
+      "not part of the wire contract",
+    );
+  }
 });
 
 Deno.test("Runtime validators reject unknown object keys and enum variants", () => {
@@ -450,82 +466,225 @@ Deno.test("Runtime public key preview matches the Server fingerprint contract", 
   );
 });
 
-Deno.test("Runtime registration rejects empty or oversized enrollment identities before sending", async () => {
-  for (const enrollment of ["", "x".repeat(257)]) {
+Deno.test("Runtime registration sends only Runtime connection data without Workspace identity copies", async () => {
+  const request = {
+    public_bundle: { identity_id: "arcadia", public_key: "test-key" },
+    endpoint: "https://runtime.example",
+  };
+  let body: unknown;
+  await createRemoteRuntime(
+    "workspace-a",
+    request,
+    ((_input: string | URL | Request, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body));
+      return Promise.resolve(Response.json(runtime()));
+    }) as typeof fetch,
+  );
+  assert(
+    JSON.stringify(body) === JSON.stringify(request),
+    "registration copied Workspace identity or approval fields",
+  );
+});
+
+Deno.test("Runtime trust replacement recognizes RepositoryApiError conflicts without retrying", async () => {
+  for (const errorKind of ["stale_binding", "fingerprint_in_use"] as const) {
+    for (
+      const diagnostics of [undefined, [], [{
+        code: errorKind,
+        severity: "error" as const,
+        message: "Reload Workspace trust before retrying.",
+      }]]
+    ) {
+      const request = {
+        public_bundle: {
+          identity_id: "runtime-a",
+          public_key: "yoi-ed25519-pub:v1:test",
+        },
+        display_name: null,
+        endpoint: "https://runtime.example",
+        expected_binding_id: "observed-binding-id",
+      };
+      const conflict: RepositoryApiError = {
+        error: errorKind,
+        message: "Reload the authoritative Runtime trust.",
+        ...(diagnostics === undefined ? {} : { diagnostics }),
+      };
+      let calls = 0;
+      const fetchImpl = ((input: RequestInfo | URL, init?: RequestInit) => {
+        calls++;
+        assert(
+          String(input) === "/api/w/workspace-a/runtimes",
+          "wrong trust route",
+        );
+        assert(
+          init?.body === JSON.stringify(request),
+          "observed binding ID changed",
+        );
+        return Promise.resolve(Response.json(conflict, { status: 409 }));
+      }) as typeof fetch;
+      try {
+        await createRemoteRuntime("workspace-a", request, fetchImpl);
+        throw new Error("expected trust replacement to reject");
+      } catch (error) {
+        assert(
+          error instanceof RuntimeTrustConflictError,
+          `binding conflict was hidden: ${String(error)}`,
+        );
+        assert(
+          error.message === conflict.message &&
+            JSON.stringify(error.conflict) === JSON.stringify(conflict),
+          "RepositoryApiError conflict was changed",
+        );
+      }
+      assert(calls === 1, "trust replacement was retried");
+    }
+  }
+});
+
+Deno.test("Runtime revoke preserves typed conflict binding identities and diagnostics", async () => {
+  const conflict: RuntimeManagementApiError = {
+    error: "stale_binding",
+    message: "Reload the authoritative Runtime trust.",
+    current_binding_id: "current-binding-id",
+    current_fingerprint: "sha256:current-key",
+    diagnostics: [],
+  };
+  try {
+    await revokeRuntimeTrustKey(
+      "workspace-a",
+      "runtime-a",
+      { expected_binding_id: "observed-binding-id" },
+      "sha256:observed-key",
+      "sha256:observed-key",
+      () => Promise.resolve(Response.json(conflict, { status: 409 })),
+    );
+    throw new Error("expected revoke to reject");
+  } catch (error) {
+    assert(
+      error instanceof RuntimeTrustConflictError,
+      "revoke conflict was hidden",
+    );
+    assert(
+      JSON.stringify(error.conflict) === JSON.stringify(conflict),
+      "typed revoke conflict identity was changed",
+    );
+  }
+});
+
+Deno.test("Runtime create surfaces other RepositoryApiError 409 messages as request errors", async () => {
+  for (
+    const diagnostics of [undefined, [], [{
+      code: "runtime_binding_replacement_blocked",
+      severity: "error" as const,
+      message: "An active Worker occupies this Runtime.",
+    }]]
+  ) {
+    const payload: RepositoryApiError = {
+      error: "conflict",
+      message: "Runtime binding replacement is blocked by an active Worker.",
+      ...(diagnostics === undefined ? {} : { diagnostics }),
+    };
     let calls = 0;
     try {
       await createRemoteRuntime("workspace-a", {
         public_bundle: { identity_id: "runtime-a", public_key: "test-key" },
-        workspace_trust_id: enrollment,
         endpoint: "https://runtime.example",
-      }, (() => { calls++; throw new Error("unexpected request"); }) as typeof fetch);
-      throw new Error("expected enrollment validation to reject");
+      }, () => {
+        calls++;
+        return Promise.resolve(Response.json(payload, { status: 409 }));
+      });
+      throw new Error("expected occupancy conflict to reject");
     } catch (error) {
-      assert(error instanceof Error && error.message.includes("workspace_trust_id"), "enrollment validation was bypassed");
-    }
-    assert(calls === 0, "invalid enrollment reached the Server");
-  }
-});
-
-Deno.test("Runtime trust replacement preserves binding conflicts without retrying", async () => {
-  for (const errorKind of ["stale_binding", "fingerprint_in_use"] as const) {
-    const request = {
-      public_bundle: {
-        identity_id: "runtime-a",
-        public_key: "yoi-ed25519-pub:v1:test",
-      },
-      display_name: null,
-      endpoint: "https://runtime.example",
-      workspace_trust_id: "runtime-issued-enrollment-id",
-      expected_binding_id: "observed-binding-id",
-    };
-    const conflict = {
-      error: errorKind,
-      message: "Reload the authoritative Runtime trust.",
-      current_binding_id: "current-binding-id",
-      current_fingerprint: "sha256:current-key",
-    };
-    let calls = 0;
-    const fetchImpl = ((input: RequestInfo | URL, init?: RequestInit) => {
-      calls++;
-      assert(String(input) === "/api/w/workspace-a/runtimes", "wrong trust route");
-      assert(init?.body === JSON.stringify(request), "observed binding ID changed");
-      return Promise.resolve(Response.json(conflict, { status: 409 }));
-    }) as typeof fetch;
-    try {
-      await createRemoteRuntime("workspace-a", request, fetchImpl);
-      throw new Error("expected trust replacement to reject");
-    } catch (error) {
-      assert(error instanceof RuntimeTrustConflictError, "binding conflict was hidden");
       assert(
-        JSON.stringify(error.conflict) === JSON.stringify(conflict),
-        "authoritative conflict identity was changed",
+        error instanceof RuntimeTrustRequestError,
+        "occupancy error was misclassified",
       );
+      assert(error.message === payload.message, "occupancy message was hidden");
     }
-    assert(calls === 1, "trust replacement was retried");
+    assert(calls === 1, "occupancy conflict was retried");
   }
 });
 
-Deno.test("Runtime trust replacement rejects unknown fields and missing binding identity in conflict responses", async () => {
-  const fetchImpl = (() => Promise.resolve(Response.json({
-    error: "stale_binding",
-    message: "Stale trust",
-    unexpected_field: true,
-  }, { status: 409 }))) as typeof fetch;
+Deno.test("Runtime create bounds legitimate RepositoryApiError 409 messages", async () => {
+  const message = "Runtime is occupied. ".repeat(30);
   try {
     await createRemoteRuntime("workspace-a", {
       public_bundle: { identity_id: "runtime-a", public_key: "test-key" },
       endpoint: "https://runtime.example",
-      workspace_trust_id: "runtime-issued-enrollment-id",
-      expected_binding_id: "observed-binding-id",
-    }, fetchImpl);
-    throw new Error("expected malformed conflict to reject");
+    }, () =>
+      Promise.resolve(Response.json(
+        {
+          error: "conflict",
+          message,
+        } satisfies RepositoryApiError,
+        { status: 409 },
+      )));
+    throw new Error("expected occupancy conflict to reject");
   } catch (error) {
-    assert(!(error instanceof RuntimeTrustConflictError), "legacy conflict was accepted");
     assert(
-      error instanceof Error && error.message === "Runtime trust conflict response was invalid",
-      "malformed conflict did not fail closed",
+      error instanceof RuntimeTrustRequestError,
+      "occupancy error was misclassified",
     );
+    assert(
+      error.message === message.slice(0, 256),
+      "bounded backend message was lost",
+    );
+  }
+});
+
+Deno.test("Runtime create rejects malformed RepositoryApiError conflicts without exposing their message", async () => {
+  const validDiagnostic = {
+    code: "conflict",
+    severity: "error",
+    message: "detail",
+  };
+  for (const errorKind of ["stale_binding", "fingerprint_in_use", "conflict"]) {
+    const valid = {
+      error: errorKind,
+      message: "Do not expose malformed payload text",
+    };
+    for (
+      const payload of [
+        { ...valid, unexpected_field: true },
+        { ...valid, current_binding_id: "not-in-creation-contract" },
+        { ...valid, current_fingerprint: "not-in-creation-contract" },
+        { ...valid, error: 409 },
+        { ...valid, error: "" },
+        { ...valid, error: "x".repeat(257) },
+        { error: errorKind },
+        { ...valid, message: null },
+        { ...valid, message: "" },
+        { ...valid, message: "é".repeat(513) },
+        { ...valid, diagnostics: null },
+        { ...valid, diagnostics: {} },
+        { ...valid, diagnostics: Array(65).fill(validDiagnostic) },
+        {
+          ...valid,
+          diagnostics: [{ ...validDiagnostic, severity: "unknown" }],
+        },
+        { ...valid, diagnostics: [{ ...validDiagnostic, code: 1 }] },
+        { ...valid, diagnostics: [{ ...validDiagnostic, extra: true }] },
+        {
+          ...valid,
+          diagnostics: [{ ...validDiagnostic, message: "x".repeat(2049) }],
+        },
+      ]
+    ) {
+      try {
+        await createRemoteRuntime("workspace-a", {
+          public_bundle: { identity_id: "runtime-a", public_key: "test-key" },
+          endpoint: "https://runtime.example",
+          expected_binding_id: "observed-binding-id",
+        }, () => Promise.resolve(Response.json(payload, { status: 409 })));
+        throw new Error("expected malformed conflict to reject");
+      } catch (error) {
+        assert(
+          error instanceof RuntimeTrustRequestError &&
+            error.message === "Runtime trust conflict response was invalid",
+          `malformed conflict did not fail closed: ${JSON.stringify(payload)}`,
+        );
+      }
+    }
   }
 });
 
@@ -551,7 +710,6 @@ Deno.test("Runtime create surfaces bounded Settings error details", async () => 
         },
         display_name: null,
         endpoint: "https://runtime.example",
-        workspace_trust_id: "runtime-issued-enrollment-id",
         expected_binding_id: null,
       },
       fetchImpl,
