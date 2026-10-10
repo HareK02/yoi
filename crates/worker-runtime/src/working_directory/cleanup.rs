@@ -76,19 +76,11 @@ pub(super) fn remaining_status(
     }
     let mut summary = saved.working_directory.status_summary();
     summary.status = WorkingDirectoryStatusKind::CleanupPending;
-    summary.cleanliness = Some(
-        match check_mounts(
-            &materializer.working_directory_root(id),
-            &fs::read("/proc/self/mountinfo").ok()?,
-        )
-        .and_then(|()| retry_inventory(materializer, id, &tree, &saved))
-        {
-            Ok(_) => "clean",
-            Err(error) if error.code == "working_directory_cleanup_changes_present" => "dirty",
-            Err(_) => "unknown",
-        }
-        .to_string(),
-    );
+    // Observation is not removal admission: do not inventory or hash the
+    // surviving checkout just to list it. The witness can be stale, so neither
+    // its old cleanliness nor a successful identity check proves current content
+    // is safe to remove. Actual retries still perform the full safety checks.
+    summary.cleanliness = Some("unknown".to_string());
     Some(WorkingDirectoryStatus { summary })
 }
 
@@ -974,7 +966,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn cleanup_pending_rechecks_current_cleanliness_and_retries_without_state_edit() {
+    fn cleanup_pending_observation_is_unknown_and_retry_checks_safety() {
         let (_runtime, materializer, binding) = fixture();
         let id = &binding.working_directory.id;
         fail_once(&materializer, id);
@@ -983,10 +975,52 @@ pub(super) mod tests {
             status.summary.status,
             WorkingDirectoryStatusKind::CleanupPending
         );
-        assert_eq!(status.summary.cleanliness.as_deref(), Some("clean"));
+        assert_eq!(status.summary.cleanliness.as_deref(), Some("unknown"));
         let removed = materializer.cleanup_working_directory(id).unwrap();
         assert_eq!(removed.summary.status, WorkingDirectoryStatusKind::NotFound);
         assert!(!binding.working_directory_root.exists());
+    }
+
+    #[test]
+    fn cleanup_pending_observation_does_not_open_checkout_content() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        let (_runtime, materializer, binding) = fixture();
+        let id = &binding.working_directory.id;
+        fail_once(&materializer, id);
+
+        // Observe actual file opens rather than a timing threshold or a large
+        // fixture. Inventory would open this surviving tracked file to hash it.
+        // SAFETY: inotify_init1 has no pointer arguments.
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(fd >= 0, "{}", io::Error::last_os_error());
+        // SAFETY: fd is a freshly created descriptor, owned only by this File.
+        let mut events = unsafe { fs::File::from_raw_fd(fd) };
+        let path =
+            std::ffi::CString::new(binding.root.join("README.md").as_os_str().as_bytes()).unwrap();
+        // SAFETY: the descriptor is live and path is a valid terminated string.
+        let watch =
+            unsafe { libc::inotify_add_watch(events.as_raw_fd(), path.as_ptr(), libc::IN_OPEN) };
+        assert!(watch >= 0, "{}", io::Error::last_os_error());
+
+        let detail = materializer.working_directory_status(id).unwrap();
+        let listed = materializer.list_working_directories().unwrap();
+        let mut buffer = [0u8; 4096];
+        assert_eq!(
+            events
+                .read(&mut buffer)
+                .expect_err("status observation opened surviving checkout content")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            detail.summary.status,
+            WorkingDirectoryStatusKind::CleanupPending
+        );
+        assert_eq!(detail.summary.cleanliness.as_deref(), Some("unknown"));
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].summary, detail.summary);
     }
 
     #[test]
@@ -1021,7 +1055,7 @@ pub(super) mod tests {
                 retained.summary.cleanup_target.as_ref(),
                 Some(&binding.working_directory.cleanup_target)
             );
-            assert_eq!(retained.summary.cleanliness.as_deref(), Some("clean"));
+            assert_eq!(retained.summary.cleanliness.as_deref(), Some("unknown"));
             assert_eq!(
                 restarted.list_working_directories().unwrap()[0].summary,
                 retained.summary
@@ -1074,7 +1108,7 @@ pub(super) mod tests {
                     .summary
                     .cleanliness
                     .as_deref(),
-                Some("dirty")
+                Some("unknown")
             );
             assert_eq!(
                 materializer.cleanup_working_directory(id).unwrap_err().code,
@@ -1117,7 +1151,7 @@ pub(super) mod tests {
                     .summary
                     .cleanliness
                     .as_deref(),
-                Some("clean"),
+                Some("unknown"),
                 "{resolution}"
             );
             // Renewal itself can fail at unlink. Its new witness must survive a

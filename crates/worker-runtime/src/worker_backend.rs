@@ -1025,7 +1025,9 @@ fn runtime_local_workdir_router(
                     command_output_scope.clone(),
                     capabilities,
                     binding.command_environment(),
-                    binding.session_resources(),
+                    binding.session_resources().map_err(|error| {
+                        format!("open Workdir attachment `{alias}` resources: {error}")
+                    })?,
                 ),
             )
             .map_err(|error| format!("bind Workdir attachment `{alias}`: {error}"))?;
@@ -3453,7 +3455,7 @@ where
             scope,
             WorkdirSessionCapabilities::ALL,
             binding.command_environment(),
-            binding.session_resources(),
+            binding.session_resources()?,
         ))
     }
 
@@ -9499,6 +9501,42 @@ mod tests {
             crate::catalog::WorkingDirectoryStatusKind::Active
         );
         assert_eq!(status.summary.cleanliness.as_deref(), Some("clean"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn local_sessions_exclude_cleanup_until_close_releases_resources() {
+        let runtime_base = tempfile::tempdir().unwrap();
+        let repo = create_clean_repo();
+        let materializer = RuntimeGitMaterializer::new(runtime_base.path());
+        let binding = materializer
+            .create(&working_directory_request(repo.path()))
+            .unwrap();
+        let id = &binding.working_directory.id;
+        let backend = WorkerRuntimeExecutionBackend::new(FailingFactory)
+            .unwrap()
+            .with_working_directory_materializer(materializer.clone());
+        let session = backend.open_workdir_session(id).unwrap();
+        let session_clone = session.clone();
+        drop(session);
+        assert_eq!(
+            materializer.cleanup_working_directory(id).unwrap_err().code,
+            "working_directory_cleanup_resource_busy"
+        );
+
+        let alias = WorkdirAttachmentAlias::new("checkout").unwrap();
+        let attachments = BTreeMap::from([(alias, binding.clone())]);
+        let scope = manifest::SharedScope::new(manifest::Scope::writable(binding.root()).unwrap());
+        let router = runtime_local_workdir_router(&attachments, &BTreeMap::new(), scope).unwrap();
+        session_clone.close().await.unwrap();
+        assert_eq!(
+            materializer.cleanup_working_directory(id).unwrap_err().code,
+            "working_directory_cleanup_resource_busy"
+        );
+        router.close_all().await.unwrap();
+        // Closed handles, router and passive bindings can remain alive.
+        materializer.cleanup_working_directory(id).unwrap();
+        assert!(!binding.working_directory_root().exists());
     }
 
     #[test]

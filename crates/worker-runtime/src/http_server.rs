@@ -951,10 +951,12 @@ async fn observe_repository_ref(
 async fn list_working_directories(
     State(state): State<RuntimeHttpState>,
 ) -> RestResult<RuntimeHttpWorkingDirectoriesResponse> {
-    let working_directories = state
-        .runtime
-        .list_working_directories()
-        .map_err(RuntimeHttpRestError::runtime)?;
+    // Inventory providers may inspect the filesystem even for read-only requests.
+    let working_directories =
+        tokio::task::spawn_blocking(move || state.runtime.list_working_directories())
+            .await
+            .map_err(RuntimeHttpRestError::working_directory_join)?
+            .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkingDirectoriesResponse {
         working_directories,
     }))
@@ -989,10 +991,11 @@ async fn get_working_directory(
     State(state): State<RuntimeHttpState>,
     Path(working_directory_id): Path<String>,
 ) -> RestResult<RuntimeHttpWorkingDirectoryResponse> {
-    let working_directory = state
-        .runtime
-        .working_directory(&working_directory_id)
-        .map_err(RuntimeHttpRestError::runtime)?;
+    let working_directory =
+        tokio::task::spawn_blocking(move || state.runtime.working_directory(&working_directory_id))
+            .await
+            .map_err(RuntimeHttpRestError::working_directory_join)?
+            .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkingDirectoryResponse {
         working_directory,
     }))
@@ -1130,10 +1133,16 @@ async fn cleanup_working_directory(
     State(state): State<RuntimeHttpState>,
     Path(working_directory_id): Path<String>,
 ) -> RestResult<RuntimeHttpWorkingDirectoryResponse> {
-    let working_directory = state
-        .runtime
-        .cleanup_working_directory(&working_directory_id)
-        .map_err(RuntimeHttpRestError::runtime)?;
+    // Keep Runtime's occupancy check and deletion together, but do not run
+    // synchronous filesystem/Git work on the HTTP executor.
+    let working_directory = tokio::task::spawn_blocking(move || {
+        state
+            .runtime
+            .cleanup_working_directory(&working_directory_id)
+    })
+    .await
+    .map_err(RuntimeHttpRestError::working_directory_join)?
+    .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkingDirectoryResponse {
         working_directory,
     }))
@@ -2441,6 +2450,16 @@ impl RuntimeHttpRestError {
         let status = status_for_runtime_error(&error);
         let code = code_for_runtime_error(&error);
         Self::new(status, code, error.to_string())
+    }
+
+    fn working_directory_join(_error: tokio::task::JoinError) -> Self {
+        // A panic payload can contain paths or credentials. A missing result
+        // also does not prove that cleanup made no changes; do not claim rollback.
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "working_directory_task_failed",
+            "Working directory operation failed to return a result",
+        )
     }
 
     fn json_rejection(error: JsonRejection) -> Self {
@@ -4341,34 +4360,379 @@ mod tests {
         assert!(!error.to_string().contains('/'));
     }
 
+    enum CleanupHttpOutcome {
+        Removed,
+        Rejected(&'static str),
+        Panicked,
+    }
+
+    struct CleanupHttpGate {
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    struct CleanupHttpBackend {
+        gate: Mutex<Option<CleanupHttpGate>>,
+        outcome: CleanupHttpOutcome,
+    }
+
+    fn removed_working_directory() -> WorkingDirectoryStatus {
+        WorkingDirectoryStatus {
+            summary: crate::catalog::WorkingDirectorySummary {
+                working_directory_id: "cleanup-test".to_string(),
+                display_name: None,
+                repository_id: "repository-test".to_string(),
+                creation_selector: None,
+                creation_ref: None,
+                creation_tree: None,
+                current_selector: None,
+                current_ref: None,
+                current_tree: None,
+                observed_at_epoch_seconds: None,
+                materializer_kind: crate::catalog::MaterializerKind::RuntimeGitClone,
+                cleanup_target: None,
+                status: crate::catalog::WorkingDirectoryStatusKind::NotFound,
+                cleanliness: None,
+                occupied_by: None,
+            },
+        }
+    }
+
+    impl WorkerExecutionBackend for CleanupHttpBackend {
+        fn backend_id(&self) -> &str {
+            "http-cleanup-test"
+        }
+
+        fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
+            AcceptingBackend.spawn_worker(request)
+        }
+
+        fn dispatch_input(
+            &self,
+            worker_ref: &WorkerRef,
+            input: WorkerInput,
+        ) -> WorkerExecutionResult {
+            AcceptingBackend.dispatch_input(worker_ref, input)
+        }
+
+        fn cleanup_working_directory(
+            &self,
+            working_directory_id: &str,
+        ) -> Result<WorkingDirectoryStatus, crate::working_directory::WorkingDirectoryDiagnostic>
+        {
+            assert_eq!(working_directory_id, "cleanup-test");
+            let gate = self.gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.send(()).expect("cleanup entry receiver");
+                // A watchdog also bounds a regression that blocks the sole
+                // Tokio thread, where an async timeout could not make progress.
+                gate.release
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("cleanup must be released after observations complete");
+            }
+            match self.outcome {
+                CleanupHttpOutcome::Removed => Ok(removed_working_directory()),
+                CleanupHttpOutcome::Rejected(code) => Err(
+                    crate::working_directory::WorkingDirectoryDiagnostic::rejected(
+                        code,
+                        "Resolve the current blocker and retry removal.",
+                    ),
+                ),
+                CleanupHttpOutcome::Panicked => panic!("private provider path /secret/cleanup"),
+            }
+        }
+    }
+
+    fn cleanup_http_router(
+        outcome: CleanupHttpOutcome,
+        gate: Option<CleanupHttpGate>,
+    ) -> (Runtime, Router) {
+        let runtime = Runtime::with_execution_backend(
+            RuntimeOptions::default(),
+            Arc::new(CleanupHttpBackend {
+                gate: Mutex::new(gate),
+                outcome,
+            }),
+        )
+        .unwrap();
+        let identity = RuntimeIdentityMaterial::generate("runtime-cleanup-test").unwrap();
+        let workspace_identity =
+            RuntimeIdentityMaterial::generate("workspace-cleanup-key").unwrap();
+        let workspace_public_key =
+            crate::auth::decode_public_key(&workspace_identity.public_key).unwrap();
+        let workspace_fingerprint = format!(
+            "sha256:{}",
+            crate::workspace_issuer::hex_lower(&sha2::Sha256::digest(workspace_public_key))
+        );
+        let app = runtime_http_router_with_workspace_auth(
+            runtime.clone(),
+            Some("cleanup-token".to_string()),
+            WorkspaceRuntimeHttpAuth {
+                verifier: WorkspaceCapabilityVerifier::new(
+                    vec![WorkspaceIssuerTrustRecord {
+                        workspace_id: "local".to_string(),
+                        backend_url: "https://backend.test".to_string(),
+                        key_id: "workspace-cleanup-key".to_string(),
+                        algorithm: "ed25519".to_string(),
+                        public_key: workspace_identity.public_key,
+                        public_key_fingerprint: workspace_fingerprint,
+                        identity_revision: 1,
+                        trust_generation: 1,
+                        state: WorkspaceIssuerTrustState::Active,
+                        registered_at_unix: 1,
+                        updated_at_unix: 1,
+                    }],
+                    Arc::new(InMemoryWorkspaceClaimReplayProtection::default()),
+                )
+                .unwrap(),
+                signer: RuntimeVerificationSigner::from_identity(&identity).unwrap(),
+                verifications: Arc::new(InMemoryWorkspaceRuntimeVerificationAuthority::default()),
+            },
+        );
+        (runtime, app)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_working_directory_cleanup_does_not_block_http_ping() {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, wait_for_release) = std::sync::mpsc::channel();
+        let (runtime, app) = cleanup_http_router(
+            CleanupHttpOutcome::Removed,
+            Some(CleanupHttpGate {
+                entered,
+                release: wait_for_release,
+            }),
+        );
+        runtime
+            .store_config_bundle(test_bundle(ProfileSelector::Builtin(
+                "builtin:coder".to_string(),
+            )))
+            .unwrap();
+        let scope = RuntimeWorkspaceScope::new("local", "local-token");
+        let mut request = task_request("unrelated Worker remains observable during cleanup");
+        request.workspace_api = Some(WorkspaceApiRef {
+            workspace_id: "local".to_string(),
+            base_url: "https://backend.test".to_string(),
+        });
+        let worker = runtime.create_worker_scoped(&scope, request).unwrap();
+        assert!(worker.workdir_attachments.is_empty());
+        let worker_path = format!("/v1/workers/{}", worker.worker_id);
+        let path = "/v1/working-directories/cleanup-test";
+        let unauthorized = empty_request(app.clone(), Method::DELETE, path).await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let error: RuntimeHttpErrorResponse = read_json(unauthorized).await;
+        assert_eq!(error.error.code, "unauthorized");
+
+        // A synchronous RuntimeState lock can stall this sole executor thread,
+        // including Tokio timeouts. Release from an independent thread on either
+        // completion, assertion unwind, or watchdog expiry, and report expiry as
+        // failure even if observations resume after the forced release.
+        let (observed, wait_for_observations) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            let timed_out = matches!(
+                wait_for_observations.recv_timeout(std::time::Duration::from_secs(5)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            );
+            let _ = release.send(());
+            timed_out
+        });
+        let cleanup = tokio::spawn(authed_empty_request(
+            app.clone(),
+            Method::DELETE,
+            path,
+            "cleanup-token",
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), started)
+            .await
+            .expect("cleanup provider must be entered")
+            .expect("cleanup entry signal");
+
+        // Unlike ping, these HTTP routes synchronously acquire RuntimeState.
+        // Exercise existing Worker paths so authorization/not-found shortcuts
+        // cannot make a global occupancy-lock regression pass unnoticed.
+        for observation_path in [
+            "/v1/workers".to_string(),
+            worker_path.clone(),
+            format!("{worker_path}/session?workspace_id=local"),
+        ] {
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                authed_empty_request(app.clone(), Method::GET, &observation_path, "cleanup-token"),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{observation_path} must finish while cleanup is gated"));
+            let status = response.status();
+            let body: serde_json::Value = read_json(response).await;
+            assert_eq!(status, StatusCode::OK, "{observation_path}: {body}");
+            if observation_path == "/v1/workers" {
+                assert_eq!(body["workers"].as_array().unwrap().len(), 1, "{body}");
+                assert_eq!(
+                    body["workers"][0]["worker_id"],
+                    worker.worker_id.to_string()
+                );
+            } else if observation_path == worker_path {
+                assert_eq!(body["worker"]["worker_id"], worker.worker_id.to_string());
+            } else {
+                // This minimal fake has no session store. Its normal, typed
+                // availability result still requires the real scoped HTTP read.
+                assert_eq!(
+                    body,
+                    serde_json::to_value(runtime_api::WorkerSessionAvailability::Unavailable {
+                        reason: runtime_api::WorkerSessionUnavailableReason::StorageUnavailable,
+                        message: "retained session storage is unavailable".to_string(),
+                    })
+                    .unwrap(),
+                );
+            }
+        }
+
+        // Exercise the same scoped snapshot acquisition used by Runtime WS
+        // subscriptions, without requiring a socket or the ws-server feature.
+        let subscription = runtime
+            .subscribe_event_selector_scoped(
+                &scope,
+                protocol::subscription::EventSubscriptionSelector::RuntimeWorkers,
+            )
+            .expect("Runtime subscription snapshot must complete while cleanup is gated");
+        let protocol::subscription::SubscriptionSnapshot::Workers { workers } =
+            subscription.snapshot()
+        else {
+            panic!("expected Runtime Worker subscription snapshot");
+        };
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].worker_id.as_str(), worker.worker_id.to_string());
+
+        let ping = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            app.oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/ping")
+                    .header(header::AUTHORIZATION, "Bearer cleanup-token")
+                    .header(RUNTIME_WORKSPACE_SCOPE_HEADER, "local")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("ping must finish while cleanup is gated")
+        .unwrap();
+        let ping_status = ping.status();
+        let ping_body: serde_json::Value = read_json(ping).await;
+        assert_eq!(ping_status, StatusCode::OK, "{ping_body}");
+        assert_eq!(ping_body["runtime_id"], "runtime-cleanup-test");
+        assert_eq!(ping_body["protocol_version"], RUNTIME_HTTP_PROTOCOL_VERSION);
+        assert!(
+            !cleanup.is_finished(),
+            "cleanup must still be gated after ping",
+        );
+        // The watchdog owns the release sender; dropping `observed` on an
+        // assertion failure also releases the provider instead of leaking a task.
+        let observations_completed = observed.send(()).is_ok();
+        let watchdog_expired = watchdog.join().unwrap();
+        assert!(
+            observations_completed && !watchdog_expired,
+            "Worker observations, subscription snapshot, and ping must finish before cleanup is released",
+        );
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), cleanup)
+            .await
+            .expect("released cleanup must finish")
+            .unwrap();
+        let status = response.status();
+        let body: serde_json::Value = read_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            serde_json::to_value(RuntimeHttpWorkingDirectoryResponse {
+                working_directory: removed_working_directory(),
+            })
+            .unwrap(),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn working_directory_cleanup_panic_returns_bounded_http_error() {
+        let (_, app) = cleanup_http_router(CleanupHttpOutcome::Panicked, None);
+        let response = authed_empty_request(
+            app,
+            Method::DELETE,
+            "/v1/working-directories/cleanup-test",
+            "cleanup-token",
+        )
+        .await;
+        let status = response.status();
+        let body: serde_json::Value = read_json(response).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": {
+                    "code": "working_directory_task_failed",
+                    "message": "Working directory operation failed to return a result",
+                },
+            }),
+        );
+    }
+
     #[tokio::test]
     async fn cleanup_cause_codes_survive_http_error_serialization() {
         let cases = [
-            ("mount_present", StatusCode::CONFLICT),
-            ("mount_check_unavailable", StatusCode::SERVICE_UNAVAILABLE),
-            ("permission_denied", StatusCode::FORBIDDEN),
-            ("resource_busy", StatusCode::CONFLICT),
-            ("storage_unavailable", StatusCode::SERVICE_UNAVAILABLE),
-            ("ownership_unknown", StatusCode::CONFLICT),
-            ("changes_present", StatusCode::CONFLICT),
-            ("changes_unknown", StatusCode::CONFLICT),
+            ("working_directory_not_found", StatusCode::NOT_FOUND),
+            (
+                "working_directory_cleanup_mount_present",
+                StatusCode::CONFLICT,
+            ),
+            (
+                "working_directory_cleanup_mount_check_unavailable",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "working_directory_cleanup_permission_denied",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "working_directory_cleanup_resource_busy",
+                StatusCode::CONFLICT,
+            ),
+            (
+                "working_directory_cleanup_storage_unavailable",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "working_directory_cleanup_ownership_unknown",
+                StatusCode::CONFLICT,
+            ),
+            (
+                "working_directory_cleanup_changes_present",
+                StatusCode::CONFLICT,
+            ),
+            (
+                "working_directory_cleanup_changes_unknown",
+                StatusCode::CONFLICT,
+            ),
         ];
-        for (cause, status) in cases {
-            let code = format!("working_directory_cleanup_{cause}");
+        for (code, expected_status) in cases {
+            let (_, app) = cleanup_http_router(CleanupHttpOutcome::Rejected(code), None);
+            let response = authed_empty_request(
+                app,
+                Method::DELETE,
+                "/v1/working-directories/cleanup-test",
+                "cleanup-token",
+            )
+            .await;
+            let status = response.status();
+            let json: serde_json::Value = read_json(response).await;
+            assert_eq!(status, expected_status, "{json}");
+            assert_eq!(json["error"]["code"], code, "{json}");
             let diagnostic = crate::working_directory::WorkingDirectoryDiagnostic::rejected(
-                &code,
+                code,
                 "Resolve the current blocker and retry removal.",
             );
-            let response =
-                RuntimeHttpRestError::runtime(RuntimeError::WorkingDirectory(diagnostic))
-                    .into_response();
-            assert_eq!(response.status(), status);
-            let body = axum::body::to_bytes(response.into_body(), 2048)
-                .await
-                .unwrap();
-            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(json["error"]["code"], code, "{json}");
-            assert!(json["error"]["message"].as_str().unwrap().contains("retry"));
+            assert_eq!(
+                json["error"]["message"],
+                RuntimeError::WorkingDirectory(diagnostic).to_string(),
+                "{json}",
+            );
         }
     }
 

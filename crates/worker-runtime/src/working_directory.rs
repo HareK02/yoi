@@ -23,6 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use workdir::WorkdirSessionResource;
 
 mod cleanup;
+mod occupancy;
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use cleanup::tests::fail_once as fail_workdir_cleanup_once;
@@ -101,6 +102,9 @@ pub struct WorkingDirectoryBinding {
     working_directory_root: PathBuf,
     command_environment: BTreeMap<String, String>,
     session_resources: Vec<Arc<dyn WorkdirSessionResource>>,
+    occupancy: occupancy::Occupancy,
+    occupancy_id: String,
+    generation: occupancy::Generation,
 }
 
 impl WorkingDirectoryBinding {
@@ -120,8 +124,23 @@ impl WorkingDirectoryBinding {
         self.command_environment.clone()
     }
 
-    pub fn session_resources(&self) -> Vec<Arc<dyn WorkdirSessionResource>> {
-        self.session_resources.clone()
+    /// Activate resources for a local session. Cloning a binding alone is passive;
+    /// the returned lease excludes cleanup until the last resource clone drops.
+    pub fn session_resources(
+        &self,
+    ) -> Result<Vec<Arc<dyn WorkdirSessionResource>>, WorkingDirectoryDiagnostic> {
+        let lease = self
+            .occupancy
+            .acquire_session_use(&self.occupancy_id, &self.generation)?;
+        if !binding_paths_are_available(self) {
+            return Err(WorkingDirectoryDiagnostic::new(
+                "working_directory_not_found",
+                "Workdir binding is no longer available; acquire a fresh binding",
+            ));
+        }
+        let mut resources = self.session_resources.clone();
+        resources.push(Arc::new(lease));
+        Ok(resources)
     }
 
     pub fn status(&self) -> WorkingDirectoryStatus {
@@ -583,6 +602,7 @@ fn repository_access_now_epoch_seconds() -> u64 {
 pub struct RuntimeGitMaterializer {
     runtime_root: PathBuf,
     repository_access: RepositoryAccessExpiryScheduler,
+    occupancy: occupancy::Occupancy,
 }
 
 impl RuntimeGitMaterializer {
@@ -590,6 +610,7 @@ impl RuntimeGitMaterializer {
         Self {
             runtime_root: runtime_root.into(),
             repository_access: RepositoryAccessExpiryScheduler::new(),
+            occupancy: occupancy::Occupancy::default(),
         }
     }
 
@@ -702,6 +723,9 @@ impl RuntimeGitMaterializer {
             working_directory_root,
             command_environment: BTreeMap::new(),
             session_resources: Vec::new(),
+            occupancy: self.occupancy.clone(),
+            occupancy_id: working_directory_id.to_string(),
+            generation: self.occupancy.generation(&working_directory_id),
         })
     }
 
@@ -904,6 +928,7 @@ impl RuntimeGitMaterializer {
         request: &WorkingDirectoryRequest,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
         validate_working_directory_id(&working_directory_id)?;
+        let _creation_lease = self.occupancy.acquire_creation(&working_directory_id)?;
         Self::validate_plain_http_source(request)?;
         let request =
             self.request_with_authorized_repository_access(&working_directory_id, request)?;
@@ -911,20 +936,30 @@ impl RuntimeGitMaterializer {
         let selector = request.repository.selector.as_deref().unwrap_or("HEAD");
         let working_directory_root = self.working_directory_root(&working_directory_id);
         let checkout_root = working_directory_root.join(CHECKOUT_DIR);
-        if checkout_root.exists() {
+        if working_directory_root.symlink_metadata().is_ok() {
             return Err(WorkingDirectoryDiagnostic::new(
                 "working_directory_exists",
                 "working directory target already exists; cleanup or choose a new working_directory",
             ));
         }
-        fs::create_dir_all(&working_directory_root).map_err(|_| {
+        fs::create_dir_all(&self.runtime_root).map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_create_failed",
+                "failed to create working directory storage",
+            )
+        })?;
+        // Prepare fallible access before owning a root that must not be adopted
+        // by a retry after failure.
+        let access = RepositoryCommandAccess::prepare(&self.runtime_root, &request)?;
+        // Atomically own this new root before any rollback can remove it. Do
+        // not adopt an existing partial-cleanup directory or another creator's root.
+        fs::create_dir(&working_directory_root).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
                 "working_directory_create_failed",
                 "failed to create working directory; backend-private path details were omitted",
             )
         })?;
 
-        let access = RepositoryCommandAccess::prepare(&self.runtime_root, &request)?;
         let mut clone = repository_git_command(&request, access.as_ref());
         clone
             .args([
@@ -1022,6 +1057,9 @@ impl RuntimeGitMaterializer {
             working_directory_root: working_directory_root.clone(),
             command_environment: BTreeMap::new(),
             session_resources: Vec::new(),
+            occupancy: self.occupancy.clone(),
+            occupancy_id: working_directory_id.to_string(),
+            generation: self.occupancy.generation(&working_directory_id),
         };
         if let Err(error) = self.write_record(&binding) {
             let _ = fs::remove_dir_all(&working_directory_root);
@@ -1046,7 +1084,10 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
         worker_ref: &WorkerRef,
         request: &WorkingDirectoryRequest,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
-        let working_directory_id = Self::working_directory_id(worker_ref, &request.repository.id);
+        let working_directory_id = request
+            .backend_workdir_id
+            .clone()
+            .unwrap_or_else(|| Self::working_directory_id(worker_ref, &request.repository.id));
         self.materialize_with_working_directory_id(working_directory_id, request)
     }
 
@@ -1066,6 +1107,7 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
         request: &WorkingDirectoryRepositoryAccessRequest,
     ) -> Result<(), WorkingDirectoryDiagnostic> {
         validate_working_directory_id(&request.working_directory_id)?;
+        let _use_lease = self.occupancy.acquire_use(&request.working_directory_id)?;
         let ssh = request.materialization.ssh.as_ref().ok_or_else(|| {
             WorkingDirectoryDiagnostic::new(
                 "working_directory_remote_repository_access_required",
@@ -1187,6 +1229,8 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
         working_directory_id: &str,
         relative_cwd: Option<&str>,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
+        validate_working_directory_id(working_directory_id)?;
+        let _use_lease = self.occupancy.acquire_use(working_directory_id)?;
         let binding = self.checked_binding(working_directory_id, relative_cwd)?;
         self.bind_repository_access(working_directory_id, binding)
     }
@@ -1281,7 +1325,10 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
         working_directory_id: &str,
     ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
         validate_working_directory_id(working_directory_id)?;
-        cleanup::remove(self, working_directory_id)
+        let _cleanup_lease = self.occupancy.acquire_cleanup(working_directory_id)?;
+        let status = cleanup::remove(self, working_directory_id)?;
+        self.occupancy.invalidate_generation(working_directory_id);
+        Ok(status)
     }
 
     fn cleanup(&self, binding: &WorkingDirectoryBinding) -> Result<(), WorkingDirectoryDiagnostic> {
@@ -2878,7 +2925,7 @@ fn sanitize_path_component(value: &str) -> String {
     }
 }
 
-fn next_working_directory_id(_repository_id: &str) -> String {
+pub(crate) fn next_working_directory_id(_repository_id: &str) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
@@ -3933,7 +3980,8 @@ mod tests {
         #[cfg(target_os = "linux")]
         {
             // Real SSH reauthorization updated access evidence repeatedly, but
-            // did not replace this clean materialization or require manual recovery.
+            // did not replace this materialization or require manual recovery.
+            // Status does not inspect content; cleanup still verifies it below.
             assert_eq!(
                 restored
                     .working_directory_status(&id)
@@ -3941,7 +3989,7 @@ mod tests {
                     .summary
                     .cleanliness
                     .as_deref(),
-                Some("clean")
+                Some("unknown")
             );
             restored.cleanup_working_directory(&id).unwrap();
             assert!(!restored.working_directory_root(&id).exists());
@@ -4441,6 +4489,307 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "working_directory_cleanup_ownership_unknown");
         assert!(root.exists());
+    }
+
+    fn materialization_context(
+        ssh: Option<RepositorySshMaterializationAccess>,
+    ) -> crate::catalog::RepositoryMaterializationContext {
+        crate::catalog::RepositoryMaterializationContext {
+            workspace_id: "workspace-1".to_string(),
+            runtime_id: "runtime-1".to_string(),
+            operation_id: "operation-1".to_string(),
+            config_revision: 7,
+            config_projection_digest: "sha256:projection".to_string(),
+            ssh,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_session_resources_block_cleanup_until_last_clone_drops() {
+        let repo = create_clean_repo();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitMaterializer::new(runtime_root.path());
+        let binding = materializer.create(&request(repo.path())).unwrap();
+        let id = &binding.working_directory.id;
+        // Read bindings and materializer clones must share the same admission.
+        let restored = materializer.bind_working_directory(id, None).unwrap();
+        let resources = restored.session_resources().unwrap();
+        let resource_clone = resources.clone();
+        let second_resources = binding.session_resources().unwrap();
+        let clone = materializer.clone();
+
+        for _ in 0..2 {
+            assert_eq!(
+                clone.cleanup_working_directory(id).unwrap_err().code,
+                "working_directory_cleanup_resource_busy"
+            );
+        }
+        assert!(binding.root().join("README.md").exists());
+        drop(resources);
+        drop(second_resources);
+        assert_eq!(
+            clone.cleanup_working_directory(id).unwrap_err().code,
+            "working_directory_cleanup_resource_busy"
+        );
+        drop(resource_clone);
+        clone.cleanup_working_directory(id).unwrap();
+        // Both bindings are still alive and passive after resource release.
+        assert!(!binding.working_directory_root().exists());
+        assert!(!restored.root().exists());
+    }
+
+    #[test]
+    fn active_cleanup_rejects_creation_and_access_before_effects() {
+        let repo = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitMaterializer::new(runtime_root.path());
+        let id = "workdir-cleanup-active";
+        let cleanup = materializer.occupancy.acquire_cleanup(id).unwrap();
+        let mut create_request = request(repo.path());
+        create_request.backend_workdir_id = Some(id.to_string());
+        let access_request = WorkingDirectoryRepositoryAccessRequest {
+            working_directory_id: id.to_string(),
+            materialization: materialization_context(Some(repository_ssh_access())),
+        };
+
+        assert_eq!(
+            materializer.create(&create_request).unwrap_err().code,
+            "working_directory_cleanup_resource_busy"
+        );
+        assert_eq!(
+            materializer
+                .materialize(&worker_ref(1), &create_request)
+                .unwrap_err()
+                .code,
+            "working_directory_cleanup_resource_busy"
+        );
+        assert_eq!(
+            materializer
+                .authorize_repository_access(&access_request)
+                .unwrap_err()
+                .code,
+            "working_directory_cleanup_resource_busy"
+        );
+        assert_eq!(
+            materializer
+                .bind_working_directory(id, None)
+                .unwrap_err()
+                .code,
+            "working_directory_cleanup_resource_busy"
+        );
+        assert!(!materializer.working_directory_root(id).exists());
+        assert_eq!(materializer.repository_access.pending_count(), 0);
+        drop(cleanup);
+        // The cleanup reservation was transient, not a persisted lifecycle.
+        assert_ne!(
+            materializer.create(&create_request).unwrap_err().code,
+            "working_directory_cleanup_resource_busy"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_cleanup_rejects_existing_binding_resources_but_not_other_ids() {
+        let repo = create_clean_repo();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitMaterializer::new(runtime_root.path());
+        let binding = materializer.create(&request(repo.path())).unwrap();
+        let id = &binding.working_directory.id;
+        let cleanup = materializer.occupancy.acquire_cleanup(id).unwrap();
+        assert_eq!(
+            binding.session_resources().unwrap_err().code,
+            "working_directory_cleanup_resource_busy"
+        );
+        assert_eq!(
+            materializer.cleanup_working_directory(id).unwrap_err().code,
+            "working_directory_cleanup_resource_busy"
+        );
+        let other = materializer.create(&request(repo.path())).unwrap();
+        let other_resources = other.session_resources().unwrap();
+        drop(other_resources);
+        materializer
+            .cleanup_working_directory(&other.working_directory.id)
+            .unwrap();
+        drop(cleanup);
+        let resources = binding.session_resources().unwrap();
+        drop(resources);
+        materializer.cleanup_working_directory(id).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_error_releases_lease_for_session_and_safe_retry() {
+        let repo = create_clean_repo();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitMaterializer::new(runtime_root.path());
+        let binding = materializer.create(&request(repo.path())).unwrap();
+        let changed = binding.root().join("untracked.txt");
+        fs::write(&changed, "preserve me\n").unwrap();
+        assert_eq!(
+            materializer
+                .cleanup_working_directory(&binding.working_directory.id)
+                .unwrap_err()
+                .code,
+            "working_directory_cleanup_changes_present"
+        );
+        let resources = binding.session_resources().unwrap();
+        fs::remove_file(changed).unwrap();
+        drop(resources);
+        materializer
+            .cleanup_working_directory(&binding.working_directory.id)
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn removed_binding_cannot_activate_against_recreated_same_id() {
+        let repo = create_clean_repo();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitMaterializer::new(runtime_root.path());
+        let mut create = request(repo.path());
+        create.backend_workdir_id = Some("workdir-reused-id".into());
+        let old = materializer.create(&create).unwrap();
+        materializer
+            .cleanup_working_directory(&old.working_directory.id)
+            .unwrap();
+        assert_eq!(
+            old.session_resources().unwrap_err().code,
+            "working_directory_not_found"
+        );
+        let fresh = materializer.create(&create).unwrap();
+        assert_eq!(
+            old.session_resources().unwrap_err().code,
+            "working_directory_not_found"
+        );
+        let resources = fresh.session_resources().unwrap();
+        assert_eq!(
+            materializer
+                .cleanup_working_directory(&fresh.working_directory.id)
+                .unwrap_err()
+                .code,
+            "working_directory_cleanup_resource_busy"
+        );
+        drop(resources);
+        materializer
+            .cleanup_working_directory(&fresh.working_directory.id)
+            .unwrap();
+    }
+
+    #[test]
+    fn same_id_creation_is_exclusive_and_never_adopts_existing_partial_root() {
+        let repo = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitMaterializer::new(runtime_root.path());
+        let id = "workdir-creation-owner";
+        let mut create = request(repo.path());
+        create.backend_workdir_id = Some(id.into());
+        let creation = materializer.occupancy.acquire_creation(id).unwrap();
+        assert_eq!(
+            materializer.clone().create(&create).unwrap_err().code,
+            "working_directory_cleanup_resource_busy"
+        );
+        assert_eq!(
+            materializer
+                .bind_working_directory(id, None)
+                .unwrap_err()
+                .code,
+            "working_directory_cleanup_resource_busy"
+        );
+        assert_eq!(
+            materializer.cleanup_working_directory(id).unwrap_err().code,
+            "working_directory_cleanup_resource_busy"
+        );
+        assert!(!materializer.working_directory_root(id).exists());
+        drop(creation);
+        let partial = materializer.working_directory_root(id);
+        fs::create_dir(&partial).unwrap();
+        fs::write(
+            partial.join("owner-content"),
+            "preserve partial removal state",
+        )
+        .unwrap();
+        assert_eq!(
+            materializer.create(&create).unwrap_err().code,
+            "working_directory_exists"
+        );
+        assert_eq!(
+            fs::read_to_string(partial.join("owner-content")).unwrap(),
+            "preserve partial removal state"
+        );
+    }
+
+    #[test]
+    fn failed_access_preparation_does_not_strand_a_creation_root() {
+        let repo = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitMaterializer::new(runtime_root.path());
+        let mut create = request(repo.path());
+        create.backend_workdir_id = Some("workdir-access-setup-failure".into());
+        let mut ssh = repository_ssh_access();
+        ssh.known_hosts_entry =
+            crate::catalog::SensitiveString::new("example.test ssh-ed25519 placeholder");
+        create.repository.source = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::Ssh,
+            uri: ssh.repository_uri.clone(),
+        };
+        create.materialization = Some(materialization_context(Some(ssh)));
+        // A local storage failure stops access setup before any SSH transport or
+        // agent can start. The materialization must remain retryable, not adopted.
+        fs::write(
+            runtime_root.path().join(REPOSITORY_ACCESS_DIR),
+            "storage obstruction",
+        )
+        .unwrap();
+        assert_eq!(
+            materializer.create(&create).unwrap_err().code,
+            "working_directory_repository_access_setup_failed"
+        );
+        assert!(
+            !materializer
+                .working_directory_root(create.backend_workdir_id.as_deref().unwrap())
+                .exists()
+        );
+    }
+
+    #[test]
+    fn failed_creation_and_access_release_use_leases() {
+        let repo = tempfile::tempdir().unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitMaterializer::new(runtime_root.path());
+        let id = "workdir-effect-errors";
+        let mut create_request = request(repo.path());
+        create_request.backend_workdir_id = Some(id.to_string());
+        // Validation fails after admission but before effects.
+        create_request.repository.provider = "unsupported".to_string();
+        assert_eq!(
+            materializer.create(&create_request).unwrap_err().code,
+            "working_directory_repository_provider_unsupported"
+        );
+        drop(materializer.occupancy.acquire_cleanup(id).unwrap());
+        // A clone failure has already created the target and must also release
+        // admission after rolling its filesystem effects back.
+        create_request.repository.provider = "git".to_string();
+        assert_eq!(
+            materializer.create(&create_request).unwrap_err().code,
+            "working_directory_repository_clone_failed"
+        );
+        assert!(!materializer.working_directory_root(id).exists());
+        drop(materializer.occupancy.acquire_cleanup(id).unwrap());
+        let access_request = WorkingDirectoryRepositoryAccessRequest {
+            working_directory_id: id.to_string(),
+            materialization: materialization_context(None),
+        };
+        assert_eq!(
+            materializer
+                .authorize_repository_access(&access_request)
+                .unwrap_err()
+                .code,
+            "working_directory_remote_repository_access_required"
+        );
+        drop(materializer.occupancy.acquire_cleanup(id).unwrap());
+        assert!(materializer.bind_working_directory(id, None).is_err());
+        drop(materializer.occupancy.acquire_cleanup(id).unwrap());
     }
 
     #[test]
