@@ -68,6 +68,7 @@ pub(crate) struct InternalWorkerSpec {
                 ) + Send,
         >,
     >,
+    pub compaction_budget: Option<crate::compact::worker::CompactWorkerInterceptor>,
     pub features: FeatureRegistryBuilder,
     pub required_tools: &'static [&'static str],
     pub authority: InternalWorkerAuthority,
@@ -118,6 +119,7 @@ where
         cache_key,
         max_turns,
         engine_configurator,
+        compaction_budget,
         features,
         required_tools,
         authority,
@@ -171,6 +173,7 @@ where
         identity: identity.clone(),
         history_entries: 0,
     })?;
+    worker.install_compaction_budget(compaction_budget);
     worker.disable_manifest_lifecycle_features();
     if let Some(session) = inherited_workdir_session {
         worker.bind_single_workdir_session(Some(session));
@@ -666,6 +669,7 @@ pub(crate) async fn spawn_internal_worker_session(
         cache_key,
         max_turns,
         engine_configurator,
+        compaction_budget,
         features,
         required_tools,
         authority,
@@ -701,6 +705,7 @@ pub(crate) async fn spawn_internal_worker_session(
     .map_err(|source| InternalWorkerSessionError::Build {
         message: source.to_string(),
     })?;
+    worker.install_compaction_budget(compaction_budget);
     worker.disable_manifest_lifecycle_features();
     if let Some(session) = inherited_workdir_session {
         worker.bind_single_workdir_session(Some(session));
@@ -762,6 +767,7 @@ pub(crate) fn prepare_internal_worker_from_spec(
             cache_key,
             max_turns,
             engine_configurator,
+            compaction_budget,
             features,
             required_tools,
             authority,
@@ -794,6 +800,7 @@ pub(crate) fn prepare_internal_worker_from_spec(
         .map_err(|source| InternalWorkerSessionError::Build {
             message: source.to_string(),
         })?;
+        worker.install_compaction_budget(compaction_budget);
         worker.disable_manifest_lifecycle_features();
         if let Some(session) = inherited_workdir_session {
             worker.bind_single_workdir_session(Some(session));
@@ -1442,6 +1449,7 @@ permission = "write"
             input: "input".to_string(),
             cache_key: Some("internal-test".to_string()),
             max_turns: Some(1),
+            compaction_budget: None,
             engine_configurator: None,
             features: FeatureRegistryBuilder::new(),
             required_tools,

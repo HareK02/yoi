@@ -133,6 +133,7 @@ struct MockClient {
     responses: Arc<Vec<Vec<LlmEvent>>>,
     call_count: Arc<AtomicUsize>,
     observer: Arc<Mutex<Option<CallObserver>>>,
+    requests: Arc<Mutex<Vec<Request>>>,
 }
 
 impl MockClient {
@@ -141,7 +142,12 @@ impl MockClient {
             responses: Arc::new(responses),
             call_count: Arc::new(AtomicUsize::new(0)),
             observer: Arc::new(Mutex::new(None)),
+            requests: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn requests(&self) -> Vec<Request> {
+        self.requests.lock().unwrap().clone()
     }
 
     fn set_observer(&self, observer: impl Fn(usize) + Send + Sync + 'static) {
@@ -157,9 +163,10 @@ impl LlmClient for MockClient {
 
     async fn stream(
         &self,
-        _request: Request,
+        request: Request,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, ClientError>> + Send>>, ClientError>
     {
+        self.requests.lock().unwrap().push(request);
         let count = self.call_count.fetch_add(1, Ordering::SeqCst);
         if let Some(observer) = self.observer.lock().unwrap().clone() {
             observer(count);
@@ -2064,4 +2071,722 @@ async fn controller_compact_method_publishes_progress_and_clear() {
     );
     let command = protocol::WorkerCommandEnvelope::new(2);
     let _ = handle.send(Method::Shutdown { command }).await;
+}
+
+const INITIAL_SUMMARY_HEADING: &str = "## Initial compaction summary (full text)\n";
+const OVERVIEW_HEADING: &str = "## Conversation overview/index\n";
+const SUMMARY_MARKER: &str = "[Compacted context summary]\n\n";
+
+// These tests prove transport and durable replacement policy, not whether a live
+// model preserves meaning. All write_summary outputs below are predetermined.
+struct SummaryInputFixture {
+    worker: Worker<MockClient, TestStore>,
+    _store_dir: tempfile::TempDir,
+}
+
+impl SummaryInputFixture {
+    async fn new(manifest_toml: &str, client: MockClient) -> Self {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = CombinedStore::new(
+            FsStore::new(store_dir.path()).unwrap(),
+            FsWorkerStore::new(store_dir.path().join("pods")).unwrap(),
+        );
+        let engine =
+            Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(
+                client,
+            );
+        let mut worker = Worker::new(
+            worker::WorkerManifest::from_toml(manifest_toml).unwrap(),
+            engine,
+            store,
+            worker::WorkerWorkspaceContext::no_workspace(),
+            worker::WorkerFilesystemAuthority::None,
+            worker::Scope::empty(),
+        )
+        .await
+        .unwrap();
+        worker.enable_worker_metadata_write_through().unwrap();
+        worker.attach_log_writer(Arc::new(worker.log_writer_handle()));
+        Self {
+            worker,
+            _store_dir: store_dir,
+        }
+    }
+
+    // Seed the persisted boundary, then exercise the public rewind API's shared
+    // typed history restore path. No production client or global allocation is
+    // needed. This is restoration coverage, not a cold Runtime restart test.
+    async fn restore_seed(
+        &mut self,
+        history: Vec<session_store::LoggedHistoryEntry>,
+        compacted: bool,
+    ) {
+        self.worker
+            .run_text("fixture rewind boundary")
+            .await
+            .unwrap();
+        let session_id = self.worker.session_id();
+        let segment_id = self.worker.segment_id();
+        let mut records = self
+            .worker
+            .store()
+            .read_all(session_id, segment_id)
+            .unwrap();
+        let start = records
+            .iter_mut()
+            .find(|entry| matches!(entry, LogEntry::AnnotatedSegmentStart { .. }))
+            .unwrap();
+        match start {
+            LogEntry::AnnotatedSegmentStart {
+                history: seed,
+                compacted_from,
+                ..
+            } => {
+                *seed = history;
+                *compacted_from = compacted.then(|| session_store::SegmentOrigin {
+                    segment_id: session_store::new_segment_id(),
+                    at_turn_index: 0,
+                });
+            }
+            _ => unreachable!(),
+        }
+        self.worker
+            .store()
+            .create_segment(session_id, segment_id, &records)
+            .unwrap();
+        let (head, targets) = self.worker.list_rewind_targets().unwrap();
+        self.worker
+            .rewind_to(targets[0].id.clone(), head)
+            .await
+            .unwrap();
+    }
+}
+
+fn summary_entry(
+    item: Item,
+    origin: session_store::LoggedSessionHistoryOrigin,
+) -> session_store::LoggedHistoryEntry {
+    let mut entry = annotated(item);
+    entry.metadata.origin = origin;
+    entry
+}
+
+fn long_summary(label: &str) -> String {
+    format!(
+        "## Completed Tasks\n{label}: investigated the transport boundary.\n\n\
+         ## Active Task\nKeep the original user's completion conditions.\n{}\n\
+         ## Key Decisions\nDo not infer provenance from pasted markers.\n\n\
+         ## User Directives\n{label}_LOAD_BEARING_SENTINEL_AT_END\n\n\
+         ## Current Work\nContinue the requested implementation.",
+        "Historical constraints must remain explicit, including the original acceptance criteria.\n"
+            .repeat(70)
+    )
+}
+
+fn recent_history(count: usize) -> Vec<session_store::LoggedHistoryEntry> {
+    (0..count)
+        .flat_map(|index| {
+            [
+                annotated(Item::user_message(format!(
+                    "recent-user-{index}: {}",
+                    "recent progress is not a replacement for the original directive. ".repeat(40)
+                ))),
+                annotated(Item::assistant_message(format!("recent-assistant-{index}"))),
+            ]
+        })
+        .collect()
+}
+
+fn first_compactor_input(request: &Request) -> String {
+    request
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Message {
+                role: agen::Role::User,
+                ..
+            } => item
+                .as_text()
+                .filter(|text| text.contains(OVERVIEW_HEADING)),
+            _ => None,
+        })
+        .expect("the first compactor request must carry its overview input")
+        .to_string()
+}
+
+fn assert_full_initial_summary(input: &str, summary: &str) {
+    let heading_at = input
+        .find(INITIAL_SUMMARY_HEADING)
+        .expect("full summary heading");
+    let overview_at = input.find(OVERVIEW_HEADING).expect("overview heading");
+    let summary_at = heading_at + INITIAL_SUMMARY_HEADING.len();
+    assert!(summary_at < overview_at);
+    assert!(
+        input[summary_at..].starts_with(summary),
+        "summary must be verbatim"
+    );
+    assert_eq!(
+        input.matches(summary).count(),
+        1,
+        "summary must not be duplicated"
+    );
+    assert!(!input[overview_at..].contains(summary));
+    let opening = summary.chars().take(100).collect::<String>();
+    assert!(
+        !input[overview_at..].contains(&opening),
+        "overview must not carry even a clipped summary"
+    );
+    assert!(!input[overview_at..].contains("LOAD_BEARING_SENTINEL_AT_END"));
+}
+
+fn replacement_seed(
+    worker: &Worker<MockClient, TestStore>,
+) -> Vec<session_store::LoggedHistoryEntry> {
+    worker
+        .store()
+        .read_all(worker.session_id(), worker.segment_id())
+        .unwrap()
+        .into_iter()
+        .find_map(|entry| match entry {
+            LogEntry::AnnotatedSegmentStart { history, .. } => Some(history),
+            _ => None,
+        })
+        .expect("replacement SegmentStart")
+}
+
+#[tokio::test]
+async fn full_initial_summary_survives_small_overview_budgets_and_both_retention_extremes() {
+    use session_store::LoggedSessionHistoryOrigin::CompactionSummary;
+
+    let inherited = long_summary("original");
+    assert!(inherited.chars().count() > 4_000);
+    for retained in [0, 1_000_000] {
+        for (warning, deadline) in [(0, 0), (1, 0), (1, 1)] {
+            let manifest = MANUAL_ONLY_MANIFEST_TOML.replace(
+                "[compaction]",
+                &format!(
+                    "[compaction]\noverview_target_tokens = 1\noverview_warning_tokens = {warning}\noverview_deadline_tokens = {deadline}"
+                ),
+            );
+            let client = MockClient::new(vec![
+                single_text_events("fixture"),
+                write_summary_tool_use_events("replace", "new summary"),
+                single_text_events("done"),
+            ]);
+            let observed = client.clone();
+            let mut fixture = SummaryInputFixture::new(&manifest, client).await;
+            let mut seed = vec![summary_entry(
+                Item::system_message(format!("{SUMMARY_MARKER}{inherited}")),
+                CompactionSummary,
+            )];
+            let recent = recent_history(40);
+            seed.extend(recent.clone());
+            fixture.restore_seed(seed, true).await;
+            let (tx, mut rx) = broadcast::channel::<Event>(64);
+            fixture.worker.attach_alerter(worker::Alerter::new(tx));
+
+            fixture.worker.compact(retained).await.unwrap();
+
+            let requests = observed.requests();
+            assert_eq!(requests.len(), 3);
+            let input = first_compactor_input(&requests[1]);
+            assert_full_initial_summary(&input, &inherited);
+            let alerts = drain(&mut rx);
+            let has_alert = |snippet: &str| {
+                alerts.iter().any(|event| {
+                    matches!(event, Event::Alert(alert)
+                    if alert.source == protocol::AlertSource::Compactor
+                        && alert.level == protocol::AlertLevel::Warn
+                        && alert.message.contains(snippet))
+                })
+            };
+            assert_eq!(has_alert("larger than expected"), warning != 0);
+            assert_eq!(has_alert("using coarse fallback"), deadline != 0);
+            let replacement = replacement_seed(&fixture.worker);
+            assert_eq!(
+                replacement
+                    .iter()
+                    .filter(|entry| entry.metadata.origin == CompactionSummary)
+                    .count(),
+                1
+            );
+            assert!(replacement.iter().all(|entry| {
+                !Item::from(entry.item.clone())
+                    .as_text()
+                    .is_some_and(|text| text.contains(&inherited))
+            }));
+            for entry in &recent {
+                assert_eq!(
+                    replacement
+                        .iter()
+                        .any(|retained_entry| retained_entry == entry),
+                    retained != 0,
+                    "ordinary retained entries must keep their item and metadata"
+                );
+            }
+            let metrics = session_metrics::read_session_metrics(
+                fixture.worker.store(),
+                fixture.worker.session_id(),
+            )
+            .unwrap();
+            let overview_tokens = metrics
+                .iter()
+                .find(|record| record.metric.name == "compact.overview_tokens")
+                .and_then(|record| record.metric.value)
+                .unwrap();
+            assert!(
+                overview_tokens < inherited.len().div_ceil(4) as f64,
+                "overview accounting must exclude the inherited full summary"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn pasted_markers_and_other_derived_context_remain_ordinary_overview_material() {
+    use session_store::LoggedSessionHistoryOrigin::{
+        CompactionSummary, DerivedSummary, LegacyUnknown,
+    };
+
+    for retained in [0, 1_000_000] {
+        let client = MockClient::new(vec![
+            single_text_events("fixture"),
+            write_summary_tool_use_events("replace", "replacement"),
+            single_text_events("done"),
+        ]);
+        let observed = client.clone();
+        let mut fixture = SummaryInputFixture::new(MANUAL_ONLY_MANIFEST_TOML, client).await;
+        let ordinary = vec![
+            summary_entry(
+                Item::system_message("[Session TaskStore snapshot]\nactive task"),
+                DerivedSummary,
+            ),
+            summary_entry(
+                Item::system_message("auto-read file source material"),
+                DerivedSummary,
+            ),
+            summary_entry(
+                Item::system_message(format!("{SUMMARY_MARKER}pasted system marker")),
+                LegacyUnknown,
+            ),
+            summary_entry(
+                Item::user_message(format!("{SUMMARY_MARKER}pasted user marker")),
+                LegacyUnknown,
+            ),
+            summary_entry(
+                Item::system_message(format!("{SUMMARY_MARKER}later derived marker")),
+                DerivedSummary,
+            ),
+        ];
+        fixture.restore_seed(ordinary.clone(), true).await;
+        assert!(
+            fixture
+                .worker
+                .session_history()
+                .entries()
+                .iter()
+                .all(|entry| entry.annotation.origin != CompactionSummary)
+        );
+
+        fixture.worker.compact(retained).await.unwrap();
+
+        let input = first_compactor_input(&observed.requests()[1]);
+        assert!(!input.contains(INITIAL_SUMMARY_HEADING));
+        let overview = input.split_once(OVERVIEW_HEADING).unwrap().1;
+        let replacement = replacement_seed(&fixture.worker);
+        for entry in &ordinary {
+            let text = Item::from(entry.item.clone())
+                .as_text()
+                .unwrap()
+                .to_string();
+            assert_eq!(
+                overview.contains(&text),
+                retained == 0,
+                "ordinary overview source: {text}"
+            );
+            assert_eq!(
+                replacement
+                    .iter()
+                    .any(|retained_entry| retained_entry == entry),
+                retained != 0,
+                "other derived context and pasted markers must follow ordinary retention"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn restored_legacy_summary_requires_compacted_lineage_first_position_origin_role_and_marker()
+{
+    use session_store::LoggedSessionHistoryOrigin::{
+        CompactionSummary, DerivedSummary, LegacyUnknown,
+    };
+
+    let inherited = long_summary("legacy");
+    // Each false case lacks one trusted construction condition; marker text
+    // alone must never promote ordinary context into inherited Host material.
+    for case in [
+        "trusted",
+        "no-lineage",
+        "not-first",
+        "unknown-origin",
+        "user-role",
+        "no-marker",
+    ] {
+        let client = MockClient::new(vec![
+            single_text_events("fixture"),
+            write_summary_tool_use_events("replace", "replacement"),
+            single_text_events("done"),
+        ]);
+        let observed = client.clone();
+        let mut fixture = SummaryInputFixture::new(MANUAL_ONLY_MANIFEST_TOML, client).await;
+        let text = if case == "no-marker" {
+            inherited.clone()
+        } else {
+            format!("{SUMMARY_MARKER}{inherited}")
+        };
+        let item = if case == "user-role" {
+            Item::user_message(text)
+        } else {
+            Item::system_message(text)
+        };
+        let origin = if case == "unknown-origin" {
+            LegacyUnknown
+        } else {
+            DerivedSummary
+        };
+        let candidate = summary_entry(item, origin);
+        let candidate_id = candidate.metadata.entry_id.clone();
+        let mut history = vec![candidate];
+        if case == "not-first" {
+            history.insert(
+                0,
+                annotated(Item::system_message("unrelated first system context")),
+            );
+        }
+        history.extend(recent_history(20));
+        fixture.restore_seed(history, case != "no-lineage").await;
+        let restored = fixture
+            .worker
+            .session_history()
+            .entries()
+            .iter()
+            .find(|entry| entry.annotation.entry_id == candidate_id)
+            .unwrap();
+        assert_eq!(
+            restored.annotation.origin == CompactionSummary,
+            case == "trusted",
+            "{case}"
+        );
+        // A restore-time upgrade is an in-memory interpretation of the trusted
+        // seed; it must not silently rewrite the historical durable record.
+        assert!(
+            replacement_seed(&fixture.worker)
+                .iter()
+                .all(|entry| entry.metadata.origin != CompactionSummary)
+        );
+
+        fixture.worker.compact(0).await.unwrap();
+
+        let input = first_compactor_input(&observed.requests()[1]);
+        if case == "trusted" {
+            assert_full_initial_summary(&input, &inherited);
+        } else {
+            assert!(!input.contains(INITIAL_SUMMARY_HEADING), "{case}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn three_chained_compactions_transport_each_complete_predecessor_without_retaining_old_summaries()
+ {
+    use session_store::LoggedSessionHistoryOrigin::CompactionSummary;
+
+    let original_goal =
+        "CHAIN_ORIGINAL_USER_GOAL: finish only after all explicit acceptance conditions hold";
+    // Every predetermined output keeps the original directive. The assertions
+    // prove that complete predecessors reach later requests, not that a model
+    // chose to preserve this directive on its own.
+    let summaries = (0..3)
+        .map(|index| {
+            format!(
+                "{}\n{original_goal}",
+                long_summary(&format!("generation-{index}"))
+            )
+        })
+        .collect::<Vec<_>>();
+    let initial = format!("{}\n{original_goal}", long_summary("initial"));
+    let mut responses = vec![single_text_events("seed response")];
+    for (index, summary) in summaries.iter().enumerate() {
+        responses.push(single_text_events(
+            "acknowledge new directive and temporary recovery",
+        ));
+        responses.push(write_summary_tool_use_events(
+            &format!("summary-{index}"),
+            summary,
+        ));
+        responses.push(single_text_events("done"));
+    }
+    let client = MockClient::new(responses);
+    let observed = client.clone();
+    let mut fixture = SummaryInputFixture::new(MANUAL_ONLY_MANIFEST_TOML, client).await;
+    fixture
+        .restore_seed(
+            vec![summary_entry(
+                Item::system_message(format!("{SUMMARY_MARKER}{initial}")),
+                CompactionSummary,
+            )],
+            true,
+        )
+        .await;
+    let original_session = fixture.worker.session_id();
+    let mut predecessor = fixture.worker.segment_id();
+    for (index, summary) in summaries.iter().enumerate() {
+        let new_directive = format!(
+            "NEW_USER_DIRECTIVE_{index}: do not merge. Temporarily recover the interrupted work and collect SubWorkers; this does not retract the original goal."
+        );
+        fixture.worker.run_text(&new_directive).await.unwrap();
+        let first_request = observed.requests().len();
+        fixture.worker.compact(0).await.unwrap();
+        let input = first_compactor_input(&observed.requests()[first_request]);
+        let prior = if index == 0 {
+            &initial
+        } else {
+            &summaries[index - 1]
+        };
+        assert_full_initial_summary(&input, prior);
+        assert!(input.contains(original_goal));
+        assert!(input.contains(&new_directive));
+        let seed = replacement_seed(&fixture.worker);
+        let inherited = seed
+            .iter()
+            .filter(|entry| entry.metadata.origin == CompactionSummary)
+            .collect::<Vec<_>>();
+        assert_eq!(inherited.len(), 1);
+        assert_eq!(
+            Item::from(inherited[0].item.clone()).as_text().unwrap(),
+            format!("{SUMMARY_MARKER}{summary}")
+        );
+        for old in &summaries[..index] {
+            assert!(
+                fixture
+                    .worker
+                    .history()
+                    .iter()
+                    .all(|item| !item.as_text().is_some_and(|text| text.contains(old)))
+            );
+        }
+        let records = fixture
+            .worker
+            .store()
+            .read_all(original_session, fixture.worker.segment_id())
+            .unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|entry| matches!(entry, LogEntry::AnnotatedSegmentStart {
+            compacted_from: Some(origin), ..
+        } if origin.segment_id == predecessor))
+        );
+        let restored = session_store::restore(
+            fixture.worker.store(),
+            original_session,
+            fixture.worker.segment_id(),
+        )
+        .unwrap();
+        assert!(restored.history.iter().any(|item| {
+            item.as_text()
+                .is_some_and(|text| text == format!("{SUMMARY_MARKER}{summary}"))
+        }));
+        predecessor = fixture.worker.segment_id();
+    }
+    assert_eq!(observed.requests().len(), 10);
+}
+
+#[tokio::test]
+async fn inherited_summary_counts_against_hard_input_limit_and_failure_does_not_activate() {
+    use session_store::LoggedSessionHistoryOrigin::CompactionSummary;
+
+    let manifest = MANUAL_ONLY_MANIFEST_TOML.replace(
+        "[compaction]",
+        "[compaction]\nworker_context_max_tokens = 10000\nfinish_warning_remaining_tokens = 0\nfinal_reserve_tokens = 0\noverview_target_tokens = 1",
+    );
+    for include_summary in [false, true] {
+        let client = MockClient::new(vec![
+            single_text_events("fixture"),
+            write_summary_tool_use_events("replace", "replacement"),
+            single_text_events("done"),
+        ]);
+        let observed = client.clone();
+        let mut fixture = SummaryInputFixture::new(&manifest, client).await;
+        let summary =
+            "Preserve the user's goal and every explicit completion condition.\n".repeat(3_000);
+        assert!(
+            agen::token_counter::total_tokens(&[Item::user_message(&summary)], &[]).tokens > 10_000
+        );
+        let mut history = Vec::new();
+        if include_summary {
+            history.push(summary_entry(
+                Item::system_message(format!("{SUMMARY_MARKER}{summary}")),
+                CompactionSummary,
+            ));
+        }
+        history.extend(recent_history(20));
+        fixture.restore_seed(history, true).await;
+        let source = fixture.worker.segment_id();
+        let source_history = fixture.worker.history();
+        let result = fixture.worker.compact(0).await;
+        if include_summary {
+            let error = result.expect_err("mandatory input over hard cap must fail, not truncate");
+            assert!(
+                matches!(error, WorkerError::CompactCancelled)
+                    || error.to_string().contains("input occupancy"),
+                "unexpected hard-cap failure: {error:?}"
+            );
+            assert_eq!(
+                observed.requests().len(),
+                1,
+                "no compactor request may cross the hard cap"
+            );
+            assert_eq!(fixture.worker.segment_id(), source);
+            assert_eq!(fixture.worker.history(), source_history);
+            assert_eq!(
+                fixture
+                    .worker
+                    .store()
+                    .read_by_name("test-worker")
+                    .unwrap()
+                    .unwrap()
+                    .active
+                    .unwrap()
+                    .segment_id,
+                Some(source)
+            );
+            assert_eq!(
+                fixture
+                    .worker
+                    .store()
+                    .list_segments(fixture.worker.session_id())
+                    .unwrap()
+                    .len(),
+                1
+            );
+        } else {
+            result.expect("the same bounded overview without inherited input fits the cap");
+            assert_eq!(observed.requests().len(), 3);
+            assert_ne!(fixture.worker.segment_id(), source);
+        }
+    }
+}
+
+#[tokio::test]
+async fn summary_output_still_over_hard_max_after_rewrite_fails_without_activation() {
+    let oversized = long_summary("oversized");
+    let manifest = MANUAL_ONLY_MANIFEST_TOML.replace(
+        "[compaction]",
+        "[compaction]\nsummary_target_tokens = 50\nsummary_max_tokens = 100",
+    );
+    let client = MockClient::new(vec![
+        single_text_events("seed"),
+        write_summary_tool_use_events("first-output", &oversized),
+        single_text_events("done"),
+        write_summary_tool_use_events("rewrite-output", &oversized),
+        single_text_events("done"),
+    ]);
+    let observed = client.clone();
+    let mut fixture = SummaryInputFixture::new(&manifest, client).await;
+    fixture.worker.run_text("user goal").await.unwrap();
+    let source = fixture.worker.segment_id();
+    let history = fixture.worker.history();
+
+    let error = fixture.worker.compact(0).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        WorkerError::CompactSummaryTooLarge { max: 100, .. }
+    ));
+    assert_eq!(fixture.worker.segment_id(), source);
+    assert_eq!(fixture.worker.history(), history);
+    assert_eq!(
+        fixture
+            .worker
+            .store()
+            .read_by_name("test-worker")
+            .unwrap()
+            .unwrap()
+            .active
+            .unwrap()
+            .segment_id,
+        Some(source)
+    );
+    assert_eq!(
+        fixture
+            .worker
+            .store()
+            .list_segments(fixture.worker.session_id())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        observed
+            .requests()
+            .iter()
+            .any(|request| request.items.iter().any(|item| item
+                .as_text()
+                .is_some_and(|text| text.contains("Rewrite it now with `write_summary`"))))
+    );
+}
+
+#[tokio::test]
+async fn budget_warning_is_durable_and_keeps_full_summary_in_first_model_request() {
+    use session_store::LoggedSessionHistoryOrigin::CompactionSummary;
+    let manifest = MANUAL_ONLY_MANIFEST_TOML.replace(
+        "[compaction]",
+        "[compaction]\nworker_context_max_tokens = 10000\nfinish_warning_remaining_tokens = 9999\nfinal_reserve_tokens = 9999",
+    );
+    let client = MockClient::new(vec![
+        single_text_events("fixture"),
+        write_summary_tool_use_events("summary", "replacement"),
+        single_text_events("done"),
+    ]);
+    let observed = client.clone();
+    let mut fixture = SummaryInputFixture::new(&manifest, client).await;
+    let inherited = long_summary("budget-warning");
+    fixture
+        .restore_seed(
+            vec![summary_entry(
+                Item::system_message(format!("{SUMMARY_MARKER}{inherited}")),
+                CompactionSummary,
+            )],
+            true,
+        )
+        .await;
+    let (tx, mut rx) = broadcast::channel::<Event>(128);
+    fixture.worker.attach_alerter(worker::Alerter::new(tx));
+    fixture.worker.compact(0).await.unwrap();
+    let requests = observed.requests();
+    assert_full_initial_summary(&first_compactor_input(&requests[1]), &inherited);
+    let warning = requests[1]
+        .items
+        .iter()
+        .filter_map(Item::as_text)
+        .find(|text| text.starts_with("[Compact worker budget warning]"))
+        .expect("normal internal Worker must preserve the budget interceptor warning");
+    assert!(warning.contains("full initial summary and segment"));
+    assert!(warning.contains("changes/retractions"));
+    assert!(
+        requests[2]
+            .items
+            .iter()
+            .filter_map(Item::as_text)
+            .any(|text| text == warning),
+        "warning must remain in history, not be a transient request insertion"
+    );
+    assert!(
+        drain(&mut rx)
+            .iter()
+            .any(|event| matches!(event, Event::Alert(alert)
+        if alert.message.contains("compact worker context budget is low")))
+    );
 }
