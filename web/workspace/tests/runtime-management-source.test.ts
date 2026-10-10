@@ -181,7 +181,7 @@ Deno.test("Runtime detail keeps trust controls owner-only and conflict-safe", as
       "new RuntimeRemovalAttempt()",
       "runtimeRemovalAttempt.operationId()",
       "operation_id: operationId",
-      "expected_binding_revision: trust.revision",
+      "expected_binding_id: trust.binding_id",
       "The Backend removes Workspace trust and this Runtime registration as one guarded operation.",
       "deleteRuntimeConfirmation.trim() !== data.runtimeId",
       "Delete Runtime registration",

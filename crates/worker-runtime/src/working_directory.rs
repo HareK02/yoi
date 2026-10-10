@@ -40,6 +40,7 @@ const REPOSITORY_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 static NEXT_WORKING_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "FrozenEvidenceRead")]
 pub struct WorkingDirectoryEvidence {
     pub repository_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,16 +49,61 @@ pub struct WorkingDirectoryEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_tree: Option<String>,
     pub materializer_kind: MaterializerKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repository_source_revision: Option<u64>,
+    /// SSH authority must be reacquired before opening a session, even if an old
+    /// record has no concrete key fingerprint. Never inferred as false from that omission.
+    pub repository_access_required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_source_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credential_revision: Option<u64>,
+    pub public_key_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_trust_revision: Option<u64>,
+    pub host_key_fingerprint: Option<String>,
+}
+
+// Frozen persisted evidence reader. Legacy counters only mark that SSH
+// access is required; they are never converted to key identity or grants.
+#[derive(Deserialize)]
+struct FrozenEvidenceRead {
+    repository_id: String,
+    requested_selector: Option<String>,
+    resolved_commit: String,
+    resolved_tree: Option<String>,
+    materializer_kind: MaterializerKind,
+    repository_source_fingerprint: Option<String>,
+    operation_id: Option<String>,
+    public_key_fingerprint: Option<String>,
+    host_key_fingerprint: Option<String>,
+    repository_access_required: Option<bool>,
+    credential_revision: Option<u64>,
+    host_trust_revision: Option<u64>,
+}
+
+impl TryFrom<FrozenEvidenceRead> for WorkingDirectoryEvidence {
+    type Error = &'static str;
+    fn try_from(wire: FrozenEvidenceRead) -> Result<Self, Self::Error> {
+        if wire.credential_revision == Some(0) || wire.host_trust_revision == Some(0) {
+            return Err("legacy SSH evidence contains an invalid authority marker");
+        }
+        let repository_access_required = wire.repository_access_required.unwrap_or(false)
+            || wire.credential_revision.is_some()
+            || wire.host_trust_revision.is_some()
+            || wire.public_key_fingerprint.is_some()
+            || wire.host_key_fingerprint.is_some();
+        Ok(Self {
+            repository_id: wire.repository_id,
+            requested_selector: wire.requested_selector,
+            resolved_commit: wire.resolved_commit,
+            resolved_tree: wire.resolved_tree,
+            materializer_kind: wire.materializer_kind,
+            repository_access_required,
+            repository_source_fingerprint: wire.repository_source_fingerprint,
+            operation_id: wire.operation_id,
+            public_key_fingerprint: wire.public_key_fingerprint,
+            host_key_fingerprint: wire.host_key_fingerprint,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,7 +202,7 @@ impl WorkingDirectoryBinding {
             WorkingDirectoryStatusKind::Active | WorkingDirectoryStatusKind::CleanupPending
         ) && binding_paths_are_available(self)
         {
-            let (current_selector, current_ref, current_tree) = binding_current_revision(self);
+            let (current_selector, current_ref, current_tree) = binding_current_commit(self);
             summary.current_selector = current_selector;
             summary.current_ref = current_ref;
             summary.current_tree = current_tree;
@@ -274,7 +320,7 @@ fn binding_paths_are_available(binding: &WorkingDirectoryBinding) -> bool {
     root.join(".git").is_dir()
 }
 
-fn binding_current_revision(
+fn binding_current_commit(
     binding: &WorkingDirectoryBinding,
 ) -> (Option<String>, Option<String>, Option<String>) {
     let current_ref = git_stdout(binding.root(), ["rev-parse", "HEAD"])
@@ -305,13 +351,12 @@ fn binding_cleanliness(binding: &WorkingDirectoryBinding) -> String {
 
 #[derive(Debug)]
 struct PendingRepositoryAccessLease {
-    generation: u64,
+    lease_id: uuid::Uuid,
     access: RepositorySshMaterializationAccess,
 }
 
 #[derive(Debug, Default)]
 struct RepositoryAccessExpiryState {
-    next_generation: u64,
     pending: HashMap<String, PendingRepositoryAccessLease>,
     shutdown: bool,
 }
@@ -360,23 +405,11 @@ impl RepositoryAccessExpiryScheduler {
         }
     }
 
-    fn next_generation(
-        state: &mut RepositoryAccessExpiryState,
-    ) -> Result<u64, WorkingDirectoryDiagnostic> {
-        state.next_generation = state.next_generation.checked_add(1).ok_or_else(|| {
-            WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_access_generation_exhausted",
-                "Runtime Repository access generation is exhausted",
-            )
-        })?;
-        Ok(state.next_generation)
-    }
-
     fn store_pending(
         &self,
         working_directory_id: &str,
         access: RepositorySshMaterializationAccess,
-    ) -> Result<u64, WorkingDirectoryDiagnostic> {
+    ) -> Result<uuid::Uuid, WorkingDirectoryDiagnostic> {
         let mut state = self.inner.state.lock().map_err(|_| {
             WorkingDirectoryDiagnostic::new(
                 "working_directory_repository_access_unavailable",
@@ -389,14 +422,14 @@ impl RepositoryAccessExpiryScheduler {
                 "Runtime Repository access state is shutting down",
             ));
         }
-        let generation = Self::next_generation(&mut state)?;
+        let lease_id = uuid::Uuid::now_v7();
         state.pending.insert(
             working_directory_id.to_string(),
-            PendingRepositoryAccessLease { generation, access },
+            PendingRepositoryAccessLease { lease_id, access },
         );
         drop(state);
         self.inner.wake.notify_one();
-        Ok(generation)
+        Ok(lease_id)
     }
 
     fn pending(
@@ -452,14 +485,14 @@ impl RepositoryAccessExpiryScheduler {
         Ok(())
     }
 
-    fn next_expiry(state: &RepositoryAccessExpiryState) -> Option<(String, u64, u64)> {
+    fn next_expiry(state: &RepositoryAccessExpiryState) -> Option<(String, uuid::Uuid, u64)> {
         state
             .pending
             .iter()
             .map(|(working_directory_id, lease)| {
                 (
                     working_directory_id.clone(),
-                    lease.generation,
+                    lease.lease_id,
                     lease.access.expires_at_epoch_seconds,
                 )
             })
@@ -469,14 +502,14 @@ impl RepositoryAccessExpiryScheduler {
     fn expire_if_current(
         state: &mut RepositoryAccessExpiryState,
         working_directory_id: &str,
-        generation: u64,
+        lease_id: uuid::Uuid,
         now_epoch_seconds: u64,
     ) {
         let should_remove = state
             .pending
             .get(working_directory_id)
             .is_some_and(|lease| {
-                lease.generation == generation
+                lease.lease_id == lease_id
                     && lease.access.expires_at_epoch_seconds <= now_epoch_seconds
             });
         if should_remove {
@@ -494,7 +527,7 @@ impl RepositoryAccessExpiryScheduler {
                 if state.shutdown {
                     return;
                 }
-                let Some((working_directory_id, generation, expires_at_epoch_seconds)) =
+                let Some((working_directory_id, lease_id, expires_at_epoch_seconds)) =
                     Self::next_expiry(&state)
                 else {
                     state = match inner.wake.wait(state) {
@@ -518,7 +551,7 @@ impl RepositoryAccessExpiryScheduler {
                 Self::expire_if_current(
                     &mut state,
                     &working_directory_id,
-                    generation,
+                    lease_id,
                     now_epoch_seconds,
                 );
                 break;
@@ -527,21 +560,21 @@ impl RepositoryAccessExpiryScheduler {
     }
 
     #[cfg(test)]
-    fn pending_generation(&self, working_directory_id: &str) -> Option<u64> {
+    fn pending_lease_id(&self, working_directory_id: &str) -> Option<uuid::Uuid> {
         self.inner
             .state
             .lock()
             .ok()?
             .pending
             .get(working_directory_id)
-            .map(|lease| lease.generation)
+            .map(|lease| lease.lease_id)
     }
 
     #[cfg(test)]
     fn expire_pending_for_test(
         &self,
         working_directory_id: &str,
-        generation: u64,
+        lease_id: uuid::Uuid,
         now_epoch_seconds: u64,
     ) {
         let Ok(mut state) = self.inner.state.lock() else {
@@ -550,7 +583,7 @@ impl RepositoryAccessExpiryScheduler {
         Self::expire_if_current(
             &mut state,
             working_directory_id,
-            generation,
+            lease_id,
             now_epoch_seconds,
         );
     }
@@ -702,6 +735,26 @@ impl RuntimeGitMaterializer {
         &self,
         working_directory_id: &str,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
+        // Frozen evidence normalization can write the record. Keep it inside
+        // use admission so observational reads cannot race physical cleanup.
+        let _use_lease = self.occupancy.acquire_use(working_directory_id)?;
+        self.read_binding_record(working_directory_id, true)
+    }
+
+    fn read_binding_for_cleanup(
+        &self,
+        working_directory_id: &str,
+    ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
+        // Cleanup already owns exclusive admission and validates the original
+        // bytes. Its witnessed status write performs any canonicalization.
+        self.read_binding_record(working_directory_id, false)
+    }
+
+    fn read_binding_record(
+        &self,
+        working_directory_id: &str,
+        migrate: bool,
+    ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
         let working_directory_root = self.working_directory_root(working_directory_id);
         let path = working_directory_root.join(MATERIALIZATION_RECORD);
         let raw = fs::read(&path).map_err(|_| {
@@ -716,7 +769,7 @@ impl RuntimeGitMaterializer {
                 "working directory working_directory record is invalid; backend-private path details were omitted",
             )
         })?;
-        Ok(WorkingDirectoryBinding {
+        let binding = WorkingDirectoryBinding {
             working_directory: record.working_directory,
             root: record.root.clone(),
             cwd: record.root,
@@ -726,7 +779,39 @@ impl RuntimeGitMaterializer {
             occupancy: self.occupancy.clone(),
             occupancy_id: working_directory_id.to_string(),
             generation: self.occupancy.generation(&working_directory_id),
+        };
+        let canonical = serde_json::to_vec_pretty(&WorkingDirectoryMaterializationRecord {
+            working_directory: binding.working_directory.clone(),
+            root: binding.root.clone(),
         })
+        .map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_record_invalid",
+                "materialization evidence is invalid",
+            )
+        })?;
+        if migrate && canonical != raw {
+            let temporary = path.with_extension(format!("migration-{}.tmp", uuid::Uuid::now_v7()));
+            let result = (|| -> std::io::Result<()> {
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)?;
+                file.write_all(&canonical)?;
+                file.sync_all()?;
+                fs::rename(&temporary, &path)?;
+                fs::File::open(&binding.working_directory_root)?.sync_all()?;
+                Ok(())
+            })();
+            if result.is_err() {
+                let _ = fs::remove_file(&temporary);
+                return Err(WorkingDirectoryDiagnostic::new(
+                    "working_directory_record_write_failed",
+                    "materialization evidence migration could not be committed",
+                ));
+            }
+        }
+        Ok(binding)
     }
 
     fn store_repository_access(
@@ -750,8 +835,7 @@ impl RuntimeGitMaterializer {
             if binding
                 .working_directory
                 .evidence
-                .credential_revision
-                .is_some()
+                .repository_access_required
             {
                 return Err(WorkingDirectoryDiagnostic::new(
                     "working_directory_remote_repository_access_required",
@@ -832,7 +916,6 @@ impl RuntimeGitMaterializer {
             if materialization.workspace_id.trim().is_empty()
                 || materialization.runtime_id.trim().is_empty()
                 || materialization.operation_id.trim().is_empty()
-                || materialization.config_revision == 0
                 || materialization.config_projection_digest.trim().is_empty()
             {
                 return Err(WorkingDirectoryDiagnostic::new(
@@ -1032,16 +1115,17 @@ impl RuntimeGitMaterializer {
                 resolved_commit,
                 resolved_tree,
                 materializer_kind: MaterializerKind::RuntimeGitClone,
-                repository_source_revision: Some(request.repository.source_revision),
+                repository_access_required: request.repository.source.kind
+                    == server_api::RepositorySourceKind::Ssh,
                 repository_source_fingerprint: Some(request.repository.source_fingerprint.clone()),
                 operation_id: context.map(|value| value.operation_id.clone()),
-                credential_revision: context
+                public_key_fingerprint: context
                     .and_then(|value| value.ssh.as_ref())
                     .and_then(|value| value.credential_candidates.first())
-                    .map(|candidate| candidate.credential_revision),
-                host_trust_revision: context
+                    .map(|candidate| candidate.public_key_fingerprint.clone()),
+                host_key_fingerprint: context
                     .and_then(|value| value.ssh.as_ref())
-                    .map(|value| value.host_trust_revision),
+                    .map(|value| value.host_key_fingerprint.clone()),
             },
             cleanup_target: WorkingDirectoryCleanupTarget {
                 kind: "runtime_git_clone".to_string(),
@@ -1122,11 +1206,10 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
             }
             Err(error) => return Err(error),
         };
-        if binding
+        if !binding
             .working_directory
             .evidence
-            .credential_revision
-            .is_none()
+            .repository_access_required
         {
             return Err(WorkingDirectoryDiagnostic::new(
                 "working_directory_repository_access_not_applicable",
@@ -1146,13 +1229,15 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
         )?;
         binding.working_directory.evidence.operation_id =
             Some(request.materialization.operation_id.clone());
-        binding.working_directory.evidence.credential_revision = Some(
+        binding.working_directory.evidence.public_key_fingerprint = Some(
             ssh.credential_candidates
                 .first()
                 .expect("validated SSH credential candidate")
-                .credential_revision,
+                .public_key_fingerprint
+                .clone(),
         );
-        binding.working_directory.evidence.host_trust_revision = Some(ssh.host_trust_revision);
+        binding.working_directory.evidence.host_key_fingerprint =
+            Some(ssh.host_key_fingerprint.clone());
         self.write_record(&binding)?;
         self.store_repository_access(&request.working_directory_id, ssh)
     }
@@ -1195,15 +1280,15 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
                 "Repository provider returned an ambiguous ref observation",
             ));
         }
-        let (revision_ref, observed_selector) = line.split_once('\t').ok_or_else(|| {
+        let (resolved_ref, observed_selector) = line.split_once('\t').ok_or_else(|| {
             WorkingDirectoryDiagnostic::new(
                 "repository_ref_response_invalid",
                 "Repository provider returned an invalid ref observation",
             )
         })?;
         if observed_selector != selector
-            || !matches!(revision_ref.len(), 40 | 64)
-            || !revision_ref.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !matches!(resolved_ref.len(), 40 | 64)
+            || !resolved_ref.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(WorkingDirectoryDiagnostic::new(
                 "repository_ref_response_invalid",
@@ -1213,10 +1298,9 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
 
         Ok(RepositoryRefObservation {
             repository_id: request.repository.id.clone(),
-            source_revision: request.repository.source_revision,
             source_fingerprint: request.repository.source_fingerprint.clone(),
             selector: selector.to_string(),
-            revision_ref: revision_ref.to_ascii_lowercase(),
+            resolved_ref: resolved_ref.to_ascii_lowercase(),
             observed_at_epoch_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -2294,11 +2378,11 @@ fn validate_ssh_materialization_access(
     if access.credential_candidates.is_empty()
         || access.credential_candidates.iter().any(|candidate| {
             candidate.credential_id.trim().is_empty()
-                || candidate.credential_revision == 0
+                || candidate.public_key_fingerprint.trim().is_empty()
                 || !candidate.private_key.expose().contains("PRIVATE KEY")
         })
         || access.host_trust_id.trim().is_empty()
-        || access.host_trust_revision == 0
+        || access.host_key_fingerprint.trim().is_empty()
         || access.known_hosts_entry.expose().trim().is_empty()
     {
         return Err(WorkingDirectoryDiagnostic::new(
@@ -3013,8 +3097,6 @@ mod tests {
             operation: crate::resource::BackendResourceOperation::FetchOnce,
             expires_at_unix_seconds: i64::MAX,
             nonce: "repository-access-1".to_string(),
-            revision: "1".to_string(),
-            generation: None,
             max_bytes: crate::resource::DEFAULT_REPOSITORY_SSH_ACCESS_MAX_BYTES,
             content_type: crate::resource::REPOSITORY_SSH_ACCESS_CONTENT_TYPE.to_string(),
             redaction: crate::resource::ResourceRedactionPolicy::RuntimeInternalOnly,
@@ -3027,11 +3109,11 @@ mod tests {
         crate::catalog::RepositorySshMaterializationAccess {
             credential_candidates: vec![crate::catalog::RepositorySshCredentialCandidate {
                 credential_id: "credential-1".to_string(),
-                credential_revision: 2,
+                public_key_fingerprint: "key-2".into(),
                 private_key: crate::catalog::SensitiveString::new("PRIVATE KEY secret bytes"),
             }],
             host_trust_id: "trust-1".to_string(),
-            host_trust_revision: 4,
+            host_key_fingerprint: "key-4".into(),
             access: server_api::RepositoryAccessMode::ReadOnly,
             expires_at_epoch_seconds: u64::MAX,
             repository_id: "repo-main".to_string(),
@@ -3043,7 +3125,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_access_expiry_fences_a_stale_pending_generation_after_refresh() {
+    fn repository_access_expiry_fences_a_stale_pending_lease_id_after_refresh() {
         let scheduler = RepositoryAccessExpiryScheduler::new();
         let working_directory_id = "working-directory-refresh";
         let old_expiry = repository_access_now_epoch_seconds() + 60;
@@ -3052,9 +3134,9 @@ mod tests {
         scheduler
             .store_pending(working_directory_id, old_access)
             .unwrap();
-        let old_generation = scheduler
-            .pending_generation(working_directory_id)
-            .expect("old pending generation");
+        let old_lease_id = scheduler
+            .pending_lease_id(working_directory_id)
+            .expect("old pending lease_id");
 
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let refresh_barrier = Arc::clone(&barrier);
@@ -3069,12 +3151,12 @@ mod tests {
         });
         barrier.wait();
         refresh.join().unwrap();
-        let refreshed_generation = scheduler
-            .pending_generation(working_directory_id)
-            .expect("refreshed pending generation");
-        assert_ne!(old_generation, refreshed_generation);
+        let refreshed_lease_id = scheduler
+            .pending_lease_id(working_directory_id)
+            .expect("refreshed pending lease_id");
+        assert_ne!(old_lease_id, refreshed_lease_id);
 
-        scheduler.expire_pending_for_test(working_directory_id, old_generation, old_expiry);
+        scheduler.expire_pending_for_test(working_directory_id, old_lease_id, old_expiry);
         let refreshed = scheduler
             .pending(working_directory_id)
             .unwrap()
@@ -3175,7 +3257,6 @@ mod tests {
                     kind: server_api::RepositorySourceKind::LocalPath,
                     uri: repo.display().to_string(),
                 },
-                source_revision: 1,
                 source_fingerprint: "sha256:test".to_string(),
                 selector: Some(RepositorySelector::from("HEAD")),
             },
@@ -3188,6 +3269,48 @@ mod tests {
 
     fn worker_ref(sequence: u64) -> WorkerRef {
         WorkerRef::new(WorkerId::from_legacy_u64(sequence))
+    }
+
+    #[test]
+    fn legacy_ssh_evidence_requires_fresh_access_and_is_rewritten_without_counters() {
+        let repository = create_clean_repo();
+        let runtime = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitMaterializer::new(runtime.path());
+        let binding = materializer.create(&request(repository.path())).unwrap();
+        let id = binding.working_directory.id.clone();
+        let record_path = binding.working_directory_root.join(MATERIALIZATION_RECORD);
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        let evidence = record["working_directory"]["evidence"]
+            .as_object_mut()
+            .unwrap();
+        evidence.remove("repository_access_required");
+        evidence.insert("credential_revision".into(), serde_json::json!(3));
+        evidence.insert("host_trust_revision".into(), serde_json::json!(2));
+        fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        drop(binding);
+        assert_eq!(
+            materializer
+                .bind_working_directory(&id, None)
+                .unwrap_err()
+                .code,
+            "working_directory_remote_repository_access_required"
+        );
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        let evidence = &migrated["working_directory"]["evidence"];
+        assert_eq!(evidence["repository_access_required"], true);
+        assert!(evidence.get("credential_revision").is_none());
+        assert!(evidence.get("host_trust_revision").is_none());
+        assert!(evidence.get("public_key_fingerprint").is_none());
+        drop(materializer);
+        assert_eq!(
+            RuntimeGitMaterializer::new(runtime.path())
+                .bind_working_directory(&id, None)
+                .unwrap_err()
+                .code,
+            "working_directory_remote_repository_access_required"
+        );
     }
 
     #[test]
@@ -3207,7 +3330,7 @@ mod tests {
             .observe_repository_ref(&observation_request)
             .unwrap();
         assert_eq!(
-            first.revision_ref,
+            first.resolved_ref,
             git_stdout(repo.path(), ["rev-parse", "published"]).unwrap()
         );
         fs::write(repo.path().join("second.txt"), "second\n").unwrap();
@@ -3218,9 +3341,9 @@ mod tests {
         let second = materializer
             .observe_repository_ref(&observation_request)
             .unwrap();
-        assert_ne!(first.revision_ref, second.revision_ref);
+        assert_ne!(first.resolved_ref, second.resolved_ref);
         assert_eq!(
-            second.revision_ref,
+            second.resolved_ref,
             git_stdout(repo.path(), ["rev-parse", "published"]).unwrap()
         );
     }
@@ -3290,8 +3413,8 @@ mod tests {
         let still_first = materializer
             .observe_repository_ref(&observation_request)
             .unwrap();
-        assert_eq!(still_first.revision_ref, first.revision_ref);
-        assert_ne!(still_first.revision_ref, unpublished_second);
+        assert_eq!(still_first.resolved_ref, first.resolved_ref);
+        assert_ne!(still_first.resolved_ref, unpublished_second);
 
         git(
             &workdir,
@@ -3300,11 +3423,11 @@ mod tests {
         let second = materializer
             .observe_repository_ref(&observation_request)
             .unwrap();
-        assert_eq!(second.revision_ref, unpublished_second);
-        assert_ne!(second.revision_ref, first.revision_ref);
+        assert_eq!(second.resolved_ref, unpublished_second);
+        assert_ne!(second.resolved_ref, first.resolved_ref);
         assert_ne!(
             git_stdout(&cache, ["rev-parse", "HEAD"]).unwrap(),
-            second.revision_ref
+            second.resolved_ref
         );
     }
 
@@ -3458,7 +3581,6 @@ mod tests {
         let mut file_request = request(repo.path());
         file_request.repository.source.kind = server_api::RepositorySourceKind::File;
         file_request.repository.source.uri = format!("file://{}", repo.path().display());
-        file_request.repository.source_revision = 2;
         file_request.repository.source_fingerprint = "sha256:file-source".to_string();
         let file = materializer
             .materialize(&worker_ref(3), &file_request)
@@ -3478,7 +3600,6 @@ mod tests {
             workspace_id: "workspace-1".to_string(),
             runtime_id: "runtime-1".to_string(),
             operation_id: "operation-1".to_string(),
-            config_revision: 7,
             config_projection_digest: "sha256:projection".to_string(),
             ssh: None,
         });
@@ -3511,8 +3632,8 @@ mod tests {
             "credential-1"
         );
         assert_eq!(
-            serialized["credential_candidates"][0]["credential_revision"],
-            2
+            serialized["credential_candidates"][0]["public_key_fingerprint"],
+            "key-2"
         );
         assert!(
             serialized["credential_candidates"][0]
@@ -3564,27 +3685,26 @@ mod tests {
             workspace_id: "workspace-1".to_string(),
             runtime_id: "runtime-1".to_string(),
             operation_id: "operation-agent".to_string(),
-            config_revision: 2,
             config_projection_digest: "sha256:projection".to_string(),
             ssh: Some(crate::catalog::RepositorySshMaterializationAccess {
                 credential_candidates: vec![
                     crate::catalog::RepositorySshCredentialCandidate {
                         credential_id: "credential-1".to_string(),
-                        credential_revision: 1,
+                        public_key_fingerprint: "key-1".into(),
                         private_key: crate::catalog::SensitiveString::new(
                             fs::read_to_string(&key_path).unwrap(),
                         ),
                     },
                     crate::catalog::RepositorySshCredentialCandidate {
                         credential_id: "credential-2".to_string(),
-                        credential_revision: 3,
+                        public_key_fingerprint: "key-3".into(),
                         private_key: crate::catalog::SensitiveString::new(
                             fs::read_to_string(&fallback_key_path).unwrap(),
                         ),
                     },
                 ],
                 host_trust_id: "trust-1".to_string(),
-                host_trust_revision: 1,
+                host_key_fingerprint: "key-1".into(),
                 access: server_api::RepositoryAccessMode::ReadWrite,
                 expires_at_epoch_seconds: u64::MAX,
                 repository_id: "repo-main".to_string(),
@@ -3720,11 +3840,11 @@ mod tests {
         ssh_backed_binding
             .working_directory
             .evidence
-            .credential_revision = Some(1);
+            .public_key_fingerprint = Some("key-1".into());
         ssh_backed_binding
             .working_directory
             .evidence
-            .host_trust_revision = Some(1);
+            .host_key_fingerprint = Some("key-1".into());
         materializer.write_record(&ssh_backed_binding).unwrap();
         #[cfg(target_os = "linux")]
         fail_workdir_cleanup_once(&materializer, &id);
@@ -3809,7 +3929,8 @@ mod tests {
         );
         let mut rotated = initial_materialization.clone();
         rotated.operation_id = "operation-agent-rotated".to_string();
-        rotated.ssh.as_mut().unwrap().credential_candidates[0].credential_revision = 2;
+        rotated.ssh.as_mut().unwrap().credential_candidates[0].public_key_fingerprint =
+            "key-2".into();
         rotated.ssh.as_mut().unwrap().access = server_api::RepositoryAccessMode::ReadOnly;
         materializer
             .authorize_repository_access(&WorkingDirectoryRepositoryAccessRequest {
@@ -3819,8 +3940,8 @@ mod tests {
             .unwrap();
         let rebound = materializer.bind_working_directory(&id, None).unwrap();
         assert_eq!(
-            rebound.working_directory.evidence.credential_revision,
-            Some(2)
+            rebound.working_directory.evidence.public_key_fingerprint,
+            Some("key-2".into())
         );
         let rebound_environment = rebound.command_environment();
         assert_eq!(rebound_environment["YOI_REPOSITORY_ACCESS"], "read_only");
@@ -3927,7 +4048,8 @@ mod tests {
 
         let mut read_write = rotated;
         read_write.operation_id = "operation-agent-read-write".to_string();
-        read_write.ssh.as_mut().unwrap().credential_candidates[0].credential_revision = 3;
+        read_write.ssh.as_mut().unwrap().credential_candidates[0].public_key_fingerprint =
+            "key-3".into();
         read_write.ssh.as_mut().unwrap().access = server_api::RepositoryAccessMode::ReadWrite;
         let read_write_command_policy =
             RepositorySshCommandPolicy::from_access(read_write.ssh.as_ref().unwrap()).unwrap();
@@ -4006,16 +4128,15 @@ mod tests {
             workspace_id: "workspace-1".to_string(),
             runtime_id: "runtime-1".to_string(),
             operation_id: "operation-read-only".to_string(),
-            config_revision: 2,
             config_projection_digest: "sha256:projection".to_string(),
             ssh: Some(crate::catalog::RepositorySshMaterializationAccess {
                 credential_candidates: vec![crate::catalog::RepositorySshCredentialCandidate {
                     credential_id: "credential-1".to_string(),
-                    credential_revision: 1,
+                    public_key_fingerprint: "key-1".into(),
                     private_key: crate::catalog::SensitiveString::new("PRIVATE KEY placeholder"),
                 }],
                 host_trust_id: "trust-1".to_string(),
-                host_trust_revision: 1,
+                host_key_fingerprint: "key-1".into(),
                 access: server_api::RepositoryAccessMode::ReadOnly,
                 expires_at_epoch_seconds: u64::MAX,
                 repository_id: "repo-main".to_string(),
@@ -4176,7 +4297,6 @@ mod tests {
             workspace_id: "workspace-1".to_string(),
             runtime_id: "runtime-1".to_string(),
             operation_id: "operation-1".to_string(),
-            config_revision: 1,
             config_projection_digest: "sha256:projection".to_string(),
             ssh: Some(access),
         });
@@ -4205,7 +4325,6 @@ mod tests {
             workspace_id: "workspace-1".to_string(),
             runtime_id: "runtime-1".to_string(),
             operation_id: "operation-1".to_string(),
-            config_revision: 1,
             config_projection_digest: "sha256:projection".to_string(),
             ssh,
         };
@@ -4283,11 +4402,11 @@ mod tests {
             crate::catalog::RepositorySshMaterializationAccess {
                 credential_candidates: vec![crate::catalog::RepositorySshCredentialCandidate {
                     credential_id: "credential-1".to_string(),
-                    credential_revision: 1,
+                    public_key_fingerprint: "key-1".into(),
                     private_key: crate::catalog::SensitiveString::new("PRIVATE KEY placeholder"),
                 }],
                 host_trust_id: "trust-1".to_string(),
-                host_trust_revision: 1,
+                host_key_fingerprint: "key-1".into(),
                 access: server_api::RepositoryAccessMode::ReadOnly,
                 expires_at_epoch_seconds: u64::MAX,
                 repository_id: "repo-main".to_string(),
@@ -4321,7 +4440,6 @@ mod tests {
             workspace_id: "workspace-1".to_string(),
             runtime_id: "runtime-1".to_string(),
             operation_id: "operation-1".to_string(),
-            config_revision: 1,
             config_projection_digest: "sha256:projection".to_string(),
             ssh: None,
         });
@@ -4498,7 +4616,6 @@ mod tests {
             workspace_id: "workspace-1".to_string(),
             runtime_id: "runtime-1".to_string(),
             operation_id: "operation-1".to_string(),
-            config_revision: 7,
             config_projection_digest: "sha256:projection".to_string(),
             ssh,
         }
@@ -4639,6 +4756,45 @@ mod tests {
         materializer
             .cleanup_working_directory(&binding.working_directory.id)
             .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_evidence_normalization_is_excluded_by_cleanup_and_cleanup_reads_do_not_rewrite() {
+        let repo = create_clean_repo();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitMaterializer::new(runtime_root.path());
+        let binding = materializer.create(&request(repo.path())).unwrap();
+        let id = &binding.working_directory.id;
+        let path = binding
+            .working_directory_root()
+            .join(MATERIALIZATION_RECORD);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        legacy["working_directory"]["evidence"]["repository_source_revision"] =
+            serde_json::json!(7);
+        let original = serde_json::to_vec_pretty(&legacy).unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let cleanup = materializer.occupancy.acquire_cleanup(id).unwrap();
+        assert_eq!(
+            materializer.read_binding(id).unwrap_err().code,
+            "working_directory_cleanup_resource_busy"
+        );
+        materializer.read_binding_for_cleanup(id).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        drop(cleanup);
+
+        materializer.read_binding(id).unwrap();
+        let canonical: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            canonical["working_directory"]["evidence"]
+                .get("repository_source_revision")
+                .is_none()
+        );
+        materializer.cleanup_working_directory(id).unwrap();
+        assert!(!binding.working_directory_root().exists());
     }
 
     #[cfg(target_os = "linux")]

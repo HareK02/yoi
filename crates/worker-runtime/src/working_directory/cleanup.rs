@@ -190,7 +190,7 @@ fn remove_with_checks(
         }
     } else {
         let mut binding = materializer
-            .read_binding(id)
+            .read_binding_for_cleanup(id)
             .map_err(|_| cause("ownership_unknown"))?;
         validate_binding(materializer, id, &binding)?;
         // Preflight the entire tree without following links or crossing mounts,
@@ -278,8 +278,8 @@ fn same_materialization(saved: &WorkingDirectory, current: &WorkingDirectory) ->
         // These fields are refreshed by authorize_repository_access, not a new
         // materialization. All repository, creation and cleanup identity stays.
         directory.evidence.operation_id = None;
-        directory.evidence.credential_revision = None;
-        directory.evidence.host_trust_revision = None;
+        directory.evidence.public_key_fingerprint = None;
+        directory.evidence.host_key_fingerprint = None;
         directory
     };
     immutable(saved) == immutable(current)
@@ -298,7 +298,7 @@ fn retry_inventory(
         return Ok(before);
     }
     let binding = materializer
-        .read_binding(id)
+        .read_binding_for_cleanup(id)
         .map_err(|_| cause("changes_present"))?;
     validate_binding(materializer, id, &binding)?;
     if !same_materialization(&saved.working_directory, &binding.working_directory)
@@ -1211,6 +1211,13 @@ pub(super) mod tests {
         for update in ["access", "repository", "creation"] {
             let (_runtime, materializer, binding) = fixture();
             let id = &binding.working_directory.id;
+            // Model an existing SSH materialization before taking the witness.
+            // Refresh replaces its access proof, not its requirement for SSH authority.
+            let mut record = materializer.read_binding(id).unwrap();
+            record.working_directory.evidence.repository_access_required = true;
+            record.working_directory.evidence.public_key_fingerprint = Some("key-1".into());
+            record.working_directory.evidence.host_key_fingerprint = Some("host-key-1".into());
+            materializer.write_record(&record).unwrap();
             fail_once(&materializer, id);
             let mut record = materializer.read_binding(id).unwrap();
             match update {
@@ -1218,8 +1225,8 @@ pub(super) mod tests {
                     // The same serialized fields changed by authorize_repository_access.
                     record.working_directory.evidence.operation_id =
                         Some("reattach-operation".into());
-                    record.working_directory.evidence.credential_revision = Some(2);
-                    record.working_directory.evidence.host_trust_revision = Some(2);
+                    record.working_directory.evidence.public_key_fingerprint = Some("key-2".into());
+                    record.working_directory.evidence.host_key_fingerprint = Some("key-2".into());
                 }
                 "repository" => {
                     record.working_directory.repository_id = "substitute".into();

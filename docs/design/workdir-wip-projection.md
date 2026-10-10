@@ -121,11 +121,11 @@ current read policy or unsupported legacy source makes a page sparse or empty;
 `empty` describes that page, and `has_more` remains authoritative for progress.
 Attachment pages use the Backend's SQL-bounded, alias-ordered limit/offset query
 and opaque `offset:<n>` cursors. Both Workdir and attachment responses supply an
-opaque complete-set `revision` derived from existing authoritative records in
+opaque complete-set `digest` derived from existing authoritative records in
 the same database snapshot as the page, not by hashing the first page. The Host
-uses this complete-set revision for the collection Object validator. A lifetime
+uses this complete-set digest for the collection Object validator. A lifetime
 or capability change beyond row 50 therefore invalidates old collection
-observations without adding a ledger or revision store. A cursor is not
+observations without adding a ledger or edit counter. A cursor is not
 a snapshot or authority grant: restart listing after concurrent collection
 changes. Filtering by exact `connection_id` is applied in the caller-scoped
 Backend ledger before paging, so direct item lookup also works beyond the first

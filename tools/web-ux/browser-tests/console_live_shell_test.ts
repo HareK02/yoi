@@ -82,18 +82,23 @@ Deno.test("production live Console completes, edits/removes typed drafts and sta
           await observePicker(page);
           page.setDefaultTimeout(5000);
           const errors: string[] = [];
+          const supersededCatalogReads: string[] = [];
           const acknowledgedDeletes = new Set<string>();
           page.on("console", (message) => {
             if (message.type() === "error") errors.push(message.text());
           });
           page.on("pageerror", (error) => errors.push(String(error)));
-          page.on(
-            "requestfailed",
-            (request) =>
-              errors.push(
-                `failed ${request.method()} ${request.url()} ${request.failure()?.errorText}`,
-              ),
-          );
+          page.on("requestfailed", (request) => {
+            // Subscription snapshots deliberately supersede the bootstrap GET.
+            if (
+              request.url() === `${base}/api/w/console-live-review/workers` &&
+              request.method() === "GET" &&
+              request.failure()?.errorText === "net::ERR_ABORTED"
+            ) supersededCatalogReads.push(request.url());
+            else errors.push(
+              `failed ${request.method()} ${request.url()} ${request.failure()?.errorText}`,
+            );
+          });
           page.on("response", (response) => {
             if (response.request().method() === "DELETE" && response.status() === 204) {
               acknowledgedDeletes.add(response.url());
@@ -248,6 +253,7 @@ Deno.test("production live Console completes, edits/removes typed drafts and sta
                   theme,
                   width,
                   errors: recordedErrors,
+                  supersededCatalogReads,
                   acknowledgedDeleteDiagnostics,
                   acknowledgedDeleteResponseStatus: releasedResponse.status(),
                   picker: pickerEvidence,

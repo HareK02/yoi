@@ -1,10 +1,10 @@
 # Subject Memory surface generation
 
-The subject Memory surface is a bounded start-time context derived from confirmed, revisioned Memory. It is not another Memory authority and is never used as extraction or consolidation input.
+The subject Memory surface is a bounded start-time context derived from confirmed Memory with immutable change history. It is not another Memory authority and is never used as extraction or consolidation input.
 
 ## Fixed policy
 
-The Backend captures one generation from current `active` revisions for exactly one subject. Staging records, Session history, historical revisions, and prior surfaces are not queried.
+The Backend captures one bounded input snapshot from current `active` records for exactly one subject. Staging records, Session history, historical changes, and prior surfaces are not queried.
 
 Selection is deterministic:
 
@@ -16,16 +16,16 @@ Selection is deterministic:
 6. both category and aggregate material bounds use the provider-independent estimate `ceil(UTF-8 bytes / 4)`;
 7. before invoking the editor, the Worker measures the actual normalized Agen request fields containing the rendered system prompt, conversation items (including the fixed question and material JSON), and the typed `SubmitMemorySurface` tool definition/schema against the 12,000-token complete-input budget. It reapplies equal per-category fairness reservations under that final estimator, reclaims unused shares in canonical order, fails rather than publishing a false empty surface if no grounded material fits, and guards every subsequent correction request before it reaches the provider. Provider-specific HTTP envelope bytes are outside this normalized request budget.
 
-The clean-context editor uses the effective `builtin:subjektiv-memory-consolidation` profile model (`codex-oauth/gpt-5.6-luna`, medium reasoning). A generation permits three model turns (the initial attempt plus at most two correction turns). A store-generation conflict causes at most one complete re-read and regeneration. The published Markdown is capped at 1,024 tokens by the same estimate.
+The clean-context editor uses the effective `builtin:subjektiv-memory-consolidation` profile model (`codex-oauth/gpt-5.6-luna`, medium reasoning). A generation permits three model turns (the initial attempt plus at most two correction turns). A Memory-input fingerprint conflict causes at most one complete re-read and regeneration. The published Markdown is capped at 1,024 tokens by the same estimate.
 
-Every editor point carries one or more exact `{memory_id, revision}` references. The Host checks the output shape, non-empty grounding, budget, subject scope, membership in the captured materials, and current store generation. These checks prove reference existence and freshness only; they do not claim semantic correctness.
+Every editor point carries one or more exact `{memory_id, change_id}` references. The Host checks the output shape, non-empty grounding, budget, subject scope, membership in the captured materials, and current `memory_fingerprint`. These checks prove reference existence and freshness only; they do not claim semantic correctness.
 
-Publication is idempotent for identical output at one store revision. A different concurrent output cannot replace the first published surface. Confirmed Memory writes atomically mark the prior surface stale. Failed surface work never rolls back confirmed Memory or candidate disposition.
+Publication is idempotent for identical output for one exact Memory-input fingerprint. A different concurrent output cannot replace the first published surface. Confirmed Memory writes atomically mark the prior surface stale. Failed surface work never rolls back confirmed Memory or candidate disposition.
 
 Resident injection uses five distinct product states:
 
-- `ready`: inject the non-empty snapshot only when its `built_from_store_revision`
-  equals the subject's exact current store revision;
+- `ready`: inject the non-empty snapshot only when its `built_from_memory_fingerprint`
+  equals the subject's exact current `memory_fingerprint`;
 - `ready-empty`: a successful current generation selected no Markdown; inject no
   prose, but preserve the explicit successful-empty state;
 - `ungenerated`: no successful current generation exists; inject nothing;

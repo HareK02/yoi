@@ -33,7 +33,7 @@ export function fixtureDetail(key = "T-101") {
   const { workspace_action_priority: _, ...ticket } = summary;
   return {
     ...ticket,
-    item_revision: "revision-1",
+    content_digest: "a".repeat(64),
     created_at: updated(1),
     readiness: null,
     body: "Implementation in progress.",
@@ -155,7 +155,6 @@ export function dashboardFixture(
       ...detail,
       body: "# Objective detail\n\nHome dashboard navigation destination.",
       body_truncated: false,
-      revision: "revision-1",
       linked_ticket_summaries: [],
       resources: [],
       events: [],

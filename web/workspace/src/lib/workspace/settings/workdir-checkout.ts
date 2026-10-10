@@ -1,6 +1,6 @@
 import type { WorkingDirectorySummary } from "../sidebar/types.ts";
 
-export function formatCurrentWorkdirRevision(
+export function formatCurrentWorkdirCheckout(
   workdir: WorkingDirectorySummary,
   repositoryProvider: string | null | undefined,
 ): string {

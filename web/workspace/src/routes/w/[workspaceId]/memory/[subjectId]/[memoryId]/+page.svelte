@@ -3,7 +3,7 @@
   import { formatDate, workspaceRoute } from '#lib/workspace/api/http.ts';
   import type {
     MemoryEvidenceOrigin,
-    SubjektivMemoryRevisionRef,
+    SubjektivMemoryChangeRef,
     SubjektivMemorySourceEvidenceRef,
   } from '#lib/generated/memory-api.ts';
   import type { PageProps } from './$types';
@@ -11,7 +11,7 @@
   let { data }: PageProps = $props();
 
   const memory = $derived(data.memory.data);
-  const revisions = $derived(data.revisions.data?.items ?? []);
+  const changes = $derived(data.changes.data?.items ?? []);
 
   function subjectHref(): string {
     return workspaceRoute(data.workspaceId, `/memory/${encodeURIComponent(data.subjectId)}`);
@@ -24,26 +24,26 @@
     );
   }
 
-  function revisionHref(revision: number): string {
-    return `${memoryPath()}?revision=${revision}`;
+  function changeHref(changeId: string): string {
+    return `${memoryPath()}?change_id=${encodeURIComponent(changeId)}`;
   }
 
-  function revisionPageHref(cursor?: string | null): string {
+  function changePageHref(cursor?: string | null): string {
     const query = new URLSearchParams();
-    if (memory) query.set('revision', String(memory.revision));
-    if (cursor) query.set('revision_cursor', cursor);
+    if (memory) query.set('change_id', String(memory.change_id));
+    if (cursor) query.set('change_cursor', cursor);
     const encoded = query.toString();
     return encoded ? `${memoryPath()}?${encoded}` : memoryPath();
   }
 
-  function derivedHref(reference: SubjektivMemoryRevisionRef): string {
-    return `${memoryPath(reference.memory_id)}?revision=${reference.revision}`;
+  function derivedHref(reference: SubjektivMemoryChangeRef): string {
+    return `${memoryPath(reference.memory_id)}?change_id=${encodeURIComponent(reference.change_id)}`;
   }
 
   function bodyContinuationHref(): string | null {
     if (!memory?.body_truncated || memory.body_next_offset == null || memory.body_next_byte_offset == null) return null;
     const query = new URLSearchParams({
-      revision: String(memory.revision),
+      change_id: String(memory.change_id),
       offset: String(memory.body_next_offset),
       byte_offset: String(memory.body_next_byte_offset),
     });
@@ -53,7 +53,7 @@
   function evidenceContinuationHref(): string | null {
     if (!memory?.evidence_has_more || !memory.evidence_next_cursor) return null;
     const query = new URLSearchParams({
-      revision: String(memory.revision),
+      change_id: String(memory.change_id),
       evidence_cursor: memory.evidence_next_cursor,
     });
     return `${memoryPath()}?${query}`;
@@ -81,7 +81,6 @@
       origin.worker_id && `worker ${origin.worker_id}`,
       origin.flow_selector && `flow ${origin.flow_selector}`,
       origin.flow_definition_id && `definition ${origin.flow_definition_id}`,
-      origin.flow_definition_revision != null && `definition revision ${origin.flow_definition_revision}`,
     ].filter(Boolean);
     return `${label(origin.kind)}${identity.length ? ` · ${identity.join(' · ')}` : ''}`;
   }
@@ -93,7 +92,7 @@
 
 <svelte:head>
   <title>{memory?.claim ?? data.memoryId} · Memory · Yoi Workspace</title>
-  <meta name="description" content="Committed Memory detail, immutable revisions, and provenance" />
+  <meta name="description" content="Committed Memory detail, immutable changes, and provenance" />
 </svelte:head>
 
 <section class="memory-page memory-detail-page" aria-labelledby="memory-detail-heading" data-memory-view="detail" data-memory-state={data.memory.error ? 'error' : memory ? memory.state : 'unavailable'}>
@@ -105,7 +104,7 @@
         <div class="pill-row">
           <span class="memory-pill is-{memory.state}">{titleLabel(memory.state)}</span>
           <span class="memory-kind">{titleLabel(memory.kind)}</span>
-          {#if memory.revision !== memory.current_revision}<span class="historical-pill">Historical revision</span>{/if}
+          {#if memory.change_id !== memory.current_change_id}<span class="historical-pill">Historical change</span>{/if}
         </div>
         <h1 id="memory-detail-heading">{memory.claim}</h1>
         <code class="memory-id" title={memory.memory_id}>{memory.memory_id}</code>
@@ -114,7 +113,7 @@
     </header>
 
     <dl class="memory-facts" aria-label="Memory details">
-      <div><dt>Memory revision</dt><dd>{memory.revision} of {memory.current_revision}</dd></div>
+      <div><dt>Memory change</dt><dd><code>{memory.change_id}</code><small>{memory.change_id === memory.current_change_id ? 'Current change' : `Current change: ${memory.current_change_id}`}</small></dd></div>
       <div><dt>Status</dt><dd>{titleLabel(memory.state)}</dd></div>
       <div><dt>Type</dt><dd>{titleLabel(memory.kind)}</dd></div>
       <div><dt>Created</dt><dd><time datetime={memory.created_at}>{formatDate(memory.created_at)}</time></dd></div>
@@ -223,48 +222,48 @@
         <p class="empty-copy">No derivation references.</p>
       {:else}
         <ul class="derived-list">
-          {#each memory.derived_from as reference (`${reference.memory_id}:${reference.revision}`)}
-            <li><a href={derivedHref(reference)}><code>{reference.memory_id}</code><span>Revision {reference.revision}</span></a></li>
+          {#each memory.derived_from as reference (`${reference.memory_id}:${reference.change_id}`)}
+            <li><a href={derivedHref(reference)}><code>{reference.memory_id}</code><span>Change {reference.change_id}</span></a></li>
           {/each}
         </ul>
       {/if}
     </section>
 
-    <section class="detail-section revision-section" aria-labelledby="revision-heading">
+    <section class="detail-section change-section" aria-labelledby="change-heading">
       <header class="section-heading">
-        <div><p class="memory-eyebrow">Immutable record</p><h2 id="revision-heading">Revision history</h2></div>
-        {#if data.revisions.data}<span>{revisions.length} shown{data.revisions.data.has_more ? ' · more available' : ''}</span>{/if}
+        <div><p class="memory-eyebrow">Immutable record</p><h2 id="change-heading">Change history</h2></div>
+        {#if data.changes.data}<span>{changes.length} shown{data.changes.data.has_more ? ' · more available' : ''}</span>{/if}
       </header>
-      <p class="section-intro">These are versions of this Memory record, separate from the Subject’s internal update number.</p>
-      {#if data.revisions.data}
-        {#if revisions.length === 0}
+      <p class="section-intro">These are immutable changes to this Memory record. Change IDs identify content; they do not imply a numeric order.</p>
+      {#if data.changes.data}
+        {#if changes.length === 0}
           <div>
-            <p class="empty-copy">No revision history is available.</p>
-            {#if data.revisionCursor}<p><a href={revisionPageHref()}>Return to the first page</a></p>{/if}
+            <p class="empty-copy">No change history is available.</p>
+            {#if data.changeCursor}<p><a href={changePageHref()}>Return to the first page</a></p>{/if}
           </div>
         {:else}
-          <ol class="revision-list">
-            {#each revisions as revision (revision.revision)}
-              <li class:current={revision.revision === memory.revision}>
-                <a href={revisionHref(revision.revision)} aria-current={revision.revision === memory.revision ? 'page' : undefined}>
-                  <div><strong>Memory revision {revision.revision}</strong><span class="memory-pill is-{revision.state}">{titleLabel(revision.state)}</span><span class="memory-kind">{titleLabel(revision.kind)}</span></div>
-                  <p>{revision.claim}</p>
-                  <small>{revision.change_reason} · <time datetime={revision.updated_at}>{formatDate(revision.updated_at)}</time></small>
+          <ol class="change-list">
+            {#each changes as change (change.change_id)}
+              <li class:current={change.change_id === memory.change_id}>
+                <a href={changeHref(change.change_id)} aria-current={change.change_id === memory.change_id ? 'page' : undefined}>
+                  <div><strong>Memory change {change.change_id}</strong>{#if change.change_id === memory.current_change_id}<span>Current</span>{/if}<span class="memory-pill is-{change.state}">{titleLabel(change.state)}</span><span class="memory-kind">{titleLabel(change.kind)}</span></div>
+                  <p>{change.claim}</p>
+                  <small>{change.change_reason} · <time datetime={change.updated_at}>{formatDate(change.updated_at)}</time></small>
                 </a>
               </li>
             {/each}
           </ol>
-          <nav class="memory-pagination" aria-label="Revision history pages">
-            {#if data.revisionCursor}<a href={revisionPageHref()}>First page</a>{/if}
-            {#if data.revisions.data.has_more && data.revisions.data.next_cursor}
-              <a href={revisionPageHref(data.revisions.data.next_cursor)}>Next page →</a>
+          <nav class="memory-pagination" aria-label="Change history pages">
+            {#if data.changeCursor}<a href={changePageHref()}>First page</a>{/if}
+            {#if data.changes.data.has_more && data.changes.data.next_cursor}
+              <a href={changePageHref(data.changes.data.next_cursor)}>Next page →</a>
             {/if}
           </nav>
         {/if}
-      {:else if data.revisions.error}
-        <div class="memory-state is-error" role="alert"><strong>Revision history unavailable.</strong><p>{data.revisions.error}</p></div>
+      {:else if data.changes.error}
+        <div class="memory-state is-error" role="alert"><strong>Change history unavailable.</strong><p>{data.changes.error}</p></div>
       {:else}
-        <div class="memory-state" role="status"><p>Revision history data is unavailable.</p></div>
+        <div class="memory-state" role="status"><p>Change history data is unavailable.</p></div>
       {/if}
     </section>
   {:else if data.memory.error}
@@ -346,7 +345,7 @@
   }
 
   .pill-row,
-  .revision-list a > div,
+  .change-list a > div,
   .evidence-heading {
     display: flex;
     flex-wrap: wrap;
@@ -407,6 +406,8 @@
   .memory-facts dt {
     white-space: normal;
   }
+
+  .memory-facts small { display: block; margin-top: var(--space-1); color: var(--text-muted); }
 
   .memory-facts dd {
     margin-top: var(--space-1);
@@ -503,7 +504,7 @@
   .evidence-list,
   .source-list,
   .derived-list,
-  .revision-list {
+  .change-list {
     display: grid;
     gap: var(--space-2);
     margin: 0;
@@ -564,8 +565,8 @@
 
   .derived-list a:hover,
   .derived-list a:focus-visible,
-  .revision-list a:hover,
-  .revision-list a:focus-visible {
+  .change-list a:hover,
+  .change-list a:focus-visible {
     background: var(--interactive-hover);
   }
 
@@ -578,19 +579,19 @@
     font-size: var(--font-size-compact);
   }
 
-  .revision-list {
+  .change-list {
     border-top: 1px solid var(--line);
   }
 
-  .revision-list li {
+  .change-list li {
     border-bottom: 1px solid var(--line);
   }
 
-  .revision-list li.current {
+  .change-list li.current {
     border-left: 3px solid var(--accent);
   }
 
-  .revision-list a {
+  .change-list a {
     display: grid;
     gap: var(--space-1);
     min-width: 0;
@@ -599,13 +600,14 @@
     text-decoration: none;
   }
 
-  .revision-list p,
-  .revision-list small {
+  .change-list strong,
+  .change-list p,
+  .change-list small {
     margin: 0;
     overflow-wrap: anywhere;
   }
 
-  .revision-list small {
+  .change-list small {
     color: var(--text-muted);
   }
 

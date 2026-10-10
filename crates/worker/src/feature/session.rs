@@ -22,8 +22,7 @@ pub(crate) enum CommittedRunExit {
 pub(crate) struct CommittedSessionCapture {
     pub(crate) session_id: String,
     pub(crate) segment_id: String,
-    /// Monotonic committed-log revision for the captured Segment.
-    pub(crate) session_revision: u64,
+
     pub(crate) entry_count: usize,
     pub(crate) run_exit: CommittedRunExit,
     pub(crate) history: Vec<HistoryEntry<SessionHistoryMetadata>>,
@@ -35,8 +34,7 @@ pub(crate) struct CommittedSessionCapture {
 pub(crate) struct CommittedSessionLocation {
     pub(crate) session_id: String,
     pub(crate) segment_id: String,
-    /// Monotonic committed-log revision for the captured Segment.
-    pub(crate) session_revision: u64,
+
     pub(crate) entry_count: usize,
 }
 
@@ -45,7 +43,7 @@ impl CommittedSessionCapture {
         CommittedSessionLocation {
             session_id: self.session_id.clone(),
             segment_id: self.segment_id.clone(),
-            session_revision: self.session_revision,
+
             entry_count: self.entry_count,
         }
     }

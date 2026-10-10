@@ -114,7 +114,6 @@ export type ConsoleLine = {
 
 export type InternalWorkerProjection = {
   worker: InternalWorkerRef;
-  revision: number;
   console: ConsoleProjection;
 };
 
@@ -194,7 +193,7 @@ export type ConsoleProjection = {
   lastEventId: string | null;
   internalWorkers: InternalWorkerProjection[];
   /** Terminal child-session fences, reset only by an authoritative snapshot. */
-  removedInternalWorkers: Record<string, number>;
+  removedInternalWorkers: Record<string, true>;
 };
 
 export type WorkerTarget = {
@@ -907,7 +906,7 @@ function projectInternalWorkerSnapshot(
   if (snapshot.in_flight?.compaction) {
     console = applyInFlightCompaction(console, snapshot.in_flight.compaction);
   }
-  return { worker: snapshot.worker, revision: snapshot.revision, console };
+  return { worker: snapshot.worker, console };
 }
 
 const RUNTIME_COMPACTION_LINE_ID = "compaction-runtime";
@@ -1247,16 +1246,13 @@ export function applyProtocolEvent(
         ? next.internalWorkers[existingIndex]
         : {
           worker: event.data.worker,
-          revision: 0,
           console: emptyConsoleProjection(),
         };
-      if (event.data.revision <= existing.revision) break;
       const updated: InternalWorkerProjection = {
         worker: event.data.worker,
-        revision: event.data.revision,
         console: applyProtocolEvent(existing.console, {
           eventId:
-            `${envelope.eventId}:internal:${event.data.worker.session_id}:${event.data.revision}`,
+            `${envelope.eventId}:internal:${event.data.worker.session_id}`,
           event: event.data.event,
           observedAtMs: envelope.observedAtMs,
         }),
@@ -1269,12 +1265,7 @@ export function applyProtocolEvent(
       const existingIndex = next.internalWorkers.findIndex((worker) =>
         worker.worker.session_id === event.data.worker.session_id
       );
-      const existingRevision = existingIndex >= 0
-        ? next.internalWorkers[existingIndex].revision
-        : 0;
-      if (event.data.revision <= existingRevision) break;
-      next.removedInternalWorkers[event.data.worker.session_id] =
-        event.data.revision;
+      next.removedInternalWorkers[event.data.worker.session_id] = true;
       if (existingIndex >= 0) next.internalWorkers.splice(existingIndex, 1);
       break;
     }

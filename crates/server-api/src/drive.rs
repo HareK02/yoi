@@ -41,6 +41,39 @@ fn canonical_positive_decimal(value: &str) -> bool {
         && value.bytes().all(|byte| byte.is_ascii_digit())
         && value.parse::<i64>().is_ok_and(|value| value > 0)
 }
+fn node_mutation_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    if value.len() > 128 || value.chars().any(char::is_control) {
+        return Err(serde::de::Error::custom(
+            "invalid committed mutation request ID",
+        ));
+    }
+    Ok(value)
+}
+fn mutation_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let value = node_mutation_id(deserializer)?;
+    if value.is_empty() {
+        return Err(serde::de::Error::custom(
+            "expected a committed mutation request ID",
+        ));
+    }
+    Ok(value)
+}
+fn optional_mutation_id<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer)?
+        .map(|value| {
+            if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+                Err(serde::de::Error::custom(
+                    "invalid committed mutation request ID",
+                ))
+            } else {
+                Ok(value)
+            }
+        })
+        .transpose()
+}
 fn bounded_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
     let value = String::deserialize(deserializer)?;
     if value.len() > DRIVE_TEXT_MAX_BYTES {
@@ -110,9 +143,10 @@ pub struct DriveEntry {
     pub parent: Option<DriveEntryRef>,
     pub name: String,
     pub kind: DriveEntryKind,
-    #[serde(deserialize_with = "decimal")]
-    #[schemars(regex(pattern = "^[1-9][0-9]*$"))]
-    pub revision: String,
+    #[serde(deserialize_with = "node_mutation_id")]
+    #[schemars(length(max = 128))]
+    /// Request ID of the last committed mutation, or empty for the immutable root.
+    pub last_mutation_id: String,
     /// File length in bytes; absent for folders.
     #[schemars(range(min = 0, max = 16_777_216))]
     pub size: Option<u32>,
@@ -201,10 +235,10 @@ pub struct DriveReadChunkQuery {
     #[serde(deserialize_with = "decimal")]
     #[schemars(regex(pattern = "^[1-9][0-9]*$"))]
     pub id: String,
-    /// Bind a multi-chunk read to the same file revision.
-    #[serde(deserialize_with = "decimal")]
-    #[schemars(regex(pattern = "^[1-9][0-9]*$"))]
-    pub expected_revision: String,
+    /// Require each chunk to match the same committed mutation observed in metadata.
+    #[serde(deserialize_with = "mutation_id")]
+    #[schemars(length(max = 128))]
+    pub expected_mutation_id: String,
     #[schemars(range(min = 0, max = 16_777_216))]
     pub offset: u32,
     #[serde(default = "default_read_size", deserialize_with = "bounded_chunk")]
@@ -219,8 +253,8 @@ pub struct DriveDownloadQuery {
     #[serde(deserialize_with = "decimal")]
     #[schemars(regex(pattern = "^[1-9][0-9]*$"))]
     pub id: String,
-    #[serde(default, deserialize_with = "optional_decimal")]
-    pub expected_revision: Option<String>,
+    #[serde(default, deserialize_with = "optional_mutation_id")]
+    pub expected_mutation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -248,26 +282,26 @@ pub enum DriveMutation {
     },
     UpdateText {
         id: DriveEntryRef,
-        #[serde(deserialize_with = "decimal")]
-        #[schemars(regex(pattern = "^[1-9][0-9]*$"))]
-        expected_revision: String,
+        #[serde(deserialize_with = "mutation_id")]
+        #[schemars(length(max = 128))]
+        expected_mutation_id: String,
         #[serde(deserialize_with = "bounded_text")]
         text: String,
         content_type: String,
     },
     Relocate {
         id: DriveEntryRef,
-        #[serde(deserialize_with = "decimal")]
-        #[schemars(regex(pattern = "^[1-9][0-9]*$"))]
-        expected_revision: String,
+        #[serde(deserialize_with = "mutation_id")]
+        #[schemars(length(max = 128))]
+        expected_mutation_id: String,
         parent: DriveEntryRef,
         name: String,
     },
     Delete {
         id: DriveEntryRef,
-        #[serde(deserialize_with = "decimal")]
-        #[schemars(regex(pattern = "^[1-9][0-9]*$"))]
-        expected_revision: String,
+        #[serde(deserialize_with = "mutation_id")]
+        #[schemars(length(max = 128))]
+        expected_mutation_id: String,
     },
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -287,8 +321,8 @@ pub enum DriveUploadOperation {
     Update,
 }
 /// Flat query metadata accompanies the binary body. The service rejects invalid
-/// combinations: create requires parent_id/name and forbids id/expected_revision;
-/// update requires id/expected_revision and forbids parent_id/name. Both targets
+/// combinations: create requires parent_id/name and forbids id/expected_mutation_id;
+/// update requires id/expected_mutation_id and forbids parent_id/name. Both targets
 /// are bound by entry_workspace_id; declared size and SHA256 must match the body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -303,8 +337,8 @@ pub struct DriveUploadQuery {
     pub name: Option<String>,
     #[serde(default, deserialize_with = "optional_decimal")]
     pub id: Option<String>,
-    #[serde(default, deserialize_with = "optional_decimal")]
-    pub expected_revision: Option<String>,
+    #[serde(default, deserialize_with = "optional_mutation_id")]
+    pub expected_mutation_id: Option<String>,
     pub content_type: String,
     /// Values above the file limit still decode as u32 so the service returns
     /// typed Limit rather than a generic request-decoding error.
@@ -422,7 +456,7 @@ impl DriveApiError {
             message: match code {
                 Denied => "Drive access denied",
                 NotFound => "Drive resource not found",
-                Conflict => "Drive revision or name conflict",
+                Conflict => "Drive content, location, or name conflict",
                 Invalid => "Invalid Drive request",
                 Limit => "Drive request exceeds a limit",
                 StorageUnavailable => "Drive storage unavailable",
@@ -614,7 +648,7 @@ mod tests {
         let value = json!({
             "entry":{"workspace_id":"a","node_id":"7"},
             "parent":{"workspace_id":"a","node_id":"1"},
-            "name":"file.txt","kind":"file","revision":"2","size":5,
+            "name":"file.txt","kind":"file","last_mutation_id":"2","size":5,
             "content_type":"text/plain","updated_by":"user-a","updated_at":"2026-10-08T00:00:00Z",
             "latest_url":"/api/w/a/drive/download?entry_workspace_id=a&id=7"
         });
@@ -665,7 +699,7 @@ mod tests {
     fn drive_json_mutations_accept_only_bounded_text_and_workspace_bound_cas() {
         let valid = json!({"request_id":"request-a", "mutation":{
             "operation":"update_text", "id":{"workspace_id":"a","node_id":"7"},
-            "expected_revision":"9007199254740993", "text":"hello", "content_type":"text/plain"
+            "expected_mutation_id":"write-資料/one", "text":"hello", "content_type":"text/plain"
         }});
         let request: DriveMutationRequest = serde_json::from_value(valid.clone()).unwrap();
         assert_eq!(serde_json::to_value(request).unwrap(), valid);
@@ -675,9 +709,16 @@ mod tests {
         let mut invalid = valid.clone();
         invalid["mutation"]["id"] = json!("7");
         assert!(serde_json::from_value::<DriveMutationRequest>(invalid).is_err());
-        let mut invalid = valid.clone();
-        invalid["mutation"]["expected_revision"] = json!("01");
-        assert!(serde_json::from_value::<DriveMutationRequest>(invalid).is_err());
+        for bad in [
+            "".to_string(),
+            "\ncontrol".to_string(),
+            "x".repeat(129),
+            "é".repeat(65),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["mutation"]["expected_mutation_id"] = json!(bad);
+            assert!(serde_json::from_value::<DriveMutationRequest>(invalid).is_err());
+        }
         // UTF-8 byte count, not character count, determines the text bound.
         let mut boundary = valid;
         boundary["mutation"]["text"] = json!("é".repeat(DRIVE_TEXT_MAX_BYTES / 2));
@@ -695,18 +736,18 @@ mod tests {
                 )
                 .is_err()
             );
-            assert!(serde_json::from_value::<DriveReadChunkQuery>(json!({"entry_workspace_id":"a","id":"7","expected_revision":"1","offset":0,"length":size})).is_err());
+            assert!(serde_json::from_value::<DriveReadChunkQuery>(json!({"entry_workspace_id":"a","id":"7","expected_mutation_id":"1","offset":0,"length":size})).is_err());
         }
         let default: DriveReadTextQuery =
             serde_json::from_value(json!({"entry_workspace_id":"a","id":"7"})).unwrap();
         assert_eq!(default.max_bytes, 65536);
-        let chunk: DriveReadChunkQuery = serde_json::from_value(json!({"entry_workspace_id":"a","id":"7","expected_revision":"1","offset":0,"length":65536})).unwrap();
+        let chunk: DriveReadChunkQuery = serde_json::from_value(json!({"entry_workspace_id":"a","id":"7","expected_mutation_id":"1","offset":0,"length":65536})).unwrap();
         assert_eq!(chunk.length, 65536);
     }
 
     #[test]
     fn drive_upload_requires_binding_declared_integrity_and_request_identity() {
-        let valid = json!({"operation":"update","request_id":"request-a","entry_workspace_id":"a","id":"7","expected_revision":"2","content_type":"application/octet-stream","size":3,"sha256":"a".repeat(64)});
+        let valid = json!({"operation":"update","request_id":"request-a","entry_workspace_id":"a","id":"7","expected_mutation_id":"2","content_type":"application/octet-stream","size":3,"sha256":"a".repeat(64)});
         assert!(serde_json::from_value::<DriveUploadQuery>(valid.clone()).is_ok());
         for field in ["entry_workspace_id", "size", "sha256", "request_id"] {
             let mut missing = valid.clone();
@@ -725,7 +766,7 @@ mod tests {
                 "service must receive oversized declared sizes for typed Limit classification"
             );
         }
-        assert!(serde_json::from_value::<DriveReadChunkQuery>(json!({"entry_workspace_id":"a","id":"7","expected_revision":"1","offset":DRIVE_FILE_MAX_BYTES,"length":1})).is_ok());
+        assert!(serde_json::from_value::<DriveReadChunkQuery>(json!({"entry_workspace_id":"a","id":"7","expected_mutation_id":"1","offset":DRIVE_FILE_MAX_BYTES,"length":1})).is_ok());
         let mut invalid = valid;
         invalid["bytes"] = json!([0, 255]);
         assert!(serde_json::from_value::<DriveUploadQuery>(invalid).is_err());
@@ -763,7 +804,12 @@ mod tests {
         for (code, wire, status, message) in [
             (Denied, "denied", 403, "Drive access denied"),
             (NotFound, "not_found", 404, "Drive resource not found"),
-            (Conflict, "conflict", 409, "Drive revision or name conflict"),
+            (
+                Conflict,
+                "conflict",
+                409,
+                "Drive content, location, or name conflict",
+            ),
             (Invalid, "invalid", 400, "Invalid Drive request"),
             (Limit, "limit", 413, "Drive request exceeds a limit"),
             (

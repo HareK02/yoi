@@ -557,7 +557,7 @@ where
             input,
             cache_key: Some(format!(
                 "flow:{}:{}",
-                attempt.instance_id, attempt.checked_state_revision
+                attempt.instance_id, attempt.attempt_id
             )),
             max_turns: Some(12),
             engine_configurator: None,
@@ -653,9 +653,7 @@ mod tests {
         FlowTransitionAttempt {
             attempt_id: id.to_string(),
             instance_id: "instance-1".to_string(),
-            definition_revision: 1,
             definition_digest: "sha256:test".to_string(),
-            checked_state_revision: 0,
             from_state: StateId::new("work").unwrap(),
             reason: "ready".to_string(),
             transitions: vec![
@@ -711,7 +709,6 @@ mod tests {
                 selector: "workspace:test-flow".parse().unwrap(),
                 workspace_id: "workspace-1".to_string(),
                 flow_id: "flow-1".to_string(),
-                revision: 1,
                 content_digest: definition.content_digest.clone(),
                 definition,
             },

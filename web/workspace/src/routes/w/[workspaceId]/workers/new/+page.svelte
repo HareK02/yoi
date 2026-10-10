@@ -12,7 +12,7 @@
     parseWorkerLaunchOptionsResponse,
   } from '#lib/workspace/api/workers.ts';
   import { parseSubjektivSubjectListResponse } from '#lib/workspace/memory/api.ts';
-  import { formatCurrentWorkdirRevision } from '#lib/workspace/settings/workdir-revision.ts';
+  import { formatCurrentWorkdirCheckout } from '#lib/workspace/settings/workdir-checkout.ts';
   import { formatExternalGrantPermissionLevel } from '#lib/workspace/settings/workdir-permissions.ts';
   import {
     buildCreateWorkspaceWorkerRequest,
@@ -46,7 +46,7 @@
     if (directory.source.kind === 'external_grant') {
       return `${label} · External · ${formatExternalGrantPermissionLevel(directory.source.grant_permissions)}`;
     }
-    return `${label} · ${formatCurrentWorkdirRevision(directory, provider)}`;
+    return `${label} · ${formatCurrentWorkdirCheckout(directory, provider)}`;
   }
 
   let { data }: PageProps = $props();

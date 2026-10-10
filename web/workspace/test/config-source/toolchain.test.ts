@@ -16,7 +16,6 @@ function assert(condition: unknown, message: string): asserts condition {
 Deno.test("toolchain converts reactive-like proxies to plain Worker messages", async () => {
   const snapshot = new Proxy(
     {
-      revision: 1,
       digest: "sha256:test",
       entries: {},
     },

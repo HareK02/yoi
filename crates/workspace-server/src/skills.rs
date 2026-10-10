@@ -71,7 +71,7 @@ pub enum SkillError {
     NotFound(String),
     #[error("Skill `{0}` has blocking diagnostics")]
     InvalidSkill(String),
-    #[error("failed to evaluate the active Workspace config revision: {0}")]
+    #[error("failed to evaluate the active Workspace config content: {0}")]
     Evaluation(String),
     #[error("the active Workspace config projection is missing its root value")]
     MissingProjection,
@@ -120,7 +120,6 @@ pub fn lint(state: &WorkspaceConfigState) -> Result<SkillCatalogResponse, SkillE
 
 fn projection_identity(state: &WorkspaceConfigState) -> SkillProjectionIdentity {
     SkillProjectionIdentity {
-        config_revision: state.snapshot.revision,
         tree_digest: state.snapshot.digest.clone(),
     }
 }
@@ -183,7 +182,7 @@ fn merged_skills(
             kind: SkillSourceKind::Builtin,
             id: format!("builtin:{BUILTIN_SKILL_ID}"),
             virtual_path: Some(BUILTIN_SKILL_VIRTUAL_PATH.to_string()),
-            revision: None,
+
             source_digest: Some(config_source::digest_bytes(BUILTIN_SKILL_SOURCE.as_bytes())),
             tree_digest: None,
         },
@@ -249,7 +248,7 @@ fn merged_skills(
                 kind: SkillSourceKind::Workspace,
                 id: format!("workspace:{name}"),
                 virtual_path: Some(canonical_path),
-                revision: Some(state.snapshot.revision),
+
                 source_digest: Some(source_digest),
                 tree_digest: Some(state.snapshot.digest.clone()),
             },
@@ -479,29 +478,26 @@ mod tests {
     fn state(main: &str, markdown: &str, name: &str) -> WorkspaceConfigState {
         let skill_path = format!("skills/{name}/SKILL.md");
         let reference_path = format!("skills/{name}/references/checklist.md");
-        let tree = ConfigTreeSnapshot::from_entries(
-            9,
-            [
-                ConfigEntry::new(
-                    VirtualPath::parse("main.dcdl").unwrap(),
-                    ConfigContentType::Decodal,
-                    main,
-                )
-                .unwrap(),
-                ConfigEntry::new(
-                    VirtualPath::parse(&skill_path).unwrap(),
-                    ConfigContentType::Text,
-                    markdown,
-                )
-                .unwrap(),
-                ConfigEntry::new(
-                    VirtualPath::parse(&reference_path).unwrap(),
-                    ConfigContentType::Text,
-                    "checklist",
-                )
-                .unwrap(),
-            ],
-        )
+        let tree = ConfigTreeSnapshot::from_entries([
+            ConfigEntry::new(
+                VirtualPath::parse("main.dcdl").unwrap(),
+                ConfigContentType::Decodal,
+                main,
+            )
+            .unwrap(),
+            ConfigEntry::new(
+                VirtualPath::parse(&skill_path).unwrap(),
+                ConfigContentType::Text,
+                markdown,
+            )
+            .unwrap(),
+            ConfigEntry::new(
+                VirtualPath::parse(&reference_path).unwrap(),
+                ConfigContentType::Text,
+                "checklist",
+            )
+            .unwrap(),
+        ])
         .unwrap();
         let bundle = WorkspaceConfigSchemaBundle::compose([SkillConfigSchemaProvider
             .contribution()
@@ -553,8 +549,10 @@ mod tests {
             .find(|item| item.name == "debug-rust")
             .unwrap();
         assert_eq!(item.provenance.kind, SkillSourceKind::Workspace);
-        assert_eq!(item.provenance.revision, Some(9));
-        assert_eq!(catalog.projection.config_revision, 9);
+        assert_eq!(
+            item.provenance.tree_digest.as_deref(),
+            Some(state.snapshot.digest.as_str())
+        );
         assert_eq!(catalog.projection.tree_digest, state.snapshot.digest);
         assert_eq!(item.activation_status, SkillActivationStatus::Active);
         assert_eq!(item.projection_status, SkillProjectionStatus::Valid);
@@ -565,7 +563,7 @@ mod tests {
         );
         let detail = detail(&state, "debug-rust").unwrap();
         assert_eq!(detail.authority, SKILL_CATALOG_AUTHORITY);
-        assert_eq!(detail.projection.config_revision, 9);
+        assert_eq!(detail.projection.tree_digest, state.snapshot.digest);
         assert_eq!(detail.activation_status, SkillActivationStatus::Active);
         assert_eq!(detail.projection_status, SkillProjectionStatus::Valid);
         assert_eq!(detail.body, "# Debug Rust\n");

@@ -17,7 +17,9 @@ identity under its operator-managed state directory, **not a fake Workspace**.
 Subject IDs are independently issued random domain identities. An ID is a lookup
 key, never an authorization credential.
 
-Existing SQL schema and migrations are retained. In particular,
+Historical migration plans remain frozen. Migration 7 replaces state counters
+with opaque Memory change identities and explicit predecessor history; the
+original serialized records are retained in an immutable audit archive.
 `store_scope.workspace_id` still stores the physical storage scope, under its
 historical column name. Existing Backend placement and snapshot manifest keys
 are unchanged. Optional historical `EvidenceOrigin.workspace_id` values continue
@@ -29,7 +31,7 @@ Workspace value. `workspace_id()` is a Backend compatibility alias for
 
 `api::execute(store, &HostOperationContext, operation)` is the common dispatcher
 used by Backend and local Hosts. It owns query/cursor rules, bounded body and
-nested provenance projections, immutable revision reads, proposal validation,
+nested provenance projections, immutable change reads, proposal validation,
 explicit staging/receipt rules, resident context, candidate decisions and
 surface generation/publication/failure projections.
 
@@ -72,5 +74,24 @@ helpers never run or replay a Job. The store's `prepare_job_surface_generation`,
 `require_job_surface_generation`, and `validate_job_surface_outcome` are public
 trusted-domain methods for both Backend and local Hosts.
 
+## Content conditions and history
+
+Memory updates require the exact `expected_change_id` read by the caller.
+Each committed change receives a new opaque ID and retains `previous_change_id`;
+IDs are never sorted or incremented to infer history. Body/evidence continuations
+pin that immutable ID, and history cursors pin a predecessor-chain head.
+
+Subject behavior updates compare `expected_behavior_md` byte-for-byte and do not
+participate in Memory freshness. Surface runs, publications and query cursors use
+`memory_fingerprint`, a SHA-256 digest of the length-framed, ordered current
+`(memory_id, change_id)` identities. The Subject stores no redundant freshness
+counter. Publication remains first-wins for the captured Memory input set.
+
+Old Surface input sets cannot be proven from historical counters. Migration 7
+retains those snapshots and runs as archival history with deliberately detached
+input identities, marks existing surfaces stale, and requires regeneration.
+Old Flow provenance keeps its exact original bytes in the archive; a definition
+fingerprint is not fabricated from an old numeric label.
+
 Dependencies: `feature-storage`, `chrono`, `memory`, `manifest`, `rusqlite`,
-`serde`, `serde_json`, `server-api`, `thiserror`, `uuid`; tests use `tempfile`.
+`serde`, `serde_json`, `server-api`, `sha2`, `thiserror`, `uuid`; tests use `tempfile`.

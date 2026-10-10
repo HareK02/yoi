@@ -6,7 +6,7 @@ export function metadataFixture(workspaceId = "home-owner") {
       ? "Workspace with a long name — international documentation and distributed development"
       : "Workspace Settings Review",
     created_at: "2026-01-01T00:00:00Z",
-    revision: "2026-01-02T00:00:00Z",
+    updated_at: "2026-01-02T00:00:00Z",
     source: "server_db",
     diagnostics: [],
   };
@@ -16,7 +16,6 @@ export function identityFixture(workspaceId = "home-owner", pending = false) {
     workspace_id: workspaceId,
     key_id: "fixture-workspace-key",
     algorithm: "ed25519",
-    revision: 1,
     state: pending ? "pending_provisioning" : "active",
     created_at: "2026-01-01T00:00:00Z",
   };
@@ -37,7 +36,6 @@ export function identityFixture(workspaceId = "home-owner", pending = false) {
       algorithm: identity.algorithm,
       public_key: publicKey,
       public_key_fingerprint: fingerprint,
-      revision: 1,
     },
   };
 }
@@ -45,7 +43,7 @@ export function deletionFixture(workspaceId = "home-owner") {
   return {
     workspace_id: workspaceId,
     display_name: metadataFixture(workspaceId).display_name,
-    expected_revision: metadataFixture(workspaceId).revision,
+    expected_workspace_updated_at: metadataFixture(workspaceId).updated_at,
     can_delete: true,
     blockers: [],
     resources: {
@@ -70,7 +68,7 @@ export function settingsFixtureHandler() {
         const current = names.get(id) ?? metadataFixture(id);
         if (request.method === "PUT") {
           const body = await request.json();
-          if (body.revision !== current.revision) {
+          if (body.expected_updated_at !== current.updated_at) {
             return new Response(
               "Workspace metadata changed. Reload the saved name.",
               { status: 409 },
@@ -79,7 +77,7 @@ export function settingsFixtureHandler() {
           const next = {
             ...current,
             display_name: String(body.display_name).trim(),
-            revision: String(Number.parseInt(current.revision, 10) + 1),
+            updated_at: new Date(Date.parse(current.updated_at) + 1).toISOString(),
           };
           names.set(id, next);
           return Response.json({ workspace: next, diagnostics: [] });
@@ -115,7 +113,7 @@ export function settingsFixtureHandler() {
         ...(names.has(deletion[1])
           ? {
             display_name: names.get(deletion[1])!.display_name,
-            expected_revision: names.get(deletion[1])!.revision,
+            expected_workspace_updated_at: names.get(deletion[1])!.updated_at,
           }
           : {}),
       });

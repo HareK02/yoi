@@ -22,7 +22,9 @@ pub enum DriveError {
     Denied,
     #[error("Drive resource not found")]
     NotFound,
-    #[error("Drive revision or name conflict; observe explicitly before another operation")]
+    #[error(
+        "Drive content, location, or name conflict; observe explicitly before another operation"
+    )]
     Conflict,
     #[error("Invalid Drive arguments: {0}")]
     Invalid(String),
@@ -54,7 +56,11 @@ impl DriveBackend {
         if let Some(parent) = &entry.parent {
             self.validate_ref(parent)?;
         }
-        if !decimal(&entry.revision) || entry.size.is_some_and(|n| n > DRIVE_FILE_MAX_BYTES) {
+        if (entry.last_mutation_id.len() > 128
+            || entry.last_mutation_id.chars().any(char::is_control)
+            || (entry.parent.is_some() && entry.last_mutation_id.is_empty()))
+            || entry.size.is_some_and(|n| n > DRIVE_FILE_MAX_BYTES)
+        {
             return Err(DriveError::Unavailable);
         }
         Ok(())
@@ -238,14 +244,14 @@ impl DriveBackend {
             return Err(DriveError::Limit);
         }
         let mut bytes = Vec::with_capacity(total as usize);
-        // Even an empty file gets a revision-fixed read and current authorization.
+        // Even an empty file gets a read bound to the observed committed mutation and current authorization.
         loop {
             let offset = bytes.len() as u32;
             let length = total.saturating_sub(offset).clamp(1, DRIVE_CHUNK_MAX_BYTES);
             let query = query_string(&DriveReadChunkQuery {
                 entry_workspace_id: entry.entry.workspace_id.clone(),
                 id: entry.entry.node_id.clone(),
-                expected_revision: entry.revision.clone(),
+                expected_mutation_id: entry.last_mutation_id.clone(),
                 offset,
                 length,
             })?;

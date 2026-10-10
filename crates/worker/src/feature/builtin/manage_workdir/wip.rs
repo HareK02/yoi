@@ -419,7 +419,7 @@ impl WipOperationHandler for CollectionHandler {
         let mut digest = Sha256::new();
         digest.update(self.domain.route());
         if matches!(self.domain, Domain::Workdir | Domain::Attachment) {
-            // The complete-set revision is computed by the existing Backend
+            // The complete-set digest is computed by the existing Backend
             // registry/ledger in the same snapshot as a bounded page. Never infer
             // collection freshness from just the first page's items.
             let path = if matches!(self.domain, Domain::Workdir) {
@@ -431,13 +431,13 @@ impl WipOperationHandler for CollectionHandler {
                 .provider
                 .request(path)
                 .ok()
-                .and_then(|p| p.get("revision").and_then(Json::as_str).map(str::to_owned))
+                .and_then(|p| p.get("digest").and_then(Json::as_str).map(str::to_owned))
             {
-                Some(revision) => {
+                Some(inventory_digest) => {
                     digest.update([0]);
-                    digest.update(revision);
+                    digest.update(inventory_digest);
                 }
-                None => digest.update(b"inventory-revision-unavailable"),
+                None => digest.update(b"inventory-digest-unavailable"),
             }
             return Some(digest.finalize().to_vec());
         }
@@ -533,9 +533,9 @@ impl WipOperationHandler for CollectionHandler {
                                 "invalid bounded inventory page".into(),
                             )
                         })?;
-                    if page.get("revision").and_then(Json::as_str).is_none() {
+                    if page.get("digest").and_then(Json::as_str).is_none() {
                         return Err(WipOperationError::OutcomeUnknown(
-                            "inventory page revision missing".into(),
+                            "inventory page digest missing".into(),
                         ));
                     }
                     let mut items = Vec::new();
@@ -1162,7 +1162,7 @@ pub(crate) mod tests {
                     let cursor = query.get("cursor").copied();
                     let mut all: Vec<_> = state.workdirs.iter().collect();
                     all.sort_by_key(|v| v["working_directory_id"].as_str().unwrap());
-                    let revision = Sha256::digest(serde_json::to_vec(&all).unwrap())
+                    let digest = Sha256::digest(serde_json::to_vec(&all).unwrap())
                         .iter()
                         .map(|b| format!("{b:02x}"))
                         .collect::<String>();
@@ -1179,7 +1179,7 @@ pub(crate) mod tests {
                     } else {
                         None
                     };
-                    json!({"items":items, "next_cursor":next, "revision":revision})
+                    json!({"items":items, "next_cursor":next, "digest":digest})
                 }
                 (WorkspaceRequestMethod::Get, "workers/self/workdir-attachments") => {
                     let query: BTreeMap<_, _> = path
@@ -1191,12 +1191,12 @@ pub(crate) mod tests {
                         .collect();
                     let mut all: Vec<_> = state.attachments.iter().collect();
                     all.sort_by_key(|v| v["alias"].as_str().unwrap());
-                    let revision = Sha256::digest(serde_json::to_vec(&all).unwrap())
+                    let digest = Sha256::digest(serde_json::to_vec(&all).unwrap())
                         .iter()
                         .map(|b| format!("{b:02x}"))
                         .collect::<String>();
                     if let Some(expected) = query.get("connection_id") {
-                        json!({"items":all.into_iter().filter(|a| a["connection_id"] == *expected).collect::<Vec<_>>(), "next_offset":null, "revision":revision})
+                        json!({"items":all.into_iter().filter(|a| a["connection_id"] == *expected).collect::<Vec<_>>(), "next_offset":null, "digest":digest})
                     } else {
                         let limit = query
                             .get("limit")
@@ -1209,7 +1209,7 @@ pub(crate) mod tests {
                         let count = all.len();
                         let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
                         let next = (offset + limit < count).then_some(offset + limit);
-                        json!({"items":items, "next_offset":next, "revision":revision})
+                        json!({"items":items, "next_offset":next, "digest":digest})
                     }
                 }
                 (WorkspaceRequestMethod::Get, p) if p.starts_with("repositories/") => {

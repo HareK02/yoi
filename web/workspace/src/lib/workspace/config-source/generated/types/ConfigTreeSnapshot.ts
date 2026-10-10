@@ -2,4 +2,11 @@
 import type { ConfigEntry } from "./ConfigEntry";
 import type { VirtualPath } from "./VirtualPath";
 
-export type ConfigTreeSnapshot = { revision: number, digest: string, entries: { [key in VirtualPath]: ConfigEntry }, };
+export type ConfigTreeSnapshot = {
+  /**
+   * SHA-256 of ordered virtual paths, content types and complete source bytes.
+   * Identifies tree content, not an edit sequence or freshness counter.
+   */
+  digest: string;
+  entries: { [key in VirtualPath]: ConfigEntry };
+};

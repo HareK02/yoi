@@ -99,8 +99,6 @@ impl BackendResourceBroker {
             operation: BackendResourceOperation::FetchArchive,
             expires_at_unix_seconds: expires_at.timestamp(),
             nonce: nonce.clone(),
-            revision: archive.reference.digest.clone(),
-            generation: None,
             max_bytes: DEFAULT_PROFILE_SOURCE_ARCHIVE_MAX_BYTES,
             content_type: PROFILE_SOURCE_ARCHIVE_CONTENT_TYPE.to_string(),
             redaction: ResourceRedactionPolicy::RuntimeInternalOnly,
@@ -126,7 +124,6 @@ impl BackendResourceBroker {
         workspace_id: impl Into<String>,
         runtime_id: &str,
         resource_id: impl Into<String>,
-        revision: impl Into<String>,
         expires_at_unix_seconds: i64,
         secret: RepositorySshAccessSecret,
     ) -> Result<BackendResourceHandle, BackendResourceError> {
@@ -142,7 +139,6 @@ impl BackendResourceBroker {
         }
         let workspace_id = workspace_id.into();
         let resource_id = resource_id.into();
-        let revision = revision.into();
         let nonce = Uuid::now_v7().to_string();
         let handle = BackendResourceHandle {
             kind: BackendResourceKind::RepositorySshAccess,
@@ -155,8 +151,6 @@ impl BackendResourceBroker {
             operation: BackendResourceOperation::FetchOnce,
             expires_at_unix_seconds,
             nonce: nonce.clone(),
-            revision,
-            generation: None,
             max_bytes: DEFAULT_REPOSITORY_SSH_ACCESS_MAX_BYTES,
             content_type: REPOSITORY_SSH_ACCESS_CONTENT_TYPE.to_string(),
             redaction: ResourceRedactionPolicy::RuntimeInternalOnly,
@@ -404,13 +398,12 @@ mod tests {
                 "workspace-test",
                 "runtime-test",
                 "repository-access-test",
-                "1",
                 i64::MAX,
                 RepositorySshAccessSecret {
                     credential_candidates: vec![
                         worker_runtime::resource::RepositorySshAccessSecretCandidate {
                             credential_id: "credential-test".to_string(),
-                            credential_revision: 1,
+                            public_key_fingerprint: "sha256:test-credential-key".to_string(),
                             private_key: "private-key-bytes".to_string(),
                         },
                     ],

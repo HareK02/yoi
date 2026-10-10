@@ -219,7 +219,10 @@ impl StandaloneJobs {
             store: self.store.clone(),
             job_id: job_id.into(),
             attempt_id: snapshot.attempt.attempt_id.clone(),
-            input_revision: snapshot.request.input_revision.clone(),
+            input_digest: snapshot
+                .request
+                .input_digest()
+                .map_err(JobStoreError::from)?,
             deadline,
         });
         let grant = match (
@@ -295,7 +298,10 @@ impl StandaloneJobs {
             store: store.clone(),
             job_id: id.clone(),
             attempt_id: attempt_id.clone(),
-            input_revision: snapshot.request.input_revision.clone(),
+            input_digest: snapshot
+                .request
+                .input_digest()
+                .map_err(JobStoreError::from)?,
             deadline,
         });
         let (cancel, mut cancellation) = watch::channel(false);
@@ -451,14 +457,14 @@ struct BoundResultSink {
     store: Arc<Mutex<Option<JobStore>>>,
     job_id: String,
     attempt_id: String,
-    input_revision: String,
+    input_digest: String,
     deadline: tokio::time::Instant,
 }
 impl worker::job::JobResultSink for BoundResultSink {
     fn submit(&self, submission: JobResultSubmission) -> Result<(), String> {
         if submission.job_id != self.job_id
             || submission.attempt_id != self.attempt_id
-            || submission.input_revision != self.input_revision
+            || submission.input_digest != self.input_digest
         {
             return Err("Job result capability binding mismatch".into());
         }
@@ -482,7 +488,7 @@ struct BoundAttemptFence {
     store: Arc<Mutex<Option<JobStore>>>,
     job_id: String,
     attempt_id: String,
-    input_revision: String,
+    input_digest: String,
     deadline: tokio::time::Instant,
 }
 impl JobAttemptFence for BoundAttemptFence {
@@ -499,7 +505,7 @@ impl JobAttemptFence for BoundAttemptFence {
         if snapshot.state != JobState::Pending
             || snapshot.attempt.state != JobAttemptState::Dispatched
             || snapshot.attempt.attempt_id != self.attempt_id
-            || snapshot.request.input_revision != self.input_revision
+            || snapshot.request.input_digest().map_err(|e| e.to_string())? != self.input_digest
         {
             return Err("Job domain grant is not bound to the current live attempt".into());
         }

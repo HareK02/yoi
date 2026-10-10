@@ -76,7 +76,6 @@ const repositoryList = {
     kind: "git",
     provider: "git",
     source: { kind: "local_path", uri: "/srv/alpha" },
-    source_revision: 1,
     source_fingerprint: "sha256:alpha",
     observed_status: "ready",
     record_authority: "workspace-control-plane",
@@ -153,21 +152,13 @@ Deno.test("stale repository aliases fail closed at the JSON boundary", () => {
   );
 });
 
-Deno.test("repository source revisions enforce the OpenAPI integer range", () => {
-  const negative = structuredClone(repositoryList) as Record<string, unknown>;
-  const negativeItems = negative.items as Array<Record<string, unknown>>;
-  negativeItems[0].source_revision = -1;
+Deno.test("repository JSON rejects removed source revision counters", () => {
+  const stale = structuredClone(repositoryList) as Record<string, unknown>;
+  const items = stale.items as Array<Record<string, unknown>>;
+  items[0].source_revision = 1;
   assertThrows(
-    () => parseRepositoryListResponse(negative),
-    "must be between 0 and Number.MAX_SAFE_INTEGER",
-  );
-
-  const unsafe = structuredClone(repositoryList) as Record<string, unknown>;
-  const unsafeItems = unsafe.items as Array<Record<string, unknown>>;
-  unsafeItems[0].source_revision = Number.MAX_SAFE_INTEGER + 1;
-  assertThrows(
-    () => parseRepositoryListResponse(unsafe),
-    "must be a safe integer",
+    () => parseRepositoryListResponse(stale),
+    ".source_revision is not part of the wire contract",
   );
 });
 
@@ -285,7 +276,7 @@ Deno.test("Workspace deletion DTOs fail closed and preserve durable operation st
   const preflight = parseWorkspaceDeletionPreflightResponse({
     workspace_id: "workspace-a",
     display_name: "Alpha",
-    expected_revision: "2026-01-01T00:00:00Z",
+    expected_workspace_updated_at: "2026-01-01T00:00:00Z",
     can_delete: true,
     resources: {
       workers: 2,

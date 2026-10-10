@@ -45,7 +45,7 @@
     const workspaceId = subjectWorkspaceId;
     const subjectId = subject.id;
     const request = {
-      expected_behavior_revision: subject.behavior_revision,
+      expected_behavior_md: subject.behavior_md,
       behavior_md: behaviorDraft,
     };
     const isCurrent = () => generation === routeGeneration &&
@@ -94,11 +94,12 @@
     return workspaceRoute(data.workspaceId, '/memory');
   }
 
-  function memoryHref(memoryId: string): string {
-    return workspaceRoute(
+  function memoryHref(memoryId: string, changeId?: string): string {
+    const path = workspaceRoute(
       data.workspaceId,
       `/memory/${encodeURIComponent(data.subjectId)}/${encodeURIComponent(memoryId)}`,
     );
+    return changeId ? `${path}?change_id=${encodeURIComponent(changeId)}` : path;
   }
 
   function memoryPageHref(cursor?: string | null): string {
@@ -192,8 +193,8 @@
       <dl>
         <div><dt>Subject ID</dt><dd><code>{subject.id}</code></dd></div>
         <div>
-          <dt>Subject store revision</dt>
-          <dd>{subject.store_revision}<small>Internal change number for committed Memories; not a Memory count or content-quality score.</small></dd>
+          <dt>Memory fingerprint</dt>
+          <dd>{subject.memory_fingerprint}<small>Content condition for current committed Memories; not a Memory count or content-quality score.</small></dd>
         </div>
         <div><dt>Last changed</dt><dd><time datetime={subject.updated_at}>{formatDate(subject.updated_at)}</time></dd></div>
       </dl>
@@ -218,7 +219,7 @@
           <button type="button" class="behavior-edit" onclick={beginBehaviorEdit}>Edit</button>
         {/if}
       </header>
-      <p class="behavior-help">The Host injects this text verbatim for connected Workers, separately from generated Memory. Saving confirms storage only. Connected Workers check for the latest revision before later model requests; this page does not report that application.</p>
+      <p class="behavior-help">The Host injects this text verbatim for connected Workers, separately from generated Memory. Saving confirms storage only. Connected Workers check for the latest text before later model requests; this page does not report that application.</p>
       {#if editingBehavior}
         <form class="behavior-form" aria-busy={behaviorSaving} onsubmit={(event) => { event.preventDefault(); void saveBehavior(); }}>
           <label>
@@ -237,7 +238,7 @@
       {:else}
         <div class="memory-state" role="status"><strong>No behavior is set.</strong><p>Connected Workers receive an explicit empty behavior document.</p></div>
       {/if}
-      {#if behaviorSaveConfirmed}<p class="behavior-saved" role="status">Behavior storage confirmed at revision {subject.behavior_revision}. This page does not confirm application by a connected Worker.</p>{/if}
+      {#if behaviorSaveConfirmed}<p class="behavior-saved" role="status">Behavior storage confirmed. This page does not confirm application by a connected Worker.</p>{/if}
     </section>
   {/if}
 
@@ -273,18 +274,18 @@
         <dl>
           <div><dt>Snapshot ID</dt><dd><code>{snapshot.snapshot_id}</code></dd></div>
           <div>
-            <dt>Generated from Subject revision</dt>
-            <dd>{snapshot.built_from_store_revision}<small>The Subject change number used for this surface, distinct from each Memory’s revision.</small></dd>
+            <dt>Generated from Memory fingerprint</dt>
+            <dd>{snapshot.built_from_memory_fingerprint}<small>The content condition used to generate this surface.</small></dd>
           </div>
           <div>
-            <dt>Referenced Memory revisions</dt>
+            <dt>Referenced Memory changes</dt>
             <dd>
               {#if snapshot.memory_refs.length === 0}
                 None
               {:else}
                 <ul class="reference-list">
-                  {#each snapshot.memory_refs as reference (`${reference.memory_id}:${reference.revision}`)}
-                    <li><a href={memoryHref(reference.memory_id)}><code>{reference.memory_id}</code> · revision {reference.revision}</a></li>
+                  {#each snapshot.memory_refs as reference (`${reference.memory_id}:${reference.change_id}`)}
+                    <li><a href={memoryHref(reference.memory_id, reference.change_id)}><code>{reference.memory_id}</code> · change {reference.change_id}</a></li>
                   {/each}
                 </ul>
               {/if}
@@ -347,7 +348,7 @@
               </div>
               <dl>
                 <div><dt>Memory ID</dt><dd><code title={memory.id}>{memory.id}</code></dd></div>
-                <div><dt>Memory revision</dt><dd>{memory.revision}</dd></div>
+                <div><dt>Memory change</dt><dd>{memory.change_id}</dd></div>
                 <div><dt>Last changed</dt><dd><time datetime={memory.updated_at}>{formatDate(memory.updated_at)}</time></dd></div>
               </dl>
             </a>

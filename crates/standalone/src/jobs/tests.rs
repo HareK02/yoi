@@ -11,7 +11,6 @@ fn request(id: &str) -> JobRequest {
     JobRequest {
         job_id: id.into(),
         purpose: "test".into(),
-        input_revision: "r1".into(),
         input_ref: "fixture:input".into(),
         input: serde_json::json!({"data":42}),
         instruction: "Return a structured result".into(),
@@ -25,7 +24,7 @@ fn sink(jobs: &StandaloneJobs, id: &str, attempt: &str) -> BoundResultSink {
         store: jobs.store.clone(),
         job_id: id.into(),
         attempt_id: attempt.into(),
-        input_revision: "r1".into(),
+        input_digest: request(id).input_digest().unwrap(),
         deadline: tokio::time::Instant::now() + Duration::from_secs(10),
     }
 }
@@ -33,7 +32,7 @@ fn result(id: &str, attempt: &str) -> JobResultSubmission {
     JobResultSubmission {
         job_id: id.into(),
         attempt_id: attempt.into(),
-        input_revision: "r1".into(),
+        input_digest: request(id).input_digest().unwrap(),
         result: serde_json::json!({"valid":true}),
     }
 }
@@ -99,7 +98,7 @@ type CapturedDomainAttempt = (JobSnapshot, Arc<dyn JobAttemptFence>);
 #[derive(Default)]
 struct RecordingDomainProvider(Mutex<Vec<CapturedDomainAttempt>>);
 fn domain_grant(id: &str) -> Value {
-    json!({"consumer":"test-domain", "job_id":id, "input_revision":"r1"})
+    json!({"consumer":"test-domain", "job_id":id, "input_digest":request(id).input_digest().unwrap()})
 }
 fn domain_request(id: &str) -> JobRequest {
     let mut intent = request(id);
@@ -244,7 +243,7 @@ async fn persisted_grant_requires_provider_and_missing_grant_cannot_be_derived_f
 }
 
 #[tokio::test]
-async fn foreign_job_revision_and_consumer_grants_are_refused_before_model_dispatch() {
+async fn foreign_job_digest_and_consumer_grants_are_refused_before_model_dispatch() {
     let temp = tempfile::tempdir().unwrap();
     let jobs =
         StandaloneJobs::open(&temp.path().join("jobs.sqlite3"), temp.path().to_path_buf()).unwrap();
@@ -253,12 +252,12 @@ async fn foreign_job_revision_and_consumer_grants_are_refused_before_model_dispa
     for (id, grant) in [
         ("foreign-job", domain_grant("another-job")),
         (
-            "foreign-revision",
-            json!({"consumer":"test-domain","job_id":"foreign-revision","input_revision":"r0"}),
+            "foreign-digest",
+            json!({"consumer":"test-domain","job_id":"foreign-digest","input_digest":"r0"}),
         ),
         (
             "foreign-consumer",
-            json!({"consumer":"another-domain","job_id":"foreign-consumer","input_revision":"r1"}),
+            json!({"consumer":"another-domain","job_id":"foreign-consumer","input_digest":request("foreign-consumer").input_digest().unwrap()}),
         ),
     ] {
         let reserved = jobs.request_granted(domain_request(id), grant).unwrap();
@@ -378,7 +377,7 @@ async fn bound_domain_does_not_change_root_generic_result_only_execution() {
 }
 
 #[tokio::test]
-async fn host_result_capability_cannot_cross_job_attempt_revision_or_deadline() {
+async fn host_result_capability_cannot_cross_job_attempt_digest_or_deadline() {
     let temp = tempfile::tempdir().unwrap();
     let jobs =
         StandaloneJobs::open(&temp.path().join("jobs.sqlite3"), temp.path().to_path_buf()).unwrap();
@@ -398,7 +397,7 @@ async fn host_result_capability_cannot_cross_job_attempt_revision_or_deadline() 
     );
     assert!(bound.submit(result("first", "first:attempt:2")).is_err());
     let mut stale = result("first", &first.attempt.attempt_id);
-    stale.input_revision = "r0".into();
+    stale.input_digest = "r0".into();
     assert!(bound.submit(stale).is_err());
     let mut expired = sink(&jobs, "first", &first.attempt.attempt_id);
     expired.deadline = tokio::time::Instant::now() - Duration::from_secs(1);

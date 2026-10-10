@@ -18,5 +18,5 @@ serde_json = "1.0"
 yoi-plugin-pdk = { path = "../../../../crates/plugin-pdk" }
 
 # Out-of-tree Plugin packages should replace the local path with a pinned
-# Yoi source revision. Use rev, not branch, for reproducible builds:
+# Yoi source commit. Use rev, not branch, for reproducible builds:
 # yoi-plugin-pdk = { git = "https://gitea.hareworks.net/Hare/yoi.git", package = "yoi-plugin-pdk", rev = "<pinned-yoi-commit-sha>" }

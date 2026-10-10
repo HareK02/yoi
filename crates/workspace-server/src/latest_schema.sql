@@ -114,15 +114,14 @@ CREATE TABLE device_login_flows (
     approved_at TEXT,
     consumed_at TEXT
 );
-CREATE TABLE flow_source_revisions (
+CREATE TABLE flow_source_contents (
     workspace_id TEXT NOT NULL,
     flow_id TEXT NOT NULL,
-    revision INTEGER NOT NULL CHECK (revision > 0),
     content TEXT NOT NULL,
     content_digest TEXT NOT NULL,
     definition_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, flow_id, revision),
+    PRIMARY KEY (workspace_id, flow_id, content_digest),
     FOREIGN KEY (workspace_id, flow_id)
         REFERENCES flow_sources(workspace_id, flow_id) ON DELETE CASCADE
 );
@@ -134,7 +133,6 @@ CREATE TABLE flow_sources (
     path TEXT NOT NULL,
     content TEXT NOT NULL,
     content_digest TEXT NOT NULL,
-    revision INTEGER NOT NULL CHECK (revision > 0),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (workspace_id, flow_id),
@@ -232,7 +230,6 @@ CREATE TABLE "repositories" (
             updated_at TEXT NOT NULL,
             source_kind TEXT NOT NULL,
             source_uri TEXT NOT NULL,
-            source_revision INTEGER NOT NULL DEFAULT 1,
             source_fingerprint TEXT NOT NULL,
             observed_status TEXT NOT NULL DEFAULT 'unverified',
             observed_at TEXT,
@@ -245,7 +242,7 @@ CREATE TABLE repository_secret_audit_events (
             event_id TEXT NOT NULL,
             kind TEXT NOT NULL,
             resource_id TEXT NOT NULL,
-            revision INTEGER NOT NULL CHECK (revision >= 1),
+            operation_id TEXT NOT NULL CHECK (length(operation_id) > 0),
             actor_account_id TEXT NOT NULL,
             created_at TEXT NOT NULL,
             PRIMARY KEY (workspace_id, event_id),
@@ -257,19 +254,20 @@ CREATE TABLE repository_secret_operations (
             request_fingerprint TEXT NOT NULL,
             resource_kind TEXT NOT NULL CHECK (resource_kind IN ('credential', 'host_trust')),
             resource_id TEXT NOT NULL,
-            result_revision INTEGER NOT NULL CHECK (result_revision >= 1),
+            result_operation_id TEXT NOT NULL CHECK (length(result_operation_id) > 0),
             created_at TEXT NOT NULL,
             PRIMARY KEY (workspace_id, operation_id),
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
         );
-CREATE TABLE repository_ssh_credential_revisions (
+CREATE TABLE repository_ssh_credential_keys (
             workspace_id TEXT NOT NULL,
             credential_id TEXT NOT NULL,
-            revision INTEGER NOT NULL CHECK (revision >= 1),
+            operation_id TEXT NOT NULL CHECK (length(operation_id) > 0),
             public_key_algorithm TEXT NOT NULL,
             public_key_fingerprint TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, credential_id, revision),
+            PRIMARY KEY (workspace_id, credential_id, operation_id),
+            UNIQUE (workspace_id, credential_id, operation_id, public_key_fingerprint),
             FOREIGN KEY (workspace_id, credential_id)
                 REFERENCES repository_ssh_credentials(workspace_id, credential_id)
                 ON DELETE CASCADE
@@ -280,24 +278,24 @@ CREATE TABLE repository_ssh_credentials (
             name TEXT NOT NULL,
             public_key_algorithm TEXT NOT NULL,
             public_key_fingerprint TEXT NOT NULL,
-            current_revision INTEGER NOT NULL CHECK (current_revision >= 1),
+            current_operation_id TEXT NOT NULL CHECK (length(current_operation_id) > 0),
             status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
             created_at TEXT NOT NULL,
             rotated_at TEXT,
             PRIMARY KEY (workspace_id, credential_id),
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
         );
-CREATE TABLE repository_ssh_host_trust_revisions (
+CREATE TABLE repository_ssh_host_trust_keys (
             workspace_id TEXT NOT NULL,
             host_trust_id TEXT NOT NULL,
-            revision INTEGER NOT NULL CHECK (revision >= 1),
+            operation_id TEXT NOT NULL CHECK (length(operation_id) > 0),
             hostname TEXT NOT NULL,
             port INTEGER NOT NULL CHECK (port >= 1 AND port <= 65535),
             key_algorithm TEXT NOT NULL,
             host_key TEXT NOT NULL,
             fingerprint TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, host_trust_id, revision),
+            PRIMARY KEY (workspace_id, host_trust_id, operation_id),
             FOREIGN KEY (workspace_id, host_trust_id)
                 REFERENCES repository_ssh_host_trusts(workspace_id, host_trust_id)
                 ON DELETE CASCADE
@@ -310,24 +308,24 @@ CREATE TABLE repository_ssh_host_trusts (
             key_algorithm TEXT NOT NULL,
             host_key TEXT NOT NULL,
             fingerprint TEXT NOT NULL,
-            current_revision INTEGER NOT NULL CHECK (current_revision >= 1),
+            current_operation_id TEXT NOT NULL CHECK (length(current_operation_id) > 0),
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (workspace_id, host_trust_id),
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
         );
-CREATE TABLE server_secret_versions (
+CREATE TABLE server_secret_objects (
             workspace_id TEXT NOT NULL,
             secret_id TEXT NOT NULL,
-            revision INTEGER NOT NULL CHECK (revision >= 1),
+            operation_id TEXT NOT NULL CHECK (length(operation_id) > 0),
             purpose TEXT NOT NULL CHECK (purpose IN ('private_key', 'passphrase')),
             encryption_algorithm TEXT NOT NULL CHECK (encryption_algorithm = 'aes-256-gcm-v1'),
             nonce BLOB NOT NULL CHECK (length(nonce) = 12),
             ciphertext BLOB NOT NULL,
             created_at TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, secret_id, revision, purpose),
-            FOREIGN KEY (workspace_id, secret_id, revision)
-                REFERENCES repository_ssh_credential_revisions(workspace_id, credential_id, revision)
+            PRIMARY KEY (workspace_id, secret_id, operation_id, purpose),
+            FOREIGN KEY (workspace_id, secret_id, operation_id)
+                REFERENCES repository_ssh_credential_keys(workspace_id, credential_id, operation_id)
                 ON DELETE CASCADE
         );
 CREATE TABLE ticket_assignment_operations (
@@ -443,11 +441,12 @@ CREATE TABLE workspace_runtime_bindings (
     base_url TEXT NOT NULL,
     public_key TEXT NOT NULL,
     public_key_fingerprint TEXT NOT NULL,
-    binding_revision INTEGER NOT NULL DEFAULT 1 CHECK (binding_revision > 0),
+    binding_id TEXT NOT NULL CHECK (length(binding_id) > 0),
     state TEXT NOT NULL CHECK (state IN ('configured', 'verified', 'revoked')),
     authentication_mode TEXT NOT NULL CHECK (authentication_mode IN ('legacy_server_issuer', 'workspace_identity')),
     workspace_key_id TEXT,
-    workspace_key_generation INTEGER CHECK (workspace_key_generation > 0),
+    workspace_public_key_fingerprint TEXT,
+    workspace_trust_id TEXT CHECK (length(workspace_trust_id) > 0),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     revoked_at TEXT,
@@ -455,9 +454,9 @@ CREATE TABLE workspace_runtime_bindings (
     UNIQUE (workspace_id, public_key_fingerprint),
     FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
     CHECK (
-        (authentication_mode = 'legacy_server_issuer' AND workspace_key_id IS NULL AND workspace_key_generation IS NULL)
+        (authentication_mode = 'legacy_server_issuer' AND workspace_key_id IS NULL AND workspace_public_key_fingerprint IS NULL AND workspace_trust_id IS NULL)
         OR
-        (authentication_mode = 'workspace_identity' AND workspace_key_id IS NOT NULL AND workspace_key_generation IS NOT NULL)
+        (authentication_mode = 'workspace_identity' AND workspace_key_id IS NOT NULL AND (state != 'verified' OR (workspace_trust_id IS NOT NULL AND workspace_public_key_fingerprint IS NOT NULL)))
     ),
     CHECK (
         (state = 'revoked' AND revoked_at IS NOT NULL)
@@ -468,12 +467,11 @@ CREATE TABLE workspace_runtime_bindings (
 CREATE TABLE workspace_runtime_verifications (
     workspace_id TEXT NOT NULL,
     runtime_id TEXT NOT NULL,
-    binding_revision INTEGER NOT NULL CHECK(binding_revision > 0),
+    binding_id TEXT NOT NULL CHECK(length(binding_id) > 0),
     workspace_key_id TEXT NOT NULL,
-    workspace_identity_revision INTEGER NOT NULL CHECK(workspace_identity_revision > 0),
-    workspace_trust_generation INTEGER NOT NULL CHECK(workspace_trust_generation > 0),
+    workspace_public_key_fingerprint TEXT NOT NULL CHECK(length(workspace_public_key_fingerprint) > 0),
+    workspace_trust_id TEXT NOT NULL CHECK(length(workspace_trust_id) > 0),
     runtime_public_key_fingerprint TEXT NOT NULL,
-    runtime_identity_revision INTEGER NOT NULL CHECK(runtime_identity_revision > 0),
     challenge_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('pending', 'verified', 'failed')),
     last_outcome TEXT NOT NULL,
@@ -494,15 +492,15 @@ CREATE TABLE workspace_runtime_binding_audit (
     action TEXT NOT NULL CHECK (action IN ('created', 'replaced', 'reactivated', 'revoked')),
     old_fingerprint TEXT,
     new_fingerprint TEXT,
-    binding_revision INTEGER NOT NULL CHECK (binding_revision > 0),
+    binding_id TEXT NOT NULL CHECK (length(binding_id) > 0),
     at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, runtime_id, binding_revision),
+    PRIMARY KEY (workspace_id, runtime_id, binding_id),
     FOREIGN KEY(workspace_id, runtime_id)
         REFERENCES workspace_runtime_bindings(workspace_id, runtime_id) ON DELETE RESTRICT,
     FOREIGN KEY(actor_account_id) REFERENCES accounts(account_id) ON DELETE RESTRICT
 );
 CREATE INDEX idx_workspace_runtime_binding_audit_recent
-    ON workspace_runtime_binding_audit(workspace_id, runtime_id, binding_revision DESC);
+    ON workspace_runtime_binding_audit(workspace_id, runtime_id, at DESC, binding_id DESC);
 CREATE TABLE typed_ticket_artifacts (
     workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, relative_path TEXT NOT NULL, content BLOB NOT NULL,
     PRIMARY KEY (workspace_id, ticket_id, relative_path),
@@ -621,13 +619,12 @@ CREATE TABLE workdir_create_operations (
             selector TEXT,
             requested_runtime_id TEXT,
             resolved_runtime_id TEXT NOT NULL,
-            config_revision INTEGER NOT NULL,
             config_projection_digest TEXT NOT NULL,
             working_directory_id TEXT NOT NULL,
             state TEXT NOT NULL CHECK (state IN ('pending', 'succeeded', 'failed')),
             failure TEXT,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL, source_kind TEXT, source_uri TEXT, source_revision INTEGER, source_fingerprint TEXT, credential_id TEXT, credential_revision INTEGER, host_trust_id TEXT, host_trust_revision INTEGER, repository_access_mode TEXT,
+            updated_at TEXT NOT NULL, source_kind TEXT, source_uri TEXT, source_fingerprint TEXT, credential_id TEXT, credential_fingerprint TEXT, host_trust_id TEXT, host_trust_fingerprint TEXT, repository_access_mode TEXT,
             PRIMARY KEY (workspace_id, operation_id),
             UNIQUE (workspace_id, working_directory_id)
         );
@@ -637,34 +634,34 @@ CREATE TABLE workdir_create_credential_candidates (
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal < 2),
     role TEXT NOT NULL CHECK (role IN ('primary', 'workspace_default_fallback')),
     credential_id TEXT NOT NULL CHECK (length(credential_id) BETWEEN 1 AND 128),
-    credential_revision INTEGER NOT NULL CHECK (credential_revision > 0),
+    credential_fingerprint TEXT NOT NULL CHECK (length(credential_fingerprint) > 0),
     PRIMARY KEY (workspace_id, operation_id, ordinal),
+    UNIQUE (workspace_id, operation_id, ordinal, credential_id, credential_fingerprint),
     UNIQUE (workspace_id, operation_id, role),
     UNIQUE (workspace_id, operation_id, credential_id),
     FOREIGN KEY (workspace_id, operation_id)
         REFERENCES workdir_create_operations(workspace_id, operation_id)
         ON DELETE CASCADE
 );
-CREATE INDEX idx_workdir_create_credential_candidates_revision
+CREATE INDEX idx_workdir_create_credential_candidates_fingerprint
     ON workdir_create_credential_candidates(
-        workspace_id, credential_id, credential_revision
+        workspace_id, credential_id, credential_fingerprint
     );
-CREATE TABLE workdir_create_credential_revision_retentions (
+CREATE TABLE workdir_create_credential_retentions (
     workspace_id TEXT NOT NULL,
     operation_id TEXT NOT NULL,
     ordinal INTEGER NOT NULL,
     credential_id TEXT NOT NULL,
-    credential_revision INTEGER NOT NULL,
+    credential_fingerprint TEXT NOT NULL,
+    credential_operation_id TEXT NOT NULL,
     PRIMARY KEY (workspace_id, operation_id, ordinal),
-    FOREIGN KEY (workspace_id, operation_id, ordinal)
+    FOREIGN KEY (workspace_id, operation_id, ordinal, credential_id, credential_fingerprint)
         REFERENCES workdir_create_credential_candidates(
-            workspace_id, operation_id, ordinal
+            workspace_id, operation_id, ordinal, credential_id, credential_fingerprint
         )
         ON DELETE CASCADE,
-    FOREIGN KEY (workspace_id, credential_id, credential_revision)
-        REFERENCES repository_ssh_credential_revisions(
-            workspace_id, credential_id, revision
-        )
+    FOREIGN KEY (workspace_id, credential_id, credential_operation_id, credential_fingerprint)
+        REFERENCES repository_ssh_credential_keys(workspace_id, credential_id, operation_id, public_key_fingerprint)
         ON DELETE RESTRICT
 );
 CREATE TABLE "workdir_registry" (
@@ -734,7 +731,7 @@ CREATE TABLE workdir_removal_operations (
     source_actor TEXT NOT NULL,
     reason TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('pending', 'failed', 'completed')),
-    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    attempt_id TEXT,
     retryable INTEGER NOT NULL CHECK (retryable IN (0, 1)),
     disposition TEXT CHECK (disposition IN ('removed', 'retained', 'attention_required')),
     failure_category TEXT,
@@ -774,7 +771,7 @@ CREATE TABLE worker_create_reservations (
             create_fingerprint TEXT NOT NULL,
             state TEXT NOT NULL CHECK (state IN ('reserved', 'created', 'removed')),
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL, request_fingerprint TEXT, memory_settings_revision INTEGER, memory_language TEXT,
+            updated_at TEXT NOT NULL, request_fingerprint TEXT, memory_language TEXT,
             singleton_key TEXT,
             singleton_generation INTEGER CHECK (singleton_generation IS NULL OR singleton_generation > 0),
             PRIMARY KEY (workspace_id, allocation_key),
@@ -810,7 +807,7 @@ CREATE TABLE worker_singleton_owners (
         );
 CREATE TABLE worker_diagnostics_archives (
         operation_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL,
-        worker_id TEXT NOT NULL, policy_id TEXT NOT NULL, policy_revision INTEGER NOT NULL,
+        worker_id TEXT NOT NULL, policy_id TEXT NOT NULL, policy_digest TEXT NOT NULL,
         committed_at TEXT NOT NULL, expires_at TEXT NOT NULL,
         FOREIGN KEY(operation_id) REFERENCES worker_removal_operations(operation_id),
         FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE);
@@ -846,7 +843,7 @@ CREATE TABLE backend_jobs (
             workspace_id TEXT NOT NULL,
             job_id TEXT NOT NULL,
             purpose TEXT NOT NULL,
-            input_revision TEXT NOT NULL,
+            input_digest TEXT NOT NULL,
             input_ref TEXT NOT NULL,
             resource_key TEXT,
             request_json TEXT NOT NULL,
@@ -874,7 +871,7 @@ CREATE TABLE backend_job_attempts (
             job_id TEXT NOT NULL,
             attempt_id TEXT NOT NULL,
             attempt INTEGER NOT NULL CHECK (attempt > 0 AND attempt <= 3),
-            input_revision TEXT NOT NULL,
+            input_digest TEXT NOT NULL,
             state TEXT NOT NULL CHECK (state IN ('reserved', 'dispatching', 'dispatched', 'completed', 'failed', 'unknown')),
             runtime_id TEXT,
             worker_id TEXT,
@@ -955,8 +952,8 @@ CREATE TABLE worker_registry_projection_diagnostics (
 CREATE TABLE worker_removal_operations (
         operation_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL UNIQUE, input_fingerprint TEXT NOT NULL,
         workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL, worker_id TEXT NOT NULL,
-        worker_revision TEXT NOT NULL,
-        policy_id TEXT NOT NULL, policy_revision INTEGER NOT NULL,
+        worker_updated_at TEXT NOT NULL,
+        policy_id TEXT NOT NULL, policy_digest TEXT NOT NULL,
         session_disposition TEXT NOT NULL, metadata_disposition TEXT NOT NULL,
         archive_retention_kind TEXT NOT NULL, archive_retention_seconds INTEGER,
         diagnostics_disposition TEXT NOT NULL,
@@ -972,7 +969,7 @@ CREATE TABLE worker_retention_audit_events (
 CREATE TABLE worker_session_archives (
         archive_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL, worker_id TEXT NOT NULL,
         session_id TEXT NOT NULL, checksum_sha256 TEXT NOT NULL, content_bytes INTEGER NOT NULL,
-        policy_id TEXT NOT NULL, policy_revision INTEGER NOT NULL, operation_id TEXT NOT NULL UNIQUE,
+        policy_id TEXT NOT NULL, policy_digest TEXT NOT NULL, operation_id TEXT NOT NULL UNIQUE,
         committed_at TEXT NOT NULL, expires_at TEXT,
         FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
         FOREIGN KEY(operation_id) REFERENCES worker_removal_operations(operation_id));
@@ -990,7 +987,7 @@ CREATE INDEX worker_session_archive_observe_grants_controller
 CREATE TABLE worker_tombstones (
         workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL, worker_id TEXT NOT NULL,
         display_name TEXT NOT NULL, profile TEXT, worker_created_at TEXT NOT NULL, removed_at TEXT NOT NULL,
-        archive_id TEXT, policy_id TEXT NOT NULL, policy_revision INTEGER NOT NULL, operation_id TEXT NOT NULL UNIQUE,
+        archive_id TEXT, policy_id TEXT NOT NULL, policy_digest TEXT NOT NULL, operation_id TEXT NOT NULL UNIQUE,
         PRIMARY KEY(workspace_id,runtime_id,worker_id),
         FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
         FOREIGN KEY(archive_id) REFERENCES worker_session_archives(archive_id),
@@ -1027,21 +1024,19 @@ CREATE TABLE workspace_config_entries (
             PRIMARY KEY (workspace_id, path),
             FOREIGN KEY (workspace_id) REFERENCES workspace_config_trees(workspace_id) ON DELETE CASCADE
         );
-CREATE TABLE workspace_config_tree_revisions (
+CREATE TABLE workspace_config_tree_history (
             workspace_id TEXT NOT NULL,
-            revision INTEGER NOT NULL,
-            tree_digest TEXT NOT NULL,
+            content_digest TEXT NOT NULL,
             toolchain_fingerprint TEXT NOT NULL,
             projection_digest TEXT NOT NULL,
             manifest_json TEXT NOT NULL,
             created_at TEXT NOT NULL, schema_bundle_json TEXT NOT NULL DEFAULT '{"contributions":[],"source":"{}","fingerprint":""}',
-            PRIMARY KEY (workspace_id, revision),
+            PRIMARY KEY (workspace_id, content_digest, toolchain_fingerprint, projection_digest),
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
         );
 CREATE TABLE workspace_config_trees (
             workspace_id TEXT PRIMARY KEY,
-            revision INTEGER NOT NULL CHECK (revision >= 0),
-            tree_digest TEXT NOT NULL,
+            content_digest TEXT NOT NULL,
             schema_version INTEGER NOT NULL,
             entrypoints_json TEXT NOT NULL,
             decodal_version TEXT NOT NULL,
@@ -1065,7 +1060,6 @@ CREATE TABLE workspace_signing_identities (
             public_key TEXT,
             public_key_fingerprint TEXT,
             private_material_ref TEXT NOT NULL UNIQUE,
-            revision INTEGER NOT NULL CHECK (revision >= 1),
             state TEXT NOT NULL CHECK (state IN ('pending_provisioning', 'active')),
             created_at TEXT NOT NULL,
             provisioned_at TEXT,
@@ -1084,7 +1078,6 @@ CREATE TABLE workspace_signing_identity_provisioning_operations (
             workspace_id TEXT NOT NULL UNIQUE,
             key_id TEXT NOT NULL UNIQUE,
             private_material_ref TEXT NOT NULL UNIQUE,
-            revision INTEGER NOT NULL CHECK (revision >= 1),
             actor_account_id TEXT NOT NULL,
             state TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
             created_at TEXT NOT NULL,
@@ -1095,7 +1088,6 @@ CREATE TABLE workspace_signing_identity_audit (
             workspace_id TEXT NOT NULL,
             key_id TEXT NOT NULL,
             action TEXT NOT NULL CHECK (action IN ('provisioned')),
-            revision INTEGER NOT NULL CHECK (revision >= 1),
             public_key_fingerprint TEXT NOT NULL,
             actor_account_id TEXT NOT NULL,
             created_at TEXT NOT NULL,
@@ -1111,7 +1103,6 @@ CREATE TABLE workspace_memory_documents (
 );
 CREATE TABLE workspace_memory_settings (
             workspace_id TEXT PRIMARY KEY NOT NULL,
-            settings_revision INTEGER NOT NULL CHECK(settings_revision >= 1),
             language TEXT NOT NULL CHECK(length(trim(language)) > 0),
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -1137,18 +1128,18 @@ CREATE TABLE "workspace_resource_keys" (
     FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
 );
 CREATE TABLE workspace_worker_retention_policies (
-        workspace_id TEXT PRIMARY KEY, policy_id TEXT NOT NULL, revision INTEGER NOT NULL, updated_at TEXT NOT NULL,
-        FOREIGN KEY(workspace_id,policy_id,revision) REFERENCES workspace_worker_retention_policy_revisions(workspace_id,policy_id,revision),
+        workspace_id TEXT PRIMARY KEY, policy_id TEXT NOT NULL, policy_digest TEXT NOT NULL, updated_at TEXT NOT NULL,
+        FOREIGN KEY(workspace_id,policy_id,policy_digest) REFERENCES workspace_worker_retention_policy_snapshots(workspace_id,policy_id,policy_digest),
         FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE);
-CREATE TABLE workspace_worker_retention_policy_revisions (
-        workspace_id TEXT NOT NULL, policy_id TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>0),
+CREATE TABLE workspace_worker_retention_policy_snapshots (
+        workspace_id TEXT NOT NULL, policy_id TEXT NOT NULL, policy_digest TEXT NOT NULL CHECK(length(policy_digest)>0),
         session_disposition TEXT NOT NULL CHECK(session_disposition IN ('archive','purge')),
         metadata_disposition TEXT NOT NULL CHECK(metadata_disposition IN ('tombstone','purge')),
         archive_retention_kind TEXT NOT NULL CHECK(archive_retention_kind IN ('forever','for_seconds')),
         archive_retention_seconds INTEGER,
         diagnostics_disposition TEXT NOT NULL CHECK(diagnostics_disposition IN ('purge','retain')),
         diagnostics_retention_seconds INTEGER, created_at TEXT NOT NULL,
-        PRIMARY KEY(workspace_id,policy_id,revision),
+        PRIMARY KEY(workspace_id,policy_id,policy_digest),
         FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE);
 CREATE TABLE "workspaces" (
             workspace_id TEXT PRIMARY KEY,
@@ -1252,8 +1243,8 @@ CREATE TABLE runtime_removal_operations (
     workspace_id TEXT NOT NULL,
     runtime_id TEXT NOT NULL,
     request_fingerprint TEXT NOT NULL,
-    expected_binding_revision INTEGER NOT NULL,
-    config_revision INTEGER NOT NULL,
+    expected_binding_id TEXT NOT NULL CHECK(length(expected_binding_id)>0),
+    config_digest TEXT NOT NULL CHECK(length(config_digest)>0),
     state TEXT NOT NULL CHECK (state IN ('pending', 'cleanup_pending', 'succeeded', 'failed')),
     failure_category TEXT,
     binding_removed INTEGER NOT NULL CHECK (binding_removed IN (0, 1)),
@@ -1446,7 +1437,7 @@ CREATE TABLE workspace_deletion_operations (
     request_fingerprint TEXT NOT NULL,
     workspace_id TEXT NOT NULL,
     workspace_display_name TEXT NOT NULL,
-    workspace_revision TEXT NOT NULL,
+    workspace_updated_at TEXT NOT NULL,
     owner_account_id TEXT NOT NULL,
     actor_account_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('queued', 'running', 'blocked', 'failed', 'succeeded')),
@@ -1464,11 +1455,11 @@ CREATE INDEX workspace_deletion_operations_workspace_recent
     ON workspace_deletion_operations(workspace_id, created_at DESC);
 
 CREATE TRIGGER seed_worker_retention_policy_after_workspace_insert AFTER INSERT ON workspaces BEGIN
-        INSERT INTO workspace_worker_retention_policy_revisions
-          (workspace_id,policy_id,revision,session_disposition,metadata_disposition,archive_retention_kind,archive_retention_seconds,diagnostics_disposition,diagnostics_retention_seconds,created_at)
-          VALUES(NEW.workspace_id,'workspace-default-conservative',1,'archive','tombstone','forever',NULL,'purge',NULL,NEW.created_at);
-        INSERT INTO workspace_worker_retention_policies(workspace_id,policy_id,revision,updated_at)
-          VALUES(NEW.workspace_id,'workspace-default-conservative',1,NEW.created_at);
+        INSERT INTO workspace_worker_retention_policy_snapshots
+          (workspace_id,policy_id,policy_digest,session_disposition,metadata_disposition,archive_retention_kind,archive_retention_seconds,diagnostics_disposition,diagnostics_retention_seconds,created_at)
+          VALUES(NEW.workspace_id,'workspace-default-conservative','sha256:30d45d5d58a10dadf95c3bf831e589ea10c81dc76da9575bfd9fb13942b3d198','archive','tombstone','forever',NULL,'purge',NULL,NEW.created_at);
+        INSERT INTO workspace_worker_retention_policies(workspace_id,policy_id,policy_digest,updated_at)
+          VALUES(NEW.workspace_id,'workspace-default-conservative','sha256:30d45d5d58a10dadf95c3bf831e589ea10c81dc76da9575bfd9fb13942b3d198',NEW.created_at);
       END;
 CREATE TRIGGER ticket_assignment_operations_validate_insert
         BEFORE INSERT ON ticket_assignment_operations
@@ -1654,3 +1645,47 @@ CREATE TRIGGER workspace_drive_grants_worker_deleted BEFORE DELETE ON worker_reg
     WHERE workspace_id=OLD.workspace_id AND runtime_id=OLD.runtime_id
       AND worker_id=OLD.worker_id AND revoked=0;
 END;
+-- Frozen evidence only. Neither table is a key, lease, or mutation authority.
+CREATE TABLE workdir_create_legacy_ssh_archives (
+    workspace_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    operation_json TEXT NOT NULL CHECK (json_valid(operation_json)),
+    candidates_json TEXT NOT NULL CHECK (json_valid(candidates_json)),
+    PRIMARY KEY (workspace_id, operation_id),
+    FOREIGN KEY (workspace_id, operation_id)
+        REFERENCES workdir_create_operations(workspace_id, operation_id) ON DELETE CASCADE
+);
+CREATE TRIGGER workdir_create_legacy_archive_cannot_authorize_update
+BEFORE UPDATE ON workdir_create_operations FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM workdir_create_legacy_ssh_archives a
+    WHERE a.workspace_id=OLD.workspace_id AND a.operation_id=OLD.operation_id)
+AND (NEW.state <> 'succeeded' OR NEW.credential_id IS NOT NULL
+    OR NEW.credential_fingerprint IS NOT NULL OR NEW.host_trust_id IS NOT NULL
+    OR NEW.host_trust_fingerprint IS NOT NULL OR NEW.repository_access_mode IS NOT NULL)
+BEGIN SELECT RAISE(ABORT, 'archived_workdir_create_cannot_authorize'); END;
+CREATE TRIGGER workdir_create_legacy_archive_blocks_candidates
+BEFORE INSERT ON workdir_create_credential_candidates FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM workdir_create_legacy_ssh_archives a
+    WHERE a.workspace_id=NEW.workspace_id AND a.operation_id=NEW.operation_id)
+BEGIN SELECT RAISE(ABORT, 'archived_workdir_create_cannot_authorize'); END;
+CREATE TRIGGER workdir_create_legacy_archive_blocks_candidate_updates
+BEFORE UPDATE ON workdir_create_credential_candidates FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM workdir_create_legacy_ssh_archives a
+    WHERE a.workspace_id=NEW.workspace_id AND a.operation_id=NEW.operation_id)
+BEGIN SELECT RAISE(ABORT, 'archived_workdir_create_cannot_authorize'); END;
+CREATE TABLE repository_secret_legacy_receipts (
+    workspace_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    resource_kind TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    result_revision INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    mutation_kind TEXT,
+    expected_revision INTEGER,
+    expected_operation_id TEXT,
+    expected_key_fingerprint TEXT,
+    PRIMARY KEY (workspace_id, operation_id),
+    FOREIGN KEY (workspace_id, operation_id)
+        REFERENCES repository_secret_operations(workspace_id, operation_id) ON DELETE CASCADE
+);

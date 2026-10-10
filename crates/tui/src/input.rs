@@ -11,6 +11,14 @@
 //! back to their original captured content so the Worker sees the full
 //! pasted text (without the placeholder label).
 
+use std::{
+    cell::RefCell,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
@@ -281,9 +289,19 @@ struct SelectedInvocation {
     invocation_id: String,
 }
 
+/// A pending completion is cancelled by the first subsequent input/cursor edit.
+/// Returning to identical text does not revive that request.
+#[derive(Debug, Clone)]
+pub(crate) struct CompletionInputWatch(Arc<AtomicBool>);
+
+impl CompletionInputWatch {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 pub struct InputBuffer {
-    /// Monotonic semantic edit/cursor revision, including ABA changes.
-    revision: u64,
+    pending_completion: RefCell<Option<Arc<AtomicBool>>>,
     atoms: Vec<Atom>,
     selected_invocations: Vec<SelectedInvocation>,
     removed_attachment_stages: Vec<String>,
@@ -300,7 +318,7 @@ pub struct InputBuffer {
 impl Default for InputBuffer {
     fn default() -> Self {
         Self {
-            revision: 0,
+            pending_completion: RefCell::new(None),
             atoms: Vec::new(),
             selected_invocations: Vec::new(),
             removed_attachment_stages: Vec::new(),
@@ -312,13 +330,25 @@ impl Default for InputBuffer {
     }
 }
 
+impl Drop for InputBuffer {
+    fn drop(&mut self) {
+        self.cancel_completion_on_edit();
+    }
+}
+
 impl InputBuffer {
-    pub fn revision(&self) -> u64 {
-        self.revision
+    pub(crate) fn watch_completion_input(&self) -> CompletionInputWatch {
+        CompletionInputWatch(Arc::clone(
+            self.pending_completion
+                .borrow_mut()
+                .get_or_insert_with(|| Arc::new(AtomicBool::new(false))),
+        ))
     }
 
-    fn bump_revision(&mut self) {
-        self.revision = self.revision.wrapping_add(1);
+    fn cancel_completion_on_edit(&mut self) {
+        if let Some(pending) = self.pending_completion.get_mut().take() {
+            pending.store(true, Ordering::Relaxed);
+        }
     }
 
     pub fn new() -> Self {
@@ -326,7 +356,7 @@ impl InputBuffer {
     }
 
     pub fn clear(&mut self) {
-        self.bump_revision();
+        self.cancel_completion_on_edit();
         self.selected_invocations.clear();
         self.atoms.clear();
         self.cursor = 0;
@@ -349,7 +379,7 @@ impl InputBuffer {
     /// by [`submit_segments`](Self::submit_segments), preserving typed chips
     /// and placing the cursor at the end of the restored input.
     pub fn replace_with_segments(&mut self, segments: &[protocol::Segment]) {
-        self.bump_revision();
+        self.cancel_completion_on_edit();
         self.selected_invocations.clear();
         self.atoms.clear();
         for segment in segments {
@@ -400,7 +430,7 @@ impl InputBuffer {
     }
 
     pub fn insert_char(&mut self, c: char) {
-        self.bump_revision();
+        self.cancel_completion_on_edit();
         self.adjust_selection(self.cursor, self.cursor, 1);
         self.atoms.insert(self.cursor, Atom::Char(c));
         self.cursor += 1;
@@ -445,7 +475,7 @@ impl InputBuffer {
     }
 
     pub fn insert_paste(&mut self, content: String) {
-        self.bump_revision();
+        self.cancel_completion_on_edit();
         let measurement = measure_paste(&content);
         if measurement.presentation() == PastePresentation::Text {
             self.insert_str(&content);
@@ -469,7 +499,7 @@ impl InputBuffer {
 
     #[cfg(test)]
     pub fn insert_uploaded_file(&mut self, file: protocol::UploadedFileRef) {
-        self.bump_revision();
+        self.cancel_completion_on_edit();
         self.adjust_selection(self.cursor, self.cursor, 1);
         self.atoms.insert(self.cursor, Atom::UploadedFile(file));
         self.cursor += 1;
@@ -493,7 +523,7 @@ impl InputBuffer {
         start: usize,
         descriptor: protocol::FeatureInvocationDescriptor,
     ) {
-        self.bump_revision();
+        self.cancel_completion_on_edit();
         self.selected_invocations
             .retain(|selection| selection.start != start);
         self.selected_invocations.push(SelectedInvocation {
@@ -508,7 +538,7 @@ impl InputBuffer {
     }
 
     pub fn retry_attachment_stage(&mut self, id: &str) {
-        self.bump_revision();
+        self.cancel_completion_on_edit();
         for atom in &mut self.atoms {
             if let Atom::AttachmentStage {
                 id: stage_id,
@@ -563,7 +593,7 @@ impl InputBuffer {
     }
 
     fn replace_atoms(&mut self, start: usize, end: usize, atoms: Vec<Atom>) {
-        self.bump_revision();
+        self.cancel_completion_on_edit();
         let inserted = atoms.len();
         self.adjust_selection(start, end, inserted);
         let removed = self.atoms.splice(start..end, atoms).collect::<Vec<_>>();
@@ -669,7 +699,7 @@ impl InputBuffer {
         id: &str,
         file: Option<protocol::UploadedFileRef>,
     ) -> bool {
-        self.bump_revision();
+        self.cancel_completion_on_edit();
         let Some(index) = self.atoms.iter().position(
             |atom| matches!(atom, Atom::AttachmentStage { id: stage_id, .. } if stage_id == id),
         ) else {
@@ -965,12 +995,12 @@ impl InputBuffer {
     }
 
     pub fn move_left(&mut self) {
-        self.bump_revision();
+        self.cancel_completion_on_edit();
         self.cursor = self.cursor.saturating_sub(1);
     }
 
     pub fn move_right(&mut self) {
-        self.bump_revision();
+        self.cancel_completion_on_edit();
         self.cursor = (self.cursor + 1).min(self.atoms.len());
     }
 
@@ -978,7 +1008,7 @@ impl InputBuffer {
     /// atoms sharing the same [`AtomClass`] — so `Word(Hiragana)` next to
     /// `Word(Han)` are separate blocks, and a `Paste` atom is its own block.
     pub fn move_word_left(&mut self) {
-        self.bump_revision();
+        self.cancel_completion_on_edit();
         while self.cursor > 0 && atom_class(&self.atoms[self.cursor - 1]) == AtomClass::Sep {
             self.cursor -= 1;
         }
@@ -993,7 +1023,7 @@ impl InputBuffer {
 
     /// Move forward by one word. Mirror of [`move_word_left`].
     pub fn move_word_right(&mut self) {
-        self.bump_revision();
+        self.cancel_completion_on_edit();
         while self.cursor < self.atoms.len()
             && atom_class(&self.atoms[self.cursor]) == AtomClass::Sep
         {
@@ -1009,7 +1039,7 @@ impl InputBuffer {
     }
 
     pub fn move_start(&mut self) {
-        self.bump_revision();
+        self.cancel_completion_on_edit();
         self.cursor = 0;
     }
 
@@ -1058,13 +1088,13 @@ impl InputBuffer {
     }
 
     pub fn move_home(&mut self) {
-        self.bump_revision();
+        self.cancel_completion_on_edit();
         let (ranges, line, _) = self.logical_line_and_col();
         self.cursor = ranges[line].0;
     }
 
     pub fn move_end(&mut self) {
-        self.bump_revision();
+        self.cancel_completion_on_edit();
         let (ranges, line, _) = self.logical_line_and_col();
         self.cursor = ranges[line].1;
     }
@@ -1072,7 +1102,7 @@ impl InputBuffer {
     /// Move one logical line up, preserving column (atom count from
     /// current line start). No-op if already on the first line.
     pub fn move_up(&mut self) {
-        self.bump_revision();
+        self.cancel_completion_on_edit();
         let (ranges, line, col) = self.logical_line_and_col();
         if line == 0 {
             return;
@@ -1083,7 +1113,7 @@ impl InputBuffer {
 
     /// Move one logical line down, preserving column.
     pub fn move_down(&mut self) {
-        self.bump_revision();
+        self.cancel_completion_on_edit();
         let (ranges, line, col) = self.logical_line_and_col();
         let Some(&(start, end)) = ranges.get(line + 1) else {
             return;

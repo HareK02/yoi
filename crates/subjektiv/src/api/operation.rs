@@ -28,14 +28,13 @@ pub fn execute(
                 .map_err(subjektiv_store_error)?;
             Response::ResidentContext(server_api::SubjektivResidentContextOutput {
                 behavior_md: resident.subject.behavior_md,
-                behavior_revision: resident.subject.behavior_revision,
                 memory_surface: resident_summary_output(resident.surface),
             })
         }
         Op::Query(input) => Response::Query(subjektiv_memory_query(store, subject_id, input)?),
         Op::Read(input) => Response::Read(subjektiv_memory_read(store, subject_id, input)?),
-        Op::ListRevisions(input) => {
-            Response::ListRevisions(subjektiv_memory_list_revisions(store, subject_id, input)?)
+        Op::ListChanges(input) => {
+            Response::ListChanges(subjektiv_memory_list_changes(store, subject_id, input)?)
         }
         Op::ValidateProposal(input) => {
             context.body()?;
@@ -169,7 +168,7 @@ pub fn execute(
             if resident.availability == crate::SurfaceAvailability::Ready {
                 response.current_snapshot_id = resident
                     .snapshot
-                    .filter(|s| s.built_from_store_revision == response.store_revision)
+                    .filter(|s| s.built_from_memory_fingerprint == response.memory_fingerprint)
                     .map(|s| s.id);
             }
             Response::SurfacePrepared(response)
@@ -194,9 +193,9 @@ pub fn execute(
                     memory_refs: point
                         .memory_refs
                         .into_iter()
-                        .map(|r| crate::MemoryRevisionRef {
+                        .map(|r| crate::MemoryChangeRef {
                             memory_id: r.memory_id,
-                            revision: r.revision,
+                            change_id: r.change_id,
                         })
                         .collect(),
                 })
@@ -206,7 +205,7 @@ pub fn execute(
                 .map_err(subjektiv_store_error)?;
             Response::SurfacePublished(server_api::SubjektivSurfacePublishResponse {
                 snapshot_id: snapshot.id,
-                built_from_store_revision: snapshot.built_from_store_revision,
+                built_from_memory_fingerprint: snapshot.built_from_memory_fingerprint,
                 empty: snapshot.body_md.is_empty(),
             })
         }
@@ -222,7 +221,7 @@ pub fn execute(
                     )
                     .map_err(subjektiv_store_error)?;
             }
-            let revision = store
+            let memory_fingerprint = store
                 .fail_surface_generation(subject_id, &input.generation_id, &input.reason_code)
                 .map_err(subjektiv_store_error)?;
             let status = if let Some(job) = job {
@@ -230,7 +229,7 @@ pub fn execute(
                     .validate_job_surface_outcome(
                         subject_id,
                         &input.generation_id,
-                        revision,
+                        memory_fingerprint.clone(),
                         "failed",
                         None,
                         Some(&input.reason_code),
@@ -247,7 +246,7 @@ pub fn execute(
                 "failed"
             };
             Response::SurfaceFailed(server_api::SubjektivSurfaceFailureResponse {
-                store_revision: revision,
+                memory_fingerprint,
                 status: status.into(),
             })
         }

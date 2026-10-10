@@ -138,10 +138,11 @@ describe("shared catalog observation refresh", () => {
       latest = state
     );
     mock.handlers.onFrame(snapshot());
-    const before = latest.observationVersion;
+    const before = latest.catalogRequest;
     const old = pending.at(-1)!;
     mock.handlers.onFrame(snapshot("idle", "generation-2"));
-    expect(latest.observationVersion).toBeGreaterThan(before);
+    expect(latest.catalogRequest).not.toBe(before);
+    expect(before?.aborted).toBe(true);
     expect(latest.workers[0].lifecycleState).toBe("idle");
     pending.at(-1)!(response("idle", "generation-2"));
     await settle();
@@ -163,9 +164,10 @@ describe("shared catalog observation refresh", () => {
     );
     mock.handlers.onFrame(snapshot());
     await settle();
-    const before = latest.observationVersion;
+    const before = latest.catalogRequest;
     await refreshWorkspaceWorkers("team");
-    expect(latest.observationVersion).toBeGreaterThan(before);
+    expect(latest.catalogRequest).not.toBe(before);
+    expect(before?.aborted).toBe(true);
     expect(fetchMock.mock.calls.every(([url]) => !url.endsWith("/restore")))
       .toBe(true);
   });

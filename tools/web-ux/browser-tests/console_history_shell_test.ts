@@ -501,12 +501,16 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
       });
       assert(centering <= 1, `turn marker is not vertically centered (${centering}px)`);
       assertEquals(await transcript.getByText("searched 1 time・ran 1 command", { exact: true }).count(), 12);
-      await page.getByRole("button", { name: "Normal", exact: true }).click();
+      const overview = page.getByRole("switch", { name: "Overview", exact: true });
+      assertEquals(await overview.getAttribute("aria-checked"), "true");
+      await overview.click();
+      assertEquals(await overview.getAttribute("aria-checked"), "false");
       const rowIds = await transcript.locator("[data-console-line-id]").evaluateAll((rows) =>
         rows.map((row) => row.getAttribute("data-console-line-id")));
       assertEquals(rowIds.length, 48);
       assertEquals(new Set(rowIds).size, rowIds.length);
-      await page.getByRole("button", { name: "Overview", exact: true }).click();
+      await overview.click();
+      assertEquals(await overview.getAttribute("aria-checked"), "true");
       assertEquals(await transcript.getByText("searched 1 time・ran 1 command", { exact: true }).count(), 12);
       const sidebar = page.locator(".sidebar-frame");
       const settleSidebar = () => sidebar.evaluate(async (element) => {

@@ -99,7 +99,6 @@ fn same_snapshot(
 ) -> Result<(), WipOperationError> {
     if snapshot.connection_id != other.connection_id
         || snapshot.validator != other.validator
-        || snapshot.revision != other.revision
         || snapshot.digest != other.digest
         || snapshot.entrypoints != other.entrypoints
     {
@@ -504,7 +503,7 @@ impl ConfigHandler {
                 "Workspace config text exceeds limit",
             ));
         }
-        // Resolve canonical per-file preconditions at the SAME captured tree revision.
+        // Resolve canonical per-file preconditions at the SAME captured tree content.
         let metadata = observe(
             &self.backend,
             &self.attachment.connection_id,
@@ -716,7 +715,6 @@ impl ConfigHandler {
                     connection_id: self.attachment.connection_id.clone(),
                     validator: self.snapshot.validator.clone(),
                     request: ConfigCommitRequest {
-                        base_revision: self.snapshot.revision,
                         base_digest: self.snapshot.digest.clone(),
                         changes,
                         entrypoints: self.snapshot.entrypoints.clone(),
@@ -735,10 +733,7 @@ impl ConfigHandler {
         )
         .await
         .map_err(|_| unknown())?;
-        if updated.revision != result.revision
-            || updated.digest != result.digest
-            || updated.validator != result.validator
-        {
+        if updated.digest != result.digest || updated.validator != result.validator {
             return Err(unknown());
         }
         let node = updated
@@ -746,7 +741,7 @@ impl ConfigHandler {
             .iter()
             .find(|n| n.path == self.node.path)
             .ok_or_else(unknown)?;
-        let value = json_to_wip(&json!({"revision": result.revision, "digest": result.digest,
+        let value = json_to_wip(&json!({"digest": result.digest,
             "activation": "Saved to canonical Workspace configuration; existing Worker manifests are not rewritten"})).map_err(|_| unknown())?;
         Ok(WipOperationOutput::native_with_validator(
             value,

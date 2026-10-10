@@ -58,8 +58,8 @@ test("A late image decode error cannot replace the newly selected image preview"
   expect(revoke).toHaveBeenCalledWith("blob:http://localhost/image-1");
 });
 
-test("Refreshing metadata never silently rebases an open rename form onto another writer revision", async () => {
-  let revision = "1";
+test("Refreshing metadata never silently rebases an open rename form onto another writer’s saved content", async () => {
+  let last_mutation_id = "1";
   const mutations: DriveMutationRequest[] = [];
   vi.stubGlobal(
     "fetch",
@@ -71,7 +71,7 @@ test("Refreshing metadata never silently rebases an open rename form onto anothe
         return Response.json({
           code: "conflict",
           classification: "not_committed",
-          message: "Revision conflict",
+          message: "Content changed",
         }, { status: 409 });
       }
       if (url.pathname.endsWith("/list")) {
@@ -79,7 +79,7 @@ test("Refreshing metadata never silently rebases an open rename form onto anothe
       }
       if (url.pathname.endsWith("/read-text")) {
         return Response.json({
-          entry: entry("2", "alpha", revision),
+          entry: entry("2", "alpha", last_mutation_id),
           text: "new",
           truncated: false,
         });
@@ -88,7 +88,7 @@ test("Refreshing metadata never silently rebases an open rename form onto anothe
         entry(
           id,
           "alpha",
-          id === "1" ? "1" : revision,
+          id === "1" ? "1" : last_mutation_id,
           id === "1" ? "folder" : "file",
         ),
       );
@@ -102,7 +102,7 @@ test("Refreshing metadata never silently rebases an open rename form onto anothe
   await fireEvent.input(view.getByLabelText("Name"), {
     target: { value: "my-name.txt" },
   });
-  revision = "2";
+  last_mutation_id = "2";
   await fireEvent.click(
     view.getByRole("button", { name: "Refresh" }),
   );
@@ -113,14 +113,14 @@ test("Refreshing metadata never silently rebases an open rename form onto anothe
       ),
     ).toBe(false)
   );
-  expect(view.container.textContent).toContain("Expected revision 1.");
+  expect(view.container.textContent).toContain("Changes by another writer will not be overwritten.");
   await fireEvent.click(
     view.getByRole("button", { name: "Apply rename / move" }),
   );
   await waitFor(() => expect(mutations).toHaveLength(1));
   expect(mutations[0].mutation).toMatchObject({
     operation: "relocate",
-    expected_revision: "1",
+    expected_mutation_id: "1",
     name: "my-name.txt",
     id: { workspace_id: "alpha", node_id: "2" },
   });
@@ -147,7 +147,7 @@ test("Folder picker blocks failed reads, filters files and self, and follows pag
         return Response.json({
           code: "conflict",
           classification: "not_committed",
-          message: "Revision conflict",
+          message: "Content changed",
         }, { status: 409 });
       }
       if (url.pathname.endsWith("/list")) {
@@ -209,7 +209,7 @@ test("Folder picker blocks failed reads, filters files and self, and follows pag
   await waitFor(() => expect(mutations).toHaveLength(1));
   expect(mutations[0].mutation).toMatchObject({
     operation: "relocate",
-    expected_revision: "7",
+    expected_mutation_id: "7",
     id: { workspace_id: "alpha", node_id: "2" },
     parent: { workspace_id: "alpha", node_id: "5" },
   });

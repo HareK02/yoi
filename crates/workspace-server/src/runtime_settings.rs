@@ -24,7 +24,6 @@ impl WorkspaceConfigSchemaProvider for RuntimeConfigSchemaProvider {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfigProjection {
-    pub config_revision: u64,
     pub projection_digest: String,
     pub default_runtime_id: Option<String>,
 }
@@ -52,7 +51,6 @@ pub fn project_runtime_from_workspace_config(
         .any(|entry| entry.provider_id == "builtin:runtime");
     if !has_runtime_schema {
         return Ok(RuntimeConfigProjection {
-            config_revision: state.snapshot.revision,
             projection_digest: state.projection_digest.clone(),
             default_runtime_id: None,
         });
@@ -71,7 +69,6 @@ pub fn project_runtime_from_workspace_config(
         .map_err(|error| Error::RegistryInconsistency(error.to_string()))?;
     let default_runtime_id = normalize_runtime_id(&config.runtime.default_runtime_id)?;
     Ok(RuntimeConfigProjection {
-        config_revision: state.snapshot.revision,
         projection_digest: evaluation.projection_digest,
         default_runtime_id,
     })
@@ -103,15 +100,12 @@ mod tests {
                 .contribution()
                 .unwrap()])
             .unwrap();
-        let snapshot = ConfigTreeSnapshot::from_entries(
-            7,
-            [ConfigEntry::new(
-                VirtualPath::parse("main.dcdl").unwrap(),
-                ConfigContentType::Decodal,
-                source,
-            )
-            .unwrap()],
+        let snapshot = ConfigTreeSnapshot::from_entries([ConfigEntry::new(
+            VirtualPath::parse("main.dcdl").unwrap(),
+            ConfigContentType::Decodal,
+            source,
         )
+        .unwrap()])
         .unwrap();
         let contract = config_source::ToolchainContract::with_schema_bundle(
             config_source::DEFAULT_SCHEMA_VERSION,
@@ -131,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_projection_reads_default_and_preserves_revision_evidence() {
+    fn runtime_projection_reads_default_and_preserves_content_evidence() {
         let projection = project_runtime_from_workspace_config(
             "workspace",
             &state(
@@ -140,8 +134,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(projection.default_runtime_id.as_deref(), Some("arcadia"));
-        assert_eq!(projection.config_revision, 7);
         assert!(!projection.projection_digest.is_empty());
+    }
+
+    #[test]
+    fn runtime_projection_digest_tracks_content_not_observation_order() {
+        let first =
+            state(r#"{ runtime = { default_runtime_id = "arcadia"; }; } as WorkspaceConfigSchema"#);
+        let same =
+            state(r#"{ runtime = { default_runtime_id = "arcadia"; }; } as WorkspaceConfigSchema"#);
+        let changed =
+            state(r#"{ runtime = { default_runtime_id = "other"; }; } as WorkspaceConfigSchema"#);
+        let first_projection = project_runtime_from_workspace_config("workspace", &first).unwrap();
+        assert_eq!(
+            first_projection,
+            project_runtime_from_workspace_config("workspace", &same).unwrap()
+        );
+        let changed_projection =
+            project_runtime_from_workspace_config("workspace", &changed).unwrap();
+        assert_ne!(
+            first_projection.projection_digest,
+            changed_projection.projection_digest
+        );
+        assert_eq!(
+            changed_projection.default_runtime_id.as_deref(),
+            Some("other")
+        );
+        assert_eq!(
+            first_projection,
+            project_runtime_from_workspace_config("workspace", &first).unwrap()
+        );
+    }
+
+    #[test]
+    fn runtime_projection_rejects_mismatched_content_evidence() {
+        let mut active = state("{} as WorkspaceConfigSchema");
+        active.projection_digest = "sha256:tampered".to_string();
+        assert!(matches!(
+            project_runtime_from_workspace_config("workspace", &active),
+            Err(Error::RegistryInconsistency(_))
+        ));
     }
 
     #[test]
@@ -165,15 +197,12 @@ mod tests {
             )
             .unwrap()])
             .unwrap();
-        let snapshot = ConfigTreeSnapshot::from_entries(
-            6,
-            [ConfigEntry::new(
-                VirtualPath::parse("main.dcdl").unwrap(),
-                ConfigContentType::Decodal,
-                "{ legacy = { enabled = true; }; } as WorkspaceConfigSchema",
-            )
-            .unwrap()],
+        let snapshot = ConfigTreeSnapshot::from_entries([ConfigEntry::new(
+            VirtualPath::parse("main.dcdl").unwrap(),
+            ConfigContentType::Decodal,
+            "{ legacy = { enabled = true; }; } as WorkspaceConfigSchema",
         )
+        .unwrap()])
         .unwrap();
         let contract = config_source::ToolchainContract::with_schema_bundle(
             config_source::DEFAULT_SCHEMA_VERSION,
@@ -193,7 +222,6 @@ mod tests {
 
         let projection = project_runtime_from_workspace_config("workspace", &state).unwrap();
         assert_eq!(projection.default_runtime_id, None);
-        assert_eq!(projection.config_revision, 6);
         assert_eq!(projection.projection_digest, projection_digest);
     }
 
@@ -204,15 +232,12 @@ mod tests {
                 .contribution()
                 .unwrap()])
             .unwrap();
-        let snapshot = ConfigTreeSnapshot::from_entries(
-            1,
-            [ConfigEntry::new(
-                VirtualPath::parse("main.dcdl").unwrap(),
-                ConfigContentType::Decodal,
-                "{ runtime = { default_runtime_id = 42; }; } as WorkspaceConfigSchema",
-            )
-            .unwrap()],
+        let snapshot = ConfigTreeSnapshot::from_entries([ConfigEntry::new(
+            VirtualPath::parse("main.dcdl").unwrap(),
+            ConfigContentType::Decodal,
+            "{ runtime = { default_runtime_id = 42; }; } as WorkspaceConfigSchema",
         )
+        .unwrap()])
         .unwrap();
         let contract = config_source::ToolchainContract::with_schema_bundle(
             config_source::DEFAULT_SCHEMA_VERSION,

@@ -3,4 +3,4 @@ import type { ConfigDiagnosticLabel } from "./ConfigDiagnosticLabel";
 import type { ConfigSpan } from "./ConfigSpan";
 import type { VirtualPath } from "./VirtualPath";
 
-export type ConfigDiagnostic = { path: VirtualPath, revision: number, tree_digest: string, kind: string, span: ConfigSpan, message: string, labels: Array<ConfigDiagnosticLabel>, notes: Array<string>, };
+export type ConfigDiagnostic = { path: VirtualPath, tree_digest: string, kind: string, span: ConfigSpan, message: string, labels: Array<ConfigDiagnosticLabel>, notes: Array<string>, };

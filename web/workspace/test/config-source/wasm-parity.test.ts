@@ -1,8 +1,11 @@
 /// <reference lib="deno.ns" />
 
-import { assertEquals } from "jsr:@std/assert";
+import { createHash } from "node:crypto";
+import { assertEquals, assertThrows } from "jsr:@std/assert";
 import init, {
   analyze_snapshot,
+  apply_changes,
+  changes_between,
   complete_current,
   compose_schema_bundle,
   evaluate_snapshot,
@@ -32,6 +35,23 @@ async function digestText(text: string): Promise<string> {
   }`;
 }
 
+
+function fixtureSnapshot(tree: Pick<ConfigTreeSnapshot, "entries">): ConfigTreeSnapshot {
+  const hash = createHash("sha256").update("yoi-config-tree-v1\0");
+  const entries: ConfigTreeSnapshot["entries"] = {};
+  for (const path of Object.keys(tree.entries).toSorted()) {
+    const entry = tree.entries[path];
+    entries[path] = {
+      ...entry,
+      content_digest: "sha256:" + createHash("sha256").update(entry.content).digest("hex"),
+    };
+    hash.update(path).update("\0")
+      .update(entry.content_type === "decodal" ? "text/x-decodal" : "text/plain")
+      .update("\0").update(entry.content).update("\0");
+  }
+  return { digest: "sha256:" + hash.digest("hex"), entries };
+}
+
 async function toolchainFingerprint(
   entrypoints: string[],
   schemaBundle: WorkspaceConfigSchemaBundle,
@@ -47,7 +67,6 @@ async function toolchainFingerprint(
 }
 
 const snapshot: ConfigTreeSnapshot = {
-  revision: 4,
   digest: "sha256:test-tree",
   entries: {
     "workspace.dcdl": {
@@ -88,15 +107,40 @@ const mainEntrypointContract: ToolchainContract = {
 };
 
 Deno.test("generated WASM evaluates the same virtual import contract", () => {
-  const result = evaluate_snapshot(snapshot, contract) as {
+  const result = evaluate_snapshot(fixtureSnapshot(snapshot), contract) as {
     projections: Array<{ data_json: { answer: number } }>;
   };
   assertEquals(result.projections[0].data_json, { answer: 42 });
 });
 
+Deno.test("generated WASM keeps literal paths matching old cache identities as relative import bases", async () => {
+  const source = "{}";
+  const literalPath = `a.dcdl@text/x-decodal@${await digestText(source)}`;
+  // Match the native fixture: even an unreferenced source must resolve its
+  // relative import from the literal path rather than another entry's cache ID.
+  const entries: ConfigTreeSnapshot["entries"] = {};
+  for (const [path, content] of [
+    ["main.dcdl", "{}"],
+    ["a.dcdl", source],
+    [literalPath, 'import "./shared.dcdl"'],
+    ["a.dcdl@text/shared.dcdl", "{ answer = 42; }"],
+  ]) {
+    entries[path] = {
+      path,
+      content_type: "decodal",
+      content,
+      content_digest: await digestText(content),
+    };
+  }
+  const result = evaluate_snapshot(
+    fixtureSnapshot({ entries }),
+    mainEntrypointContract,
+  ) as { projections: Array<{ data_json: unknown }> };
+  assertEquals(result.projections[0].data_json, {});
+});
+
 Deno.test("generated WASM accepts the mandatory main schema assertion", () => {
   const assertedSnapshot: ConfigTreeSnapshot = {
-    revision: 1,
     digest: "sha256:asserted-main",
     entries: {
       "main.dcdl": {
@@ -107,8 +151,7 @@ Deno.test("generated WASM accepts the mandatory main schema assertion", () => {
       },
     },
   };
-  const result = evaluate_snapshot(
-    assertedSnapshot,
+  const result = evaluate_snapshot(fixtureSnapshot(assertedSnapshot),
     mainEntrypointContract,
   ) as { projections: Array<{ data_json: { answer: number } }> };
 
@@ -116,19 +159,17 @@ Deno.test("generated WASM accepts the mandatory main schema assertion", () => {
 });
 
 Deno.test("generated WASM diagnostics carry snapshot provenance", () => {
-  const diagnostics = analyze_snapshot(
-    snapshot,
+  const diagnostics = analyze_snapshot(fixtureSnapshot(snapshot),
     "workspace.dcdl",
     "{ broken = ; }",
   ) as Array<{
     path: string;
-    revision: number;
     tree_digest: string;
     kind: string;
   }>;
   assertEquals(diagnostics[0].path, "workspace.dcdl");
-  assertEquals(diagnostics[0].revision, 4);
-  assertEquals(diagnostics[0].tree_digest, "sha256:test-tree");
+  assertEquals(diagnostics[0].tree_digest, fixtureSnapshot(snapshot).digest);
+  assertEquals("revision" in diagnostics[0], false);
   assertEquals(diagnostics[0].kind, "syntax");
 });
 
@@ -153,7 +194,6 @@ const schemaBundle = compose_schema_bundle([
 
 function schemaSnapshot(source: string): ConfigTreeSnapshot {
   return {
-    revision: 7,
     digest: "sha256:schema-tree",
     entries: {
       "main.dcdl": {
@@ -177,7 +217,6 @@ const schemaContract: ToolchainContract = {
 };
 
 const markdownSnapshot: ConfigTreeSnapshot = {
-  revision: 8,
   digest: "sha256:markdown-tree",
   entries: {
     "main.dcdl": {
@@ -203,7 +242,7 @@ const markdownContract: ToolchainContract = {
 };
 
 Deno.test("generated WASM evaluates Markdown with the shared Skill projection", () => {
-  const result = evaluate_snapshot(markdownSnapshot, markdownContract) as {
+  const result = evaluate_snapshot(fixtureSnapshot(markdownSnapshot), markdownContract) as {
     projections: Array<{ data_json: Record<string, unknown> }>;
   };
   assertEquals(result.projections[0].data_json, {
@@ -219,10 +258,9 @@ Deno.test("generated WASM evaluates Markdown with the shared Skill projection", 
 });
 
 Deno.test("generated WASM applies Decodal 0.4 typed maps and explicit object rest", () => {
-  const result = evaluate_snapshot(
-    schemaSnapshot(
+  const result = evaluate_snapshot(fixtureSnapshot(schemaSnapshot(
       "{ features = { console = { enabled = true; }; }; web = { enabled = true; extension_value = 42; }; }",
-    ),
+    )),
     schemaContract,
   ) as { projections: Array<{ data_json: Record<string, unknown> }> };
   assertEquals(result.projections[0].data_json, {
@@ -240,7 +278,7 @@ type ProjectedDiagnostic = {
 
 function evaluateFailure(source: string): ProjectedDiagnostic {
   try {
-    evaluate_snapshot(schemaSnapshot(source), schemaContract);
+    evaluate_snapshot(fixtureSnapshot(schemaSnapshot(source)), schemaContract);
   } catch (error) {
     const diagnostics = error as ProjectedDiagnostic[];
     assertEquals(Array.isArray(diagnostics), true);
@@ -274,7 +312,7 @@ Deno.test("generated WASM preserves native Decodal 0.4 diagnostic semantics", ()
 
 Deno.test("generated WASM returns completion items for the editor adapter", () => {
   const source = 'import "./"';
-  set_snapshot({
+  set_snapshot(fixtureSnapshot({
     ...snapshot,
     entries: {
       ...snapshot.entries,
@@ -283,7 +321,7 @@ Deno.test("generated WASM returns completion items for the editor adapter", () =
         content: source,
       },
     },
-  });
+  }));
   const result = complete_current(
     "workspace.dcdl",
     source,
@@ -301,7 +339,7 @@ Deno.test("generated WASM returns completion items for the editor adapter", () =
 
 Deno.test("generated WASM exposes read-only builtin completions without editable builtin entries", () => {
   const tree = schemaSnapshot("{}");
-  set_snapshot(tree);
+  set_snapshot(fixtureSnapshot(tree));
   set_schema_bundle(emptySchemaBundle);
   const source = 'let 名 = 1; import "$builtin/profiles/comp"';
   const result = complete_current(
@@ -320,8 +358,7 @@ Deno.test("generated WASM exposes read-only builtin completions without editable
   assertEquals(companion?.kind, "file");
   assertEquals(companion?.detail, "read-only builtin Decodal source");
   assertEquals(Object.keys(tree.entries), ["main.dcdl"]);
-  const evaluated = evaluate_snapshot(
-    schemaSnapshot('import "$builtin/profiles/companion.dcdl"'),
+  const evaluated = evaluate_snapshot(fixtureSnapshot(schemaSnapshot('import "$builtin/profiles/companion.dcdl"')),
     mainEntrypointContract,
   ) as {
     projections: Array<{ data_json: { slug: string } }>;
@@ -338,16 +375,14 @@ Deno.test("generated WASM rejects unknown builtin imports without same-suffix wo
     content_digest: "sha256:workspace-fallback",
   };
   set_schema_bundle(emptySchemaBundle);
-  const diagnostics = analyze_snapshot(tree, "main.dcdl", undefined) as Array<{
+  const diagnostics = analyze_snapshot(fixtureSnapshot(tree), "main.dcdl", undefined) as Array<{
     path: string;
-    revision: number;
     tree_digest: string;
     message: string;
   }>;
   assertEquals(diagnostics.length > 0, true);
   assertEquals(diagnostics[0].path, "main.dcdl");
-  assertEquals(diagnostics[0].revision, tree.revision);
-  assertEquals(diagnostics[0].tree_digest, tree.digest);
+  assertEquals(diagnostics[0].tree_digest, fixtureSnapshot(tree).digest);
   assertEquals(
     diagnostics[0].message.includes(
       "unknown or non-public read-only builtin source",
@@ -360,7 +395,7 @@ Deno.test("generated WASM rejects unknown builtin imports without same-suffix wo
   );
   let failed = false;
   try {
-    evaluate_snapshot(tree, mainEntrypointContract);
+    evaluate_snapshot(fixtureSnapshot(tree), mainEntrypointContract);
   } catch (error) {
     failed = true;
     assertEquals(
@@ -372,26 +407,24 @@ Deno.test("generated WASM rejects unknown builtin imports without same-suffix wo
   }
   assertEquals(failed, true);
   assertEquals(
-    analyze_snapshot(tree, "main.dcdl", 'import "./profiles/missing.dcdl"'),
+    analyze_snapshot(fixtureSnapshot(tree), "main.dcdl", 'import "./profiles/missing.dcdl"'),
     [],
   );
 });
 
 function importFailure(tree: ConfigTreeSnapshot): ProjectedDiagnostic[] {
   try {
-    evaluate_snapshot(tree, mainEntrypointContract);
+    evaluate_snapshot(fixtureSnapshot(tree), mainEntrypointContract);
   } catch (error) {
     // A WASM trap/stack overflow must not count as a structured import failure.
     assertEquals(Array.isArray(error), true);
     const diagnostics = error as Array<
       ProjectedDiagnostic & {
-        revision: number;
         tree_digest: string;
       }
     >;
     assertEquals(diagnostics.length > 0, true);
-    assertEquals(diagnostics[0].revision, tree.revision);
-    assertEquals(diagnostics[0].tree_digest, tree.digest);
+    assertEquals(diagnostics[0].tree_digest, fixtureSnapshot(tree).digest);
     return diagnostics;
   }
   throw new Error("expected a structured import diagnostic");
@@ -427,7 +460,7 @@ Deno.test("generated WASM enforces the import depth budget on a real 33-deep cha
     return tree;
   }
   // The synthetic evaluation-wrapper import consumes one of the 32 edges.
-  const accepted = evaluate_snapshot(chain(31), mainEntrypointContract) as {
+  const accepted = evaluate_snapshot(fixtureSnapshot(chain(31)), mainEntrypointContract) as {
     projections: Array<{ data_json: { answer: number } }>;
   };
   assertEquals(accepted.projections[0].data_json, { answer: 42 });
@@ -447,7 +480,7 @@ Deno.test("generated WASM completes blank nested schema positions after Unicode"
   const source =
     '{ description = "日本語"; profile = {  }\n} as WorkspaceConfigSchema';
   const cursor = source.indexOf("{  }") + 2;
-  set_snapshot({
+  set_snapshot(fixtureSnapshot({
     ...snapshot,
     entries: {
       ...snapshot.entries,
@@ -456,7 +489,7 @@ Deno.test("generated WASM completes blank nested schema positions after Unicode"
         content: source,
       },
     },
-  });
+  }));
   set_schema_bundle({
     contributions: [],
     source: "{ profile = { default_profile = String; }; prompts = {}; }",
@@ -486,7 +519,7 @@ Deno.test("generated WASM completes asserted WorkspaceConfigSchema keys", () => 
   const bareSource = "{ pro }";
   const source = "{ pro } as WorkspaceConfigSchema";
   const cursor = source.indexOf("pro") + 3;
-  set_snapshot({
+  set_snapshot(fixtureSnapshot({
     ...snapshot,
     entries: {
       ...snapshot.entries,
@@ -495,7 +528,7 @@ Deno.test("generated WASM completes asserted WorkspaceConfigSchema keys", () => 
         content: source,
       },
     },
-  });
+  }));
   set_schema_bundle({
     contributions: [],
     source: "{ profile = { default_profile = String; }; prompts = {}; }",
@@ -566,7 +599,6 @@ Deno.test("generated WASM authors value-based Profiles using the Backend schema 
   const content =
     '{ profile = { entries = [{ selector = "project:alpha"; profile = {}; }]; }; } as WorkspaceConfigSchema';
   const tree: ConfigTreeSnapshot = {
-    revision: 8,
     digest: "sha256:value-profile-tree",
     entries: {
       "main.dcdl": {
@@ -583,9 +615,9 @@ Deno.test("generated WASM authors value-based Profiles using the Backend schema 
     schema_bundle: schema,
     fingerprint: await toolchainFingerprint(["main.dcdl"], schema),
   };
-  set_snapshot(tree);
+  set_snapshot(fixtureSnapshot(tree));
   set_schema_bundle(schema);
-  const evaluated = evaluate_snapshot(tree, valueContract) as {
+  const evaluated = evaluate_snapshot(fixtureSnapshot(tree), valueContract) as {
     projections: Array<
       { data_json: { profile: { entries: Array<{ profile: unknown }> } } }
     >;
@@ -648,13 +680,13 @@ Deno.test("generated WASM authors value-based Profiles using the Backend schema 
       `profile = ${value};`,
     );
     assertEquals(
-      analyze_snapshot(tree, "main.dcdl", partialContent),
+      analyze_snapshot(fixtureSnapshot(tree), "main.dcdl", partialContent),
       [],
       value,
     );
   }
   const recipe = "{ worker = { mode = 42; }; }";
-  const analysisTree = {
+  const analysisTree: ConfigTreeSnapshot = {
     ...tree,
     entries: {
       ...tree.entries,
@@ -685,13 +717,12 @@ Deno.test("generated WASM authors value-based Profiles using the Backend schema 
       "profile = {};",
       `profile = ${value};`,
     );
-    const diagnostics = analyze_snapshot(
-      analysisTree,
+    const diagnostics = analyze_snapshot(fixtureSnapshot(analysisTree),
       "main.dcdl",
       invalidContent,
     ) as Array<{
       path: string;
-      revision: number;
+      tree_digest: string;
       kind: string;
       span: { start_byte: number; end_byte: number };
       message: string;
@@ -702,7 +733,7 @@ Deno.test("generated WASM authors value-based Profiles using the Backend schema 
     assertEquals(diagnostics.length > 0, true, value);
     const diagnostic = diagnostics[0];
     assertEquals(diagnostic.path, expectedPath);
-    assertEquals(diagnostic.revision, tree.revision);
+    assertEquals(diagnostic.tree_digest, fixtureSnapshot(analysisTree).digest);
     assertEquals(
       ["constraint_violation", "type_mismatch"].includes(diagnostic.kind),
       true,
@@ -783,7 +814,7 @@ Deno.test("generated WASM authors value-based Profiles using the Backend schema 
         "profile = {};",
         `profile = ${form};`,
       );
-      const scopedTree = {
+      const scopedTree: ConfigTreeSnapshot = {
         ...tree,
         entries: {
           "main.dcdl": {
@@ -800,12 +831,11 @@ Deno.test("generated WASM authors value-based Profiles using the Backend schema 
         },
       };
       assertEquals(
-        analyze_snapshot(scopedTree, "main.dcdl", undefined),
+        analyze_snapshot(fixtureSnapshot(scopedTree), "main.dcdl", undefined),
         [],
         form,
       );
-      const result = evaluate_snapshot(
-        scopedTree,
+      const result = evaluate_snapshot(fixtureSnapshot(scopedTree),
         valueContract,
       ) as typeof evaluated;
       assertEquals(
@@ -839,7 +869,7 @@ Deno.test("generated WASM authors value-based Profiles using the Backend schema 
         "profile = {};",
         `profile = ${form};`,
       );
-      const fixtureTree = {
+      const fixtureTree: ConfigTreeSnapshot = {
         ...tree,
         entries: {
           "main.dcdl": {
@@ -856,12 +886,11 @@ Deno.test("generated WASM authors value-based Profiles using the Backend schema 
         },
       };
       assertEquals(
-        analyze_snapshot(fixtureTree, "main.dcdl", undefined),
+        analyze_snapshot(fixtureSnapshot(fixtureTree), "main.dcdl", undefined),
         [],
         `${fixture.name}: ${form}`,
       );
-      const result = evaluate_snapshot(
-        fixtureTree,
+      const result = evaluate_snapshot(fixtureSnapshot(fixtureTree),
         valueContract,
       ) as typeof evaluated;
       assertEquals(
@@ -896,5 +925,65 @@ Deno.test("generated WASM authors value-based Profiles using the Backend schema 
     );
   }
   // Neither completion nor diagnostic shape checking changes the saved value.
-  assertEquals(evaluate_snapshot(tree, valueContract), evaluated);
+  assertEquals(evaluate_snapshot(fixtureSnapshot(tree), valueContract), evaluated);
+});
+
+Deno.test("generated WASM returns to the same content digest and enforces entry digest CAS", () => {
+  const base = fixtureSnapshot(schemaSnapshot("{ answer = 1; }"));
+  set_schema_bundle(emptySchemaBundle);
+  set_snapshot(base);
+  const changed = apply_changes([{
+    kind: "update", path: "main.dcdl",
+    expected_digest: base.entries["main.dcdl"].content_digest,
+    content: "{ broken = ; }",
+  }]) as ConfigTreeSnapshot;
+  assertEquals(changed.digest === base.digest, false);
+  assertEquals("revision" in changed, false);
+  const diagnostics = analyze_snapshot(changed, "main.dcdl", undefined) as Array<{ tree_digest: string }>;
+  assertEquals(diagnostics.length > 0, true);
+  assertEquals(diagnostics.every((diagnostic) => diagnostic.tree_digest === changed.digest), true);
+  assertThrows(() => apply_changes([{
+    kind: "update", path: "main.dcdl",
+    expected_digest: base.entries["main.dcdl"].content_digest,
+    content: "{ answer = 2; }",
+  }]));
+  const restored = apply_changes(changes_between(changed, base)) as ConfigTreeSnapshot;
+  assertEquals(restored, base);
+  assertEquals(analyze_snapshot(restored, "main.dcdl", undefined), []);
+});
+
+Deno.test("generated WASM rejects cache URI paths in snapshot JSON despite valid content digests", async () => {
+  const source = "{}";
+  const cacheUri = `config-source://a.dcdl@text/x-decodal@${await digestText(source)}`;
+  // Both entry and tree digests are correct, so rejection must come from the
+  // untrusted VirtualPath boundary rather than a content-identity mismatch.
+  const snapshot = fixtureSnapshot({
+    entries: {
+      "a.dcdl": {
+        path: "a.dcdl",
+        content_type: "decodal",
+        content: source,
+        content_digest: await digestText(source),
+      },
+      [cacheUri]: {
+        path: cacheUri,
+        content_type: "decodal",
+        content: 'import "./shared.dcdl"',
+        content_digest: await digestText('import "./shared.dcdl"'),
+      },
+    },
+  });
+  const json = JSON.stringify(snapshot);
+  const rejection = assertThrows(() => set_snapshot(JSON.parse(json)));
+  assertEquals(String(rejection).includes("config-source://"), true);
+});
+
+Deno.test("generated WASM rejects forged content identity at the snapshot boundary", () => {
+  const base = fixtureSnapshot(schemaSnapshot("{}"));
+  for (const forged of [
+    { ...base, digest: "sha256:forged" },
+    { ...base, entries: { "main.dcdl": { ...base.entries["main.dcdl"], content: "{ changed = true; }" } } },
+  ]) {
+    assertThrows(() => set_snapshot(forged));
+  }
 });

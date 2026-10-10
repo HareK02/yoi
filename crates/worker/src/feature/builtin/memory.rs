@@ -5,7 +5,6 @@
 //! workspace backend instead of resolving `.yoi/memory` from a Worker workdir.
 
 use crate::subjektiv::{SubjektivHostConnection, SubjektivHostError};
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::time::Duration;
@@ -335,21 +334,21 @@ fn subjektiv_consolidation_tools(host: SubjektivHostConnection) -> Vec<ToolDefin
     [
         (
             "SubjektivMemoryQuery",
-            "Search current Memory revisions for the delegated subject.",
+            "Search current Memory changes for the delegated subject.",
             schema_for::<server_api::SubjektivMemoryQueryRequest>(),
             Operation::Query,
         ),
         (
             "SubjektivMemoryRead",
-            "Read one current or historical Memory revision for the delegated subject.",
+            "Read one current or historical Memory change for the delegated subject.",
             schema_for::<server_api::SubjektivMemoryReadRequest>(),
             Operation::Read,
         ),
         (
-            "SubjektivMemoryListRevisions",
-            "List immutable revisions of one Memory for the delegated subject.",
-            schema_for::<server_api::SubjektivMemoryListRevisionsRequest>(),
-            Operation::ListRevisions,
+            "SubjektivMemoryListChanges",
+            "List immutable changes of one Memory for the delegated subject.",
+            schema_for::<server_api::SubjektivMemoryListChangesRequest>(),
+            Operation::ListChanges,
         ),
         (
             "MemoryStagingList",
@@ -359,13 +358,13 @@ fn subjektiv_consolidation_tools(host: SubjektivHostConnection) -> Vec<ToolDefin
         ),
         (
             "MemoryStagingRead",
-            "Read one pending candidate, including typed revision proposal metadata and provenance.",
+            "Read one pending candidate, including typed change proposal metadata and provenance.",
             schema_for::<server_api::SubjektivMemoryCandidateReadRequest>(),
             Operation::ReadCandidate,
         ),
         (
             "MemoryApplyCandidate",
-            "Atomically apply or reject one subject candidate. A request_id is idempotent; application revalidates exact revision proposal metadata and returns concrete affected revision refs.",
+            "Atomically apply or reject one subject candidate. A request_id is idempotent; application revalidates exact change proposal metadata and returns concrete affected change refs.",
             schema_for::<server_api::SubjektivMemoryCandidateDecisionRequest>(),
             Operation::DecideCandidate,
         ),
@@ -392,7 +391,7 @@ fn subjektiv_consolidation_tools(host: SubjektivHostConnection) -> Vec<ToolDefin
 enum SubjectConsolidationOperation {
     Query,
     Read,
-    ListRevisions,
+    ListChanges,
     ListCandidates,
     ReadCandidate,
     DecideCandidate,
@@ -418,8 +417,8 @@ impl Tool for SubjectConsolidationTool {
             Operation::Read => {
                 server_api::SubjektivMemoryBackendOperation::Read(parse_input(input_json)?)
             }
-            Operation::ListRevisions => {
-                server_api::SubjektivMemoryBackendOperation::ListRevisions(parse_input(input_json)?)
+            Operation::ListChanges => {
+                server_api::SubjektivMemoryBackendOperation::ListChanges(parse_input(input_json)?)
             }
             Operation::ListCandidates => {
                 server_api::SubjektivMemoryBackendOperation::ListCandidates(parse_input(
@@ -452,12 +451,12 @@ impl Tool for SubjectConsolidationTool {
             }
             server_api::SubjektivMemoryBackendResponse::Read(value) => {
                 format!(
-                    "Read Memory {} revision {}.",
-                    value.memory_id, value.revision
+                    "Read Memory {} change {}.",
+                    value.memory_id, value.change_id
                 )
             }
-            server_api::SubjektivMemoryBackendResponse::ListRevisions(value) => {
-                format!("Listed {} revision(s).", value.items.len())
+            server_api::SubjektivMemoryBackendResponse::ListChanges(value) => {
+                format!("Listed {} change(s).", value.items.len())
             }
             server_api::SubjektivMemoryBackendResponse::Candidates(value) => {
                 format!("Listed {} pending candidate(s).", value.items.len())
@@ -640,8 +639,7 @@ struct WorkspaceResidentSummarySource {
 
 #[derive(Default)]
 struct SubjectBehaviorRefreshState {
-    applied: Option<(u64, String)>,
-    pending: HashMap<u64, String>,
+    applied: Option<String>,
 }
 
 struct WorkspaceSubjektivResidentSummarySource {
@@ -727,8 +725,7 @@ impl WorkspaceSubjektivResidentSummarySource {
             .behavior_state
             .lock()
             .expect("subject behavior state poisoned");
-        state.applied = Some((output.behavior_revision, output.behavior_md.clone()));
-        state.pending.remove(&output.behavior_revision);
+        state.applied = Some(output.behavior_md.clone());
     }
 }
 
@@ -769,33 +766,22 @@ impl SystemPromptContributionSource for WorkspaceSubjektivResidentSummarySource 
             .expect("subject behavior state poisoned")
             .applied
             .as_ref()
-            .is_none_or(|(revision, body)| {
-                *revision != output.behavior_revision || body != &output.behavior_md
-            });
+            .is_none_or(|body| body != &output.behavior_md);
         if !changed {
             return Ok(None);
         }
         let rendered = self.render(&output)?;
-        let revision = output.behavior_revision;
-        self.behavior_state
-            .lock()
-            .expect("subject behavior state poisoned")
-            .pending
-            .insert(revision, output.behavior_md);
         Ok(Some(ResidentContextRefresh {
             body: rendered,
-            revision,
+            behavior_md: output.behavior_md,
         }))
     }
 
-    fn confirm_resident_context_revision(&self, revision: u64) {
-        let mut state = self
-            .behavior_state
+    fn confirm_resident_context_behavior(&self, behavior_md: &str) {
+        self.behavior_state
             .lock()
-            .expect("subject behavior state poisoned");
-        if let Some(body) = state.pending.remove(&revision) {
-            state.applied = Some((revision, body));
-        }
+            .expect("subject behavior state poisoned")
+            .applied = Some(behavior_md.to_owned());
     }
 
     fn invalidate_resident_context_representation(&self) {
@@ -942,7 +928,7 @@ impl Hook<PreLlmRequest> for SubjektivBehaviorRefreshHook {
                     "Subject behavior refresh requires durable session append authority",
                 )
             })?;
-            system_items.append_subject_behavior_refresh(refresh.body, refresh.revision);
+            system_items.append_subject_behavior_refresh(refresh.body, refresh.behavior_md);
         }
         Ok(HookPreRequestAction::Continue)
     }
@@ -971,7 +957,7 @@ impl Hook<WorkerRestored> for SubjektivResidentRestoreRefreshHook {
             body,
             session_store::PromptRenderProvenance {
                 workspace_id: self.workspace_id.clone(),
-                config_revision: projection.config_revision,
+
                 source_digest: projection.source_digest.clone(),
                 projection_digest: projection.catalog_digest.clone(),
                 logical_name: WorkerPrompt::ResidentMemoryRestoreSection.key().to_string(),
@@ -1270,7 +1256,7 @@ mod tests {
         availability: memory::backend::MemoryResidentSummaryAvailability,
         content: Option<String>,
         scope_allowed: bool,
-        behavior: Mutex<(u64, String)>,
+        behavior: Mutex<String>,
         paths: Mutex<Vec<String>>,
         timeouts: Mutex<Vec<Duration>>,
     }
@@ -1284,7 +1270,7 @@ mod tests {
                 availability,
                 content: content.map(str::to_string),
                 scope_allowed: true,
-                behavior: Mutex::new((3, "Be deliberate.".to_string())),
+                behavior: Mutex::new("Be deliberate.".to_string()),
                 paths: Mutex::new(Vec::new()),
                 timeouts: Mutex::new(Vec::new()),
             }
@@ -1295,7 +1281,7 @@ mod tests {
                 availability: memory::backend::MemoryResidentSummaryAvailability::Ready,
                 content: Some("must not be injected".into()),
                 scope_allowed: false,
-                behavior: Mutex::new((3, "must not be injected".to_string())),
+                behavior: Mutex::new("must not be injected".to_string()),
                 paths: Mutex::new(Vec::new()),
                 timeouts: Mutex::new(Vec::new()),
             }
@@ -1333,14 +1319,13 @@ mod tests {
                     body: "subject scope unavailable".into(),
                 });
             }
-            let (behavior_revision, behavior_md) = self.behavior.lock().unwrap().clone();
+            let behavior_md = self.behavior.lock().unwrap().clone();
             Ok(WorkspaceResponse {
                 status: 200,
                 body: serde_json::to_string(
                     &server_api::SubjektivMemoryBackendResponse::ResidentContext(
                         server_api::SubjektivResidentContextOutput {
                             behavior_md,
-                            behavior_revision,
                             memory_surface: memory::backend::MemoryResidentSummaryOutput {
                                 availability: self.availability,
                                 content: self.content.clone(),
@@ -1483,7 +1468,7 @@ mod tests {
         enabled
             .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "workspace".to_string(),
-                settings_revision: 1,
+
                 language: "English".to_string(),
             })
             .unwrap();
@@ -1543,7 +1528,7 @@ mod tests {
             .subjektiv
             .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "workspace".into(),
-                settings_revision: 1,
+
                 language: "English".into(),
             })
             .unwrap();
@@ -1586,7 +1571,7 @@ mod tests {
         config
             .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "workspace".to_string(),
-                settings_revision: 1,
+
                 language: "English".to_string(),
             })
             .unwrap();
@@ -1643,7 +1628,7 @@ permission = "write"
             .subjektiv
             .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: workspace_id.to_string(),
-                settings_revision: 1,
+
                 language: "English".to_string(),
             })
             .unwrap();
@@ -1712,7 +1697,7 @@ permission = "write"
     }
 
     #[tokio::test]
-    async fn subject_resident_source_emits_only_changed_behavior_revisions() {
+    async fn subject_resident_source_emits_only_changed_behavior() {
         let manifest = subject_manifest("workspace");
         let client = Arc::new(SubjectResidentClient::new(
             memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
@@ -1732,15 +1717,15 @@ permission = "write"
                 .is_none()
         );
 
-        *client.behavior.lock().unwrap() = (4, "Ask when uncertain.".to_string());
+        *client.behavior.lock().unwrap() = "Ask when uncertain.".to_string();
         let refresh = source
             .load_changed_resident_context()
             .await
             .unwrap()
             .expect("changed behavior must produce one refresh");
-        assert_eq!(refresh.revision, 4);
+        assert_eq!(refresh.behavior_md, "Ask when uncertain.");
         assert!(refresh.body.contains("Ask when uncertain."));
-        source.confirm_resident_context_revision(refresh.revision);
+        source.confirm_resident_context_behavior(&refresh.behavior_md);
         assert!(
             source
                 .load_changed_resident_context()
@@ -1749,15 +1734,15 @@ permission = "write"
                 .is_none()
         );
 
-        *client.behavior.lock().unwrap() = (5, String::new());
+        *client.behavior.lock().unwrap() = String::new();
         let cleared = source
             .load_changed_resident_context()
             .await
             .unwrap()
             .expect("cleared behavior must produce one refresh");
-        assert_eq!(cleared.revision, 5);
+        assert_eq!(cleared.behavior_md, "");
         assert!(cleared.body.contains("No user-managed behavior is set"));
-        source.confirm_resident_context_revision(cleared.revision);
+        source.confirm_resident_context_behavior(&cleared.behavior_md);
         assert!(
             source
                 .load_changed_resident_context()
@@ -1772,7 +1757,7 @@ permission = "write"
             .await
             .unwrap()
             .expect("history rewrite must require a durable current representation");
-        assert_eq!(replay_after_rewrite.revision, 5);
+        assert_eq!(replay_after_rewrite.behavior_md, "");
         assert!(
             replay_after_rewrite
                 .body
@@ -1783,6 +1768,63 @@ permission = "write"
         assert_eq!(
             client.timeouts.lock().unwrap().as_slice(),
             &[RESIDENT_SUMMARY_REQUEST_TIMEOUT; 7]
+        );
+    }
+
+    #[tokio::test]
+    async fn resident_behavior_ack_tracks_exact_committed_content_not_latest_fetch() {
+        let manifest = subject_manifest("workspace");
+        let client = Arc::new(SubjectResidentClient::new(
+            memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
+            None,
+        ));
+        let source = backend_resident_source(&manifest, client.clone(), test_prompts())
+            .unwrap()
+            .unwrap();
+        source.load().await;
+        *client.behavior.lock().unwrap() = "first behavior".into();
+        let first = source
+            .load_changed_resident_context()
+            .await
+            .unwrap()
+            .unwrap();
+        let retry = source
+            .load_changed_resident_context()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry, first); // Fetch alone never acknowledges model representation.
+        *client.behavior.lock().unwrap() = "second behavior".into();
+        let second = source
+            .load_changed_resident_context()
+            .await
+            .unwrap()
+            .unwrap();
+        source.confirm_resident_context_behavior(&first.behavior_md);
+        assert_eq!(
+            source
+                .load_changed_resident_context()
+                .await
+                .unwrap()
+                .unwrap(),
+            second
+        );
+        source.confirm_resident_context_behavior(&second.behavior_md);
+        assert!(
+            source
+                .load_changed_resident_context()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        source.invalidate_resident_context_representation();
+        assert_eq!(
+            source
+                .load_changed_resident_context()
+                .await
+                .unwrap()
+                .unwrap(),
+            second
         );
     }
 
@@ -2001,14 +2043,14 @@ permission = "write"
                 "MemoryApplyCandidate",
                 "MemoryStagingList",
                 "MemoryStagingRead",
-                "SubjektivMemoryListRevisions",
+                "SubjektivMemoryListChanges",
                 "SubjektivMemoryQuery",
                 "SubjektivMemoryRead",
             ]
         );
         let decision = tool_meta(tools, "MemoryApplyCandidate").to_string();
         assert!(decision.contains("request_id"));
-        assert!(decision.contains("expected_revision"));
+        assert!(decision.contains("expected_change_id"));
         assert!(decision.contains("already_covered"));
         assert!(!decision.contains("subject_id"));
         assert!(!decision.contains("workspace_id"));

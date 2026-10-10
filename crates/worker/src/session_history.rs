@@ -153,7 +153,7 @@ mod tests {
                 WorkerHistoryProvenance::FlowInstruction {
                     selector: "builtin:coder-review".to_string(),
                     definition_id: "coder-review".to_string(),
-                    definition_revision: 7,
+                    definition_digest: Some("sha256:flow-source".into()),
                     instance_id: "flow-instance".to_string(),
                     state_id: "implement".to_string(),
                 },

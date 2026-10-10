@@ -3662,7 +3662,7 @@ mod tests {
             LoggedSessionHistoryOrigin::FlowInstruction {
                 selector: "builtin:coder-review".into(),
                 definition_id: "flow-definition".into(),
-                definition_revision: 7,
+                definition_digest: Some("sha256:flow-source".into()),
                 instance_id: "flow-instance".into(),
                 state_id: "implement".into(),
             },
@@ -3695,7 +3695,7 @@ mod tests {
                                 origin: LoggedSessionHistoryOrigin::FlowInstruction {
                                     selector: "builtin:coder-review".into(),
                                     definition_id: "flow-definition".into(),
-                                    definition_revision: 7,
+                                    definition_digest: Some("sha256:flow-source".into()),
                                     instance_id: "flow-instance".into(),
                                     state_id: "implement".into(),
                                 },

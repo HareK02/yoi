@@ -1,8 +1,8 @@
-//! Host-scoped model tools for revisioned subjektiv Memory.
+//! Host-scoped model tools for change-identified subjektiv Memory.
 //!
-//! Confirmed Memory is read-only here. Explicit remembering and revision requests
+//! Confirmed Memory is read-only here. Explicit remembering and change requests
 //! become immutable staging candidates; T-670 remains the only authority that may
-//! adopt a candidate as a confirmed revision.
+//! adopt a candidate as a confirmed change.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -13,10 +13,9 @@ use memory::extract::CandidateKind;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use server_api::{
-    SubjektivMemoryBackendOperation, SubjektivMemoryBackendResponse,
-    SubjektivMemoryListRevisionsRequest, SubjektivMemoryQueryRequest, SubjektivMemoryReadRequest,
-    SubjektivMemoryReceiptStatus, SubjektivMemoryReceiptStatusRequest,
-    SubjektivMemoryRevisionIntent, SubjektivMemoryRevisionProposal,
+    SubjektivMemoryBackendOperation, SubjektivMemoryBackendResponse, SubjektivMemoryChangeIntent,
+    SubjektivMemoryChangeProposal, SubjektivMemoryListChangesRequest, SubjektivMemoryQueryRequest,
+    SubjektivMemoryReadRequest, SubjektivMemoryReceiptStatus, SubjektivMemoryReceiptStatusRequest,
     SubjektivMemoryStageExplicitRequest, SubjektivMemoryStageExplicitResponse,
     SubjektivMemoryValidateProposalRequest,
 };
@@ -41,19 +40,19 @@ use server_api::SubjektivMemoryBackendRequest;
 
 const QUERY_TOOL: &str = "SubjektivMemoryQuery";
 const READ_TOOL: &str = "SubjektivMemoryRead";
-const LIST_REVISIONS_TOOL: &str = "SubjektivMemoryListRevisions";
+const LIST_CHANGES_TOOL: &str = "SubjektivMemoryListChanges";
 const REMEMBER_TOOL: &str = "SubjektivMemoryRemember";
-const PROPOSE_REVISION_TOOL: &str = "SubjektivMemoryProposeRevision";
+const PROPOSE_CHANGE_TOOL: &str = "SubjektivMemoryProposeChange";
 const COMMIT_HOOK: &str = "stage-explicit-memory-after-commit";
 const RETRY_HOOK: &str = "retry-committed-explicit-memory";
 const REWRITE_HOOK: &str = "flush-explicit-memory-before-rewrite";
 const MAX_EVIDENCE_REFS: usize = 10;
 
-const QUERY_DESCRIPTION: &str = "Search the connected subject's current Memory revisions. Omitted states means active only; results are bounded and cursors are bound to the subject, filters, order, and store snapshot.";
-const READ_DESCRIPTION: &str = "Read one current or immutable historical Memory revision for the connected subject, with line- and byte-bounded Markdown plus paged provenance anchors. Continue partial reads using the returned exact revision, line offset, and byte offset.";
-const LIST_REVISIONS_DESCRIPTION: &str = "List immutable revisions of one connected-subject Memory in descending revision order using snapshot-bound pagination.";
+const QUERY_DESCRIPTION: &str = "Search the connected subject's current Memory changes. Omitted states means active only; results are bounded and cursors are bound to the subject, filters, order, and store snapshot.";
+const READ_DESCRIPTION: &str = "Read one current or immutable historical Memory change for the connected subject, with line- and byte-bounded Markdown plus paged provenance anchors. Continue partial reads using the returned exact change, line offset, and byte offset.";
+const LIST_CHANGES_DESCRIPTION: &str = "List immutable changes of one connected-subject Memory in newest-first change order using snapshot-bound pagination.";
 const REMEMBER_DESCRIPTION: &str = "Explicitly stage a new Memory candidate for the connected subject. This never writes confirmed Memory. With no entry_refs, the committed tool call itself becomes model-origin evidence after the run commits and status is pending_commit.";
-const PROPOSE_DESCRIPTION: &str = "Stage a typed correction, resolution, retraction, or reopen proposal for an exact current Memory revision. This validates optimistic concurrency now but never creates a confirmed revision.";
+const PROPOSE_DESCRIPTION: &str = "Stage a typed correction, resolution, retraction, or reopen proposal for an exact current Memory change. This validates optimistic concurrency now but never creates a confirmed change.";
 
 #[derive(Clone)]
 pub(crate) struct SubjektivMemoryFeature {
@@ -73,7 +72,7 @@ struct PendingExplicit {
     claim: String,
     why_useful: String,
     staleness: Option<String>,
-    proposal: Option<SubjektivMemoryRevisionProposal>,
+    proposal: Option<SubjektivMemoryChangeProposal>,
 }
 
 impl SubjektivMemoryFeature {
@@ -102,12 +101,12 @@ impl FeatureModule for SubjektivMemoryFeature {
             .with_tool(ToolDeclaration::new(QUERY_TOOL, QUERY_DESCRIPTION))
             .with_tool(ToolDeclaration::new(READ_TOOL, READ_DESCRIPTION))
             .with_tool(ToolDeclaration::new(
-                LIST_REVISIONS_TOOL,
-                LIST_REVISIONS_DESCRIPTION,
+                LIST_CHANGES_TOOL,
+                LIST_CHANGES_DESCRIPTION,
             ))
             .with_tool(ToolDeclaration::new(REMEMBER_TOOL, REMEMBER_DESCRIPTION))
             .with_tool(ToolDeclaration::new(
-                PROPOSE_REVISION_TOOL,
+                PROPOSE_CHANGE_TOOL,
                 PROPOSE_DESCRIPTION,
             ))
             .with_hook(HookDeclaration::new(
@@ -129,9 +128,9 @@ impl FeatureModule for SubjektivMemoryFeature {
             (QUERY_TOOL, QUERY_DESCRIPTION, ReadOperation::Query),
             (READ_TOOL, READ_DESCRIPTION, ReadOperation::Read),
             (
-                LIST_REVISIONS_TOOL,
-                LIST_REVISIONS_DESCRIPTION,
-                ReadOperation::ListRevisions,
+                LIST_CHANGES_TOOL,
+                LIST_CHANGES_DESCRIPTION,
+                ReadOperation::ListChanges,
             ),
         ] {
             context.tools().register(ToolContribution::new(
@@ -149,9 +148,9 @@ impl FeatureModule for SubjektivMemoryFeature {
             ),
         ))?;
         context.tools().register(ToolContribution::new(
-            PROPOSE_REVISION_TOOL,
+            PROPOSE_CHANGE_TOOL,
             explicit_tool_definition(
-                PROPOSE_REVISION_TOOL,
+                PROPOSE_CHANGE_TOOL,
                 PROPOSE_DESCRIPTION,
                 self.state.clone(),
                 ExplicitOperation::Propose,
@@ -184,7 +183,7 @@ impl FeatureModule for SubjektivMemoryFeature {
 enum ReadOperation {
     Query,
     Read,
-    ListRevisions,
+    ListChanges,
 }
 
 fn read_tool_definition(
@@ -197,7 +196,7 @@ fn read_tool_definition(
         let schema = match operation {
             ReadOperation::Query => schema_for::<SubjektivMemoryQueryRequest>(),
             ReadOperation::Read => schema_for::<SubjektivMemoryReadRequest>(),
-            ReadOperation::ListRevisions => schema_for::<SubjektivMemoryListRevisionsRequest>(),
+            ReadOperation::ListChanges => schema_for::<SubjektivMemoryListChangesRequest>(),
         };
         let tool: Arc<dyn Tool> = Arc::new(SubjektivReadTool {
             state: state.clone(),
@@ -231,10 +230,9 @@ impl Tool for SubjektivReadTool {
             ReadOperation::Read => {
                 SubjektivMemoryBackendOperation::Read(parse(input_json, READ_TOOL)?)
             }
-            ReadOperation::ListRevisions => SubjektivMemoryBackendOperation::ListRevisions(parse(
-                input_json,
-                LIST_REVISIONS_TOOL,
-            )?),
+            ReadOperation::ListChanges => {
+                SubjektivMemoryBackendOperation::ListChanges(parse(input_json, LIST_CHANGES_TOOL)?)
+            }
         };
         let response = match self.state.execute(operation) {
             Ok(response) => response,
@@ -247,14 +245,14 @@ impl Tool for SubjektivReadTool {
             ),
             SubjektivMemoryBackendResponse::Read(value) => (
                 format!(
-                    "Read Memory {} revision {}.",
-                    value.memory_id, value.revision
+                    "Read Memory {} change {}.",
+                    value.memory_id, value.change_id
                 ),
                 serde_json::to_value(value),
             ),
-            SubjektivMemoryBackendResponse::ListRevisions(value) => (
+            SubjektivMemoryBackendResponse::ListChanges(value) => (
                 format!(
-                    "Listed {} revision(s) for Memory {}.",
+                    "Listed {} change(s) for Memory {}.",
                     value.items.len(),
                     value.memory_id
                 ),
@@ -296,7 +294,7 @@ fn explicit_tool_definition(
     Arc::new(move || {
         let schema = match operation {
             ExplicitOperation::Remember => schema_for::<RememberParams>(),
-            ExplicitOperation::Propose => schema_for::<ProposeRevisionParams>(),
+            ExplicitOperation::Propose => schema_for::<ProposeChangeParams>(),
         };
         let tool: Arc<dyn Tool> = Arc::new(SubjektivExplicitTool {
             state: state.clone(),
@@ -325,11 +323,11 @@ struct RememberParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct ProposeRevisionParams {
+struct ProposeChangeParams {
     memory_id: String,
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    expected_revision: u64,
-    intent: SubjektivMemoryRevisionIntent,
+    #[schemars(length(min = 1))]
+    expected_change_id: String,
+    intent: SubjektivMemoryChangeIntent,
     claim: String,
     why_useful: String,
     change_reason: String,
@@ -371,10 +369,10 @@ impl Tool for SubjektivExplicitTool {
                 )
             }
             ExplicitOperation::Propose => {
-                let params: ProposeRevisionParams = parse(input_json, PROPOSE_REVISION_TOOL)?;
-                if params.expected_revision == 0 {
+                let params: ProposeChangeParams = parse(input_json, PROPOSE_CHANGE_TOOL)?;
+                if params.expected_change_id.trim().is_empty() {
                     return Err(ToolError::InvalidArgument(
-                        "expected_revision must be a positive integer".into(),
+                        "expected_change_id must not be empty".into(),
                     ));
                 }
                 let validation =
@@ -383,7 +381,7 @@ impl Tool for SubjektivExplicitTool {
                         .execute(SubjektivMemoryBackendOperation::ValidateProposal(
                             SubjektivMemoryValidateProposalRequest {
                                 memory_id: params.memory_id.clone(),
-                                expected_revision: params.expected_revision,
+                                expected_change_id: params.expected_change_id.clone(),
                                 intent: params.intent,
                             },
                         )) {
@@ -398,9 +396,9 @@ impl Tool for SubjektivExplicitTool {
                         )));
                     }
                 };
-                let proposal = SubjektivMemoryRevisionProposal {
+                let proposal = SubjektivMemoryChangeProposal {
                     memory_id: params.memory_id,
-                    expected_revision: params.expected_revision,
+                    expected_change_id: params.expected_change_id.clone(),
                     intent: params.intent,
                     change_reason: params.change_reason,
                 };
@@ -447,7 +445,7 @@ impl Tool for SubjektivExplicitTool {
                 "status": "pending_commit",
                 "target": proposal.as_ref().map(|value| serde_json::json!({
                     "memory_id": value.memory_id,
-                    "expected_revision": value.expected_revision,
+                    "expected_change_id": value.expected_change_id,
                 })),
                 "intent": proposal.as_ref().map(|value| value.intent),
                 "message": "Candidate is not confirmed Memory. It will be staged only after this tool call is durably committed; an uncommitted/cancelled operation is discarded.",
@@ -514,7 +512,7 @@ impl SubjektivMemoryState {
             let session_id = capture.session_id.clone();
             let view = SessionCapture::from_history_entries(capture.segment_id, capture.history);
             let committed = view
-                .committed_pending_tool_calls(&[REMEMBER_TOOL, PROPOSE_REVISION_TOOL])
+                .committed_pending_tool_calls(&[REMEMBER_TOOL, PROPOSE_CHANGE_TOOL])
                 .into_iter()
                 .any(|call| {
                     receipt_id(&session_id, &call.call_id)
@@ -537,7 +535,7 @@ impl SubjektivMemoryState {
         why_useful: String,
         staleness: Option<String>,
         entries: Vec<SessionEntryEvidence>,
-        proposal: Option<SubjektivMemoryRevisionProposal>,
+        proposal: Option<SubjektivMemoryChangeProposal>,
     ) -> Result<SubjektivMemoryStageExplicitResponse, ToolError> {
         if entries.is_empty() {
             return Err(ToolError::ExecutionFailed(
@@ -620,7 +618,7 @@ fn replay_pending_committed_memory_with_policy(
     let view =
         SessionCapture::from_history_entries(capture.segment_id.clone(), capture.history.clone());
     let mut failures = Vec::new();
-    for call in view.committed_pending_tool_calls(&[REMEMBER_TOOL, PROPOSE_REVISION_TOOL]) {
+    for call in view.committed_pending_tool_calls(&[REMEMBER_TOOL, PROPOSE_CHANGE_TOOL]) {
         let receipt_id = match receipt_id(&capture.session_id, &call.call_id) {
             Ok(value) => value,
             Err(error) => {
@@ -693,12 +691,12 @@ fn pending_from_committed_call(
                 None,
             )
         }
-        PROPOSE_REVISION_TOOL => {
-            let params: ProposeRevisionParams = parse(arguments, PROPOSE_REVISION_TOOL)?;
+        PROPOSE_CHANGE_TOOL => {
+            let params: ProposeChangeParams = parse(arguments, PROPOSE_CHANGE_TOOL)?;
             let response = state.execute(SubjektivMemoryBackendOperation::ValidateProposal(
                 SubjektivMemoryValidateProposalRequest {
                     memory_id: params.memory_id.clone(),
-                    expected_revision: params.expected_revision,
+                    expected_change_id: params.expected_change_id.clone(),
                     intent: params.intent,
                 },
             ))?;
@@ -716,9 +714,9 @@ fn pending_from_committed_call(
                 params.why_useful,
                 params.staleness,
                 params.entry_refs,
-                Some(SubjektivMemoryRevisionProposal {
+                Some(SubjektivMemoryChangeProposal {
                     memory_id: params.memory_id,
-                    expected_revision: params.expected_revision,
+                    expected_change_id: params.expected_change_id.clone(),
                     intent: params.intent,
                     change_reason: params.change_reason,
                 }),
@@ -1067,7 +1065,7 @@ mod tests {
             Ok(CommittedSessionCapture {
                 session_id: "session-1".into(),
                 segment_id: "segment-1".into(),
-                session_revision: 1,
+
                 entry_count: 0,
                 run_exit: CommittedRunExit::Finished,
                 history: Vec::new(),
@@ -1096,9 +1094,9 @@ mod tests {
             vec![
                 QUERY_TOOL,
                 READ_TOOL,
-                LIST_REVISIONS_TOOL,
+                LIST_CHANGES_TOOL,
                 REMEMBER_TOOL,
-                PROPOSE_REVISION_TOOL,
+                PROPOSE_CHANGE_TOOL,
             ]
         );
         assert_eq!(descriptor.hooks.len(), 3);
@@ -1128,11 +1126,11 @@ mod tests {
                 .any(|field| field == "entry_refs")
         );
 
-        let propose = schema_for::<ProposeRevisionParams>();
+        let propose = schema_for::<ProposeChangeParams>();
         let propose_text = serde_json::to_string(&propose).unwrap();
         assert!(!propose_text.contains("subject_id"));
         assert!(!propose_text.contains("\"kind\""));
-        assert!(propose_text.contains("expected_revision"));
+        assert!(propose_text.contains("expected_change_id"));
         assert!(propose_text.contains("change_reason"));
 
         let parsed: RememberParams = serde_json::from_str(
@@ -1152,7 +1150,7 @@ mod tests {
             worker_id: Some("w".repeat(64)),
             flow_selector: Some("f".repeat(64)),
             flow_definition_id: Some("d".repeat(64)),
-            flow_definition_revision: Some(1),
+            flow_definition_fingerprint: Some("fingerprint".into()),
         };
         let evidence = (0..MAX_EVIDENCE_REFS)
             .map(|index| memory::extract::StagingEvidence {
@@ -1178,8 +1176,8 @@ mod tests {
             .collect::<Vec<_>>();
         let response = server_api::SubjektivMemoryReadResponse {
             memory_id: "memory-1".into(),
-            revision: 1,
-            current_revision: 1,
+            change_id: "change-1".into(),
+            current_change_id: "change-1".into(),
             kind: CandidateKind::Lesson,
             state: server_api::SubjektivMemoryState::Active,
             claim: "Escape-aware read".into(),
@@ -1252,7 +1250,7 @@ mod tests {
 
     #[tokio::test]
     async fn backend_conflict_discriminants_survive_as_structured_tool_output() {
-        for code in ["revision_conflict", "stale_cursor"] {
+        for code in ["change_conflict", "stale_cursor"] {
             let tool = SubjektivReadTool {
                 state: SubjektivMemoryState {
                     host: crate::subjektiv::test_connection(Arc::new(ConflictWorkspaceClient(
@@ -1291,7 +1289,7 @@ mod tests {
             operation: ExplicitOperation::Remember,
         };
         let input =
-            r#"{"kind":"lesson","claim":"Use fixed revisions","why_useful":"Avoid mixed reads"}"#;
+            r#"{"kind":"lesson","claim":"Use fixed changes","why_useful":"Avoid mixed reads"}"#;
         let output = tool
             .execute(input, ToolExecutionContext::new("call-1", "batch-1", 0))
             .await
@@ -1321,7 +1319,7 @@ mod tests {
             Ok(CommittedSessionCapture {
                 session_id: "session-1".into(),
                 segment_id: "segment-1".into(),
-                session_revision: 1,
+
                 entry_count: 3,
                 run_exit: CommittedRunExit::Interrupted,
                 history: vec![
@@ -1380,7 +1378,7 @@ mod tests {
             Ok(CommittedSessionCapture {
                 session_id: "session-1".into(),
                 segment_id: "segment-1".into(),
-                session_revision: 2,
+
                 entry_count: 2,
                 run_exit: CommittedRunExit::Finished,
                 history: vec![
@@ -1457,7 +1455,7 @@ mod tests {
             Ok(CommittedSessionCapture {
                 session_id: "session-1".into(),
                 segment_id: "segment-1".into(),
-                session_revision: 2,
+
                 entry_count: 2,
                 run_exit: CommittedRunExit::Finished,
                 history: vec![

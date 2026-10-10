@@ -1,5 +1,5 @@
 import type { WorkingDirectorySummary } from "../sidebar/types.ts";
-import { formatCurrentWorkdirRevision } from "./workdir-revision.ts";
+import { formatCurrentWorkdirCheckout } from "./workdir-checkout.ts";
 
 declare const Deno: {
   test(name: string, fn: () => Promise<void> | void): void;
@@ -32,7 +32,7 @@ function workdir(
 
 Deno.test("Git detached Workdir shows only its current ref", () => {
   assertEquals(
-    formatCurrentWorkdirRevision(
+    formatCurrentWorkdirCheckout(
       workdir(null, "0123456789abcdef0123456789abcdef01234567"),
       "git",
     ),
@@ -42,7 +42,7 @@ Deno.test("Git detached Workdir shows only its current ref", () => {
 
 Deno.test("Git Workdir with a selector shows selector at current ref", () => {
   assertEquals(
-    formatCurrentWorkdirRevision(
+    formatCurrentWorkdirCheckout(
       workdir("feature/current", "fedcba9876543210fedcba9876543210fedcba98"),
       "git",
     ),
@@ -52,7 +52,7 @@ Deno.test("Git Workdir with a selector shows selector at current ref", () => {
 
 Deno.test("non-Git Workdir does not receive Git hash formatting", () => {
   assertEquals(
-    formatCurrentWorkdirRevision(
+    formatCurrentWorkdirCheckout(
       workdir("snapshot", "revision-value"),
       "archive",
     ),

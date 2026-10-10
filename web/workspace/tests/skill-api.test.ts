@@ -53,7 +53,6 @@ function workspaceProvenance() {
     kind: "workspace",
     id: "workspace:release",
     virtual_path: "skills/release/SKILL.md",
-    revision: 42,
     source_digest: "workspace-source-digest",
     tree_digest: "tree-digest",
   };
@@ -62,7 +61,7 @@ function workspaceProvenance() {
 function catalogFixture(): Record<string, unknown> {
   return {
     authority: "workspace-config-skills-v1",
-    projection: { config_revision: 42, tree_digest: "tree-digest" },
+    projection: { tree_digest: "tree-digest" },
     entries: [{
       name: "errors",
       description: "Builtin guidance",
@@ -92,7 +91,7 @@ function catalogFixture(): Record<string, unknown> {
 function detailFixture(): Record<string, unknown> {
   return {
     authority: "workspace-config-skills-v1",
-    projection: { config_revision: 42, tree_digest: "tree-digest" },
+    projection: { tree_digest: "tree-digest" },
     name: "release",
     description: "Workspace guidance",
     provenance: workspaceProvenance(),
@@ -117,7 +116,7 @@ Deno.test("Skill catalog parser accepts generated builtin, Workspace, and invali
   assertEquals(parsed.entries[0].provenance.kind, "builtin");
   assertEquals(parsed.entries[1].activation_status, "inactive");
   assertEquals(parsed.entries[1].projection_status, "invalid");
-  assertEquals(parsed.projection.config_revision, 42);
+  assertEquals(parsed.projection.tree_digest, "tree-digest");
 });
 
 Deno.test("Skill detail parser preserves shared generated DTO fields", () => {
@@ -127,13 +126,7 @@ Deno.test("Skill detail parser preserves shared generated DTO fields", () => {
   assertEquals(parsed.resources[0].supported, true);
 });
 
-Deno.test("Skill parser rejects stale Workspace projection revision and digest", () => {
-  const staleRevision = catalogFixture();
-  (staleRevision.projection as Record<string, unknown>).config_revision = 43;
-  assertContractError(
-    () => parseSkillCatalogResponse(staleRevision),
-    "stale Workspace Skill projection",
-  );
+Deno.test("Skill parser rejects stale Workspace projection digest", () => {
 
   const staleDigest = catalogFixture();
   (staleDigest.projection as Record<string, unknown>).tree_digest = "new-tree";
@@ -168,13 +161,12 @@ Deno.test("Skill parser fails closed on unknown fields and newer enum values", (
   );
 });
 
-Deno.test("Skill parser rejects unsafe revisions and oversized collections or strings", () => {
-  const unsafeRevision = catalogFixture();
-  (unsafeRevision.projection as Record<string, unknown>).config_revision =
-    Number.MAX_SAFE_INTEGER + 1;
+Deno.test("Skill parser rejects removed revision fields and oversized collections or strings", () => {
+  const legacyRevision = catalogFixture();
+  (legacyRevision.projection as Record<string, unknown>).config_revision = 1;
   assertContractError(
-    () => parseSkillCatalogResponse(unsafeRevision),
-    "safe integer",
+    () => parseSkillCatalogResponse(legacyRevision),
+    "unknown fields",
   );
 
   const oversizedCatalog = catalogFixture();

@@ -14,7 +14,6 @@ export const currentInitialRepository = {
   provider: "git",
   source: { kind: "https", uri: "https://example.test/current.git" },
   default_ref: "main",
-  source_revision: 2,
   source_fingerprint: "sha256:current",
   observed_status: "unverified",
   observed_at: null,
@@ -26,7 +25,6 @@ export function creationResponse(repository: unknown = null, replayed = false) {
   return {
     workspace: createdWorkspace,
     repository,
-    config_revision: 1,
     request_fingerprint: "sha256:creation",
     replayed,
   };

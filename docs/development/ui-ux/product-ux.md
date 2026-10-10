@@ -60,7 +60,7 @@ Workspaceを選ぶ前のscopeを扱う。
    - Subjects
    - Surface
    - Committed Memory
-   - Revisions
+   - Changes
    - Sources
 5. Workers
 
@@ -108,7 +108,7 @@ Workspace pageは、次のいずれかを基本形とする。
 - 同じfieldをresource間で比較する場合、flat listまたはtableを使う。
 - 人が読むnameとcanonical keyを最初のcolumnに置く。
 - columnは判断に必要な値だけに絞る。
-- provider detail、revision、digestはdetailまたはtechnical disclosureへ移す。
+- provider detail、変更ID、digestはdetailまたはtechnical disclosureへ移す。
 
 ### Resource detail
 
@@ -130,8 +130,8 @@ Workspace pageは、次のいずれかを基本形とする。
 - Memoryの入口はWorkspace全体のlegacy `Document` / `Staging`ではなく、明示的に選択したsubjectとする。
 - subject detailではcurrent Workerをkeyed-singleton projectionとして表示し、historical Worker／Session attributionをcurrent authorityとして扱わない。
 - `Surface`はresident contextのcurrent stateを表示する。`ready`、`ready-empty`、`ungenerated`、`stale`、`failed`を区別し、空表示やrequest failureへまとめない。
-- `Committed Memory`はcurrent confirmed revisionの一覧とdetailを持つ。revision historyはappend-only viewとして分離し、過去revisionをcurrentへ暗黙fallbackしない。
-- `Sources`は候補、resolution、exact Memory revision refs、Host-recorded Session attribution、閲覧可能なSession sourceをたどるviewとする。source IDをpermissionとして扱わず、現在のWorkspace／subject authorizationを毎回適用する。
+- `Committed Memory`はcurrent confirmed Memoryの一覧とdetailを持つ。変更履歴はappend-only viewとして分離し、過去の変更内容をcurrentへ暗黙fallbackしない。
+- `Sources`は候補、resolution、exact `{memory_id, change_id}` refs、Host-recorded Session attribution、閲覧可能なSession sourceをたどるviewとする。source IDをpermissionとして扱わず、現在のWorkspace／subject authorizationを毎回適用する。
 - legacy `/memory` の`Document` / `Staging` viewはdeprecated compatibility surfaceとして明示し、新しいsubject viewへ同じinputを別の意味で転送しない。
 - Markdown本文とdetail presentationはT-661の共有rendererを再利用する。Memory route独自のrenderer、application shell、Header、Sidebarを再実装せず、既存shellのmain contentとnested navigationを保つ。
 

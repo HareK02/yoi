@@ -10,7 +10,7 @@ import {
   commitConfigTree,
   ConfigSourceApiError,
   fetchConfigEntry,
-  fetchConfigRevision,
+  fetchConfigHistory,
   fetchConfigTree,
   parseWorkspaceConfigTreeResponse,
 } from "../../src/lib/workspace/config-source/api.ts";
@@ -29,7 +29,6 @@ const entry = {
   content_digest: "sha256:entry",
 };
 const snapshot = {
-  revision: 7,
   digest: "sha256:tree",
   entries: { "profiles/main.dcdl": entry },
 };
@@ -57,15 +56,14 @@ Deno.test("config source API commits directly through the workspace scope", asyn
     const url = String(input);
     calls.push({ url, init });
     if (url.includes("/entries/")) return Promise.resolve(response(entry));
-    if (url.includes("/revisions/")) return Promise.resolve(response(snapshot));
+    if (url.includes("/history/")) return Promise.resolve(response(snapshot));
     return Promise.resolve(response(tree));
   }) as typeof fetch;
 
   await fetchConfigTree("w/one", fetcher);
-  await fetchConfigRevision("w/one", 7, fetcher);
+  await fetchConfigHistory("w/one", "sha256:tree", fetcher);
   await fetchConfigEntry("w/one", "profiles/main.dcdl", fetcher);
   await commitConfigTree("w/one", {
-    base_revision: 4,
     base_digest: "sha256:base",
     changes: [],
     entrypoints: [],
@@ -73,7 +71,7 @@ Deno.test("config source API commits directly through the workspace scope", asyn
 
   assertEquals<unknown>(calls.map((call) => call.url), [
     "/api/w/w%2Fone/config/source-tree",
-    "/api/w/w%2Fone/config/source-tree/revisions/7",
+    "/api/w/w%2Fone/config/source-tree/history/sha256%3Atree",
     "/api/w/w%2Fone/config/source-tree/entries/profiles%2Fmain.dcdl",
     "/api/w/w%2Fone/config/source-tree/commit",
   ]);
@@ -81,6 +79,9 @@ Deno.test("config source API commits directly through the workspace scope", asyn
   assert(
     String(calls[3].init?.body).includes('"base_digest":"sha256:base"'),
   );
+  assertEquals(JSON.parse(String(calls[3].init?.body)), {
+    base_digest: "sha256:base", changes: [], entrypoints: [],
+  });
 });
 
 function withSchema(source: unknown, contributionSource: unknown = "builtin") {
@@ -113,7 +114,6 @@ for (const field of ["bundle", "contribution"] as const) {
     assertEquals<unknown>(await fetchConfigTree("w", fetcher), body);
     assertEquals<unknown>(
       await commitConfigTree("w", {
-        base_revision: 7,
         base_digest: snapshot.digest,
         changes: [],
         entrypoints: ["main.dcdl"],
@@ -197,12 +197,12 @@ Deno.test("config source API rejects mismatched entry map paths", async () => {
   );
 });
 
-Deno.test("config source API rejects unsafe revisions and oversized entry content", () => {
+Deno.test("config source API rejects removed snapshot revision fields and oversized entry content", () => {
   assertThrows(
     () =>
       parseWorkspaceConfigTreeResponse({
         ...tree,
-        snapshot: { ...snapshot, revision: Number.MAX_SAFE_INTEGER + 1 },
+        snapshot: { ...snapshot, revision: 7 },
       }),
     ConfigSourceApiError,
     "invalid response",
@@ -251,7 +251,6 @@ Deno.test("config source API does not materialize imported builtins in the works
 Deno.test("config source API preserves unknown read-only builtin diagnostics without fallback requests", async () => {
   const diagnostic = {
     path: "main.dcdl",
-    revision: 7,
     tree_digest: "sha256:tree",
     kind: "import",
     span: { start_byte: 8, end_byte: 40 },
@@ -270,7 +269,6 @@ Deno.test("config source API preserves unknown read-only builtin diagnostics wit
   const error = await assertRejects(
     () =>
       commitConfigTree("w", {
-        base_revision: 7,
         base_digest: "sha256:tree",
         changes: [],
         entrypoints: ["main.dcdl"],
@@ -290,7 +288,6 @@ Deno.test("config source API surfaces bounded failed evaluation details", async 
   let message = "";
   try {
     await commitConfigTree("w", {
-      base_revision: 1,
       base_digest: "sha256:base",
       changes: [],
       entrypoints: [],

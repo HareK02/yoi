@@ -166,7 +166,6 @@ try {
                 workspace_id: "space",
                 generated_at: "2026-10-09",
                 runtime_id: "runtime-a",
-                revision: "plan-1",
                 digest: "digest-1",
                 diagnostics: [],
                 workdirs: [],

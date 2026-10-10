@@ -57,7 +57,7 @@ async fn cached_drive_handle_rejects_mutation_after_deletion_reservation() {
             &config.workspace_id,
             &WorkspaceDeletionRequest {
                 operation_id: "delete-cached-drive".into(),
-                expected_revision: preflight.expected_revision,
+                expected_workspace_updated_at: preflight.expected_workspace_updated_at,
                 confirmation: preflight.display_name,
             },
         )
@@ -137,7 +137,7 @@ async fn deleting_workspace_reopens_fenced_drive_and_purges_blobs_before_feature
             &config.workspace_id,
             &WorkspaceDeletionRequest {
                 operation_id: "delete-drive-workspace".into(),
-                expected_revision: preflight.expected_revision,
+                expected_workspace_updated_at: preflight.expected_workspace_updated_at,
                 confirmation: preflight.display_name,
             },
         )

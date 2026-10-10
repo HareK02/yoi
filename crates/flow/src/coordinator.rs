@@ -21,10 +21,8 @@ pub enum FlowInstanceStatus {
 pub struct FlowInstance {
     pub instance_id: String,
     pub definition_id: String,
-    pub definition_revision: u64,
     pub definition_digest: String,
     pub current_state: StateId,
-    pub state_revision: u64,
     pub status: FlowInstanceStatus,
     pub active_attempt_id: Option<String>,
 }
@@ -33,7 +31,6 @@ impl FlowInstance {
     pub fn start(
         instance_id: impl Into<String>,
         definition_id: impl Into<String>,
-        definition_revision: u64,
         definition: &CompiledFlowDefinition,
     ) -> Result<Self, FlowTransitionError> {
         let instance_id = instance_id.into();
@@ -41,11 +38,6 @@ impl FlowInstance {
         ensure_non_empty("instance_id", &instance_id)
             .and_then(|_| ensure_non_empty("definition_id", &definition_id))
             .map_err(FlowTransitionError::InvalidRequest)?;
-        if definition_revision == 0 {
-            return Err(FlowTransitionError::InvalidRequest(
-                "definition_revision must be positive".to_string(),
-            ));
-        }
         let initial_state = definition.state(&definition.initial).ok_or_else(|| {
             FlowTransitionError::Invariant("compiled initial state is missing".to_string())
         })?;
@@ -57,10 +49,8 @@ impl FlowInstance {
         Ok(Self {
             instance_id,
             definition_id,
-            definition_revision,
             definition_digest: definition.content_digest.clone(),
             current_state: definition.initial.clone(),
-            state_revision: 0,
             status,
             active_attempt_id: None,
         })
@@ -77,9 +67,7 @@ pub struct FlowTransitionRequest {
 pub struct FlowTransitionAttempt {
     pub attempt_id: String,
     pub instance_id: String,
-    pub definition_revision: u64,
     pub definition_digest: String,
-    pub checked_state_revision: u64,
     pub from_state: StateId,
     pub reason: String,
     pub transitions: Vec<TransitionCheckSnapshot>,
@@ -174,7 +162,6 @@ pub enum FlowEventKind {
     TransitionRequested {
         attempt_id: String,
         state_id: StateId,
-        state_revision: u64,
         reason: String,
         transitions: Vec<TransitionCheckSnapshot>,
     },
@@ -201,7 +188,6 @@ pub enum FlowEventKind {
     StateEntered {
         attempt_id: String,
         state_id: StateId,
-        state_revision: u64,
         status: FlowInstanceStatus,
     },
 }
@@ -214,7 +200,7 @@ pub struct FlowRuntimeEvent {
 
 /// Durable Flow authority owned by one Runtime Worker.
 ///
-/// Workspace authority resolves and revisions the source, but never mutates
+/// Workspace authority resolves the exact source content, but never mutates
 /// this value. Runtime persists the complete snapshot with the Worker session
 /// and replaces it only after the corresponding session-log write succeeds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,12 +226,8 @@ impl FlowRuntimeState {
                 "resolved Flow selector does not match compiled definition name".to_string(),
             ));
         }
-        let instance = FlowInstance::start(
-            instance_id,
-            source.flow_id.clone(),
-            source.revision,
-            &source.definition,
-        )?;
+        let instance =
+            FlowInstance::start(instance_id, source.flow_id.clone(), &source.definition)?;
         let initial = source
             .definition
             .state(&source.definition.initial)
@@ -257,7 +239,6 @@ impl FlowRuntimeState {
             event: FlowEventKind::StateEntered {
                 attempt_id: String::new(),
                 state_id: instance.current_state.clone(),
-                state_revision: instance.state_revision,
                 status: instance.status,
             },
         };
@@ -282,8 +263,22 @@ impl FlowRuntimeState {
         if let Some(attempt) = &self.active_attempt {
             return Ok(attempt.clone());
         }
+        let attempt_id = attempt_id.into();
+        // The event log is the identity authority: an attempt ID is used once,
+        // including failed/cancelled attempts. This prevents a delayed result
+        // from an earlier visit to the same state from matching a later attempt.
+        if self.events.iter().any(|event| {
+            matches!(
+                &event.event,
+                FlowEventKind::TransitionRequested { attempt_id: used, .. } if used == &attempt_id
+            )
+        }) {
+            return Err(FlowTransitionError::InvalidRequest(
+                "transition attempt ID has already been used".to_string(),
+            ));
+        }
         let request = FlowTransitionRequest {
-            attempt_id: attempt_id.into(),
+            attempt_id,
             reason: reason.into(),
         };
         let (attempt, events) = begin_transition(&mut self.instance, &self.definition, request)?;
@@ -329,7 +324,7 @@ pub enum FlowTransitionError {
     NotActive,
     #[error("another transition attempt is already active")]
     AttemptInProgress,
-    #[error("Flow definition does not match the instance's pinned revision")]
+    #[error("Flow definition content does not match the instance's pinned digest")]
     DefinitionMismatch,
     #[error("invalid transition request: {0}")]
     InvalidRequest(String),
@@ -337,7 +332,7 @@ pub enum FlowTransitionError {
     Invariant(String),
 }
 
-pub fn begin_transition(
+fn begin_transition(
     instance: &mut FlowInstance,
     definition: &CompiledFlowDefinition,
     request: FlowTransitionRequest,
@@ -374,9 +369,7 @@ pub fn begin_transition(
     let attempt = FlowTransitionAttempt {
         attempt_id: request.attempt_id,
         instance_id: instance.instance_id.clone(),
-        definition_revision: instance.definition_revision,
         definition_digest: instance.definition_digest.clone(),
-        checked_state_revision: instance.state_revision,
         from_state: instance.current_state.clone(),
         reason: request.reason,
         transitions,
@@ -387,7 +380,6 @@ pub fn begin_transition(
         FlowEventKind::TransitionRequested {
             attempt_id: attempt.attempt_id.clone(),
             state_id: attempt.from_state.clone(),
-            state_revision: attempt.checked_state_revision,
             reason: attempt.reason.clone(),
             transitions: attempt.transitions.clone(),
         },
@@ -398,20 +390,23 @@ pub fn begin_transition(
     Ok((attempt, events))
 }
 
-pub fn resolve_transition(
+fn resolve_transition(
     instance: &mut FlowInstance,
     definition: &CompiledFlowDefinition,
     mut attempt: FlowTransitionAttempt,
     outcome: FlowVerifierOutcome,
 ) -> Result<FlowTransitionResolution, FlowTransitionError> {
-    if instance.active_attempt_id.as_deref() != Some(attempt.attempt_id.as_str()) {
+    // Accept a result only for the currently reserved operation on this instance.
+    // A completed/cancelled attempt has already released that reservation.
+    if instance.instance_id != attempt.instance_id
+        || instance.active_attempt_id.as_deref() != Some(attempt.attempt_id.as_str())
+    {
         return Err(FlowTransitionError::InvalidRequest(
             "attempt is not the active/latest attempt for this Flow instance".to_string(),
         ));
     }
     if definition.content_digest != instance.definition_digest
         || attempt.definition_digest != instance.definition_digest
-        || attempt.definition_revision != instance.definition_revision
     {
         return Err(FlowTransitionError::DefinitionMismatch);
     }
@@ -447,7 +442,7 @@ pub fn resolve_transition(
             )
         }
         FlowVerifierOutcome::Completed { results } => {
-            if instance.state_revision != attempt.checked_state_revision
+            if instance.status != FlowInstanceStatus::Active
                 || instance.current_state != attempt.from_state
             {
                 attempt.status = FlowAttemptStatus::Rejected;
@@ -604,9 +599,6 @@ fn resolve_completed_results(
         results,
     });
     instance.current_state = transition.target.clone();
-    instance.state_revision = instance.state_revision.checked_add(1).ok_or_else(|| {
-        FlowTransitionError::Invariant("Flow state revision overflowed".to_string())
-    })?;
     instance.status = if transition.target.as_str() == CANCELLED_STATE_ID {
         FlowInstanceStatus::Cancelled
     } else if target_state.terminal {
@@ -617,7 +609,6 @@ fn resolve_completed_results(
     events.push(FlowEventKind::StateEntered {
         attempt_id: attempt.attempt_id.clone(),
         state_id: instance.current_state.clone(),
-        state_revision: instance.state_revision,
         status: instance.status,
     });
     Ok(FlowTransitionResolution {
@@ -735,16 +726,109 @@ mod tests {
         attempt
     }
 
+    fn runtime_state() -> FlowRuntimeState {
+        let definition = definition();
+        FlowRuntimeState::start(
+            &crate::ResolvedFlowSource {
+                selector: "workspace:simple".parse().unwrap(),
+                workspace_id: "workspace-1".into(),
+                flow_id: "flow-1".into(),
+                content_digest: definition.content_digest.clone(),
+                definition,
+            },
+            "instance-1",
+        )
+        .unwrap()
+        .0
+    }
+
+    #[test]
+    fn cancelled_attempt_id_cannot_be_reused_even_after_restore() {
+        let mut state = runtime_state();
+        state.begin_or_recover_transition("first", "ready").unwrap();
+        state
+            .resolve_active_transition("first", FlowVerifierOutcome::Cancelled)
+            .unwrap();
+        let mut restored: FlowRuntimeState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        let before = restored.clone();
+        assert!(matches!(
+            restored.begin_or_recover_transition("first", "try again"),
+            Err(FlowTransitionError::InvalidRequest(_))
+        ));
+        assert_eq!(restored, before);
+        restored
+            .begin_or_recover_transition("second", "try again")
+            .unwrap();
+        assert_eq!(
+            restored.instance.active_attempt_id.as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn late_result_cannot_consume_a_new_attempt_in_the_same_state() {
+        let mut state = runtime_state();
+        state.begin_or_recover_transition("first", "ready").unwrap();
+        state
+            .resolve_active_transition("first", FlowVerifierOutcome::Cancelled)
+            .unwrap();
+        state
+            .begin_or_recover_transition("second", "ready")
+            .unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.resolve_active_transition(
+                "first",
+                FlowVerifierOutcome::Completed { results: vec![] }
+            ),
+            Err(FlowTransitionError::InvalidRequest(_))
+        ));
+        assert_eq!(state, before);
+        state
+            .resolve_active_transition("second", FlowVerifierOutcome::Cancelled)
+            .unwrap();
+        assert!(state.active_attempt.is_none());
+    }
+
+    #[test]
+    fn source_content_is_checked_before_start_and_before_accepting_a_result() {
+        let mut state = runtime_state();
+        let mut changed = state.definition.clone();
+        changed.content_digest = "different-content".into();
+        assert_eq!(
+            begin_transition(
+                &mut state.instance,
+                &changed,
+                FlowTransitionRequest {
+                    attempt_id: "first".into(),
+                    reason: "ready".into(),
+                }
+            )
+            .unwrap_err(),
+            FlowTransitionError::DefinitionMismatch
+        );
+        assert!(state.instance.active_attempt_id.is_none());
+        state.begin_or_recover_transition("first", "ready").unwrap();
+        state.definition = changed;
+        let before = state.clone();
+        assert_eq!(
+            state
+                .resolve_active_transition("first", FlowVerifierOutcome::Cancelled)
+                .unwrap_err(),
+            FlowTransitionError::DefinitionMismatch
+        );
+        assert_eq!(state, before);
+    }
+
     #[test]
     fn exactly_one_met_transition_enters_terminal_state() {
         let definition = definition();
         let mut instance = FlowInstance {
             instance_id: "instance-1".to_string(),
             definition_id: "definition-1".to_string(),
-            definition_revision: 1,
             definition_digest: definition.content_digest.clone(),
             current_state: definition.initial.clone(),
-            state_revision: 0,
             status: FlowInstanceStatus::Active,
             active_attempt_id: None,
         };
@@ -770,7 +854,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(instance.current_state.as_str(), "done");
-        assert_eq!(instance.state_revision, 1);
+
         assert_eq!(instance.status, FlowInstanceStatus::Completed);
         assert!(resolution.rejection.is_none());
         assert!(matches!(
@@ -788,10 +872,8 @@ mod tests {
         let mut instance = FlowInstance {
             instance_id: "instance-1".to_string(),
             definition_id: "definition-1".to_string(),
-            definition_revision: 1,
             definition_digest: definition.content_digest.clone(),
             current_state: definition.initial.clone(),
-            state_revision: 0,
             status: FlowInstanceStatus::Active,
             active_attempt_id: None,
         };
@@ -827,10 +909,8 @@ mod tests {
         let mut instance = FlowInstance {
             instance_id: "instance-1".to_string(),
             definition_id: "definition-1".to_string(),
-            definition_revision: 1,
             definition_digest: definition.content_digest.clone(),
             current_state: definition.initial.clone(),
-            state_revision: 0,
             status: FlowInstanceStatus::Active,
             active_attempt_id: None,
         };
@@ -852,7 +932,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(instance.current_state.as_str(), "work");
-        assert_eq!(instance.state_revision, 0);
+
         assert_eq!(instance.active_attempt_id, None);
         assert_eq!(
             resolution.rejection.unwrap().code,
@@ -866,10 +946,8 @@ mod tests {
         let mut instance = FlowInstance {
             instance_id: "instance-1".to_string(),
             definition_id: "definition-1".to_string(),
-            definition_revision: 1,
             definition_digest: definition.content_digest.clone(),
             current_state: definition.initial.clone(),
-            state_revision: 0,
             status: FlowInstanceStatus::Active,
             active_attempt_id: None,
         };
@@ -901,15 +979,13 @@ mod tests {
         let mut instance = FlowInstance {
             instance_id: "instance-1".to_string(),
             definition_id: "definition-1".to_string(),
-            definition_revision: 1,
             definition_digest: definition.content_digest.clone(),
             current_state: definition.initial.clone(),
-            state_revision: 0,
             status: FlowInstanceStatus::Active,
             active_attempt_id: None,
         };
         let attempt = begin(&mut instance);
-        instance.state_revision = 1;
+        instance.current_state = StateId::new("done").unwrap();
         let results = attempt
             .transitions
             .iter()
@@ -938,10 +1014,8 @@ mod tests {
         let mut instance = FlowInstance {
             instance_id: "instance-1".to_string(),
             definition_id: "definition-1".to_string(),
-            definition_revision: 1,
             definition_digest: definition.content_digest.clone(),
             current_state: definition.initial.clone(),
-            state_revision: 0,
             status: FlowInstanceStatus::Active,
             active_attempt_id: None,
         };
@@ -967,7 +1041,7 @@ mod tests {
             FlowRejectionCode::MultipleConditionsMet
         );
         assert_eq!(instance.current_state.as_str(), "work");
-        assert_eq!(instance.state_revision, 0);
+
         assert!(
             resolution
                 .events
@@ -982,10 +1056,8 @@ mod tests {
         let mut instance = FlowInstance {
             instance_id: "instance-1".to_string(),
             definition_id: "definition-1".to_string(),
-            definition_revision: 1,
             definition_digest: definition.content_digest.clone(),
             current_state: definition.initial.clone(),
-            state_revision: 0,
             status: FlowInstanceStatus::Active,
             active_attempt_id: None,
         };
@@ -1015,10 +1087,8 @@ mod tests {
         let mut instance = FlowInstance {
             instance_id: "instance-1".to_string(),
             definition_id: "definition-1".to_string(),
-            definition_revision: 1,
             definition_digest: definition.content_digest.clone(),
             current_state: definition.initial.clone(),
-            state_revision: 0,
             status: FlowInstanceStatus::Active,
             active_attempt_id: None,
         };

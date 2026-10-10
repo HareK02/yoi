@@ -188,7 +188,8 @@ impl DriveFeature {
                     return Err(DriveError::Limit);
                 }
                 let read = self.backend.read(&args.entry, args.max_bytes).await?;
-                if pinned.is_some_and(|entry| entry.revision != read.entry.revision) {
+                if pinned.is_some_and(|entry| entry.last_mutation_id != read.entry.last_mutation_id)
+                {
                     return Err(DriveError::Conflict);
                 }
                 self.observe(read.entry.clone())?;
@@ -260,7 +261,7 @@ impl DriveFeature {
                             request_id,
                             mutation: DriveMutation::UpdateText {
                                 id: entry.entry,
-                                expected_revision: entry.revision,
+                                expected_mutation_id: entry.last_mutation_id,
                                 text,
                                 content_type: entry.content_type.unwrap_or_else(default_media),
                             },
@@ -281,7 +282,7 @@ impl DriveFeature {
                     .backend
                     .read(&entry.entry, DRIVE_TEXT_MAX_BYTES as u32)
                     .await?;
-                if read.entry.revision != entry.revision {
+                if read.entry.last_mutation_id != entry.last_mutation_id {
                     return Err(DriveError::Conflict);
                 }
                 if read.truncated {
@@ -297,7 +298,7 @@ impl DriveFeature {
                             request_id,
                             mutation: DriveMutation::UpdateText {
                                 id: entry.entry,
-                                expected_revision: entry.revision,
+                                expected_mutation_id: entry.last_mutation_id,
                                 text,
                                 content_type: entry.content_type.unwrap_or_else(default_media),
                             },
@@ -316,7 +317,7 @@ impl DriveFeature {
                             request_id,
                             mutation: DriveMutation::Relocate {
                                 id: entry.entry,
-                                expected_revision: entry.revision,
+                                expected_mutation_id: entry.last_mutation_id,
                                 parent: args.parent,
                                 name: args.name,
                             },
@@ -334,7 +335,7 @@ impl DriveFeature {
                             request_id,
                             mutation: DriveMutation::Delete {
                                 id: entry.entry,
-                                expected_revision: entry.revision,
+                                expected_mutation_id: entry.last_mutation_id,
                             },
                         })
                         .await?,
@@ -385,7 +386,7 @@ impl DriveFeature {
                     parent_id: Some(args.parent.node_id),
                     name: Some(args.name),
                     id: None,
-                    expected_revision: None,
+                    expected_mutation_id: None,
                     content_type: args.content_type,
                     size: bytes.len() as u32,
                     sha256: digest(&bytes),
@@ -399,7 +400,7 @@ impl DriveFeature {
             }
             _ => return Err(DriveError::Invalid("unknown operation".into())),
         };
-        // A successful mutation does not silently substitute its new revision
+        // A successful mutation does not silently substitute its new observation
         // into a prior observation. The caller observes explicitly next time.
         if let Some(id) = mutated_id {
             self.observations
@@ -640,13 +641,13 @@ pub(super) const SPECS: &[Spec] = &[
     Spec {
         name: "DriveMetadata",
         operation: "metadata",
-        description: "Inspect one Workspace-bound stable entry ID and observe its revision for mutation.",
+        description: "Inspect one Workspace-bound stable entry ID and retain its last committed request for mutation checks.",
         schema: schema::<EntryArgs>,
     },
     Spec {
         name: "DriveList",
         operation: "list",
-        description: "List a bounded folder page (default root), up to 200 entries. Results do not expand the WIP tree or observe revisions for writes.",
+        description: "List a bounded folder page (default root), up to 200 entries. Results do not expand the WIP tree or establish mutation preconditions.",
         schema: schema::<ListArgs>,
     },
     Spec {
@@ -658,7 +659,7 @@ pub(super) const SPECS: &[Spec] = &[
     Spec {
         name: "DriveRead",
         operation: "read",
-        description: "Read up to 64 KiB UTF-8 text and observe entry revision. Past Session text remains an immutable observation.",
+        description: "Read up to 64 KiB UTF-8 text and retain the entry’s last committed request. Past Session text remains an immutable observation.",
         schema: schema::<ReadArgs>,
     },
     Spec {
@@ -676,31 +677,31 @@ pub(super) const SPECS: &[Spec] = &[
     Spec {
         name: "DriveWrite",
         operation: "write",
-        description: "Replace <=64 KiB text using a previously read/metadata-observed revision. Conflicts are not retried with latest revision.",
+        description: "Replace <=64 KiB text using a previously observed committed request. Conflicts are not retried with a newer observation.",
         schema: schema::<WriteArgs>,
     },
     Spec {
         name: "DriveEdit",
         operation: "edit",
-        description: "Partial text edit using previously observed revision and shared old_string rules. Require nonempty unique match unless replace_all. Truncated preimages cannot be edited.",
+        description: "Partial text edit using previously observed committed request and shared old_string rules. Require nonempty unique match unless replace_all. Truncated preimages cannot be edited.",
         schema: schema::<EditArgs>,
     },
     Spec {
         name: "DriveRelocate",
         operation: "relocate",
-        description: "Rename and/or move an observed entry with revision precondition; stable ID and URL remain unchanged.",
+        description: "Rename and/or move an observed entry only if its last committed request still matches the observation; stable ID and URL remain unchanged.",
         schema: schema::<RelocateArgs>,
     },
     Spec {
         name: "DriveDelete",
         operation: "delete",
-        description: "Delete one observed entry with revision precondition. A recreated name has a different ID; stale observations cannot target it.",
+        description: "Delete one observed entry only if its last committed request still matches the observation. A recreated name has a different ID; stale observations cannot target it.",
         schema: schema::<EntryArgs>,
     },
     Spec {
         name: "DriveViewImage",
         operation: "view_image",
-        description: "Attach revision-fixed PNG/JPEG/GIF/WebP bytes (<=10 MiB) through durable ToolOutput history/capture; a URL alone is not image viewing.",
+        description: "Attach committed-request-bound PNG/JPEG/GIF/WebP bytes (<=10 MiB) through durable ToolOutput history/capture; a URL alone is not image viewing.",
         schema: schema::<EntryArgs>,
     },
     Spec {

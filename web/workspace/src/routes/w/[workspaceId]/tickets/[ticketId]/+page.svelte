@@ -92,7 +92,7 @@
   let manualWorkerId = $state("");
   let manualBindings = $state<{ alias: string; working_directory_id: string; connection_id: string }[]>([]);
   let cancellationReason = $state("");
-  let routeTicketSnapshot = `${initialData.ticketId}:${loadedTicket.item_revision}`;
+  let routeTicketSnapshot = JSON.stringify([initialData.workspaceId, initialData.ticketId, loadedTicket]);
   let routeGeneration = 0;
   const workerAssignment = $derived(
     ticket.assignments.find((assignment) => assignment.role === "worker") ?? null,
@@ -164,7 +164,7 @@
     const incomingTicketId = data.ticketId;
     const incomingTicket = data.ticket.data;
     if (!incomingTicket) return;
-    const incomingSnapshot = `${incomingTicketId}:${incomingTicket.item_revision}`;
+    const incomingSnapshot = JSON.stringify([data.workspaceId, incomingTicketId, incomingTicket]);
 
     untrack(() => {
       if (incomingSnapshot === routeTicketSnapshot) return;
@@ -176,7 +176,7 @@
 
   function ticketMutationError(error: unknown): string {
     const message = error instanceof Error ? error.message : String(error);
-    if (/\(409\)/.test(message)) return `Update conflict. Refresh the Ticket and resolve the current revision or resource binding before retrying. ${message}`;
+    if (/\(409\)/.test(message)) return `Update conflict. Refresh the Ticket and resolve the current content or resource binding before retrying. ${message}`;
     if (/\(401\)|\(403\)/.test(message)) return `Permission denied. This action did not grant access. ${message}`;
     if (/\(404\)/.test(message)) return `Resource unavailable or not connected. Check the Ticket and authorized resource connection. ${message}`;
     return `Outcome unknown or request rejected. Refresh before retrying; no success is inferred. ${message}`;
@@ -382,7 +382,7 @@
       await mutate("state", "/state", {
         state: nextState,
         operation_key: crypto.randomUUID(),
-        expected_item_revision: ticket.item_revision,
+        expected_content_digest: ticket.content_digest,
         expected_state: ticket.state,
         reason: transitionReason.trim(),
         body: progressBody.trim() || null,
@@ -408,7 +408,7 @@
       await mutate("close", "/close", {
         resolution: resolution.trim(),
         operation_key: crypto.randomUUID(),
-        expected_item_revision: ticket.item_revision,
+        expected_content_digest: ticket.content_digest,
         expected_state: ticket.state,
       })
     ) resolution = "";
@@ -674,7 +674,7 @@
                     {/each}
                   </select>
                 </label>
-                <label>Ref selector<input bind:value={target.ref_selector} placeholder={selectedRepository?.default_selector ?? "branch, tag, or revision"} disabled={busy !== null} /></label>
+                <label>Ref selector<input bind:value={target.ref_selector} placeholder={selectedRepository?.default_selector ?? "branch, tag, or commit"} disabled={busy !== null} /></label>
                 <label>Access
                   <select bind:value={target.access} disabled={busy !== null}>
                     <option value="read_write">Read and write</option>

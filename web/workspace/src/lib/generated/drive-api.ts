@@ -10,7 +10,10 @@ export type DriveEntry = {
   parent: DriveEntryRef | null;
   name: string;
   kind: DriveEntryKind;
-  revision: string;
+  /**
+   * Request ID of the last committed mutation, or empty for the immutable root.
+   */
+  last_mutation_id: string;
   /**
    * File length in bytes; absent for folders.
    */
@@ -74,9 +77,9 @@ export type DriveReadChunkQuery = {
   entry_workspace_id: string;
   id: string;
   /**
-   * Bind a multi-chunk read to the same file revision.
+   * Require each chunk to match the same committed mutation observed in metadata.
    */
-  expected_revision: string;
+  expected_mutation_id: string;
   offset: number;
   length: number;
 };
@@ -84,7 +87,7 @@ export type DriveReadChunkQuery = {
 export type DriveDownloadQuery = {
   entry_workspace_id: string;
   id: string;
-  expected_revision: string | null;
+  expected_mutation_id: string | null;
 };
 
 export type DriveMutation = {
@@ -100,16 +103,16 @@ export type DriveMutation = {
 } | {
   "operation": "update_text";
   id: DriveEntryRef;
-  expected_revision: string;
+  expected_mutation_id: string;
   text: string;
   content_type: string;
 } | {
   "operation": "relocate";
   id: DriveEntryRef;
-  expected_revision: string;
+  expected_mutation_id: string;
   parent: DriveEntryRef;
   name: string;
-} | { "operation": "delete"; id: DriveEntryRef; expected_revision: string };
+} | { "operation": "delete"; id: DriveEntryRef; expected_mutation_id: string };
 
 export type DriveMutationRequest = {
   request_id: string;
@@ -133,7 +136,7 @@ export type DriveUploadQuery = {
   parent_id: string | null;
   name: string | null;
   id: string | null;
-  expected_revision: string | null;
+  expected_mutation_id: string | null;
   content_type: string;
   /**
    * Values above the file limit still decode as u32 so the service returns

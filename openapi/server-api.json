@@ -301,7 +301,7 @@
       "BrowserCloseTicketRequest": {
         "additionalProperties": false,
         "properties": {
-          "expected_item_revision": {
+          "expected_content_digest": {
             "type": "string"
           },
           "expected_state": {
@@ -316,7 +316,7 @@
         },
         "required": [
           "operation_key",
-          "expected_item_revision",
+          "expected_content_digest",
           "expected_state",
           "resolution"
         ],
@@ -477,7 +477,7 @@
               "null"
             ]
           },
-          "expected_item_revision": {
+          "expected_content_digest": {
             "type": "string"
           },
           "expected_state": {
@@ -496,7 +496,7 @@
         "required": [
           "state",
           "operation_key",
-          "expected_item_revision",
+          "expected_content_digest",
           "expected_state",
           "reason"
         ],
@@ -1094,7 +1094,7 @@
       "CompleteTicketRequest": {
         "additionalProperties": false,
         "properties": {
-          "expected_item_revision": {
+          "expected_content_digest": {
             "type": "string"
           },
           "expected_state": {
@@ -1116,7 +1116,7 @@
         },
         "required": [
           "operation_key",
-          "expected_item_revision",
+          "expected_content_digest",
           "expected_state",
           "reason"
         ],
@@ -1193,12 +1193,6 @@
           "base_digest": {
             "type": "string"
           },
-          "base_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
-          },
           "changes": {
             "items": {
               "$ref": "#/components/schemas/ConfigTreeChange"
@@ -1213,7 +1207,6 @@
           }
         },
         "required": [
-          "base_revision",
           "base_digest",
           "changes",
           "entrypoints"
@@ -1433,16 +1426,9 @@
               "$ref": "#/components/schemas/ConfigEntry"
             },
             "type": "object"
-          },
-          "revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
           }
         },
         "required": [
-          "revision",
           "digest",
           "entries"
         ],
@@ -1451,12 +1437,9 @@
       "ConfirmRepositorySshHostTrustRequest": {
         "additionalProperties": false,
         "properties": {
-          "expected_host_trust_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
+          "expected_host_key_fingerprint": {
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -1539,21 +1522,23 @@
           "endpoint": {
             "type": "string"
           },
-          "expected_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
+          "expected_binding_id": {
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
           "public_bundle": {
             "$ref": "#/components/schemas/RuntimePublicIdentityBundle"
+          },
+          "workspace_trust_id": {
+            "description": "Exact Runtime-issued enrollment identity from `trust-workspace add/show`.\nA key fingerprint alone cannot distinguish revocation and re-enrollment.",
+            "type": "string"
           }
         },
         "required": [
           "public_bundle",
+          "workspace_trust_id",
           "endpoint"
         ],
         "type": "object"
@@ -1732,11 +1717,8 @@
       "DeleteRepositorySshCredentialRequest": {
         "additionalProperties": false,
         "properties": {
-          "expected_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
+          "expected_public_key_fingerprint": {
+            "type": "string"
           },
           "operation_id": {
             "type": "string"
@@ -1744,18 +1726,15 @@
         },
         "required": [
           "operation_id",
-          "expected_revision"
+          "expected_public_key_fingerprint"
         ],
         "type": "object"
       },
       "DeleteRepositorySshHostTrustRequest": {
         "additionalProperties": false,
         "properties": {
-          "expected_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
+          "expected_fingerprint": {
+            "type": "string"
           },
           "operation_id": {
             "type": "string"
@@ -1763,7 +1742,7 @@
         },
         "required": [
           "operation_id",
-          "expected_revision"
+          "expected_fingerprint"
         ],
         "type": "object"
       },
@@ -2013,7 +1992,7 @@
           "entry_workspace_id": {
             "type": "string"
           },
-          "expected_revision": {
+          "expected_mutation_id": {
             "default": null,
             "type": [
               "string",
@@ -2047,6 +2026,11 @@
           "kind": {
             "$ref": "#/components/schemas/DriveEntryKind"
           },
+          "last_mutation_id": {
+            "description": "Request ID of the last committed mutation, or empty for the immutable root.",
+            "maxLength": 128,
+            "type": "string"
+          },
           "latest_url": {
             "description": "Stable relative authenticated URL in this same Workspace. No bearer token\nor cross-Workspace link is embedded in this metadata.",
             "type": "string"
@@ -2063,10 +2047,6 @@
                 "type": "null"
               }
             ]
-          },
-          "revision": {
-            "pattern": "^[1-9][0-9]*$",
-            "type": "string"
           },
           "size": {
             "description": "File length in bytes; absent for folders.",
@@ -2090,7 +2070,7 @@
           "entry",
           "name",
           "kind",
-          "revision",
+          "last_mutation_id",
           "updated_by",
           "updated_at",
           "latest_url"
@@ -2380,8 +2360,8 @@
               "content_type": {
                 "type": "string"
               },
-              "expected_revision": {
-                "pattern": "^[1-9][0-9]*$",
+              "expected_mutation_id": {
+                "maxLength": 128,
                 "type": "string"
               },
               "id": {
@@ -2398,7 +2378,7 @@
             "required": [
               "operation",
               "id",
-              "expected_revision",
+              "expected_mutation_id",
               "text",
               "content_type"
             ],
@@ -2407,8 +2387,8 @@
           {
             "additionalProperties": false,
             "properties": {
-              "expected_revision": {
-                "pattern": "^[1-9][0-9]*$",
+              "expected_mutation_id": {
+                "maxLength": 128,
                 "type": "string"
               },
               "id": {
@@ -2428,7 +2408,7 @@
             "required": [
               "operation",
               "id",
-              "expected_revision",
+              "expected_mutation_id",
               "parent",
               "name"
             ],
@@ -2437,8 +2417,8 @@
           {
             "additionalProperties": false,
             "properties": {
-              "expected_revision": {
-                "pattern": "^[1-9][0-9]*$",
+              "expected_mutation_id": {
+                "maxLength": 128,
                 "type": "string"
               },
               "id": {
@@ -2452,7 +2432,7 @@
             "required": [
               "operation",
               "id",
-              "expected_revision"
+              "expected_mutation_id"
             ],
             "type": "object"
           }
@@ -2503,9 +2483,9 @@
           "entry_workspace_id": {
             "type": "string"
           },
-          "expected_revision": {
-            "description": "Bind a multi-chunk read to the same file revision.",
-            "pattern": "^[1-9][0-9]*$",
+          "expected_mutation_id": {
+            "description": "Require each chunk to match the same committed mutation observed in metadata.",
+            "maxLength": 128,
             "type": "string"
           },
           "id": {
@@ -2529,7 +2509,7 @@
         "required": [
           "entry_workspace_id",
           "id",
-          "expected_revision",
+          "expected_mutation_id",
           "offset"
         ],
         "type": "object"
@@ -2662,7 +2642,7 @@
       },
       "DriveUploadQuery": {
         "additionalProperties": false,
-        "description": "Flat query metadata accompanies the binary body. The service rejects invalid\ncombinations: create requires parent_id/name and forbids id/expected_revision;\nupdate requires id/expected_revision and forbids parent_id/name. Both targets\nare bound by entry_workspace_id; declared size and SHA256 must match the body.",
+        "description": "Flat query metadata accompanies the binary body. The service rejects invalid\ncombinations: create requires parent_id/name and forbids id/expected_mutation_id;\nupdate requires id/expected_mutation_id and forbids parent_id/name. Both targets\nare bound by entry_workspace_id; declared size and SHA256 must match the body.",
         "properties": {
           "content_type": {
             "type": "string"
@@ -2670,7 +2650,7 @@
           "entry_workspace_id": {
             "type": "string"
           },
-          "expected_revision": {
+          "expected_mutation_id": {
             "default": null,
             "type": [
               "string",
@@ -2731,12 +2711,6 @@
           "catalog_digest": {
             "type": "string"
           },
-          "config_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
-          },
           "schema_fingerprint": {
             "type": "string"
           },
@@ -2755,7 +2729,6 @@
         },
         "required": [
           "templates",
-          "config_revision",
           "schema_fingerprint",
           "toolchain_fingerprint",
           "catalog_digest"
@@ -2776,18 +2749,16 @@
               "null"
             ]
           },
-          "flow_definition_id": {
+          "flow_definition_fingerprint": {
+            "description": "SHA-256 of the exact pinned Flow definition content, when available.\nHistorical origins without captured definition content leave this absent.",
             "type": [
               "string",
               "null"
             ]
           },
-          "flow_definition_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
+          "flow_definition_id": {
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -2850,9 +2821,6 @@
           "expected_plan_digest": {
             "type": "string"
           },
-          "expected_plan_revision": {
-            "type": "string"
-          },
           "workdir_target_ids": {
             "default": [],
             "items": {
@@ -2869,7 +2837,6 @@
           }
         },
         "required": [
-          "expected_plan_revision",
           "expected_plan_digest"
         ],
         "type": "object"
@@ -3237,12 +3204,6 @@
           "path": {
             "type": "string"
           },
-          "revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
-          },
           "source_kind": {
             "$ref": "#/components/schemas/FlowSourceKind"
           },
@@ -3261,7 +3222,6 @@
           "path",
           "content",
           "content_digest",
-          "revision",
           "created_at",
           "updated_at"
         ],
@@ -4315,18 +4275,15 @@
               "null"
             ]
           },
-          "flow_definition_id": {
+          "flow_definition_fingerprint": {
             "type": [
               "string",
               "null"
             ]
           },
-          "flow_definition_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
+          "flow_definition_id": {
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -4430,19 +4387,12 @@
           "language": {
             "type": "string"
           },
-          "settings_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
-          },
           "workspace_id": {
             "type": "string"
           }
         },
         "required": [
           "workspace_id",
-          "settings_revision",
           "language"
         ],
         "type": "object"
@@ -5236,7 +5186,7 @@
               "subject_ref": {
                 "type": "string"
               },
-              "ticket_item_revision": {
+              "ticket_content_digest": {
                 "type": "string"
               },
               "ticket_merge_request_subjects": {
@@ -5251,7 +5201,7 @@
               "event_id",
               "sequence",
               "subject_ref",
-              "ticket_item_revision",
+              "ticket_content_digest",
               "ticket_merge_request_subjects",
               "requested_by",
               "reviewer",
@@ -5299,7 +5249,7 @@
               "subject_ref": {
                 "type": "string"
               },
-              "ticket_item_revision": {
+              "ticket_content_digest": {
                 "type": "string"
               },
               "ticket_merge_request_subjects": {
@@ -5315,7 +5265,7 @@
               "sequence",
               "request_event_id",
               "subject_ref",
-              "ticket_item_revision",
+              "ticket_content_digest",
               "ticket_merge_request_subjects",
               "decision",
               "body",
@@ -5845,9 +5795,6 @@
             },
             "type": "array"
           },
-          "revision": {
-            "type": "string"
-          },
           "state": {
             "type": "string"
           },
@@ -5866,7 +5813,6 @@
           "resource_key",
           "title",
           "state",
-          "revision",
           "linked_tickets",
           "linked_ticket_summaries",
           "resources",
@@ -6590,17 +6536,8 @@
       },
       "ProfileSettingsResponse": {
         "additionalProperties": false,
-        "description": "Read-only Profile catalog projected from one active Workspace config revision.",
+        "description": "Read-only Profile catalog projected from one active Workspace config tree.",
         "properties": {
-          "config_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
           "default_profile": {
             "type": [
               "string",
@@ -6625,9 +6562,6 @@
               "null"
             ]
           },
-          "registry_revision": {
-            "type": "string"
-          },
           "sources": {
             "items": {
               "$ref": "#/components/schemas/WorkspaceProfileSourceSummary"
@@ -6646,7 +6580,6 @@
         },
         "required": [
           "workspace_id",
-          "registry_revision",
           "profiles",
           "sources",
           "diagnostics"
@@ -6728,13 +6661,10 @@
       "PutRepositorySshHostTrustRequest": {
         "additionalProperties": false,
         "properties": {
-          "expected_revision": {
+          "expected_fingerprint": {
             "default": null,
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -6915,11 +6845,8 @@
       "RemoveRuntimeRequest": {
         "additionalProperties": false,
         "properties": {
-          "expected_binding_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
+          "expected_binding_id": {
+            "type": "string"
           },
           "operation_id": {
             "type": "string"
@@ -6927,7 +6854,7 @@
         },
         "required": [
           "operation_id",
-          "expected_binding_revision"
+          "expected_binding_id"
         ],
         "type": "object"
       },
@@ -6968,12 +6895,6 @@
             },
             "type": "array"
           },
-          "config_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
-          },
           "projection_digest": {
             "type": "string"
           },
@@ -6983,7 +6904,6 @@
         },
         "required": [
           "workspace_id",
-          "config_revision",
           "projection_digest",
           "bindings"
         ],
@@ -7231,12 +7151,9 @@
             },
             "type": "array"
           },
-          "expected_host_trust_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
+          "expected_host_key_fingerprint": {
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -7295,12 +7212,6 @@
           "credential_id": {
             "type": "string"
           },
-          "current_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
-          },
           "name": {
             "type": "string"
           },
@@ -7336,7 +7247,6 @@
           "name",
           "public_key_algorithm",
           "public_key_fingerprint",
-          "current_revision",
           "status",
           "created_at"
         ],
@@ -7369,12 +7279,6 @@
           "created_at": {
             "type": "string"
           },
-          "current_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
-          },
           "fingerprint": {
             "type": "string"
           },
@@ -7418,7 +7322,6 @@
           "key_algorithm",
           "host_key",
           "fingerprint",
-          "current_revision",
           "created_at",
           "updated_at"
         ],
@@ -7431,12 +7334,6 @@
           "created_at": {
             "type": "string"
           },
-          "current_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
-          },
           "fingerprint": {
             "type": "string"
           },
@@ -7480,7 +7377,6 @@
           "key_algorithm",
           "host_key",
           "fingerprint",
-          "current_revision",
           "created_at",
           "updated_at"
         ],
@@ -7491,12 +7387,6 @@
         "properties": {
           "credential_id": {
             "type": "string"
-          },
-          "current_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
           },
           "public_key": {
             "type": "string"
@@ -7510,7 +7400,6 @@
         },
         "required": [
           "credential_id",
-          "current_revision",
           "public_key_algorithm",
           "public_key_fingerprint",
           "public_key"
@@ -7571,12 +7460,6 @@
           },
           "source_fingerprint": {
             "type": "string"
-          },
-          "source_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
           }
         },
         "required": [
@@ -7584,7 +7467,6 @@
           "kind",
           "provider",
           "source",
-          "source_revision",
           "source_fingerprint",
           "observed_status",
           "record_authority"
@@ -7632,12 +7514,6 @@
           "flow_id": {
             "type": "string"
           },
-          "revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
-          },
           "selector": {
             "type": "string"
           },
@@ -7649,7 +7525,6 @@
           "selector",
           "workspace_id",
           "flow_id",
-          "revision",
           "content_digest",
           "definition"
         ],
@@ -7716,7 +7591,7 @@
           "subject_ref": {
             "type": "string"
           },
-          "ticket_item_revision": {
+          "ticket_content_digest": {
             "type": "string"
           },
           "ticket_merge_request_subjects": {
@@ -7731,7 +7606,7 @@
           "sequence",
           "request_event_id",
           "subject_ref",
-          "ticket_item_revision",
+          "ticket_content_digest",
           "ticket_merge_request_subjects",
           "decision",
           "body",
@@ -7780,26 +7655,20 @@
       "RevokeRuntimeTrustKeyRequest": {
         "additionalProperties": false,
         "properties": {
-          "expected_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
+          "expected_binding_id": {
+            "type": "string"
           }
         },
         "required": [
-          "expected_revision"
+          "expected_binding_id"
         ],
         "type": "object"
       },
       "RotateRepositorySshCredentialRequest": {
         "additionalProperties": false,
         "properties": {
-          "expected_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
+          "expected_public_key_fingerprint": {
+            "type": "string"
           },
           "operation_id": {
             "type": "string"
@@ -7817,7 +7686,7 @@
         },
         "required": [
           "operation_id",
-          "expected_revision",
+          "expected_public_key_fingerprint",
           "private_key"
         ],
         "type": "object"
@@ -7899,9 +7768,6 @@
           "generated_at": {
             "type": "string"
           },
-          "revision": {
-            "type": "string"
-          },
           "runtime_id": {
             "type": "string"
           },
@@ -7925,7 +7791,6 @@
           "workspace_id",
           "runtime_id",
           "generated_at",
-          "revision",
           "digest",
           "workers",
           "workdirs",
@@ -8010,11 +7875,8 @@
               "null"
             ]
           },
-          "binding_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
+          "binding_id": {
+            "type": "string"
           },
           "checked_at": {
             "type": "string"
@@ -8068,7 +7930,7 @@
         "required": [
           "workspace_id",
           "runtime_id",
-          "binding_revision",
+          "binding_id",
           "connection_state",
           "checked_at",
           "status",
@@ -8130,18 +7992,15 @@
       "RuntimeManagementApiError": {
         "additionalProperties": false,
         "properties": {
-          "current_fingerprint": {
+          "current_binding_id": {
             "type": [
               "string",
               "null"
             ]
           },
-          "current_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
+          "current_fingerprint": {
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -8440,6 +8299,9 @@
           "at": {
             "type": "string"
           },
+          "binding_id": {
+            "type": "string"
+          },
           "new_fingerprint": {
             "type": [
               "string",
@@ -8451,18 +8313,12 @@
               "string",
               "null"
             ]
-          },
-          "revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
           }
         },
         "required": [
           "action",
           "actor_account_id",
-          "revision",
+          "binding_id",
           "at"
         ],
         "type": "object"
@@ -8482,6 +8338,12 @@
       "RuntimeTrustKeyState": {
         "additionalProperties": false,
         "properties": {
+          "binding_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "created_at": {
             "type": [
               "string",
@@ -8491,15 +8353,6 @@
           "fingerprint": {
             "type": [
               "string",
-              "null"
-            ]
-          },
-          "revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": [
-              "integer",
               "null"
             ]
           },
@@ -8535,23 +8388,14 @@
       "RuntimeVerificationEvidenceSummary": {
         "additionalProperties": false,
         "properties": {
-          "binding_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
+          "binding_id": {
+            "type": "string"
           },
           "last_checked_at": {
             "type": "string"
           },
           "last_outcome": {
             "$ref": "#/components/schemas/RuntimeVerificationOutcome"
-          },
-          "runtime_identity_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
           },
           "runtime_public_key_fingerprint": {
             "type": "string"
@@ -8562,31 +8406,24 @@
               "null"
             ]
           },
-          "workspace_identity_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
-          },
           "workspace_key_id": {
             "type": "string"
           },
-          "workspace_trust_generation": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
+          "workspace_public_key_fingerprint": {
+            "type": "string"
+          },
+          "workspace_trust_id": {
+            "type": "string"
           }
         },
         "required": [
           "last_checked_at",
           "last_outcome",
-          "binding_revision",
+          "binding_id",
           "workspace_key_id",
-          "workspace_identity_revision",
-          "workspace_trust_generation",
-          "runtime_public_key_fingerprint",
-          "runtime_identity_revision"
+          "workspace_public_key_fingerprint",
+          "workspace_trust_id",
+          "runtime_public_key_fingerprint"
         ],
         "type": "object"
       },
@@ -9857,18 +9694,11 @@
       "SkillProjectionIdentity": {
         "additionalProperties": false,
         "properties": {
-          "config_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
-          },
           "tree_digest": {
             "type": "string"
           }
         },
         "required": [
-          "config_revision",
           "tree_digest"
         ],
         "type": "object"
@@ -9888,14 +9718,6 @@
           },
           "kind": {
             "$ref": "#/components/schemas/SkillSourceKind"
-          },
-          "revision": {
-            "format": "uint64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
           },
           "source_digest": {
             "type": [
@@ -10103,6 +9925,75 @@
         ],
         "type": "object"
       },
+      "SubjektivMemoryChangeItem": {
+        "additionalProperties": false,
+        "properties": {
+          "change_id": {
+            "type": "string"
+          },
+          "change_reason": {
+            "type": "string"
+          },
+          "claim": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/CandidateKind"
+          },
+          "state": {
+            "$ref": "#/components/schemas/SubjektivMemoryState"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "change_id",
+          "kind",
+          "state",
+          "claim",
+          "change_reason",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "SubjektivMemoryChangeRef": {
+        "additionalProperties": false,
+        "properties": {
+          "change_id": {
+            "type": "string"
+          },
+          "memory_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id",
+          "change_id"
+        ],
+        "type": "object"
+      },
+      "SubjektivMemoryChangesQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "uint",
+            "maximum": 100,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "SubjektivMemoryDetailQuery": {
         "additionalProperties": false,
         "properties": {
@@ -10112,6 +10003,12 @@
             "minimum": 0,
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "change_id": {
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -10134,15 +10031,6 @@
             "format": "uint",
             "maximum": 9007199254740991,
             "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 1,
             "type": [
               "integer",
               "null"
@@ -10199,6 +10087,39 @@
         ],
         "type": "object"
       },
+      "SubjektivMemoryListChangesResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "current_change_id": {
+            "type": "string"
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SubjektivMemoryChangeItem"
+            },
+            "type": "array"
+          },
+          "memory_id": {
+            "type": "string"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "memory_id",
+          "current_change_id",
+          "items",
+          "has_more"
+        ],
+        "type": "object"
+      },
       "SubjektivMemoryListQuery": {
         "additionalProperties": false,
         "description": "Browser GET query for committed subject Memory. Enum lists use a bounded,\ncomma-separated scalar representation so URL-form encoding stays portable.",
@@ -10245,45 +10166,12 @@
         },
         "type": "object"
       },
-      "SubjektivMemoryListRevisionsResponse": {
-        "additionalProperties": false,
-        "properties": {
-          "current_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 1,
-            "type": "integer"
-          },
-          "has_more": {
-            "type": "boolean"
-          },
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/SubjektivMemoryRevisionItem"
-            },
-            "type": "array"
-          },
-          "memory_id": {
-            "type": "string"
-          },
-          "next_cursor": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "memory_id",
-          "current_revision",
-          "items",
-          "has_more"
-        ],
-        "type": "object"
-      },
       "SubjektivMemoryQueryItem": {
         "additionalProperties": false,
         "properties": {
+          "change_id": {
+            "type": "string"
+          },
           "claim": {
             "type": "string"
           },
@@ -10296,12 +10184,6 @@
           "kind": {
             "$ref": "#/components/schemas/CandidateKind"
           },
-          "revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 1,
-            "type": "integer"
-          },
           "state": {
             "$ref": "#/components/schemas/SubjektivMemoryState"
           },
@@ -10311,7 +10193,7 @@
         },
         "required": [
           "id",
-          "revision",
+          "change_id",
           "kind",
           "state",
           "claim",
@@ -10385,6 +10267,9 @@
           "body_truncated": {
             "type": "boolean"
           },
+          "change_id": {
+            "type": "string"
+          },
           "change_reason": {
             "type": "string"
           },
@@ -10394,16 +10279,13 @@
           "created_at": {
             "type": "string"
           },
-          "current_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 1,
-            "type": "integer"
+          "current_change_id": {
+            "type": "string"
           },
           "derived_from": {
             "description": "Derivation references on this evidence page.",
             "items": {
-              "$ref": "#/components/schemas/SubjektivMemoryRevisionRef"
+              "$ref": "#/components/schemas/SubjektivMemoryChangeRef"
             },
             "type": "array"
           },
@@ -10421,12 +10303,6 @@
           },
           "memory_id": {
             "type": "string"
-          },
-          "revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 1,
-            "type": "integer"
           },
           "source_candidate_ids": {
             "description": "Candidate ids on this evidence page. A compatible historical candidate\nmay repeat across pages while its nested anchors advance through the same\nevidence cursor. Corresponding bounded anchors retain the same order in\n`source_candidates`.",
@@ -10459,8 +10335,8 @@
         },
         "required": [
           "memory_id",
-          "revision",
-          "current_revision",
+          "change_id",
+          "current_change_id",
           "kind",
           "state",
           "claim",
@@ -10479,83 +10355,8 @@
         ],
         "type": "object"
       },
-      "SubjektivMemoryRevisionItem": {
-        "additionalProperties": false,
-        "properties": {
-          "change_reason": {
-            "type": "string"
-          },
-          "claim": {
-            "type": "string"
-          },
-          "kind": {
-            "$ref": "#/components/schemas/CandidateKind"
-          },
-          "revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 1,
-            "type": "integer"
-          },
-          "state": {
-            "$ref": "#/components/schemas/SubjektivMemoryState"
-          },
-          "updated_at": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "revision",
-          "kind",
-          "state",
-          "claim",
-          "change_reason",
-          "updated_at"
-        ],
-        "type": "object"
-      },
-      "SubjektivMemoryRevisionRef": {
-        "additionalProperties": false,
-        "properties": {
-          "memory_id": {
-            "type": "string"
-          },
-          "revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 1,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "memory_id",
-          "revision"
-        ],
-        "type": "object"
-      },
-      "SubjektivMemoryRevisionsQuery": {
-        "additionalProperties": false,
-        "properties": {
-          "cursor": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "limit": {
-            "format": "uint",
-            "maximum": 100,
-            "minimum": 1,
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "SubjektivMemoryState": {
-        "description": "Current lifecycle state of one confirmed subject Memory revision.",
+        "description": "Current lifecycle state of one confirmed subject Memory change.",
         "enum": [
           "active",
           "resolved",
@@ -10604,11 +10405,8 @@
           "body_md": {
             "type": "string"
           },
-          "built_from_store_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
+          "built_from_memory_fingerprint": {
+            "type": "string"
           },
           "created_at": {
             "type": "string"
@@ -10616,7 +10414,7 @@
           "memory_refs": {
             "default": [],
             "items": {
-              "$ref": "#/components/schemas/SubjektivMemoryRevisionRef"
+              "$ref": "#/components/schemas/SubjektivMemoryChangeRef"
             },
             "type": "array"
           },
@@ -10627,7 +10425,7 @@
         "required": [
           "snapshot_id",
           "body_md",
-          "built_from_store_revision",
+          "built_from_memory_fingerprint",
           "created_at"
         ],
         "type": "object"
@@ -10638,15 +10436,13 @@
           "behavior_md": {
             "type": "string"
           },
-          "expected_behavior_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
+          "expected_behavior_md": {
+            "description": "Exact previously observed user-managed behavior document.",
+            "type": "string"
           }
         },
         "required": [
-          "expected_behavior_revision",
+          "expected_behavior_md",
           "behavior_md"
         ],
         "type": "object"
@@ -10726,12 +10522,6 @@
           "behavior_md": {
             "type": "string"
           },
-          "behavior_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
-          },
           "created_at": {
             "type": "string"
           },
@@ -10749,17 +10539,14 @@
           "id": {
             "type": "string"
           },
+          "memory_fingerprint": {
+            "type": "string"
+          },
           "role": {
             "type": "string"
           },
           "state": {
             "$ref": "#/components/schemas/SubjektivSubjectState"
-          },
-          "store_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
           },
           "updated_at": {
             "type": "string"
@@ -10769,9 +10556,8 @@
           "id",
           "role",
           "behavior_md",
-          "behavior_revision",
           "state",
-          "store_revision",
+          "memory_fingerprint",
           "created_at",
           "updated_at"
         ],
@@ -11021,7 +10807,7 @@
               "null"
             ]
           },
-          "expected_item_revision": {
+          "expected_content_digest": {
             "type": "string"
           },
           "expected_state": {
@@ -11042,7 +10828,7 @@
           }
         },
         "required": [
-          "expected_item_revision",
+          "expected_content_digest",
           "expected_state",
           "operation_key",
           "reason"
@@ -11118,6 +10904,9 @@
           "body_truncated": {
             "type": "boolean"
           },
+          "content_digest": {
+            "type": "string"
+          },
           "created_at": {
             "type": [
               "string",
@@ -11160,9 +10949,6 @@
               "$ref": "#/components/schemas/TicketEvidenceEvent"
             },
             "type": "array"
-          },
-          "item_revision": {
-            "type": "string"
           },
           "linked_objectives": {
             "items": {
@@ -11253,7 +11039,7 @@
           "title",
           "state",
           "priority",
-          "item_revision",
+          "content_digest",
           "targets",
           "risk_flags",
           "body",
@@ -12284,6 +12070,9 @@
             "minimum": 0,
             "type": "integer"
           },
+          "content_digest": {
+            "type": "string"
+          },
           "created_at": {
             "type": [
               "string",
@@ -12304,9 +12093,6 @@
             "$ref": "#/components/schemas/TicketEvidenceSummary"
           },
           "id": {
-            "type": "string"
-          },
-          "item_revision": {
             "type": "string"
           },
           "linked_objective_ids": {
@@ -12411,7 +12197,7 @@
           "title",
           "state",
           "priority",
-          "item_revision",
+          "content_digest",
           "workspace_action_priority",
           "matched_fields",
           "linked_objective_ids",
@@ -12978,7 +12764,7 @@
       },
       "TicketStateUpdate": {
         "additionalProperties": false,
-        "description": "External state mutation with item/state CAS and an immutable operation receipt.\nExact replay returns the current authoritative Ticket without a new event or\nreapplying the recorded state, even after later edits or reopening.\nSetting `state` to Closed also stores `reason` as the resolution; reopening\nchanges Ticket metadata only and never revives released work identities.",
+        "description": "External state mutation with content/state CAS and an immutable operation receipt.\nExact replay returns the current authoritative Ticket without a new event or\nreapplying the recorded state, even after later edits or reopening.\nSetting `state` to Closed also stores `reason` as the resolution; reopening\nchanges Ticket metadata only and never revives released work identities.",
         "properties": {
           "author": {
             "default": null,
@@ -12987,7 +12773,7 @@
               "null"
             ]
           },
-          "expected_item_revision": {
+          "expected_content_digest": {
             "type": "string"
           },
           "expected_state": {
@@ -13011,7 +12797,7 @@
           }
         },
         "required": [
-          "expected_item_revision",
+          "expected_content_digest",
           "expected_state",
           "state",
           "operation_key",
@@ -13295,18 +13081,15 @@
         "additionalProperties": false,
         "description": "Compare-and-swap update for Workspace-owned Memory settings.",
         "properties": {
-          "expected_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
+          "expected_language": {
+            "type": "string"
           },
           "language": {
             "type": "string"
           }
         },
         "required": [
-          "expected_revision",
+          "expected_language",
           "language"
         ],
         "type": "object"
@@ -13318,13 +13101,13 @@
           "display_name": {
             "type": "string"
           },
-          "revision": {
+          "expected_updated_at": {
             "type": "string"
           }
         },
         "required": [
           "display_name",
-          "revision"
+          "expected_updated_at"
         ],
         "type": "object"
       },
@@ -14871,12 +14654,6 @@
         "additionalProperties": false,
         "description": "Response returned after atomically creating a Workspace.\n\nOn replay, Workspace/config and the Repository at the originally requested key are\ncurrent authority, not historical snapshots. Repository is null when creation omitted\nit or that key has since been removed/renamed; replay never recreates an asset.",
         "properties": {
-          "config_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
-          },
           "replayed": {
             "type": "boolean"
           },
@@ -14899,7 +14676,6 @@
         },
         "required": [
           "workspace",
-          "config_revision",
           "request_fingerprint",
           "replayed"
         ],
@@ -15026,8 +14802,8 @@
           "display_name": {
             "type": "string"
           },
-          "expected_revision": {
-            "description": "Opaque persisted Workspace metadata revision used as a CAS fence.",
+          "expected_workspace_updated_at": {
+            "description": "Observed Workspace metadata update timestamp used as a CAS fence.",
             "type": "string"
           },
           "resources": {
@@ -15040,7 +14816,7 @@
         "required": [
           "workspace_id",
           "display_name",
-          "expected_revision",
+          "expected_workspace_updated_at",
           "can_delete",
           "resources",
           "blockers"
@@ -15054,7 +14830,7 @@
           "confirmation": {
             "type": "string"
           },
-          "expected_revision": {
+          "expected_workspace_updated_at": {
             "type": "string"
           },
           "operation_id": {
@@ -15063,7 +14839,7 @@
         },
         "required": [
           "operation_id",
-          "expected_revision",
+          "expected_workspace_updated_at",
           "confirmation"
         ],
         "type": "object"
@@ -15198,19 +14974,12 @@
           "language": {
             "type": "string"
           },
-          "settings_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
-          },
           "workspace_id": {
             "type": "string"
           }
         },
         "required": [
           "workspace_id",
-          "settings_revision",
           "language"
         ],
         "type": "object"
@@ -15250,10 +15019,10 @@
           "display_name": {
             "type": "string"
           },
-          "revision": {
+          "source": {
             "type": "string"
           },
-          "source": {
+          "updated_at": {
             "type": "string"
           },
           "workspace_id": {
@@ -15264,7 +15033,7 @@
           "workspace_id",
           "display_name",
           "created_at",
-          "revision",
+          "updated_at",
           "source",
           "diagnostics"
         ],
@@ -15331,9 +15100,6 @@
           "provenance": {
             "$ref": "#/components/schemas/WorkspaceProfileSourceProvenance"
           },
-          "revision": {
-            "type": "string"
-          },
           "size_bytes": {
             "format": "uint64",
             "maximum": 9007199254740991,
@@ -15349,7 +15115,6 @@
           "content_digest",
           "provenance",
           "editable",
-          "revision",
           "size_bytes",
           "diagnostics"
         ],
@@ -15408,16 +15173,10 @@
       },
       "WorkspacePromptProjection": {
         "additionalProperties": false,
-        "description": "Effective Prompt catalog projected from one immutable Workspace config revision.",
+        "description": "Effective Prompt catalog projected from one immutable Workspace config tree.",
         "properties": {
           "catalog": {
             "$ref": "#/components/schemas/EffectivePromptCatalog"
-          },
-          "config_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
           },
           "projection_digest": {
             "type": "string"
@@ -15437,7 +15196,6 @@
         },
         "required": [
           "workspace_id",
-          "config_revision",
           "source_digest",
           "projection_digest",
           "schema_fingerprint",
@@ -15465,12 +15223,6 @@
           "public_key_fingerprint": {
             "type": "string"
           },
-          "revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
-          },
           "workspace_id": {
             "type": "string"
           }
@@ -15481,8 +15233,7 @@
           "key_id",
           "algorithm",
           "public_key",
-          "public_key_fingerprint",
-          "revision"
+          "public_key_fingerprint"
         ],
         "type": "object"
       },
@@ -15526,12 +15277,6 @@
           "source_fingerprint": {
             "type": "string"
           },
-          "source_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
-          },
           "updated_at": {
             "type": "string"
           },
@@ -15544,7 +15289,6 @@
           "repository_key",
           "kind",
           "source",
-          "source_revision",
           "source_fingerprint",
           "observed_status",
           "created_at",
@@ -15603,14 +15347,11 @@
       "WorkspaceRuntimeBindingSummary": {
         "additionalProperties": false,
         "properties": {
+          "binding_id": {
+            "type": "string"
+          },
           "connection_state": {
             "$ref": "#/components/schemas/RuntimeConnectionDisplayState"
-          },
-          "revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
           },
           "state": {
             "$ref": "#/components/schemas/WorkspaceRuntimeBindingState"
@@ -15625,16 +15366,13 @@
               }
             ]
           },
-          "workspace_key_generation": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
+          "workspace_key_id": {
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
-          "workspace_key_id": {
+          "workspace_trust_id": {
             "type": [
               "string",
               "null"
@@ -15644,7 +15382,7 @@
         "required": [
           "state",
           "connection_state",
-          "revision"
+          "binding_id"
         ],
         "type": "object"
       },
@@ -15695,9 +15433,6 @@
           "provenance": {
             "$ref": "#/components/schemas/WorkspaceRuntimeConfigProvenance"
           },
-          "revision": {
-            "type": "string"
-          },
           "workspace_id": {
             "type": "string"
           }
@@ -15705,7 +15440,6 @@
         "required": [
           "id",
           "digest",
-          "revision",
           "workspace_id",
           "created_at",
           "provenance"
@@ -16012,12 +15746,6 @@
           "catalog_digest": {
             "type": "string"
           },
-          "config_revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
-          },
           "schema_fingerprint": {
             "type": "string"
           },
@@ -16036,7 +15764,6 @@
         },
         "required": [
           "templates",
-          "config_revision",
           "schema_fingerprint",
           "toolchain_fingerprint",
           "catalog_digest"
@@ -16118,15 +15845,6 @@
             "minimum": 0,
             "type": "integer"
           },
-          "generation": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
           "kind": {
             "$ref": "#/components/schemas/WorkspaceRuntimeResourceKind"
           },
@@ -16156,9 +15874,6 @@
             "$ref": "#/components/schemas/WorkspaceRuntimeResourceRedactionPolicy"
           },
           "resource_id": {
-            "type": "string"
-          },
-          "revision": {
             "type": "string"
           },
           "runtime_id": {
@@ -16191,7 +15906,6 @@
           "operation",
           "expires_at_unix_seconds",
           "nonce",
-          "revision",
           "max_bytes",
           "content_type",
           "redaction",
@@ -16250,12 +15964,6 @@
               "null"
             ]
           },
-          "revision": {
-            "format": "uint64",
-            "maximum": 9007199254740991,
-            "minimum": 0,
-            "type": "integer"
-          },
           "state": {
             "$ref": "#/components/schemas/WorkspaceSigningIdentityState"
           },
@@ -16267,7 +15975,6 @@
           "workspace_id",
           "key_id",
           "algorithm",
-          "revision",
           "state",
           "created_at"
         ],
@@ -16429,7 +16136,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:6dd3e9e7ffe5e653697addc29675545b5fb28ea856b14bafc580355f0453ec12"
+    "x-yoi-source-digest": "sha256:07cfe53bfdd700cad76d00695a031255ffa76a6062110a05596fa8b64ae372c4"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -20151,9 +19858,9 @@
         ]
       }
     },
-    "/api/w/{workspace_id}/config/source-tree/revisions/{revision}": {
+    "/api/w/{workspace_id}/config/source-tree/history/{content_digest}": {
       "get": {
-        "operationId": "workspace_config_revision",
+        "operationId": "workspace_config_history",
         "parameters": [
           {
             "explode": false,
@@ -20168,7 +19875,7 @@
           {
             "explode": false,
             "in": "path",
-            "name": "revision",
+            "name": "content_digest",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/string"
@@ -32686,9 +32393,9 @@
         ]
       }
     },
-    "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/memories/{memory_id}/revisions": {
+    "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/memories/{memory_id}/changes": {
       "get": {
-        "operationId": "subjektiv_memory_revisions",
+        "operationId": "subjektiv_memory_changes",
         "parameters": [
           {
             "explode": false,
@@ -32726,7 +32433,7 @@
             "name": "query",
             "required": true,
             "schema": {
-              "$ref": "#/components/schemas/SubjektivMemoryRevisionsQuery"
+              "$ref": "#/components/schemas/SubjektivMemoryChangesQuery"
             },
             "style": "form"
           }
@@ -32736,7 +32443,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SubjektivMemoryListRevisionsResponse"
+                  "$ref": "#/components/schemas/SubjektivMemoryListChangesResponse"
                 }
               }
             },

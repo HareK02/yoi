@@ -51,7 +51,9 @@ pub enum LoggedSessionHistoryOrigin {
     FlowInstruction {
         selector: String,
         definition_id: String,
-        definition_revision: u64,
+        /// Exact compiled source used for these instructions; absent in older logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        definition_digest: Option<String>,
         instance_id: String,
         state_id: String,
     },

@@ -46,12 +46,14 @@ fn file(
     .node
 }
 fn read(d: &Drive, n: &Node) -> Vec<u8> {
-    d.read(n.id, n.revision, 0, MAX_READ_BYTES).unwrap().bytes
+    d.read(n.id, &n.last_mutation_id, 0, MAX_READ_BYTES)
+        .unwrap()
+        .bytes
 }
 fn update(n: &Node, bytes: &[u8]) -> Mutation {
     Mutation::Update {
         id: n.id,
-        expected_revision: n.revision,
+        expected_mutation_id: n.last_mutation_id.clone(),
         content_type: "text/markdown".into(),
         bytes: bytes.to_vec(),
     }
@@ -117,7 +119,7 @@ fn relocate_and_paged_list_only_use_metadata_even_when_blob_is_missing() {
             "account",
             Mutation::Relocate {
                 id: f.id,
-                expected_revision: f.revision,
+                expected_mutation_id: f.last_mutation_id.clone(),
                 parent: b.id,
                 name: "改名".into(),
             },
@@ -133,7 +135,7 @@ fn relocate_and_paged_list_only_use_metadata_even_when_blob_is_missing() {
     std::fs::remove_file(blobs.join(&before[0])).unwrap();
     assert_eq!(d.list(b.id, None, 1).unwrap().nodes, vec![moved.clone()]);
     assert!(matches!(
-        d.read(moved.id, moved.revision, 0, 1),
+        d.read(moved.id, &moved.last_mutation_id, 0, 1),
         Err(Error::Blob(_))
     ));
     let first = d.list(root.id, None, 1).unwrap();
@@ -144,7 +146,7 @@ fn relocate_and_paged_list_only_use_metadata_even_when_blob_is_missing() {
 }
 
 #[test]
-fn parallel_revision_and_name_competitors_use_database_authority() {
+fn parallel_last_mutation_id_and_name_competitors_use_database_authority() {
     let t = tempfile::tempdir().unwrap();
     let db = t.path().join("db");
     let blobs = t.path().join("blobs");
@@ -215,7 +217,7 @@ fn concurrent_cycle_moves_and_parent_delete_child_create_preserve_tree() {
             "account",
             Mutation::Relocate {
                 id: b2.id,
-                expected_revision: b2.revision,
+                expected_mutation_id: b2.last_mutation_id.clone(),
                 parent: aa.id,
                 name: "b".into(),
             },
@@ -227,7 +229,7 @@ fn concurrent_cycle_moves_and_parent_delete_child_create_preserve_tree() {
         "account",
         Mutation::Relocate {
             id: a.id,
-            expected_revision: a.revision,
+            expected_mutation_id: a.last_mutation_id.clone(),
             parent: b.id,
             name: "a".into(),
         },
@@ -255,7 +257,7 @@ fn concurrent_cycle_moves_and_parent_delete_child_create_preserve_tree() {
         "account",
         Mutation::Delete {
             id: p.id,
-            expected_revision: p.revision,
+            expected_mutation_id: p.last_mutation_id.clone(),
         },
     );
     let created = worker.join().unwrap();
@@ -308,7 +310,7 @@ fn receipts_survive_response_loss_and_restart_without_double_mutation() {
 }
 
 #[test]
-fn deletion_recreation_does_not_reuse_id_or_silently_switch_read_revision() {
+fn deletion_recreation_does_not_reuse_id_or_silently_switch_read_last_mutation_id() {
     let t = tempfile::tempdir().unwrap();
     let d = open(&t.path().join("db"), &t.path().join("blobs"), "ws");
     let root = d.root().unwrap();
@@ -318,7 +320,7 @@ fn deletion_recreation_does_not_reuse_id_or_silently_switch_read_revision() {
         .unwrap()
         .node;
     assert!(matches!(
-        d.read(old.id, old.revision, 0, 1),
+        d.read(old.id, &old.last_mutation_id, 0, 1),
         Err(Error::Conflict)
     ));
     d.mutate(
@@ -326,7 +328,7 @@ fn deletion_recreation_does_not_reuse_id_or_silently_switch_read_revision() {
         "account",
         Mutation::Delete {
             id: next.id,
-            expected_revision: next.revision,
+            expected_mutation_id: next.last_mutation_id.clone(),
         },
     )
     .unwrap();
@@ -366,11 +368,11 @@ fn bounded_search_and_read_reject_paths_oversize_and_invalid_parents() {
     );
     let g = file(&d, &root, "g", "needle.png", "image/png", b"needle");
     assert!(matches!(
-        d.read(f.id, f.revision, 0, MAX_READ_BYTES + 1),
+        d.read(f.id, &f.last_mutation_id, 0, MAX_READ_BYTES + 1),
         Err(Error::Invalid(_))
     ));
     assert!(matches!(
-        d.read(f.id, f.revision, f.size + 1, 1),
+        d.read(f.id, &f.last_mutation_id, f.size + 1, 1),
         Err(Error::Invalid(_))
     ));
     assert!(matches!(
@@ -434,7 +436,7 @@ fn fence_purge_restart_and_workspace_boundaries_are_persistent() {
 }
 
 #[test]
-fn stopped_writer_backup_restores_ids_revisions_receipts_and_sequence_with_blobs() {
+fn stopped_writer_backup_restores_ids_last_mutation_ids_receipts_and_sequence_with_blobs() {
     let t = tempfile::tempdir().unwrap();
     let metadata = t.path().join("metadata");
     let blobs = t.path().join("blobs");
@@ -454,7 +456,7 @@ fn stopped_writer_backup_restores_ids_revisions_receipts_and_sequence_with_blobs
         "account",
         Mutation::Delete {
             id: deleted.id,
-            expected_revision: deleted.revision,
+            expected_mutation_id: deleted.last_mutation_id.clone(),
         },
     )
     .unwrap();
@@ -486,15 +488,10 @@ fn stopped_writer_backup_restores_ids_revisions_receipts_and_sequence_with_blobs
 }
 
 #[test]
-fn external_ids_and_revisions_keep_full_integer_precision() {
+fn external_node_ids_keep_full_integer_precision() {
     let max = "9223372036854775807";
     let id: workspace_drive::NodeId = serde_json::from_str(&format!("\"{max}\"")).unwrap();
-    let revision: workspace_drive::Revision = serde_json::from_str(&format!("\"{max}\"")).unwrap();
     assert_eq!(serde_json::to_string(&id).unwrap(), format!("\"{max}\""));
-    assert_eq!(
-        serde_json::to_string(&revision).unwrap(),
-        format!("\"{max}\"")
-    );
     for bad in ["0", "-1", "01", "9223372036854775808"] {
         assert!(serde_json::from_str::<workspace_drive::NodeId>(&format!("\"{bad}\"")).is_err());
     }
@@ -508,9 +505,12 @@ fn text_read_is_bounded_utf8_and_referenced_size_corruption_is_diagnosed() {
     let d = open(&t.path().join("db"), &blobs, "ws");
     let root = d.root().unwrap();
     let f = file(&d, &root, "f", "f", "text/plain", "日本語".as_bytes());
-    assert_eq!(d.read_text(f.id, f.revision, 0, 3).unwrap().text, "日");
+    assert_eq!(
+        d.read_text(f.id, &f.last_mutation_id, 0, 3).unwrap().text,
+        "日"
+    );
     assert!(matches!(
-        d.read_text(f.id, f.revision, 1, 2),
+        d.read_text(f.id, &f.last_mutation_id, 1, 2),
         Err(Error::Invalid(_))
     ));
     let path = std::fs::read_dir(&blobs)
@@ -521,7 +521,7 @@ fn text_read_is_bounded_utf8_and_referenced_size_corruption_is_diagnosed() {
         .path();
     std::fs::write(&path, b"corrupt length").unwrap();
     assert!(matches!(
-        d.read(f.id, f.revision, 0, 1),
+        d.read(f.id, &f.last_mutation_id, 0, 1),
         Err(Error::Invalid(_))
     ));
     assert!(matches!(
@@ -537,7 +537,7 @@ fn text_read_is_bounded_utf8_and_referenced_size_corruption_is_diagnosed() {
         }
     }
     assert!(matches!(
-        d.read(empty.id, empty.revision, 0, 1),
+        d.read(empty.id, &empty.last_mutation_id, 0, 1),
         Err(Error::Blob(_))
     ));
 }
@@ -573,7 +573,7 @@ fn simultaneous_same_request_replays_one_create_and_folder_deletion_is_empty_onl
             "account",
             Mutation::Delete {
                 id: one.node.id,
-                expected_revision: one.node.revision
+                expected_mutation_id: one.node.last_mutation_id
             }
         ),
         Err(Error::Conflict)
@@ -585,7 +585,7 @@ fn simultaneous_same_request_replays_one_create_and_folder_deletion_is_empty_onl
             "account",
             Mutation::Delete {
                 id: root.id,
-                expected_revision: root.revision
+                expected_mutation_id: root.last_mutation_id
             }
         ),
         Err(Error::Invalid(_))
@@ -596,7 +596,7 @@ fn simultaneous_same_request_replays_one_create_and_folder_deletion_is_empty_onl
             "account",
             Mutation::Relocate {
                 id: child.id,
-                expected_revision: child.revision,
+                expected_mutation_id: child.last_mutation_id.clone(),
                 parent: root.id,
                 name: "child".into(),
             },
@@ -609,10 +609,73 @@ fn simultaneous_same_request_replays_one_create_and_folder_deletion_is_empty_onl
             "account",
             Mutation::Delete {
                 id: child.id,
-                expected_revision: child.revision
+                expected_mutation_id: child.last_mutation_id
             }
         ),
         Err(Error::Conflict)
     ));
     assert_eq!(d.metadata(changed.id).unwrap(), changed);
+}
+
+#[test]
+fn identical_writes_and_move_away_back_do_not_revive_old_observations() {
+    let t = tempfile::tempdir().unwrap();
+    let d = open(&t.path().join("db"), &t.path().join("blobs"), "ws");
+    let root = d.root().unwrap();
+    let first = file(
+        &d,
+        &root,
+        "create-資料",
+        "original",
+        "text/markdown",
+        b"same",
+    );
+    assert_eq!(first.last_mutation_id, "create-資料");
+    let identical = d
+        .mutate("same-content", "account", update(&first, b"same"))
+        .unwrap()
+        .node;
+    assert_eq!(identical.last_mutation_id, "same-content");
+    assert!(matches!(
+        d.read(first.id, &first.last_mutation_id, 0, 4),
+        Err(Error::Conflict)
+    ));
+    let mut current = identical;
+    for (request, name) in [("away", "temporary"), ("back", "original")] {
+        current = d
+            .mutate(
+                request,
+                "account",
+                Mutation::Relocate {
+                    id: current.id,
+                    expected_mutation_id: current.last_mutation_id,
+                    parent: root.id,
+                    name: name.into(),
+                },
+            )
+            .unwrap()
+            .node;
+    }
+    assert_eq!(current.name, first.name);
+    assert_eq!(current.last_mutation_id, "back");
+    assert!(matches!(
+        d.mutate(
+            "stale-delete",
+            "account",
+            Mutation::Delete {
+                id: first.id,
+                expected_mutation_id: first.last_mutation_id,
+            }
+        ),
+        Err(Error::Conflict)
+    ));
+    assert!(
+        matches!(
+            d.mutate("same-content", "account", update(&current, b"same")),
+            Err(Error::Conflict)
+        ),
+        "reusing a receipt ID with another observation must not publish"
+    );
+    assert_eq!(d.metadata(current.id).unwrap(), current);
+    assert_eq!(read(&d, &current), b"same");
 }

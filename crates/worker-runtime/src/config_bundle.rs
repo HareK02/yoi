@@ -43,7 +43,6 @@ impl ConfigBundle {
     pub fn computed_digest(&self) -> String {
         let mut lines = Vec::new();
         lines.push(format!("id\0{}", self.metadata.id));
-        lines.push(format!("revision\0{}", self.metadata.revision));
         lines.push(format!("workspace_id\0{}", self.metadata.workspace_id));
         lines.push(format!("created_at\0{}", self.metadata.created_at));
         lines.push(format!(
@@ -82,7 +81,7 @@ impl ConfigBundle {
         if let Some(prompt_catalog) = &self.prompt_catalog {
             lines.push(format!(
                 "prompt_catalog\0{}\0{}\0{}\0{}",
-                prompt_catalog.config_revision,
+                prompt_catalog.source_digest,
                 prompt_catalog.schema_fingerprint,
                 prompt_catalog.toolchain_fingerprint,
                 prompt_catalog.catalog_digest
@@ -100,12 +99,8 @@ impl ConfigBundle {
         }
         if let Some(handle) = &self.profile_source_archive_handle {
             lines.push(format!(
-                "profile_archive_handle\0{}\0{}\0{}\0{}\0{}",
-                handle.workspace_id,
-                handle.resource_id,
-                handle.digest,
-                handle.revision,
-                handle.max_bytes
+                "profile_archive_handle\0{}\0{}\0{}\0{}",
+                handle.workspace_id, handle.resource_id, handle.digest, handle.max_bytes
             ));
             for (selector, path) in handle
                 .profile_source_graph
@@ -140,7 +135,6 @@ impl ConfigBundle {
             id: self.metadata.id.clone(),
             digest: self.metadata.digest.clone(),
             digest_algorithm: CONFIG_BUNDLE_DIGEST_ALGORITHM.to_string(),
-            revision: self.metadata.revision.clone(),
             workspace_id: self.metadata.workspace_id.clone(),
             created_at: self.metadata.created_at.clone(),
             provenance: self.metadata.provenance.clone(),
@@ -182,7 +176,6 @@ impl From<ConfigBundle> for server_api::WorkspaceRuntimeConfigResponse {
             prompt_catalog: prompt_catalog.map(|catalog| {
                 server_api::WorkspaceRuntimePromptCatalog {
                     templates: catalog.templates,
-                    config_revision: catalog.config_revision,
                     source_digest: catalog.source_digest,
                     schema_fingerprint: catalog.schema_fingerprint,
                     toolchain_fingerprint: catalog.toolchain_fingerprint,
@@ -200,7 +193,6 @@ impl From<ConfigBundleMetadata> for server_api::WorkspaceRuntimeConfigMetadata {
         Self {
             id: metadata.id,
             digest: metadata.digest,
-            revision: metadata.revision,
             workspace_id: metadata.workspace_id,
             created_at: metadata.created_at,
             provenance: metadata.provenance.into(),
@@ -303,8 +295,6 @@ impl From<BackendResourceHandle> for server_api::WorkspaceRuntimeResourceHandle 
             operation: handle.operation.into(),
             expires_at_unix_seconds: handle.expires_at_unix_seconds,
             nonce: handle.nonce,
-            revision: handle.revision,
-            generation: handle.generation,
             max_bytes: handle.max_bytes,
             content_type: handle.content_type,
             redaction: handle.redaction.into(),
@@ -344,7 +334,6 @@ impl From<ResourceRedactionPolicy> for server_api::WorkspaceRuntimeResourceRedac
 pub struct ConfigBundleMetadata {
     pub id: String,
     pub digest: String,
-    pub revision: String,
     pub workspace_id: String,
     pub created_at: String,
     pub provenance: ConfigBundleProvenance,
@@ -402,7 +391,6 @@ pub struct ConfigBundleSummary {
     pub id: String,
     pub digest: String,
     pub digest_algorithm: String,
-    pub revision: String,
     pub workspace_id: String,
     pub created_at: String,
     pub provenance: ConfigBundleProvenance,
@@ -422,7 +410,6 @@ pub(crate) fn validate_config_bundle(bundle: &ConfigBundle) -> Result<(), Runtim
     validate_config_bundle_id(&bundle.metadata.id)?;
     validate_non_empty("config bundle digest", &bundle.metadata.digest)?;
     validate_digest("config bundle digest", &bundle.metadata.digest)?;
-    validate_non_empty("config bundle revision", &bundle.metadata.revision)?;
     validate_non_empty("config bundle workspace id", &bundle.metadata.workspace_id)?;
     validate_non_empty("config bundle created_at", &bundle.metadata.created_at)?;
     validate_non_empty(
@@ -430,7 +417,6 @@ pub(crate) fn validate_config_bundle(bundle: &ConfigBundle) -> Result<(), Runtim
         &bundle.metadata.provenance.source,
     )?;
     validate_boundary_text("config bundle id", &bundle.metadata.id)?;
-    validate_boundary_text("config bundle revision", &bundle.metadata.revision)?;
     validate_boundary_text("config bundle workspace id", &bundle.metadata.workspace_id)?;
     validate_boundary_text(
         "config bundle provenance source",
@@ -489,7 +475,6 @@ pub(crate) fn validate_config_bundle(bundle: &ConfigBundle) -> Result<(), Runtim
             ("resource handle resource id", handle.resource_id.as_str()),
             ("resource handle digest", handle.digest.as_str()),
             ("resource handle nonce", handle.nonce.as_str()),
-            ("resource handle revision", handle.revision.as_str()),
             ("resource handle content type", handle.content_type.as_str()),
             (
                 "resource handle audit correlation id",
@@ -766,7 +751,6 @@ mod tests {
             metadata: ConfigBundleMetadata {
                 id: "bundle-1".to_string(),
                 digest: String::new(),
-                revision: "rev-1".to_string(),
                 workspace_id: "workspace-1".to_string(),
                 created_at: "2026-06-26T00:00:00Z".to_string(),
                 provenance: ConfigBundleProvenance {
@@ -823,7 +807,6 @@ mod tests {
         bundle.prompt_catalog = Some(
             worker::EffectivePromptCatalog::new(
                 std::collections::BTreeMap::from([("default".to_string(), "hello".to_string())]),
-                7,
                 "schema",
                 "toolchain",
             )
@@ -866,8 +849,6 @@ mod tests {
             operation: crate::resource::BackendResourceOperation::FetchArchive,
             expires_at_unix_seconds: 4_102_444_800,
             nonce: "nonce-not-for-browser".to_string(),
-            revision: "rev-1".to_string(),
-            generation: Some(1),
             max_bytes: 128,
             content_type: crate::resource::PROFILE_SOURCE_ARCHIVE_CONTENT_TYPE.to_string(),
             redaction: crate::resource::ResourceRedactionPolicy::RuntimeInternalOnly,

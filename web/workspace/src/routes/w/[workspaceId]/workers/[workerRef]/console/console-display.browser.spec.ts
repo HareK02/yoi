@@ -94,7 +94,7 @@ function pageData(workerId = "worker-a", runtimeId = "runtime-a") {
 function emptySession(): SessionSnapshot {
   return {
     pending_submissions: {
-      revision: 0,
+
       notification_count: 0,
       head_id: null,
       submissions: [],
@@ -591,13 +591,13 @@ function subworkerFrame() {
   session.entries.push(reply, { ...reply, entry_id: "child-reply-2" });
   const snapshot = snapshotEvent(sessionWithUserMessage("parent question")) as Extract<ProtocolEvent, { event: "snapshot" }>;
   snapshot.data.internal_workers = [{
-    worker: child, revision: 5, session, status: "idle",
+    worker: child, session, status: "idle",
     in_flight: { blocks: [] }, internal_workers: [],
   }];
   const frame = subscribedFrame();
-  frame.message.payload.snapshot.data.events = [snapshot, ...[6, 7].map((revision): ProtocolEvent => ({
+  frame.message.payload.snapshot.data.events = [snapshot, ...[reply, reply].map((entry): ProtocolEvent => ({
     event: "internal_worker", data: {
-      worker: child, revision, event: { event: "session_entry_committed", data: { entry: reply } },
+      worker: child, event: { event: "session_entry_committed", data: { entry } },
     },
   }))];
   return frame;
@@ -782,13 +782,13 @@ test.each([
   expect(form.children).toHaveLength(1);
 });
 
-test("pending inputs show literal previews above Composer with revision-fenced icon actions", async () => {
+test("pending inputs show literal previews above Composer with submission-identity icon actions", async () => {
   vi.stubGlobal("fetch", vi.fn(async () => Response.json({ availability: "live_protocol" })));
   const view = render(ConsolePage, { data: pageData() });
   await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
   const session = emptySession();
   session.pending_submissions = {
-    revision: 7, head_id: "private-submission-id", notification_count: 1,
+    head_id: "private-submission-id", notification_count: 1,
     notification_previews: ["<b>通知内容</b>"],
     submissions: [
       { submission_id: "private-submission-id", preview: "<b>実際の入力</b> " + "長文".repeat(100), accepted_at_ms: 1, segment_count: 1, byte_len: 500 },
@@ -820,14 +820,14 @@ test("pending inputs show literal previews above Composer with revision-fenced i
   await fireEvent.click(cancel);
   expect(multiplexer.sendWorkerMethod).toHaveBeenLastCalledWith({
     method: "cancel_pending_submission",
-    params: { submission_id: "private-submission-id", expected_revision: 7 },
+    params: { submission_id: "private-submission-id" },
   });
   // Do not remove a row optimistically before the authoritative snapshot arrives.
   expect(queue.querySelectorAll("li")).toHaveLength(2);
   latestListener().onFrame({ frame: "event", message: { event: "event", data: {
     payload: { event: "worker_protocol", data: { worker_id: "worker-a", event: {
       event: "pending_submissions_changed", data: { pending: {
-        ...session.pending_submissions, revision: 8, head_id: "legacy-submission-id",
+        ...session.pending_submissions, head_id: "legacy-submission-id",
         submissions: session.pending_submissions.submissions.slice(1),
       } },
     } } },
@@ -836,7 +836,7 @@ test("pending inputs show literal previews above Composer with revision-fenced i
   expect(notifications.textContent).toContain("<b>通知内容</b>");
   await fireEvent.click(screen.getByRole("button", { name: "Cancel queued input 1" }));
   expect(multiplexer.sendWorkerMethod).toHaveBeenLastCalledWith({
-    method: "cancel_pending_submission", params: { submission_id: "legacy-submission-id", expected_revision: 8 },
+    method: "cancel_pending_submission", params: { submission_id: "legacy-submission-id" },
   });
   latestListener().onFrame(subscribedFrame(emptySession()));
   await waitFor(() => expect(screen.queryByRole("region", { name: "Pending activations" })).toBeNull());

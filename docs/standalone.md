@@ -41,7 +41,7 @@ On explicit selected-Subject Host startup, reserved Jobs resume automatically. A
 
 ## Memory and historical Sessions
 
-The normal body Profile has recall, revision reads, explicit candidate tools, and bounded historical Session exploration. It cannot directly apply Memory. Explicit Remember/Revise without `entry_refs` returns a pending-commit receipt; the Host stages its exact tool-call evidence only after the logical Run is append-only committed. Pre-request retry may defer an open Run, but commit/rewrite failures are not silently treated as success. A candidate remains unconfirmed until the restricted consolidation Job applies or rejects it using the shared CAS/receipt rules.
+The normal body Profile has recall, exact Memory change reads, explicit candidate tools, and bounded historical Session exploration. It cannot directly apply Memory. Explicit Remember/Revise without `entry_refs` returns a pending-commit receipt; the Host stages its exact tool-call evidence only after the logical Run is append-only committed. Pre-request retry may defer an open Run, but commit/rewrite failures are not silently treated as success. A candidate remains unconfirmed until the restricted consolidation Job applies or rejects it using the shared CAS/receipt rules.
 
 Normal extraction uses the existing committed-capture lifecycle, restricted extraction tools, and append-only `subjektiv.extract.v1` pointer. The selected Profile owns extraction thresholds/model policy. An explicit extraction model override chooses that provider, not an injected dialog transport. Local Memory language defaults to English and is stored in operator-managed `subjektiv/language.json`, never loaded from repository policy files.
 

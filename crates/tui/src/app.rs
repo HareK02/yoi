@@ -35,12 +35,20 @@ pub enum CommandCompletionApply {
 /// typing inside a `@` / `#` / `/` token. Cleared whenever the trigger
 /// is invalidated (cursor moved out, whitespace landed inside the
 /// token, the sigil was deleted, or the candidate was confirmed).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct CompletionSnapshot {
-    input_revision: u64,
-    generation: u64,
+    input: crate::input::CompletionInputWatch,
     target: String,
     worker_view: Option<String>,
+}
+
+impl CompletionSnapshot {
+    fn same_context(&self, other: &Self) -> bool {
+        !self.input.is_cancelled()
+            && !other.input.is_cancelled()
+            && self.target == other.target
+            && self.worker_view == other.worker_view
+    }
 }
 
 struct PendingFeatureEdit {
@@ -229,7 +237,6 @@ impl ActionbarNotice {
 
 pub struct InternalWorkerView {
     pub worker: InternalWorkerRef,
-    pub revision: u64,
     pub app: Box<App>,
 }
 
@@ -242,7 +249,7 @@ pub struct WorkerViewTab {
 pub struct App {
     pub worker_name: String,
     pub connected: bool,
-    /// Latest authoritative revisioned live execution state.
+    /// Latest authoritative live execution state.
     pub worker_state: WorkerStateSnapshot,
     next_command_id: u64,
     /// Derived Runtime-catalog compatibility projection used by existing UI.
@@ -297,8 +304,9 @@ pub struct App {
     /// Turn/protocol errors retained when a real `SegmentStart` replaces the
     /// replayable conversation rows during segment rotation.
     run_error_messages: Vec<String>,
-    /// Current compaction identity/revision used to fence snapshot/live updates.
-    active_compaction: Option<(String, u64)>,
+    /// Current compaction operation; terminal IDs cannot reopen on delayed events.
+    active_compaction: Option<String>,
+    terminal_compactions: std::collections::HashSet<String>,
     pub compaction_progress: Option<protocol::InFlightCompaction>,
     /// Presentation-only Internal Worker projections keyed by session identity.
     /// They are rendered in separate selectable views and never mixed into `blocks`.
@@ -307,7 +315,7 @@ pub struct App {
     /// view; the stable session identity survives projection reordering.
     selected_internal_worker_session_id: Option<String>,
     /// Terminal child-session fences, reset only by an authoritative snapshot.
-    removed_internal_workers: HashMap<String, u64>,
+    removed_internal_workers: std::collections::HashSet<String>,
     pub scroll: Scroll,
     pub mode: Mode,
     pub cache: FileCache,
@@ -323,7 +331,6 @@ pub struct App {
     /// typed FeatureInvoke chip.
     selected_feature_invocations: HashMap<String, protocol::FeatureInvocationDescriptor>,
     pending_feature_edit: Option<PendingFeatureEdit>,
-    completion_generation: u64,
     completion_target: String,
     /// Dedicated main-view rewind picker state.
     pub rewind_picker: Option<RewindPickerState>,
@@ -397,11 +404,12 @@ impl App {
             shutdown_confirm: None,
             blocks: Vec::new(),
             active_compaction: None,
+            terminal_compactions: std::collections::HashSet::new(),
             compaction_progress: None,
             run_error_messages: Vec::new(),
             internal_workers: Vec::new(),
             selected_internal_worker_session_id: None,
-            removed_internal_workers: HashMap::new(),
+            removed_internal_workers: std::collections::HashSet::new(),
             scroll: Scroll::default(),
             mode: Mode::Normal,
             cache: FileCache::new(),
@@ -409,7 +417,6 @@ impl App {
             completion: None,
             selected_feature_invocations: HashMap::new(),
             pending_feature_edit: None,
-            completion_generation: 0,
             completion_target: protocol::new_submission_request_id(),
             rewind_picker: None,
             rewind_request_pending: false,
@@ -542,7 +549,7 @@ impl App {
     /// Cycle the presentation-only transcript/task view. Input and control
     /// methods continue to target the parent Worker regardless of selection.
     pub fn cycle_worker_view(&mut self) -> bool {
-        self.invalidate_completion_generation();
+        self.cancel_completion_requests();
         if self.internal_workers.is_empty() {
             self.selected_internal_worker_session_id = None;
             return false;
@@ -604,8 +611,7 @@ impl App {
 
     fn completion_snapshot(&self) -> CompletionSnapshot {
         CompletionSnapshot {
-            input_revision: self.input.revision(),
-            generation: self.completion_generation,
+            input: self.input.watch_completion_input(),
             target: self.completion_target.clone(),
             worker_view: self.selected_internal_worker_session_id.clone(),
         }
@@ -614,14 +620,13 @@ impl App {
     pub(crate) fn set_completion_target(&mut self, target: String) {
         if self.completion_target != target {
             self.completion_target = target;
-            self.invalidate_completion_generation();
+            self.cancel_completion_requests();
             self.selected_feature_invocations.clear();
         }
     }
 
     /// Authority/snapshot/target changes revoke in-flight queries and visible candidates.
-    fn invalidate_completion_generation(&mut self) {
-        self.completion_generation = self.completion_generation.wrapping_add(1);
+    fn cancel_completion_requests(&mut self) {
         self.completion = None;
         self.pending_feature_edit = None;
     }
@@ -672,7 +677,7 @@ impl App {
                         && state.prefix_start == start
                         && state.prefix == prefix
                         && state.context == context
-                        && state.snapshot == snapshot
+                        && state.snapshot.same_context(&snapshot)
                 }) {
                     return None;
                 }
@@ -722,7 +727,7 @@ impl App {
     }
 
     pub fn cancel_completion(&mut self) {
-        self.invalidate_completion_generation();
+        self.cancel_completion_requests();
     }
 
     /// Tab path: insert the popup-selected entry's value (with a
@@ -736,7 +741,7 @@ impl App {
         if self
             .completion
             .as_ref()
-            .is_some_and(|state| state.snapshot != self.completion_snapshot())
+            .is_some_and(|state| !state.snapshot.same_context(&self.completion_snapshot()))
         {
             self.cancel_completion();
             return None;
@@ -885,7 +890,7 @@ impl App {
         if self
             .completion
             .as_ref()
-            .is_some_and(|state| state.snapshot != self.completion_snapshot())
+            .is_some_and(|state| !state.snapshot.same_context(&self.completion_snapshot()))
         {
             self.cancel_completion();
             return false;
@@ -942,7 +947,7 @@ impl App {
         if self
             .completion
             .as_ref()
-            .is_some_and(|state| state.snapshot != self.completion_snapshot())
+            .is_some_and(|state| !state.snapshot.same_context(&self.completion_snapshot()))
         {
             self.cancel_completion();
             return false;
@@ -1248,22 +1253,23 @@ impl App {
 
     pub fn continue_pending_method(&self) -> Option<Method> {
         Some(Method::ContinuePending {
-            expected_revision: self.pending_submissions.revision,
             expected_head_id: self.pending_submissions.head_id.clone()?,
         })
     }
 
     pub fn clear_pending_method(&self) -> Method {
         Method::ClearPendingSubmissions {
-            expected_revision: self.pending_submissions.revision,
+            expected_submission_ids: self
+                .pending_submissions
+                .submissions
+                .iter()
+                .map(|submission| submission.submission_id.clone())
+                .collect(),
         }
     }
 
     pub fn cancel_pending_method(&self, submission_id: String) -> Method {
-        Method::CancelPendingSubmission {
-            submission_id,
-            expected_revision: self.pending_submissions.revision,
-        }
+        Method::CancelPendingSubmission { submission_id }
     }
 
     pub fn next_queued_input_preview(&self) -> Option<&str> {
@@ -1802,14 +1808,13 @@ impl App {
                 });
             }
             Event::CompactStart { lifecycle } => {
-                let should_apply = match &self.active_compaction {
-                    None => true,
-                    Some((id, revision)) => {
-                        id == &lifecycle.compaction_id && lifecycle.revision > *revision
-                    }
-                };
+                let should_apply = !self.terminal_compactions.contains(&lifecycle.compaction_id)
+                    && self
+                        .active_compaction
+                        .as_ref()
+                        .is_none_or(|id| id == &lifecycle.compaction_id);
                 if should_apply {
-                    self.active_compaction = Some((lifecycle.compaction_id, lifecycle.revision));
+                    self.active_compaction = Some(lifecycle.compaction_id);
                     if self.last_streaming_compact_mut().is_none() {
                         self.blocks.push(Block::Compact(CompactEvent::Streaming {
                             started_at: Instant::now(),
@@ -1818,15 +1823,16 @@ impl App {
                 }
             }
             Event::CompactDone { lifecycle } => {
-                let should_apply = match &self.active_compaction {
-                    None => true,
-                    Some((id, revision)) => {
-                        id == &lifecycle.compaction_id && lifecycle.revision > *revision
-                    }
-                };
+                let should_apply = !self.terminal_compactions.contains(&lifecycle.compaction_id)
+                    && self
+                        .active_compaction
+                        .as_ref()
+                        .is_none_or(|id| id == &lifecycle.compaction_id);
                 if !should_apply {
                     return None;
                 }
+                self.terminal_compactions
+                    .insert(lifecycle.compaction_id.clone());
                 self.active_compaction = None;
                 let new_segment_id = lifecycle
                     .new_segment_id
@@ -1852,15 +1858,16 @@ impl App {
                 }
             }
             Event::CompactFailed { lifecycle } => {
-                let should_apply = match &self.active_compaction {
-                    None => true,
-                    Some((id, revision)) => {
-                        id == &lifecycle.compaction_id && lifecycle.revision > *revision
-                    }
-                };
+                let should_apply = !self.terminal_compactions.contains(&lifecycle.compaction_id)
+                    && self
+                        .active_compaction
+                        .as_ref()
+                        .is_none_or(|id| id == &lifecycle.compaction_id);
                 if !should_apply {
                     return None;
                 }
+                self.terminal_compactions
+                    .insert(lifecycle.compaction_id.clone());
                 self.active_compaction = None;
                 let error = lifecycle
                     .error
@@ -1915,14 +1922,10 @@ impl App {
                 self.replace_internal_worker_snapshots(internal_workers);
                 return self.refresh_completion();
             }
-            Event::InternalWorker {
-                worker,
-                revision,
-                event,
-            } => self.apply_internal_worker_event(worker, revision, *event),
-            Event::InternalWorkerRemoved { worker, revision } => {
-                self.remove_internal_worker(worker, revision)
+            Event::InternalWorker { worker, event } => {
+                self.apply_internal_worker_event(worker, *event)
             }
+            Event::InternalWorkerRemoved { worker } => self.remove_internal_worker(worker),
             Event::WorkerState { snapshot } => {
                 self.rewind_refresh_fence = false;
                 self.apply_worker_state_snapshot(&snapshot);
@@ -1956,7 +1959,7 @@ impl App {
                     && self.pending_feature_edit.as_ref().is_some_and(|edit| {
                         edit.invocation.name == prefix
                             && request_id.as_ref() == Some(&edit.request_id)
-                            && edit.snapshot == snapshot
+                            && edit.snapshot.same_context(&snapshot)
                     })
                 {
                     let invocation = self.pending_feature_edit.take().unwrap().invocation;
@@ -1981,7 +1984,7 @@ impl App {
                 // stale argument/provider replies cannot cross invocation scope.
                 if let Some(state) = self.completion.as_mut()
                     && request_id.as_ref() == Some(&state.request_id)
-                    && state.snapshot == snapshot
+                    && state.snapshot.same_context(&snapshot)
                     && state.kind == kind
                     && state.prefix == prefix
                     && state.context == context
@@ -2100,7 +2103,7 @@ impl App {
                 );
             }
             Event::Shutdown => {
-                self.invalidate_completion_generation();
+                self.cancel_completion_requests();
                 self.mark_orphan_compacts_incomplete();
                 self.quit = true;
             }
@@ -2309,7 +2312,7 @@ impl App {
     }
 
     pub fn enter_command_mode(&mut self) {
-        self.invalidate_completion_generation();
+        self.cancel_completion_requests();
         self.input_mode = CommandInputMode::Command;
         self.completion = None;
         self.command_completion_selected = None;
@@ -2317,7 +2320,7 @@ impl App {
     }
 
     pub fn exit_command_mode(&mut self) {
-        self.invalidate_completion_generation();
+        self.cancel_completion_requests();
         self.input_mode = CommandInputMode::Composer;
         self.command_input.clear();
         self.command_completion_selected = None;
@@ -2445,7 +2448,7 @@ impl App {
     }
 
     pub fn request_rewind_picker(&mut self) -> Option<Method> {
-        self.invalidate_completion_generation();
+        self.cancel_completion_requests();
         // Rewind is a parent Worker control surface. Bring the parent transcript
         // back into view before presenting diagnostics or the picker.
         self.selected_internal_worker_session_id = None;
@@ -2791,21 +2794,12 @@ impl App {
         app.replace_internal_worker_snapshots(snapshot.internal_workers);
         InternalWorkerView {
             worker: snapshot.worker,
-            revision: snapshot.revision,
             app: Box::new(app),
         }
     }
 
-    fn apply_internal_worker_event(
-        &mut self,
-        worker: InternalWorkerRef,
-        revision: u64,
-        event: Event,
-    ) {
-        if self
-            .removed_internal_workers
-            .contains_key(&worker.session_id)
-        {
+    fn apply_internal_worker_event(&mut self, worker: InternalWorkerRef, event: Event) {
+        if self.removed_internal_workers.contains(&worker.session_id) {
             return;
         }
         let index = self
@@ -2819,21 +2813,16 @@ impl App {
             app.mode = self.mode;
             self.internal_workers.push(InternalWorkerView {
                 worker: worker.clone(),
-                revision: 0,
                 app: Box::new(app),
             });
             self.internal_workers.last_mut().unwrap()
         };
-        if revision <= target.revision {
-            return;
-        }
         target.worker = worker;
-        target.revision = revision;
         let _ = target.app.handle_worker_event(event);
     }
 
-    fn remove_internal_worker(&mut self, worker: InternalWorkerRef, revision: u64) {
-        self.invalidate_completion_generation();
+    fn remove_internal_worker(&mut self, worker: InternalWorkerRef) {
+        self.cancel_completion_requests();
         let session_id = worker.session_id;
         let Some(index) = self
             .internal_workers
@@ -2843,20 +2832,14 @@ impl App {
             if self.selected_internal_worker_session_id.as_deref() == Some(session_id.as_str()) {
                 self.selected_internal_worker_session_id = None;
             }
-            self.removed_internal_workers
-                .entry(session_id)
-                .and_modify(|current| *current = (*current).max(revision))
-                .or_insert(revision);
+            self.removed_internal_workers.insert(session_id);
             return;
         };
-        if revision <= self.internal_workers[index].revision {
-            return;
-        }
         self.internal_workers.remove(index);
         if self.selected_internal_worker_session_id.as_deref() == Some(session_id.as_str()) {
             self.selected_internal_worker_session_id = None;
         }
-        self.removed_internal_workers.insert(session_id, revision);
+        self.removed_internal_workers.insert(session_id);
     }
 
     fn restore_snapshot(
@@ -2918,7 +2901,7 @@ impl App {
         session: &protocol::SessionSnapshot,
         greeting: Option<protocol::Greeting>,
     ) {
-        self.invalidate_completion_generation();
+        self.cancel_completion_requests();
         self.run_error_messages.clear();
         self.turn_index = 0;
         self.blocks.clear();
@@ -4102,7 +4085,6 @@ mod completion_flow_tests {
         let mut app = App::new("test".into());
         app.handle_worker_event(Event::PendingSubmissionsChanged {
             pending: protocol::PendingSubmissionsSnapshot {
-                revision: 3,
                 notification_count: 0,
                 notification_previews: vec![],
                 head_id: Some("submission-1".into()),
@@ -4497,34 +4479,25 @@ mod completion_flow_tests {
         };
         app.handle_worker_event(Event::InternalWorker {
             worker: worker.clone(),
-            revision: 2,
             event: Box::new(Event::TextDelta {
                 text: "child output".into(),
             }),
         });
         app.handle_worker_event(Event::InternalWorker {
             worker,
-            revision: 1,
             event: Box::new(Event::TextDelta {
-                text: "stale".into(),
+                text: " next".into(),
             }),
         });
 
         assert!(app.blocks.is_empty());
         assert_eq!(app.internal_workers.len(), 1);
-        assert_eq!(app.internal_workers[0].revision, 2);
-        assert!(
-            app.internal_workers[0].app.blocks.iter().any(
-                |block| matches!(block, Block::AssistantText { text } if text == "child output")
-            )
-        );
+        assert!(app.internal_workers[0].app.blocks.iter().any(
+            |block| matches!(block, Block::AssistantText { text } if text == "child output next")
+        ));
     }
 
-    fn test_internal_worker_snapshot(
-        session_id: &str,
-        name: &str,
-        revision: u64,
-    ) -> InternalWorkerSnapshot {
+    fn test_internal_worker_snapshot(session_id: &str, name: &str) -> InternalWorkerSnapshot {
         InternalWorkerSnapshot {
             worker: InternalWorkerRef {
                 session_id: session_id.into(),
@@ -4532,7 +4505,6 @@ mod completion_flow_tests {
                 parent_session_id: Some("parent".into()),
                 kind: protocol::InternalWorkerKind::SubWorker,
             },
-            revision,
             status: WorkerStatus::Idle,
             greeting: None,
             session: protocol::SessionSnapshot {
@@ -4548,7 +4520,7 @@ mod completion_flow_tests {
     #[test]
     fn internal_worker_snapshot_uses_child_greeting_metadata() {
         let mut app = App::new("parent".into());
-        let mut child = test_internal_worker_snapshot("child", "research", 1);
+        let mut child = test_internal_worker_snapshot("child", "research");
         let mut greeting = test_greeting();
         greeting.worker_name = "research".into();
         greeting.model = "child-model".into();
@@ -4570,7 +4542,7 @@ mod completion_flow_tests {
     #[test]
     fn live_internal_worker_snapshot_installs_child_metadata_before_context_updates() {
         let mut app = App::new("parent".into());
-        let worker = test_internal_worker_snapshot("child", "research", 1).worker;
+        let worker = test_internal_worker_snapshot("child", "research").worker;
         let mut greeting = test_greeting();
         greeting.worker_name = "research".into();
         greeting.model = "child-model".into();
@@ -4582,7 +4554,6 @@ mod completion_flow_tests {
 
         app.handle_worker_event(Event::InternalWorker {
             worker: worker.clone(),
-            revision: 1,
             event: Box::new(Event::Snapshot {
                 session: protocol::SessionSnapshot {
                     pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
@@ -4596,7 +4567,6 @@ mod completion_flow_tests {
         });
         app.handle_worker_event(Event::InternalWorker {
             worker,
-            revision: 2,
             event: Box::new(Event::ContextUsage {
                 usage: Some(protocol::ContextUsage {
                     tokens: 14_000,
@@ -4626,7 +4596,6 @@ mod completion_flow_tests {
                     parent_session_id: Some("parent".into()),
                     kind: protocol::InternalWorkerKind::SubWorker,
                 },
-                revision: 1,
                 app: Box::new(App::new(name.into())),
             });
         }
@@ -4664,7 +4633,7 @@ mod completion_flow_tests {
 
         let mut app = App::new("parent".into());
         app.replace_internal_worker_snapshots(vec![test_internal_worker_snapshot(
-            "child", "child", 1,
+            "child", "child",
         )]);
         select_first_row(&mut app, "parent selection");
         select_first_row(app.internal_workers[0].app.as_mut(), "child selection");
@@ -4687,7 +4656,6 @@ mod completion_flow_tests {
                 parent_session_id: Some("parent".into()),
                 kind: protocol::InternalWorkerKind::SubWorker,
             },
-            revision: 1,
             app: Box::new(App::new("old".into())),
         });
         app.cycle_worker_view();
@@ -4711,7 +4679,7 @@ mod completion_flow_tests {
 
         let mut app = App::new("parent".into());
         app.replace_internal_worker_snapshots(vec![test_internal_worker_snapshot(
-            "child", "child", 1,
+            "child", "child",
         )]);
         let child = app.internal_workers[0].app.as_mut();
         child.scroll.follow_tail = false;
@@ -4733,11 +4701,9 @@ mod completion_flow_tests {
         app.replace_internal_worker_snapshots(vec![test_internal_worker_snapshot(
             "child",
             "renamed-child",
-            2,
         )]);
 
         let view = &app.internal_workers[0];
-        assert_eq!(view.revision, 2);
         assert_eq!(view.app.worker_name, "renamed-child");
         assert!(!view.app.scroll.follow_tail);
         assert_eq!(view.app.scroll.top_offset, 7);
@@ -4749,8 +4715,8 @@ mod completion_flow_tests {
     fn task_pane_scroll_is_local_to_selected_worker_view() {
         let mut app = App::new("parent".into());
         app.replace_internal_worker_snapshots(vec![
-            test_internal_worker_snapshot("child-a", "alpha", 1),
-            test_internal_worker_snapshot("child-b", "beta", 1),
+            test_internal_worker_snapshot("child-a", "alpha"),
+            test_internal_worker_snapshot("child-b", "beta"),
         ]);
         app.task_pane_scroll = 3;
 
@@ -4793,10 +4759,8 @@ mod completion_flow_tests {
         };
         app.handle_worker_event(Event::InternalWorker {
             worker: worker.clone(),
-            revision: 2,
             event: Box::new(Event::InternalWorker {
                 worker: nested,
-                revision: 1,
                 event: Box::new(Event::TextDone {
                     text: "nested".into(),
                 }),
@@ -4809,11 +4773,9 @@ mod completion_flow_tests {
 
         app.handle_worker_event(Event::InternalWorkerRemoved {
             worker: worker.clone(),
-            revision: 3,
         });
         app.handle_worker_event(Event::InternalWorker {
             worker,
-            revision: 4,
             event: Box::new(Event::TextDone {
                 text: "late".into(),
             }),
@@ -4836,7 +4798,7 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn stale_internal_worker_removal_keeps_newer_projection() {
+    fn internal_worker_removal_applies_in_stream_order() {
         let mut app = App::new("parent".into());
         let worker = InternalWorkerRef {
             session_id: "child-session".into(),
@@ -4846,18 +4808,13 @@ mod completion_flow_tests {
         };
         app.handle_worker_event(Event::InternalWorker {
             worker: worker.clone(),
-            revision: 4,
             event: Box::new(Event::TextDone {
                 text: "current".into(),
             }),
         });
-        app.handle_worker_event(Event::InternalWorkerRemoved {
-            worker,
-            revision: 3,
-        });
+        app.handle_worker_event(Event::InternalWorkerRemoved { worker });
 
-        assert_eq!(app.internal_workers.len(), 1);
-        assert_eq!(app.internal_workers[0].revision, 4);
+        assert!(app.internal_workers.is_empty());
     }
 
     #[test]
@@ -4870,7 +4827,6 @@ mod completion_flow_tests {
                 parent_session_id: None,
                 kind: protocol::InternalWorkerKind::SubWorker,
             },
-            revision: 1,
             app: Box::new(App::new("old".into())),
         });
         app.handle_worker_event(Event::Snapshot {
@@ -4888,7 +4844,6 @@ mod completion_flow_tests {
                     parent_session_id: Some("parent-session".into()),
                     kind: protocol::InternalWorkerKind::SubWorker,
                 },
-                revision: 4,
                 session: protocol::SessionSnapshot {
                     pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                     entries: Vec::new(),
@@ -4903,7 +4858,6 @@ mod completion_flow_tests {
 
         assert_eq!(app.internal_workers.len(), 1);
         assert_eq!(app.internal_workers[0].worker.session_id, "replacement");
-        assert_eq!(app.internal_workers[0].revision, 4);
         assert_eq!(
             app.internal_workers[0].app.worker_status,
             WorkerStatus::Running
@@ -4955,7 +4909,6 @@ mod completion_flow_tests {
         protocol::CompactionLifecycle {
             schema_version: 2,
             compaction_id: "compaction-test".into(),
-            revision: 1,
             internal_worker: None,
             state,
             started_at_ms: 1,
@@ -4975,7 +4928,6 @@ mod completion_flow_tests {
             lifecycle: test_compaction_lifecycle(protocol::CompactionLifecycleState::Running),
         });
         let mut lifecycle = test_compaction_lifecycle(protocol::CompactionLifecycleState::Done);
-        lifecycle.revision = 2;
         lifecycle.new_segment_id = Some(id.to_string());
         app.handle_worker_event(Event::CompactDone { lifecycle });
 
@@ -4990,6 +4942,25 @@ mod completion_flow_tests {
     }
 
     #[test]
+    fn terminal_compaction_identity_rejects_duplicate_and_delayed_start() {
+        let mut app = App::new("test".into());
+        app.handle_worker_event(Event::CompactStart {
+            lifecycle: test_compaction_lifecycle(protocol::CompactionLifecycleState::Running),
+        });
+        app.handle_worker_event(Event::CompactDone {
+            lifecycle: test_compaction_lifecycle(protocol::CompactionLifecycleState::Done),
+        });
+        app.handle_worker_event(Event::CompactStart {
+            lifecycle: test_compaction_lifecycle(protocol::CompactionLifecycleState::Running),
+        });
+        app.handle_worker_event(Event::CompactDone {
+            lifecycle: test_compaction_lifecycle(protocol::CompactionLifecycleState::Done),
+        });
+        assert_eq!(compact_block_count(&app), 1);
+        assert!(app.active_compaction.is_none());
+    }
+
+    #[test]
     fn compact_failed_replaces_live_block() {
         let mut app = App::new("test".into());
 
@@ -4997,7 +4968,6 @@ mod completion_flow_tests {
             lifecycle: test_compaction_lifecycle(protocol::CompactionLifecycleState::Running),
         });
         let mut lifecycle = test_compaction_lifecycle(protocol::CompactionLifecycleState::Failed);
-        lifecycle.revision = 2;
         lifecycle.error = Some("provider 429".into());
         app.handle_worker_event(Event::CompactFailed { lifecycle });
 
@@ -5662,7 +5632,7 @@ mod completion_correlation_tests {
         let first = app.refresh_completion().unwrap();
         app.input.insert_char('x');
         app.input.delete_before();
-        // Prefix, context, token location, and cursor are identical; semantic revision is not.
+        // Returning to the same text cannot revive a request cancelled by the edit.
         app.handle_worker_event(reply(&first, "old"));
         assert!(app.completion.as_ref().unwrap().entries.is_empty());
         let second = app.refresh_completion().unwrap();
@@ -5734,7 +5704,7 @@ mod completion_correlation_tests {
     }
 
     #[test]
-    fn permission_snapshot_generation_aba_revokes_queries_even_when_scope_returns_to_original() {
+    fn permission_snapshot_aba_revokes_queries_even_when_scope_returns_to_original() {
         let mut app = App::new("test".into());
         app.handle_worker_event(authority_snapshot("Writable: /tmp"));
         crate::invocation_tests::select(&mut app, crate::invocation_tests::descriptor(), "run");
@@ -5748,8 +5718,8 @@ mod completion_correlation_tests {
             .unwrap();
         assert_ne!(request_id(&first), request_id(&denied));
         assert_ne!(request_id(&first), request_id(&current));
-        app.handle_worker_event(reply(&first, "old permission generation"));
-        app.handle_worker_event(reply(&denied, "intermediate generation"));
+        app.handle_worker_event(reply(&first, "old permission context"));
+        app.handle_worker_event(reply(&denied, "intermediate context"));
         assert!(app.completion.as_ref().unwrap().entries.is_empty());
         app.handle_worker_event(reply(&current, "資料/current"));
         assert_eq!(
@@ -5789,7 +5759,6 @@ mod completion_correlation_tests {
                 parent_session_id: Some("parent".into()),
                 kind: protocol::InternalWorkerKind::SubWorker,
             },
-            revision: 1,
             event: Box::new(Event::WorkerState {
                 snapshot: protocol::WorkerStateSnapshot::from(WorkerStatus::Idle),
             }),

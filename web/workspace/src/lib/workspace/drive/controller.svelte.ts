@@ -15,7 +15,7 @@ import {
 export type DriveDraft = {
   text: string;
   baseText: string;
-  expectedRevision: string;
+  expectedMutationId: string;
   contentType: string;
   conflict: boolean;
 };
@@ -42,7 +42,7 @@ export type DriveControllerState = {
 };
 type ReceiptRecord = {
   receipt: DriveReceipt;
-  saved?: { text: string; revision: string };
+  saved?: { text: string; last_mutation_id: string };
 };
 const empty = (): DriveControllerState => ({
   workspaceId: null,
@@ -208,7 +208,7 @@ export class DriveController {
         if (!this.current(generation)) return;
         let draft = this.drafts.get(k) ?? null;
         // Clean acknowledged drafts may refresh, but dirty/conflicted drafts
-        // and unresolved requests must keep their original CAS revision.
+        // and unresolved requests must keep their original CAS last_mutation_id.
         const unresolved = this.currentReceipts(k).some((receipt) =>
           receipt.state === "pending" || receipt.state === "unknown"
         );
@@ -225,7 +225,7 @@ export class DriveController {
           draft = {
             text: result.text,
             baseText: result.text,
-            expectedRevision: result.entry.revision,
+            expectedMutationId: result.entry.last_mutation_id,
             contentType: result.entry.content_type ?? "text/plain",
             conflict: false,
           };
@@ -354,11 +354,11 @@ export class DriveController {
         this.client.mutate(s.ws, id, {
           operation: "update_text",
           id: s.entry.entry,
-          expected_revision: draft.expectedRevision,
+          expected_mutation_id: draft.expectedMutationId,
           text: draft.text,
           content_type: draft.contentType,
         }, signal),
-      { text: draft.text, revision: draft.expectedRevision },
+      { text: draft.text, last_mutation_id: draft.expectedMutationId },
     );
   }
   async mutate(mutation: DriveMutation): Promise<string> {
@@ -453,13 +453,13 @@ export class DriveController {
     const draft = this.drafts.get(k);
     if (
       record.saved && draft && entry &&
-      draft.expectedRevision === record.saved.revision &&
+      draft.expectedMutationId === record.saved.last_mutation_id &&
       entry.entry.node_id === this.value.entry?.entry.node_id
     ) {
       const updated = {
         ...draft,
         baseText: record.saved.text,
-        expectedRevision: entry.revision,
+        expectedMutationId: entry.last_mutation_id,
         conflict: false,
       };
       this.drafts.set(k, updated);

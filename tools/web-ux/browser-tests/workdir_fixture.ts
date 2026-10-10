@@ -41,7 +41,6 @@ export function workdirFixture() {
     workspace_id: workspace,
     runtime_id: "fixture-runtime",
     generated_at: "2026-01-01T00:00:00Z",
-    revision: "plan-1",
     digest: "digest-1",
     workers: [],
     diagnostics: [],

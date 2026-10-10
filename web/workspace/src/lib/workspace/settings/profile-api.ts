@@ -146,7 +146,7 @@ export function parseWorkspaceMetadataSettingsResponse(
       "workspace_id",
       "display_name",
       "created_at",
-      "revision",
+      "updated_at",
       "source",
       "diagnostics",
     ],
@@ -157,7 +157,7 @@ export function parseWorkspaceMetadataSettingsResponse(
     workspace_id: stringValue(item.workspace_id, "Workspace metadata"),
     display_name: stringValue(item.display_name, "Workspace metadata"),
     created_at: stringValue(item.created_at, "Workspace metadata"),
-    revision: stringValue(item.revision, "Workspace metadata"),
+    updated_at: stringValue(item.updated_at, "Workspace metadata"),
     source: stringValue(item.source, "Workspace metadata"),
     diagnostics: arrayValue(
       item.diagnostics,
@@ -237,7 +237,6 @@ function parseWorkspaceProfileSourceSummary(
       "content_digest",
       "provenance",
       "editable",
-      "revision",
       "size_bytes",
       "diagnostics",
     ],
@@ -269,7 +268,6 @@ function parseWorkspaceProfileSourceSummary(
     content_digest: stringValue(item.content_digest, "Profile source catalog"),
     provenance: provenance as WorkspaceProfileSourceProvenance,
     editable: booleanValue(item.editable, "Profile source catalog"),
-    revision: stringValue(item.revision, "Profile source catalog"),
     size_bytes: sizeBytes,
     diagnostics: arrayValue(
       item.diagnostics,
@@ -285,14 +283,12 @@ export function parseProfileSettingsResponse(
   const item = record(value, "Profile settings");
   exactKeys(
     item,
-    ["workspace_id", "registry_revision", "profiles", "sources", "diagnostics"],
-    ["config_revision", "tree_digest", "projection_digest", "default_profile"],
+    ["workspace_id", "profiles", "sources", "diagnostics"],
+    ["tree_digest", "projection_digest", "default_profile"],
     "Profile settings",
   );
   return {
     workspace_id: stringValue(item.workspace_id, "Profile settings"),
-    registry_revision: stringValue(item.registry_revision, "Profile settings"),
-    config_revision: optionalRevision(item.config_revision, "Profile settings"),
     tree_digest: optionalString(item.tree_digest, "Profile settings"),
     projection_digest: optionalString(
       item.projection_digest,
@@ -330,7 +326,7 @@ export function parseWorkspaceSigningIdentityResponse(
   const identityItem = record(item.identity, "Workspace signing identity");
   exactKeys(
     identityItem,
-    ["workspace_id", "key_id", "algorithm", "revision", "state", "created_at"],
+    ["workspace_id", "key_id", "algorithm", "state", "created_at"],
     ["public_key", "public_key_fingerprint", "provisioned_at"],
     "Workspace signing identity",
   );
@@ -340,16 +336,6 @@ export function parseWorkspaceSigningIdentityResponse(
     32,
   );
   if (state !== "pending_provisioning" && state !== "active") {
-    throw new ProfileApiError(
-      "Workspace signing identity returned an invalid response.",
-      502,
-    );
-  }
-  const revision = optionalRevision(
-    identityItem.revision,
-    "Workspace signing identity",
-  );
-  if (revision === undefined || revision === null || revision < 1) {
     throw new ProfileApiError(
       "Workspace signing identity returned an invalid response.",
       502,
@@ -392,7 +378,6 @@ export function parseWorkspaceSigningIdentityResponse(
     ...(fingerprint === undefined || fingerprint === null
       ? {}
       : { public_key_fingerprint: fingerprint }),
-    revision,
     state: state as WorkspaceSigningIdentityState,
     created_at: boundedStringValue(
       identityItem.created_at,
@@ -419,24 +404,10 @@ export function parseWorkspaceSigningIdentityResponse(
         "algorithm",
         "public_key",
         "public_key_fingerprint",
-        "revision",
       ],
       [],
       "Workspace public identity bundle",
     );
-    const bundleRevision = optionalRevision(
-      bundle.revision,
-      "Workspace public identity bundle",
-    );
-    if (
-      bundleRevision === undefined || bundleRevision === null ||
-      bundleRevision < 1
-    ) {
-      throw new ProfileApiError(
-        "Workspace public identity bundle returned an invalid response.",
-        502,
-      );
-    }
     publicBundle = {
       workspace_id: boundedStringValue(
         bundle.workspace_id,
@@ -468,7 +439,6 @@ export function parseWorkspaceSigningIdentityResponse(
         "Workspace public identity bundle",
         128,
       ),
-      revision: bundleRevision,
     };
   }
   if (
@@ -478,8 +448,7 @@ export function parseWorkspaceSigningIdentityResponse(
       publicBundle.key_id !== identity.key_id ||
       publicBundle.algorithm !== identity.algorithm ||
       publicBundle.public_key !== identity.public_key ||
-      publicBundle.public_key_fingerprint !== identity.public_key_fingerprint ||
-      publicBundle.revision !== identity.revision
+      publicBundle.public_key_fingerprint !== identity.public_key_fingerprint
     )
   ) {
     throw new ProfileApiError(

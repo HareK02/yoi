@@ -33,7 +33,6 @@ export type SkillProvenance = {
   kind: SkillSourceKind;
   id: string;
   virtual_path?: string;
-  revision?: number;
   source_digest?: string;
   tree_digest?: string;
 };
@@ -42,10 +41,7 @@ export type SkillActivationStatus = "active" | "inactive";
 
 export type SkillProjectionStatus = "valid" | "invalid";
 
-export type SkillProjectionIdentity = {
-  config_revision: number;
-  tree_digest: string;
-};
+export type SkillProjectionIdentity = { tree_digest: string };
 
 export type SkillResourceRef = {
   kind: string;

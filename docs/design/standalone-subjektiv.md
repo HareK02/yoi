@@ -18,6 +18,8 @@ Validation must distinguish scripted model/Host and real test-owned process/lock
 
 ## Implemented boundaries and validation
 
+The validation counts and former API terminology below record T-709 at the cited source, not new executions. Current Memory changes and Job input-digest bindings follow [the store contract](subjektiv-store.md) and [the Job contract](standalone-jobs.md).
+
 - `feature-storage` owns the shared SQLite connection policy/Feature manager; `subjektiv` owns the unchanged domain schema/migrations, Host-neutral API dispatch, and T-704 consolidation request/result/surface validation. Server modules remain thin adapters; Worker/standalone do not depend on Workspace Server.
 - `worker::subjektiv` exposes a nonserializable live Host capability plus a separate attenuated consolidation capability. Backend creation still requires the actual authenticated client and bound snapshot. Local creation is explicit Host injection; unavailable Backend never falls back locally.
 - The local catalog keeps private scope/language settings and common Feature storage under `subjektiv/`, separately from generic Subject Job ledgers. The common attribution table's existing `runtime_id` lookup key is the local storage namespace for local rows, not a running Runtime identity; public local evidence leaves `runtime_id`, Workspace, and Account fields absent. Worker IDs, Subject binding, and operator-managed scope must all match before Session content is read.

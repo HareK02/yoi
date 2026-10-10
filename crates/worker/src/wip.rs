@@ -2987,7 +2987,7 @@ mod tests {
         }
     }
 
-    fn objective_detail_response(revision: &str) -> crate::worker::WorkspaceResponse {
+    fn objective_detail_response(content_digest: &str) -> crate::worker::WorkspaceResponse {
         crate::worker::WorkspaceResponse {
             status: 200,
             body: json!({
@@ -2997,7 +2997,7 @@ mod tests {
                 "body": "Body",
                 "body_truncated": false,
                 "state": "active",
-                "revision": revision,
+                "content_digest": content_digest,
                 "created_at": null,
                 "updated_at": null,
                 "linked_ticket_summaries": [],
@@ -4009,7 +4009,7 @@ mod tests {
 
     struct ContextualItemResolver {
         owner: Arc<ContextualHandler>,
-        revision: Arc<AtomicUsize>,
+        content: Arc<Mutex<String>>,
         contextual_family: bool,
     }
 
@@ -4032,7 +4032,7 @@ mod tests {
                     description: None,
                     interfaces: vec![root_reference("test.dynamic/v1")],
                     r#ref: Some(format!("objective:{item_reference}")),
-                    validator: Some(vec![self.revision.load(Ordering::SeqCst) as u8]),
+                    validator: Some(self.content.lock().unwrap().as_bytes().to_vec()),
                 },
                 handler: Arc::new(handler),
             })
@@ -4050,16 +4050,16 @@ mod tests {
     fn contextual_dynamic_registry(
         owner: Arc<ContextualHandler>,
         contributor: Arc<ContextualHandler>,
-        revision: Arc<AtomicUsize>,
+        content: Arc<Mutex<String>>,
         contextual_collection: bool,
     ) -> WipMountRegistry {
-        let mut registry = dynamic_registry(Arc::clone(&revision), Arc::clone(&owner.calls));
+        let mut registry = dynamic_registry(Arc::clone(&content), Arc::clone(&owner.calls));
         let mut mounted = registry.dynamic_mounts.pop().unwrap();
         mounted.descriptor.operations = vec![contributed_operation("read")];
         mounted.interface_validator = Some(descriptor_validator(&mounted.descriptor));
         mounted.resolver = Arc::new(ContextualItemResolver {
             owner,
-            revision,
+            content,
             contextual_family: !contextual_collection,
         });
         if contextual_collection {
@@ -4084,16 +4084,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn contextual_dynamic_filters_by_path_and_rechecks_permission_and_object_revision() {
+    async fn contextual_dynamic_filters_by_path_and_rechecks_permission_and_object_content() {
         // Both ways to opt in a family must block unqualified descriptor fetches.
         for contextual_collection in [false, true] {
             let owner = Arc::new(ContextualHandler::new(true, true));
             let contributor = Arc::new(ContextualHandler::new(true, true));
-            let revision = Arc::new(AtomicUsize::new(1));
+            let content = Arc::new(Mutex::new("initial fixture body".to_string()));
             let host = WipHost::new(contextual_dynamic_registry(
                 Arc::clone(&owner),
                 Arc::clone(&contributor),
-                Arc::clone(&revision),
+                Arc::clone(&content),
                 contextual_collection,
             ));
             let initial = host.projection("/objectives/O-1").unwrap();
@@ -4161,7 +4161,7 @@ mod tests {
                     ..
                 }))
             ));
-            revision.store(2, Ordering::SeqCst);
+            *content.lock().unwrap() = "changed fixture body".to_string();
             assert!(matches!(
                 host.call(asset_request(&current, "read"), direct_wip_context())
                     .await,
@@ -4280,7 +4280,7 @@ mod tests {
 
     struct CurrentObjectValidatorHandler {
         inner: Arc<ContextualHandler>,
-        revision: Arc<AtomicUsize>,
+        content: Arc<Mutex<String>>,
     }
 
     #[async_trait]
@@ -4290,7 +4290,7 @@ mod tests {
         }
 
         fn object_validator(&self) -> Option<Vec<u8>> {
-            Some(self.revision.load(Ordering::SeqCst).to_be_bytes().to_vec())
+            Some(self.content.lock().unwrap().as_bytes().to_vec())
         }
 
         async fn call(
@@ -4306,14 +4306,14 @@ mod tests {
     #[tokio::test]
     async fn static_object_validator_hook_rejects_current_owner_state_changes() {
         let owner = Arc::new(ContextualHandler::new(true, true));
-        let revision = Arc::new(AtomicUsize::new(1));
+        let content = Arc::new(Mutex::new("initial fixture body".to_string()));
         let mut registry = WipMountRegistry::new();
         registry.allocate_namespace("asset", "assets").unwrap();
         registry
             .mount(contribution_projection(Arc::new(
                 CurrentObjectValidatorHandler {
                     inner: Arc::clone(&owner),
-                    revision: Arc::clone(&revision),
+                    content: Arc::clone(&content),
                 },
             )))
             .unwrap();
@@ -4328,7 +4328,7 @@ mod tests {
                 descriptor,
                 handler: Arc::new(CurrentObjectValidatorHandler {
                     inner: Arc::new(ContextualHandler::new(true, true)),
-                    revision: Arc::new(AtomicUsize::new(99)),
+                    content: Arc::new(Mutex::new("contributor body".to_string())),
                 }),
             })
             .unwrap();
@@ -4338,12 +4338,12 @@ mod tests {
         let initial = runtime.host.projection("/assets/A-1").unwrap();
         assert_eq!(
             initial.object.validator,
-            Some(1usize.to_be_bytes().to_vec())
+            Some(b"initial fixture body".to_vec())
         );
-        revision.store(2, Ordering::SeqCst);
+        *content.lock().unwrap() = "changed fixture body".to_string();
         assert_eq!(
             runtime.host.object_at("/assets/A-1").unwrap().validator,
-            Some(2usize.to_be_bytes().to_vec())
+            Some(b"changed fixture body".to_vec())
         );
         assert!(matches!(
             runtime
@@ -4381,7 +4381,7 @@ mod tests {
         let mut registry = contextual_dynamic_registry(
             Arc::clone(&owner),
             Arc::new(ContextualHandler::new(false, true)),
-            Arc::new(AtomicUsize::new(1)),
+            Arc::new(Mutex::new("initial fixture body".to_string())),
             true,
         );
         let denied_collection = Arc::new(ContextualHandler::new(false, true));
@@ -5682,7 +5682,7 @@ mod tests {
     }
 
     struct DynamicResolver {
-        revision: Arc<AtomicUsize>,
+        content: Arc<Mutex<String>>,
         calls: Arc<AtomicUsize>,
     }
 
@@ -5715,7 +5715,7 @@ mod tests {
                     description: None,
                     interfaces: vec![root_reference("test.dynamic/v1")],
                     r#ref: Some(format!("objective:{item_reference}")),
-                    validator: Some(vec![self.revision.load(Ordering::SeqCst) as u8]),
+                    validator: Some(self.content.lock().unwrap().as_bytes().to_vec()),
                 },
                 handler: Arc::new(DynamicHandler {
                     calls: Arc::clone(&self.calls),
@@ -5738,7 +5738,7 @@ mod tests {
         }
     }
 
-    fn dynamic_registry(revision: Arc<AtomicUsize>, calls: Arc<AtomicUsize>) -> WipMountRegistry {
+    fn dynamic_registry(content: Arc<Mutex<String>>, calls: Arc<AtomicUsize>) -> WipMountRegistry {
         let mut registry = WipMountRegistry::new();
         let namespace = registry
             .allocate_namespace("objective", "objectives")
@@ -5772,7 +5772,7 @@ mod tests {
                 interface: root_reference("test.dynamic/v1"),
                 descriptor,
                 interface_validator,
-                resolver: Arc::new(DynamicResolver { revision, calls }),
+                resolver: Arc::new(DynamicResolver { content, calls }),
             })
             .unwrap();
         registry
@@ -5780,15 +5780,15 @@ mod tests {
 
     #[tokio::test]
     async fn dynamic_routes_resolve_only_direct_children_and_reject_stale_calls() {
-        let revision = Arc::new(AtomicUsize::new(1));
+        let content = Arc::new(Mutex::new("initial fixture body".to_string()));
         let calls = Arc::new(AtomicUsize::new(0));
-        let host = WipHost::new(dynamic_registry(Arc::clone(&revision), Arc::clone(&calls)));
+        let host = WipHost::new(dynamic_registry(Arc::clone(&content), Arc::clone(&calls)));
         let initial = host.projection("/objectives/O-3").unwrap();
         assert!(host.projection("/objectives/O-3/other").is_none());
         assert!(host.projection("/objectives/T-3").is_none());
         assert!(host.projection("/hidden/objectives/O-3").is_none());
 
-        revision.store(2, Ordering::SeqCst);
+        *content.lock().unwrap() = "changed fixture body".to_string();
         let result = host
             .call(
                 CallOperationRequest {
@@ -5825,9 +5825,9 @@ mod tests {
 
     #[test]
     fn dynamic_registration_rejects_foreign_owners_and_operation_collisions_atomically() {
-        let revision = Arc::new(AtomicUsize::new(1));
+        let content = Arc::new(Mutex::new("initial fixture body".to_string()));
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut registry = dynamic_registry(Arc::clone(&revision), Arc::clone(&calls));
+        let mut registry = dynamic_registry(Arc::clone(&content), Arc::clone(&calls));
         let mounted = registry.dynamic_mounts.pop().unwrap();
         let foreign = WipDynamicMount {
             collection_route: mounted.collection_route.clone(),
@@ -5836,7 +5836,7 @@ mod tests {
             descriptor: mounted.descriptor.clone(),
             interface_validator: mounted.interface_validator.clone(),
             resolver: Arc::new(DynamicResolver {
-                revision,
+                content,
                 calls: Arc::clone(&calls),
             }),
         };
@@ -5887,11 +5887,11 @@ mod tests {
 
     #[tokio::test]
     async fn dynamic_object_resolver_accepts_disjoint_feature_operations() {
-        let revision = Arc::new(AtomicUsize::new(1));
+        let content = Arc::new(Mutex::new("initial fixture body".to_string()));
         let base_calls = Arc::new(AtomicUsize::new(0));
         let contribution_calls = Arc::new(AtomicUsize::new(0));
         let allowed = Arc::new(AtomicBool::new(true));
-        let mut registry = dynamic_registry(revision, base_calls);
+        let mut registry = dynamic_registry(content, base_calls);
         let mounted = registry
             .dynamic_mounts
             .first()
@@ -5952,8 +5952,8 @@ mod tests {
         engine.register_tool(echo_definition("Echo".into(), Arc::clone(&calls)));
         engine.register_tool(echo_definition("Other".into(), Arc::clone(&calls)));
 
-        let revision = Arc::new(AtomicUsize::new(1));
-        let mut registry = dynamic_registry(revision, calls);
+        let content = Arc::new(Mutex::new("initial fixture body".to_string()));
+        let mut registry = dynamic_registry(content, calls);
         registry
             .replace_compatibility_tools("/objectives", ["Echo"])
             .unwrap();
@@ -6302,7 +6302,7 @@ mod tests {
                     "sequence": 2,
                     "request_event_id": "request-1",
                     "subject_ref": "source-1",
-                    "ticket_item_revision": "ticket-rev-1",
+                    "ticket_content_digest": "ticket-rev-1",
                     "ticket_merge_request_subjects": [{"merge_request_id": "MR-1", "subject_ref": "source-1"}],
                     "decision": "approve",
                     "body": "approved",

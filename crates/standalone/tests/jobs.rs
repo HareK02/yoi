@@ -91,7 +91,6 @@ fn request(id: &str) -> JobRequest {
     JobRequest {
         job_id: id.into(),
         purpose: "generic_test".into(),
-        input_revision: "r1".into(),
         input_ref: "test:immutable".into(),
         input: serde_json::json!({"test_input":42}),
         instruction: "Return a structured validity result".into(),

@@ -49,8 +49,8 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
       "Edit the Server-owned virtual Decodal source tree through one native/WASM toolchain contract.",
     bullets: [
       "Virtual paths and imports resolve inside the committed Workspace tree, never from browser or Server host paths.",
-      "Browser analysis is advisory; Server evaluation is required before an atomic revision commit.",
-      "Profile launch data is projected from this active revision; remaining Skill, Prompt, and Plugin consumers migrate in their follow-up cutovers.",
+      "Browser analysis is advisory; Server evaluation is required before an atomic content-digest CAS commit.",
+      "Profile, Skill, Prompt, and Plugin data are projected from the active immutable source tree.",
     ],
   },
   {
@@ -82,11 +82,11 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
     label: "Profile Sources",
     status: "editable",
     summary:
-      "Inspect the Profile launch projection derived from the active Workspace configuration revision.",
+      "Inspect the Profile launch projection derived from the active Workspace configuration tree.",
     bullets: [
       "Selectors are source-qualified (builtin:* or project:*); raw profile source paths, archive content, archive digests, resource handles, and runtime tokens are not exposed.",
       "Profile declarations and sources are edited only through the shared Workspace configuration editor and evaluate-before-commit contract.",
-      "Launch candidates and Profile archives carry the same active config revision, tree digest, and projection digest.",
+      "Launch candidates and Profile archives carry the same active tree digest and projection digest.",
     ],
   },
   {

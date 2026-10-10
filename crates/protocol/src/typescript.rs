@@ -322,7 +322,6 @@ fn rust_serialized_subscription_frame_fixtures() -> Vec<SubscriptionFrame> {
                             parent_session_id: Some("fixture-parent-session".into()),
                             kind: InternalWorkerKind::SubWorker,
                         },
-                        revision: 1,
                         session: SessionSnapshot {
                             pending_submissions: PendingSubmissionsSnapshot::default(),
                             entries: Vec::new(),

@@ -17,7 +17,7 @@ const LEASE_FILE: &str = "lease.json";
 const LEASE_LOCK_FILE: &str = "lease.lock";
 const SESSIONS_DIR: &str = "sessions";
 const WORKER_DIR: &str = "worker";
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StandaloneCwdIdentity {
@@ -79,7 +79,6 @@ pub enum StandaloneShutdownReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StandaloneWorkerRecord {
     pub schema_version: u32,
-    pub revision: u64,
     pub worker_id: WorkerId,
     /// User-facing Worker name resolved from the profile.
     pub worker_name: String,
@@ -194,7 +193,6 @@ impl StandaloneWorkerStore {
         let now = now_unix_ms()?;
         let record = StandaloneWorkerRecord {
             schema_version: SCHEMA_VERSION,
-            revision: 1,
             worker_id: allocation.worker_id,
             worker_name: manifest.worker.name.clone(),
             storage_key,
@@ -326,13 +324,12 @@ impl StandaloneWorkerStore {
         active_segment_id: Option<SegmentId>,
     ) -> Result<StandaloneWorkerRecord, StandaloneStoreError> {
         let mut next = record.clone();
-        next.revision = next.revision.saturating_add(1);
         next.updated_at_unix_ms = now_unix_ms()?;
         next.active_session_id = active_session_id;
         next.active_segment_id = active_segment_id;
         next.status = StandaloneWorkerStatus::Active;
         next.shutdown_reason = None;
-        self.commit_record(Some(record.revision), &next)?;
+        self.commit_record(Some(record), &next)?;
         Ok(next)
     }
 
@@ -344,13 +341,12 @@ impl StandaloneWorkerStore {
         reason: StandaloneShutdownReason,
     ) -> Result<StandaloneWorkerRecord, StandaloneStoreError> {
         let mut next = record.clone();
-        next.revision = next.revision.saturating_add(1);
         next.updated_at_unix_ms = now_unix_ms()?;
         next.active_session_id = active_session_id;
         next.active_segment_id = active_segment_id;
         next.status = StandaloneWorkerStatus::Stopped;
         next.shutdown_reason = Some(reason);
-        self.commit_record(Some(record.revision), &next)?;
+        self.commit_record(Some(record), &next)?;
         Ok(next)
     }
 
@@ -405,7 +401,7 @@ impl StandaloneWorkerStore {
 
     fn commit_record(
         &self,
-        expected_revision: Option<u64>,
+        expected_record: Option<&StandaloneWorkerRecord>,
         next: &StandaloneWorkerRecord,
     ) -> Result<(), StandaloneStoreError> {
         let dir = self.worker_dir(next.worker_id);
@@ -421,19 +417,21 @@ impl StandaloneWorkerStore {
                     StandaloneStoreError::Io(error)
                 }
             })?;
-        writeln!(marker_file, "{}", next.revision).map_err(StandaloneStoreError::Io)?;
+        writeln!(marker_file, "{}", next.worker_id).map_err(StandaloneStoreError::Io)?;
         marker_file.sync_all().map_err(StandaloneStoreError::Io)?;
         sync_directory(&dir)?;
 
-        if let Some(expected) = expected_revision {
+        if let Some(expected) = expected_record {
             let current = self.load_record_while_committing(next.worker_id)?;
-            if current.revision != expected {
-                let _ = fs::remove_file(&marker);
-                return Err(StandaloneStoreError::RevisionConflict {
-                    id: next.worker_id,
-                    expected,
-                    found: current.revision,
-                });
+            // The create-new commit marker excludes other writers across this
+            // comparison and replacement. Compare the observed metadata itself,
+            // including its manifest, pointer and lifecycle state, not a counter.
+            if serde_json::to_value(&current).map_err(StandaloneStoreError::Json)?
+                != serde_json::to_value(expected).map_err(StandaloneStoreError::Json)?
+            {
+                fs::remove_file(&marker).map_err(StandaloneStoreError::Io)?;
+                sync_directory(&dir)?;
+                return Err(StandaloneStoreError::MetadataChanged(next.worker_id));
             }
         }
 
@@ -681,6 +679,19 @@ fn decode_worker_record(
                 "standalone Worker record must be an object",
             ))
         })?;
+        // Frozen schema-1 adapter: the counter was not domain data. Preserve
+        // every metadata field and use content comparison for future writes.
+        if object
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1)
+        {
+            object.remove("revision");
+            object.insert(
+                "schema_version".to_string(),
+                serde_json::json!(SCHEMA_VERSION),
+            );
+        }
         let persisted_manifest = object.remove("manifest").ok_or_else(|| {
             serde_json::Error::io(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -770,14 +781,8 @@ pub enum StandaloneStoreError {
     LeaseOwnershipLost,
     #[error("standalone Worker {0} must be stopped before deletion")]
     DeleteActive(WorkerId),
-    #[error(
-        "standalone Worker {id} metadata revision changed (expected {expected}, found {found})"
-    )]
-    RevisionConflict {
-        id: WorkerId,
-        expected: u64,
-        found: u64,
-    },
+    #[error("standalone Worker {0} metadata changed since it was read")]
+    MetadataChanged(WorkerId),
     #[error("system clock is before the Unix epoch or out of range")]
     Clock,
     #[error("standalone metadata serialization failed")]
@@ -816,7 +821,6 @@ permission = "write"
         let manifest = test_manifest();
         let record = StandaloneWorkerRecord {
             schema_version: SCHEMA_VERSION,
-            revision: 6,
             worker_id,
             worker_name: manifest.worker.name.clone(),
             storage_key: "standalone-test".to_string(),
@@ -857,6 +861,122 @@ permission = "write"
             persisted["manifest"]["manifest"]["feature"]["memory"]["profile"]["enabled"],
             false
         );
+    }
+
+    #[test]
+    fn metadata_write_compares_observed_content_even_with_equal_timestamps() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StandaloneWorkerStore::open(root.path().join("workers")).unwrap();
+        let allocation = store
+            .allocate(root.path(), StaleLeasePolicy::Reject)
+            .unwrap();
+        let record = store
+            .commit_created(
+                &allocation,
+                test_manifest(),
+                "metadata-test".into(),
+                session_store::new_session_id(),
+                None,
+            )
+            .unwrap();
+        // Simulate another committed pointer change in the same clock tick.
+        let mut changed = record.clone();
+        changed.active_session_id = session_store::new_session_id();
+        store.commit_record(Some(&record), &changed).unwrap();
+        assert!(matches!(
+            store.mark_stopped(
+                &record,
+                record.active_session_id,
+                None,
+                StandaloneShutdownReason::UserExit
+            ),
+            Err(StandaloneStoreError::MetadataChanged(_))
+        ));
+        assert_eq!(
+            store.load(record.worker_id).unwrap().active_session_id,
+            changed.active_session_id
+        );
+        assert!(
+            !store
+                .worker_dir(record.worker_id)
+                .join(COMMIT_MARKER)
+                .exists()
+        );
+        let stopped = store
+            .mark_stopped(
+                &changed,
+                changed.active_session_id,
+                None,
+                StandaloneShutdownReason::UserExit,
+            )
+            .unwrap();
+        assert_eq!(stopped.status, StandaloneWorkerStatus::Stopped);
+    }
+
+    #[test]
+    fn schema_one_metadata_preserves_content_without_an_update_counter() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StandaloneWorkerStore::open(root.path().join("workers")).unwrap();
+        let allocation = store
+            .allocate(root.path(), StaleLeasePolicy::Reject)
+            .unwrap();
+        let record = store
+            .commit_created_connected(
+                &allocation,
+                test_manifest(),
+                "migration-test".into(),
+                session_store::new_session_id(),
+                None,
+                Some(crate::subjektiv::StandaloneSubjectBinding {
+                    scope_id: "local-scope".into(),
+                    subject_id: "local-subject".into(),
+                }),
+            )
+            .unwrap();
+        let record = store
+            .mark_stopped(
+                &record,
+                record.active_session_id,
+                Some(session_store::new_segment_id()),
+                StandaloneShutdownReason::UserExit,
+            )
+            .unwrap();
+        let mut persisted = Vec::new();
+        write_worker_record(&mut persisted, &record).unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_slice(&persisted).unwrap();
+        legacy["schema_version"] = serde_json::json!(1);
+        legacy["revision"] = serde_json::json!(42);
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        fs::write(
+            store.worker_dir(record.worker_id).join(RECORD_FILE),
+            &legacy_bytes,
+        )
+        .unwrap();
+        let migrated = store.load(record.worker_id).unwrap();
+        assert_eq!(
+            serde_json::to_value(&migrated).unwrap(),
+            serde_json::to_value(&record).unwrap()
+        );
+        let mut encoded = Vec::new();
+        write_worker_record(&mut encoded, &migrated).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert!(saved.get("revision").is_none());
+        assert_eq!(saved["schema_version"], 2);
+        let resumed = store
+            .update_active_pointer(
+                &migrated,
+                migrated.active_session_id,
+                migrated.active_segment_id,
+            )
+            .unwrap();
+        let disk: serde_json::Value = serde_json::from_slice(
+            &fs::read(store.worker_dir(record.worker_id).join(RECORD_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert!(disk.get("revision").is_none());
+        assert_eq!(disk["schema_version"], 2);
+        assert_eq!(resumed.subject, record.subject);
+        assert_eq!(resumed.active_segment_id, record.active_segment_id);
     }
 
     #[test]

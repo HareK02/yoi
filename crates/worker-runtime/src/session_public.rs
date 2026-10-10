@@ -374,7 +374,6 @@ fn api_archive_manifest(manifest: &DomainArchiveManifest) -> WorkerSessionArchiv
         content_bytes: manifest.content_bytes,
         content_file_count: manifest.content_file_count,
         policy_id: manifest.policy_id.clone(),
-        policy_revision: manifest.policy_revision,
         operation_id: manifest.operation_id.clone(),
         input_fingerprint: manifest.input_fingerprint.clone(),
     }

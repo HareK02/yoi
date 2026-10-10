@@ -1996,33 +1996,39 @@ mod tests {
 
     #[test]
     fn generator_rejects_lossy_safe_integers_and_preserves_bounded_ranges() {
-        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
-        document["components"]["schemas"]["RepositorySummary"]["properties"]["source_revision"]["maximum"] =
+        let mut fixture: Value = serde_json::from_str(OPENAPI).unwrap();
+        fixture["components"]["schemas"]["RepositorySummary"]["properties"]["size_bytes"] = serde_json::json!({"type": "integer", "format": "uint64", "minimum": 0, "maximum": 9_007_199_254_740_991_u64});
+        fixture["components"]["schemas"]["RepositorySummary"]["required"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("size_bytes"));
+        let mut document = fixture.clone();
+        document["components"]["schemas"]["RepositorySummary"]["properties"]["size_bytes"]["maximum"] =
             serde_json::json!(9_007_199_254_740_992_u64);
         let error = generate_repository_typescript(&document.to_string()).unwrap_err();
         assert!(error.to_string().contains("safe-number"));
 
-        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
-        document["components"]["schemas"]["RepositorySummary"]["properties"]["source_revision"]["minimum"] =
+        let mut document = fixture.clone();
+        document["components"]["schemas"]["RepositorySummary"]["properties"]["size_bytes"]["minimum"] =
             serde_json::json!(-1);
         let error = generate_repository_typescript(&document.to_string()).unwrap_err();
         assert!(error.to_string().contains("safe-number"));
 
-        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
-        document["components"]["schemas"]["RepositorySummary"]["properties"]["source_revision"]["maximum"] =
+        let mut document = fixture.clone();
+        document["components"]["schemas"]["RepositorySummary"]["properties"]["size_bytes"]["maximum"] =
             serde_json::json!(9_007_199_254_740_990_u64);
         let output = generate_repository_typescript(&document.to_string()).unwrap();
         assert!(output.contains(
-            "source_revision: number & { readonly \"__yoiIntegerRange\": \"0..9007199254740990\"; }"
+            "size_bytes: number & { readonly \"__yoiIntegerRange\": \"0..9007199254740990\"; }"
         ));
 
-        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
-        document["components"]["schemas"]["RepositorySummary"]["properties"]["source_revision"]["format"] =
+        let mut document = fixture.clone();
+        document["components"]["schemas"]["RepositorySummary"]["properties"]["size_bytes"]["format"] =
             serde_json::json!("int64");
         let error = generate_repository_typescript(&document.to_string()).unwrap_err();
         assert!(error.to_string().contains("unsupported integer format"));
 
-        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
+        let mut document = fixture.clone();
         document["components"]["schemas"]["RepositorySummary"]["properties"]["git"]["anyOf"]
             .as_array_mut()
             .unwrap()

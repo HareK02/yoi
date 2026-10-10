@@ -31,7 +31,7 @@ Item interface `yoi.merge-request/item/v1`:
 | --- | --- | --- |
 | `read` | `ShowMergeRequest` | bounded thread `after` and `limit`; Backend resolves current source and target refs |
 | `check_readiness` | `CheckMergeRequestReadiness` | Backend resolves the current source subject and derives current approval/blockers |
-| `review` | `ReviewMergeRequest` | decision/body/findings plus the injected Reviewer capability, captured request event, Ticket revision, linked result snapshot, and exact candidate |
+| `review` | `ReviewMergeRequest` | decision/body/findings plus the injected Reviewer capability, captured request event, Ticket content digest, linked result snapshot, and exact candidate |
 | `complete` | `CompleteMergeRequest` | operation ID, approval event, target-before/after refs, merge strategy and conflict resolution; Backend requires Orchestrator authority |
 
 Typical role surfaces are therefore:
@@ -49,7 +49,7 @@ The native projection delegates to the same ordinary tools and REST endpoints. I
 - Workspace and configured-repository isolation;
 - current Coder assignment and assigned-Workdir source-selector proof for opening/review requests;
 - provider resolution of the exact current source candidate;
-- ReviewRequested binding to the Ticket item revision and complete linked-MR/source snapshot;
+- ReviewRequested binding to the Ticket item `content_digest` and complete linked-MR/source snapshot;
 - injected Reviewer capability consumption and exact MR/candidate matching;
 - source movement invalidating source approval while target-only movement preserves unchanged-source review;
 - unresolved request-change and revoked/stale approval rejection;

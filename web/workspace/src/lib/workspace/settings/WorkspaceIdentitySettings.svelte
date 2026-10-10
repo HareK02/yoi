@@ -113,7 +113,7 @@
     nameError = nameNotice = null;
     try {
       const response = await updateWorkspaceMetadata(workspaceId, {
-        display_name: displayNameDraft, revision: workspaceMetadata.revision,
+        display_name: displayNameDraft, expected_updated_at: workspaceMetadata.updated_at,
       });
       if (disposed) return;
       workspaceMetadata = response.workspace;
@@ -203,13 +203,13 @@
       if (typeof value !== 'object' || value === null) return null;
       const record = value as Record<string, unknown>;
       if (
-        Object.keys(record).sort().join(',') !== 'confirmation,expected_revision,operation_id' ||
+        Object.keys(record).sort().join(',') !== 'confirmation,expected_workspace_updated_at,operation_id' ||
         typeof record.operation_id !== 'string' || record.operation_id.length === 0 || record.operation_id.length > 128 ||
         !/^[A-Za-z0-9_-]+$/.test(record.operation_id) ||
-        typeof record.expected_revision !== 'string' || record.expected_revision.length > 128 ||
+        typeof record.expected_workspace_updated_at !== 'string' || record.expected_workspace_updated_at.length > 128 ||
         typeof record.confirmation !== 'string' || record.confirmation !== workspaceName || record.confirmation.length > 256
       ) return null;
-      return { operation_id: record.operation_id, expected_revision: record.expected_revision, confirmation: record.confirmation };
+      return { operation_id: record.operation_id, expected_workspace_updated_at: record.expected_workspace_updated_at, confirmation: record.confirmation };
     } catch { return null; }
   }
   onMount(() => {
@@ -232,7 +232,7 @@
     deletionError = null;
     try {
       const request = deletionRequest ?? {
-        operation_id: crypto.randomUUID(), expected_revision: deletionPreflight!.expected_revision, confirmation: deletionConfirmation,
+        operation_id: crypto.randomUUID(), expected_workspace_updated_at: deletionPreflight!.expected_workspace_updated_at, confirmation: deletionConfirmation,
       };
       deletionRequest = request;
       sessionStorage.setItem(deletionStorageKey(), JSON.stringify(request));
@@ -285,7 +285,6 @@
         <summary>Technical details</summary>
         <dl>
           <div><dt>Source</dt><dd><code>{workspaceMetadata.source}</code></dd></div>
-          <div><dt>Revision</dt><dd><code>{workspaceMetadata.revision}</code></dd></div>
         </dl>
         {#each diagnostics.filter((item) => item.severity === 'info') as diagnostic}<p>{diagnostic.message}</p>{/each}
       </details>
@@ -316,7 +315,6 @@
           <dl>
             <div><dt>Key</dt><dd><code>{signingIdentity.identity.key_id}</code></dd></div>
             <div><dt>Fingerprint</dt><dd><code>{signingIdentity.identity.public_key_fingerprint}</code></dd></div>
-            <div><dt>Revision</dt><dd><code>{signingIdentity.identity.revision}</code></dd></div>
           </dl>
           <label>Public identity bundle<textarea readonly rows="9" value={identityBundleText} spellcheck="false"></textarea></label>
         </details>

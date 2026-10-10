@@ -176,7 +176,7 @@ fn memory_evidence_origin_projection(origin: EvidenceOrigin) -> MemoryEvidenceOr
         worker_id: origin.worker_id,
         flow_selector: origin.flow_selector,
         flow_definition_id: origin.flow_definition_id,
-        flow_definition_revision: origin.flow_definition_revision,
+        flow_definition_fingerprint: origin.flow_definition_fingerprint,
     }
 }
 
@@ -313,7 +313,7 @@ mod tests {
                     worker_id: Some("worker-1".to_string()),
                     flow_selector: Some("builtin:coder-review".to_string()),
                     flow_definition_id: Some("flow-1".to_string()),
-                    flow_definition_revision: Some(7),
+                    flow_definition_fingerprint: Some("sha256:flow-content".into()),
                 }),
                 ..SourceEvidenceRef::default()
             });
@@ -328,7 +328,10 @@ mod tests {
                 Some("builtin:coder-review")
             );
             assert_eq!(origin.flow_definition_id.as_deref(), Some("flow-1"));
-            assert_eq!(origin.flow_definition_revision, Some(7));
+            assert_eq!(
+                origin.flow_definition_fingerprint,
+                Some("sha256:flow-content".into())
+            );
         }
     }
 

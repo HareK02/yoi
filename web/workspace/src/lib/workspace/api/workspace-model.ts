@@ -258,7 +258,6 @@ function repositorySummary(value: unknown, path: string): RepositorySummary {
       "kind",
       "provider",
       "source",
-      "source_revision",
       "source_fingerprint",
       "observed_status",
       "observed_at",
@@ -291,10 +290,6 @@ function repositorySummary(value: unknown, path: string): RepositorySummary {
     kind: repositoryString(item.kind, `${path}.kind`),
     provider: repositoryString(item.provider, `${path}.provider`),
     source: repositorySource(item.source, `${path}.source`),
-    source_revision: repositorySourceRevision(
-      item.source_revision,
-      `${path}.source_revision`,
-    ),
     source_fingerprint: repositoryString(
       item.source_fingerprint,
       `${path}.source_fingerprint`,
@@ -360,7 +355,6 @@ function workspaceRepositoryRecord(
       "provider",
       "source",
       "default_ref",
-      "source_revision",
       "source_fingerprint",
       "observed_status",
       "observed_at",
@@ -383,10 +377,6 @@ function workspaceRepositoryRecord(
     provider: nullableString(item.provider, `${path}.provider`),
     source: repositorySource(item.source, `${path}.source`),
     default_ref: nullableString(item.default_ref, `${path}.default_ref`),
-    source_revision: repositorySourceRevision(
-      item.source_revision,
-      `${path}.source_revision`,
-    ),
     source_fingerprint: repositoryString(
       item.source_fingerprint,
       `${path}.source_fingerprint`,
@@ -558,7 +548,6 @@ export function parseWorkspaceCreateResponse(
     [
       "workspace",
       "repository",
-      "config_revision",
       "request_fingerprint",
       "replayed",
     ],
@@ -572,10 +561,6 @@ export function parseWorkspaceCreateResponse(
     repository: response.repository === null ? null : workspaceRepositoryRecord(
       response.repository,
       "workspace create response.repository",
-    ),
-    config_revision: integer(
-      response.config_revision,
-      "workspace create response.config_revision",
     ),
     request_fingerprint: string(
       response.request_fingerprint,
@@ -789,7 +774,7 @@ export function parseRepositorySshConnectionProbeResponse(
       "port",
       "trust_state",
       "host_trust_id",
-      "expected_host_trust_revision",
+      "expected_host_key_fingerprint",
       "candidates",
     ],
     "repository SSH connection probe response",
@@ -829,11 +814,10 @@ export function parseRepositorySshConnectionProbeResponse(
       response.host_trust_id,
       "repository SSH connection probe response.host_trust_id",
     ),
-    expected_host_trust_revision: response.expected_host_trust_revision === null
-      ? null
-      : integer(
-        response.expected_host_trust_revision,
-        "repository SSH connection probe response.expected_host_trust_revision",
+    expected_host_key_fingerprint:
+      response.expected_host_key_fingerprint === null ? null : string(
+        response.expected_host_key_fingerprint,
+        "repository SSH connection probe response.expected_host_key_fingerprint",
       ),
     candidates: array(
       response.candidates,
@@ -980,7 +964,7 @@ export function parseWorkspaceDeletionPreflightResponse(
   exactKeys(item, [
     "workspace_id",
     "display_name",
-    "expected_revision",
+    "expected_workspace_updated_at",
     "can_delete",
     "resources",
     "blockers",
@@ -994,9 +978,9 @@ export function parseWorkspaceDeletionPreflightResponse(
       item.display_name,
       "Workspace deletion preflight.display_name",
     ),
-    expected_revision: deletionBoundedString(
-      item.expected_revision,
-      "Workspace deletion preflight.expected_revision",
+    expected_workspace_updated_at: deletionBoundedString(
+      item.expected_workspace_updated_at,
+      "Workspace deletion preflight.expected_workspace_updated_at",
       WORKSPACE_DELETION_MAX_REVISION_BYTES,
     ),
     can_delete: boolean(
@@ -1116,7 +1100,8 @@ export function parseHostListResponse(value: unknown): HostListResponse {
     ),
     limit,
     items: repositoryArray(response.items, "host list response.items").map(
-      (item, index) => parseHostSummary(item, `host list response.items[${index}]`),
+      (item, index) =>
+        parseHostSummary(item, `host list response.items[${index}]`),
     ),
     source: repositoryString(response.source, "host list response.source"),
     diagnostics: repositoryArray(

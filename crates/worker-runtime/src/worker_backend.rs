@@ -133,7 +133,7 @@ use worker::feature::builtin::{
     WorkspaceClientWorkerObservationProvider,
 };
 #[cfg(feature = "ws-server")]
-use worker::ipc::protocol_session::{live_log_entry_event, subscribe_worker_protocol_session};
+use worker::ipc::protocol_session::{WorkerProtocolSessionStreams, live_log_entry_event};
 use worker::{
     PreparedWorker, PromptCatalogSource, SegmentLogSink, SubjektivSessionAttributionLifecycle,
     Worker, WorkerBootstrap, WorkerBootstrapError, WorkerBootstrapLayout,
@@ -141,6 +141,15 @@ use worker::{
     WorkerSharedState, WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
     bash_output_dir_for_worker_id,
 };
+
+#[cfg(feature = "ws-server")]
+fn subscribe_worker_protocol_session(handle: &WorkerHandle) -> WorkerProtocolSessionStreams {
+    // Child state changes and their live events share this publication gate.
+    // Acquire it before subscribing, and retain it through the parent snapshot
+    // capture, so a pre-snapshot child event cannot replay after newer state.
+    let _publish_guard = handle.protocol_snapshot_publish_guard();
+    worker::ipc::protocol_session::subscribe_worker_protocol_session(handle)
+}
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
 const RUNTIME_TASK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -403,26 +412,12 @@ impl WorkspacePromptProjectionCache {
             .active
             .lock()
             .map_err(|_| "Workspace Prompt projection cache lock was poisoned".to_string())?;
-        if let Some(current) = active.get(&workspace_id) {
-            if current.projection.config_revision > resolution.projection.config_revision {
-                return Ok(current.clone());
-            }
-            if current.projection.config_revision == resolution.projection.config_revision
-                && (current.projection.source_digest != resolution.projection.source_digest
-                    || current.projection.projection_digest
-                        != resolution.projection.projection_digest
-                    || current.projection.catalog.catalog_digest
-                        != resolution.projection.catalog.catalog_digest
-                    || current.projection.catalog.schema_fingerprint
-                        != resolution.projection.catalog.schema_fingerprint
-                    || current.projection.catalog.toolchain_fingerprint
-                        != resolution.projection.catalog.toolchain_fingerprint)
-            {
-                return Err(format!(
-                    "Workspace Prompt projection identity changed without a config revision transition: workspace={workspace_id} revision={}",
-                    resolution.projection.config_revision
-                ));
-            }
+        // Runtime receives authoritative projections in operation/arrival order.
+        // Equal content reuses the compiled catalog; counters are not authority.
+        if let Some(current) = active.get(&workspace_id)
+            && current.projection == resolution.projection
+        {
+            return Ok(current.clone());
         }
         active.insert(workspace_id, resolution.clone());
         Ok(resolution)
@@ -688,7 +683,7 @@ impl ProfileRuntimeWorkerFactory {
             None => fallback,
         };
         // Saved policy is execution authority. Rebinding current settings here
-        // would hide revision and attachment mismatches.
+        // would hide content and attachment mismatches.
         validate_worker_memory_settings(&manifest, request)?;
         Ok((manifest, loader))
     }
@@ -1195,11 +1190,8 @@ fn validate_worker_memory_settings(
                 "Workspace Worker restored without its bound Memory settings snapshot".to_string()
             })?;
         return Err(format!(
-            "Workspace Worker Memory settings snapshot mismatch: expected {} revision {}, restored {} revision {}",
-            expected.workspace_id,
-            expected.settings_revision,
-            actual.workspace_id,
-            actual.settings_revision
+            "Workspace Worker Memory settings snapshot mismatch: expected {} language {}, restored {} language {}",
+            expected.workspace_id, expected.language, actual.workspace_id, actual.language
         ));
     }
     let subjektiv_settings = manifest.feature.subjektiv.workspace_settings();
@@ -1216,11 +1208,8 @@ fn validate_worker_memory_settings(
                     .to_string()
             })?;
             return Err(format!(
-                "Workspace Worker subjektiv settings snapshot mismatch: expected {} revision {}, restored {} revision {}",
-                expected.workspace_id,
-                expected.settings_revision,
-                actual.workspace_id,
-                actual.settings_revision
+                "Workspace Worker subjektiv settings snapshot mismatch: expected {} language {}, restored {} language {}",
+                expected.workspace_id, expected.language, actual.workspace_id, actual.language
             ));
         }
     } else if subjektiv_settings.is_some() {
@@ -4789,7 +4778,6 @@ mod tests {
         request.subjektiv_attached = true;
         request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
             workspace_id: "workspace-saved-subjektiv".to_string(),
-            settings_revision: 17,
             language: "English".to_string(),
         });
         bind_workspace_memory_settings(&mut saved, &request).unwrap();
@@ -5982,7 +5970,6 @@ mod tests {
         );
         let mut catalog = worker::EffectivePromptCatalog::new(
             templates,
-            17,
             projection.schema_fingerprint.clone(),
             projection.toolchain_fingerprint.clone(),
         )
@@ -6005,7 +5992,6 @@ mod tests {
         missing_instruction_bundle.prompt_catalog = Some(
             worker::EffectivePromptCatalog::new(
                 templates,
-                17,
                 projection.schema_fingerprint.clone(),
                 projection.toolchain_fingerprint.clone(),
             )
@@ -6115,19 +6101,19 @@ mod tests {
             .with_runtime_store_dir(&runtime_store)
             .with_runtime_id("runtime-subjektiv-test");
         let before = persisted_files(&runtime_store);
-        let mut wrong_revision = request.clone();
-        wrong_revision
+        let mut wrong_settings = request.clone();
+        wrong_settings
             .request
             .memory_settings
             .as_mut()
             .unwrap()
-            .settings_revision = 18;
+            .language = "different language".into();
         let mut detached = request.clone();
         detached.request.subjektiv_attached = false;
         let mut missing_settings = request.clone();
         missing_settings.request.memory_settings = None;
         for (invalid, expected) in [
-            (wrong_revision, "subjektiv settings snapshot mismatch"),
+            (wrong_settings, "subjektiv settings snapshot mismatch"),
             (detached, "unauthorized subjektiv attachment"),
             (missing_settings, "missing its trusted settings snapshot"),
         ] {
@@ -6660,7 +6646,6 @@ mod tests {
         let cache = WorkspacePromptProjectionCache::default();
         let catalog_v1 = worker::EffectivePromptCatalog::new(
             BTreeMap::from([("default".to_string(), "prompt-v1".to_string())]),
-            8,
             "schema",
             "toolchain",
         )
@@ -6674,7 +6659,6 @@ mod tests {
         .unwrap();
         let catalog_v2 = worker::EffectivePromptCatalog::new(
             BTreeMap::from([("default".to_string(), "prompt-v2".to_string())]),
-            9,
             "schema",
             "toolchain",
         )
@@ -6691,7 +6675,7 @@ mod tests {
         cache.observe(projection_v2).unwrap();
 
         let active = cache.active("workspace-a").unwrap().unwrap();
-        assert_eq!(active.projection.config_revision, 9);
+        assert_eq!(active.projection.source_digest, "source-v2");
         assert_eq!(
             active.projection.catalog.catalog_digest,
             catalog_v2.catalog_digest
@@ -6699,10 +6683,9 @@ mod tests {
     }
 
     #[test]
-    fn workspace_prompt_projection_cache_rejects_same_revision_source_drift() {
+    fn workspace_prompt_projection_cache_accepts_authoritative_source_change() {
         let catalog = worker::EffectivePromptCatalog::new(
             BTreeMap::from([("default".to_string(), "prompt".to_string())]),
-            8,
             "schema",
             "toolchain",
         )
@@ -6724,22 +6707,20 @@ mod tests {
         let cache = WorkspacePromptProjectionCache::default();
 
         cache.observe(first).unwrap();
-        let error = cache.observe(drifted).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("without a config revision transition")
+        assert_eq!(
+            cache.observe(drifted).unwrap().projection.source_digest,
+            "source-b"
         );
     }
 
     #[test]
-    fn workspace_prompt_projection_cache_rejects_same_revision_schema_drift() {
+    fn workspace_prompt_projection_cache_accepts_authoritative_toolchain_change() {
         let templates = BTreeMap::from([("default".to_string(), "prompt".to_string())]);
         let first_catalog =
-            worker::EffectivePromptCatalog::new(templates.clone(), 8, "schema-a", "toolchain")
+            worker::EffectivePromptCatalog::new(templates.clone(), "schema-a", "toolchain")
                 .unwrap();
         let drifted_catalog =
-            worker::EffectivePromptCatalog::new(templates, 8, "schema-b", "toolchain").unwrap();
+            worker::EffectivePromptCatalog::new(templates, "schema-b", "toolchain").unwrap();
         let first = worker::WorkspacePromptProjection::new(
             "workspace-a",
             "source-a",
@@ -6757,8 +6738,14 @@ mod tests {
         let cache = WorkspacePromptProjectionCache::default();
 
         cache.observe(first).unwrap();
-        let error = cache.observe(drifted).unwrap_err();
-        assert!(error.contains("without a config revision transition"));
+        assert_eq!(
+            cache
+                .observe(drifted)
+                .unwrap()
+                .projection
+                .schema_fingerprint,
+            "schema-b"
+        );
     }
 
     #[test]
@@ -7165,7 +7152,6 @@ mod tests {
             metadata: crate::config_bundle::ConfigBundleMetadata {
                 id: "adapter-test-bundle".to_string(),
                 digest: String::new(),
-                revision: "test".to_string(),
                 workspace_id: "adapter-test".to_string(),
                 created_at: "test".to_string(),
                 provenance: crate::config_bundle::ConfigBundleProvenance {
@@ -7273,7 +7259,7 @@ mod tests {
             request.backend_job = Some(crate::catalog::BackendJobExecutionBinding {
                 job_id: "job-1".into(),
                 attempt_id: "attempt-1".into(),
-                input_revision: None,
+                input_digest: None,
                 subjektiv_consolidation: granted,
             });
             for tools in [false, true] {
@@ -7329,7 +7315,6 @@ mod tests {
         };
         let settings = manifest::WorkspaceMemorySettingsSnapshot {
             workspace_id: "workspace-subject".to_string(),
-            settings_revision: 3,
             language: "English".to_string(),
         };
         let mut ordinary_request = create_request("ordinary");
@@ -7987,7 +7972,6 @@ mod tests {
                     kind: server_api::RepositorySourceKind::LocalPath,
                     uri: repo.display().to_string(),
                 },
-                source_revision: 1,
                 source_fingerprint: "sha256:test".to_string(),
                 selector: Some(RepositorySelector::from("HEAD")),
             },
@@ -8197,7 +8181,6 @@ mod tests {
         );
         let mut effective = worker::EffectivePromptCatalog::new(
             templates,
-            7,
             projection.schema_fingerprint.clone(),
             projection.toolchain_fingerprint.clone(),
         )
@@ -8213,7 +8196,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(resolution.projection.config_revision, 7);
+        assert_eq!(resolution.projection.source_digest, "source-7");
         assert_eq!(
             resolution.catalog.notify_wrapper("restored").unwrap(),
             "PENDING-LAUNCH restored"
@@ -8250,7 +8233,6 @@ mod tests {
         });
         request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
             workspace_id: "workspace-restore".to_string(),
-            settings_revision: 1,
             language: "English".to_string(),
         });
         let identity = RuntimeIdentityMaterial::generate("runtime-restore").unwrap();

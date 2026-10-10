@@ -674,7 +674,7 @@ mod tests {
 
     fn worker(runtime_id: &str, worker_id: &str, profile: Option<&str>) -> BackendWorkerSummary {
         BackendWorkerSummary {
-            restore_observation_token: Some("observed-worker-generation".into()),
+            restore_observation_token: Some("observed-worker-state".into()),
             runtime_id: runtime_id.to_string(),
             worker_id: worker_id.to_string(),
             resource_key: "W-1".to_string(),
@@ -953,7 +953,6 @@ mod tests {
                 workspace_api: None,
                 memory_settings: Some(manifest::WorkspaceMemorySettingsSnapshot {
                     workspace_id: "local".into(),
-                    settings_revision: 1,
                     language: "English".into(),
                 }),
                 subjektiv_attached: false,
@@ -1107,7 +1106,7 @@ mod tests {
             target,
             BackendWorkerPickerIntent::Resume,
             Some(client::BackendWorkerRestoreRequest {
-                expected_observation_token: "observed-worker-generation".into(),
+                expected_observation_token: "observed-worker-state".into(),
                 request_id: "resume-operation".into(),
             }),
             |_| Ok(false),
@@ -1142,7 +1141,7 @@ mod tests {
             target,
             BackendWorkerPickerIntent::Resume,
             Some(client::BackendWorkerRestoreRequest {
-                expected_observation_token: "observed-worker-generation".into(),
+                expected_observation_token: "observed-worker-state".into(),
                 request_id: "resume-operation".into(),
             }),
             |_| Ok(false),

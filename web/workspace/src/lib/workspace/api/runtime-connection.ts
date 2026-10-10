@@ -8,7 +8,7 @@ import type {
 const RESPONSE_KEYS = [
   "workspace_id",
   "runtime_id",
-  "binding_revision",
+  "binding_id",
   "connection_state",
   "verification",
   "checked_at",
@@ -107,15 +107,15 @@ export function parseRuntimeConnectionTestResponse(
   ) {
     return null;
   }
-  const bindingRevision = value.binding_revision;
+  const bindingId = value.binding_id;
   const connectionState = parseConnectionState(value.connection_state);
   const verification = parseVerificationEvidence(value.verification);
   if (
-    !isSafeRevision(bindingRevision) ||
+    !isBoundedString(bindingId) ||
     connectionState === null ||
     (value.verification !== null && verification === null) ||
     (verification !== null &&
-      verification.binding_revision !== bindingRevision) ||
+      verification.binding_id !== bindingId) ||
     (connectionState === "verified" && value.status !== "compatible") ||
     (connectionState === "verified" && verification !== null &&
       (verification.last_outcome !== "verified" ||
@@ -126,7 +126,7 @@ export function parseRuntimeConnectionTestResponse(
   return {
     workspace_id: value.workspace_id,
     runtime_id: value.runtime_id,
-    binding_revision: bindingRevision,
+    binding_id: bindingId,
     connection_state: connectionState,
     verification,
     checked_at: value.checked_at,
@@ -147,10 +147,6 @@ function parseConnectionState(
     : null;
 }
 
-function isSafeRevision(value: unknown): value is number {
-  return Number.isSafeInteger(value) && (value as number) >= 0;
-}
-
 function parseVerificationEvidence(
   value: unknown,
 ): RuntimeVerificationEvidenceSummary | null {
@@ -159,12 +155,11 @@ function parseVerificationEvidence(
     "verified_at",
     "last_checked_at",
     "last_outcome",
-    "binding_revision",
+    "binding_id",
     "workspace_key_id",
-    "workspace_identity_revision",
-    "workspace_trust_generation",
+    "workspace_public_key_fingerprint",
+    "workspace_trust_id",
     "runtime_public_key_fingerprint",
-    "runtime_identity_revision",
   ] as const;
   if (!isRecord(value) || !hasExactKeys(value, keys)) return null;
   if (
@@ -177,12 +172,11 @@ function parseVerificationEvidence(
       value.last_outcome !== "challenge_issued" &&
       value.last_outcome !== "verification_failed" &&
       value.last_outcome !== "connectivity_failed") ||
-    !isSafeRevision(value.binding_revision) ||
+    !isBoundedString(value.binding_id) ||
     !isBoundedString(value.workspace_key_id, 128) ||
-    !isSafeRevision(value.workspace_identity_revision) ||
-    !isSafeRevision(value.workspace_trust_generation) ||
-    !isBoundedString(value.runtime_public_key_fingerprint, 128) ||
-    !isSafeRevision(value.runtime_identity_revision)
+    !isBoundedString(value.workspace_public_key_fingerprint) ||
+    !isBoundedString(value.workspace_trust_id) ||
+    !isBoundedString(value.runtime_public_key_fingerprint, 128)
   ) {
     return null;
   }
@@ -190,12 +184,11 @@ function parseVerificationEvidence(
     verified_at: value.verified_at,
     last_checked_at: value.last_checked_at,
     last_outcome: value.last_outcome,
-    binding_revision: value.binding_revision,
+    binding_id: value.binding_id,
     workspace_key_id: value.workspace_key_id,
-    workspace_identity_revision: value.workspace_identity_revision,
-    workspace_trust_generation: value.workspace_trust_generation,
+    workspace_public_key_fingerprint: value.workspace_public_key_fingerprint,
+    workspace_trust_id: value.workspace_trust_id,
     runtime_public_key_fingerprint: value.runtime_public_key_fingerprint,
-    runtime_identity_revision: value.runtime_identity_revision,
   };
 }
 

@@ -393,8 +393,8 @@ async fn workdirless_workers_share_markdown_through_current_read_and_write_grant
         .unwrap(),
     );
     assert_ne!(
-        updated["entry"]["metadata"]["revision"],
-        created["entry"]["metadata"]["revision"]
+        updated["entry"]["metadata"]["last_mutation_id"],
+        created["entry"]["metadata"]["last_mutation_id"]
     );
     assert_eq!(
         value(
@@ -416,7 +416,8 @@ async fn workdirless_workers_share_markdown_through_current_read_and_write_grant
 }
 
 #[tokio::test]
-async fn simultaneous_worker_edits_publish_exactly_one_revision_and_preserve_the_loser_conflict() {
+async fn simultaneous_worker_edits_publish_exactly_one_last_mutation_id_and_preserve_the_loser_conflict()
+ {
     let f = Fixture::new(["read_write", "read_write"]).await;
     let id = entry(&f.create("simultaneous.md", "original").await);
     for feature in &f.features {
@@ -456,7 +457,7 @@ async fn simultaneous_worker_edits_publish_exactly_one_revision_and_preserve_the
 }
 
 #[tokio::test]
-async fn stale_worker_observations_cannot_write_edit_relocate_or_delete_newer_revision() {
+async fn stale_worker_observations_cannot_write_edit_relocate_or_delete_newer_last_mutation_id() {
     let f = Fixture::new(["read_write", "read_write"]).await;
     let id = entry(&f.create("cas.md", "old").await);
     let root = f.root(0).await;
@@ -914,8 +915,8 @@ async fn lost_mutation_response_is_resolved_by_receipt_without_resending_effect(
     let listed = value(tool(&f.features[1], "DriveList", json!({})).await.unwrap());
     assert_eq!(listed["entries"].as_array().unwrap().len(), 1);
     assert_eq!(
-        listed["entries"][0]["metadata"]["revision"],
-        created["entry"]["metadata"]["revision"]
+        listed["entries"][0]["metadata"]["last_mutation_id"],
+        created["entry"]["metadata"]["last_mutation_id"]
     );
 }
 
@@ -954,8 +955,8 @@ async fn scoped_workdir_import_publishes_document_and_image_bytes_with_bounded_r
             .append_pair("entry_workspace_id", TEST_WORKSPACE_ID)
             .append_pair("id", id["node_id"].as_str().unwrap())
             .append_pair(
-                "expected_revision",
-                metadata["metadata"]["revision"].as_str().unwrap(),
+                "expected_mutation_id",
+                metadata["metadata"]["last_mutation_id"].as_str().unwrap(),
             )
             .append_pair("offset", "0")
             .append_pair("length", "17")
@@ -1271,7 +1272,7 @@ async fn native_tree_does_not_index_entries_but_direct_inspect_and_invoke_use_cu
 }
 
 #[tokio::test]
-async fn native_create_and_write_use_client_managed_revisions_and_reject_stale_worker() {
+async fn native_create_and_write_use_client_managed_committed_requests_and_reject_stale_worker() {
     let f = Fixture::new(["read_write", "read_write"]).await;
     let first = native_tools(&f.features[0]);
     let second = native_tools(&f.features[1]);
@@ -1294,8 +1295,8 @@ async fn native_create_and_write_use_client_managed_revisions_and_reject_stale_w
     );
     let updated = value(native_tool(&first, "Invoke", json!({"path":path,"interface":observed_first["interfaces"][0]["reference"],"operation":"write","arguments":{"content":"committed"}})).await.unwrap());
     assert_ne!(
-        updated["entry"]["metadata"]["revision"],
-        created["entry"]["metadata"]["revision"]
+        updated["entry"]["metadata"]["last_mutation_id"],
+        created["entry"]["metadata"]["last_mutation_id"]
     );
     let error = native_tool(&second, "Invoke", json!({"path":path,"interface":observed_second["interfaces"][0]["reference"],"operation":"write","arguments":{"content":"lost"}})).await.unwrap_err();
     assert!(
@@ -1333,7 +1334,7 @@ async fn image_attachment_retains_original_bytes_after_drive_update_and_revocati
                   request: &str,
                   bytes: &[u8],
                   id: Option<&Value>,
-                  revision: Option<&str>| {
+                  last_mutation_id: Option<&str>| {
         let mut query = url::form_urlencoded::Serializer::new(String::new());
         query
             .append_pair("operation", operation)
@@ -1345,7 +1346,7 @@ async fn image_attachment_retains_original_bytes_after_drive_update_and_revocati
         if let Some(id) = id {
             query
                 .append_pair("id", id["node_id"].as_str().unwrap())
-                .append_pair("expected_revision", revision.unwrap());
+                .append_pair("expected_mutation_id", last_mutation_id.unwrap());
         } else {
             query
                 .append_pair("parent_id", root["node_id"].as_str().unwrap())
@@ -1400,7 +1401,7 @@ async fn image_attachment_retains_original_bytes_after_drive_update_and_revocati
             "image-update",
             replacement,
             Some(&id),
-            saved["entry"]["revision"].as_str(),
+            saved["entry"]["last_mutation_id"].as_str(),
         ),
         replacement,
     )

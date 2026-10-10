@@ -100,8 +100,6 @@ pub struct JobRequest {
     /// Stable caller-selected idempotency key within the host's namespace.
     pub job_id: String,
     pub purpose: String,
-    /// Revision fenced by the structured result.
-    pub input_revision: String,
     pub input_ref: String,
     /// Bounded immutable snapshot; must not contain credentials.
     pub input: Value,
@@ -126,7 +124,6 @@ impl JobRequest {
     pub fn validate_fields(&self) -> Result<()> {
         validate_identifier("job_id", &self.job_id, 256)?;
         validate_identifier("purpose", &self.purpose, MAX_JOB_PURPOSE_BYTES)?;
-        validate_identifier("input_revision", &self.input_revision, 256)?;
         validate_bounded_text("input_ref", &self.input_ref, MAX_JOB_REFERENCE_BYTES)?;
         validate_bounded_text("instruction", &self.instruction, MAX_JOB_INSTRUCTION_BYTES)?;
         self.profile_selector()?;
@@ -157,6 +154,13 @@ impl JobRequest {
         fingerprint(self)
     }
 
+    /// Content identity for result fencing; hosts compare it with the reserved
+    /// attempt's input, never with a caller-selected counter.
+    pub fn input_digest(&self) -> Result<String> {
+        self.validate_input()?;
+        fingerprint(&self.input)
+    }
+
     pub fn worker_input(&self, attempt_id: &str) -> Result<String> {
         worker_input(self, attempt_id)
     }
@@ -167,7 +171,8 @@ impl JobRequest {
 pub struct JobResultSubmission {
     pub job_id: String,
     pub attempt_id: String,
-    pub input_revision: String,
+    /// SHA-256 of the exact JSON encoding of the immutable input snapshot.
+    pub input_digest: String,
     pub result: Value,
 }
 
@@ -202,7 +207,8 @@ pub enum JobAttemptState {
 #[serde(deny_unknown_fields)]
 pub struct JobOutcome {
     pub job_id: String,
-    pub input_revision: String,
+    /// SHA-256 of the exact JSON encoding of the immutable input snapshot.
+    pub input_digest: String,
     pub attempt_id: String,
     pub attempt: u8,
     pub state: JobState,
@@ -263,11 +269,11 @@ pub fn worker_input_with_label(
     let input = serde_json::to_string(&request.input)
         .map_err(|error| JobError::InvalidInput(format!("serialize Job input: {error}")))?;
     Ok(format!(
-        "{}\n\n{label} envelope (immutable):\njob_id: {}\nattempt_id: {}\ninput_revision: {}\ninput_ref: {}\ninput_json: {}\n\nReturn success only through the structured {label} result capability. Final prose and Worker Idle/Stopped state are not result authority.",
+        "{}\n\n{label} envelope (immutable):\njob_id: {}\nattempt_id: {}\ninput_digest: {}\ninput_ref: {}\ninput_json: {}\n\nReturn success only through the structured {label} result capability. Final prose and Worker Idle/Stopped state are not result authority.",
         request.instruction,
         request.job_id,
         attempt_id,
-        request.input_revision,
+        request.input_digest()?,
         request.input_ref,
         input
     ))

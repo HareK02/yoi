@@ -124,7 +124,6 @@ pub struct ResolvedFlowSource {
     pub selector: FlowSelector,
     pub workspace_id: String,
     pub flow_id: String,
-    pub revision: u64,
     pub content_digest: String,
     pub definition: crate::CompiledFlowDefinition,
 }

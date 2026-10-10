@@ -22,7 +22,7 @@ fn escaped_ids_use_exact_t704_complete_result_budget() {
         .collect();
     let result = serde_json::json!({
         "subject_id": "\\\"".repeat(128), "candidate_ids": batch, "candidate_dispositions": dispositions,
-        "surface": { "availability": "failed", "generation_id": "g".repeat(100), "store_revision": u64::MAX, "reason_code": "\\\"".repeat(128) }
+        "surface": { "availability": "failed", "generation_id": "g".repeat(100), "memory_fingerprint": "f".repeat(64), "reason_code": "\\\"".repeat(128) }
     });
     assert!(serde_json::to_vec(&result).unwrap().len() <= MAX_RESULT_BYTES as usize);
     assert!(
@@ -119,7 +119,7 @@ fn result_checks_durable_dispositions_and_exact_job_surface_outcome() {
         .publish_surface_generation(&subject.id, &generation.id, vec![])
         .unwrap();
     let ready = serde_json::json!({"subject_id": subject.id, "candidate_ids": batch,
-        "surface": {"availability": "ready", "generation_id": generation.id, "store_revision": snapshot.built_from_store_revision, "snapshot_id": snapshot.id}});
+        "surface": {"availability": "ready", "generation_id": generation.id, "memory_fingerprint": snapshot.built_from_memory_fingerprint, "snapshot_id": snapshot.id}});
     assert!(
         validate_result(&store, &subject.id, &batch, "job", "attempt", &ready)
             .unwrap_err()
@@ -170,11 +170,11 @@ fn result_checks_durable_dispositions_and_exact_job_surface_outcome() {
     let failure = store
         .prepare_job_surface_generation(&subject.id, Some(("job", "attempt")))
         .unwrap();
-    let revision = store
+    let memory_fingerprint = store
         .fail_surface_generation(&subject.id, &failure.id, "model_failure")
         .unwrap();
     let failed = serde_json::json!({"subject_id": subject.id, "candidate_ids": batch,
-        "surface": {"availability": "failed", "generation_id": failure.id, "store_revision": revision, "reason_code": "model_failure"}});
+        "surface": {"availability": "failed", "generation_id": failure.id, "memory_fingerprint": memory_fingerprint, "reason_code": "model_failure"}});
     validate_result(&store, &subject.id, &batch, "job", "attempt", &failed).unwrap();
     assert!(validate_result(&store, &subject.id, &batch, "job", "attempt", &ready).is_err());
     let mut false_reason = failed;

@@ -11,7 +11,7 @@ README documents the tool; running the tool is not itself visual review completi
 The workbench produces a **review context bundle** rather than treating a screenshot as evidence by
 itself. Every capture records the persona, route, viewport, theme, intended user goal, expected data
 state, sanitized document URL/status, console/page/request failures, screenshot hashes, an
-accessibility snapshot, source revision, and browser version.
+accessibility snapshot, source Git commit SHA, and browser version.
 
 ## Environment
 

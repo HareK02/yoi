@@ -122,7 +122,7 @@ impl EvidenceApiFixture {
     }
 
     fn revision(&self) -> String {
-        ticket_item_checker::item_revision(
+        ticket_item_checker::content_digest(
             &self.backend.show(self.ticket_id.clone().into()).unwrap(),
         )
     }
@@ -150,7 +150,7 @@ impl EvidenceApiFixture {
             .request_review(RequestMergeRequestReview {
                 merge_request_id: EVIDENCE_MR.into(),
                 ticket_id: self.ticket_id.clone(),
-                ticket_item_revision: self.revision(),
+                ticket_content_digest: self.revision(),
                 ticket_merge_request_subjects: self.subjects(),
                 subject_ref: EVIDENCE_SOURCE.into(),
                 child_session_id,
@@ -194,7 +194,7 @@ impl EvidenceApiFixture {
     fn completion(&self, _approval: &ReviewEvent) -> ticket::TicketCompletion {
         ticket::TicketCompletion {
             operation_key: "evidence-ticket-completion".into(),
-            expected_item_revision: self.revision(),
+            expected_content_digest: self.revision(),
             expected_state: TicketWorkflowState::InProgress,
             reason: "Implementation judged complete independently of MR attestation".into(),
             references: Vec::new(),
@@ -247,7 +247,7 @@ impl EvidenceApiFixture {
             assert_eq!(ids, expected, "{filter}");
             if matches {
                 let shown = self.show().await;
-                assert_eq!(result.items[0].item_revision, shown.item_revision);
+                assert_eq!(result.items[0].content_digest, shown.content_digest);
                 assert_eq!(result.items[0].evidence, shown.evidence);
                 assert_eq!(result.items[0].merge_requests, shown.merge_requests);
             }
@@ -306,7 +306,7 @@ async fn done_merged_remote_ticket_uses_immutable_result_in_show_query_list_and_
         .backend
         .complete(&fixture.ticket_id, fixture.completion(&approval))
         .unwrap();
-    assert_eq!(ticket::ticket_item_revision(&completion), revision);
+    assert_eq!(ticket::ticket_content_digest(&completion), revision);
     assert!(
         fixture
             .api
@@ -326,7 +326,7 @@ async fn done_merged_remote_ticket_uses_immutable_result_in_show_query_list_and_
 
     let shown = fixture.show().await;
     assert_eq!(shown.state, "done");
-    assert_eq!(shown.item_revision, revision);
+    assert_eq!(shown.content_digest, revision);
     assert!(
         shown.evidence.complete_for_integration,
         "{:?}",
@@ -366,9 +366,9 @@ async fn done_merged_remote_ticket_uses_immutable_result_in_show_query_list_and_
     assert!(empty.merge_request.thread.is_empty());
     for detail in [first, empty] {
         assert_eq!(detail.source.status, "known");
-        assert_eq!(detail.source.revision_ref.as_deref(), Some(EVIDENCE_SOURCE));
+        assert_eq!(detail.source.resolved_ref.as_deref(), Some(EVIDENCE_SOURCE));
         assert_eq!(detail.target.status, "known");
-        assert_eq!(detail.target.revision_ref.as_deref(), Some(EVIDENCE_TARGET));
+        assert_eq!(detail.target.resolved_ref.as_deref(), Some(EVIDENCE_TARGET));
         assert_eq!(detail.source.observed_at, merge.created_at.to_rfc3339());
         assert_eq!(detail.source.diagnostic, None);
         assert_eq!(detail.target.diagnostic, None);
@@ -382,7 +382,7 @@ async fn latest_postmerge_approval_requires_exact_revision_and_stored_source_res
     let merge = fixture.integrate(&integration);
     fixture.rescope();
     let revision = fixture.revision();
-    assert_ne!(integration.ticket_item_revision, revision);
+    assert_ne!(integration.ticket_content_digest, revision);
 
     let stale = fixture.show().await;
     assert!(stale.evidence.approved_current_subject); // integration proof survives
@@ -396,7 +396,7 @@ async fn latest_postmerge_approval_requires_exact_revision_and_stored_source_res
     );
     fixture.assert_filters(false, true, true).await;
     let mut outdated_completion = fixture.completion(&integration);
-    outdated_completion.expected_item_revision = integration.ticket_item_revision.clone();
+    outdated_completion.expected_content_digest = integration.ticket_content_digest.clone();
     assert!(
         fixture
             .backend
@@ -407,7 +407,7 @@ async fn latest_postmerge_approval_requires_exact_revision_and_stored_source_res
 
     let latest = fixture.approve("latest-revision");
     assert_eq!(latest.created_at, integration.created_at);
-    assert_eq!(latest.ticket_item_revision, revision);
+    assert_eq!(latest.ticket_content_digest, revision);
     assert_eq!(latest.ticket_merge_request_subjects, fixture.subjects());
     let fresh = fixture.show().await;
     assert!(
@@ -484,13 +484,13 @@ async fn latest_postmerge_approval_requires_exact_revision_and_stored_source_res
     assert_eq!(stored.merged_result().unwrap(), &merge);
     let detail = fixture.detail(repaired.sequence - 1, 1).await;
     assert_eq!(detail.merge_request.thread.len(), 1);
-    assert_eq!(detail.source.revision_ref.as_deref(), Some(EVIDENCE_SOURCE));
-    assert_eq!(detail.target.revision_ref.as_deref(), Some(EVIDENCE_TARGET));
+    assert_eq!(detail.source.resolved_ref.as_deref(), Some(EVIDENCE_SOURCE));
+    assert_eq!(detail.target.resolved_ref.as_deref(), Some(EVIDENCE_TARGET));
     let completion = fixture
         .backend
         .complete(&fixture.ticket_id, fixture.completion(&repaired))
         .unwrap();
-    assert_eq!(ticket::ticket_item_revision(&completion), revision);
+    assert_eq!(ticket::ticket_content_digest(&completion), revision);
     assert_eq!(fixture.show().await.state, "done");
     fixture.assert_filters(true, false, false).await;
 }
@@ -560,7 +560,7 @@ async fn open_source_without_runtime_is_typed_unavailable_not_stale_after_rescop
     let detail = fixture.detail(approval.sequence, 1).await;
     assert!(detail.merge_request.thread.is_empty());
     assert_eq!(detail.source.status, "unknown");
-    assert_eq!(detail.source.revision_ref, None);
+    assert_eq!(detail.source.resolved_ref, None);
     assert_eq!(
         detail.source.diagnostic.unwrap().code,
         "source_ref_runtime_unavailable"
@@ -649,7 +649,7 @@ async fn closing_ticket_with_open_unreviewed_mr_does_not_change_its_proof_or_sta
             &fixture.ticket_id,
             ticket::TicketStateUpdate {
                 operation_key: "close-with-open-mr".into(),
-                expected_item_revision: fixture.revision(),
+                expected_content_digest: fixture.revision(),
                 expected_state: TicketWorkflowState::InProgress,
                 state: TicketWorkflowState::Closed,
                 reason: "The request was withdrawn; no integration or approval is asserted".into(),
@@ -686,7 +686,7 @@ async fn mrless_completion_is_a_ticket_judgment_not_approved_or_missing_merge_ev
             &reference.id,
             ticket::TicketCompletion {
                 operation_key: "research-result".into(),
-                expected_item_revision: ticket::ticket_item_revision(&ticket),
+                expected_content_digest: ticket::ticket_content_digest(&ticket),
                 expected_state: TicketWorkflowState::Planning,
                 reason: "Answer recorded in the Ticket thread".into(),
                 references: Vec::new(),
@@ -760,7 +760,7 @@ async fn all_public_state_and_close_routes_require_explicit_cas_and_operation_re
     )
     .await;
     let close = json!({
-        "operation_key":"guarded-close","expected_item_revision":ticket::ticket_item_revision(&before),
+        "operation_key":"guarded-close","expected_content_digest":ticket::ticket_content_digest(&before),
         "expected_state":"planning","reason":"No further work required","author":"spoofed-client-author"
     });
     let response = app
@@ -786,7 +786,7 @@ async fn all_public_state_and_close_routes_require_explicit_cas_and_operation_re
         Some(&"guarded-close".to_string())
     );
     let reopen = json!({
-        "operation_key":"reopen","expected_item_revision":ticket::ticket_item_revision(&closed),
+        "operation_key":"reopen","expected_content_digest":ticket::ticket_content_digest(&closed),
         "expected_state":"closed","state":"planning","reason":"A new question arrived"
     });
     let response = app

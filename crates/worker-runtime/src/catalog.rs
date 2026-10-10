@@ -75,7 +75,6 @@ pub struct WorkingDirectoryRepository {
     pub id: String,
     pub provider: String,
     pub source: server_api::RepositorySource,
-    pub source_revision: u64,
     pub source_fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<RepositorySelector>,
@@ -121,7 +120,7 @@ impl std::fmt::Debug for SensitiveString {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositorySshCredentialCandidate {
     pub credential_id: String,
-    pub credential_revision: u64,
+    pub public_key_fingerprint: String,
     #[serde(skip, default)]
     pub private_key: SensitiveString,
 }
@@ -130,7 +129,7 @@ pub struct RepositorySshCredentialCandidate {
 pub struct RepositorySshMaterializationAccess {
     pub credential_candidates: Vec<RepositorySshCredentialCandidate>,
     pub host_trust_id: String,
-    pub host_trust_revision: u64,
+    pub host_key_fingerprint: String,
     pub access: server_api::RepositoryAccessMode,
     pub expires_at_epoch_seconds: u64,
     pub repository_id: String,
@@ -146,7 +145,6 @@ pub struct RepositoryMaterializationContext {
     pub workspace_id: String,
     pub runtime_id: String,
     pub operation_id: String,
-    pub config_revision: u64,
     pub config_projection_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<RepositorySshMaterializationAccess>,
@@ -191,10 +189,9 @@ pub struct RepositoryRefObservationRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryRefObservation {
     pub repository_id: String,
-    pub source_revision: u64,
     pub source_fingerprint: String,
     pub selector: String,
-    pub revision_ref: String,
+    pub resolved_ref: String,
     pub observed_at_epoch_seconds: u64,
 }
 

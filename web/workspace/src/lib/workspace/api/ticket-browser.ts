@@ -737,7 +737,7 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     "evidence",
     "id",
     "implementation_reports",
-    "item_revision",
+    "content_digest",
     "linked_objectives",
     "merge_request",
     "merge_requests",
@@ -792,7 +792,7 @@ export function parseTicketDetail(value: unknown): TicketDetail {
       `${label}.implementation_reports`,
       parseTicketEvidenceEvent,
     ),
-    item_revision: string(item.item_revision, `${label}.item_revision`),
+    content_digest: string(item.content_digest, `${label}.content_digest`),
     linked_objectives: array(
       item.linked_objectives,
       `${label}.linked_objectives`,
@@ -986,7 +986,6 @@ export function parseObjectiveDetail(value: unknown): ObjectiveDetail {
     "record_source",
     "resource_key",
     "resources",
-    "revision",
     "state",
     "title",
     "updated_at",
@@ -1011,7 +1010,6 @@ export function parseObjectiveDetail(value: unknown): ObjectiveDetail {
       `${label}.resources`,
       parseObjectiveResource,
     ),
-    revision: string(item.revision, `${label}.revision`),
     state: string(item.state, `${label}.state`),
     title: string(item.title, `${label}.title`),
     updated_at: optionalNullableString(item.updated_at, `${label}.updated_at`),
@@ -1138,7 +1136,7 @@ function parseMergeRequestThreadEvent(
         "requested_by",
         "reviewer",
         "subject_ref",
-        "ticket_item_revision",
+        "ticket_content_digest",
         "ticket_merge_request_subjects",
       ],
       label,
@@ -1152,9 +1150,9 @@ function parseMergeRequestThreadEvent(
       ),
       reviewer: parseMergeRequestWorker(item.reviewer, `${label}.reviewer`),
       subject_ref: string(item.subject_ref, `${label}.subject_ref`),
-      ticket_item_revision: string(
-        item.ticket_item_revision,
-        `${label}.ticket_item_revision`,
+      ticket_content_digest: string(
+        item.ticket_content_digest,
+        `${label}.ticket_content_digest`,
       ),
       ticket_merge_request_subjects: array(
         item.ticket_merge_request_subjects,
@@ -1172,7 +1170,7 @@ function parseMergeRequestThreadEvent(
       "request_event_id",
       "reviewer",
       "subject_ref",
-      "ticket_item_revision",
+      "ticket_content_digest",
       "ticket_merge_request_subjects",
     ], label);
     const decision = string(item.decision, `${label}.decision`);
@@ -1191,9 +1189,9 @@ function parseMergeRequestThreadEvent(
       ),
       reviewer: parseMergeRequestWorker(item.reviewer, `${label}.reviewer`),
       subject_ref: string(item.subject_ref, `${label}.subject_ref`),
-      ticket_item_revision: string(
-        item.ticket_item_revision,
-        `${label}.ticket_item_revision`,
+      ticket_content_digest: string(
+        item.ticket_content_digest,
+        `${label}.ticket_content_digest`,
       ),
       ticket_merge_request_subjects: array(
         item.ticket_merge_request_subjects,

@@ -154,11 +154,11 @@
       "id": "detail",
       "label": "Committed Memory detail",
       "path": "/w/memory-review/memory/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/memory-decision-with-a-deliberately-long-stable-identity-for-overflow-review-0000000001",
-      "goal": "Audit immutable Memory body, candidate evidence, source refs, derivations, and revision history.",
-      "dataState": "Current active revision with bounded typed provenance and active/resolved/retracted immutable history.",
+      "goal": "Audit immutable Memory body, candidate evidence, source refs, derivations, and change history.",
+      "dataState": "Current active change with bounded typed provenance and active/resolved/retracted immutable history.",
       "ready": {
         "kind": "selector",
-        "selector": "[data-memory-view='detail'] .revision-list"
+        "selector": "[data-memory-view='detail'] .change-list"
       },
       "capturePoints": [{ "id": "initial", "label": "Memory detail" }]
     },

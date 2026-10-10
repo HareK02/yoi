@@ -475,7 +475,7 @@ async fn workspace_config_real_selected_invoke_backend_wip_edit_create_delete_im
         .load_workspace_config(TEST_WORKSPACE_ID)
         .unwrap()
         .unwrap();
-    assert_eq!(after.snapshot.revision, before.snapshot.revision + 1);
+    assert_ne!(after.snapshot.digest, before.snapshot.digest);
     assert!(
         after
             .snapshot

@@ -68,13 +68,14 @@ commands and generic POSIX operations are not exposed. The adapter uses the type
 an owner config API as a bypass.
 
 Client-managed PATH validators are compared against freshly resolved Host
-metadata. Each mutation captures the ROOT validator, whole-tree revision/digest,
+metadata. Each mutation captures the ROOT validator, whole-tree content digest,
 canonical entrypoints and node state from that same observation. Backend resolves
 the live grant/link and validates canonical changes/CAS under its execution lock.
 No operation accepts LLM-supplied validators or `expected_digest` fields. Returned
-post-call path validators are refreshed from the exact committed revision, not
-substituted with root validators or later unrelated state. UI/Worker edits and
-same-bytes replacement revisions reject stale calls. Old descriptors cannot
+post-call path validators are refreshed from the exact committed content, not
+substituted with root validators or later unrelated state. Content changes and
+reattachment to a new connection lifetime reject stale calls, even when the new
+attachment exposes the same bytes. Old descriptors cannot
 bypass read-only restrictions, detach, revocation or Workspace boundaries.
 
 Bounds: depth 0..8, 256 observed nodes/changes, 512-byte relative paths, 256 KiB

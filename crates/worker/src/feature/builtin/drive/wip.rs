@@ -1,5 +1,5 @@
 //! Native non-indexable Drive entries. Publication resolves just one ID through
-//! current Backend authorization; the Client owns identity/revision validators.
+//! current Backend authorization; the Client owns entry/committed-request validators.
 use super::{
     DriveFeature, SPECS, Spec,
     backend::{DriveError, decimal},
@@ -101,7 +101,7 @@ impl WipSubtreeProvider for DriveProvider {
         };
         let descriptor = descriptor(&specs, root);
         let reference = contextual_reference(INTERFACE, path);
-        let validator = entry.revision.as_bytes().to_vec();
+        let validator = entry.last_mutation_id.as_bytes().to_vec();
         let object = Object {
             name: if root {
                 "drive".into()
@@ -183,7 +183,7 @@ fn parameter(name: &str, required: bool, r#type: TypeExpr) -> ParameterDeclarati
     }
 }
 fn descriptor(specs: &[Spec], _root: bool) -> InterfaceDescriptor {
-    InterfaceDescriptor {format:INTERFACE_FORMAT_V1.into(),documentation:Some(Documentation {summary:"Backend-authorized Workspace Drive operations".into(),details:Some("Entry IDs are Workspace-bound. The Host/Client manage revisions; never supply validators or retry conflicts/outcome-unknown with a new revision. Read-only grants reject mutations at Backend. List/search return paths for direct Inspect, never tree inventories. Image bytes attach to durable ToolOutput; URLs are not image viewing. Workdir source read and Drive destination write are independent.".into())}),types:Vec::new(),operations:specs.iter().map(|spec|OperationDeclaration {name:spec.operation.into(),documentation:Some(Documentation {summary:spec.description.into(),details:None}),parameters:match spec.operation {
+    InterfaceDescriptor {format:INTERFACE_FORMAT_V1.into(),documentation:Some(Documentation {summary:"Backend-authorized Workspace Drive operations".into(),details:Some("Entry IDs are Workspace-bound. The Host/Client retain the last committed request observed for an entry. Never supply validators or silently retry a conflict against a newer observation. On outcome-unknown, query the original request receipt. Read-only grants reject mutations at Backend. List/search return paths for direct Inspect, never tree inventories. Image bytes attach to durable ToolOutput; URLs are not image viewing. Workdir source read and Drive destination write are independent.".into())}),types:Vec::new(),operations:specs.iter().map(|spec|OperationDeclaration {name:spec.operation.into(),documentation:Some(Documentation {summary:spec.description.into(),details:None}),parameters:match spec.operation {
         "list"=>vec![parameter("limit",false,TypeExpr::Integer),parameter("after",false,TypeExpr::String)],
         "search"=>vec![parameter("query",true,TypeExpr::String),parameter("include_text",false,TypeExpr::Boolean),parameter("limit",false,TypeExpr::Integer),parameter("after",false,TypeExpr::String)],
         "read"=>vec![parameter("max_bytes",false,TypeExpr::Integer)],
@@ -230,7 +230,7 @@ impl WipOperationHandler for DriveHandler {
             .any(|key| !declaration.parameters.iter().any(|p| p.name == *key))
         {
             return Err(map_error(DriveError::Invalid(
-                "unrecognized arguments; revision metadata is Client-managed".into(),
+                "unrecognized arguments; committed-request observations are Client-managed".into(),
             )));
         }
         let mut input = wip_to_json(&Value::Record(arguments.clone()))
@@ -296,12 +296,14 @@ impl WipOperationHandler for DriveHandler {
         // Attachments use the existing ToolOutput side channel and durable Engine
         // capture, not transient request injection or URL-only success.
         let result = if matches!(operation, "write" | "edit" | "relocate") {
-            let revision = output.value["entry"]["metadata"]["revision"]
+            let last_mutation_id = output.value["entry"]["metadata"]["last_mutation_id"]
                 .as_str()
                 .ok_or_else(|| {
-                    WipOperationError::OutcomeUnknown("Committed Drive revision unavailable".into())
+                    WipOperationError::OutcomeUnknown(
+                        "Committed Drive request identity unavailable".into(),
+                    )
                 })?;
-            WipOperationOutput::native_with_validator(value, revision.as_bytes().to_vec())
+            WipOperationOutput::native_with_validator(value, last_mutation_id.as_bytes().to_vec())
         } else {
             WipOperationOutput::native(value)
         };

@@ -23,7 +23,6 @@ const MAX_OPERATION_KEY_BYTES: usize = 200;
 pub struct WorkspaceCreateResult {
     pub workspace: WorkspaceRecord,
     pub repository: Option<RepositoryRecord>,
-    pub config_revision: u64,
     pub request_fingerprint: String,
     pub replayed: bool,
 }
@@ -159,7 +158,6 @@ impl WorkspaceCatalogService {
                         provider: Some("git".to_string()),
                         source: repository_source.clone(),
                         default_ref: Some(default_ref),
-                        source_revision: 1,
                         source_fingerprint: repository_source_fingerprint(&repository_source),
                         observed_status: RepositoryObservedStatus::Unverified,
                         observed_at: None,
@@ -174,7 +172,6 @@ impl WorkspaceCatalogService {
         Ok(WorkspaceCreateResult {
             workspace: result.workspace,
             repository: result.repository,
-            config_revision: result.config_revision,
             request_fingerprint: fingerprint,
             replayed: result.replayed,
         })
@@ -632,11 +629,10 @@ mod tests {
         let created = service.create(request.clone(), owner.clone()).unwrap();
         let mut repository = created.repository.unwrap();
         repository.source = validate_repository_source("https://example.test/changed.git").unwrap();
-        repository.source_revision += 1;
         repository.source_fingerprint = repository_source_fingerprint(&repository.source);
         store.with_conn(|conn| {
-            conn.execute("UPDATE repositories SET source_kind = ?1, source_uri = ?2, source_revision = ?3, source_fingerprint = ?4 WHERE workspace_id = ?5 AND repository_key = 'main'",
-                rusqlite::params![repository.source.kind.as_str(), repository.source.uri, repository.source_revision, repository.source_fingerprint, repository.workspace_id])?;
+            conn.execute("UPDATE repositories SET source_kind = ?1, source_uri = ?2, source_fingerprint = ?3 WHERE workspace_id = ?4 AND repository_key = 'main'",
+                rusqlite::params![repository.source.kind.as_str(), repository.source.uri, repository.source_fingerprint, repository.workspace_id])?;
             Ok(())
         }).unwrap();
         assert_eq!(
@@ -880,7 +876,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(persisted.source.kind, RepositorySourceKind::Ssh);
-        assert_eq!(persisted.source_revision, 1);
         assert!(persisted.source_fingerprint.starts_with("sha256:"));
         assert_eq!(
             persisted.observed_status,

@@ -35,7 +35,7 @@ struct ModelTicketQueryItem {
 #[derive(Debug, Serialize)]
 pub(super) struct ModelTicketDetail {
     ticket: String,
-    item_revision: String,
+    content_digest: String,
     title: String,
     body: String,
     state: String,
@@ -82,7 +82,6 @@ pub(super) struct ModelObjectiveDetail {
     body: String,
     body_truncated: bool,
     state: String,
-    revision: String,
     created_at: Option<String>,
     updated_at: Option<String>,
     linked_tickets: Vec<ModelTicketSummary>,
@@ -284,7 +283,7 @@ pub(super) fn project_ticket_detail(value: Value) -> Result<ModelTicketDetail, S
 
     Ok(ModelTicketDetail {
         ticket: resource_ref(root, "resource_key", "T-")?,
-        item_revision: string_field(root, "item_revision")?,
+        content_digest: string_field(root, "content_digest")?,
         title: string_field(root, "title")?,
         body: string_field(root, "body")?,
         state: string_field(root, "state")?,
@@ -369,7 +368,6 @@ pub(super) fn project_objective_detail(value: Value) -> Result<ModelObjectiveDet
         body: string_field(root, "body")?,
         body_truncated: bool_field(root, "body_truncated")?,
         state: string_field(root, "state")?,
-        revision: string_field(root, "revision")?,
         created_at: optional_string(root, "created_at")?,
         updated_at: optional_string(root, "updated_at")?,
         linked_tickets: array_field(root, "linked_ticket_summaries")?
@@ -705,7 +703,7 @@ mod tests {
             "closed",
         ] {
             let projected = project_ticket_detail(json!({
-                "resource_key": "T-718", "item_revision": "rev-1", "title": "No Git required", "body": "Decision",
+                "resource_key": "T-718", "content_digest": "rev-1", "title": "No Git required", "body": "Decision",
                 "state": state, "events": [{"sequence": 1, "kind": "completed", "body": "No Git needed"}],
                 "linked_objectives": [], "assignments": [], "implementation_reports": [],
                 "merge_requests": [], "merge_request": null,
@@ -735,7 +733,6 @@ mod tests {
             "body": "Body",
             "body_truncated": false,
             "state": "active",
-            "revision": "rev-3",
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-02T00:00:00Z",
             "linked_tickets": ["00001M0E82D1V"],
@@ -759,7 +756,6 @@ mod tests {
         let text = json.to_string();
         assert!(text.contains("O-543"));
         assert!(text.contains("T-496"));
-        assert_eq!(json["revision"], "rev-3");
         assert_eq!(json["body_truncated"], false);
         assert!(!text.contains("00001M10HW6BV"));
         assert!(!text.contains("00001M0E82D1V"));
@@ -845,7 +841,7 @@ mod tests {
         let projected = project_ticket_detail(json!({
             "id": "internal-ticket",
             "resource_key": "T-588",
-            "item_revision": "revision-1",
+            "content_digest": "revision-1",
             "title": "Queued Submit",
             "body": "Body",
             "state": "planning",
@@ -896,7 +892,7 @@ mod tests {
         .expect("current Ticket blocker shape must project");
 
         let projected = serde_json::to_value(projected).expect("serialize Ticket detail");
-        assert_eq!(projected["item_revision"], "revision-1");
+        assert_eq!(projected["content_digest"], "revision-1");
         assert_eq!(
             projected["relations"]["blockers"],
             json!([{
@@ -948,7 +944,7 @@ mod tests {
             });
             let projected = project_ticket_detail(json!({
                 "resource_key": "T-716",
-                "item_revision": "current-ticket-revision",
+                "content_digest": "current-ticket-revision",
                 "title": "Source evidence",
                 "body": "Body",
                 "state": if merged { "done" } else { "inprogress" },
@@ -986,7 +982,7 @@ mod tests {
                     Some(&json!(integration_error))
                 );
             }
-            assert_eq!(projected["item_revision"], "current-ticket-revision");
+            assert_eq!(projected["content_digest"], "current-ticket-revision");
             assert_eq!(projected["evidence"]["review_after_rescope"], attested);
             assert_eq!(projected["evidence"]["complete_for_integration"], merged);
         }

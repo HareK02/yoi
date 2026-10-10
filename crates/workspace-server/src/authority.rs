@@ -310,21 +310,12 @@ impl SqliteWorkspaceAuthority {
                 created_at: event.created_at.clone(),
             })
             .collect::<Vec<_>>();
-        let revision = format!(
-            "{}:{}",
-            record.updated_at,
-            all_events
-                .last()
-                .map(|event| event.event_id.as_str())
-                .unwrap_or("none")
-        );
         Ok(ObjectiveDetail {
             resource_key: self
                 .resource_key(WorkspaceResourceKind::Objective, &record.objective_id)?,
             id: record.objective_id,
             title: record.title,
             state: record.state,
-            revision,
             created_at: Some(record.created_at),
             updated_at: Some(record.updated_at),
             linked_tickets,
@@ -878,16 +869,9 @@ impl SqliteWorkspaceAuthority {
             })
             .collect::<Result<Vec<_>>>()?;
         let merge_request = (merge_requests.len() == 1).then(|| merge_requests[0].clone());
-        let item_revision = ticket
-            .events
-            .iter()
-            .rev()
-            .find(|event| matches!(event.kind.as_str(), "create" | "item_edit"))
-            .and_then(|event| event.attributes.get("event_id").cloned())
-            .or_else(|| ticket.meta.updated_at.clone())
-            .unwrap_or_else(|| format!("{}:0", ticket.meta.id));
+        let content_digest = ticket::ticket_content_digest(&ticket);
         let requirement_approved =
-            ticket_requirement_approved(&requests, &merge_requests, &item_revision);
+            ticket_requirement_approved(&requests, &merge_requests, &content_digest);
         let evidence = ticket_evidence_summary(
             &write_repository_keys,
             &merge_requests,
@@ -934,7 +918,7 @@ impl SqliteWorkspaceAuthority {
             priority: ticket.meta.priority,
             created_at: ticket.meta.created_at,
             updated_at: ticket.meta.updated_at,
-            item_revision,
+            content_digest,
             queued_by: ticket.meta.queued_by,
             queued_at: ticket.meta.queued_at,
             targets,
@@ -1846,7 +1830,7 @@ fn ticket_write_target_repository_keys(targets: &[ticket::TicketTarget]) -> Vec<
 fn ticket_requirement_approved(
     requests: &[MergeRequest],
     summaries: &[TicketMergeRequestSummary],
-    item_revision: &str,
+    content_digest: &str,
 ) -> bool {
     let subjects = summaries
         .iter()
@@ -1860,7 +1844,7 @@ fn ticket_requirement_approved(
         })
         .collect::<Option<Vec<_>>>();
     subjects.is_some_and(|subjects| {
-        merge_request::requirement_approval(requests, item_revision, &subjects, None).is_ok()
+        merge_request::requirement_approval(requests, content_digest, &subjects, None).is_ok()
     })
 }
 
@@ -2333,7 +2317,7 @@ fn ticket_query_item(
         priority: summary.priority,
         created_at: detail.created_at.clone(),
         updated_at: summary.updated_at,
-        item_revision: detail.item_revision.clone(),
+        content_digest: detail.content_digest.clone(),
         workspace_action_priority: summary.workspace_action_priority,
         matched_fields,
         snippet: snippet.map(|value| truncate_body(&value, 512).0),
@@ -2794,7 +2778,7 @@ mod tests {
                 event_id: "request-1".to_string(),
                 sequence: 1,
                 subject_ref: "commit-1".to_string(),
-                ticket_item_revision: "revision-1".to_string(),
+                ticket_content_digest: "revision-1".to_string(),
                 ticket_merge_request_subjects: vec![merge_request::MergeRequestReviewSubject {
                     merge_request_id: "mr-1".to_string(),
                     subject_ref: "commit-1".to_string(),
@@ -2808,7 +2792,7 @@ mod tests {
                 sequence: 2,
                 request_event_id: "request-1".to_string(),
                 subject_ref: "commit-1".to_string(),
-                ticket_item_revision: "revision-1".to_string(),
+                ticket_content_digest: "revision-1".to_string(),
                 ticket_merge_request_subjects: vec![merge_request::MergeRequestReviewSubject {
                     merge_request_id: "mr-1".to_string(),
                     subject_ref: "commit-1".to_string(),
@@ -3079,14 +3063,14 @@ mod tests {
                 MergeRequestThreadEvent::ReviewRequested(review) => {
                     review.event_id = format!("request-{sequence}");
                     review.sequence = sequence;
-                    review.ticket_item_revision = revision.into();
+                    review.ticket_content_digest = revision.into();
                     review.ticket_merge_request_subjects = subjects.clone();
                 }
                 MergeRequestThreadEvent::Review(review) => {
                     review.event_id = format!("review-{sequence}");
                     review.request_event_id = format!("request-{sequence}");
                     review.sequence = sequence + 1;
-                    review.ticket_item_revision = revision.into();
+                    review.ticket_content_digest = revision.into();
                     review.ticket_merge_request_subjects = subjects.clone();
                 }
                 _ => unreachable!(),
@@ -3521,7 +3505,7 @@ VALUES ('workspace-test', 'ticket', 4);
         assert!(ticket.body.contains("Ticket body"));
         assert!(ticket.body_truncated);
         assert!(!ticket.body.contains("Deep Ticket marker"));
-        assert!(!ticket.item_revision.is_empty());
+        assert!(!ticket.content_digest.is_empty());
         assert_eq!(ticket.linked_objectives[0].id, "00000000001J3");
         assert_eq!(ticket.event_page.returned, ticket.events.len());
         let ticket_query = authority
@@ -3704,7 +3688,6 @@ VALUES ('workspace-test', 'ticket', 4);
 
         let objective = authority.objective("00000000001J3").unwrap();
         assert!(objective.body.contains("Objective body"));
-        assert!(!objective.revision.is_empty());
         assert_eq!(objective.linked_ticket_summaries[0].id, "00000000001J2");
         assert_eq!(objective.linked_ticket_summaries[0].state, "ready");
         let linked_ticket_key = objective.linked_ticket_summaries[0].resource_key.clone();

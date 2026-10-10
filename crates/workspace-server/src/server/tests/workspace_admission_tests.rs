@@ -598,7 +598,6 @@ async fn runtime_callbacks_during_deletion_drain_still_require_bound_proofs() {
             TEST_WORKSPACE_ID,
             WorkdirlessFixtureRuntime::RUNTIME_ID,
             "fixture-resource",
-            "1",
             Utc::now().timestamp() + 60,
             worker_runtime::resource::RepositorySshAccessSecret {
                 credential_candidates: Vec::new(),
@@ -846,7 +845,7 @@ async fn create_and_restore_session_callbacks_finish_while_deletion_start_waits(
             &format!("/api/workspaces/{TEST_WORKSPACE_ID}/deletion"),
             json!({
                 "operation_id": if restore {"delete-during-restore"} else {"delete-during-create"},
-                "expected_revision": "fixture-revision", "confirmation":"fixture",
+                "expected_workspace_updated_at": "fixture-updated-at", "confirmation":"fixture",
             }),
         );
         let mut deletion = Box::pin(f.app.clone().oneshot(request));

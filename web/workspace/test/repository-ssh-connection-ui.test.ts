@@ -30,7 +30,7 @@ Deno.test("Repository SSH probe parser preserves the confirmation contract", () 
     port: 22,
     trust_state: "untrusted" as const,
     host_trust_id: "tofu-example.test-22",
-    expected_host_trust_revision: null,
+    expected_host_key_fingerprint: null,
     candidates: [
       {
         algorithm: "ssh-ed25519",
@@ -136,7 +136,7 @@ Deno.test("Repository SSH connection test requires an explicit host-key confirma
       "selectedRuntimeId",
       "candidate.fingerprint",
       "Confirm and trust selected host key",
-      "expected_host_trust_revision",
+      "expected_host_key_fingerprint",
       "requestConnectionTest('POST'",
       "requestConnectionTest('PUT'",
     ]

@@ -94,7 +94,6 @@ fn request(profile: &str) -> ::job::JobRequest {
     ::job::JobRequest {
         job_id: "job-a".into(),
         purpose: "scripted".into(),
-        input_revision: "rev-1".into(),
         input_ref: "snapshot:one".into(),
         input: json!({"text":"input"}),
         instruction: "Summarize the input".into(),
@@ -187,7 +186,7 @@ async fn executes_selected_profiles_with_only_result_authority_and_bounded_polic
             ::job::JobResultSubmission {
                 job_id: "job-a".into(),
                 attempt_id: "attempt-7".into(),
-                input_revision: "rev-1".into(),
+                input_digest: request("a").input_digest().unwrap(),
                 result: json!({"ok":true})
             }
         );
@@ -266,7 +265,10 @@ async fn selected_builtin_job_executes_with_catalog_contract_and_only_result_too
     assert!(rx.await.unwrap().is_closed());
     assert_eq!(result.submission.job_id, request.job_id);
     assert_eq!(result.submission.attempt_id, "builtin-attempt");
-    assert_eq!(result.submission.input_revision, request.input_revision);
+    assert_eq!(
+        result.submission.input_digest,
+        request.input_digest().unwrap()
+    );
     assert_eq!(result.submission.result, json!({"ok":true}));
     assert_eq!(sink.0.lock().unwrap().len(), 1);
     let requests = client.requests.lock().unwrap();

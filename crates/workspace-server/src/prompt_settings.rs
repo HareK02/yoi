@@ -12,7 +12,6 @@ use crate::{Error, Result};
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PromptProjectionCacheKey {
     workspace_id: String,
-    config_revision: u64,
     source_digest: String,
     projection_digest: String,
     schema_fingerprint: String,
@@ -23,7 +22,6 @@ impl PromptProjectionCacheKey {
     fn new(workspace_id: &str, state: &WorkspaceConfigState) -> Self {
         Self {
             workspace_id: workspace_id.to_string(),
-            config_revision: state.snapshot.revision,
             source_digest: state.snapshot.digest.clone(),
             projection_digest: state.projection_digest.clone(),
             schema_fingerprint: state.contract.schema_bundle.fingerprint.clone(),
@@ -37,15 +35,15 @@ type PromptProjectionCell = OnceLock<std::result::Result<Arc<WorkspacePromptProj
 #[derive(Debug, Default)]
 struct PromptProjectionCacheState {
     entries: BTreeMap<PromptProjectionCacheKey, Arc<PromptProjectionCell>>,
-    active: BTreeMap<String, PromptProjectionCacheKey>,
 }
 
 /// WorkspaceApi-shared immutable Prompt projections keyed by authoritative Workspace config
 /// identity.
 ///
 /// This cache is an evaluation optimization only. Callers must load the active
-/// [`WorkspaceConfigState`] from Server DB authority before resolving an entry. Advancing a
-/// Workspace replaces only its active cache entry; in-flight users retain their immutable `Arc`.
+/// [`WorkspaceConfigState`] from Server DB authority before resolving an entry.
+/// Content and evaluation contracts are distinct keys; in-flight users retain their
+/// immutable `Arc`. No ordering or freshness is inferred from a digest.
 #[derive(Debug, Clone, Default)]
 pub struct WorkspacePromptProjectionCache {
     inner: Arc<Mutex<PromptProjectionCacheState>>,
@@ -58,33 +56,25 @@ impl WorkspacePromptProjectionCache {
         state: &WorkspaceConfigState,
     ) -> Result<Arc<WorkspacePromptProjection>> {
         let key = PromptProjectionCacheKey::new(workspace_id, state);
-        let (cell, cached) = {
+        let cell = {
             let mut cache = self.lock()?;
-            if let Some(active) = cache.active.get(workspace_id) {
-                if key.config_revision == active.config_revision && key != *active {
-                    return Err(Error::RegistryInconsistency(format!(
-                        "Workspace Prompt projection identity changed without a config revision transition: workspace={workspace_id} revision={}",
-                        key.config_revision
-                    )));
-                }
-                if key.config_revision < active.config_revision {
-                    (Arc::new(PromptProjectionCell::new()), false)
-                } else {
-                    let cell = cache
-                        .entries
-                        .entry(key.clone())
-                        .or_insert_with(|| Arc::new(PromptProjectionCell::new()))
-                        .clone();
-                    (cell, true)
-                }
-            } else {
-                let cell = cache
+            // Bound retained cells without treating any content identity as newer.
+            // In-flight evaluation cells are never evicted, preserving single flight.
+            if !cache.entries.contains_key(&key) && cache.entries.len() >= 64 {
+                let evict = cache
                     .entries
-                    .entry(key.clone())
-                    .or_insert_with(|| Arc::new(PromptProjectionCell::new()))
-                    .clone();
-                (cell, true)
+                    .iter()
+                    .find(|(_, cell)| Arc::strong_count(cell) == 1)
+                    .map(|(key, _)| key.clone());
+                if let Some(evict) = evict {
+                    cache.entries.remove(&evict);
+                }
             }
+            cache
+                .entries
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(PromptProjectionCell::new()))
+                .clone()
         };
 
         let resolved = cell
@@ -97,52 +87,27 @@ impl WorkspacePromptProjectionCache {
         let catalog = match resolved {
             Ok(catalog) => catalog,
             Err(error) => {
-                if cached {
-                    self.lock()?.entries.remove(&key);
-                }
+                self.lock()?.entries.remove(&key);
                 return Err(Error::Config(error));
             }
         };
 
-        if cached {
-            self.record_resolved(workspace_id, &key, &cell)?;
+        // Concurrent distinct evaluations may temporarily exceed the retention
+        // limit. Trim completed cells after resolution without evicting in-flight
+        // work or assigning a temporal order to content identities.
+        let mut cache = self.lock()?;
+        while cache.entries.len() > 64 {
+            let evict = cache
+                .entries
+                .iter()
+                .find(|(_, cell)| Arc::strong_count(cell) == 1)
+                .map(|(key, _)| key.clone());
+            let Some(evict) = evict else {
+                break;
+            };
+            cache.entries.remove(&evict);
         }
         Ok(catalog)
-    }
-
-    fn record_resolved(
-        &self,
-        workspace_id: &str,
-        key: &PromptProjectionCacheKey,
-        cell: &Arc<PromptProjectionCell>,
-    ) -> Result<()> {
-        let mut cache = self.lock()?;
-        let active = cache.active.get(workspace_id).cloned();
-        match active {
-            Some(active) if active.config_revision > key.config_revision => {
-                cache.entries.remove(key);
-            }
-            Some(active) if active.config_revision == key.config_revision => {
-                if active != *key {
-                    cache.entries.remove(key);
-                    return Err(Error::RegistryInconsistency(format!(
-                        "Workspace Prompt projection identity changed without a config revision transition: workspace={workspace_id} revision={}",
-                        key.config_revision
-                    )));
-                }
-                cache.entries.entry(key.clone()).or_insert(cell.clone());
-            }
-            _ => {
-                cache.entries.insert(key.clone(), cell.clone());
-                cache.active.insert(workspace_id.to_string(), key.clone());
-                cache.entries.retain(|existing, _| {
-                    existing.workspace_id != workspace_id
-                        || existing == key
-                        || existing.config_revision > key.config_revision
-                });
-            }
-        }
-        Ok(())
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, PromptProjectionCacheState>> {
@@ -192,7 +157,7 @@ pub fn validate_evaluated_prompt_catalog(
     let prompts = projection.data_json.get("prompts").ok_or_else(|| {
         Error::InvalidInput("Workspace config projection has no prompts namespace".to_string())
     })?;
-    EffectivePromptCatalog::from_projection(prompts, 0, "preview", "preview")
+    EffectivePromptCatalog::from_projection(prompts, "preview", "preview")
         .map(|_| ())
         .map_err(|error| Error::InvalidInput(format!("invalid Prompt catalog: {error}")))
 }
@@ -203,7 +168,7 @@ pub fn project_prompts_from_workspace_config(
     let evaluation = evaluate_workspace_config_state(state, state.contract.schema_bundle.clone())?;
     if evaluation.projection_digest != state.projection_digest {
         return Err(Error::RegistryInconsistency(
-            "Prompt projection digest does not match the active Workspace config revision"
+            "Prompt projection digest does not match the active Workspace config content"
                 .to_string(),
         ));
     }
@@ -217,7 +182,6 @@ pub fn project_prompts_from_workspace_config(
     })?;
     let mut catalog = EffectivePromptCatalog::from_projection(
         prompts,
-        state.snapshot.revision,
         state.contract.schema_bundle.fingerprint.clone(),
         state.contract.fingerprint.clone(),
     )
@@ -249,23 +213,16 @@ mod tests {
     };
 
     fn state(source: &str) -> WorkspaceConfigState {
-        state_at(7, source)
-    }
-
-    fn state_at(revision: u64, source: &str) -> WorkspaceConfigState {
         let schema = WorkspaceConfigSchemaBundle::compose([PromptConfigSchemaProvider
             .contribution()
             .unwrap()])
         .unwrap();
-        let snapshot = ConfigTreeSnapshot::from_entries(
-            revision,
-            [ConfigEntry::new(
-                VirtualPath::parse("main.dcdl").unwrap(),
-                ConfigContentType::Decodal,
-                source,
-            )
-            .unwrap()],
+        let snapshot = ConfigTreeSnapshot::from_entries([ConfigEntry::new(
+            VirtualPath::parse("main.dcdl").unwrap(),
+            ConfigContentType::Decodal,
+            source,
         )
+        .unwrap()])
         .unwrap();
         let contract = ToolchainContract::with_schema_bundle(
             config_source::DEFAULT_SCHEMA_VERSION,
@@ -285,134 +242,74 @@ mod tests {
     }
 
     #[test]
-    fn prompt_projection_cache_shares_immutable_entry_and_replaces_workspace_revision() {
+    fn prompt_projection_cache_reuses_content_and_separates_workspaces() {
         let cache = WorkspacePromptProjectionCache::default();
         let initial = state("{}");
         let first = cache.resolve("workspace-a", &initial).unwrap();
-        let retry = cache.resolve("workspace-a", &initial).unwrap();
+        let retry = cache.resolve("workspace-a", &state("{}")).unwrap();
         assert!(Arc::ptr_eq(&first, &retry));
-        assert_eq!(cache.len(), 1);
-
-        let updated = state_at(
-            8,
-            r#"{ prompts = { common = { language = "UPDATED"; }; }; }"#,
-        );
+        let updated = state(r#"{ prompts = { common = { language = "UPDATED"; }; }; }"#);
         let replacement = cache.resolve("workspace-a", &updated).unwrap();
         assert!(!Arc::ptr_eq(&first, &replacement));
         assert_eq!(
             replacement.catalog().templates["common.language"],
             "UPDATED"
         );
-        assert_eq!(cache.len(), 1);
+        assert!(Arc::ptr_eq(
+            &first,
+            &cache.resolve("workspace-a", &initial).unwrap()
+        ));
         assert_ne!(first.catalog().templates["common.language"], "UPDATED");
+        let other = cache.resolve("workspace-b", &updated).unwrap();
+        assert!(!Arc::ptr_eq(&replacement, &other));
+        assert_eq!(cache.len(), 3);
+    }
 
-        let other_workspace = cache.resolve("workspace-b", &updated).unwrap();
-        assert!(!Arc::ptr_eq(&replacement, &other_workspace));
+    #[test]
+    fn prompt_projection_cache_separates_contracts_for_same_content() {
+        let cache = WorkspacePromptProjectionCache::default();
+        let initial = state("{}");
+        let mut changed = initial.clone();
+        let bundle = WorkspaceConfigSchemaBundle::compose([
+            PromptConfigSchemaProvider.contribution().unwrap(),
+            ConfigSchemaContribution::new(
+                "builtin:extra",
+                "extra",
+                "1",
+                "{ extra = Bool default false; }",
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        changed.contract = ToolchainContract::with_schema_bundle(
+            config_source::DEFAULT_SCHEMA_VERSION,
+            changed.contract.entrypoints.clone(),
+            config_source::DEFAULT_IMPORT_POLICY_VERSION,
+            bundle,
+        );
+        changed.projection_digest = SnapshotEnvironment::new(changed.snapshot.clone())
+            .evaluate_contract(&changed.contract)
+            .unwrap()
+            .projection_digest;
+        assert_eq!(initial.snapshot.digest, changed.snapshot.digest);
+        let first = cache.resolve("workspace-a", &initial).unwrap();
+        let second = cache.resolve("workspace-a", &changed).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(
+            &first,
+            &cache.resolve("workspace-a", &initial).unwrap()
+        ));
         assert_eq!(cache.len(), 2);
     }
 
     #[test]
-    fn prompt_projection_cache_does_not_let_stale_revision_evict_active_entry() {
+    fn prompt_projection_cache_bounds_retained_content_cells() {
         let cache = WorkspacePromptProjectionCache::default();
-        let current = state_at(
-            8,
-            r#"{ prompts = { common = { language = "CURRENT"; }; }; }"#,
-        );
-        let stale = state_at(7, "{}");
-
-        let current_catalog = cache.resolve("workspace-a", &current).unwrap();
-        let stale_catalog = cache.resolve("workspace-a", &stale).unwrap();
-        let current_retry = cache.resolve("workspace-a", &current).unwrap();
-
-        assert_eq!(stale_catalog.catalog().config_revision, 7);
-        assert!(Arc::ptr_eq(&current_catalog, &current_retry));
-        assert_eq!(cache.len(), 1);
-    }
-
-    #[test]
-    fn prompt_projection_cache_rejects_same_revision_reinterpretation() {
-        let cache = WorkspacePromptProjectionCache::default();
-        let first = state_at(7, "{}");
-        let changed = state_at(
-            7,
-            r#"{ prompts = { common = { language = "CHANGED"; }; }; }"#,
-        );
-
-        cache.resolve("workspace-a", &first).unwrap();
-        let error = cache.resolve("workspace-a", &changed).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("without a config revision transition")
-        );
-        assert_eq!(cache.len(), 1);
-    }
-
-    #[test]
-    fn prompt_projection_cache_post_init_rejects_concurrent_same_revision_identity() {
-        let cache = WorkspacePromptProjectionCache::default();
-        let first = PromptProjectionCacheKey::new("workspace-a", &state_at(7, "{}"));
-        let conflicting = PromptProjectionCacheKey::new(
-            "workspace-a",
-            &state_at(
-                7,
-                r#"{ prompts = { common = { language = "CONFLICT"; }; }; }"#,
-            ),
-        );
-        let first_cell = Arc::new(PromptProjectionCell::new());
-        let conflicting_cell = Arc::new(PromptProjectionCell::new());
-        {
-            let mut state = cache.lock().unwrap();
-            state.entries.insert(first.clone(), first_cell.clone());
-            state
-                .entries
-                .insert(conflicting.clone(), conflicting_cell.clone());
+        for index in 0..80 {
+            let source = format!("{{ prompts = {{ common = {{ language = \"{index}\"; }}; }}; }}");
+            cache.resolve("workspace-a", &state(&source)).unwrap();
         }
-
-        cache
-            .record_resolved("workspace-a", &first, &first_cell)
-            .unwrap();
-        let error = cache
-            .record_resolved("workspace-a", &conflicting, &conflicting_cell)
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("without a config revision transition")
-        );
-        let state = cache.lock().unwrap();
-        assert_eq!(state.active["workspace-a"], first);
-        assert!(!state.entries.contains_key(&conflicting));
-    }
-
-    #[test]
-    fn prompt_projection_cache_keeps_newer_inflight_entry_when_older_finishes_first() {
-        let cache = WorkspacePromptProjectionCache::default();
-        let older = PromptProjectionCacheKey::new("workspace-a", &state_at(7, "{}"));
-        let newer = PromptProjectionCacheKey::new(
-            "workspace-a",
-            &state_at(8, r#"{ prompts = { common = { language = "NEW"; }; }; }"#),
-        );
-        let older_cell = Arc::new(PromptProjectionCell::new());
-        let newer_cell = Arc::new(PromptProjectionCell::new());
-        {
-            let mut state = cache.lock().unwrap();
-            state.entries.insert(older.clone(), older_cell.clone());
-            state.entries.insert(newer.clone(), newer_cell.clone());
-        }
-
-        cache
-            .record_resolved("workspace-a", &older, &older_cell)
-            .unwrap();
-        assert!(cache.lock().unwrap().entries.contains_key(&newer));
-
-        cache
-            .record_resolved("workspace-a", &newer, &newer_cell)
-            .unwrap();
-        let state = cache.lock().unwrap();
-        assert_eq!(state.active["workspace-a"], newer);
-        assert_eq!(state.entries.len(), 1);
-        assert!(state.entries.contains_key(&newer));
+        assert_eq!(cache.len(), 64);
     }
 
     #[test]
@@ -442,7 +339,7 @@ mod tests {
         let baseline = project_prompts_from_workspace_config(&state("{}")).unwrap();
         let state = state(r#"{ prompts = { common = { language = "OVERRIDE"; }; }; }"#);
         let catalog = project_prompts_from_workspace_config(&state).unwrap();
-        assert_eq!(catalog.config_revision, 7);
+        assert_eq!(catalog.source_digest, state.snapshot.digest);
         assert_eq!(catalog.templates["common.language"], "OVERRIDE");
         for (key, value) in baseline.templates {
             if key != "common.language" {
@@ -462,15 +359,12 @@ mod tests {
             r#"{ prompts = { common = { language = "{%- include \"missing\" -%}"; }; }; }"#,
             r#"{ prompts = { common = { language = "{% include \"common.workspace\" %}"; workspace = "{% include \"common.language\" %}"; }; }; }"#,
         ] {
-            let snapshot = ConfigTreeSnapshot::from_entries(
-                0,
-                [ConfigEntry::new(
-                    VirtualPath::parse("main.dcdl").unwrap(),
-                    ConfigContentType::Decodal,
-                    source,
-                )
-                .unwrap()],
+            let snapshot = ConfigTreeSnapshot::from_entries([ConfigEntry::new(
+                VirtualPath::parse("main.dcdl").unwrap(),
+                ConfigContentType::Decodal,
+                source,
             )
+            .unwrap()])
             .unwrap();
             let contract = ToolchainContract::with_schema_bundle(
                 config_source::DEFAULT_SCHEMA_VERSION,
@@ -496,15 +390,12 @@ mod tests {
             "{ prompts = { common = { unknown = \"bad\"; }; }; }",
             "{ prompts = { common = { language = 42; }; }; }",
         ] {
-            let snapshot = ConfigTreeSnapshot::from_entries(
-                0,
-                [ConfigEntry::new(
-                    VirtualPath::parse("main.dcdl").unwrap(),
-                    ConfigContentType::Decodal,
-                    source,
-                )
-                .unwrap()],
+            let snapshot = ConfigTreeSnapshot::from_entries([ConfigEntry::new(
+                VirtualPath::parse("main.dcdl").unwrap(),
+                ConfigContentType::Decodal,
+                source,
             )
+            .unwrap()])
             .unwrap();
             let contract = ToolchainContract::with_schema_bundle(
                 config_source::DEFAULT_SCHEMA_VERSION,

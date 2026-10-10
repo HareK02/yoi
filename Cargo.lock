@@ -2754,6 +2754,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "ticket",
  "uuid",
 ]
 
@@ -4788,6 +4789,7 @@ dependencies = [
  "serde",
  "serde_json",
  "server-api",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "uuid",

@@ -2,9 +2,11 @@
 //! blocking thread, never on an async executor. SQL IMMEDIATE transactions are
 //! the cross-process authority for uploads, tree changes, reads, and collection.
 mod blob;
+mod migrations;
+use migrations::MIGRATIONS;
 
 use feature_storage::{
-    FeatureDatabase, FeatureMigration, FeatureRegistration, FeatureStorageError, RegisteredFeature,
+    FeatureDatabase, FeatureRegistration, FeatureStorageError, RegisteredFeature,
     ScopedFeatureStorage,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -25,9 +27,9 @@ pub const MAX_NAME_BYTES: usize = 255;
 pub enum Error {
     #[error("invalid Drive request: {0}")]
     Invalid(String),
-    #[error("Drive node or revision no longer exists")]
+    #[error("Drive node no longer exists")]
     NotFound,
-    #[error("Drive revision, name, or request identity conflict")]
+    #[error("Drive node changed, name is taken, or request identity conflicts")]
     Conflict,
     #[error("Drive access denied")]
     Denied,
@@ -72,7 +74,6 @@ macro_rules! decimal_id {
     };
 }
 decimal_id!(NodeId);
-decimal_id!(Revision);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -88,7 +89,8 @@ pub struct Node {
     pub parent_id: Option<NodeId>,
     pub name: String,
     pub kind: Kind,
-    pub revision: Revision,
+    /// Request ID of the last committed mutation; empty only for the immutable root.
+    pub last_mutation_id: String,
     pub size: u64,
     pub content_type: Option<String>,
     pub updated_by: String,
@@ -110,19 +112,19 @@ pub enum Mutation {
     },
     Update {
         id: NodeId,
-        expected_revision: Revision,
+        expected_mutation_id: String,
         content_type: String,
         bytes: Vec<u8>,
     },
     Relocate {
         id: NodeId,
-        expected_revision: Revision,
+        expected_mutation_id: String,
         parent: NodeId,
         name: String,
     },
     Delete {
         id: NodeId,
-        expected_revision: Revision,
+        expected_mutation_id: String,
     },
 }
 
@@ -151,7 +153,7 @@ pub struct Page {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReadChunk {
     pub id: NodeId,
-    pub revision: Revision,
+    pub last_mutation_id: String,
     pub offset: u64,
     pub bytes: Vec<u8>,
     pub eof: bool,
@@ -159,7 +161,7 @@ pub struct ReadChunk {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TextChunk {
     pub id: NodeId,
-    pub revision: Revision,
+    pub last_mutation_id: String,
     pub offset: u64,
     pub text: String,
     pub eof: bool,
@@ -187,35 +189,6 @@ pub struct Drive {
     _storage: ScopedFeatureStorage,
 }
 
-static MIGRATIONS: &[FeatureMigration] =
-    &[FeatureMigration::new(1, "drive_tree_and_receipts", migrate)];
-fn migrate(tx: &Transaction<'_>) -> feature_storage::Result<()> {
-    tx.execute_batch("\
-        CREATE TABLE drive_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-            workspace_id TEXT NOT NULL UNIQUE, deleting INTEGER NOT NULL DEFAULT 0 CHECK(deleting IN (0,1)));
-        CREATE TABLE drive_nodes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            workspace_id TEXT NOT NULL REFERENCES drive_state(workspace_id),
-            parent_id INTEGER,
-            name TEXT NOT NULL CHECK(length(CAST(name AS BLOB)) <= 255),
-            kind TEXT NOT NULL CHECK(kind IN ('file','directory')),
-            revision INTEGER NOT NULL CHECK(revision > 0),
-            blob_key TEXT, size INTEGER NOT NULL CHECK(size >= 0 AND size <= 16777216),
-            content_type TEXT, updated_by TEXT NOT NULL, updated_at_ms INTEGER NOT NULL,
-            UNIQUE(workspace_id,id),
-            FOREIGN KEY(workspace_id,parent_id) REFERENCES drive_nodes(workspace_id,id),
-            CHECK((kind='directory' AND blob_key IS NULL AND size=0 AND content_type IS NULL)
-                OR (kind='file' AND blob_key IS NOT NULL AND content_type IS NOT NULL)));
-        CREATE UNIQUE INDEX drive_sibling_name ON drive_nodes(workspace_id,ifnull(parent_id,0),name);
-        CREATE INDEX drive_children ON drive_nodes(parent_id,id);
-        CREATE INDEX drive_blob_reference ON drive_nodes(blob_key) WHERE blob_key IS NOT NULL;
-        CREATE UNIQUE INDEX drive_single_root ON drive_nodes(workspace_id) WHERE parent_id IS NULL;
-        CREATE TABLE drive_receipts (request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
-            result_json TEXT NOT NULL, committed_at_ms INTEGER NOT NULL);
-    ")?;
-    Ok(())
-}
-
 impl Drive {
     pub fn register(storage: &ScopedFeatureStorage) -> feature_storage::Result<RegisteredFeature> {
         storage.register(FeatureRegistration::new("workspace-drive", MIGRATIONS))
@@ -232,8 +205,8 @@ impl Drive {
             tx.execute("INSERT OR IGNORE INTO drive_state(singleton,workspace_id) VALUES (1,?1)", [&workspace_id])?;
             let stored: String = tx.query_row("SELECT workspace_id FROM drive_state WHERE singleton=1", [], |r| r.get(0))?;
             if stored != workspace_id { return Err(Error::Invalid("metadata belongs to another Workspace".into())); }
-            tx.execute("INSERT OR IGNORE INTO drive_nodes(workspace_id,parent_id,name,kind,revision,size,updated_by,updated_at_ms)
-                VALUES (?1,NULL,'','directory',1,0,'server',?2)", params![workspace_id, now_ms()])?;
+            tx.execute("INSERT OR IGNORE INTO drive_nodes(workspace_id,parent_id,name,kind,last_mutation_id,size,updated_by,updated_at_ms)
+                VALUES (?1,NULL,'','directory','',0,'server',?2)", params![workspace_id, now_ms()])?;
             Ok(())
         })?;
         Ok(Self {
@@ -356,6 +329,9 @@ impl Drive {
         })
     }
 
+    /// Recover the committed result by request identity, including pre-cutover
+    /// receipts whose payload cannot be verified for replay. Committed status is
+    /// not proof that a different actor/payload matches that request.
     pub fn request_status(&self, request_id: &str) -> Result<RequestStatus> {
         validate_identity(request_id, "request_id", 128)?;
         self.database.try_transaction(|c| {
@@ -379,6 +355,9 @@ impl Drive {
     /// DB commit is publication. The blob and receipt are never independently
     /// treated as a successful mutation. Successful request IDs are retained for
     /// the Workspace lifetime; reuse with a different actor/payload is conflict.
+    /// Pre-cutover replay checks the original typed-payload digest using proven
+    /// receipt correspondence. If that evidence is unavailable, returns Conflict
+    /// without executing; recover the committed result through request_status.
     pub fn mutate(
         &self,
         request_id: &str,
@@ -396,7 +375,9 @@ impl Drive {
             self.authorize(tx, true)?;
             if let Some((old_fingerprint,json)) = tx.query_row("SELECT fingerprint,result_json FROM drive_receipts WHERE request_id=?1",
                 [request_id], |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()? {
-                if old_fingerprint != fingerprint { return Err(Error::Conflict); }
+                if old_fingerprint != fingerprint && !migrations::matches_legacy_replay(tx, request_id, actor, &mutation, &old_fingerprint)? {
+                    return Err(Error::Conflict);
+                }
                 return Ok(serde_json::from_str(&json)?);
             }
             accepting(tx)?;
@@ -404,40 +385,40 @@ impl Drive {
             let result = match mutation {
                 Mutation::CreateFolder { parent,name } => {
                     directory(tx,parent)?;
-                    insert(tx,&self.workspace_id,parent,&name,Kind::Directory,None,0,None,actor,at)?
+                    insert(tx,&self.workspace_id,parent,&name,Kind::Directory,None,0,None,actor,at,request_id)?
                 }
                 Mutation::CreateFile { parent,name,content_type,bytes } => {
                     directory(tx,parent)?;
                     let key = Uuid::now_v7().to_string();
                     self.blobs.put(&key,&bytes)?;
-                    insert(tx,&self.workspace_id,parent,&name,Kind::File,Some(&key),bytes.len(),Some(&content_type),actor,at)?
+                    insert(tx,&self.workspace_id,parent,&name,Kind::File,Some(&key),bytes.len(),Some(&content_type),actor,at,request_id)?
                 }
-                Mutation::Update { id,expected_revision,content_type,bytes } => {
-                    let old = changeable(tx,id,expected_revision)?;
+                Mutation::Update { id,expected_mutation_id,content_type,bytes } => {
+                    let old = changeable(tx,id,&expected_mutation_id)?;
                     if old.kind != Kind::File { return Err(Error::Invalid("cannot write a directory".into())); }
                     let key = Uuid::now_v7().to_string();
                     self.blobs.put(&key,&bytes)?;
-                    cas(tx.execute("UPDATE drive_nodes SET blob_key=?1,size=?2,content_type=?3,revision=revision+1,updated_by=?4,updated_at_ms=?5
-                        WHERE id=?6 AND revision=?7", params![key,bytes.len(),content_type,actor,at,id.0,expected_revision.0])?)?;
+                    cas(tx.execute("UPDATE drive_nodes SET blob_key=?1,size=?2,content_type=?3,last_mutation_id=?7,updated_by=?4,updated_at_ms=?5
+                        WHERE id=?6", params![key,bytes.len(),content_type,actor,at,id.0,request_id])?)?;
                     MutationResult { node: node(tx,id)?, deleted:false }
                 }
-                Mutation::Relocate { id,expected_revision,parent,name } => {
-                    changeable(tx,id,expected_revision)?;
+                Mutation::Relocate { id,expected_mutation_id,parent,name } => {
+                    changeable(tx,id,&expected_mutation_id)?;
                     directory(tx,parent)?;
                     let cyclic: bool = tx.query_row("WITH RECURSIVE ancestors(id,parent_id) AS (
                         SELECT id,parent_id FROM drive_nodes WHERE id=?1 UNION ALL
                         SELECT n.id,n.parent_id FROM drive_nodes n JOIN ancestors a ON n.id=a.parent_id)
                         SELECT EXISTS(SELECT 1 FROM ancestors WHERE id=?2)",params![parent.0,id.0],|r|r.get(0))?;
                     if cyclic { return Err(Error::Invalid("move would create a cycle".into())); }
-                    unique(tx.execute("UPDATE drive_nodes SET parent_id=?1,name=?2,revision=revision+1,updated_by=?3,updated_at_ms=?4
-                        WHERE id=?5 AND revision=?6",params![parent.0,name,actor,at,id.0,expected_revision.0]))?;
+                    unique(tx.execute("UPDATE drive_nodes SET parent_id=?1,name=?2,last_mutation_id=?6,updated_by=?3,updated_at_ms=?4
+                        WHERE id=?5",params![parent.0,name,actor,at,id.0,request_id]))?;
                     MutationResult { node:node(tx,id)?,deleted:false }
                 }
-                Mutation::Delete { id,expected_revision } => {
-                    let old = changeable(tx,id,expected_revision)?;
+                Mutation::Delete { id,expected_mutation_id } => {
+                    let old = changeable(tx,id,&expected_mutation_id)?;
                     let children: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM drive_nodes WHERE parent_id=?1)",[id.0],|r|r.get(0))?;
                     if children { return Err(Error::Conflict); }
-                    cas(tx.execute("DELETE FROM drive_nodes WHERE id=?1 AND revision=?2",params![id.0,expected_revision.0])?)?;
+                    cas(tx.execute("DELETE FROM drive_nodes WHERE id=?1",params![id.0])?)?;
                     MutationResult { node:old,deleted:true }
                 }
             };
@@ -447,13 +428,13 @@ impl Drive {
         })
     }
 
-    /// Each chunk requires the originally selected revision. Old revisions are
+    /// Each chunk requires the originally observed committed mutation. Old blobs are
     /// not retained: after update/delete return conflict/not-found, never switch
     /// silently to the latest blob. GC cannot run while this read holds SQL lock.
     pub fn read(
         &self,
         id: NodeId,
-        revision: Revision,
+        expected_mutation_id: &str,
         offset: u64,
         length: usize,
     ) -> Result<ReadChunk> {
@@ -462,7 +443,7 @@ impl Drive {
             self.authorize(tx, false)?;
             accepting(tx)?;
             let selected = node(tx, id)?;
-            if selected.revision != revision {
+            if selected.last_mutation_id != expected_mutation_id {
                 return Err(Error::Conflict);
             }
             if selected.kind != Kind::File {
@@ -486,7 +467,7 @@ impl Drive {
             }
             Ok(ReadChunk {
                 id,
-                revision,
+                last_mutation_id: selected.last_mutation_id,
                 offset,
                 bytes,
                 eof: end == selected.size,
@@ -499,17 +480,17 @@ impl Drive {
     pub fn read_text(
         &self,
         id: NodeId,
-        revision: Revision,
+        expected_mutation_id: &str,
         offset: u64,
         length: usize,
     ) -> Result<TextChunk> {
-        let chunk = self.read(id, revision, offset, length)?;
+        let chunk = self.read(id, expected_mutation_id, offset, length)?;
         let text = String::from_utf8(chunk.bytes).map_err(|_| {
             Error::Invalid("range is not valid UTF-8; select character-aligned offsets".into())
         })?;
         Ok(TextChunk {
             id,
-            revision,
+            last_mutation_id: chunk.last_mutation_id,
             offset,
             text,
             eof: chunk.eof,
@@ -693,9 +674,9 @@ fn accepting(c: &Connection) -> Result<()> {
     Ok(())
 }
 fn node(c: &Connection, id: NodeId) -> Result<Node> {
-    c.query_row("SELECT id,workspace_id,parent_id,name,kind,revision,size,content_type,updated_by,updated_at_ms FROM drive_nodes WHERE id=?1",[id.0],|r| {
+    c.query_row("SELECT id,workspace_id,parent_id,name,kind,last_mutation_id,size,content_type,updated_by,updated_at_ms FROM drive_nodes WHERE id=?1",[id.0],|r| {
         Ok(Node {id:NodeId(r.get(0)?),workspace_id:r.get(1)?,parent_id:r.get::<_,Option<i64>>(2)?.map(NodeId),name:r.get(3)?,
-            kind:if r.get::<_,String>(4)?=="file" {Kind::File} else {Kind::Directory},revision:Revision(r.get(5)?),
+            kind:if r.get::<_,String>(4)?=="file" {Kind::File} else {Kind::Directory},last_mutation_id:r.get(5)?,
             size:r.get::<_,i64>(6)? as u64,content_type:r.get(7)?,updated_by:r.get(8)?,updated_at_ms:r.get(9)?})
     }).optional()?.ok_or(Error::NotFound)
 }
@@ -706,16 +687,17 @@ fn directory(c: &Connection, id: NodeId) -> Result<()> {
         Ok(())
     }
 }
-fn changeable(c: &Connection, id: NodeId, revision: Revision) -> Result<Node> {
+// Called only inside the same IMMEDIATE transaction that publishes the mutation.
+// Compare the last successful request, not time: even identical bytes or a move
+// away and back cannot revive an old request. Receipts prevent request ID reuse.
+fn changeable(c: &Transaction<'_>, id: NodeId, expected_mutation_id: &str) -> Result<Node> {
     let n = node(c, id)?;
     if n.parent_id.is_none() {
         return Err(Error::Invalid("root is immutable".into()));
     }
-    if n.revision != revision {
+    validate_identity(expected_mutation_id, "expected_mutation_id", 128)?;
+    if n.last_mutation_id != expected_mutation_id {
         return Err(Error::Conflict);
-    }
-    if revision.0 == i64::MAX {
-        return Err(Error::Invalid("revision exhausted".into()));
     }
     Ok(n)
 }
@@ -748,9 +730,10 @@ fn insert(
     content_type: Option<&str>,
     actor: &str,
     at: i64,
+    request_id: &str,
 ) -> Result<MutationResult> {
-    unique(tx.execute("INSERT INTO drive_nodes(workspace_id,parent_id,name,kind,revision,blob_key,size,content_type,updated_by,updated_at_ms)
-        VALUES (?1,?2,?3,?4,1,?5,?6,?7,?8,?9)",params![workspace,parent.0,name,if kind==Kind::File {"file"} else {"directory"},key,size,content_type,actor,at]))?;
+    unique(tx.execute("INSERT INTO drive_nodes(workspace_id,parent_id,name,kind,last_mutation_id,blob_key,size,content_type,updated_by,updated_at_ms)
+        VALUES (?1,?2,?3,?4,?10,?5,?6,?7,?8,?9)",params![workspace,parent.0,name,if kind==Kind::File {"file"} else {"directory"},key,size,content_type,actor,at,request_id]))?;
     Ok(MutationResult {
         node: node(tx, NodeId(tx.last_insert_rowid()))?,
         deleted: false,

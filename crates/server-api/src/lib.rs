@@ -292,12 +292,12 @@ impl_openapi_schema!(
     SubjektivResidentSurfaceResponse,
     SubjektivResidentSurfaceSnapshot,
     SubjektivMemoryDetailQuery,
-    SubjektivMemoryRevisionsQuery,
+    SubjektivMemoryChangesQuery,
     SubjektivMemoryListQuery,
     SubjektivMemoryQueryRequest,
     SubjektivMemoryQueryResponse,
     SubjektivMemoryReadResponse,
-    SubjektivMemoryListRevisionsResponse,
+    SubjektivMemoryListChangesResponse,
     SubjektivStageCandidateRequest,
     SubjektivStageCandidateResponse,
     SubjektivRecordSessionRequest,
@@ -1014,17 +1014,17 @@ pub trait ServerApi {
     ) -> Result<WorkspaceConfigTreeResponse, RepositoryApiError>;
 
     #[get(
-        "/api/w/{workspace_id}/config/source-tree/revisions/{revision}",
+        "/api/w/{workspace_id}/config/source-tree/history/{content_digest}",
         status = 200,
         error_status = 404,
         additional_error_statuses = [400, 401, 403, 500],
         bearer_auth = true,
         browser_auth = true
     )]
-    async fn workspace_config_revision(
+    async fn workspace_config_history(
         &self,
         #[path] workspace_id: String,
-        #[path] revision: String,
+        #[path] content_digest: String,
     ) -> Result<ConfigTreeSnapshot, RepositoryApiError>;
 
     #[get(
@@ -1270,20 +1270,20 @@ pub trait ServerApi {
         #[query] query: SubjektivMemoryDetailQuery,
     ) -> Result<SubjektivMemoryReadResponse, RepositoryApiError>;
     #[get(
-        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/memories/{memory_id}/revisions",
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/memories/{memory_id}/changes",
         status = 200,
         error_status = 404,
         additional_error_statuses = [400, 401, 403, 500],
         bearer_auth = true,
         browser_auth = true,
     )]
-    async fn subjektiv_memory_revisions(
+    async fn subjektiv_memory_changes(
         &self,
         #[path] workspace_id: String,
         #[path] subject_id: String,
         #[path] memory_id: String,
-        #[query] query: SubjektivMemoryRevisionsQuery,
-    ) -> Result<SubjektivMemoryListRevisionsResponse, RepositoryApiError>;
+        #[query] query: SubjektivMemoryChangesQuery,
+    ) -> Result<SubjektivMemoryListChangesResponse, RepositoryApiError>;
     #[post(
         "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/retire",
         status = 200,
@@ -3853,7 +3853,6 @@ pub struct WorkspaceRuntimeConfigResponse {
 pub struct WorkspaceRuntimeConfigMetadata {
     pub id: String,
     pub digest: String,
-    pub revision: String,
     pub workspace_id: String,
     pub created_at: String,
     pub provenance: WorkspaceRuntimeConfigProvenance,
@@ -3906,8 +3905,6 @@ pub enum WorkspaceRuntimeConfigDeclarationKind {
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceRuntimePromptCatalog {
     pub templates: BTreeMap<String, String>,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub config_revision: u64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_digest: String,
     pub schema_fingerprint: String,
@@ -3961,10 +3958,6 @@ pub struct WorkspaceRuntimeResourceHandle {
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_i64))]
     pub expires_at_unix_seconds: i64,
     pub nonce: String,
-    pub revision: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub generation: Option<u64>,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub max_bytes: u64,
     pub content_type: String,
@@ -4365,9 +4358,6 @@ pub struct WorkspaceRepositoryRecord {
     pub provider: Option<String>,
     pub source: RepositorySource,
     pub default_ref: Option<String>,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub source_revision: u64,
     pub source_fingerprint: String,
     pub observed_status: RepositoryObservedStatus,
     pub observed_at: Option<String>,
@@ -4406,9 +4396,6 @@ pub struct WorkspaceCreateRequest {
 pub struct WorkspaceCreateResponse {
     pub workspace: WorkspaceSummary,
     pub repository: Option<WorkspaceRepositoryRecord>,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub config_revision: u64,
     pub request_fingerprint: String,
     pub replayed: bool,
 }
@@ -4485,7 +4472,7 @@ pub struct WorkspaceMetadataSettingsResponse {
     pub workspace_id: String,
     pub display_name: String,
     pub created_at: String,
-    pub revision: String,
+    pub updated_at: String,
     pub source: String,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -4496,7 +4483,7 @@ pub struct WorkspaceMetadataSettingsResponse {
 #[serde(deny_unknown_fields)]
 pub struct UpdateWorkspaceMetadataRequest {
     pub display_name: String,
-    pub revision: String,
+    pub expected_updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -4531,9 +4518,6 @@ pub struct WorkspaceSigningIdentityPublic {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub public_key_fingerprint: Option<String>,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub revision: u64,
     pub state: WorkspaceSigningIdentityState,
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4552,9 +4536,6 @@ pub struct WorkspacePublicIdentityBundle {
     pub algorithm: String,
     pub public_key: String,
     pub public_key_fingerprint: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -4592,9 +4573,6 @@ pub struct ConfigEntry {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct ConfigTreeSnapshot {
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub revision: u64,
     pub digest: String,
     pub entries: BTreeMap<String, ConfigEntry>,
 }
@@ -4691,21 +4669,16 @@ pub struct WorkspaceConfigTreeResponse {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct ConfigCommitRequest {
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub base_revision: u64,
     pub base_digest: String,
     pub changes: Vec<ConfigTreeChange>,
     pub entrypoints: Vec<String>,
 }
 
-/// Effective Prompt catalog projected from one immutable Workspace config revision.
+/// Effective Prompt catalog projected from one immutable Workspace config tree.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspacePromptProjection {
     pub workspace_id: String,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub config_revision: u64,
     pub source_digest: String,
     pub projection_digest: String,
     pub schema_fingerprint: String,
@@ -4717,8 +4690,6 @@ pub struct WorkspacePromptProjection {
 #[serde(deny_unknown_fields)]
 pub struct EffectivePromptCatalog {
     pub templates: BTreeMap<String, String>,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub config_revision: u64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_digest: String,
     pub schema_fingerprint: String,
@@ -4746,9 +4717,6 @@ pub struct FlowSourceRecord {
     pub path: String,
     pub content: String,
     pub content_digest: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub revision: u64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -4810,9 +4778,6 @@ pub struct ResolvedFlowSource {
     pub selector: String,
     pub workspace_id: String,
     pub flow_id: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub revision: u64,
     pub content_digest: String,
     pub definition: CompiledFlowDefinition,
 }
@@ -4871,8 +4836,8 @@ pub struct SubjektivSubjectCreateRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubjektivSubjectBehaviorUpdateRequest {
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub expected_behavior_revision: u64,
+    /// Exact previously observed user-managed behavior document.
+    pub expected_behavior_md: String,
     pub behavior_md: String,
 }
 
@@ -4906,11 +4871,8 @@ pub struct SubjektivSubjectResponse {
     pub id: String,
     pub role: String,
     pub behavior_md: String,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub behavior_revision: u64,
     pub state: SubjektivSubjectState,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub store_revision: u64,
+    pub memory_fingerprint: String,
     pub created_at: String,
     pub updated_at: String,
     /// Current keyed-singleton owner, when one exists. This is a live Yoi
@@ -4934,9 +4896,8 @@ pub struct SubjektivResidentSurfaceSnapshot {
     pub snapshot_id: String,
     pub body_md: String,
     #[serde(default)]
-    pub memory_refs: Vec<SubjektivMemoryRevisionRef>,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub built_from_store_revision: u64,
+    pub memory_refs: Vec<SubjektivMemoryChangeRef>,
+    pub built_from_memory_fingerprint: String,
     pub created_at: String,
 }
 
@@ -5038,8 +4999,7 @@ impl From<SubjektivMemoryListQuery> for SubjektivMemoryQueryRequest {
 #[serde(deny_unknown_fields)]
 pub struct SubjektivMemoryDetailQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    pub revision: Option<u64>,
+    pub change_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub offset: Option<usize>,
@@ -5055,7 +5015,7 @@ pub struct SubjektivMemoryDetailQuery {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SubjektivMemoryRevisionsQuery {
+pub struct SubjektivMemoryChangesQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 100))]
     pub limit: Option<usize>,
@@ -5369,7 +5329,7 @@ pub const SUBJEKTIV_SESSION_MAX_TOOL_CONTENT_BYTES: usize = 56 * 1024;
 pub const SUBJEKTIV_SESSION_MAX_READ_CONTENT_BYTES: usize = 16 * 1024;
 pub const SUBJEKTIV_SESSION_MAX_SNIPPET_BYTES: usize = 512;
 
-/// Current lifecycle state of one confirmed subject Memory revision.
+/// Current lifecycle state of one confirmed subject Memory change.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SubjektivMemoryState {
@@ -5378,10 +5338,10 @@ pub enum SubjektivMemoryState {
     Retracted,
 }
 
-/// Requested state/change semantics for a staging-only revision proposal.
+/// Requested state/change semantics for a staging-only change proposal.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum SubjektivMemoryRevisionIntent {
+pub enum SubjektivMemoryChangeIntent {
     Revise,
     Resolve,
     Retract,
@@ -5390,20 +5350,18 @@ pub enum SubjektivMemoryRevisionIntent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SubjektivMemoryRevisionRef {
+pub struct SubjektivMemoryChangeRef {
     pub memory_id: String,
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    pub revision: u64,
+    pub change_id: String,
 }
 
-/// Typed metadata retained with a revision proposal candidate for T-670.
+/// Typed metadata retained with a change proposal candidate for T-670.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SubjektivMemoryRevisionProposal {
+pub struct SubjektivMemoryChangeProposal {
     pub memory_id: String,
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    pub expected_revision: u64,
-    pub intent: SubjektivMemoryRevisionIntent,
+    pub expected_change_id: String,
+    pub intent: SubjektivMemoryChangeIntent,
     pub change_reason: String,
 }
 
@@ -5411,8 +5369,7 @@ pub struct SubjektivMemoryRevisionProposal {
 #[serde(deny_unknown_fields)]
 pub struct SubjektivMemoryProposalTarget {
     pub memory_id: String,
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    pub expected_revision: u64,
+    pub expected_change_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -5436,8 +5393,7 @@ pub struct SubjektivMemoryQueryRequest {
 pub struct SubjektivMemoryReadRequest {
     pub memory_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    pub revision: Option<u64>,
+    pub change_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub offset: Option<usize>,
@@ -5455,7 +5411,7 @@ pub struct SubjektivMemoryReadRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SubjektivMemoryListRevisionsRequest {
+pub struct SubjektivMemoryListChangesRequest {
     pub memory_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 100))]
@@ -5468,9 +5424,8 @@ pub struct SubjektivMemoryListRevisionsRequest {
 #[serde(deny_unknown_fields)]
 pub struct SubjektivMemoryValidateProposalRequest {
     pub memory_id: String,
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    pub expected_revision: u64,
-    pub intent: SubjektivMemoryRevisionIntent,
+    pub expected_change_id: String,
+    pub intent: SubjektivMemoryChangeIntent,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -5496,7 +5451,7 @@ pub struct SubjektivMemoryStageExplicitRequest {
     #[serde(default)]
     pub source_refs: Vec<memory::schema::SourceEvidenceRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proposal: Option<SubjektivMemoryRevisionProposal>,
+    pub proposal: Option<SubjektivMemoryChangeProposal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -5515,11 +5470,10 @@ pub struct SubjektivMemoryCandidateReadRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SubjektivMemoryRevisionProposalMetadata {
+pub struct SubjektivMemoryChangeProposalMetadata {
     pub memory_id: String,
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    pub expected_revision: u64,
-    pub intent: SubjektivMemoryRevisionIntent,
+    pub expected_change_id: String,
+    pub intent: SubjektivMemoryChangeIntent,
     pub change_reason: String,
 }
 
@@ -5538,7 +5492,7 @@ pub struct SubjektivMemoryCandidate {
     #[serde(default)]
     pub source_refs: Vec<memory::schema::SourceEvidenceRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revision_proposal: Option<SubjektivMemoryRevisionProposalMetadata>,
+    pub change_proposal: Option<SubjektivMemoryChangeProposalMetadata>,
     pub created_at: String,
 }
 
@@ -5549,7 +5503,7 @@ pub struct SubjektivMemoryCandidateSummary {
     pub kind: memory::extract::CandidateKind,
     pub claim: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revision_proposal: Option<SubjektivMemoryRevisionProposalMetadata>,
+    pub change_proposal: Option<SubjektivMemoryChangeProposalMetadata>,
     pub created_at: String,
 }
 
@@ -5566,8 +5520,7 @@ pub enum SubjektivMemoryApplyTarget {
     Create,
     Revise {
         memory_id: String,
-        #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-        expected_revision: u64,
+        expected_change_id: String,
     },
 }
 
@@ -5582,7 +5535,7 @@ pub struct SubjektivMemoryDraft {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staleness: Option<String>,
     #[serde(default)]
-    pub derived_from: Vec<SubjektivMemoryRevisionRef>,
+    pub derived_from: Vec<SubjektivMemoryChangeRef>,
     pub change_reason: String,
 }
 
@@ -5605,7 +5558,7 @@ pub enum SubjektivMemoryCandidateDecision {
     Close {
         action: SubjektivMemoryCandidateCloseAction,
         #[serde(default)]
-        affected_memory: Vec<SubjektivMemoryRevisionRef>,
+        affected_memory: Vec<SubjektivMemoryChangeRef>,
     },
 }
 
@@ -5630,8 +5583,7 @@ pub enum SubjektivMemoryAffectedOperation {
 #[serde(deny_unknown_fields)]
 pub struct SubjektivMemoryAffectedRef {
     pub memory_id: String,
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    pub revision: u64,
+    pub change_id: String,
     pub operation: SubjektivMemoryAffectedOperation,
 }
 
@@ -5655,21 +5607,19 @@ pub struct SubjektivMemoryCandidateDecisionResponse {
     #[serde(default)]
     pub affected_memory: Vec<SubjektivMemoryAffectedRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory: Option<SubjektivMemoryRevisionRef>,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub store_revision: u64,
+    pub memory: Option<SubjektivMemoryChangeRef>,
+    pub memory_fingerprint: String,
     pub surface_dirty: bool,
 }
 
 /// One bounded current Memory supplied to the surface editor. The Backend
 /// selects these records deterministically; callers cannot name arbitrary
-/// Memory revisions or broaden the generation input.
+/// Memory changes or broaden the generation input.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubjektivSurfaceMaterial {
     pub memory_id: String,
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    pub revision: u64,
+    pub change_id: String,
     pub kind: memory::extract::CandidateKind,
     pub body_md: String,
     pub why_useful: String,
@@ -5685,11 +5635,10 @@ pub struct SubjektivSurfacePrepareRequest {}
 #[serde(deny_unknown_fields)]
 pub struct SubjektivSurfacePrepareResponse {
     pub generation_id: String,
-    /// Existing ready surface at this exact store revision, if no rebuild is needed.
+    /// Existing ready surface at this exact store change_id, if no rebuild is needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_snapshot_id: Option<String>,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub store_revision: u64,
+    pub memory_fingerprint: String,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub active_memory_count: usize,
     pub materials: Vec<SubjektivSurfaceMaterial>,
@@ -5710,7 +5659,7 @@ pub struct SubjektivSurfacePrepareResponse {
 #[serde(deny_unknown_fields)]
 pub struct SubjektivSurfacePoint {
     pub body_md: String,
-    pub memory_refs: Vec<SubjektivMemoryRevisionRef>,
+    pub memory_refs: Vec<SubjektivMemoryChangeRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -5731,16 +5680,14 @@ pub struct SubjektivSurfaceFailureRequest {
 #[serde(deny_unknown_fields)]
 pub struct SubjektivSurfacePublishResponse {
     pub snapshot_id: String,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub built_from_store_revision: u64,
+    pub built_from_memory_fingerprint: String,
     pub empty: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubjektivSurfaceFailureResponse {
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub store_revision: u64,
+    pub memory_fingerprint: String,
     pub status: String,
 }
 
@@ -5749,8 +5696,6 @@ pub struct SubjektivSurfaceFailureResponse {
 pub struct SubjektivResidentContextOutput {
     /// Exact user-managed document. Empty means explicitly unset.
     pub behavior_md: String,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub behavior_revision: u64,
     /// Independently-fresh generated Memory projection.
     pub memory_surface: memory::backend::MemoryResidentSummaryOutput,
 }
@@ -5762,7 +5707,7 @@ pub enum SubjektivMemoryBackendOperation {
     ResidentContext(memory::backend::MemoryResidentSummaryOperation),
     Query(SubjektivMemoryQueryRequest),
     Read(SubjektivMemoryReadRequest),
-    ListRevisions(SubjektivMemoryListRevisionsRequest),
+    ListChanges(SubjektivMemoryListChangesRequest),
     ValidateProposal(SubjektivMemoryValidateProposalRequest),
     ReceiptStatus(SubjektivMemoryReceiptStatusRequest),
     StageExplicit(SubjektivMemoryStageExplicitRequest),
@@ -5784,8 +5729,7 @@ pub struct SubjektivMemoryBackendRequest {
 #[serde(deny_unknown_fields)]
 pub struct SubjektivMemoryQueryItem {
     pub id: String,
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    pub revision: u64,
+    pub change_id: String,
     pub kind: memory::extract::CandidateKind,
     pub state: SubjektivMemoryState,
     pub claim: String,
@@ -5825,10 +5769,8 @@ pub struct SubjektivMemoryEvidenceCandidate {
 #[serde(deny_unknown_fields)]
 pub struct SubjektivMemoryReadResponse {
     pub memory_id: String,
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    pub revision: u64,
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    pub current_revision: u64,
+    pub change_id: String,
+    pub current_change_id: String,
     pub kind: memory::extract::CandidateKind,
     pub state: SubjektivMemoryState,
     pub claim: String,
@@ -5858,7 +5800,7 @@ pub struct SubjektivMemoryReadResponse {
     pub source_candidate_ids: Vec<String>,
     pub source_candidates: Vec<SubjektivMemoryEvidenceCandidate>,
     /// Derivation references on this evidence page.
-    pub derived_from: Vec<SubjektivMemoryRevisionRef>,
+    pub derived_from: Vec<SubjektivMemoryChangeRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_next_cursor: Option<String>,
     pub evidence_has_more: bool,
@@ -5866,9 +5808,8 @@ pub struct SubjektivMemoryReadResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SubjektivMemoryRevisionItem {
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    pub revision: u64,
+pub struct SubjektivMemoryChangeItem {
+    pub change_id: String,
     pub kind: memory::extract::CandidateKind,
     pub state: SubjektivMemoryState,
     pub claim: String,
@@ -5878,11 +5819,10 @@ pub struct SubjektivMemoryRevisionItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SubjektivMemoryListRevisionsResponse {
+pub struct SubjektivMemoryListChangesResponse {
     pub memory_id: String,
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    pub current_revision: u64,
-    pub items: Vec<SubjektivMemoryRevisionItem>,
+    pub current_change_id: String,
+    pub items: Vec<SubjektivMemoryChangeItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     pub has_more: bool,
@@ -5892,11 +5832,10 @@ pub struct SubjektivMemoryListRevisionsResponse {
 #[serde(deny_unknown_fields)]
 pub struct SubjektivMemoryProposalValidationResponse {
     pub memory_id: String,
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    pub current_revision: u64,
+    pub current_change_id: String,
     pub kind: memory::extract::CandidateKind,
     pub state: SubjektivMemoryState,
-    pub intent: SubjektivMemoryRevisionIntent,
+    pub intent: SubjektivMemoryChangeIntent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -5925,7 +5864,7 @@ pub struct SubjektivMemoryStageExplicitResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<SubjektivMemoryProposalTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub intent: Option<SubjektivMemoryRevisionIntent>,
+    pub intent: Option<SubjektivMemoryChangeIntent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -5935,7 +5874,7 @@ pub enum SubjektivMemoryBackendResponse {
     ResidentContext(SubjektivResidentContextOutput),
     Query(SubjektivMemoryQueryResponse),
     Read(SubjektivMemoryReadResponse),
-    ListRevisions(SubjektivMemoryListRevisionsResponse),
+    ListChanges(SubjektivMemoryListChangesResponse),
     ProposalValidated(SubjektivMemoryProposalValidationResponse),
     ReceiptStatus(SubjektivMemoryReceiptStatusResponse),
     Staged(SubjektivMemoryStageExplicitResponse),
@@ -5948,7 +5887,7 @@ pub enum SubjektivMemoryBackendResponse {
 }
 
 pub const WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES: usize = 128;
-pub const WORKSPACE_DELETION_MAX_REVISION_BYTES: usize = 128;
+pub const WORKSPACE_DELETION_MAX_UPDATED_AT_BYTES: usize = 128;
 pub const WORKSPACE_DELETION_MAX_CONFIRMATION_BYTES: usize = 256;
 pub const WORKSPACE_DELETION_MAX_BLOCKERS: usize = 1024;
 pub const WORKSPACE_DELETION_MAX_CHILD_OPERATION_IDS: usize = 4096;
@@ -5968,14 +5907,14 @@ where
     Ok(value)
 }
 
-fn deserialize_workspace_deletion_revision<'de, D>(deserializer: D) -> Result<String, D::Error>
+fn deserialize_workspace_deletion_updated_at<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let value = String::deserialize(deserializer)?;
-    if value.len() > WORKSPACE_DELETION_MAX_REVISION_BYTES {
+    if value.len() > WORKSPACE_DELETION_MAX_UPDATED_AT_BYTES {
         return Err(serde::de::Error::custom(
-            "Workspace deletion revision is too long",
+            "Workspace deletion update timestamp is too long",
         ));
     }
     Ok(value)
@@ -6134,8 +6073,8 @@ pub struct WorkspaceDeletionResourceCounts {
 pub struct WorkspaceDeletionPreflightResponse {
     pub workspace_id: String,
     pub display_name: String,
-    /// Opaque persisted Workspace metadata revision used as a CAS fence.
-    pub expected_revision: String,
+    /// Observed Workspace metadata update timestamp used as a CAS fence.
+    pub expected_workspace_updated_at: String,
     pub can_delete: bool,
     pub resources: WorkspaceDeletionResourceCounts,
     pub blockers: Vec<WorkspaceDeletionBlocker>,
@@ -6147,7 +6086,7 @@ pub struct WorkspaceDeletionPreflightResponse {
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceDeletionRequest {
     pub operation_id: String,
-    pub expected_revision: String,
+    pub expected_workspace_updated_at: String,
     pub confirmation: String,
 }
 
@@ -6211,8 +6150,8 @@ impl<'de> Deserialize<'de> for WorkspaceDeletionBlocker {
 struct WorkspaceDeletionPreflightResponseWire {
     workspace_id: String,
     display_name: String,
-    #[serde(deserialize_with = "deserialize_workspace_deletion_revision")]
-    expected_revision: String,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_updated_at")]
+    expected_workspace_updated_at: String,
     can_delete: bool,
     resources: WorkspaceDeletionResourceCounts,
     #[serde(deserialize_with = "deserialize_workspace_deletion_blockers")]
@@ -6228,7 +6167,7 @@ impl<'de> Deserialize<'de> for WorkspaceDeletionPreflightResponse {
         Ok(Self {
             workspace_id: wire.workspace_id,
             display_name: wire.display_name,
-            expected_revision: wire.expected_revision,
+            expected_workspace_updated_at: wire.expected_workspace_updated_at,
             can_delete: wire.can_delete,
             resources: wire.resources,
             blockers: wire.blockers,
@@ -6241,8 +6180,8 @@ impl<'de> Deserialize<'de> for WorkspaceDeletionPreflightResponse {
 struct WorkspaceDeletionRequestWire {
     #[serde(deserialize_with = "deserialize_workspace_deletion_operation_id")]
     operation_id: String,
-    #[serde(deserialize_with = "deserialize_workspace_deletion_revision")]
-    expected_revision: String,
+    #[serde(deserialize_with = "deserialize_workspace_deletion_updated_at")]
+    expected_workspace_updated_at: String,
     #[serde(deserialize_with = "deserialize_workspace_deletion_confirmation")]
     confirmation: String,
 }
@@ -6255,7 +6194,7 @@ impl<'de> Deserialize<'de> for WorkspaceDeletionRequest {
         let wire = WorkspaceDeletionRequestWire::deserialize(deserializer)?;
         Ok(Self {
             operation_id: wire.operation_id,
-            expected_revision: wire.expected_revision,
+            expected_workspace_updated_at: wire.expected_workspace_updated_at,
             confirmation: wire.confirmation,
         })
     }
@@ -6302,18 +6241,13 @@ impl<'de> Deserialize<'de> for WorkspaceDeletionOperationResponse {
     }
 }
 
-/// Read-only Profile catalog projected from one active Workspace config revision.
+/// Read-only Profile catalog projected from one active Workspace config tree.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
 #[serde(deny_unknown_fields)]
 pub struct ProfileSettingsResponse {
     pub workspace_id: String,
-    pub registry_revision: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional, type = "number | null"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub config_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tree_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6354,7 +6288,6 @@ pub struct WorkspaceProfileSourceSummary {
     pub content_digest: String,
     pub provenance: WorkspaceProfileSourceProvenance,
     pub editable: bool,
-    pub revision: String,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub size_bytes: u64,
@@ -6404,9 +6337,6 @@ pub struct RepositorySummary {
     pub kind: String,
     pub provider: String,
     pub source: RepositorySource,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub source_revision: u64,
     pub source_fingerprint: String,
     pub observed_status: RepositoryObservedStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6493,9 +6423,7 @@ pub struct RepositorySshConnectionProbeResponse {
     pub port: u16,
     pub trust_state: RepositorySshConnectionTrustState,
     pub host_trust_id: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub expected_host_trust_revision: Option<u64>,
+    pub expected_host_key_fingerprint: Option<String>,
     pub candidates: Vec<RepositorySshHostKeyCandidate>,
 }
 
@@ -6506,9 +6434,7 @@ pub struct ConfirmRepositorySshHostTrustRequest {
     pub operation_id: String,
     pub runtime_id: String,
     pub host_key: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub expected_host_trust_revision: Option<u64>,
+    pub expected_host_key_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -7094,7 +7020,7 @@ pub struct CurrentWorkerWorkdirCatalogResponse {
     pub items: Vec<WorkingDirectorySummary>,
     pub next_cursor: Option<String>,
     /// Opaque digest of the complete authoritative inventory and its occupancy.
-    pub revision: String,
+    pub digest: String,
 }
 
 /// Bounded, alias-ordered paging over the current Worker's active attachments.
@@ -7127,7 +7053,7 @@ pub struct CurrentWorkerWorkdirAttachmentListResponse {
     pub items: Vec<CurrentWorkerWorkdirAttachmentItem>,
     pub next_offset: Option<u32>,
     /// Opaque digest of this caller's complete active connection set, independent of query paging/filtering.
-    pub revision: String,
+    pub digest: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -7268,7 +7194,6 @@ pub struct ObjectiveDetail {
     pub resource_key: String,
     pub title: String,
     pub state: String,
-    pub revision: String,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub linked_tickets: Vec<String>,
@@ -7666,7 +7591,7 @@ pub struct TicketQueryItem {
     pub priority: String,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
-    pub item_revision: String,
+    pub content_digest: String,
     pub workspace_action_priority: String,
     pub matched_fields: Vec<String>,
     pub snippet: Option<String>,
@@ -7721,7 +7646,7 @@ pub struct TicketDetail {
     pub priority: String,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
-    pub item_revision: String,
+    pub content_digest: String,
     pub queued_by: Option<String>,
     pub queued_at: Option<String>,
     #[cfg_attr(feature = "typescript", ts(type = "Array<TicketTarget>"))]
@@ -7942,7 +7867,7 @@ pub struct BrowserEditTicketRequest {
 pub struct BrowserTransitionTicketStateRequest {
     pub state: BrowserTicketWorkflowState,
     pub operation_key: String,
-    pub expected_item_revision: String,
+    pub expected_content_digest: String,
     pub expected_state: BrowserTicketWorkflowState,
     pub reason: String,
     pub body: Option<String>,
@@ -7977,7 +7902,7 @@ pub struct BrowserQueueTicketRequest {}
 #[serde(deny_unknown_fields)]
 pub struct BrowserCloseTicketRequest {
     pub operation_key: String,
-    pub expected_item_revision: String,
+    pub expected_content_digest: String,
     pub expected_state: BrowserTicketWorkflowState,
     pub resolution: String,
 }
@@ -8133,7 +8058,7 @@ macro_rules! merge_request_event {
 
 merge_request_event!(ReviewRequestedEvent {
     subject_ref: String,
-    ticket_item_revision: String,
+    ticket_content_digest: String,
     ticket_merge_request_subjects: Vec<MergeRequestReviewSubject>,
     requested_by: MergeRequestWorkerIdentity,
     reviewer: MergeRequestWorkerIdentity,
@@ -8141,7 +8066,7 @@ merge_request_event!(ReviewRequestedEvent {
 merge_request_event!(ReviewEvent {
     request_event_id: String,
     subject_ref: String,
-    ticket_item_revision: String,
+    ticket_content_digest: String,
     ticket_merge_request_subjects: Vec<MergeRequestReviewSubject>,
     decision: ReviewDecision,
     body: String,
@@ -8248,7 +8173,7 @@ pub struct MergeRequestThreadQuery {
 pub struct MergeRequestRefResponse {
     pub status: String,
     #[serde(rename = "ref")]
-    pub revision_ref: Option<String>,
+    pub resolved_ref: Option<String>,
     pub observed_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
@@ -8358,7 +8283,7 @@ pub struct CompleteMergeRequestRequest {
 #[serde(deny_unknown_fields)]
 pub struct CompleteTicketRequest {
     pub operation_key: String,
-    pub expected_item_revision: String,
+    pub expected_content_digest: String,
     pub expected_state: ticket::TicketWorkflowState,
     pub reason: String,
     #[serde(default)]
@@ -8373,8 +8298,7 @@ pub struct RuntimeManagementApiError {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<Diagnostic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub current_revision: Option<u64>,
+    pub current_binding_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_fingerprint: Option<String>,
     #[serde(skip, default = "default_repository_error_status")]
@@ -8385,12 +8309,12 @@ impl RuntimeManagementApiError {
     pub fn trust_conflict(conflict: RuntimeTrustConflictResponse) -> Self {
         Self {
             error: match conflict.error {
-                RuntimeTrustConflictKind::StaleRevision => "stale_revision".to_string(),
+                RuntimeTrustConflictKind::StaleBinding => "stale_binding".to_string(),
                 RuntimeTrustConflictKind::FingerprintInUse => "fingerprint_in_use".to_string(),
             },
             message: conflict.message,
             diagnostics: Vec::new(),
-            current_revision: conflict.current_revision,
+            current_binding_id: conflict.current_binding_id,
             current_fingerprint: conflict.current_fingerprint,
             status: 409,
         }
@@ -8415,7 +8339,7 @@ impl From<RepositoryApiError> for RuntimeManagementApiError {
             error: error.error,
             message: error.message,
             diagnostics: error.diagnostics,
-            current_revision: None,
+            current_binding_id: None,
             current_fingerprint: None,
             status: error.status,
         }
@@ -8780,7 +8704,6 @@ pub struct RuntimeCleanupPlanResponse {
     pub workspace_id: String,
     pub runtime_id: String,
     pub generated_at: String,
-    pub revision: String,
     pub digest: String,
     pub workers: Vec<CleanupWorkerCandidate>,
     pub workdirs: Vec<CleanupWorkdirCandidate>,
@@ -8790,7 +8713,6 @@ pub struct RuntimeCleanupPlanResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExecuteRuntimeCleanupRequest {
-    pub expected_plan_revision: String,
     pub expected_plan_digest: String,
     #[serde(default)]
     pub worker_target_ids: Vec<String>,
@@ -8952,20 +8874,11 @@ pub struct RuntimeVerificationEvidenceSummary {
     pub verified_at: Option<String>,
     pub last_checked_at: String,
     pub last_outcome: RuntimeVerificationOutcome,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub binding_revision: u64,
+    pub binding_id: String,
     pub workspace_key_id: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub workspace_identity_revision: u64,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub workspace_trust_generation: u64,
+    pub workspace_public_key_fingerprint: String,
+    pub workspace_trust_id: String,
     pub runtime_public_key_fingerprint: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub runtime_identity_revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -8974,15 +8887,11 @@ pub struct RuntimeVerificationEvidenceSummary {
 pub struct WorkspaceRuntimeBindingSummary {
     pub state: WorkspaceRuntimeBindingState,
     pub connection_state: RuntimeConnectionDisplayState,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub revision: u64,
+    pub binding_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_key_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub workspace_key_generation: Option<u64>,
+    pub workspace_trust_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<RuntimeVerificationEvidenceSummary>,
 }
@@ -9039,9 +8948,7 @@ pub struct RuntimeTrustKeyState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub revision: Option<u64>,
+    pub binding_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -9070,9 +8977,7 @@ pub struct RuntimeTrustAuditEntry {
     pub old_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_fingerprint: Option<String>,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub revision: u64,
+    pub binding_id: String,
     pub at: String,
 }
 
@@ -9100,9 +9005,7 @@ pub struct RuntimeTrustKeyRevealResponse {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RevokeRuntimeTrustKeyRequest {
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub expected_revision: u64,
+    pub expected_binding_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -9110,9 +9013,7 @@ pub struct RevokeRuntimeTrustKeyRequest {
 #[serde(deny_unknown_fields)]
 pub struct RemoveRuntimeRequest {
     pub operation_id: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub expected_binding_revision: u64,
+    pub expected_binding_id: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -9147,7 +9048,7 @@ pub struct RuntimeRemovalOperationResponse {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeTrustConflictKind {
-    StaleRevision,
+    StaleBinding,
     FingerprintInUse,
 }
 
@@ -9158,9 +9059,7 @@ pub struct RuntimeTrustConflictResponse {
     pub error: RuntimeTrustConflictKind,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub current_revision: Option<u64>,
+    pub current_binding_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_fingerprint: Option<String>,
 }
@@ -9178,13 +9077,14 @@ pub struct RuntimePublicIdentityBundle {
 #[serde(deny_unknown_fields)]
 pub struct CreateRemoteRuntimeRequest {
     pub public_bundle: RuntimePublicIdentityBundle,
+    /// Exact Runtime-issued enrollment identity from `trust-workspace add/show`.
+    /// A key fingerprint alone cannot distinguish revocation and re-enrollment.
+    pub workspace_trust_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub expected_revision: Option<u64>,
+    pub expected_binding_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -9225,9 +9125,7 @@ pub enum RuntimeConnectionTestFailureKind {
 pub struct RuntimeConnectionTestResponse {
     pub workspace_id: String,
     pub runtime_id: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub binding_revision: u64,
+    pub binding_id: String,
     pub connection_state: RuntimeConnectionDisplayState,
     pub verification: Option<RuntimeVerificationEvidenceSummary>,
     pub checked_at: String,
@@ -9447,10 +9345,6 @@ pub struct RuntimeResourceHandle {
     #[schemars(range(min = -9_007_199_254_740_991_i64, max = 9_007_199_254_740_991_i64))]
     pub expires_at_unix_seconds: i64,
     pub nonce: String,
-    pub revision: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub generation: Option<u64>,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub max_bytes: u64,
     pub content_type: String,
@@ -10161,7 +10055,7 @@ pub struct MemoryEvidenceOrigin {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional, type = "number | null"))]
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub flow_definition_revision: Option<u64>,
+    pub flow_definition_fingerprint: Option<String>,
 }
 
 /// Record-level source range for one Memory staging candidate.
@@ -10293,23 +10187,23 @@ pub fn memory_api_typescript() -> String {
 
 export type SubjektivSubjectCreateRequest = { role: string, behavior_md?: string, };
 
-export type SubjektivSubjectBehaviorUpdateRequest = { expected_behavior_revision: number, behavior_md: string, };
+export type SubjektivSubjectBehaviorUpdateRequest = { expected_behavior_md: string, behavior_md: string, };
 
-export type SubjektivSubjectResponse = { id: string, role: string, behavior_md: string, behavior_revision: number, state: SubjektivSubjectState, store_revision: number, created_at: string, updated_at: string, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
+export type SubjektivSubjectResponse = { id: string, role: string, behavior_md: string, state: SubjektivSubjectState, memory_fingerprint: string, created_at: string, updated_at: string, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
 
 export type SubjektivSubjectListResponse = { limit: number, items: Array<SubjektivSubjectResponse>, next_cursor?: string | null, has_more: boolean, };
 
 export type SubjektivMemoryState = "active" | "resolved" | "retracted";
 
-export type SubjektivMemoryRevisionRef = { memory_id: string, revision: number, };
+export type SubjektivMemoryChangeRef = { memory_id: string, change_id: string, };
 
 export type SubjektivResidentSurfaceAvailability = "ungenerated" | "stale" | "failed" | "ready";
 
-export type SubjektivResidentSurfaceSnapshot = { snapshot_id: string, body_md: string, memory_refs: Array<SubjektivMemoryRevisionRef>, built_from_store_revision: number, created_at: string, };
+export type SubjektivResidentSurfaceSnapshot = { snapshot_id: string, body_md: string, memory_refs: Array<SubjektivMemoryChangeRef>, built_from_memory_fingerprint: string, created_at: string, };
 
 export type SubjektivResidentSurfaceResponse = { subject_id: string, availability: SubjektivResidentSurfaceAvailability, snapshot?: SubjektivResidentSurfaceSnapshot | null, };
 
-export type SubjektivMemoryQueryItem = { id: string, revision: number, kind: MemoryCandidateKind, state: SubjektivMemoryState, claim: string, excerpt: string, updated_at: string, };
+export type SubjektivMemoryQueryItem = { id: string, change_id: string, kind: MemoryCandidateKind, state: SubjektivMemoryState, claim: string, excerpt: string, updated_at: string, };
 
 export type SubjektivMemoryQueryResponse = { items: Array<SubjektivMemoryQueryItem>, next_cursor?: string | null, has_more: boolean, };
 
@@ -10319,11 +10213,11 @@ export type SubjektivMemorySourceEvidenceRef = { session_id?: string | null, seg
 
 export type SubjektivMemoryEvidenceCandidate = { candidate_id: string, evidence: Array<SubjektivMemoryEvidence>, evidence_total: number, evidence_truncated: boolean, source_refs: Array<SubjektivMemorySourceEvidenceRef>, source_refs_total: number, source_refs_truncated: boolean, };
 
-export type SubjektivMemoryReadResponse = { memory_id: string, revision: number, current_revision: number, kind: MemoryCandidateKind, state: SubjektivMemoryState, claim: string, body_md: string, why_useful: string, staleness?: string | null, change_reason: string, created_at: string, updated_at: string, body_offset: number, body_byte_offset: number, body_next_offset?: number | null, body_next_byte_offset?: number | null, body_truncated: boolean, source_candidate_ids: Array<string>, source_candidates: Array<SubjektivMemoryEvidenceCandidate>, derived_from: Array<SubjektivMemoryRevisionRef>, evidence_next_cursor?: string | null, evidence_has_more: boolean, };
+export type SubjektivMemoryReadResponse = { memory_id: string, change_id: string, current_change_id: string, kind: MemoryCandidateKind, state: SubjektivMemoryState, claim: string, body_md: string, why_useful: string, staleness?: string | null, change_reason: string, created_at: string, updated_at: string, body_offset: number, body_byte_offset: number, body_next_offset?: number | null, body_next_byte_offset?: number | null, body_truncated: boolean, source_candidate_ids: Array<string>, source_candidates: Array<SubjektivMemoryEvidenceCandidate>, derived_from: Array<SubjektivMemoryChangeRef>, evidence_next_cursor?: string | null, evidence_has_more: boolean, };
 
-export type SubjektivMemoryRevisionItem = { revision: number, kind: MemoryCandidateKind, state: SubjektivMemoryState, claim: string, change_reason: string, updated_at: string, };
+export type SubjektivMemoryChangeItem = { change_id: string, kind: MemoryCandidateKind, state: SubjektivMemoryState, claim: string, change_reason: string, updated_at: string, };
 
-export type SubjektivMemoryListRevisionsResponse = { memory_id: string, current_revision: number, items: Array<SubjektivMemoryRevisionItem>, next_cursor?: string | null, has_more: boolean, };"#;
+export type SubjektivMemoryListChangesResponse = { memory_id: string, current_change_id: string, items: Array<SubjektivMemoryChangeItem>, next_cursor?: string | null, has_more: boolean, };"#;
 
     let limits = format!(
         "export const MEMORY_API_LIMITS = {{\n  maxResponseBytes: {MEMORY_API_MAX_RESPONSE_BYTES},\n  maxDocumentBytes: {MEMORY_API_MAX_DOCUMENT_BYTES},\n  maxCollectionItems: {MEMORY_API_MAX_COLLECTION_ITEMS},\n  maxStringBytes: {MEMORY_API_MAX_STRING_BYTES},\n  maxIdentifierBytes: {MEMORY_API_MAX_IDENTIFIER_BYTES},\n}} as const;"
@@ -10346,8 +10240,6 @@ export type SubjektivMemoryListRevisionsResponse = { memory_id: string, current_
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceMemorySettings {
     pub workspace_id: String,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub settings_revision: u64,
     pub language: String,
 }
 
@@ -10355,8 +10247,7 @@ pub struct WorkspaceMemorySettings {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateWorkspaceMemorySettingsRequest {
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub expected_revision: u64,
+    pub expected_language: String,
     pub language: String,
 }
 
@@ -10372,9 +10263,6 @@ pub struct RepositorySshCredential {
     pub name: String,
     pub public_key_algorithm: String,
     pub public_key_fingerprint: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub current_revision: u64,
     pub status: String,
     pub created_at: String,
     pub rotated_at: Option<String>,
@@ -10412,9 +10300,6 @@ pub struct GenerateRepositorySshCredentialRequest {
 #[serde(deny_unknown_fields)]
 pub struct RepositorySshPublicKey {
     pub credential_id: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub current_revision: u64,
     pub public_key_algorithm: String,
     pub public_key_fingerprint: String,
     pub public_key: String,
@@ -10425,9 +10310,7 @@ pub struct RepositorySshPublicKey {
 #[serde(deny_unknown_fields)]
 pub struct RotateRepositorySshCredentialRequest {
     pub operation_id: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub expected_revision: u64,
+    pub expected_public_key_fingerprint: String,
     pub private_key: String,
     #[serde(default)]
     pub passphrase: Option<String>,
@@ -10438,9 +10321,7 @@ pub struct RotateRepositorySshCredentialRequest {
 #[serde(deny_unknown_fields)]
 pub struct DeleteRepositorySshCredentialRequest {
     pub operation_id: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub expected_revision: u64,
+    pub expected_public_key_fingerprint: String,
 }
 
 /// Public metadata for an explicitly pinned SSH host key.
@@ -10455,9 +10336,6 @@ pub struct RepositorySshHostTrust {
     pub key_algorithm: String,
     pub host_key: String,
     pub fingerprint: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub current_revision: u64,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default)]
@@ -10478,9 +10356,7 @@ pub struct PutRepositorySshHostTrustRequest {
     pub port: u16,
     pub host_key: String,
     #[serde(default)]
-    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub expected_revision: Option<u64>,
+    pub expected_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -10504,9 +10380,7 @@ impl api_macros::HttpSuccess for RepositorySshHostTrustMutationResponse {
 #[serde(deny_unknown_fields)]
 pub struct DeleteRepositorySshHostTrustRequest {
     pub operation_id: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub expected_revision: u64,
+    pub expected_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -10534,9 +10408,6 @@ pub struct RepositorySshAccessBinding {
 #[serde(deny_unknown_fields)]
 pub struct RepositoryAccessProjection {
     pub workspace_id: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub config_revision: u64,
     pub projection_digest: String,
     pub bindings: Vec<RepositorySshAccessBinding>,
 }
@@ -10623,9 +10494,6 @@ pub struct SkillProvenance {
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub virtual_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional, type = "number"))]
-    pub revision: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub source_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -10655,9 +10523,6 @@ pub enum SkillProjectionStatus {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct SkillProjectionIdentity {
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub config_revision: u64,
     pub tree_digest: String,
 }
 
@@ -10754,7 +10619,6 @@ impl std::error::Error for SkillApiValidationError {}
 
 impl SkillProjectionIdentity {
     fn validate(&self) -> Result<(), SkillApiValidationError> {
-        validate_safe_integer(self.config_revision)?;
         validate_nonempty_string(&self.tree_digest, SKILL_API_MAX_DIGEST_BYTES)
             .map_err(|_| SkillApiValidationError::InvalidProjectionIdentity)
     }
@@ -10769,9 +10633,6 @@ impl SkillProvenance {
         validate_optional_string(self.virtual_path.as_deref(), SKILL_API_MAX_PATH_BYTES)?;
         validate_optional_string(self.source_digest.as_deref(), SKILL_API_MAX_DIGEST_BYTES)?;
         validate_optional_string(self.tree_digest.as_deref(), SKILL_API_MAX_DIGEST_BYTES)?;
-        if let Some(revision) = self.revision {
-            validate_safe_integer(revision)?;
-        }
 
         let expected_prefix = match self.kind {
             SkillSourceKind::Builtin => "builtin:",
@@ -10789,18 +10650,15 @@ impl SkillProvenance {
 
         match self.kind {
             SkillSourceKind::Builtin => {
-                if self.revision.is_some() || self.tree_digest.is_some() {
+                if self.tree_digest.is_some() {
                     return Err(SkillApiValidationError::InvalidProvenance);
                 }
             }
             SkillSourceKind::Workspace => {
-                let Some(revision) = self.revision else {
-                    return Err(SkillApiValidationError::InvalidProvenance);
-                };
                 let Some(tree_digest) = self.tree_digest.as_deref() else {
                     return Err(SkillApiValidationError::InvalidProvenance);
                 };
-                if revision != projection.config_revision || tree_digest != projection.tree_digest {
+                if tree_digest != projection.tree_digest {
                     return Err(SkillApiValidationError::StaleProjection);
                 }
             }
@@ -10866,14 +10724,6 @@ impl SkillDetailResponse {
             provenance.validate(&self.projection)?;
         }
         Ok(())
-    }
-}
-
-fn validate_safe_integer(value: u64) -> Result<(), SkillApiValidationError> {
-    if value <= SKILL_API_MAX_SAFE_INTEGER {
-        Ok(())
-    } else {
-        Err(SkillApiValidationError::InvalidProjectionIdentity)
     }
 }
 
@@ -11522,7 +11372,6 @@ mod tests {
             "metadata": {
                 "id": "bundle-a",
                 "digest": "0123456789abcdef",
-                "revision": "revision-a",
                 "workspace_id": "workspace-a",
                 "created_at": "2026-01-01T00:00:00Z",
                 "provenance": {
@@ -11541,7 +11390,6 @@ mod tests {
             }],
             "prompt_catalog": {
                 "templates": { "default": "Prompt" },
-                "config_revision": 7,
                 "source_digest": "source-digest",
                 "schema_fingerprint": "schema-a",
                 "toolchain_fingerprint": "toolchain-a",
@@ -11572,8 +11420,6 @@ mod tests {
                 "operation": "fetch_archive",
                 "expires_at_unix_seconds": 1_800_000_000,
                 "nonce": "nonce-a",
-                "revision": "revision-a",
-                "generation": 2,
                 "max_bytes": 1_048_576,
                 "content_type": "application/vnd.yoi.profile-source-archive+tar",
                 "redaction": "runtime_internal_only",
@@ -11860,9 +11706,9 @@ mod tests {
                 "/api/w/{workspace_id}/config/source-tree/commit",
             ),
             (
-                "workspace_config_revision",
+                "workspace_config_history",
                 HttpMethod::Get,
-                "/api/w/{workspace_id}/config/source-tree/revisions/{revision}",
+                "/api/w/{workspace_id}/config/source-tree/history/{content_digest}",
             ),
             (
                 "workspace_config_entry",
@@ -12017,7 +11863,6 @@ mod tests {
 
     fn skill_projection() -> SkillProjectionIdentity {
         SkillProjectionIdentity {
-            config_revision: 42,
             tree_digest: "tree-digest".to_string(),
         }
     }
@@ -12027,7 +11872,6 @@ mod tests {
             kind: SkillSourceKind::Builtin,
             id: "builtin:errors".to_string(),
             virtual_path: Some("skills/errors/SKILL.md".to_string()),
-            revision: None,
             source_digest: Some("builtin-source-digest".to_string()),
             tree_digest: None,
         }
@@ -12038,7 +11882,6 @@ mod tests {
             kind: SkillSourceKind::Workspace,
             id: "workspace:skills/release/SKILL.md".to_string(),
             virtual_path: Some("skills/release/SKILL.md".to_string()),
-            revision: Some(42),
             source_digest: Some("workspace-source-digest".to_string()),
             tree_digest: Some("tree-digest".to_string()),
         }
@@ -12082,7 +11925,7 @@ mod tests {
         let decoded: SkillCatalogResponse =
             serde_json::from_str(&json).expect("deserialize Skill catalog");
         assert_eq!(decoded, response);
-        assert!(!json.contains("\"revision\":null"));
+        assert!(!json.contains("\"revision\""));
         assert!(!json.contains("\"tree_digest\":null"));
     }
 
@@ -12113,9 +11956,9 @@ mod tests {
     }
 
     #[test]
-    fn skill_projection_validation_detects_stale_workspace_revision() {
+    fn skill_projection_validation_detects_stale_workspace_tree() {
         let mut provenance = workspace_skill_provenance();
-        provenance.revision = Some(41);
+        provenance.tree_digest = Some("stale-tree-digest".to_string());
         let response = SkillCatalogResponse {
             authority: "workspace-config-skills-v1".to_string(),
             projection: skill_projection(),
@@ -12141,7 +11984,7 @@ mod tests {
     fn skill_dto_rejects_unknown_fields_and_unknown_provenance_kind() {
         let unknown_field = serde_json::json!({
             "authority": "workspace-config-skills-v1",
-            "projection": {"config_revision": 42, "tree_digest": "tree-digest"},
+            "projection": {"tree_digest": "tree-digest"},
             "entries": [],
             "diagnostics": [],
             "body": "must not be accepted"
@@ -12175,7 +12018,7 @@ mod tests {
                 worker_id: Some("worker-1".to_string()),
                 flow_selector: Some("builtin:coder-review".to_string()),
                 flow_definition_id: Some("flow-1".to_string()),
-                flow_definition_revision: Some(7),
+                flow_definition_fingerprint: Some("sha256:flow-definition".into()),
             };
             let encoded = serde_json::to_value(&origin).unwrap();
             let decoded: MemoryEvidenceOrigin = serde_json::from_value(encoded).unwrap();
@@ -12360,7 +12203,7 @@ mod tests {
         let preflight = WorkspaceDeletionPreflightResponse {
             workspace_id: "workspace-test".to_string(),
             display_name: "Test".to_string(),
-            expected_revision: "revision-7".to_string(),
+            expected_workspace_updated_at: "2026-01-02T00:00:00Z".to_string(),
             can_delete: true,
             resources: WorkspaceDeletionResourceCounts {
                 workers: 2,
@@ -12386,7 +12229,7 @@ mod tests {
         assert!(
             serde_json::from_value::<WorkspaceDeletionRequest>(serde_json::json!({
                 "operation_id": "delete-test",
-                "expected_revision": "revision-7",
+                "expected_workspace_updated_at": "2026-01-02T00:00:00Z",
                 "confirmation": "Test",
                 "workspace_id": "caller-controlled"
             }))
@@ -12395,7 +12238,7 @@ mod tests {
         assert!(
             serde_json::from_value::<WorkspaceDeletionRequest>(serde_json::json!({
                 "operation_id": "x".repeat(WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES + 1),
-                "expected_revision": "revision-7",
+                "expected_workspace_updated_at": "2026-01-02T00:00:00Z",
                 "confirmation": "Test"
             }))
             .is_err()
@@ -12540,7 +12383,7 @@ mod tests {
         );
         let list = CurrentWorkerWorkdirAttachmentListResponse {
             workspace_id: "workspace".to_string(),
-            revision: "opaque-revision".to_string(),
+            digest: "inventory-digest".to_string(),
             next_offset: Some(1),
             items: vec![CurrentWorkerWorkdirAttachmentItem {
                 alias: "checkout".to_string(),
@@ -12559,7 +12402,7 @@ mod tests {
     }
 
     #[test]
-    fn current_worker_workdir_catalog_contract_is_bounded_and_revision_is_required() {
+    fn current_worker_workdir_catalog_contract_is_bounded_and_digest_is_required() {
         let query = CurrentWorkerWorkdirCatalogQuery {
             limit: Some(100),
             cursor: Some("stable-id".to_string()),
@@ -12591,7 +12434,7 @@ mod tests {
             workspace_id: "workspace".to_string(),
             items: Vec::new(),
             next_cursor: Some("scanned-legacy-row".to_string()),
-            revision: "opaque".to_string(),
+            digest: "inventory-digest".to_string(),
         };
         assert_eq!(
             serde_json::from_value::<CurrentWorkerWorkdirCatalogResponse>(
@@ -12661,7 +12504,6 @@ mod tests {
                 "kind": "git",
                 "provider": "git",
                 "source": {"kind": "local_path", "uri": "/srv/project"},
-                "source_revision": 1,
                 "source_fingerprint": "sha256:test",
                 "observed_status": "ready",
                 "record_authority": "workspace-control-plane"
@@ -12727,7 +12569,7 @@ mod tests {
             "trust_key": {
                 "status": "active",
                 "fingerprint": "SHA256:test",
-                "revision": 2,
+                "binding_id": "binding-new",
                 "created_at": "2026-09-01T12:00:00Z",
                 "updated_at": "2026-09-01T13:00:00Z"
             },
@@ -12736,7 +12578,7 @@ mod tests {
                 "actor_account_id": "account-owner",
                 "old_fingerprint": "SHA256:old",
                 "new_fingerprint": "SHA256:test",
-                "revision": 2,
+                "binding_id": "binding-new",
                 "at": "2026-09-01T13:00:00Z"
             }]
         });
@@ -12755,7 +12597,7 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<RevokeRuntimeTrustKeyRequest>(serde_json::json!({
-                "expected_revision": 1,
+                "expected_binding_id": "trust-observed",
                 "delete_runtime": true
             }))
             .is_err()
@@ -12763,11 +12605,26 @@ mod tests {
     }
 
     #[test]
+    fn runtime_registration_requires_explicit_runtime_issued_trust_identity() {
+        let mut value = serde_json::json!({
+            "public_bundle": {"identity_id": "runtime", "public_key": "public-key"},
+            "endpoint": "https://runtime.example.test",
+            "workspace_trust_id": "runtime-issued-enrollment"
+        });
+        let request: CreateRemoteRuntimeRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(request.workspace_trust_id, "runtime-issued-enrollment");
+        value.as_object_mut().unwrap().remove("workspace_trust_id");
+        assert!(serde_json::from_value::<CreateRemoteRuntimeRequest>(value.clone()).is_err());
+        value["workspace_key_generation"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<CreateRemoteRuntimeRequest>(value).is_err());
+    }
+
+    #[test]
     fn runtime_connection_test_response_is_closed_and_typed() {
         let compatible = serde_json::json!({
             "workspace_id": "workspace-test",
             "runtime_id": "runtime-test",
-            "binding_revision": 3,
+            "binding_id": "binding-test",
             "connection_state": "verified",
             "verification": null,
             "checked_at": "2026-09-01T12:00:00Z",
@@ -12787,10 +12644,80 @@ mod tests {
     }
 
     #[test]
+    fn runtime_trust_contract_binds_concrete_keys_and_binding_lifetimes() {
+        let evidence = RuntimeVerificationEvidenceSummary {
+            verified_at: Some("2026-10-06T00:00:00Z".into()),
+            last_checked_at: "2026-10-06T00:00:00Z".into(),
+            last_outcome: RuntimeVerificationOutcome::Verified,
+            binding_id: "binding-new".into(),
+            workspace_key_id: "workspace-key".into(),
+            workspace_public_key_fingerprint: "sha256:workspace-key".into(),
+            workspace_trust_id: "trust-new".into(),
+            runtime_public_key_fingerprint: "sha256:runtime-key".into(),
+        };
+        round_trip(evidence.clone());
+        let mut stale = serde_json::to_value(evidence).unwrap();
+        stale["workspace_identity_revision"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<RuntimeVerificationEvidenceSummary>(stale).is_err());
+        round_trip(RevokeRuntimeTrustKeyRequest {
+            expected_binding_id: "binding-observed".into(),
+        });
+        assert!(
+            serde_json::from_value::<RevokeRuntimeTrustKeyRequest>(serde_json::json!({
+                "expected_revision": 1
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<RemoveRuntimeRequest>(serde_json::json!({
+                "operation_id": "remove-binding",
+                "expected_binding_revision": 1
+            }))
+            .is_err()
+        );
+        round_trip(RemoveRuntimeRequest {
+            operation_id: "remove-binding".into(),
+            expected_binding_id: "binding-observed".into(),
+        });
+    }
+
+    #[test]
+    fn repository_key_mutations_require_observed_key_fingerprints() {
+        round_trip(RotateRepositorySshCredentialRequest {
+            operation_id: "rotate-key".into(),
+            expected_public_key_fingerprint: "sha256:observed-key".into(),
+            private_key: "fixture-not-a-real-key".into(),
+            passphrase: None,
+        });
+        round_trip(PutRepositorySshHostTrustRequest {
+            operation_id: "trust-host".into(),
+            host_trust_id: "host-trust".into(),
+            hostname: "example.test".into(),
+            port: 22,
+            host_key: "fixture-host-key".into(),
+            expected_fingerprint: None,
+        });
+        assert!(
+            serde_json::from_value::<DeleteRepositorySshCredentialRequest>(serde_json::json!({
+                "operation_id": "delete-key",
+                "expected_revision": 1
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<DeleteRepositorySshHostTrustRequest>(serde_json::json!({
+                "operation_id": "delete-trust",
+                "expected_revision": 1
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn ticket_completion_wire_requires_cas_and_judgment_not_merge_evidence() {
         let request = serde_json::json!({
             "operation_key": "investigation-done",
-            "expected_item_revision": "ticket:1",
+            "expected_content_digest": "ticket:1",
             "expected_state": "planning",
             "reason": "Question answered in the thread"
         });
@@ -12798,7 +12725,7 @@ mod tests {
         assert!(parsed.references.is_empty());
         for field in [
             "operation_key",
-            "expected_item_revision",
+            "expected_content_digest",
             "expected_state",
             "reason",
         ] {
@@ -12836,7 +12763,7 @@ mod tests {
         assert!(output.contains("export type WorkspaceConfigTreeResponse ="));
         assert!(output.contains("export type ConfigCommitRequest ="));
         assert!(output.contains("export type ProfileSettingsResponse ="));
-        assert!(output.contains("config_revision?: number | null"));
+        assert!(!output.contains("config_revision"));
         assert!(output.contains("provenance: WorkspaceProfileSourceProvenance"));
         assert!(output.contains(
             "export type WorkspaceProfileSourceProvenance = \"project_profile_source_tree\""
@@ -12908,20 +12835,20 @@ mod tests {
         let diagnostic = Diagnostic {
             code: "profile_projection_warning".to_string(),
             severity: DiagnosticSeverity::Warning,
-            message: "projected from the active config revision".to_string(),
+            message: "projected from the active config content".to_string(),
         };
         let metadata = WorkspaceMetadataSettingsResponse {
             workspace_id: "workspace-test".to_string(),
             display_name: "Test".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
-            revision: "sha256:metadata".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
             source: "workspace-config".to_string(),
             diagnostics: vec![diagnostic.clone()],
         };
         round_trip(metadata.clone());
         round_trip(UpdateWorkspaceMetadataRequest {
             display_name: "Renamed".to_string(),
-            revision: metadata.revision.clone(),
+            expected_updated_at: metadata.updated_at.clone(),
         });
         round_trip(WorkspaceMetadataMutationResponse {
             workspace: metadata,
@@ -12930,8 +12857,6 @@ mod tests {
 
         round_trip(ProfileSettingsResponse {
             workspace_id: "workspace-test".to_string(),
-            registry_revision: "config-source:7:sha256:tree:sha256:projection".to_string(),
-            config_revision: Some(7),
             tree_digest: Some("sha256:tree".to_string()),
             projection_digest: Some("sha256:projection".to_string()),
             default_profile: Some("workspace:coder".to_string()),
@@ -12954,7 +12879,6 @@ mod tests {
                 content_digest: "sha256:source".to_string(),
                 provenance: WorkspaceProfileSourceProvenance::ProjectProfileSourceTree,
                 editable: false,
-                revision: "config-source:7".to_string(),
                 size_bytes: 128,
                 diagnostics: vec![],
             }],
@@ -12963,14 +12887,12 @@ mod tests {
 
         let absent_optional_fields = serde_json::json!({
             "workspace_id": "workspace-test",
-            "registry_revision": "builtin",
             "profiles": [],
             "sources": [],
             "diagnostics": []
         });
         let decoded: ProfileSettingsResponse =
             serde_json::from_value(absent_optional_fields.clone()).unwrap();
-        assert_eq!(decoded.config_revision, None);
         assert_eq!(decoded.tree_digest, None);
         assert_eq!(decoded.projection_digest, None);
         assert_eq!(decoded.default_profile, None);
@@ -12989,7 +12911,6 @@ mod tests {
                 algorithm: "ed25519".to_string(),
                 public_key: None,
                 public_key_fingerprint: None,
-                revision: 1,
                 state: WorkspaceSigningIdentityState::PendingProvisioning,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 provisioned_at: None,
@@ -13004,7 +12925,6 @@ mod tests {
                     "workspace_id": "workspace-test",
                     "key_id": "WK-test",
                     "algorithm": "ed25519",
-                    "revision": 1,
                     "state": "pending_provisioning",
                     "created_at": "2026-01-01T00:00:00Z"
                 }

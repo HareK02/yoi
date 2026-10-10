@@ -13,7 +13,7 @@ removed when T-713 thread sequence 26 specified 0.2.0.
 
 Canonical contract reference: wip-reference
 `6086f3c5ef10aa1464ce9c824750d7f667217bfd`. This reference documents the contract;
-Cargo resolves the release, not that checkout or an unreleased Rust revision.
+Cargo resolves the release, not that checkout or an unreleased Rust source commit.
 
 ## Executed checks on registry 0.2.0
 

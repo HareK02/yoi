@@ -413,7 +413,8 @@ pub struct RuntimeHttpWorkspacePromptProjectionRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeHttpWorkspacePromptProjectionResponse {
     pub workspace_id: String,
-    pub config_revision: u64,
+    pub source_digest: String,
+    pub projection_digest: String,
 }
 
 /// Config bundle availability response used by sync/check endpoints.
@@ -576,10 +577,10 @@ async fn post_workspace_verification_challenge(
     })?;
     if challenge.workspace_id != verified.workspace_id
         || challenge.runtime_id != verified.runtime_id
-        || challenge.binding_revision != verified.binding_revision
+        || challenge.binding_id != verified.binding_id
         || challenge.workspace_key_id != verified.issuer_key_id
-        || challenge.workspace_identity_revision != verified.issuer_identity_revision
-        || challenge.workspace_trust_generation != verified.trust_generation
+        || challenge.workspace_public_key_fingerprint != verified.issuer_public_key_fingerprint
+        || challenge.workspace_trust_id != verified.trust_id
         || challenge.runtime_id != auth.signer.runtime_id()
         || challenge.runtime_public_key_fingerprint != auth.signer.public_key_fingerprint()
     {
@@ -599,6 +600,13 @@ async fn post_workspace_verification_challenge(
                 error.to_string(),
             )
         })?;
+    auth.verifications.begin(challenge).map_err(|error| {
+        RuntimeHttpRestError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workspace_runtime_verification_unavailable",
+            error.to_string(),
+        )
+    })?;
     Ok(Json(response))
 }
 
@@ -616,17 +624,17 @@ async fn post_workspace_verification_acknowledgement(
     })?;
     if acknowledgement.workspace_id != verified.workspace_id
         || acknowledgement.runtime_id != verified.runtime_id
-        || acknowledgement.binding_revision != verified.binding_revision
+        || acknowledgement.binding_id != verified.binding_id
         || acknowledgement.workspace_key_id != verified.issuer_key_id
-        || acknowledgement.workspace_identity_revision != verified.issuer_identity_revision
-        || acknowledgement.workspace_trust_generation != verified.trust_generation
+        || acknowledgement.workspace_public_key_fingerprint
+            != verified.issuer_public_key_fingerprint
+        || acknowledgement.workspace_trust_id != verified.trust_id
         || acknowledgement.runtime_id != auth.signer.runtime_id()
         || acknowledgement.runtime_public_key_fingerprint != auth.signer.public_key_fingerprint()
         || acknowledgement.expires_at <= unix_now_i64()
-        || acknowledgement.binding_revision == 0
-        || acknowledgement.runtime_identity_revision == 0
-        || acknowledgement.workspace_identity_revision == 0
-        || acknowledgement.workspace_trust_generation == 0
+        || acknowledgement.binding_id.is_empty()
+        || acknowledgement.workspace_public_key_fingerprint.is_empty()
+        || acknowledgement.workspace_trust_id.is_empty()
         || acknowledgement.workspace_nonce.is_empty()
         || acknowledgement.runtime_nonce.is_empty()
         || acknowledgement.response_digest.len() != workspace_request_body_digest(&[]).len()
@@ -641,12 +649,11 @@ async fn post_workspace_verification_acknowledgement(
         challenge_id: acknowledgement.challenge_id.clone(),
         workspace_id: acknowledgement.workspace_id.clone(),
         runtime_id: acknowledgement.runtime_id.clone(),
-        binding_revision: acknowledgement.binding_revision,
+        binding_id: acknowledgement.binding_id.clone(),
         workspace_key_id: acknowledgement.workspace_key_id.clone(),
-        workspace_identity_revision: acknowledgement.workspace_identity_revision,
-        workspace_trust_generation: acknowledgement.workspace_trust_generation,
+        workspace_public_key_fingerprint: acknowledgement.workspace_public_key_fingerprint.clone(),
+        workspace_trust_id: acknowledgement.workspace_trust_id.clone(),
         runtime_public_key_fingerprint: acknowledgement.runtime_public_key_fingerprint.clone(),
-        runtime_identity_revision: acknowledgement.runtime_identity_revision,
         workspace_nonce: acknowledgement.workspace_nonce.clone(),
         expires_at: acknowledgement.expires_at,
     };
@@ -689,17 +696,23 @@ async fn post_workspace_verification_acknowledgement(
         )
     })?;
     auth.verifications
-        .record(WorkspaceRuntimeVerificationRecord {
-            workspace_id: acknowledgement.workspace_id.clone(),
-            runtime_id: acknowledgement.runtime_id.clone(),
-            binding_revision: acknowledgement.binding_revision,
-            workspace_key_id: acknowledgement.workspace_key_id.clone(),
-            workspace_identity_revision: acknowledgement.workspace_identity_revision,
-            workspace_trust_generation: acknowledgement.workspace_trust_generation,
-            runtime_public_key_fingerprint: acknowledgement.runtime_public_key_fingerprint.clone(),
-            runtime_identity_revision: acknowledgement.runtime_identity_revision,
-            verified_at: unix_now_i64(),
-        })
+        .acknowledge(
+            &acknowledgement.challenge_id,
+            WorkspaceRuntimeVerificationRecord {
+                workspace_id: acknowledgement.workspace_id.clone(),
+                runtime_id: acknowledgement.runtime_id.clone(),
+                binding_id: acknowledgement.binding_id.clone(),
+                workspace_key_id: acknowledgement.workspace_key_id.clone(),
+                workspace_public_key_fingerprint: acknowledgement
+                    .workspace_public_key_fingerprint
+                    .clone(),
+                workspace_trust_id: acknowledgement.workspace_trust_id.clone(),
+                runtime_public_key_fingerprint: acknowledgement
+                    .runtime_public_key_fingerprint
+                    .clone(),
+                verified_at: unix_now_i64(),
+            },
+        )
         .map_err(|error| {
             RuntimeHttpRestError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -711,7 +724,7 @@ async fn post_workspace_verification_acknowledgement(
         challenge_id: acknowledgement.challenge_id,
         workspace_id: acknowledgement.workspace_id,
         runtime_id: acknowledgement.runtime_id,
-        binding_revision: acknowledgement.binding_revision,
+        binding_id: acknowledgement.binding_id.clone(),
         accepted_at: unix_now_i64(),
     }))
 }
@@ -810,14 +823,16 @@ async fn observe_workspace_prompt_projection(
         ));
     }
     let workspace_id = request.projection.workspace_id.clone();
-    let config_revision = request.projection.config_revision;
+    let source_digest = request.projection.source_digest.clone();
+    let projection_digest = request.projection.projection_digest.clone();
     state
         .runtime
         .observe_workspace_prompt_projection(request.projection)
         .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkspacePromptProjectionResponse {
         workspace_id,
-        config_revision,
+        source_digest,
+        projection_digest,
     }))
 }
 
@@ -2108,7 +2123,7 @@ async fn require_runtime_auth(
         let body_digest = workspace_request_body_digest(&body);
         let expected = WorkspaceCapabilityExpectation {
             workspace_id: &claims.issuer_workspace_id,
-            binding_revision: claims.binding_revision,
+            binding_id: &claims.binding_id,
             runtime_id: workspace_auth.signer.runtime_id(),
             worker_id: expected_worker_id.as_deref(),
             operation: required_permission,
@@ -2145,13 +2160,13 @@ async fn require_runtime_auth(
                             .into_response();
                         }
                     };
-                    if record.binding_revision != verified.binding_revision
+                    if record.binding_id != verified.binding_id
                         || record.workspace_key_id != verified.issuer_key_id
-                        || record.workspace_identity_revision != verified.issuer_identity_revision
-                        || record.workspace_trust_generation != verified.trust_generation
+                        || record.workspace_public_key_fingerprint
+                            != verified.issuer_public_key_fingerprint
+                        || record.workspace_trust_id != verified.trust_id
                         || record.runtime_public_key_fingerprint
                             != workspace_auth.signer.public_key_fingerprint()
-                        || record.runtime_identity_revision == 0
                     {
                         return RuntimeHttpRestError::new(
                             StatusCode::FORBIDDEN,
@@ -2782,9 +2797,8 @@ mod tests {
                 key_id: "workspace-key".to_string(),
                 algorithm: "ed25519".to_string(),
                 public_key: workspace_identity.public_key.clone(),
-                public_key_fingerprint: workspace_fingerprint,
-                identity_revision: 1,
-                trust_generation: 1,
+                public_key_fingerprint: workspace_fingerprint.clone(),
+                trust_id: "trust-test".into(),
                 state: WorkspaceIssuerTrustState::Active,
                 registered_at_unix: 1,
                 updated_at_unix: 1,
@@ -2805,12 +2819,11 @@ mod tests {
             challenge_id: "challenge-1".to_string(),
             workspace_id: "workspace-a".to_string(),
             runtime_id: "runtime-test".to_string(),
-            binding_revision: 4,
+            binding_id: "binding-test".into(),
             workspace_key_id: "workspace-key".to_string(),
-            workspace_identity_revision: 1,
-            workspace_trust_generation: 1,
+            workspace_public_key_fingerprint: workspace_fingerprint.clone(),
+            workspace_trust_id: "trust-test".into(),
             runtime_public_key_fingerprint: runtime_fingerprint,
-            runtime_identity_revision: 1,
             workspace_nonce: "workspace-nonce".to_string(),
             expires_at: unix_now_i64() + 60,
         };
@@ -2819,9 +2832,9 @@ mod tests {
             issuer: "https://backend.test".to_string(),
             issuer_workspace_id: "workspace-a".to_string(),
             issuer_key_id: "workspace-key".to_string(),
-            issuer_identity_revision: 1,
-            trust_generation: 1,
-            binding_revision: 4,
+            issuer_public_key_fingerprint: workspace_fingerprint.clone(),
+            trust_id: "trust-test".into(),
+            binding_id: "binding-test".into(),
             runtime_id: "runtime-test".to_string(),
             worker_id: None,
             operation: WORKSPACE_VERIFICATION_OPERATION.to_string(),
@@ -2870,14 +2883,15 @@ mod tests {
             challenge_id: verification_response.challenge_id.clone(),
             workspace_id: verification_response.workspace_id.clone(),
             runtime_id: verification_response.runtime_id.clone(),
-            binding_revision: verification_response.binding_revision,
+            binding_id: verification_response.binding_id.clone(),
             workspace_key_id: verification_response.workspace_key_id.clone(),
-            workspace_identity_revision: verification_response.workspace_identity_revision,
-            workspace_trust_generation: verification_response.workspace_trust_generation,
+            workspace_public_key_fingerprint: verification_response
+                .workspace_public_key_fingerprint
+                .clone(),
+            workspace_trust_id: verification_response.workspace_trust_id.clone(),
             runtime_public_key_fingerprint: verification_response
                 .runtime_public_key_fingerprint
                 .clone(),
-            runtime_identity_revision: verification_response.runtime_identity_revision,
             workspace_nonce: verification_response.workspace_nonce.clone(),
             runtime_nonce: verification_response.runtime_nonce.clone(),
             response_digest: workspace_request_body_digest(&response_body),
@@ -2974,13 +2988,11 @@ mod tests {
             workspace_id: "workspace-b".to_string(),
             source_runtime_id: "runtime-a".to_string(),
             worker_id: retention_worker_id,
-            expected_worker_revision: "revision".to_string(),
             source_created_at: "2025-01-01T00:00:00Z".to_string(),
             removed_at: "2025-01-02T00:00:00Z".to_string(),
             effective_profile: None,
             retention_class: None,
             policy_id: "policy".to_string(),
-            policy_revision: 1,
             session_disposition: SessionDisposition::Purge,
             diagnostics_disposition: DiagnosticsDisposition::Retain,
         };
@@ -3016,6 +3028,141 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let error: RuntimeHttpErrorResponse = read_json(response).await;
         assert_eq!(error.error.code, "worker_not_found");
+    }
+
+    #[tokio::test]
+    async fn reenrolled_binding_trust_or_keys_require_fresh_signed_verification() {
+        let workspace_identity = RuntimeIdentityMaterial::generate("workspace-key").unwrap();
+        let runtime_identity = RuntimeIdentityMaterial::generate("runtime-test").unwrap();
+        let fingerprint = |key: &str| {
+            format!(
+                "sha256:{}",
+                crate::workspace_issuer::hex_lower(&sha2::Sha256::digest(
+                    crate::auth::decode_public_key(key).unwrap()
+                ))
+            )
+        };
+        let old_trust = WorkspaceIssuerTrustRecord::from_bundle(
+            server_api::WorkspacePublicIdentityBundle {
+                workspace_id: "workspace-a".into(),
+                backend_url: "https://backend.test".into(),
+                key_id: "workspace-key".into(),
+                algorithm: "ed25519".into(),
+                public_key: workspace_identity.public_key.clone(),
+                public_key_fingerprint: fingerprint(&workspace_identity.public_key),
+            },
+            "old-trust".into(),
+            1,
+        )
+        .unwrap();
+        let old_verification = WorkspaceRuntimeVerificationRecord {
+            workspace_id: old_trust.workspace_id.clone(),
+            runtime_id: "runtime-test".into(),
+            binding_id: "old-binding".into(),
+            workspace_key_id: old_trust.key_id.clone(),
+            workspace_public_key_fingerprint: old_trust.public_key_fingerprint.clone(),
+            workspace_trust_id: old_trust.trust_id.clone(),
+            runtime_public_key_fingerprint: fingerprint(&runtime_identity.public_key),
+            verified_at: 1,
+        };
+        for changed in ["binding", "trust", "workspace_key", "runtime_key"] {
+            let mut current = old_verification.clone();
+            let mut trust = old_trust.clone();
+            let mut workspace_key = workspace_identity.clone();
+            let mut runtime_key = runtime_identity.clone();
+            match changed {
+                "binding" => current.binding_id = "reenrolled-binding".into(),
+                "trust" => {
+                    trust.trust_id = "reaccepted-trust".into();
+                    current.workspace_trust_id = trust.trust_id.clone();
+                }
+                "workspace_key" => {
+                    workspace_key = RuntimeIdentityMaterial::generate("new-workspace-key").unwrap();
+                    trust.key_id = workspace_key.identity_id.clone();
+                    trust.public_key = workspace_key.public_key.clone();
+                    trust.public_key_fingerprint = fingerprint(&workspace_key.public_key);
+                    current.workspace_key_id = trust.key_id.clone();
+                    current.workspace_public_key_fingerprint = trust.public_key_fingerprint.clone();
+                }
+                "runtime_key" => {
+                    runtime_key = RuntimeIdentityMaterial::generate("runtime-test").unwrap();
+                    current.runtime_public_key_fingerprint = fingerprint(&runtime_key.public_key);
+                }
+                _ => unreachable!(),
+            }
+            let authority = Arc::new(InMemoryWorkspaceRuntimeVerificationAuthority::default());
+            authority.record(old_verification.clone()).unwrap();
+            let app = runtime_http_router_with_workspace_auth(
+                Runtime::new_memory(),
+                None,
+                WorkspaceRuntimeHttpAuth {
+                    verifier: WorkspaceCapabilityVerifier::new(
+                        vec![trust.clone()],
+                        Arc::new(InMemoryWorkspaceClaimReplayProtection::default()),
+                    )
+                    .unwrap(),
+                    signer: RuntimeVerificationSigner::from_identity(&runtime_key).unwrap(),
+                    verifications: authority.clone(),
+                },
+            );
+            let claims = WorkspaceCapabilityClaims {
+                issuer: trust.backend_url.clone(),
+                issuer_workspace_id: trust.workspace_id.clone(),
+                issuer_key_id: trust.key_id.clone(),
+                issuer_public_key_fingerprint: trust.public_key_fingerprint.clone(),
+                trust_id: trust.trust_id.clone(),
+                binding_id: current.binding_id.clone(),
+                runtime_id: current.runtime_id.clone(),
+                worker_id: None,
+                operation: RUNTIME_PING_PERMISSION.into(),
+                method: "GET".into(),
+                path_and_query: "/v1/ping".into(),
+                body_digest: workspace_request_body_digest(&[]),
+                iat: unix_now_i64(),
+                exp: unix_now_i64() + 60,
+                jti: "stale-verification".into(),
+            };
+            for (expected, token_id) in [
+                (StatusCode::FORBIDDEN, "stale-verification"),
+                (StatusCode::OK, "fresh-verification"),
+            ] {
+                if expected == StatusCode::OK {
+                    authority.record(current.clone()).unwrap();
+                }
+                let token = issue_workspace_capability_token(
+                    &workspace_key.signing_key().unwrap(),
+                    &WorkspaceCapabilityClaims {
+                        jti: token_id.into(),
+                        ..claims.clone()
+                    },
+                )
+                .unwrap();
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/v1/ping")
+                            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                            .header(RUNTIME_WORKSPACE_SCOPE_HEADER, "workspace-a")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                assert_eq!(
+                    status,
+                    expected,
+                    "{changed}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                if expected == StatusCode::FORBIDDEN {
+                    let error: RuntimeHttpErrorResponse = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(error.error.code, "workspace_runtime_verification_stale");
+                }
+            }
+        }
     }
 
     #[cfg(feature = "ws-server")]
@@ -3107,7 +3254,6 @@ mod tests {
             metadata: ConfigBundleMetadata {
                 id: "http-test-bundle".to_string(),
                 digest: String::new(),
-                revision: "test".to_string(),
                 workspace_id: "test-workspace".to_string(),
                 created_at: "test".to_string(),
                 provenance: ConfigBundleProvenance {
@@ -3164,7 +3310,6 @@ mod tests {
             workspace_api: None,
             memory_settings: Some(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "local".to_string(),
-                settings_revision: 1,
                 language: "English".to_string(),
             }),
             subjektiv_attached: false,
@@ -4477,8 +4622,7 @@ mod tests {
                         algorithm: "ed25519".to_string(),
                         public_key: workspace_identity.public_key,
                         public_key_fingerprint: workspace_fingerprint,
-                        identity_revision: 1,
-                        trust_generation: 1,
+                        trust_id: "trust-cleanup-test".to_string(),
                         state: WorkspaceIssuerTrustState::Active,
                         registered_at_unix: 1,
                         updated_at_unix: 1,
@@ -5041,7 +5185,6 @@ mod ws_tests {
             metadata: ConfigBundleMetadata {
                 id: "ws-test-bundle".to_string(),
                 digest: String::new(),
-                revision: "test".to_string(),
                 workspace_id: "test".to_string(),
                 created_at: "test".to_string(),
                 provenance: ConfigBundleProvenance {
@@ -5097,7 +5240,6 @@ mod ws_tests {
             workspace_api: None,
             memory_settings: Some(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "local".to_string(),
-                settings_revision: 1,
                 language: "English".to_string(),
             }),
             subjektiv_attached: false,

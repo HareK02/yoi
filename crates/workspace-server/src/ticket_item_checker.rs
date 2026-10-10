@@ -21,11 +21,11 @@ const MAX_SUGGESTION_BYTES: usize = 512;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TicketItemCheckInput {
-    /// Canonical internal identity used for an authoritative revision reread.
+    /// Canonical internal identity used for an authoritative content_digest reread.
     pub ticket_id: String,
     /// User-facing identity used in checker output and advisory notifications.
     pub ticket_resource_key: String,
-    pub revision: String,
+    pub content_digest: String,
     pub title: String,
     pub body: String,
     pub edit: TicketItemCheckEdit,
@@ -88,8 +88,8 @@ impl TicketItemCheckFindingCategory {
     }
 }
 
-pub fn item_revision(ticket: &ticket::Ticket) -> String {
-    ticket::ticket_item_revision(ticket)
+pub fn content_digest(ticket: &ticket::Ticket) -> String {
+    ticket::ticket_content_digest(ticket)
 }
 
 pub fn request(
@@ -98,7 +98,7 @@ pub fn request(
     source_worker: RuntimeWorkerRef,
     instruction: String,
 ) -> Result<BackendJobRequest> {
-    let revision = item_revision(ticket);
+    let content_digest = content_digest(ticket);
     let resource_key = ticket
         .meta
         .resource_key
@@ -107,16 +107,15 @@ pub fn request(
     let input = TicketItemCheckInput {
         ticket_id: ticket.meta.id.clone(),
         ticket_resource_key: resource_key.clone(),
-        revision: revision.clone(),
+        content_digest: content_digest.clone(),
         title: ticket.meta.title.clone(),
         body: ticket.document.body.as_str().to_string(),
         edit,
     };
-    let request = BackendJobRequest {
-        job_id: format!("ticket-item-check:{}:{revision}", ticket.meta.id),
+    let mut request = BackendJobRequest {
+        job_id: format!("ticket-item-check:{}", ticket.meta.id),
         purpose: PURPOSE.to_string(),
-        input_revision: revision.clone(),
-        input_ref: format!("ticket://{resource_key}/revisions/{revision}"),
+        input_ref: format!("ticket://{resource_key}/contents/{content_digest}"),
         input: serde_json::to_value(input).map_err(|error| {
             Error::InvalidInput(format!("serialize Ticket item checker input: {error}"))
         })?,
@@ -133,6 +132,11 @@ pub fn request(
             max_attempts: 1,
         },
     };
+    // The same item content can result from distinct edits or different source
+    // Workers. Content identity fences advisory freshness, but does not identify
+    // the complete Job intent. Hash the request with its stable Ticket prefix
+    // before adding the digest so exact retries still reuse the same Job.
+    request.job_id = format!("{}:{}", request.job_id, request.fingerprint()?);
     request.validate()?;
     Ok(request)
 }
@@ -143,7 +147,7 @@ pub fn parse_input(value: &Value) -> Result<TicketItemCheckInput> {
     })?;
     if input.ticket_id.trim().is_empty()
         || input.ticket_resource_key.trim().is_empty()
-        || input.revision.trim().is_empty()
+        || input.content_digest.trim().is_empty()
     {
         return Err(Error::InvalidInput(
             "Ticket item checker input identity is incomplete".to_string(),
@@ -217,8 +221,7 @@ pub fn notification(
             Error::InvalidInput("completed Ticket item checker Job has no result".to_string())
         })?,
     )?;
-    if input.revision != acceptance.job.request.input_revision
-        || input.revision != item_revision(current_ticket)
+    if input.content_digest != content_digest(current_ticket)
         || input.ticket_id != current_ticket.meta.id
     {
         return Ok(TicketItemCheckNotification::Stale);
@@ -228,8 +231,8 @@ pub fn notification(
     }
 
     let mut content = format!(
-        "[Ticket item checker advisory]\nTicket: {}\nRevision: {}\n\nThis is a post-save advisory based only on the inspected Ticket text. It is not a new user request, approval gate, workflow blocker, or implementation instruction.\n",
-        input.ticket_resource_key, input.revision
+        "[Ticket item checker advisory]\nTicket: {}\nContent digest: {}\n\nThis is a post-save advisory based only on the inspected Ticket text. It is not a new user request, approval gate, workflow blocker, or implementation instruction.\n",
+        input.ticket_resource_key, input.content_digest
     );
     for (index, finding) in result.findings.iter().enumerate() {
         let quoted = serde_json::to_string(&finding.quote).map_err(|error| {
@@ -255,11 +258,77 @@ mod tests {
         serde_json::json!({
             "ticket_id": "ticket-internal",
             "ticket_resource_key": "T-42",
-            "revision": "revision-7",
+            "content_digest": "content_digest-7",
             "title": "Deploy safely",
             "body": "This turn only creates the Ticket; I will not implement it. Production deployment requires approval.",
             "edit": { "kind": "create" }
         })
+    }
+
+    #[test]
+    fn checker_job_identity_reuses_exact_intent_but_separates_edits_and_sources() {
+        use ticket::TicketBackend;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend =
+            ticket::SqliteTicketBackend::open(dir.path().join("tickets.db"), "space").unwrap();
+        let (_, ticket) = backend
+            .create_with_snapshot(ticket::NewTicket::new("Check this content"))
+            .unwrap();
+        let source = RuntimeWorkerRef {
+            runtime_id: "runtime".into(),
+            worker_id: "source".into(),
+        };
+        let build = |edit, source, instruction: &str| {
+            request(&ticket, edit, source, instruction.to_string()).unwrap()
+        };
+        let created = build(
+            TicketItemCheckEdit::Create,
+            source.clone(),
+            "Check the item.",
+        );
+        let replay = build(
+            TicketItemCheckEdit::Create,
+            source.clone(),
+            "Check the item.",
+        );
+        assert_eq!(created.job_id, replay.job_id);
+        assert_eq!(
+            created.fingerprint().unwrap(),
+            replay.fingerprint().unwrap()
+        );
+
+        let edited = build(
+            TicketItemCheckEdit::Edit {
+                title_changed: true,
+                body_changed: false,
+                previous_title: Some("Different prior title".into()),
+                previous_body: None,
+                body_replacement: None,
+            },
+            source.clone(),
+            "Check the item.",
+        );
+        let other_source = build(
+            TicketItemCheckEdit::Create,
+            RuntimeWorkerRef {
+                worker_id: "other-source".into(),
+                ..source.clone()
+            },
+            "Check the item.",
+        );
+        let other_instruction = build(
+            TicketItemCheckEdit::Create,
+            source,
+            "Check with new policy.",
+        );
+        for different_intent in [edited, other_source, other_instruction] {
+            assert_eq!(
+                created.input["content_digest"],
+                different_intent.input["content_digest"]
+            );
+            assert_ne!(created.job_id, different_intent.job_id);
+        }
     }
 
     #[test]

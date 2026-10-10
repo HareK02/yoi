@@ -1,4 +1,4 @@
-//! Subject-scoped, revisioned Memory storage for the `subjektiv` Feature.
+//! Subject-scoped Memory storage with immutable change history.
 //!
 //! This module owns subjektiv's domain schema and typed repository. Physical
 //! SQLite placement, connection configuration, migration execution, backup,
@@ -8,6 +8,12 @@
 
 pub mod api;
 pub mod job;
+mod legacy_migrations;
+mod schema;
+use legacy_migrations::{
+    add_candidate_decision_receipts, add_subject_behavior, add_subject_session_attribution,
+    add_surface_generation_state, add_surface_job_provenance, create_schema,
+};
 
 use std::collections::HashSet;
 
@@ -73,20 +79,14 @@ pub enum SubjektivError {
     SessionAttributionConflict(String),
     #[error("memory `{0}` was not found for this subject")]
     MemoryNotFound(String),
-    #[error("memory `{memory_id}` revision conflict: expected {expected}, current {actual}")]
-    RevisionConflict {
+    #[error("memory `{memory_id}` change_id conflict: expected {expected}, current {actual}")]
+    MemoryChangeConflict {
         memory_id: String,
-        expected: u64,
-        actual: u64,
+        expected: String,
+        actual: String,
     },
-    #[error(
-        "subject `{subject_id}` behavior revision conflict: expected {expected}, current {actual}"
-    )]
-    SubjectBehaviorConflict {
-        subject_id: String,
-        expected: u64,
-        actual: u64,
-    },
+    #[error("subject `{subject_id}` behavior content changed")]
+    SubjectBehaviorConflict { subject_id: String },
     #[error("surface generation conflict: {0}")]
     SurfaceGenerationConflict(String),
     #[error("memory `{memory_id}` cannot transition from {from:?} to {to:?}")]
@@ -153,14 +153,7 @@ pub struct SubjectRecord {
     /// Memory lifecycle operations must preserve it byte-for-byte.
     #[serde(default)]
     pub behavior_md: String,
-    /// Monotonic CAS generation for behavior updates, independent of Memory's
-    /// `store_revision`.
-    #[serde(default)]
-    pub behavior_revision: u64,
     pub state: SubjectState,
-    /// Monotonic generation incremented exactly once for every committed Memory
-    /// creation or revision for this subject.
-    pub store_revision: u64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -230,7 +223,7 @@ pub struct SubjectSessionAttributionPage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RevisionProposalIntent {
+pub enum ChangeProposalIntent {
     Revise,
     Resolve,
     Retract,
@@ -240,35 +233,35 @@ pub enum RevisionProposalIntent {
 /// Host-owned metadata describing how a staged candidate is expected to change
 /// one existing Memory. It is validated against the current scoped Memory when
 /// the candidate is staged; it is not model-authored and does not itself apply
-/// the revision.
+/// the change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RevisionProposal {
-    pub intent: RevisionProposalIntent,
+pub struct ChangeProposal {
+    pub intent: ChangeProposalIntent,
     pub memory_id: String,
-    pub expected_revision: u64,
+    pub expected_change_id: String,
     pub change_reason: String,
 }
 
-impl RevisionProposal {
+impl ChangeProposal {
     pub fn new(
-        intent: RevisionProposalIntent,
+        intent: ChangeProposalIntent,
         memory_id: impl Into<String>,
-        expected_revision: u64,
+        expected_change_id: String,
         change_reason: impl Into<String>,
     ) -> Result<Self> {
         let proposal = Self {
             intent,
             memory_id: memory_id.into(),
-            expected_revision,
+            expected_change_id,
             change_reason: change_reason.into(),
         };
-        validate_revision_proposal_metadata(&proposal)?;
+        validate_change_proposal_metadata(&proposal)?;
         Ok(proposal)
     }
 }
 
-impl<'de> Deserialize<'de> for RevisionProposal {
+impl<'de> Deserialize<'de> for ChangeProposal {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -276,17 +269,17 @@ impl<'de> Deserialize<'de> for RevisionProposal {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct WireProposal {
-            intent: RevisionProposalIntent,
+            intent: ChangeProposalIntent,
             memory_id: String,
-            expected_revision: u64,
+            expected_change_id: String,
             change_reason: String,
         }
 
         let proposal = WireProposal::deserialize(deserializer)?;
-        RevisionProposal::new(
+        ChangeProposal::new(
             proposal.intent,
             proposal.memory_id,
-            proposal.expected_revision,
+            proposal.expected_change_id,
             proposal.change_reason,
         )
         .map_err(serde::de::Error::custom)
@@ -294,7 +287,7 @@ impl<'de> Deserialize<'de> for RevisionProposal {
 }
 
 /// The existing extraction schema with only host-owned subject scope,
-/// persistence time, and optional revision proposal metadata added. Model input
+/// persistence time, and optional change proposal metadata added. Model input
 /// still contains none of those fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -314,7 +307,7 @@ pub struct SubjectStagingRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_refs: Vec<SourceEvidenceRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revision_proposal: Option<RevisionProposal>,
+    pub change_proposal: Option<ChangeProposal>,
     pub created_at: String,
 }
 
@@ -338,22 +331,22 @@ impl SubjectStagingRecord {
             staleness: record.staleness,
             evidence: record.evidence,
             source_refs: record.source_refs,
-            revision_proposal: None,
+            change_proposal: None,
             created_at,
         }
     }
 
-    /// Attaches host-owned revision proposal metadata to this candidate.
-    pub fn with_revision_proposal(mut self, proposal: RevisionProposal) -> Result<Self> {
-        validate_revision_proposal_metadata(&proposal)?;
-        self.revision_proposal = Some(proposal);
+    /// Attaches host-owned change proposal metadata to this candidate.
+    pub fn with_change_proposal(mut self, proposal: ChangeProposal) -> Result<Self> {
+        validate_change_proposal_metadata(&proposal)?;
+        self.change_proposal = Some(proposal);
         Ok(self)
     }
 
-    /// Mutably attaches host-owned revision proposal metadata to this candidate.
-    pub fn attach_revision_proposal(&mut self, proposal: RevisionProposal) -> Result<()> {
-        validate_revision_proposal_metadata(&proposal)?;
-        self.revision_proposal = Some(proposal);
+    /// Mutably attaches host-owned change proposal metadata to this candidate.
+    pub fn attach_change_proposal(&mut self, proposal: ChangeProposal) -> Result<()> {
+        validate_change_proposal_metadata(&proposal)?;
+        self.change_proposal = Some(proposal);
         Ok(())
     }
 }
@@ -365,7 +358,7 @@ pub enum MemoryState {
     /// grants no authority.
     Active,
     /// No longer current because its question, condition, or applicability has
-    /// ended. A later revision may reopen it when circumstances change.
+    /// ended. A later change may reopen it when circumstances change.
     Resolved,
     /// Invalidated and no longer eligible for recall. Retraction is terminal;
     /// corrected follow-up experience is a separate Memory linked by derivation.
@@ -374,9 +367,9 @@ pub enum MemoryState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct MemoryRevisionRef {
+pub struct MemoryChangeRef {
     pub memory_id: String,
-    pub revision: u64,
+    pub change_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,7 +378,8 @@ pub struct MemoryRecord {
     pub schema_version: u32,
     pub id: String,
     pub subject_id: String,
-    pub revision: u64,
+    pub change_id: String,
+    pub previous_change_id: Option<String>,
     pub kind: CandidateKind,
     pub state: MemoryState,
     pub claim: String,
@@ -396,7 +390,7 @@ pub struct MemoryRecord {
     #[serde(default)]
     pub source_candidate_ids: Vec<String>,
     #[serde(default)]
-    pub derived_from: Vec<MemoryRevisionRef>,
+    pub derived_from: Vec<MemoryChangeRef>,
     pub change_reason: String,
     pub created_at: String,
     pub updated_at: String,
@@ -412,7 +406,7 @@ pub struct MemoryDraft {
     pub why_useful: String,
     pub staleness: Option<String>,
     pub source_candidate_ids: Vec<String>,
-    pub derived_from: Vec<MemoryRevisionRef>,
+    pub derived_from: Vec<MemoryChangeRef>,
     pub change_reason: String,
 }
 
@@ -458,7 +452,7 @@ pub struct StagingResolution {
     pub action: StagingResolutionAction,
     pub reason: String,
     #[serde(default)]
-    pub affected_memory: Vec<MemoryRevisionRef>,
+    pub affected_memory: Vec<MemoryChangeRef>,
     /// Immutable copy of the candidate as it was staged. The database also
     /// retains the exact serialized bytes independently of this projection.
     pub candidate: SubjectStagingRecord,
@@ -473,8 +467,8 @@ pub struct SurfaceSnapshot {
     pub subject_id: String,
     pub body_md: String,
     #[serde(default)]
-    pub memory_refs: Vec<MemoryRevisionRef>,
-    pub built_from_store_revision: u64,
+    pub memory_refs: Vec<MemoryChangeRef>,
+    pub built_from_memory_fingerprint: String,
     pub created_at: String,
 }
 
@@ -482,7 +476,7 @@ pub struct SurfaceSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct SurfaceMaterial {
     pub memory_id: String,
-    pub revision: u64,
+    pub change_id: String,
     pub kind: CandidateKind,
     pub body_md: String,
     pub why_useful: String,
@@ -494,7 +488,7 @@ pub struct SurfaceMaterial {
 pub struct SurfaceGeneration {
     pub id: String,
     pub subject_id: String,
-    pub store_revision: u64,
+    pub memory_fingerprint: String,
     pub active_memory_count: usize,
     pub materials: Vec<SurfaceMaterial>,
     pub created_at: String,
@@ -504,7 +498,7 @@ pub struct SurfaceGeneration {
 #[serde(deny_unknown_fields)]
 pub struct SurfacePoint {
     pub body_md: String,
-    pub memory_refs: Vec<MemoryRevisionRef>,
+    pub memory_refs: Vec<MemoryChangeRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -529,11 +523,11 @@ pub struct SubjectResidentContext {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum MemoryRevisionTarget {
+pub enum MemoryChangeTarget {
     Create,
     Revise {
         memory_id: String,
-        expected_revision: u64,
+        expected_change_id: String,
     },
 }
 
@@ -549,13 +543,13 @@ pub enum MemoryDecisionOperation {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CandidateDecision {
     Apply {
-        target: MemoryRevisionTarget,
+        target: MemoryChangeTarget,
         draft: MemoryDraft,
     },
     Close {
         action: StagingResolutionAction,
         #[serde(default)]
-        affected_memory: Vec<MemoryRevisionRef>,
+        affected_memory: Vec<MemoryChangeRef>,
     },
 }
 
@@ -578,449 +572,8 @@ pub struct CandidateDecisionReceipt {
     pub memory: Option<MemoryRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<MemoryDecisionOperation>,
-    pub store_revision: u64,
+    pub memory_fingerprint: String,
     pub surface_dirty: bool,
-}
-
-fn create_schema(transaction: &Transaction<'_>) -> feature_storage::Result<()> {
-    transaction.execute_batch(
-        r#"
-CREATE TABLE store_scope (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    workspace_id TEXT NOT NULL UNIQUE
-);
-
-CREATE TABLE subjects (
-    subject_id TEXT PRIMARY KEY,
-    role TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('active', 'retired')),
-    store_revision INTEGER NOT NULL CHECK (store_revision >= 0),
-    record_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE staging_records (
-    subject_id TEXT NOT NULL,
-    candidate_id TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK (
-        kind IN (
-            'preference', 'working_assumption', 'constraint',
-            'decision', 'open_question', 'lesson'
-        )
-    ),
-    record_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (subject_id, candidate_id),
-    FOREIGN KEY (subject_id) REFERENCES subjects(subject_id) ON DELETE RESTRICT
-);
-
-CREATE TABLE memory_records (
-    subject_id TEXT NOT NULL,
-    memory_id TEXT NOT NULL,
-    current_revision INTEGER NOT NULL CHECK (current_revision > 0),
-    kind TEXT NOT NULL CHECK (
-        kind IN (
-            'preference', 'working_assumption', 'constraint',
-            'decision', 'open_question', 'lesson'
-        )
-    ),
-    state TEXT NOT NULL CHECK (state IN ('active', 'resolved', 'retracted')),
-    record_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (subject_id, memory_id),
-    FOREIGN KEY (subject_id) REFERENCES subjects(subject_id) ON DELETE RESTRICT,
-    FOREIGN KEY (subject_id, memory_id, current_revision)
-        REFERENCES memory_revisions(subject_id, memory_id, revision)
-        DEFERRABLE INITIALLY DEFERRED
-);
-
-CREATE TABLE memory_revisions (
-    subject_id TEXT NOT NULL,
-    memory_id TEXT NOT NULL,
-    revision INTEGER NOT NULL CHECK (revision > 0),
-    kind TEXT NOT NULL CHECK (
-        kind IN (
-            'preference', 'working_assumption', 'constraint',
-            'decision', 'open_question', 'lesson'
-        )
-    ),
-    state TEXT NOT NULL CHECK (state IN ('active', 'resolved', 'retracted')),
-    record_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (subject_id, memory_id, revision),
-    FOREIGN KEY (subject_id, memory_id)
-        REFERENCES memory_records(subject_id, memory_id)
-        ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
-);
-
-CREATE TABLE memory_revision_candidates (
-    subject_id TEXT NOT NULL,
-    memory_id TEXT NOT NULL,
-    revision INTEGER NOT NULL,
-    candidate_id TEXT NOT NULL,
-    PRIMARY KEY (subject_id, memory_id, revision, candidate_id),
-    FOREIGN KEY (subject_id, memory_id, revision)
-        REFERENCES memory_revisions(subject_id, memory_id, revision) ON DELETE RESTRICT,
-    FOREIGN KEY (subject_id, candidate_id)
-        REFERENCES staging_records(subject_id, candidate_id) ON DELETE RESTRICT
-);
-
-CREATE TABLE memory_revision_derivations (
-    subject_id TEXT NOT NULL,
-    memory_id TEXT NOT NULL,
-    revision INTEGER NOT NULL,
-    source_memory_id TEXT NOT NULL,
-    source_revision INTEGER NOT NULL,
-    PRIMARY KEY (
-        subject_id, memory_id, revision, source_memory_id, source_revision
-    ),
-    FOREIGN KEY (subject_id, memory_id, revision)
-        REFERENCES memory_revisions(subject_id, memory_id, revision) ON DELETE RESTRICT,
-    FOREIGN KEY (subject_id, source_memory_id, source_revision)
-        REFERENCES memory_revisions(subject_id, memory_id, revision) ON DELETE RESTRICT
-);
-
-CREATE TABLE staging_resolutions (
-    subject_id TEXT NOT NULL,
-    candidate_id TEXT NOT NULL,
-    resolution_id TEXT NOT NULL,
-    action TEXT NOT NULL CHECK (
-        action IN ('applied', 'discarded', 'invalid', 'duplicate', 'already_covered')
-    ),
-    reason TEXT NOT NULL,
-    affected_refs_json TEXT NOT NULL,
-    staging_raw_json TEXT NOT NULL,
-    resolution_json TEXT NOT NULL,
-    resolved_at TEXT NOT NULL,
-    PRIMARY KEY (subject_id, candidate_id),
-    UNIQUE (resolution_id),
-    FOREIGN KEY (subject_id, candidate_id)
-        REFERENCES staging_records(subject_id, candidate_id) ON DELETE RESTRICT
-);
-
-CREATE TABLE staging_resolution_targets (
-    subject_id TEXT NOT NULL,
-    candidate_id TEXT NOT NULL,
-    memory_id TEXT NOT NULL,
-    revision INTEGER NOT NULL,
-    PRIMARY KEY (subject_id, candidate_id, memory_id, revision),
-    FOREIGN KEY (subject_id, candidate_id)
-        REFERENCES staging_resolutions(subject_id, candidate_id) ON DELETE RESTRICT,
-    FOREIGN KEY (subject_id, memory_id, revision)
-        REFERENCES memory_revisions(subject_id, memory_id, revision) ON DELETE RESTRICT
-);
-
-CREATE TABLE surface_snapshots (
-    subject_id TEXT NOT NULL,
-    snapshot_id TEXT NOT NULL,
-    built_from_store_revision INTEGER NOT NULL CHECK (built_from_store_revision >= 0),
-    snapshot_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (subject_id, snapshot_id),
-    FOREIGN KEY (subject_id) REFERENCES subjects(subject_id) ON DELETE RESTRICT
-);
-
-CREATE TABLE surface_snapshot_refs (
-    subject_id TEXT NOT NULL,
-    snapshot_id TEXT NOT NULL,
-    memory_id TEXT NOT NULL,
-    revision INTEGER NOT NULL,
-    PRIMARY KEY (subject_id, snapshot_id, memory_id),
-    FOREIGN KEY (subject_id, snapshot_id)
-        REFERENCES surface_snapshots(subject_id, snapshot_id) ON DELETE RESTRICT,
-    FOREIGN KEY (subject_id, memory_id, revision)
-        REFERENCES memory_revisions(subject_id, memory_id, revision) ON DELETE RESTRICT
-);
-
-CREATE TABLE memory_revision_seals (
-    subject_id TEXT NOT NULL,
-    memory_id TEXT NOT NULL,
-    revision INTEGER NOT NULL,
-    PRIMARY KEY (subject_id, memory_id, revision),
-    FOREIGN KEY (subject_id, memory_id, revision)
-        REFERENCES memory_revisions(subject_id, memory_id, revision) ON DELETE RESTRICT
-);
-
-CREATE TABLE staging_resolution_seals (
-    subject_id TEXT NOT NULL,
-    candidate_id TEXT NOT NULL,
-    PRIMARY KEY (subject_id, candidate_id),
-    FOREIGN KEY (subject_id, candidate_id)
-        REFERENCES staging_resolutions(subject_id, candidate_id) ON DELETE RESTRICT
-);
-
-CREATE TABLE surface_snapshot_seals (
-    subject_id TEXT NOT NULL,
-    snapshot_id TEXT NOT NULL,
-    PRIMARY KEY (subject_id, snapshot_id),
-    FOREIGN KEY (subject_id, snapshot_id)
-        REFERENCES surface_snapshots(subject_id, snapshot_id) ON DELETE RESTRICT
-);
-
-CREATE TRIGGER memory_revision_candidates_no_late_insert
-BEFORE INSERT ON memory_revision_candidates
-WHEN EXISTS (
-    SELECT 1 FROM memory_revision_seals
-    WHERE subject_id = NEW.subject_id
-      AND memory_id = NEW.memory_id
-      AND revision = NEW.revision
-) BEGIN
-    SELECT RAISE(ABORT, 'subjektiv revision evidence is sealed');
-END;
-CREATE TRIGGER memory_revision_derivations_no_late_insert
-BEFORE INSERT ON memory_revision_derivations
-WHEN EXISTS (
-    SELECT 1 FROM memory_revision_seals
-    WHERE subject_id = NEW.subject_id
-      AND memory_id = NEW.memory_id
-      AND revision = NEW.revision
-) BEGIN
-    SELECT RAISE(ABORT, 'subjektiv derivations are sealed');
-END;
-CREATE TRIGGER staging_resolution_targets_no_late_insert
-BEFORE INSERT ON staging_resolution_targets
-WHEN EXISTS (
-    SELECT 1 FROM staging_resolution_seals
-    WHERE subject_id = NEW.subject_id
-      AND candidate_id = NEW.candidate_id
-) BEGIN
-    SELECT RAISE(ABORT, 'subjektiv resolution targets are sealed');
-END;
-CREATE TRIGGER surface_snapshot_refs_no_late_insert
-BEFORE INSERT ON surface_snapshot_refs
-WHEN EXISTS (
-    SELECT 1 FROM surface_snapshot_seals
-    WHERE subject_id = NEW.subject_id
-      AND snapshot_id = NEW.snapshot_id
-) BEGIN
-    SELECT RAISE(ABORT, 'subjektiv surface references are sealed');
-END;
-
-CREATE TRIGGER memory_revision_seals_no_update
-BEFORE UPDATE ON memory_revision_seals BEGIN
-    SELECT RAISE(ABORT, 'subjektiv revision seals are immutable');
-END;
-CREATE TRIGGER memory_revision_seals_no_delete
-BEFORE DELETE ON memory_revision_seals BEGIN
-    SELECT RAISE(ABORT, 'subjektiv revision seals are retained');
-END;
-CREATE TRIGGER staging_resolution_seals_no_update
-BEFORE UPDATE ON staging_resolution_seals BEGIN
-    SELECT RAISE(ABORT, 'subjektiv resolution seals are immutable');
-END;
-CREATE TRIGGER staging_resolution_seals_no_delete
-BEFORE DELETE ON staging_resolution_seals BEGIN
-    SELECT RAISE(ABORT, 'subjektiv resolution seals are retained');
-END;
-CREATE TRIGGER surface_snapshot_seals_no_update
-BEFORE UPDATE ON surface_snapshot_seals BEGIN
-    SELECT RAISE(ABORT, 'subjektiv snapshot seals are immutable');
-END;
-CREATE TRIGGER surface_snapshot_seals_no_delete
-BEFORE DELETE ON surface_snapshot_seals BEGIN
-    SELECT RAISE(ABORT, 'subjektiv snapshot seals are retained');
-END;
-
-CREATE TRIGGER memory_revisions_no_update
-BEFORE UPDATE ON memory_revisions BEGIN
-    SELECT RAISE(ABORT, 'subjektiv memory revisions are immutable');
-END;
-CREATE TRIGGER memory_revisions_no_delete
-BEFORE DELETE ON memory_revisions BEGIN
-    SELECT RAISE(ABORT, 'subjektiv memory revisions are retained');
-END;
-CREATE TRIGGER memory_revision_candidates_no_update
-BEFORE UPDATE ON memory_revision_candidates BEGIN
-    SELECT RAISE(ABORT, 'subjektiv revision evidence is immutable');
-END;
-CREATE TRIGGER memory_revision_candidates_no_delete
-BEFORE DELETE ON memory_revision_candidates BEGIN
-    SELECT RAISE(ABORT, 'subjektiv revision evidence is retained');
-END;
-CREATE TRIGGER memory_revision_derivations_no_update
-BEFORE UPDATE ON memory_revision_derivations BEGIN
-    SELECT RAISE(ABORT, 'subjektiv derivations are immutable');
-END;
-CREATE TRIGGER memory_revision_derivations_no_delete
-BEFORE DELETE ON memory_revision_derivations BEGIN
-    SELECT RAISE(ABORT, 'subjektiv derivations are retained');
-END;
-CREATE TRIGGER staging_records_no_update
-BEFORE UPDATE ON staging_records BEGIN
-    SELECT RAISE(ABORT, 'subjektiv staging records are immutable');
-END;
-CREATE TRIGGER staging_records_no_delete
-BEFORE DELETE ON staging_records BEGIN
-    SELECT RAISE(ABORT, 'subjektiv staging records are retained');
-END;
-CREATE TRIGGER staging_resolutions_no_update
-BEFORE UPDATE ON staging_resolutions BEGIN
-    SELECT RAISE(ABORT, 'subjektiv staging resolutions are immutable');
-END;
-CREATE TRIGGER staging_resolutions_no_delete
-BEFORE DELETE ON staging_resolutions BEGIN
-    SELECT RAISE(ABORT, 'subjektiv staging resolutions are retained');
-END;
-CREATE TRIGGER staging_resolution_targets_no_update
-BEFORE UPDATE ON staging_resolution_targets BEGIN
-    SELECT RAISE(ABORT, 'subjektiv resolution targets are immutable');
-END;
-CREATE TRIGGER staging_resolution_targets_no_delete
-BEFORE DELETE ON staging_resolution_targets BEGIN
-    SELECT RAISE(ABORT, 'subjektiv resolution targets are retained');
-END;
-CREATE TRIGGER surface_snapshots_no_update
-BEFORE UPDATE ON surface_snapshots BEGIN
-    SELECT RAISE(ABORT, 'subjektiv surface snapshots are immutable');
-END;
-CREATE TRIGGER surface_snapshots_no_delete
-BEFORE DELETE ON surface_snapshots BEGIN
-    SELECT RAISE(ABORT, 'subjektiv surface snapshots are retained');
-END;
-CREATE TRIGGER surface_snapshot_refs_no_update
-BEFORE UPDATE ON surface_snapshot_refs BEGIN
-    SELECT RAISE(ABORT, 'subjektiv surface references are immutable');
-END;
-CREATE TRIGGER surface_snapshot_refs_no_delete
-BEFORE DELETE ON surface_snapshot_refs BEGIN
-    SELECT RAISE(ABORT, 'subjektiv surface references are retained');
-END;
-"#,
-    )?;
-    Ok(())
-}
-
-fn add_subject_session_attribution(transaction: &Transaction<'_>) -> feature_storage::Result<()> {
-    transaction.execute_batch(
-        r#"
-CREATE TABLE subject_session_attributions (
-    session_id TEXT PRIMARY KEY,
-    subject_id TEXT NOT NULL,
-    runtime_id TEXT NOT NULL,
-    worker_id TEXT NOT NULL,
-    record_json TEXT NOT NULL,
-    attributed_at TEXT NOT NULL,
-    FOREIGN KEY (subject_id) REFERENCES subjects(subject_id) ON DELETE RESTRICT
-);
-
-CREATE INDEX subject_session_attributions_by_subject
-ON subject_session_attributions(subject_id, attributed_at, session_id);
-
-CREATE TRIGGER subject_session_attributions_no_update
-BEFORE UPDATE ON subject_session_attributions BEGIN
-    SELECT RAISE(ABORT, 'subjektiv session attribution is immutable');
-END;
-CREATE TRIGGER subject_session_attributions_no_delete
-BEFORE DELETE ON subject_session_attributions BEGIN
-    SELECT RAISE(ABORT, 'subjektiv session attribution is retained');
-END;
-"#,
-    )?;
-    Ok(())
-}
-
-fn add_candidate_decision_receipts(transaction: &Transaction<'_>) -> feature_storage::Result<()> {
-    transaction.execute_batch(
-        r#"
-CREATE TABLE candidate_decision_receipts (
-    subject_id TEXT NOT NULL,
-    request_id TEXT NOT NULL,
-    candidate_id TEXT NOT NULL,
-    request_json TEXT NOT NULL,
-    receipt_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (subject_id, request_id),
-    UNIQUE (subject_id, candidate_id),
-    FOREIGN KEY (subject_id, candidate_id)
-        REFERENCES staging_resolutions(subject_id, candidate_id) ON DELETE RESTRICT
-);
-
-CREATE TRIGGER candidate_decision_receipts_no_update
-BEFORE UPDATE ON candidate_decision_receipts BEGIN
-    SELECT RAISE(ABORT, 'subjektiv candidate decision receipts are immutable');
-END;
-CREATE TRIGGER candidate_decision_receipts_no_delete
-BEFORE DELETE ON candidate_decision_receipts BEGIN
-    SELECT RAISE(ABORT, 'subjektiv candidate decision receipts are retained');
-END;
-"#,
-    )?;
-    Ok(())
-}
-
-fn add_surface_generation_state(transaction: &Transaction<'_>) -> feature_storage::Result<()> {
-    transaction.execute_batch(
-        r#"
-CREATE TABLE surface_generation_state (
-    subject_id TEXT PRIMARY KEY,
-    store_revision INTEGER NOT NULL CHECK (store_revision >= 0),
-    status TEXT NOT NULL CHECK (status IN ('dirty', 'failed', 'ready')),
-    snapshot_id TEXT,
-    reason_code TEXT,
-    updated_at TEXT NOT NULL,
-    FOREIGN KEY (subject_id) REFERENCES subjects(subject_id) ON DELETE RESTRICT,
-    FOREIGN KEY (subject_id, snapshot_id)
-        REFERENCES surface_snapshots(subject_id, snapshot_id) ON DELETE RESTRICT
-);
-
-INSERT INTO surface_generation_state (
-    subject_id, store_revision, status, snapshot_id, reason_code, updated_at
-)
-SELECT subjects.subject_id,
-       subjects.store_revision,
-       'dirty',
-       NULL,
-       'legacy_snapshot_requires_regeneration',
-       subjects.updated_at
-FROM subjects
-WHERE EXISTS (
-    SELECT 1 FROM surface_snapshots any_snapshot
-    WHERE any_snapshot.subject_id = subjects.subject_id
-);
-
-CREATE TABLE surface_generation_runs (
-    subject_id TEXT NOT NULL,
-    generation_id TEXT NOT NULL,
-    store_revision INTEGER NOT NULL CHECK (store_revision >= 0),
-    active_memory_count INTEGER NOT NULL CHECK (active_memory_count >= 0),
-    materials_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (subject_id, generation_id),
-    FOREIGN KEY (subject_id) REFERENCES subjects(subject_id) ON DELETE RESTRICT
-);
-
-CREATE INDEX surface_generation_runs_by_revision
-ON surface_generation_runs(subject_id, store_revision, created_at, generation_id);
-
-CREATE TRIGGER surface_generation_runs_no_update
-BEFORE UPDATE ON surface_generation_runs BEGIN
-    SELECT RAISE(ABORT, 'subjektiv surface generation inputs are immutable');
-END;
-CREATE TRIGGER surface_generation_runs_no_delete
-BEFORE DELETE ON surface_generation_runs BEGIN
-    SELECT RAISE(ABORT, 'subjektiv surface generation inputs are retained');
-END;
-"#,
-    )?;
-    Ok(())
-}
-
-fn add_subject_behavior(transaction: &Transaction<'_>) -> feature_storage::Result<()> {
-    transaction.execute_batch(
-        r#"
-ALTER TABLE subjects ADD COLUMN behavior_md TEXT NOT NULL DEFAULT '';
-ALTER TABLE subjects ADD COLUMN behavior_revision INTEGER NOT NULL DEFAULT 0
-    CHECK (behavior_revision >= 0);
-"#,
-    )?;
-    Ok(())
-}
-
-fn add_surface_job_provenance(transaction: &Transaction<'_>) -> feature_storage::Result<()> {
-    transaction.execute_batch("ALTER TABLE surface_generation_runs ADD COLUMN job_id TEXT; ALTER TABLE surface_generation_runs ADD COLUMN attempt_id TEXT;")?;
-    Ok(())
 }
 
 static MIGRATIONS: &[FeatureMigration] = &[
@@ -1045,6 +598,11 @@ static MIGRATIONS: &[FeatureMigration] = &[
         6,
         "bind surface generation provenance to Job attempts",
         add_surface_job_provenance,
+    ),
+    FeatureMigration::new(
+        7,
+        "replace counters with immutable changes and content conditions",
+        schema::migrate,
     ),
 ];
 
@@ -1142,9 +700,7 @@ impl SubjektivStore {
             id: issued_id("subject"),
             role,
             behavior_md,
-            behavior_revision: 0,
             state: SubjectState::Active,
-            store_revision: 0,
             created_at: timestamp.clone(),
             updated_at: timestamp,
         };
@@ -1152,9 +708,8 @@ impl SubjektivStore {
         self.database.try_transaction(|transaction| {
             transaction.execute(
                 "INSERT INTO subjects (
-                    subject_id, role, behavior_md, behavior_revision, state,
-                    store_revision, record_json, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, 0, 'active', 0, ?4, ?5, ?6)",
+                    subject_id, role, behavior_md, state, record_json, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6)",
                 params![
                     record.id,
                     record.role.as_str(),
@@ -1181,48 +736,35 @@ impl SubjektivStore {
         })
     }
 
-    /// Replaces or clears the user-managed behavior document using its own CAS
-    /// generation. Memory revisions do not participate in this generation.
+    /// Replaces behavior only if its exact previously-read content still matches.
+    /// Memory changes do not participate in this condition.
     pub fn update_subject_behavior(
         &self,
         subject_id: &str,
-        expected_behavior_revision: u64,
+        expected_behavior_md: &str,
         behavior_md: String,
     ) -> Result<SubjectRecord> {
         validate_subject_behavior(&behavior_md)?;
-        self.database.try_transaction(|transaction| {
-            let mut subject = require_subject(transaction, subject_id)?;
-            if subject.behavior_revision != expected_behavior_revision {
-                return Err(SubjektivError::SubjectBehaviorConflict {
-                    subject_id: subject_id.to_string(),
-                    expected: expected_behavior_revision,
-                    actual: subject.behavior_revision,
-                });
+        self.database.try_transaction(|tx| {
+            let mut subject = require_subject(tx, subject_id)?;
+            if subject.behavior_md != expected_behavior_md {
+                return Err(SubjektivError::SubjectBehaviorConflict { subject_id: subject_id.into() });
             }
-            if subject.behavior_md == behavior_md {
-                return Ok(subject);
-            }
+            if subject.behavior_md == behavior_md { return Ok(subject); }
             subject.behavior_md = behavior_md;
-            subject.behavior_revision =
-                subject.behavior_revision.checked_add(1).ok_or_else(|| {
-                    SubjektivError::InvalidRecord("subject behavior revision overflow".to_string())
-                })?;
             subject.updated_at = now();
-            let raw = serde_json::to_string(&subject)?;
-            transaction.execute(
-                "UPDATE subjects
-                 SET behavior_md = ?2, behavior_revision = ?3,
-                     record_json = ?4, updated_at = ?5
-                 WHERE subject_id = ?1",
-                params![
-                    subject.id,
-                    subject.behavior_md,
-                    to_i64(subject.behavior_revision)?,
-                    raw,
-                    subject.updated_at
-                ],
-            )?;
+            tx.execute("UPDATE subjects SET behavior_md = ?2, record_json = ?3, updated_at = ?4 WHERE subject_id = ?1",
+                params![subject.id, subject.behavior_md, serde_json::to_string(&subject)?, subject.updated_at])?;
             Ok(subject)
+        })
+    }
+
+    /// Derived content condition over all current Memory identities, not stored
+    /// on the Subject and never incremented.
+    pub fn memory_fingerprint(&self, subject_id: &str) -> Result<String> {
+        self.database.try_transaction(|tx| {
+            require_subject(tx, subject_id)?;
+            memory_fingerprint_in_connection(tx, subject_id)
         })
     }
 
@@ -1608,7 +1150,7 @@ impl SubjektivStore {
         }
         let memory_id = issued_id("memory");
         self.database.try_transaction(|transaction| {
-            write_memory_revision(transaction, subject_id, &memory_id, None, draft)
+            write_memory_change(transaction, subject_id, &memory_id, None, draft)
         })
     }
 
@@ -1616,28 +1158,28 @@ impl SubjektivStore {
         &self,
         subject_id: &str,
         memory_id: &str,
-        expected_revision: u64,
+        expected_change_id: String,
         draft: MemoryDraft,
     ) -> Result<MemoryRecord> {
         validate_direct_memory_draft(&draft)?;
         self.database.try_transaction(|transaction| {
-            write_memory_revision(
+            write_memory_change(
                 transaction,
                 subject_id,
                 memory_id,
-                Some(expected_revision),
+                Some(expected_change_id),
                 draft,
             )
         })
     }
 
-    /// Atomically writes a Memory revision and one candidate's immutable
+    /// Atomically writes a Memory change and one candidate's immutable
     /// resolution. Any conflict or invalid reference rolls both changes back.
     pub fn apply_candidate(
         &self,
         subject_id: &str,
         candidate_id: &str,
-        target: MemoryRevisionTarget,
+        target: MemoryChangeTarget,
         draft: MemoryDraft,
         reason: impl Into<String>,
     ) -> Result<(MemoryRecord, StagingResolution)> {
@@ -1648,13 +1190,13 @@ impl SubjektivStore {
     }
 
     /// Atomically applies one or more candidates to exactly one new Memory
-    /// revision. The repository derives `source_candidate_ids` from this list so
+    /// change_id. The repository derives `source_candidate_ids` from this list so
     /// every applied resolution has a reciprocal immutable provenance edge.
     pub fn apply_candidates(
         &self,
         subject_id: &str,
         candidate_ids: &[String],
-        target: MemoryRevisionTarget,
+        target: MemoryChangeTarget,
         draft: MemoryDraft,
         reason: impl Into<String>,
     ) -> Result<(MemoryRecord, Vec<StagingResolution>)> {
@@ -1726,8 +1268,8 @@ impl SubjektivStore {
             let (memory, operation, resolution) = match request.decision.clone() {
                 CandidateDecision::Apply { target, draft } => {
                     let operation = match &target {
-                        MemoryRevisionTarget::Create => MemoryDecisionOperation::Create,
-                        MemoryRevisionTarget::Revise { .. } => MemoryDecisionOperation::Revise,
+                        MemoryChangeTarget::Create => MemoryDecisionOperation::Create,
+                        MemoryChangeTarget::Revise { .. } => MemoryDecisionOperation::Revise,
                     };
                     let candidate_ids = [request.candidate_id.clone()];
                     let (memory, mut resolutions) = apply_candidates_in_transaction(
@@ -1762,7 +1304,7 @@ impl SubjektivStore {
                     (None, operation, resolution)
                 }
             };
-            let store_revision = require_subject(transaction, subject_id)?.store_revision;
+            let memory_fingerprint = memory_fingerprint_in_connection(transaction, subject_id)?;
             let receipt = CandidateDecisionReceipt {
                 request_id: request.request_id.clone(),
                 candidate_id: request.candidate_id.clone(),
@@ -1770,7 +1312,7 @@ impl SubjektivStore {
                 memory,
                 operation,
                 resolution,
-                store_revision,
+                memory_fingerprint,
             };
             let receipt_raw = serde_json::to_string(&receipt)?;
             transaction.execute(
@@ -1797,7 +1339,7 @@ impl SubjektivStore {
         candidate_id: &str,
         action: StagingResolutionAction,
         reason: impl Into<String>,
-        affected_memory: Vec<MemoryRevisionRef>,
+        affected_memory: Vec<MemoryChangeRef>,
     ) -> Result<StagingResolution> {
         let reason = reason.into();
         validate_nonempty("resolution reason", &reason)?;
@@ -1851,18 +1393,18 @@ impl SubjektivStore {
         })
     }
 
-    pub fn memory_revision(
+    pub fn memory_change(
         &self,
         subject_id: &str,
         memory_id: &str,
-        revision: u64,
+        change_id: String,
     ) -> Result<Option<MemoryRecord>> {
         self.database.try_with_connection(|connection| {
             let raw = connection
                 .query_row(
-                    "SELECT record_json FROM memory_revisions
-                     WHERE subject_id = ?1 AND memory_id = ?2 AND revision = ?3",
-                    params![subject_id, memory_id, to_i64(revision)?],
+                    "SELECT record_json FROM memory_changes
+                     WHERE subject_id = ?1 AND memory_id = ?2 AND change_id = ?3",
+                    params![subject_id, memory_id, change_id],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
@@ -1881,20 +1423,20 @@ impl SubjektivStore {
         })
     }
 
-    /// Reads one immutable revision after verifying that the Memory belongs to
-    /// the requested subject. A missing revision of a valid scoped Memory is
+    /// Reads one immutable change_id after verifying that the Memory belongs to
+    /// the requested subject. A missing change_id of a valid scoped Memory is
     /// returned as `None`.
-    pub fn scoped_memory_revision(
+    pub fn scoped_memory_change(
         &self,
         subject_id: &str,
         memory_id: &str,
-        revision: u64,
+        change_id: String,
     ) -> Result<Option<MemoryRecord>> {
         validate_label("subject id", subject_id)?;
         validate_label("Memory id", memory_id)?;
-        if revision == 0 {
+        if change_id.is_empty() {
             return Err(SubjektivError::InvalidRecord(
-                "Memory revision must be greater than zero".into(),
+                "Memory change must be a nonempty change identity".into(),
             ));
         }
         self.database.try_with_connection(|connection| {
@@ -1902,9 +1444,9 @@ impl SubjektivStore {
             scoped_memory_in_connection(connection, subject_id, memory_id)?;
             let raw = connection
                 .query_row(
-                    "SELECT record_json FROM memory_revisions
-                     WHERE subject_id = ?1 AND memory_id = ?2 AND revision = ?3",
-                    params![subject_id, memory_id, to_i64(revision)?],
+                    "SELECT record_json FROM memory_changes
+                     WHERE subject_id = ?1 AND memory_id = ?2 AND change_id = ?3",
+                    params![subject_id, memory_id, change_id],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
@@ -1932,35 +1474,36 @@ impl SubjektivStore {
         })
     }
 
-    /// Lists every immutable revision of one scoped Memory, newest first.
-    pub fn list_memory_revisions(
+    /// Walks the immutable predecessor chain, newest first. Identity is opaque;
+    /// clock time and UUID lexical order do not determine ancestry.
+    pub fn list_memory_changes(
         &self,
         subject_id: &str,
         memory_id: &str,
     ) -> Result<Vec<MemoryRecord>> {
-        validate_label("subject id", subject_id)?;
-        validate_label("Memory id", memory_id)?;
-        self.database.try_with_connection(|connection| {
-            require_subject_in_connection(connection, subject_id)?;
-            scoped_memory_in_connection(connection, subject_id, memory_id)?;
-            let mut statement = connection.prepare(
-                "SELECT record_json FROM memory_revisions
-                 WHERE subject_id = ?1 AND memory_id = ?2
-                 ORDER BY revision DESC",
-            )?;
-            let rows = statement.query_map(params![subject_id, memory_id], |row| {
-                row.get::<_, String>(0)
-            })?;
+        self.database.try_transaction(|tx| {
+            require_subject(tx, subject_id)?;
+            let mut record = scoped_memory_in_connection(tx, subject_id, memory_id)?;
+            let mut seen = HashSet::new();
             let mut records = Vec::new();
-            for row in rows {
-                records.push(parse_memory(&row?)?);
+            loop {
+                if !seen.insert(record.change_id.clone()) {
+                    return Err(SubjektivError::InvalidRecord("cyclic Memory history".into()));
+                }
+                let previous = record.previous_change_id.clone();
+                records.push(record);
+                let Some(previous) = previous else { break; };
+                let raw: String = tx.query_row(
+                    "SELECT record_json FROM memory_changes WHERE subject_id = ?1 AND memory_id = ?2 AND change_id = ?3",
+                    params![subject_id, memory_id, previous], |row| row.get(0))?;
+                record = parse_memory(&raw)?;
             }
             Ok(records)
         })
     }
 
     /// Captures one deterministic, bounded generation input from only current
-    /// active Memory revisions. Kind order is fixed and selection is round-robin
+    /// active Memory changes. Kind order is fixed and selection is round-robin
     /// across kinds; within each kind, updated_at desc then memory id asc.
     pub fn prepare_surface_generation(&self, subject_id: &str) -> Result<SurfaceGeneration> {
         self.prepare_job_surface_generation(subject_id, None)
@@ -1972,26 +1515,27 @@ impl SubjektivStore {
         job_attempt: Option<(&str, &str)>,
     ) -> Result<SurfaceGeneration> {
         self.database.try_transaction(|transaction| {
-            let subject = require_active_subject(transaction, subject_id)?;
+            require_active_subject(transaction, subject_id)?;
+            let memory_fingerprint = memory_fingerprint_in_connection(transaction, subject_id)?;
             let (active_memory_count, materials) =
                 select_surface_materials(transaction, subject_id)?;
             let generation = SurfaceGeneration {
                 id: issued_id("surface-generation"),
                 subject_id: subject_id.to_string(),
-                store_revision: subject.store_revision,
+                memory_fingerprint,
                 active_memory_count,
                 materials,
                 created_at: now(),
             };
             transaction.execute(
                 "INSERT INTO surface_generation_runs (
-                    subject_id, generation_id, store_revision, active_memory_count,
+                    subject_id, generation_id, memory_fingerprint, active_memory_count,
                     materials_json, created_at, job_id, attempt_id
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     subject_id,
                     generation.id,
-                    to_i64(generation.store_revision)?,
+                    generation.memory_fingerprint,
                     to_i64(generation.active_memory_count as u64)?,
                     serde_json::to_string(&generation.materials)?,
                     generation.created_at,
@@ -2011,7 +1555,7 @@ impl SubjektivStore {
         &self,
         subject_id: &str,
         generation_id: &str,
-        store_revision: u64,
+        memory_fingerprint: String,
         availability: &str,
         snapshot_id: Option<&str>,
         reason_code: Option<&str>,
@@ -2019,17 +1563,18 @@ impl SubjektivStore {
         attempt_id: &str,
     ) -> Result<()> {
         self.database.try_with_connection(|connection| {
-            let subject = require_subject_in_connection(connection, subject_id)?;
-            let generation_revision = require_job_generation(connection, subject_id, generation_id, job_id, attempt_id)?;
-            if generation_revision != store_revision || subject.store_revision != store_revision {
+            require_subject_in_connection(connection, subject_id)?;
+            let current_fingerprint = memory_fingerprint_in_connection(connection, subject_id)?;
+            let generation_change = require_job_generation(connection, subject_id, generation_id, job_id, attempt_id)?;
+            if generation_change != memory_fingerprint || current_fingerprint != memory_fingerprint {
                 return Err(SubjektivError::InvalidRecord("surface generation is stale".into()));
             }
             let state = connection.query_row(
-                "SELECT store_revision, status, snapshot_id, reason_code FROM surface_generation_state WHERE subject_id = ?1",
+                "SELECT memory_fingerprint, status, snapshot_id, reason_code FROM surface_generation_state WHERE subject_id = ?1",
                 [subject_id],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?)),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?)),
             ).optional()?.ok_or_else(|| SubjektivError::InvalidRecord("surface generation has no terminal outcome".into()))?;
-            if state.0 != to_i64(store_revision)? || state.1 != availability
+            if state.0 != memory_fingerprint || state.1 != availability
                 || !matches!(availability, "ready" | "failed")
                 || state.2.as_deref() != snapshot_id || state.3.as_deref() != reason_code {
                 return Err(SubjektivError::InvalidRecord("surface claim differs from the persisted outcome".into()));
@@ -2061,16 +1606,17 @@ impl SubjektivStore {
     ) -> Result<SurfaceSnapshot> {
         validate_label("surface generation id", generation_id)?;
         self.database.try_transaction(|transaction| {
-            let subject = require_active_subject(transaction, subject_id)?;
-            let (store_revision, active_memory_count, materials_json) = transaction
+            require_active_subject(transaction, subject_id)?;
+            let current_fingerprint = memory_fingerprint_in_connection(transaction, subject_id)?;
+            let (memory_fingerprint, active_memory_count, materials_json) = transaction
                 .query_row(
-                    "SELECT store_revision, active_memory_count, materials_json
+                    "SELECT memory_fingerprint, active_memory_count, materials_json
                      FROM surface_generation_runs
                      WHERE subject_id = ?1 AND generation_id = ?2",
                     params![subject_id, generation_id],
                     |row| {
                         Ok((
-                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(0)?,
                             row.get::<_, i64>(1)?,
                             row.get::<_, String>(2)?,
                         ))
@@ -2082,13 +1628,10 @@ impl SubjektivStore {
                         "unknown generation `{generation_id}` for subject `{subject_id}`"
                     ))
                 })?;
-            let store_revision = u64::try_from(store_revision).map_err(|_| {
-                SubjektivError::InvalidRecord("surface generation revision is negative".into())
-            })?;
-            if subject.store_revision != store_revision {
+            if current_fingerprint != memory_fingerprint {
                 return Err(SubjektivError::SurfaceGenerationConflict(format!(
-                    "generation {store_revision} is stale; current store revision is {}",
-                    subject.store_revision
+                    "generation input {memory_fingerprint} is stale; current Memory input fingerprint is {}",
+                    current_fingerprint
                 )));
             }
             let materials: Vec<SurfaceMaterial> = serde_json::from_str(&materials_json)?;
@@ -2099,13 +1642,13 @@ impl SubjektivStore {
             }
             let (body_md, memory_refs) = validate_surface_points(&materials, &points)?;
             if let Some(existing) =
-                ready_surface_snapshot_for_revision(transaction, subject_id, store_revision)?
+                ready_surface_snapshot_for_fingerprint(transaction, subject_id, &memory_fingerprint)?
             {
                 if existing.body_md == body_md && existing.memory_refs == memory_refs {
                     return Ok(existing);
                 }
                 return Err(SubjektivError::SurfaceGenerationConflict(format!(
-                    "store revision {store_revision} already has a different published surface"
+                    "Memory input fingerprint {memory_fingerprint} already has a different published surface"
                 )));
             }
             insert_surface_snapshot(
@@ -2113,7 +1656,7 @@ impl SubjektivStore {
                 subject_id,
                 body_md,
                 memory_refs,
-                store_revision,
+                memory_fingerprint,
             )
         })
     }
@@ -2125,17 +1668,18 @@ impl SubjektivStore {
         subject_id: &str,
         generation_id: &str,
         reason_code: &str,
-    ) -> Result<u64> {
+    ) -> Result<String> {
         validate_label("surface generation id", generation_id)?;
         validate_label("surface failure reason", reason_code)?;
         self.database.try_transaction(|transaction| {
-            let subject = require_active_subject(transaction, subject_id)?;
-            let generation_revision = transaction
+            require_active_subject(transaction, subject_id)?;
+            let memory_fingerprint = memory_fingerprint_in_connection(transaction, subject_id)?;
+            let generation_change = transaction
                 .query_row(
-                    "SELECT store_revision FROM surface_generation_runs
+                    "SELECT memory_fingerprint FROM surface_generation_runs
                      WHERE subject_id = ?1 AND generation_id = ?2",
                     params![subject_id, generation_id],
-                    |row| row.get::<_, i64>(0),
+                    |row| row.get::<_, String>(0),
                 )
                 .optional()?
                 .ok_or_else(|| {
@@ -2143,10 +1687,7 @@ impl SubjektivStore {
                         "unknown generation `{generation_id}` for subject `{subject_id}`"
                     ))
                 })?;
-            let generation_revision = u64::try_from(generation_revision).map_err(|_| {
-                SubjektivError::InvalidRecord("surface generation revision is negative".into())
-            })?;
-            if generation_revision == subject.store_revision {
+            if generation_change == memory_fingerprint {
                 let ready = transaction
                     .query_row(
                         "SELECT status FROM surface_generation_state WHERE subject_id = ?1",
@@ -2158,18 +1699,18 @@ impl SubjektivStore {
                 if !ready {
                     transaction.execute(
                         "INSERT INTO surface_generation_state (
-                            subject_id, store_revision, status, snapshot_id, reason_code, updated_at
+                            subject_id, memory_fingerprint, status, snapshot_id, reason_code, updated_at
                          ) VALUES (?1, ?2, 'failed', NULL, ?3, ?4)
                          ON CONFLICT(subject_id) DO UPDATE SET
-                            store_revision = excluded.store_revision,
+                            memory_fingerprint = excluded.memory_fingerprint,
                             status = 'failed', snapshot_id = NULL,
                             reason_code = excluded.reason_code,
                             updated_at = excluded.updated_at",
-                        params![subject_id, to_i64(generation_revision)?, reason_code, now()],
+                        params![subject_id, generation_change, reason_code, now()],
                     )?;
                 }
             }
-            Ok(subject.store_revision)
+            Ok(memory_fingerprint)
         })
     }
 
@@ -2197,18 +1738,19 @@ impl SubjektivStore {
         &self,
         subject_id: &str,
         body_md: impl Into<String>,
-        memory_refs: Vec<MemoryRevisionRef>,
-        built_from_store_revision: u64,
+        memory_refs: Vec<MemoryChangeRef>,
+        built_from_memory_fingerprint: String,
     ) -> Result<SurfaceSnapshot> {
         reject_duplicate_refs("surface snapshot", &memory_refs)?;
         reject_duplicate_memory_ids("surface snapshot", &memory_refs)?;
         let body_md = body_md.into();
         self.database.try_transaction(|transaction| {
-            let subject = require_active_subject(transaction, subject_id)?;
-            if subject.store_revision != built_from_store_revision {
+            require_active_subject(transaction, subject_id)?;
+            let memory_fingerprint = memory_fingerprint_in_connection(transaction, subject_id)?;
+            if memory_fingerprint != built_from_memory_fingerprint {
                 return Err(SubjektivError::InvalidRecord(format!(
-                    "surface snapshot generation {built_from_store_revision} does not match current subject store revision {}",
-                    subject.store_revision
+                    "surface snapshot generation {built_from_memory_fingerprint} does not match current subject Memory input fingerprint {}",
+                    memory_fingerprint
                 )));
             }
             validate_memory_refs(transaction, subject_id, &memory_refs)?;
@@ -2217,16 +1759,16 @@ impl SubjektivStore {
                     "surface snapshot body exceeds {SURFACE_BODY_TOKEN_BUDGET} token estimate"
                 )));
             }
-            if let Some(existing) = surface_snapshot_for_revision(
+            if let Some(existing) = surface_snapshot_for_fingerprint(
                 transaction,
                 subject_id,
-                built_from_store_revision,
+                &built_from_memory_fingerprint,
             )? {
                 if existing.body_md == body_md && existing.memory_refs == memory_refs {
                     return Ok(existing);
                 }
                 return Err(SubjektivError::SurfaceGenerationConflict(format!(
-                    "store revision {built_from_store_revision} already has a different published surface"
+                    "Memory input fingerprint {built_from_memory_fingerprint} already has a different published surface"
                 )));
             }
             insert_surface_snapshot(
@@ -2234,7 +1776,7 @@ impl SubjektivStore {
                 subject_id,
                 body_md,
                 memory_refs,
-                built_from_store_revision,
+                built_from_memory_fingerprint,
             )
         })
     }
@@ -2277,7 +1819,7 @@ fn select_surface_materials(
         if buckets[bucket].len() < SURFACE_PER_KIND_LIMIT {
             buckets[bucket].push(SurfaceMaterial {
                 memory_id: memory.id,
-                revision: memory.revision,
+                change_id: memory.change_id.clone(),
                 kind: memory.kind,
                 body_md: memory.body_md,
                 why_useful: memory.why_useful,
@@ -2379,7 +1921,7 @@ fn surface_kind_index(kind: &CandidateKind) -> usize {
 fn validate_surface_points(
     materials: &[SurfaceMaterial],
     points: &[SurfacePoint],
-) -> Result<(String, Vec<MemoryRevisionRef>)> {
+) -> Result<(String, Vec<MemoryChangeRef>)> {
     if materials.is_empty() {
         if points.is_empty() {
             return Ok((String::new(), Vec::new()));
@@ -2400,7 +1942,7 @@ fn validate_surface_points(
     }
     let allowed = materials
         .iter()
-        .map(|material| (material.memory_id.as_str(), material.revision))
+        .map(|material| (material.memory_id.as_str(), material.change_id.as_str()))
         .collect::<HashSet<_>>();
     let mut bodies = Vec::with_capacity(points.len());
     let mut seen = HashSet::new();
@@ -2415,13 +1957,13 @@ fn validate_surface_points(
         }
         reject_duplicate_refs("surface point", &point.memory_refs)?;
         for reference in &point.memory_refs {
-            if !allowed.contains(&(reference.memory_id.as_str(), reference.revision)) {
+            if !allowed.contains(&(reference.memory_id.as_str(), reference.change_id.as_str())) {
                 return Err(SubjektivError::SubjectScopeMismatch {
                     subject_id: "surface generation materials".into(),
-                    reference: format!("{}@{}", reference.memory_id, reference.revision),
+                    reference: format!("{}@{}", reference.memory_id, reference.change_id),
                 });
             }
-            if seen.insert((reference.memory_id.clone(), reference.revision)) {
+            if seen.insert((reference.memory_id.clone(), reference.change_id.clone())) {
                 refs.push(reference.clone());
             }
         }
@@ -2436,10 +1978,10 @@ fn validate_surface_points(
     Ok((body_md, refs))
 }
 
-fn ready_surface_snapshot_for_revision(
+fn ready_surface_snapshot_for_fingerprint(
     transaction: &Transaction<'_>,
     subject_id: &str,
-    store_revision: u64,
+    memory_fingerprint: &str,
 ) -> Result<Option<SurfaceSnapshot>> {
     let raw = transaction
         .query_row(
@@ -2449,26 +1991,26 @@ fn ready_surface_snapshot_for_revision(
                ON snapshots.subject_id = state.subject_id
               AND snapshots.snapshot_id = state.snapshot_id
              WHERE state.subject_id = ?1
-               AND state.store_revision = ?2
+               AND state.memory_fingerprint = ?2
                AND state.status = 'ready'",
-            params![subject_id, to_i64(store_revision)?],
+            params![subject_id, memory_fingerprint],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
     raw.map(|raw| parse_surface_snapshot(&raw)).transpose()
 }
 
-fn surface_snapshot_for_revision(
+fn surface_snapshot_for_fingerprint(
     transaction: &Transaction<'_>,
     subject_id: &str,
-    store_revision: u64,
+    memory_fingerprint: &str,
 ) -> Result<Option<SurfaceSnapshot>> {
     let raw = transaction
         .query_row(
             "SELECT snapshot_json FROM surface_snapshots
-             WHERE subject_id = ?1 AND built_from_store_revision = ?2
+             WHERE subject_id = ?1 AND built_from_memory_fingerprint = ?2
              ORDER BY created_at ASC, snapshot_id ASC LIMIT 1",
-            params![subject_id, to_i64(store_revision)?],
+            params![subject_id, memory_fingerprint],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
@@ -2479,8 +2021,8 @@ fn insert_surface_snapshot(
     transaction: &Transaction<'_>,
     subject_id: &str,
     body_md: String,
-    memory_refs: Vec<MemoryRevisionRef>,
-    built_from_store_revision: u64,
+    memory_refs: Vec<MemoryChangeRef>,
+    built_from_memory_fingerprint: String,
 ) -> Result<SurfaceSnapshot> {
     validate_memory_refs(transaction, subject_id, &memory_refs)?;
     let snapshot = SurfaceSnapshot {
@@ -2489,18 +2031,18 @@ fn insert_surface_snapshot(
         subject_id: subject_id.to_string(),
         body_md,
         memory_refs,
-        built_from_store_revision,
+        built_from_memory_fingerprint: built_from_memory_fingerprint.clone(),
         created_at: now(),
     };
     let raw = serde_json::to_string(&snapshot)?;
     transaction.execute(
         "INSERT INTO surface_snapshots (
-            subject_id, snapshot_id, built_from_store_revision, snapshot_json, created_at
+            subject_id, snapshot_id, built_from_memory_fingerprint, snapshot_json, created_at
          ) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             subject_id,
             snapshot.id,
-            to_i64(snapshot.built_from_store_revision)?,
+            snapshot.built_from_memory_fingerprint,
             raw,
             snapshot.created_at
         ],
@@ -2508,13 +2050,13 @@ fn insert_surface_snapshot(
     for reference in &snapshot.memory_refs {
         transaction.execute(
             "INSERT INTO surface_snapshot_refs (
-                subject_id, snapshot_id, memory_id, revision
+                subject_id, snapshot_id, memory_id, change_id
              ) VALUES (?1, ?2, ?3, ?4)",
             params![
                 subject_id,
                 snapshot.id,
                 reference.memory_id,
-                to_i64(reference.revision)?
+                reference.change_id
             ],
         )?;
     }
@@ -2524,15 +2066,15 @@ fn insert_surface_snapshot(
     )?;
     transaction.execute(
         "INSERT INTO surface_generation_state (
-            subject_id, store_revision, status, snapshot_id, reason_code, updated_at
+            subject_id, memory_fingerprint, status, snapshot_id, reason_code, updated_at
          ) VALUES (?1, ?2, 'ready', ?3, NULL, ?4)
          ON CONFLICT(subject_id) DO UPDATE SET
-            store_revision = excluded.store_revision,
+            memory_fingerprint = excluded.memory_fingerprint,
             status = 'ready', snapshot_id = excluded.snapshot_id,
             reason_code = NULL, updated_at = excluded.updated_at",
         params![
             subject_id,
-            to_i64(built_from_store_revision)?,
+            built_from_memory_fingerprint,
             snapshot.id,
             snapshot.created_at
         ],
@@ -2552,7 +2094,7 @@ fn apply_candidates_in_transaction(
     transaction: &Transaction<'_>,
     subject_id: &str,
     candidate_ids: &[String],
-    target: &MemoryRevisionTarget,
+    target: &MemoryChangeTarget,
     mut draft: MemoryDraft,
     reason: &str,
 ) -> Result<(MemoryRecord, Vec<StagingResolution>)> {
@@ -2567,28 +2109,28 @@ fn apply_candidates_in_transaction(
     draft.source_candidate_ids = candidate_ids.to_vec();
     let new_memory_id = issued_id("memory");
     let memory = match target {
-        MemoryRevisionTarget::Create => {
+        MemoryChangeTarget::Create => {
             if draft.state != MemoryState::Active {
                 return Err(SubjektivError::InvalidRecord(
                     "a new Memory must start in active state".into(),
                 ));
             }
-            write_memory_revision(transaction, subject_id, &new_memory_id, None, draft)?
+            write_memory_change(transaction, subject_id, &new_memory_id, None, draft)?
         }
-        MemoryRevisionTarget::Revise {
+        MemoryChangeTarget::Revise {
             memory_id,
-            expected_revision,
-        } => write_memory_revision(
+            expected_change_id,
+        } => write_memory_change(
             transaction,
             subject_id,
             memory_id,
-            Some(*expected_revision),
+            Some(expected_change_id.clone()),
             draft,
         )?,
     };
-    let reference = MemoryRevisionRef {
+    let reference = MemoryChangeRef {
         memory_id: memory.id.clone(),
-        revision: memory.revision,
+        change_id: memory.change_id.clone(),
     };
     let resolutions = candidate_ids
         .iter()
@@ -2606,11 +2148,11 @@ fn apply_candidates_in_transaction(
     Ok((memory, resolutions))
 }
 
-fn write_memory_revision(
+fn write_memory_change(
     transaction: &Transaction<'_>,
     subject_id: &str,
     memory_id: &str,
-    expected_revision: Option<u64>,
+    expected_change_id: Option<String>,
     draft: MemoryDraft,
 ) -> Result<MemoryRecord> {
     validate_memory_draft(&draft)?;
@@ -2625,24 +2167,24 @@ fn write_memory_revision(
         .optional()?;
     let current = current_raw.map(|raw| parse_memory(&raw)).transpose()?;
 
-    let (revision, created_at) = match (current.as_ref(), expected_revision) {
-        (None, None) => (1, now()),
+    let (change_id, created_at) = match (current.as_ref(), expected_change_id) {
+        (None, None) => (issued_id("memory-change"), now()),
         (None, Some(_)) => return Err(SubjektivError::MemoryNotFound(memory_id.to_string())),
         (Some(_), None) => {
             return Err(SubjektivError::InvalidRecord(format!(
                 "memory `{memory_id}` already exists"
             )));
         }
-        (Some(current), Some(expected)) if current.revision != expected => {
-            return Err(SubjektivError::RevisionConflict {
+        (Some(current), Some(expected)) if current.change_id != expected => {
+            return Err(SubjektivError::MemoryChangeConflict {
                 memory_id: memory_id.to_string(),
                 expected,
-                actual: current.revision,
+                actual: current.change_id.clone(),
             });
         }
         (Some(current), Some(_)) => {
             validate_state_transition(memory_id, current.state, draft.state)?;
-            (current.revision + 1, current.created_at.clone())
+            (issued_id("memory-change"), current.created_at.clone())
         }
     };
 
@@ -2656,7 +2198,8 @@ fn write_memory_revision(
         schema_version: SUBJEKTIV_SCHEMA_VERSION,
         id: memory_id.to_string(),
         subject_id: subject_id.to_string(),
-        revision,
+        change_id: change_id.clone(),
+        previous_change_id: current.as_ref().map(|record| record.change_id.clone()),
         kind: draft.kind,
         state: draft.state,
         claim: draft.claim,
@@ -2674,13 +2217,13 @@ fn write_memory_revision(
     if current.is_none() {
         transaction.execute(
             "INSERT INTO memory_records (
-                subject_id, memory_id, current_revision, kind, state,
+                subject_id, memory_id, current_change_id, kind, state,
                 record_json, created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 subject_id,
                 memory_id,
-                to_i64(revision)?,
+                change_id,
                 candidate_kind_name(&record.kind),
                 memory_state_name(record.state),
                 raw,
@@ -2690,29 +2233,30 @@ fn write_memory_revision(
         )?;
     }
     transaction.execute(
-        "INSERT INTO memory_revisions (
-            subject_id, memory_id, revision, kind, state, record_json, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO memory_changes (
+            subject_id, memory_id, change_id, kind, state, record_json, created_at, previous_change_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             subject_id,
             memory_id,
-            to_i64(revision)?,
+            change_id,
             candidate_kind_name(&record.kind),
             memory_state_name(record.state),
             raw,
-            record.updated_at
+            record.updated_at,
+            record.previous_change_id
         ],
     )?;
     if current.is_some() {
         transaction.execute(
             "UPDATE memory_records
-             SET current_revision = ?3, kind = ?4, state = ?5,
+             SET current_change_id = ?3, kind = ?4, state = ?5,
                  record_json = ?6, updated_at = ?7
              WHERE subject_id = ?1 AND memory_id = ?2",
             params![
                 subject_id,
                 memory_id,
-                to_i64(revision)?,
+                change_id,
                 candidate_kind_name(&record.kind),
                 memory_state_name(record.state),
                 raw,
@@ -2722,62 +2266,51 @@ fn write_memory_revision(
     }
     for candidate_id in &record.source_candidate_ids {
         transaction.execute(
-            "INSERT INTO memory_revision_candidates (
-                subject_id, memory_id, revision, candidate_id
+            "INSERT INTO memory_change_candidates (
+                subject_id, memory_id, change_id, candidate_id
              ) VALUES (?1, ?2, ?3, ?4)",
-            params![subject_id, memory_id, to_i64(revision)?, candidate_id],
+            params![subject_id, memory_id, change_id, candidate_id],
         )?;
     }
     for source in &record.derived_from {
         transaction.execute(
-            "INSERT INTO memory_revision_derivations (
-                subject_id, memory_id, revision, source_memory_id, source_revision
+            "INSERT INTO memory_change_derivations (
+                subject_id, memory_id, change_id, source_memory_id, source_change_id
              ) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 subject_id,
                 memory_id,
-                to_i64(revision)?,
+                change_id,
                 source.memory_id,
-                to_i64(source.revision)?
+                source.change_id
             ],
         )?;
     }
     transaction.execute(
-        "INSERT INTO memory_revision_seals (subject_id, memory_id, revision)
+        "INSERT INTO memory_change_seals (subject_id, memory_id, change_id)
          VALUES (?1, ?2, ?3)",
-        params![subject_id, memory_id, to_i64(revision)?],
+        params![subject_id, memory_id, change_id],
     )?;
 
-    subject.store_revision = subject
-        .store_revision
-        .checked_add(1)
-        .ok_or_else(|| SubjektivError::InvalidRecord("subject store revision overflow".into()))?;
     subject.updated_at = record.updated_at.clone();
-    let subject_raw = serde_json::to_string(&subject)?;
     transaction.execute(
-        "UPDATE subjects
-         SET store_revision = ?2, record_json = ?3, updated_at = ?4
-         WHERE subject_id = ?1",
+        "UPDATE subjects SET record_json = ?2, updated_at = ?3 WHERE subject_id = ?1",
         params![
             subject_id,
-            to_i64(subject.store_revision)?,
-            subject_raw,
+            serde_json::to_string(&subject)?,
             subject.updated_at
         ],
     )?;
+    let memory_fingerprint = memory_fingerprint_in_connection(transaction, subject_id)?;
     transaction.execute(
         "INSERT INTO surface_generation_state (
-            subject_id, store_revision, status, snapshot_id, reason_code, updated_at
+            subject_id, memory_fingerprint, status, snapshot_id, reason_code, updated_at
          ) VALUES (?1, ?2, 'dirty', NULL, NULL, ?3)
          ON CONFLICT(subject_id) DO UPDATE SET
-            store_revision = excluded.store_revision,
+            memory_fingerprint = excluded.memory_fingerprint,
             status = 'dirty', snapshot_id = NULL, reason_code = NULL,
             updated_at = excluded.updated_at",
-        params![
-            subject_id,
-            to_i64(subject.store_revision)?,
-            subject.updated_at
-        ],
+        params![subject_id, memory_fingerprint, subject.updated_at],
     )?;
     Ok(record)
 }
@@ -2802,7 +2335,7 @@ fn write_staging_candidate(
         }
         return Err(SubjektivError::CandidateConflict(record.id.clone()));
     }
-    validate_staged_revision_proposal(transaction, &record)?;
+    validate_staged_change_proposal(transaction, &record)?;
     transaction.execute(
         "INSERT INTO staging_records (
             subject_id, candidate_id, kind, record_json, created_at
@@ -2868,7 +2401,7 @@ fn insert_resolution(
     candidate_id: &str,
     action: StagingResolutionAction,
     reason: &str,
-    affected_memory: &[MemoryRevisionRef],
+    affected_memory: &[MemoryChangeRef],
 ) -> Result<StagingResolution> {
     require_active_subject(transaction, subject_id)?;
     reject_duplicate_refs("staging resolution", affected_memory)?;
@@ -2876,19 +2409,19 @@ fn insert_resolution(
     if action == StagingResolutionAction::Applied {
         if affected_memory.is_empty() {
             return Err(SubjektivError::InvalidRecord(
-                "an applied candidate requires an affected Memory revision".into(),
+                "an applied candidate requires an affected Memory change".into(),
             ));
         }
         for reference in affected_memory {
             let reciprocal = transaction
                 .query_row(
-                    "SELECT 1 FROM memory_revision_candidates
+                    "SELECT 1 FROM memory_change_candidates
                      WHERE subject_id = ?1 AND memory_id = ?2
-                       AND revision = ?3 AND candidate_id = ?4",
+                       AND change_id = ?3 AND candidate_id = ?4",
                     params![
                         subject_id,
                         reference.memory_id,
-                        to_i64(reference.revision)?,
+                        reference.change_id,
                         candidate_id
                     ],
                     |_| Ok(()),
@@ -2898,7 +2431,7 @@ fn insert_resolution(
             if !reciprocal {
                 return Err(SubjektivError::InvalidRecord(format!(
                     "applied candidate `{candidate_id}` has no reciprocal provenance edge to `{}@{}`",
-                    reference.memory_id, reference.revision
+                    reference.memory_id, reference.change_id
                 )));
             }
         }
@@ -2944,13 +2477,13 @@ fn insert_resolution(
     for reference in affected_memory {
         transaction.execute(
             "INSERT INTO staging_resolution_targets (
-                subject_id, candidate_id, memory_id, revision
+                subject_id, candidate_id, memory_id, change_id
              ) VALUES (?1, ?2, ?3, ?4)",
             params![
                 subject_id,
                 candidate_id,
                 reference.memory_id,
-                to_i64(reference.revision)?
+                reference.change_id
             ],
         )?;
     }
@@ -3067,20 +2600,20 @@ fn validate_candidate_refs(
 fn validate_memory_refs(
     transaction: &Transaction<'_>,
     subject_id: &str,
-    references: &[MemoryRevisionRef],
+    references: &[MemoryChangeRef],
 ) -> Result<()> {
     for reference in references {
-        if reference.revision == 0 {
+        if reference.change_id.is_empty() {
             return Err(SubjektivError::InvalidRecord(format!(
-                "Memory `{}` revision must be greater than zero",
+                "Memory `{}` change_id must be a nonempty change identity",
                 reference.memory_id
             )));
         }
         let exists = transaction
             .query_row(
-                "SELECT 1 FROM memory_revisions
-                 WHERE subject_id = ?1 AND memory_id = ?2 AND revision = ?3",
-                params![subject_id, reference.memory_id, to_i64(reference.revision)?],
+                "SELECT 1 FROM memory_changes
+                 WHERE subject_id = ?1 AND memory_id = ?2 AND change_id = ?3",
+                params![subject_id, reference.memory_id, reference.change_id],
                 |_| Ok(()),
             )
             .optional()?
@@ -3088,7 +2621,7 @@ fn validate_memory_refs(
         if !exists {
             return Err(SubjektivError::SubjectScopeMismatch {
                 subject_id: subject_id.to_string(),
-                reference: format!("{}@{}", reference.memory_id, reference.revision),
+                reference: format!("{}@{}", reference.memory_id, reference.change_id),
             });
         }
     }
@@ -3220,8 +2753,8 @@ fn validate_staging_record(workspace_id: &str, record: &SubjectStagingRecord) ->
             });
         }
     }
-    if let Some(proposal) = &record.revision_proposal {
-        validate_revision_proposal_metadata(proposal)?;
+    if let Some(proposal) = &record.change_proposal {
+        validate_change_proposal_metadata(proposal)?;
     }
     Ok(())
 }
@@ -3239,63 +2772,63 @@ fn validate_staging_admission(record: &SubjectStagingRecord) -> Result<()> {
     Ok(())
 }
 
-fn validate_revision_proposal_metadata(proposal: &RevisionProposal) -> Result<()> {
-    validate_label("revision proposal Memory id", &proposal.memory_id)?;
-    if proposal.expected_revision == 0 {
+fn validate_change_proposal_metadata(proposal: &ChangeProposal) -> Result<()> {
+    validate_label("change proposal Memory id", &proposal.memory_id)?;
+    if proposal.expected_change_id.is_empty() {
         return Err(SubjektivError::InvalidRecord(
-            "revision proposal expected_revision must be greater than zero".into(),
+            "change proposal expected_change_id must be a nonempty change identity".into(),
         ));
     }
-    validate_nonempty("revision proposal change_reason", &proposal.change_reason)
+    validate_nonempty("change proposal change_reason", &proposal.change_reason)
 }
 
 fn validate_candidate_application(
     transaction: &Transaction<'_>,
     subject_id: &str,
     candidate: &SubjectStagingRecord,
-    target: &MemoryRevisionTarget,
+    target: &MemoryChangeTarget,
     draft: &MemoryDraft,
 ) -> Result<()> {
-    let Some(proposal) = &candidate.revision_proposal else {
+    let Some(proposal) = &candidate.change_proposal else {
         return Ok(());
     };
-    let MemoryRevisionTarget::Revise {
+    let MemoryChangeTarget::Revise {
         memory_id,
-        expected_revision,
+        expected_change_id,
     } = target
     else {
         return Err(SubjektivError::InvalidRecord(
-            "a revision proposal cannot create a different Memory".into(),
+            "a change proposal cannot create a different Memory".into(),
         ));
     };
-    if memory_id != &proposal.memory_id || expected_revision != &proposal.expected_revision {
+    if memory_id != &proposal.memory_id || expected_change_id != &proposal.expected_change_id {
         return Err(SubjektivError::InvalidRecord(
-            "candidate application target must exactly match revision proposal metadata".into(),
+            "candidate application target must exactly match change proposal metadata".into(),
         ));
     }
     let current = scoped_memory_in_connection(transaction, subject_id, memory_id)?;
-    if current.revision != *expected_revision {
-        return Err(SubjektivError::RevisionConflict {
+    if current.change_id != *expected_change_id {
+        return Err(SubjektivError::MemoryChangeConflict {
             memory_id: memory_id.clone(),
-            expected: *expected_revision,
-            actual: current.revision,
+            expected: expected_change_id.clone(),
+            actual: current.change_id.clone(),
         });
     }
     let expected_state = match proposal.intent {
-        RevisionProposalIntent::Revise => current.state,
-        RevisionProposalIntent::Resolve => MemoryState::Resolved,
-        RevisionProposalIntent::Retract => MemoryState::Retracted,
-        RevisionProposalIntent::Reopen => MemoryState::Active,
+        ChangeProposalIntent::Revise => current.state,
+        ChangeProposalIntent::Resolve => MemoryState::Resolved,
+        ChangeProposalIntent::Retract => MemoryState::Retracted,
+        ChangeProposalIntent::Reopen => MemoryState::Active,
     };
     let intent_allowed = match proposal.intent {
-        RevisionProposalIntent::Revise => {
+        ChangeProposalIntent::Revise => {
             matches!(current.state, MemoryState::Active | MemoryState::Resolved)
         }
-        RevisionProposalIntent::Resolve => current.state == MemoryState::Active,
-        RevisionProposalIntent::Retract => {
+        ChangeProposalIntent::Resolve => current.state == MemoryState::Active,
+        ChangeProposalIntent::Retract => {
             matches!(current.state, MemoryState::Active | MemoryState::Resolved)
         }
-        RevisionProposalIntent::Reopen => current.state == MemoryState::Resolved,
+        ChangeProposalIntent::Reopen => current.state == MemoryState::Resolved,
     };
     if !intent_allowed || draft.state != expected_state {
         return Err(SubjektivError::InvalidStateTransition {
@@ -3306,48 +2839,48 @@ fn validate_candidate_application(
     }
     if draft.kind != current.kind || draft.kind != candidate.kind {
         return Err(SubjektivError::InvalidRecord(
-            "revision proposal application must preserve the target Memory kind".into(),
+            "change proposal application must preserve the target Memory kind".into(),
         ));
     }
     if draft.change_reason != proposal.change_reason {
         return Err(SubjektivError::InvalidRecord(
-            "revision proposal application must preserve change_reason".into(),
+            "change proposal application must preserve change_reason".into(),
         ));
     }
     Ok(())
 }
 
-fn validate_staged_revision_proposal(
+fn validate_staged_change_proposal(
     transaction: &Transaction<'_>,
     record: &SubjectStagingRecord,
 ) -> Result<()> {
-    let Some(proposal) = &record.revision_proposal else {
+    let Some(proposal) = &record.change_proposal else {
         return Ok(());
     };
     let current =
         scoped_memory_in_connection(transaction, &record.subject_id, &proposal.memory_id)?;
-    if current.revision != proposal.expected_revision {
-        return Err(SubjektivError::RevisionConflict {
+    if current.change_id != proposal.expected_change_id {
+        return Err(SubjektivError::MemoryChangeConflict {
             memory_id: proposal.memory_id.clone(),
-            expected: proposal.expected_revision,
-            actual: current.revision,
+            expected: proposal.expected_change_id.clone(),
+            actual: current.change_id.clone(),
         });
     }
     let to = match proposal.intent {
-        RevisionProposalIntent::Revise => current.state,
-        RevisionProposalIntent::Resolve => MemoryState::Resolved,
-        RevisionProposalIntent::Retract => MemoryState::Retracted,
-        RevisionProposalIntent::Reopen => MemoryState::Active,
+        ChangeProposalIntent::Revise => current.state,
+        ChangeProposalIntent::Resolve => MemoryState::Resolved,
+        ChangeProposalIntent::Retract => MemoryState::Retracted,
+        ChangeProposalIntent::Reopen => MemoryState::Active,
     };
     let allowed = match proposal.intent {
-        RevisionProposalIntent::Revise => {
+        ChangeProposalIntent::Revise => {
             matches!(current.state, MemoryState::Active | MemoryState::Resolved)
         }
-        RevisionProposalIntent::Resolve => current.state == MemoryState::Active,
-        RevisionProposalIntent::Retract => {
+        ChangeProposalIntent::Resolve => current.state == MemoryState::Active,
+        ChangeProposalIntent::Retract => {
             matches!(current.state, MemoryState::Active | MemoryState::Resolved)
         }
-        RevisionProposalIntent::Reopen => current.state == MemoryState::Resolved,
+        ChangeProposalIntent::Reopen => current.state == MemoryState::Resolved,
     };
     if allowed {
         Ok(())
@@ -3489,9 +3022,9 @@ fn parse_staging_without_workspace(raw: &str) -> Result<SubjectStagingRecord> {
 fn parse_memory(raw: &str) -> Result<MemoryRecord> {
     let record: MemoryRecord = serde_json::from_str(raw)?;
     validate_schema_version(record.schema_version, "Memory")?;
-    if record.revision == 0 {
+    if record.change_id.is_empty() {
         return Err(SubjektivError::InvalidRecord(
-            "Memory revision must be greater than zero".to_string(),
+            "Memory change must be a nonempty change identity".to_string(),
         ));
     }
     Ok(record)
@@ -3535,27 +3068,26 @@ fn resident_surface_in_connection(
 ) -> Result<ResidentSurface> {
     let state = connection
         .query_row(
-            "SELECT store_revision, status, snapshot_id
+            "SELECT memory_fingerprint, status, snapshot_id
              FROM surface_generation_state WHERE subject_id = ?1",
             [&subject.id],
             |row| {
                 Ok((
-                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
                 ))
             },
         )
         .optional()?;
-    let Some((revision, status, snapshot_id)) = state else {
+    let Some((change_id, status, snapshot_id)) = state else {
         return Ok(ResidentSurface {
             availability: SurfaceAvailability::Ungenerated,
             snapshot: None,
         });
     };
-    let revision = u64::try_from(revision)
-        .map_err(|_| SubjektivError::InvalidRecord("surface state revision is negative".into()))?;
-    if revision != subject.store_revision || status == "dirty" {
+    let memory_fingerprint = memory_fingerprint_in_connection(connection, &subject.id)?;
+    if change_id != memory_fingerprint || status == "dirty" {
         return Ok(ResidentSurface {
             availability: SurfaceAvailability::Stale,
             snapshot: None,
@@ -3577,7 +3109,7 @@ fn resident_surface_in_connection(
         |row| row.get::<_, String>(0),
     )?;
     let snapshot = parse_surface_snapshot(&raw)?;
-    if snapshot.built_from_store_revision != subject.store_revision {
+    if snapshot.built_from_memory_fingerprint != memory_fingerprint {
         return Err(SubjektivError::InvalidRecord(
             "ready surface snapshot generation does not match subject".into(),
         ));
@@ -3640,21 +3172,21 @@ fn reject_duplicates(kind: &str, values: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn reject_duplicate_refs(kind: &str, values: &[MemoryRevisionRef]) -> Result<()> {
+fn reject_duplicate_refs(kind: &str, values: &[MemoryChangeRef]) -> Result<()> {
     let mut seen = HashSet::new();
     if let Some(duplicate) = values
         .iter()
-        .find(|value| !seen.insert((value.memory_id.as_str(), value.revision)))
+        .find(|value| !seen.insert((value.memory_id.as_str(), value.change_id.as_str())))
     {
         return Err(SubjektivError::InvalidRecord(format!(
             "duplicate {kind} `{}@{}`",
-            duplicate.memory_id, duplicate.revision
+            duplicate.memory_id, duplicate.change_id
         )));
     }
     Ok(())
 }
 
-fn reject_duplicate_memory_ids(kind: &str, values: &[MemoryRevisionRef]) -> Result<()> {
+fn reject_duplicate_memory_ids(kind: &str, values: &[MemoryChangeRef]) -> Result<()> {
     let mut seen = HashSet::new();
     if let Some(duplicate) = values
         .iter()
@@ -3674,23 +3206,52 @@ fn require_job_generation(
     generation_id: &str,
     job_id: &str,
     attempt_id: &str,
-) -> Result<u64> {
-    let revision: Option<i64> = connection.query_row(
-        "SELECT store_revision FROM surface_generation_runs WHERE subject_id = ?1 AND generation_id = ?2 AND job_id = ?3 AND attempt_id = ?4",
+) -> Result<String> {
+    let change_id: Option<String> = connection.query_row(
+        "SELECT memory_fingerprint FROM surface_generation_runs WHERE subject_id = ?1 AND generation_id = ?2 AND job_id = ?3 AND attempt_id = ?4",
         params![subject_id, generation_id, job_id, attempt_id], |row| row.get(0),
     ).optional()?;
-    revision
-        .and_then(|value| u64::try_from(value).ok())
-        .ok_or_else(|| {
-            SubjektivError::InvalidRecord(
-                "surface generation is not owned by this Job attempt".into(),
-            )
-        })
+    change_id.ok_or_else(|| {
+        SubjektivError::InvalidRecord("surface generation is not owned by this Job attempt".into())
+    })
+}
+
+fn memory_fingerprint_in_connection(connection: &Connection, subject_id: &str) -> Result<String> {
+    let mut statement = connection.prepare(
+        "SELECT memory_id, current_change_id FROM memory_records WHERE subject_id = ?1 ORDER BY memory_id ASC",
+    )?;
+    let identities = statement
+        .query_map([subject_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(memory_identity_fingerprint(&identities))
+}
+
+fn memory_identity_fingerprint(identities: &[(String, String)]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut identities = identities.to_vec();
+    identities.sort();
+    // Length framing prevents delimiter collisions. Change identities include
+    // every state/body/provenance update and prevent ABA reuse.
+    let mut digest = Sha256::new();
+    digest.update(b"subjektiv-memory-identities-v1\0");
+    for (memory_id, change_id) in identities {
+        digest.update((memory_id.len() as u64).to_be_bytes());
+        digest.update(memory_id.as_bytes());
+        digest.update((change_id.len() as u64).to_be_bytes());
+        digest.update(change_id.as_bytes());
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn to_i64(value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| {
-        SubjektivError::InvalidRecord(format!("revision value {value} exceeds SQLite range"))
+        SubjektivError::InvalidRecord(format!("change_id value {value} exceeds SQLite range"))
     })
 }
 
@@ -3738,30 +3299,15 @@ mod tests {
     use super::*;
     use feature_storage::FeatureStorage;
 
-    static V1_MIGRATIONS: &[FeatureMigration] = &[FeatureMigration::new(
-        1,
-        "create subjektiv subject memory store",
-        create_schema,
-    )];
-    static V3_MIGRATIONS: &[FeatureMigration] = &[
-        FeatureMigration::new(1, "create subjektiv subject memory store", create_schema),
-        FeatureMigration::new(
-            2,
-            "add immutable subject session attribution",
-            add_subject_session_attribution,
-        ),
-        FeatureMigration::new(
-            3,
-            "add idempotent atomic candidate decision receipts",
-            add_candidate_decision_receipts,
-        ),
-    ];
-
-    fn role() -> SubjectRole {
+    pub(super) fn role() -> SubjectRole {
         SubjectRole::new("workspace_companion").unwrap()
     }
 
-    fn candidate(subject_id: &str, candidate_id: &str, workspace_id: &str) -> SubjectStagingRecord {
+    pub(super) fn candidate(
+        subject_id: &str,
+        candidate_id: &str,
+        workspace_id: &str,
+    ) -> SubjectStagingRecord {
         let origin = EvidenceOrigin {
             kind: EvidenceOriginKind::HumanInput,
             account_id: Some("account-1".into()),
@@ -3770,7 +3316,7 @@ mod tests {
             worker_id: None,
             flow_selector: None,
             flow_definition_id: None,
-            flow_definition_revision: None,
+            flow_definition_fingerprint: None,
         };
         let record = StagingRecord::from_candidate(
             candidate_id,
@@ -3808,7 +3354,7 @@ mod tests {
         SubjectStagingRecord::attach_at(subject_id, record, "2026-09-28T10:00:00.000Z".into())
     }
 
-    fn attribution(
+    pub(super) fn attribution(
         subject_id: &str,
         runtime_id: &str,
         worker_id: &str,
@@ -3832,15 +3378,15 @@ mod tests {
     }
 
     fn proposal(
-        intent: RevisionProposalIntent,
+        intent: ChangeProposalIntent,
         memory_id: &str,
-        expected_revision: u64,
+        expected_change_id: String,
         change_reason: &str,
-    ) -> RevisionProposal {
-        RevisionProposal::new(intent, memory_id, expected_revision, change_reason).unwrap()
+    ) -> ChangeProposal {
+        ChangeProposal::new(intent, memory_id, expected_change_id, change_reason).unwrap()
     }
 
-    fn open_store(
+    pub(super) fn open_store(
         root: &std::path::Path,
         workspace_id: &str,
     ) -> (FeatureStorage, ScopedFeatureStorage, SubjektivStore) {
@@ -3885,68 +3431,54 @@ mod tests {
     }
 
     #[test]
-    fn subject_behavior_is_bounded_revisioned_and_independent_from_memory_revision() {
+    fn behavior_content_cas_is_independent_of_memory() {
         let temp = tempfile::tempdir().unwrap();
-        let (_manager, _workspace, store) = open_store(temp.path(), "workspace-a");
+        let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
         let subject = store
-            .create_subject_with_behavior(role(), "Prefer explicit evidence.".to_string())
+            .create_subject_with_behavior(role(), "Prefer explicit evidence.".into())
             .unwrap();
-        assert_eq!(subject.behavior_revision, 0);
-        assert_eq!(subject.store_revision, 0);
-
+        let before = store.memory_fingerprint(&subject.id).unwrap();
         let updated = store
             .update_subject_behavior(
                 &subject.id,
-                0,
-                "Prefer explicit evidence.\nAsk when uncertain.".to_string(),
+                &subject.behavior_md,
+                "Ask when uncertain.".into(),
             )
             .unwrap();
-        assert_eq!(updated.behavior_revision, 1);
-        assert_eq!(updated.store_revision, 0);
-
+        assert_eq!(store.memory_fingerprint(&subject.id).unwrap(), before);
         store
-            .create_memory(
+            .create_memory(&subject.id, draft("confirmed", "isolation"))
+            .unwrap();
+        let after = store.subject(&subject.id).unwrap().unwrap();
+        assert_eq!(after.behavior_md, updated.behavior_md);
+        assert_ne!(store.memory_fingerprint(&subject.id).unwrap(), before);
+        let (_reopened_manager, _reopened_scope, reopened) = open_store(temp.path(), "workspace-a");
+        assert_eq!(
+            reopened.subject(&subject.id).unwrap().unwrap().behavior_md,
+            updated.behavior_md
+        );
+        assert!(matches!(
+            store.update_subject_behavior(&subject.id, &subject.behavior_md, String::new()),
+            Err(SubjektivError::SubjectBehaviorConflict { .. })
+        ));
+        let unchanged = store
+            .update_subject_behavior(
                 &subject.id,
-                draft(
-                    "A confirmed observation",
-                    "exercise Memory lifecycle isolation",
-                ),
+                &updated.behavior_md,
+                updated.behavior_md.clone(),
             )
             .unwrap();
-        let after_memory = store.subject(&subject.id).unwrap().unwrap();
-        assert_eq!(after_memory.behavior_md, updated.behavior_md);
-        assert_eq!(after_memory.behavior_revision, 1);
-        assert_eq!(after_memory.store_revision, 1);
-
-        let (_reopened_manager, _reopened_workspace, reopened) =
-            open_store(temp.path(), "workspace-a");
-        let persisted = reopened.subject(&subject.id).unwrap().unwrap();
-        assert_eq!(persisted.behavior_md, updated.behavior_md);
-        assert_eq!(persisted.behavior_revision, 1);
-        assert!(matches!(
-            store.update_subject_behavior(&subject.id, 0, String::new()),
-            Err(SubjektivError::SubjectBehaviorConflict {
-                expected: 0,
-                actual: 1,
-                ..
-            })
-        ));
-
-        let unchanged = store
-            .update_subject_behavior(&subject.id, 1, updated.behavior_md.clone())
-            .unwrap();
-        assert_eq!(unchanged.behavior_revision, 1);
+        assert_eq!(unchanged, after);
         let cleared = store
-            .update_subject_behavior(&subject.id, 1, String::new())
+            .update_subject_behavior(&subject.id, &updated.behavior_md, String::new())
             .unwrap();
-        assert_eq!(cleared.behavior_revision, 2);
         assert!(cleared.behavior_md.is_empty());
         assert!(validate_subject_behavior(&"x".repeat(MAX_SUBJECT_BEHAVIOR_BYTES + 1)).is_err());
         assert!(validate_subject_behavior("   ").is_err());
     }
 
     #[test]
-    fn attributed_candidates_preserve_revision_and_surface_reference_continuity() {
+    fn attributed_candidates_preserve_change_and_surface_reference_continuity() {
         let temp = tempfile::tempdir().unwrap();
         let (_manager, _workspace, store) = open_store(temp.path(), "workspace-a");
         let subject = store.create_subject(role()).unwrap();
@@ -3976,7 +3508,7 @@ mod tests {
             candidate_id: first_candidate.id.clone(),
             reason: "adopt the attributed candidate".into(),
             decision: CandidateDecision::Apply {
-                target: MemoryRevisionTarget::Create,
+                target: MemoryChangeTarget::Create,
                 draft: draft(
                     "Keep the first confirmed rule",
                     "initial attributed decision",
@@ -3986,20 +3518,26 @@ mod tests {
         let created = store
             .decide_candidate(&subject.id, create_request.clone())
             .unwrap();
-        let first_revision = created.memory.unwrap();
-        assert_eq!(first_revision.revision, 1);
+        let first_change = created.memory.unwrap();
+        assert!(!first_change.change_id.is_empty());
         assert_eq!(
-            first_revision.source_candidate_ids,
+            first_change.source_candidate_ids,
             [first_candidate.id.clone()]
         );
         assert_eq!(created.resolution.affected_memory.len(), 1);
-        assert_eq!(created.resolution.affected_memory[0].revision, 1);
+        assert_eq!(
+            created.resolution.affected_memory[0].change_id,
+            first_change.change_id
+        );
 
         // Exact decision retries return the original receipt rather than creating
-        // a second revision or resolution.
+        // a second change_id or resolution.
         let replayed = store.decide_candidate(&subject.id, create_request).unwrap();
-        assert_eq!(replayed.store_revision, created.store_revision);
-        assert_eq!(replayed.memory.as_ref().unwrap().revision, 1);
+        assert_eq!(replayed.memory_fingerprint, created.memory_fingerprint);
+        assert_eq!(
+            replayed.memory.as_ref().unwrap().change_id,
+            first_change.change_id
+        );
 
         let (second_candidate, _) = store
             .stage_candidate_with_attribution(
@@ -4015,21 +3553,29 @@ mod tests {
                     candidate_id: second_candidate.id.clone(),
                     reason: "apply the attributed correction".into(),
                     decision: CandidateDecision::Apply {
-                        target: MemoryRevisionTarget::Revise {
-                            memory_id: first_revision.id.clone(),
-                            expected_revision: 1,
+                        target: MemoryChangeTarget::Revise {
+                            memory_id: first_change.id.clone(),
+                            expected_change_id: first_change.change_id.clone(),
                         },
                         draft: draft("Keep the corrected confirmed rule", "attributed correction"),
                     },
                 },
             )
             .unwrap();
-        let second_revision = revised.memory.unwrap();
-        assert_eq!(second_revision.revision, 2);
-        assert_eq!(second_revision.source_candidate_ids, [second_candidate.id]);
+        let second_change = revised.memory.unwrap();
+        assert_ne!(second_change.change_id, first_change.change_id);
+        assert_eq!(
+            second_change.previous_change_id.as_deref(),
+            Some(first_change.change_id.as_str())
+        );
+        assert_eq!(second_change.source_candidate_ids, [second_candidate.id]);
 
         let historical = store
-            .scoped_memory_revision(&subject.id, &first_revision.id, 1)
+            .scoped_memory_change(
+                &subject.id,
+                &first_change.id,
+                first_change.change_id.clone(),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(historical.source_candidate_ids, [first_candidate.id]);
@@ -4044,11 +3590,11 @@ mod tests {
 
         let generation = store.prepare_surface_generation(&subject.id).unwrap();
         assert_eq!(generation.materials.len(), 1);
-        assert_eq!(generation.materials[0].memory_id, second_revision.id);
-        assert_eq!(generation.materials[0].revision, 2);
-        let expected_ref = MemoryRevisionRef {
-            memory_id: second_revision.id.clone(),
-            revision: second_revision.revision,
+        assert_eq!(generation.materials[0].memory_id, second_change.id);
+        assert_eq!(generation.materials[0].change_id, second_change.change_id);
+        let expected_ref = MemoryChangeRef {
+            memory_id: second_change.id.clone(),
+            change_id: second_change.change_id.clone(),
         };
         let published = store
             .publish_surface_generation(
@@ -4061,7 +3607,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(published.memory_refs, [expected_ref.clone()]);
-        assert_eq!(published.built_from_store_revision, revised.store_revision);
+        assert_eq!(
+            published.built_from_memory_fingerprint,
+            revised.memory_fingerprint
+        );
 
         let resident = store.resident_surface(&subject.id).unwrap();
         assert_eq!(resident.availability, SurfaceAvailability::Ready);
@@ -4079,47 +3628,53 @@ mod tests {
             decoded.source_refs[0].session_id.as_deref(),
             Some("session-1")
         );
-        assert!(decoded.revision_proposal.is_none());
-        assert!(!raw.contains("revision_proposal"));
+        assert!(decoded.change_proposal.is_none());
+        assert!(!raw.contains("change_proposal"));
         assert!(raw.contains("human_input"));
 
         let proposed = staging
             .clone()
-            .with_revision_proposal(proposal(
-                RevisionProposalIntent::Revise,
+            .with_change_proposal(proposal(
+                ChangeProposalIntent::Revise,
                 "memory-1",
-                3,
+                "fixture-change".into(),
                 "Incorporate the new bounded evidence",
             ))
             .unwrap();
         let proposed_raw = serde_json::to_string(&proposed).unwrap();
         let proposed_decoded: SubjectStagingRecord = serde_json::from_str(&proposed_raw).unwrap();
         assert_eq!(
-            proposed_decoded.revision_proposal,
+            proposed_decoded.change_proposal,
             Some(proposal(
-                RevisionProposalIntent::Revise,
+                ChangeProposalIntent::Revise,
                 "memory-1",
-                3,
+                "fixture-change".into(),
                 "Incorporate the new bounded evidence",
             ))
         );
         assert!(
-            RevisionProposal::new(
-                RevisionProposalIntent::Revise,
+            ChangeProposal::new(
+                ChangeProposalIntent::Revise,
                 "memory-1",
-                0,
-                "invalid zero revision"
+                String::new(),
+                "invalid zero change_id"
             )
             .is_err()
         );
         assert!(
-            RevisionProposal::new(RevisionProposalIntent::Revise, "memory-1", 1, "   ").is_err()
+            ChangeProposal::new(
+                ChangeProposalIntent::Revise,
+                "memory-1",
+                "fixture-change".into(),
+                "   "
+            )
+            .is_err()
         );
         assert!(
-            serde_json::from_value::<RevisionProposal>(serde_json::json!({
+            serde_json::from_value::<ChangeProposal>(serde_json::json!({
                 "intent": "revise",
                 "memory_id": "memory-1",
-                "expected_revision": 0,
+                "expected_change_id": "",
                 "change_reason": "invalid"
             }))
             .is_err()
@@ -4136,7 +3691,8 @@ mod tests {
             schema_version: SUBJEKTIV_SCHEMA_VERSION,
             id: "memory-1".into(),
             subject_id: "subject-1".into(),
-            revision: 1,
+            change_id: "fixture-change".into(),
+            previous_change_id: None,
             kind: CandidateKind::Constraint,
             state: MemoryState::Active,
             claim: "Memory is not authority".into(),
@@ -4151,187 +3707,8 @@ mod tests {
         };
         let raw = serde_json::to_string(&memory).unwrap();
         let decoded: MemoryRecord = serde_json::from_str(&raw).unwrap();
-        assert_eq!(decoded.revision, 1);
+        assert!(!decoded.change_id.is_empty());
         assert!(serde_json::from_str::<MemoryRecord>(&raw.replace("active", "unknown")).is_err());
-    }
-
-    #[test]
-    fn v1_store_migrates_before_attributed_staging() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("storage");
-        let subject_id = {
-            let manager = FeatureStorage::new(&root);
-            let workspace = manager.workspace("workspace-a").unwrap();
-            let registration = workspace
-                .register(FeatureRegistration::new(
-                    SUBJEKTIV_FEATURE_ID,
-                    V1_MIGRATIONS,
-                ))
-                .unwrap();
-            let store = SubjektivStore::open(&workspace, &registration).unwrap();
-            let timestamp = now();
-            let subject_id = issued_id("subject");
-            let mut raw = serde_json::json!({
-                "schema_version": SUBJEKTIV_SCHEMA_VERSION,
-                "id": subject_id,
-                "role": role(),
-                "state": SubjectState::Active,
-                "store_revision": 0,
-                "created_at": timestamp.clone(),
-                "updated_at": timestamp.clone(),
-            });
-            let raw = serde_json::to_string(&raw.take()).unwrap();
-            store
-                .database
-                .try_transaction(|transaction| -> Result<()> {
-                    transaction.execute(
-                        "INSERT INTO subjects (
-                            subject_id, role, state, store_revision,
-                            record_json, created_at, updated_at
-                         ) VALUES (?1, ?2, 'active', 0, ?3, ?4, ?5)",
-                        params![subject_id, role().as_str(), raw, timestamp, timestamp],
-                    )?;
-                    Ok(())
-                })
-                .unwrap();
-            subject_id
-        };
-
-        let (_manager, _workspace, store) = open_store(&root, "workspace-a");
-        let migrated_subject = store.subject(&subject_id).unwrap().unwrap();
-        assert!(migrated_subject.behavior_md.is_empty());
-        assert_eq!(migrated_subject.behavior_revision, 0);
-        let lifecycle_attribution = attribution(
-            &subject_id,
-            "runtime-1",
-            "worker-1",
-            "session-1",
-            "2026-09-28T10:00:00.000Z",
-        );
-        store
-            .record_session_attribution(lifecycle_attribution.clone())
-            .unwrap();
-        let (staged, stored_attribution) = store
-            .stage_candidate_with_attribution(
-                candidate(&subject_id, "candidate-after-migration", "workspace-a"),
-                lifecycle_attribution,
-            )
-            .unwrap();
-
-        assert_eq!(staged.subject_id, subject_id);
-        assert_eq!(stored_attribution.session_id, "session-1");
-        assert_eq!(
-            store.session_attribution("session-1").unwrap().unwrap(),
-            stored_attribution
-        );
-    }
-
-    #[test]
-    fn legacy_surface_snapshot_migrates_as_stale_until_regenerated() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("storage");
-        let (subject_id, snapshot_id) = {
-            let manager = FeatureStorage::new(&root);
-            let workspace = manager.workspace("workspace-a").unwrap();
-            let registration = workspace
-                .register(FeatureRegistration::new(
-                    SUBJEKTIV_FEATURE_ID,
-                    V3_MIGRATIONS,
-                ))
-                .unwrap();
-            let store = SubjektivStore::open(&workspace, &registration).unwrap();
-            let subject_id = issued_id("subject");
-            let timestamp = now();
-            let subject_json = serde_json::to_string(&serde_json::json!({
-                "schema_version": SUBJEKTIV_SCHEMA_VERSION,
-                "id": subject_id,
-                "role": role(),
-                "state": SubjectState::Active,
-                "store_revision": 0,
-                "created_at": timestamp,
-                "updated_at": timestamp,
-            }))
-            .unwrap();
-            let snapshot = SurfaceSnapshot {
-                schema_version: SUBJEKTIV_SCHEMA_VERSION,
-                id: "legacy-surface".into(),
-                subject_id: subject_id.clone(),
-                body_md: "Legacy summary without generation-policy evidence.".into(),
-                memory_refs: Vec::new(),
-                built_from_store_revision: 0,
-                created_at: now(),
-            };
-            store
-                .database
-                .try_transaction(|transaction| -> Result<()> {
-                    transaction.execute(
-                        "INSERT INTO subjects (
-                            subject_id, role, state, store_revision,
-                            record_json, created_at, updated_at
-                         ) VALUES (?1, ?2, 'active', 0, ?3, ?4, ?5)",
-                        params![
-                            subject_id,
-                            role().as_str(),
-                            subject_json,
-                            timestamp,
-                            timestamp
-                        ],
-                    )?;
-                    transaction.execute(
-                        "INSERT INTO surface_snapshots (
-                            subject_id, snapshot_id, built_from_store_revision,
-                            snapshot_json, created_at
-                         ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![
-                            subject_id,
-                            snapshot.id,
-                            to_i64(snapshot.built_from_store_revision)?,
-                            serde_json::to_string(&snapshot)?,
-                            snapshot.created_at
-                        ],
-                    )?;
-                    transaction.execute(
-                        "INSERT INTO surface_snapshot_seals (subject_id, snapshot_id)
-                         VALUES (?1, ?2)",
-                        params![subject_id, snapshot.id],
-                    )?;
-                    Ok(())
-                })
-                .unwrap();
-            (subject_id, snapshot.id)
-        };
-
-        let (_manager, _workspace, store) = open_store(&root, "workspace-a");
-        let resident = store.resident_surface(&subject_id).unwrap();
-        assert_eq!(resident.availability, SurfaceAvailability::Stale);
-        assert!(resident.snapshot.is_none());
-        assert!(
-            store
-                .surface_snapshot(&subject_id, &snapshot_id)
-                .unwrap()
-                .is_some(),
-            "migration retains the legacy snapshot as history without injecting it"
-        );
-
-        let generation = store.prepare_surface_generation(&subject_id).unwrap();
-        let regenerated = store
-            .publish_surface_generation(&subject_id, &generation.id, Vec::new())
-            .unwrap();
-        assert_ne!(regenerated.id, snapshot_id);
-        let ready = store.resident_surface(&subject_id).unwrap();
-        assert_eq!(ready.availability, SurfaceAvailability::Ready);
-        assert_eq!(ready.snapshot.unwrap().id, regenerated.id);
-        assert!(
-            store
-                .surface_snapshot(&subject_id, &snapshot_id)
-                .unwrap()
-                .is_some(),
-            "regeneration appends instead of mutating legacy history"
-        );
-        let retried = store
-            .publish_surface_generation(&subject_id, &generation.id, Vec::new())
-            .unwrap();
-        assert_eq!(retried.id, regenerated.id);
     }
 
     #[test]
@@ -4657,7 +4034,7 @@ mod tests {
     }
 
     #[test]
-    fn revision_proposal_roundtrips_through_staging_and_resolution() {
+    fn change_proposal_roundtrips_through_staging_and_resolution() {
         let temp = tempfile::tempdir().unwrap();
         let (_manager, _workspace, store) = open_store(&temp.path().join("storage"), "workspace-a");
         let subject = store.create_subject(role()).unwrap();
@@ -4665,25 +4042,25 @@ mod tests {
             .create_memory(&subject.id, draft("Existing memory", "initial observation"))
             .unwrap();
         let proposal = proposal(
-            RevisionProposalIntent::Revise,
+            ChangeProposalIntent::Revise,
             &memory.id,
-            1,
+            memory.change_id.clone(),
             "Refine the wording from new evidence",
         );
         let staged = store
             .stage_candidate(
                 candidate(&subject.id, "candidate-proposed", "workspace-a")
-                    .with_revision_proposal(proposal.clone())
+                    .with_change_proposal(proposal.clone())
                     .unwrap(),
             )
             .unwrap();
-        assert_eq!(staged.revision_proposal, Some(proposal.clone()));
+        assert_eq!(staged.change_proposal, Some(proposal.clone()));
         assert_eq!(
             store
                 .staging_candidate(&subject.id, &staged.id)
                 .unwrap()
                 .unwrap()
-                .revision_proposal,
+                .change_proposal,
             Some(proposal.clone())
         );
 
@@ -4696,17 +4073,14 @@ mod tests {
                 vec![],
             )
             .unwrap();
-        assert_eq!(
-            resolution.candidate.revision_proposal,
-            Some(proposal.clone())
-        );
+        assert_eq!(resolution.candidate.change_proposal, Some(proposal.clone()));
         assert_eq!(
             store
                 .staging_resolution(&subject.id, &staged.id)
                 .unwrap()
                 .unwrap()
                 .candidate
-                .revision_proposal,
+                .change_proposal,
             Some(proposal)
         );
     }
@@ -4723,10 +4097,10 @@ mod tests {
         let staged = store
             .stage_candidate(
                 candidate(&subject.id, "candidate-resolve-atomic", "workspace-a")
-                    .with_revision_proposal(proposal(
-                        RevisionProposalIntent::Resolve,
+                    .with_change_proposal(proposal(
+                        ChangeProposalIntent::Resolve,
                         &memory.id,
-                        memory.revision,
+                        memory.change_id.clone(),
                         change_reason,
                     ))
                     .unwrap(),
@@ -4739,9 +4113,9 @@ mod tests {
             candidate_id: staged.id.clone(),
             reason: "Accepted exact resolution proposal".into(),
             decision: CandidateDecision::Apply {
-                target: MemoryRevisionTarget::Revise {
+                target: MemoryChangeTarget::Revise {
                     memory_id: memory.id.clone(),
-                    expected_revision: memory.revision,
+                    expected_change_id: memory.change_id.clone(),
                 },
                 draft: revised,
             },
@@ -4752,23 +4126,29 @@ mod tests {
             .unwrap();
         let retried = store.decide_candidate(&subject.id, request).unwrap();
 
-        assert_eq!(first.memory.as_ref().unwrap().revision, 2);
-        assert_eq!(retried.memory.as_ref().unwrap().revision, 2);
+        assert_eq!(
+            first.memory.as_ref().unwrap().previous_change_id.as_deref(),
+            Some(memory.change_id.as_str())
+        );
+        assert_eq!(
+            retried.memory.as_ref().unwrap().change_id,
+            first.memory.as_ref().unwrap().change_id
+        );
         assert_eq!(first.resolution.id, retried.resolution.id);
-        assert_eq!(first.store_revision, 2);
+        assert_eq!(first.memory_fingerprint, retried.memory_fingerprint);
         assert!(first.surface_dirty);
         assert_eq!(
             first
                 .resolution
                 .candidate
-                .revision_proposal
+                .change_proposal
                 .unwrap()
                 .change_reason,
             change_reason
         );
         assert_eq!(
             store
-                .list_memory_revisions(&subject.id, &memory.id)
+                .list_memory_changes(&subject.id, &memory.id)
                 .unwrap()
                 .len(),
             2
@@ -4786,17 +4166,22 @@ mod tests {
         let stale = store
             .stage_candidate(
                 candidate(&subject.id, "candidate-stale-apply", "workspace-a")
-                    .with_revision_proposal(proposal(
-                        RevisionProposalIntent::Revise,
+                    .with_change_proposal(proposal(
+                        ChangeProposalIntent::Revise,
                         &memory.id,
-                        1,
+                        memory.change_id.clone(),
                         "stale correction",
                     ))
                     .unwrap(),
             )
             .unwrap();
         store
-            .revise_memory(&subject.id, &memory.id, 1, draft("Advanced", "advance"))
+            .revise_memory(
+                &subject.id,
+                &memory.id,
+                memory.change_id.clone(),
+                draft("Advanced", "advance"),
+            )
             .unwrap();
         let stale_result = store.decide_candidate(
             &subject.id,
@@ -4805,9 +4190,9 @@ mod tests {
                 candidate_id: stale.id.clone(),
                 reason: "must not auto-rebase".into(),
                 decision: CandidateDecision::Apply {
-                    target: MemoryRevisionTarget::Revise {
+                    target: MemoryChangeTarget::Revise {
                         memory_id: memory.id.clone(),
-                        expected_revision: 1,
+                        expected_change_id: memory.change_id.clone(),
                     },
                     draft: draft("Stale", "stale correction"),
                 },
@@ -4815,11 +4200,7 @@ mod tests {
         );
         assert!(matches!(
             stale_result,
-            Err(SubjektivError::RevisionConflict {
-                expected: 1,
-                actual: 2,
-                ..
-            })
+            Err(SubjektivError::MemoryChangeConflict { .. })
         ));
         assert!(
             store
@@ -4830,17 +4211,17 @@ mod tests {
 
         let apply_intent = |store: &SubjektivStore,
                             candidate_id: &str,
-                            intent: RevisionProposalIntent,
-                            expected_revision: u64,
+                            intent: ChangeProposalIntent,
+                            expected_change_id: String,
                             state: MemoryState,
                             reason: &str| {
             let staged = store
                 .stage_candidate(
                     candidate(&subject.id, candidate_id, "workspace-a")
-                        .with_revision_proposal(proposal(
+                        .with_change_proposal(proposal(
                             intent,
                             &memory.id,
-                            expected_revision,
+                            expected_change_id.clone(),
                             reason,
                         ))
                         .unwrap(),
@@ -4856,9 +4237,9 @@ mod tests {
                         candidate_id: staged.id,
                         reason: format!("apply {candidate_id}"),
                         decision: CandidateDecision::Apply {
-                            target: MemoryRevisionTarget::Revise {
+                            target: MemoryChangeTarget::Revise {
                                 memory_id: memory.id.clone(),
-                                expected_revision,
+                                expected_change_id,
                             },
                             draft: next,
                         },
@@ -4871,24 +4252,28 @@ mod tests {
         let resolved = apply_intent(
             &store,
             "resolve",
-            RevisionProposalIntent::Resolve,
-            2,
+            ChangeProposalIntent::Resolve,
+            store
+                .memory(&subject.id, &memory.id)
+                .unwrap()
+                .unwrap()
+                .change_id,
             MemoryState::Resolved,
             "resolve reason",
         );
         let reopened = apply_intent(
             &store,
             "reopen",
-            RevisionProposalIntent::Reopen,
-            resolved.revision,
+            ChangeProposalIntent::Reopen,
+            resolved.change_id.clone(),
             MemoryState::Active,
             "reopen reason",
         );
         let retracted = apply_intent(
             &store,
             "retract",
-            RevisionProposalIntent::Retract,
-            reopened.revision,
+            ChangeProposalIntent::Retract,
+            reopened.change_id.clone(),
             MemoryState::Retracted,
             "retract reason",
         );
@@ -4896,10 +4281,10 @@ mod tests {
         assert!(matches!(
             store.stage_candidate(
                 candidate(&subject.id, "post-retract", "workspace-a")
-                    .with_revision_proposal(proposal(
-                        RevisionProposalIntent::Reopen,
+                    .with_change_proposal(proposal(
+                        ChangeProposalIntent::Reopen,
                         &memory.id,
-                        retracted.revision,
+                        retracted.change_id.clone(),
                         "cannot revive",
                     ))
                     .unwrap()
@@ -4921,9 +4306,9 @@ mod tests {
             .stage_candidate(candidate(&other.id, "candidate-foreign", "workspace-a"))
             .unwrap();
         let mut invalid = draft("Would be written", "must roll back");
-        invalid.derived_from.push(MemoryRevisionRef {
+        invalid.derived_from.push(MemoryChangeRef {
             memory_id: "missing-memory".into(),
-            revision: 1,
+            change_id: "fixture-change".into(),
         });
         let failed = store.decide_candidate(
             &subject.id,
@@ -4932,7 +4317,7 @@ mod tests {
                 candidate_id: staged.id.clone(),
                 reason: "invalid derivation".into(),
                 decision: CandidateDecision::Apply {
-                    target: MemoryRevisionTarget::Create,
+                    target: MemoryChangeTarget::Create,
                     draft: invalid,
                 },
             },
@@ -5027,7 +4412,7 @@ mod tests {
     }
 
     #[test]
-    fn revision_proposals_enforce_scope_revision_and_state_transitions() {
+    fn change_proposals_enforce_scope_change_and_state_transitions() {
         let temp = tempfile::tempdir().unwrap();
         let (_manager, _workspace, store) = open_store(&temp.path().join("storage"), "workspace-a");
         let subject = store.create_subject(role()).unwrap();
@@ -5040,10 +4425,10 @@ mod tests {
             .unwrap();
 
         let foreign = candidate(&other_subject.id, "candidate-foreign-target", "workspace-a")
-            .with_revision_proposal(proposal(
-                RevisionProposalIntent::Revise,
+            .with_change_proposal(proposal(
+                ChangeProposalIntent::Revise,
                 &memory.id,
-                1,
+                memory.change_id.clone(),
                 "Must remain subject scoped",
             ))
             .unwrap();
@@ -5056,36 +4441,34 @@ mod tests {
         ));
 
         let stale = candidate(&subject.id, "candidate-stale", "workspace-a")
-            .with_revision_proposal(proposal(
-                RevisionProposalIntent::Resolve,
+            .with_change_proposal(proposal(
+                ChangeProposalIntent::Resolve,
                 &memory.id,
-                2,
+                "missing-change".into(),
                 "Resolve the active memory",
             ))
             .unwrap();
         assert!(matches!(
             store.stage_candidate(stale),
-            Err(SubjektivError::RevisionConflict {
-                memory_id,
-                expected: 2,
-                actual: 1,
-            }) if memory_id == memory.id
+            Err(SubjektivError::MemoryChangeConflict {
+                memory_id, ..
+                }) if memory_id == memory.id
         ));
 
         let resolve_proposal = candidate(&subject.id, "candidate-resolve", "workspace-a")
-            .with_revision_proposal(proposal(
-                RevisionProposalIntent::Resolve,
+            .with_change_proposal(proposal(
+                ChangeProposalIntent::Resolve,
                 &memory.id,
-                1,
+                memory.change_id.clone(),
                 "The active condition has ended",
             ))
             .unwrap();
         assert!(store.stage_candidate(resolve_proposal).is_ok());
         let invalid_reopen = candidate(&subject.id, "candidate-invalid-reopen", "workspace-a")
-            .with_revision_proposal(proposal(
-                RevisionProposalIntent::Reopen,
+            .with_change_proposal(proposal(
+                ChangeProposalIntent::Reopen,
                 &memory.id,
-                1,
+                memory.change_id.clone(),
                 "An active Memory cannot be reopened",
             ))
             .unwrap();
@@ -5101,16 +4484,16 @@ mod tests {
         let mut resolve = draft("Resolved target", "the condition ended");
         resolve.state = MemoryState::Resolved;
         let resolved = store
-            .revise_memory(&subject.id, &memory.id, 1, resolve)
+            .revise_memory(&subject.id, &memory.id, memory.change_id.clone(), resolve)
             .unwrap();
         let mut attributed_stale =
             candidate(&subject.id, "candidate-attributed-stale", "workspace-a");
         attributed_stale.source_refs[0].session_id = None;
         attributed_stale
-            .attach_revision_proposal(proposal(
-                RevisionProposalIntent::Revise,
+            .attach_change_proposal(proposal(
+                ChangeProposalIntent::Revise,
                 &memory.id,
-                1,
+                memory.change_id.clone(),
                 "This attribution must roll back with the stale proposal",
             ))
             .unwrap();
@@ -5126,11 +4509,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store.stage_candidate_with_attribution(attributed_stale, stale_attribution,),
-            Err(SubjektivError::RevisionConflict {
-                expected: 1,
-                actual: 2,
-                ..
-            })
+            Err(SubjektivError::MemoryChangeConflict { .. })
         ));
         assert!(
             store
@@ -5139,10 +4518,10 @@ mod tests {
                 .is_some()
         );
         let reopen = candidate(&subject.id, "candidate-reopen", "workspace-a")
-            .with_revision_proposal(proposal(
-                RevisionProposalIntent::Reopen,
+            .with_change_proposal(proposal(
+                ChangeProposalIntent::Reopen,
                 &memory.id,
-                resolved.revision,
+                resolved.change_id.clone(),
                 "The condition applies again",
             ))
             .unwrap();
@@ -5150,16 +4529,16 @@ mod tests {
             store
                 .stage_candidate(reopen)
                 .unwrap()
-                .revision_proposal
+                .change_proposal
                 .unwrap()
                 .intent,
-            RevisionProposalIntent::Reopen
+            ChangeProposalIntent::Reopen
         );
         let retract_proposal = candidate(&subject.id, "candidate-retract", "workspace-a")
-            .with_revision_proposal(proposal(
-                RevisionProposalIntent::Retract,
+            .with_change_proposal(proposal(
+                ChangeProposalIntent::Retract,
                 &memory.id,
-                resolved.revision,
+                resolved.change_id.clone(),
                 "The supporting evidence was invalidated",
             ))
             .unwrap();
@@ -5168,13 +4547,13 @@ mod tests {
         let mut retract = draft("Retracted target", "the evidence was invalidated");
         retract.state = MemoryState::Retracted;
         let retracted = store
-            .revise_memory(&subject.id, &memory.id, resolved.revision, retract)
+            .revise_memory(&subject.id, &memory.id, resolved.change_id.clone(), retract)
             .unwrap();
         let terminal = candidate(&subject.id, "candidate-after-retract", "workspace-a")
-            .with_revision_proposal(proposal(
-                RevisionProposalIntent::Revise,
+            .with_change_proposal(proposal(
+                ChangeProposalIntent::Revise,
                 &memory.id,
-                retracted.revision,
+                retracted.change_id.clone(),
                 "Retraction must remain terminal",
             ))
             .unwrap();
@@ -5199,11 +4578,11 @@ mod tests {
         let staged = store
             .stage_candidate(
                 candidate(&subject.id, "candidate-retry-proposal", "workspace-a")
-                    .with_revision_proposal(proposal(
-                        RevisionProposalIntent::Revise,
+                    .with_change_proposal(proposal(
+                        ChangeProposalIntent::Revise,
                         &memory.id,
-                        1,
-                        "Refine the current revision",
+                        memory.change_id.clone(),
+                        "Refine the current change_id",
                     ))
                     .unwrap(),
             )
@@ -5212,7 +4591,7 @@ mod tests {
             .revise_memory(
                 &subject.id,
                 &memory.id,
-                1,
+                memory.change_id.clone(),
                 draft("Advanced target", "another accepted refinement"),
             )
             .unwrap();
@@ -5221,7 +4600,7 @@ mod tests {
         retry.created_at = "2026-09-28T11:00:00.000Z".into();
         let retried = store.stage_candidate(retry).unwrap();
         assert_eq!(retried.created_at, staged.created_at);
-        assert_eq!(retried.revision_proposal, staged.revision_proposal);
+        assert_eq!(retried.change_proposal, staged.change_proposal);
     }
 
     #[test]
@@ -5249,30 +4628,30 @@ mod tests {
         );
 
         thread::sleep(Duration::from_millis(2));
-        let mut revision = draft("First memory revised", "second revision reason");
-        revision.body_md = "New second body".into();
+        let mut change_id = draft("First memory revised", "second change_id reason");
+        change_id.body_md = "New second body".into();
         let revised = store
-            .revise_memory(&subject.id, &first.id, 1, revision)
+            .revise_memory(&subject.id, &first.id, first.change_id.clone(), change_id)
             .unwrap();
         let memories = store.list_memories(&subject.id).unwrap();
         assert_eq!(memories[0].id, first.id);
-        assert_eq!(memories[0].revision, 2);
+        assert_eq!(memories[0].change_id, revised.change_id);
 
-        let history = store.list_memory_revisions(&subject.id, &first.id).unwrap();
+        let history = store.list_memory_changes(&subject.id, &first.id).unwrap();
         assert_eq!(
             history
                 .iter()
-                .map(|record| record.revision)
+                .map(|record| record.change_id.clone())
                 .collect::<Vec<_>>(),
-            vec![2, 1]
+            vec![revised.change_id.clone(), first.change_id.clone()]
         );
         assert_eq!(history[0].body_md, "New second body");
-        assert_eq!(history[0].change_reason, "second revision reason");
+        assert_eq!(history[0].change_reason, "second change_id reason");
         assert_eq!(history[1].body_md, "Immutable first body");
         assert_eq!(history[1].change_reason, "first reason");
         assert_eq!(
             store
-                .scoped_memory_revision(&subject.id, &first.id, 1)
+                .scoped_memory_change(&subject.id, &first.id, first.change_id.clone())
                 .unwrap()
                 .unwrap()
                 .body_md,
@@ -5280,11 +4659,11 @@ mod tests {
         );
         let scoped_current = store.scoped_memory(&subject.id, &first.id).unwrap();
         assert_eq!(scoped_current.id, revised.id);
-        assert_eq!(scoped_current.revision, revised.revision);
+        assert_eq!(scoped_current.change_id.clone(), revised.change_id);
         assert_eq!(scoped_current.body_md, revised.body_md);
 
         assert!(matches!(
-            store.list_memory_revisions(&other_subject.id, &first.id),
+            store.list_memory_changes(&other_subject.id, &first.id),
             Err(SubjektivError::SubjectScopeMismatch {
                 subject_id,
                 reference,
@@ -5297,7 +4676,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_apply_revision_history_and_resolution_are_atomic() {
+    fn candidate_apply_change_history_and_resolution_are_atomic() {
         let temp = tempfile::tempdir().unwrap();
         let (_manager, _workspace, store) = open_store(&temp.path().join("storage"), "workspace-a");
         let subject = store.create_subject(role()).unwrap();
@@ -5313,7 +4692,7 @@ mod tests {
             .apply_candidate(
                 &subject.id,
                 &staged.id,
-                MemoryRevisionTarget::Create,
+                MemoryChangeTarget::Create,
                 draft(
                     "Memory content cannot authorize operations",
                     "accepted candidate",
@@ -5321,13 +4700,10 @@ mod tests {
                 "Applied as a durable constraint",
             )
             .unwrap();
-        assert_eq!(first.revision, 1);
+        assert!(!first.change_id.is_empty());
         assert_eq!(resolution.action, StagingResolutionAction::Applied);
-        assert_eq!(resolution.affected_memory[0].revision, 1);
-        assert_eq!(
-            store.subject(&subject.id).unwrap().unwrap().store_revision,
-            1
-        );
+        assert_eq!(resolution.affected_memory[0].change_id, first.change_id);
+        assert_eq!(store.list_memories(&subject.id).unwrap().len(), 1);
 
         let unrelated = store
             .stage_candidate(candidate(&subject.id, "candidate-unrelated", "workspace-a"))
@@ -5338,9 +4714,9 @@ mod tests {
                 &unrelated.id,
                 StagingResolutionAction::Applied,
                 "must not bypass atomic application",
-                vec![MemoryRevisionRef {
+                vec![MemoryChangeRef {
                     memory_id: first.id.clone(),
-                    revision: 1,
+                    change_id: first.change_id.clone(),
                 }],
             ),
             Err(SubjektivError::InvalidRecord(_))
@@ -5361,24 +4737,20 @@ mod tests {
         let stale = store.revise_memory(
             &subject.id,
             &first.id,
-            0,
-            draft("stale write", "wrong expected revision"),
+            "missing-change".into(),
+            draft("stale write", "wrong expected change_id"),
         );
         assert!(matches!(
             stale,
-            Err(SubjektivError::RevisionConflict {
-                expected: 0,
-                actual: 1,
-                ..
-            })
+            Err(SubjektivError::MemoryChangeConflict { .. })
         ));
-        assert_eq!(
-            store
+        assert!(
+            !store
                 .memory(&subject.id, &first.id)
                 .unwrap()
                 .unwrap()
-                .revision,
-            1
+                .change_id
+                .is_empty()
         );
 
         let mut second_draft = draft(
@@ -5386,55 +4758,57 @@ mod tests {
             "made the scope explicit",
         );
         second_draft.state = MemoryState::Resolved;
-        second_draft.derived_from.push(MemoryRevisionRef {
+        second_draft.derived_from.push(MemoryChangeRef {
             memory_id: first.id.clone(),
-            revision: 1,
+            change_id: first.change_id.clone(),
         });
         let second = store
-            .revise_memory(&subject.id, &first.id, 1, second_draft)
+            .revise_memory(
+                &subject.id,
+                &first.id,
+                first.change_id.clone(),
+                second_draft,
+            )
             .unwrap();
-        assert_eq!(second.revision, 2);
+        assert_eq!(
+            second.previous_change_id.as_deref(),
+            Some(first.change_id.as_str())
+        );
         assert_eq!(second.state, MemoryState::Resolved);
-        assert_eq!(second.derived_from[0].revision, 1);
+        assert_eq!(second.derived_from[0].change_id, first.change_id);
 
         let old = store
-            .memory_revision(&subject.id, &first.id, 1)
+            .memory_change(&subject.id, &first.id, first.change_id.clone())
             .unwrap()
             .unwrap();
         assert_eq!(old.claim, "Memory content cannot authorize operations");
         assert_eq!(old.source_candidate_ids, ["candidate-1"]);
-        assert_eq!(
-            store.subject(&subject.id).unwrap().unwrap().store_revision,
-            2
-        );
+        assert_eq!(store.list_memories(&subject.id).unwrap().len(), 1);
 
         let repeat = store.apply_candidate(
             &subject.id,
             &staged.id,
-            MemoryRevisionTarget::Revise {
+            MemoryChangeTarget::Revise {
                 memory_id: first.id.clone(),
-                expected_revision: 2,
+                expected_change_id: "missing-change".into(),
             },
             draft("must roll back", "candidate already resolved"),
             "cannot apply twice",
         );
         assert!(matches!(repeat, Err(SubjektivError::CandidateResolved(_))));
-        assert_eq!(
-            store
+        assert!(
+            !store
                 .memory(&subject.id, &first.id)
                 .unwrap()
                 .unwrap()
-                .revision,
-            2
+                .change_id
+                .is_empty()
         );
-        assert_eq!(
-            store.subject(&subject.id).unwrap().unwrap().store_revision,
-            2
-        );
+        assert_eq!(store.list_memories(&subject.id).unwrap().len(), 1);
     }
 
     #[test]
-    fn concurrent_writers_get_one_typed_revision_conflict() {
+    fn concurrent_writers_get_one_typed_change_conflict() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("storage");
         let first_manager = FeatureStorage::new(&root);
@@ -5443,7 +4817,7 @@ mod tests {
         let first_store = SubjektivStore::open(&first_workspace, &first_registration).unwrap();
         let subject = first_store.create_subject(role()).unwrap();
         let memory = first_store
-            .create_memory(&subject.id, draft("Revision basis", "initial"))
+            .create_memory(&subject.id, draft("Change basis", "initial"))
             .unwrap();
 
         let second_manager = FeatureStorage::new(&root);
@@ -5454,12 +4828,13 @@ mod tests {
         let revise = |store: SubjektivStore, claim: &'static str, barrier: Arc<Barrier>| {
             let subject_id = subject.id.clone();
             let memory_id = memory.id.clone();
+            let expected_change_id = memory.change_id.clone();
             thread::spawn(move || {
                 barrier.wait();
                 store.revise_memory(
                     &subject_id,
                     &memory_id,
-                    1,
+                    expected_change_id,
                     draft(claim, "concurrent refinement"),
                 )
             })
@@ -5472,22 +4847,15 @@ mod tests {
         assert_eq!(
             results
                 .iter()
-                .filter(|result| matches!(result, Err(SubjektivError::RevisionConflict { .. })))
+                .filter(|result| matches!(result, Err(SubjektivError::MemoryChangeConflict { .. })))
                 .count(),
             1
         );
-        assert_eq!(
-            first_store
-                .subject(&subject.id)
-                .unwrap()
-                .unwrap()
-                .store_revision,
-            2
-        );
+        assert_eq!(first_store.list_memories(&subject.id).unwrap().len(), 1);
     }
 
     #[test]
-    fn scope_and_fixed_revision_references_are_enforced() {
+    fn scope_and_fixed_change_references_are_enforced() {
         let temp = tempfile::tempdir().unwrap();
         let manager = FeatureStorage::new(temp.path().join("storage"));
         let registration = manager.register(REGISTRATION).unwrap();
@@ -5510,49 +4878,35 @@ mod tests {
             Err(SubjektivError::SubjectNotFound(_))
         ));
         let mut foreign_derived = draft("Workspace B experience", "invalid derivation");
-        foreign_derived.derived_from.push(MemoryRevisionRef {
+        foreign_derived.derived_from.push(MemoryChangeRef {
             memory_id: memory_a.id.clone(),
-            revision: 1,
+            change_id: memory_a.change_id.clone(),
         });
         assert!(matches!(
             store_b.create_memory(&subject_b.id, foreign_derived),
             Err(SubjektivError::SubjectScopeMismatch { .. })
         ));
-        assert_eq!(
-            store_b
-                .subject(&subject_b.id)
-                .unwrap()
-                .unwrap()
-                .store_revision,
-            0
-        );
+        assert_eq!(store_b.list_memories(&subject_b.id).unwrap().len(), 0);
 
         let mut other_subject_derived = draft("Same Workspace, other subject", "invalid scope");
-        other_subject_derived.derived_from.push(MemoryRevisionRef {
+        other_subject_derived.derived_from.push(MemoryChangeRef {
             memory_id: memory_a.id.clone(),
-            revision: 1,
+            change_id: memory_a.change_id.clone(),
         });
         assert!(matches!(
             store_a.create_memory(&other_subject_a.id, other_subject_derived),
             Err(SubjektivError::SubjectScopeMismatch { .. })
         ));
-        let mut wrong_revision = draft("Missing fixed revision", "invalid revision");
-        wrong_revision.derived_from.push(MemoryRevisionRef {
+        let mut wrong_change = draft("Missing fixed change_id", "invalid change_id");
+        wrong_change.derived_from.push(MemoryChangeRef {
             memory_id: memory_a.id.clone(),
-            revision: 2,
+            change_id: "missing-change".into(),
         });
         assert!(matches!(
-            store_a.create_memory(&subject_a.id, wrong_revision),
+            store_a.create_memory(&subject_a.id, wrong_change),
             Err(SubjektivError::SubjectScopeMismatch { .. })
         ));
-        assert_eq!(
-            store_a
-                .subject(&other_subject_a.id)
-                .unwrap()
-                .unwrap()
-                .store_revision,
-            0
-        );
+        assert_eq!(store_a.list_memories(&other_subject_a.id).unwrap().len(), 0);
 
         let foreign_origin = candidate(&subject_a.id, "candidate-foreign", "workspace-b");
         assert!(matches!(
@@ -5573,11 +4927,11 @@ mod tests {
             .create_surface_snapshot(
                 &subject.id,
                 "Bounded resident summary",
-                vec![MemoryRevisionRef {
+                vec![MemoryChangeRef {
                     memory_id: first.id.clone(),
-                    revision: 1,
+                    change_id: first.change_id.clone(),
                 }],
-                1,
+                store.memory_fingerprint(&subject.id).unwrap(),
             )
             .unwrap();
         assert_eq!(
@@ -5586,34 +4940,39 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .memory_refs[0]
-                .revision,
-            1
+                .change_id,
+            first.change_id
         );
         assert!(
             store
-                .create_surface_snapshot(&subject.id, "stale", vec![], 0)
+                .create_surface_snapshot(&subject.id, "stale", vec![], "stale-input".into())
                 .is_err()
         );
 
         let mut retract = draft("Retracted constraint", "evidence invalidated it");
         retract.state = MemoryState::Retracted;
         let retracted = store
-            .revise_memory(&subject.id, &first.id, 1, retract)
+            .revise_memory(&subject.id, &first.id, first.change_id.clone(), retract)
             .unwrap();
         assert_eq!(retracted.state, MemoryState::Retracted);
         assert!(matches!(
             store.revise_memory(
                 &subject.id,
                 &first.id,
-                2,
+                retracted.change_id.clone(),
                 draft("cannot reactivate", "retraction is terminal")
             ),
             Err(SubjektivError::InvalidStateTransition { .. })
         ));
-        let mut retract_again = draft("still retracted", "no post-retraction revisions");
+        let mut retract_again = draft("still retracted", "no post-retraction changes");
         retract_again.state = MemoryState::Retracted;
         assert!(matches!(
-            store.revise_memory(&subject.id, &first.id, 2, retract_again),
+            store.revise_memory(
+                &subject.id,
+                &first.id,
+                retracted.change_id.clone(),
+                retract_again
+            ),
             Err(SubjektivError::InvalidStateTransition { .. })
         ));
 
@@ -5638,7 +4997,7 @@ mod tests {
             .apply_candidate(
                 &subject.id,
                 &staged.id,
-                MemoryRevisionTarget::Create,
+                MemoryChangeTarget::Create,
                 draft("Immutable history", "accept"),
                 "applied",
             )
@@ -5653,11 +5012,11 @@ mod tests {
             .create_surface_snapshot(
                 &subject.id,
                 "sealed snapshot",
-                vec![MemoryRevisionRef {
+                vec![MemoryChangeRef {
                     memory_id: memory.id.clone(),
-                    revision: 1,
+                    change_id: memory.change_id.clone(),
                 }],
-                2,
+                store.memory_fingerprint(&subject.id).unwrap(),
             )
             .unwrap();
 
@@ -5665,9 +5024,9 @@ mod tests {
             .database
             .try_with_connection::<_, SubjektivError>(|connection| {
                 connection.execute(
-                    "UPDATE memory_revisions SET record_json = '{}' \
-                 WHERE subject_id = ?1 AND memory_id = ?2 AND revision = 1",
-                    params![subject.id, memory.id],
+                    "UPDATE memory_changes SET record_json = '{}' \
+                 WHERE subject_id = ?1 AND memory_id = ?2 AND change_id = ?3",
+                    params![subject.id, memory.id, memory.change_id],
                 )?;
                 Ok(())
             });
@@ -5687,10 +5046,10 @@ mod tests {
             .database
             .try_with_connection::<_, SubjektivError>(|connection| {
                 connection.execute(
-                    "INSERT INTO memory_revision_candidates (
-                        subject_id, memory_id, revision, candidate_id
-                     ) VALUES (?1, ?2, 1, ?3)",
-                    params![subject.id, memory.id, extra_candidate.id],
+                    "INSERT INTO memory_change_candidates (
+                        subject_id, memory_id, change_id, candidate_id
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![subject.id, memory.id, memory.change_id, extra_candidate.id],
                 )?;
                 Ok(())
             });
@@ -5700,10 +5059,16 @@ mod tests {
                 .database
                 .try_with_connection::<_, SubjektivError>(|connection| {
                     connection.execute(
-                        "INSERT INTO memory_revision_derivations (
-                        subject_id, memory_id, revision, source_memory_id, source_revision
-                     ) VALUES (?1, ?2, 1, ?3, 1)",
-                        params![subject.id, memory.id, other_memory.id],
+                        "INSERT INTO memory_change_derivations (
+                        subject_id, memory_id, change_id, source_memory_id, source_change_id
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            subject.id,
+                            memory.id,
+                            memory.change_id,
+                            other_memory.id,
+                            other_memory.change_id
+                        ],
                     )?;
                     Ok(())
                 });
@@ -5714,9 +5079,14 @@ mod tests {
                 .try_with_connection::<_, SubjektivError>(|connection| {
                     connection.execute(
                         "INSERT INTO staging_resolution_targets (
-                        subject_id, candidate_id, memory_id, revision
-                     ) VALUES (?1, ?2, ?3, 1)",
-                        params![subject.id, staged.id, other_memory.id],
+                        subject_id, candidate_id, memory_id, change_id
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            subject.id,
+                            staged.id,
+                            other_memory.id,
+                            other_memory.change_id
+                        ],
                     )?;
                     Ok(())
                 });
@@ -5727,9 +5097,14 @@ mod tests {
                 .try_with_connection::<_, SubjektivError>(|connection| {
                     connection.execute(
                         "INSERT INTO surface_snapshot_refs (
-                        subject_id, snapshot_id, memory_id, revision
-                     ) VALUES (?1, ?2, ?3, 1)",
-                        params![subject.id, snapshot.id, other_memory.id],
+                        subject_id, snapshot_id, memory_id, change_id
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            subject.id,
+                            snapshot.id,
+                            other_memory.id,
+                            other_memory.change_id
+                        ],
                     )?;
                     Ok(())
                 });
@@ -5737,7 +5112,7 @@ mod tests {
 
         assert!(
             store
-                .memory_revision(&subject.id, &memory.id, 1)
+                .memory_change(&subject.id, &memory.id, memory.change_id.clone())
                 .unwrap()
                 .is_some()
         );
@@ -5782,7 +5157,12 @@ mod tests {
         resolved.kind = current.kind;
         resolved.state = MemoryState::Resolved;
         store
-            .revise_memory(&subject.id, &resolved_id, current.revision, resolved)
+            .revise_memory(
+                &subject.id,
+                &resolved_id,
+                current.change_id.clone(),
+                resolved,
+            )
             .unwrap();
 
         let first = store.prepare_surface_generation(&subject.id).unwrap();
@@ -5910,9 +5290,9 @@ mod tests {
             &stale_generation.id,
             vec![SurfacePoint {
                 body_md: "Invented".into(),
-                memory_refs: vec![MemoryRevisionRef {
+                memory_refs: vec![MemoryChangeRef {
                     memory_id: "foreign-memory".into(),
-                    revision: 1,
+                    change_id: "fixture-change".into(),
                 }],
             }],
         );
@@ -5932,8 +5312,8 @@ mod tests {
                 .memory(&subject.id, &memory.id)
                 .unwrap()
                 .unwrap()
-                .revision,
-            1,
+                .change_id,
+            memory.change_id,
             "surface failure must not roll back confirmed Memory"
         );
 
@@ -5942,7 +5322,7 @@ mod tests {
             .revise_memory(
                 &subject.id,
                 &memory.id,
-                1,
+                memory.change_id.clone(),
                 draft("Corrected constraint", "correction"),
             )
             .unwrap();
@@ -5952,9 +5332,9 @@ mod tests {
                 &raced.id,
                 vec![SurfacePoint {
                     body_md: "Old wording".into(),
-                    memory_refs: vec![MemoryRevisionRef {
+                    memory_refs: vec![MemoryChangeRef {
                         memory_id: memory.id.clone(),
-                        revision: 1,
+                        change_id: memory.change_id.clone(),
                     }],
                 }],
             ),
@@ -5966,9 +5346,9 @@ mod tests {
         );
 
         let current = store.prepare_surface_generation(&subject.id).unwrap();
-        let current_ref = MemoryRevisionRef {
+        let current_ref = MemoryChangeRef {
             memory_id: memory.id.clone(),
-            revision: 2,
+            change_id: current.materials[0].change_id.clone(),
         };
         let points = vec![SurfacePoint {
             body_md: "Keep the corrected constraint, including its condition.".into(),
@@ -6013,7 +5393,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_surface_generations_cannot_overwrite_one_revision() {
+    fn concurrent_surface_generations_cannot_overwrite_one_change() {
         let temp = tempfile::tempdir().unwrap();
         let (_manager, _workspace, store) = open_store(temp.path(), "workspace-a");
         let subject = store.create_subject(role()).unwrap();
@@ -6028,6 +5408,7 @@ mod tests {
             let store = store.clone();
             let subject_id = subject.id.clone();
             let memory_id = memory.id.clone();
+            let change_id = memory.change_id.clone();
             let barrier = Arc::clone(&barrier);
             joins.push(thread::spawn(move || {
                 barrier.wait();
@@ -6036,9 +5417,9 @@ mod tests {
                     &generation.id,
                     vec![SurfacePoint {
                         body_md: body.into(),
-                        memory_refs: vec![MemoryRevisionRef {
+                        memory_refs: vec![MemoryChangeRef {
                             memory_id,
-                            revision: 1,
+                            change_id,
                         }],
                     }],
                 )
@@ -6079,8 +5460,8 @@ mod tests {
             .apply_candidate(
                 &subject.id,
                 &candidate.id,
-                MemoryRevisionTarget::Create,
-                draft("Persist this revision", "accepted before restart"),
+                MemoryChangeTarget::Create,
+                draft("Persist this change_id", "accepted before restart"),
                 "applied",
             )
             .unwrap();
@@ -6091,11 +5472,11 @@ mod tests {
         let (manager, workspace, reopened) = open_store(&root, "workspace-a");
         assert_eq!(
             reopened
-                .memory_revision(&subject.id, &memory.id, 1)
+                .memory_change(&subject.id, &memory.id, memory.change_id.clone())
                 .unwrap()
                 .unwrap()
                 .claim,
-            "Persist this revision"
+            "Persist this change_id"
         );
         assert_eq!(
             reopened
@@ -6112,23 +5493,28 @@ mod tests {
             .create_surface_snapshot(
                 &subject.id,
                 "Persisted resident surface",
-                vec![MemoryRevisionRef {
+                vec![MemoryChangeRef {
                     memory_id: memory.id.clone(),
-                    revision: 1,
+                    change_id: memory.change_id.clone(),
                 }],
-                1,
+                reopened.memory_fingerprint(&subject.id).unwrap(),
             )
             .unwrap();
         workspace.backup(&snapshot_path).unwrap();
-        let mut post_backup = draft("Post-backup revision", "not in snapshot");
-        post_backup.derived_from.push(MemoryRevisionRef {
+        let mut post_backup = draft("Post-backup change_id", "not in snapshot");
+        post_backup.derived_from.push(MemoryChangeRef {
             memory_id: memory.id.clone(),
-            revision: 1,
+            change_id: memory.change_id.clone(),
         });
         let second = reopened
-            .revise_memory(&subject.id, &memory.id, 1, post_backup)
+            .revise_memory(
+                &subject.id,
+                &memory.id,
+                memory.change_id.clone(),
+                post_backup,
+            )
             .unwrap();
-        assert_eq!(second.revision, 2);
+        assert!(second.previous_change_id.is_some());
         workspace.delete().unwrap();
         drop(reopened);
         drop(workspace);
@@ -6139,25 +5525,18 @@ mod tests {
         workspace.restore(&snapshot_path).unwrap();
         let registration = SubjektivStore::register(&workspace).unwrap();
         let restored = SubjektivStore::open(&workspace, &registration).unwrap();
-        assert_eq!(
-            restored
-                .subject(&subject.id)
-                .unwrap()
-                .unwrap()
-                .store_revision,
-            1
-        );
+        assert_eq!(restored.list_memories(&subject.id).unwrap().len(), 1);
         assert_eq!(
             restored
                 .memory(&subject.id, &memory.id)
                 .unwrap()
                 .unwrap()
                 .claim,
-            "Persist this revision"
+            "Persist this change_id"
         );
         assert!(
             restored
-                .memory_revision(&subject.id, &memory.id, 2)
+                .memory_change(&subject.id, &memory.id, second.change_id.clone())
                 .unwrap()
                 .is_none()
         );
@@ -6173,9 +5552,9 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .memory_refs,
-            vec![MemoryRevisionRef {
+            vec![MemoryChangeRef {
                 memory_id: memory.id,
-                revision: 1,
+                change_id: memory.change_id.clone(),
             }]
         );
     }

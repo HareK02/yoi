@@ -1339,7 +1339,7 @@ enabled = false
             .subjektiv
             .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "workspace-test".to_string(),
-                settings_revision: 1,
+
                 language: "English".to_string(),
             })
             .unwrap();
@@ -2100,7 +2100,7 @@ enabled = false
         parent.feature.memory.profile.enabled = true;
         let settings = manifest::WorkspaceMemorySettingsSnapshot {
             workspace_id: "workspace-1".to_string(),
-            settings_revision: 4,
+
             language: "日本語".to_string(),
         };
         parent

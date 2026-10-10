@@ -323,18 +323,18 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
       assertEquals(await detailPage.getByText("candidate-release-decision-0001").count(), 1);
       assertEquals(await detailPage.getByText("Memory information design source").count(), 1);
       assertEquals(await detailPage.getByText("memory-derived-source-0002").count(), 1);
-      assertEquals(await detailPage.getByRole("heading", { name: "Revision history" }).count(), 1);
-      assertEquals(await detailPage.getByText("Memory revision 3", { exact: true }).count(), 1);
-      assertEquals(await detailPage.getByText("Memory revision 2", { exact: true }).count(), 1);
-      assertEquals(await detailPage.getByText("Memory revision 1", { exact: true }).count(), 0);
-      await detailPage.getByRole("navigation", { name: "Revision history pages" }).getByRole(
+      assertEquals(await detailPage.getByRole("heading", { name: "Change history" }).count(), 1);
+      assertEquals(await detailPage.getByText("Memory change change-current", { exact: true }).count(), 1);
+      assertEquals(await detailPage.getByText("Memory change change-earlier", { exact: true }).count(), 1);
+      assertEquals(await detailPage.getByText("Memory change change-original", { exact: true }).count(), 0);
+      await detailPage.getByRole("navigation", { name: "Change history pages" }).getByRole(
         "link",
         { name: "Next page →" },
       ).click();
-      await detailPage.getByText("Memory revision 1", { exact: true }).waitFor();
-      assert(new URL(detailPage.url()).searchParams.has("revision_cursor"));
+      await detailPage.getByText("Memory change change-original", { exact: true }).waitFor();
+      assert(new URL(detailPage.url()).searchParams.has("change_cursor"));
       assertEquals(
-        await detailPage.getByRole("navigation", { name: "Revision history pages" }).getByRole(
+        await detailPage.getByRole("navigation", { name: "Change history pages" }).getByRole(
           "link",
           { name: "First page" },
         ).count(),
@@ -497,7 +497,7 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
         path: join(createInteractionArtifacts, "behavior-edit-desktop-light.png"),
       });
       await createPage.getByRole("button", { name: "Save behavior" }).click();
-      await createPage.getByText(/Behavior storage confirmed at revision 1/).waitFor();
+      await createPage.getByText(/Behavior storage confirmed/).waitFor();
       assert(
         (await createPage.getByRole("status").filter({
           hasText: "This page does not confirm application",

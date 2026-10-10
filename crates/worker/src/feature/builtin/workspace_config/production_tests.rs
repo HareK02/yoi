@@ -14,7 +14,6 @@ use protocol::{FeatureInvocation, FeatureInvocationIdentity};
 use serde::Serialize;
 use serde_json::{Value as Json, json};
 use server_api::*;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
@@ -24,7 +23,6 @@ struct State {
     read_only: bool,
     active: Option<WorkspaceConfigAttachment>,
     next_connection: u64,
-    revision: u64,
     entries: BTreeMap<String, (ConfigContentType, String)>,
     commits: Vec<WorkspaceConfigCommitRequest>,
     requests: Vec<WorkspaceRequest>,
@@ -32,6 +30,7 @@ struct State {
     fail_current: bool,
     lose_commit_reply: bool,
     race_commit: bool,
+    mismatched_commit_reply: Option<&'static str>,
 }
 #[derive(Debug)]
 struct Router {
@@ -47,7 +46,6 @@ impl Router {
                 read_only: false,
                 active: None,
                 next_connection: 0,
-                revision: 1,
                 entries: BTreeMap::from([
                     (
                         "main.dcdl".into(),
@@ -64,6 +62,7 @@ impl Router {
                 fail_current: false,
                 lose_commit_reply: false,
                 race_commit: false,
+                mismatched_commit_reply: None,
             })),
         })
     }
@@ -88,20 +87,30 @@ fn denied(status: u16, classification: WorkspaceConfigFailureClassification) -> 
     }
 }
 fn digest(content: &str) -> String {
-    Sha256::digest(content.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    config_source::digest_bytes(content.as_bytes())
 }
 impl State {
     fn tree_digest(&self) -> String {
-        digest(&serde_json::to_string(&self.entries).unwrap())
+        config_source::ConfigTreeSnapshot::from_entries(self.entries.iter().map(
+            |(path, (content_type, content))| {
+                config_source::ConfigEntry::new(
+                    config_source::VirtualPath::parse(path).unwrap(),
+                    match content_type {
+                        ConfigContentType::Decodal => config_source::ConfigContentType::Decodal,
+                        ConfigContentType::Text => config_source::ConfigContentType::Text,
+                    },
+                    content.clone(),
+                )
+                .unwrap()
+            },
+        ))
+        .unwrap()
+        .digest
     }
     fn validator(&self, path: &str) -> String {
         format!(
-            "wc:{}:{}:{}:{}",
+            "wc:{}:{}:{}",
             self.active.as_ref().unwrap().connection_id,
-            self.revision,
             self.tree_digest(),
             path
         )
@@ -262,7 +271,6 @@ impl WorkspaceClient for Router {
                 Ok(response(&WorkspaceConfigObserveResponse {
                     connection_id: state.active.as_ref().unwrap().connection_id.clone(),
                     validator: state.validator(""),
-                    revision: state.revision,
                     digest: state.tree_digest(),
                     entrypoints: vec!["main.dcdl".into()],
                     nodes,
@@ -294,7 +302,7 @@ impl WorkspaceClient for Router {
                 let request: WorkspaceConfigCommitRequest = serde_json::from_value(input).unwrap();
                 state.commits.push(request.clone());
                 if state.race_commit {
-                    state.revision += 1;
+                    state.entries.get_mut("main.dcdl").unwrap().1 = "model = concurrent".into();
                     state.race_commit = false;
                 }
                 if state.read_only {
@@ -305,7 +313,6 @@ impl WorkspaceClient for Router {
                 }
                 assert_eq!(request.request.entrypoints, ["main.dcdl"]);
                 if request.validator != state.validator("")
-                    || request.request.base_revision != state.revision
                     || request.request.base_digest != state.tree_digest()
                 {
                     return Ok(denied(
@@ -396,18 +403,23 @@ impl WorkspaceClient for Router {
                     ));
                 }
                 state.entries = entries;
-                state.revision += 1;
                 if state.lose_commit_reply {
                     state.lose_commit_reply = false;
                     return Err(WorkspaceClientError::Request(
                         "secret-token /private/host/config".into(),
                     ));
                 }
-                Ok(response(&WorkspaceConfigCommitResponse {
+                let mut result = WorkspaceConfigCommitResponse {
                     validator: state.validator(""),
-                    revision: state.revision,
                     digest: state.tree_digest(),
-                }))
+                };
+                match state.mismatched_commit_reply.take() {
+                    Some("digest") => result.digest = "different-content".into(),
+                    Some("validator") => result.validator = "different-authority".into(),
+                    None => {}
+                    Some(_) => unreachable!("unknown fixture mismatch"),
+                }
+                Ok(response(&result))
             }
             _ => panic!("unregistered endpoint: {suffix}"),
         }
@@ -668,13 +680,20 @@ fn runtime_for_cross(client: Arc<dyn WorkspaceClient>) -> (WorkspaceConfigFeatur
 }
 
 #[tokio::test]
-async fn workspace_config_production_stale_same_bytes_and_commit_race_never_overwrite() {
+async fn workspace_config_production_stale_content_and_commit_race_never_overwrite() {
     let client = Router::new();
     let (feature, runtime) = runtime(client.clone());
     feature.attach("initial", None).await.unwrap();
     let path = "/workspace-config/main.dcdl";
     observe_interface(&runtime, path, true).await;
-    client.state.lock().unwrap().revision += 1; // Same bytes, different identity revision.
+    client
+        .state
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut("main.dcdl")
+        .unwrap()
+        .1 = "model = external".into();
     assert!(
         call(&runtime, path, "write", json!({"content":"overwritten"}))
             .await
@@ -690,7 +709,7 @@ async fn workspace_config_production_stale_same_bytes_and_commit_race_never_over
     );
     assert_eq!(
         client.state.lock().unwrap().entries["main.dcdl"].1,
-        "model = old"
+        "model = concurrent"
     );
     assert_eq!(client.state.lock().unwrap().commits.len(), 1);
 }
@@ -756,6 +775,26 @@ async fn workspace_config_production_invalid_size_save_failure_unknown_are_safe_
         client.state.lock().unwrap().entries["main.dcdl"].1,
         "saved-but-reply-lost"
     );
+}
+
+#[tokio::test]
+async fn post_commit_observation_mismatch_reports_unknown_without_replaying_write() {
+    for field in ["digest", "validator"] {
+        let client = Router::new();
+        let (feature, runtime) = runtime(client.clone());
+        feature.attach("initial", None).await.unwrap();
+        let path = "/workspace-config/main.dcdl";
+        observe_interface(&runtime, path, true).await;
+        client.state.lock().unwrap().mismatched_commit_reply = Some(field);
+        let error = call(&runtime, path, "write", json!({"content":"saved"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown"), "{field}: {error}");
+        let state = client.state.lock().unwrap();
+        assert_eq!(state.commits.len(), 1);
+        assert_eq!(state.entries["main.dcdl"].1, "saved");
+    }
 }
 
 #[tokio::test]
@@ -876,7 +915,6 @@ async fn workspace_config_edit_shared_argument_rejection_never_commits() {
         assert!(error.to_string().contains(expected), "{error:?}");
         let state = client.state.lock().unwrap();
         assert!(state.commits.is_empty());
-        assert_eq!(state.revision, 1);
         assert_eq!(state.entries["main.dcdl"].1, "model = old");
         // Argument-only rejection must not even fetch a preimage.
         assert!(

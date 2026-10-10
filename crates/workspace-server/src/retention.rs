@@ -38,7 +38,7 @@ pub enum ArchiveRetention {
 pub struct WorkerRetentionPolicy {
     pub workspace_id: String,
     pub policy_id: String,
-    pub revision: u64,
+    pub policy_digest: String,
     pub session_disposition: SessionDisposition,
     pub metadata_disposition: MetadataDisposition,
     pub archive_retention: ArchiveRetention,
@@ -97,9 +97,9 @@ pub struct WorkerRemovalPlan {
     pub input_fingerprint: String,
     pub workspace_id: String,
     pub worker: RuntimeWorkerRef,
-    pub worker_revision: String,
+    pub worker_updated_at: String,
     pub policy_id: String,
-    pub policy_revision: u64,
+    pub policy_digest: String,
     pub session_disposition: SessionDisposition,
     pub metadata_disposition: MetadataDisposition,
     pub archive_retention: ArchiveRetention,
@@ -132,7 +132,7 @@ pub struct WorkerTombstone {
     pub removed_at: String,
     pub archive_id: Option<String>,
     pub policy_id: String,
-    pub policy_revision: u64,
+    pub policy_digest: String,
     pub operation_id: String,
 }
 
@@ -145,7 +145,7 @@ pub struct WorkerSessionArchiveRecord {
     pub checksum_sha256: String,
     pub content_bytes: u64,
     pub policy_id: String,
-    pub policy_revision: u64,
+    pub policy_digest: String,
     pub operation_id: String,
     pub committed_at: String,
     pub expires_at: Option<String>,
@@ -168,8 +168,8 @@ pub enum WorkerRetentionError {
     Store(#[from] StoreError),
     #[error("Worker retention policy is not configured for Workspace {workspace_id}")]
     PolicyMissing { workspace_id: String },
-    #[error("Worker retention policy revision conflict: expected {expected}, current {actual}")]
-    PolicyRevisionConflict { expected: u64, actual: u64 },
+    #[error("Worker retention policy digest conflict: expected {expected}, current {actual}")]
+    PolicyDigestConflict { expected: String, actual: String },
     #[error("Worker was not found in the requested Workspace")]
     WorkerNotFound,
     #[error("Worker belongs to a different Workspace")]
@@ -195,21 +195,24 @@ impl SqliteWorkspaceStore {
     pub fn update_worker_retention_policy(
         &self,
         workspace_id: &str,
-        expected: u64,
+        expected: &str,
         update: &WorkerRetentionPolicyUpdate,
     ) -> Result<WorkerRetentionPolicy, WorkerRetentionError> {
         validate_policy(update)?;
         self.with_conn_mut(|conn| {
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let current=load_policy(&tx,workspace_id)?.ok_or_else(|| StoreError::InvalidInput(format!("policy-missing:{workspace_id}")))?;
-            if current.revision!=expected { return Err(StoreError::InvalidInput(format!("policy-conflict:{expected}:{}",current.revision))); }
-            let revision=current.revision+1; let now=Utc::now().to_rfc3339();
-            tx.execute("INSERT INTO workspace_worker_retention_policy_revisions
-              (workspace_id,policy_id,revision,session_disposition,metadata_disposition,archive_retention_kind,archive_retention_seconds,diagnostics_disposition,diagnostics_retention_seconds,created_at)
-              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![workspace_id,update.policy_id,revision,sess(update.session_disposition),meta(update.metadata_disposition),archive_kind(update.archive_retention),archive_seconds(update.archive_retention),diag(update.diagnostics_disposition),update.diagnostics_retention_seconds,now])?;
-            let changed=tx.execute("UPDATE workspace_worker_retention_policies SET policy_id=?1,revision=?2,updated_at=?3 WHERE workspace_id=?4 AND revision=?5",
-              params![update.policy_id,revision,now,workspace_id,expected])?;
-            if changed!=1 { return Err(StoreError::InvalidInput(format!("policy-conflict:{expected}:{revision}"))); }
+            if current.policy_digest != expected {
+                return Err(StoreError::InvalidInput(format!("policy-conflict:{}", serde_json::to_string(&(expected, &current.policy_digest)).unwrap())));
+            }
+            let digest = worker_retention_policy_digest(update);
+            let now = Utc::now().to_rfc3339();
+            tx.execute("INSERT OR IGNORE INTO workspace_worker_retention_policy_snapshots
+              (workspace_id,policy_id,policy_digest,session_disposition,metadata_disposition,archive_retention_kind,archive_retention_seconds,diagnostics_disposition,diagnostics_retention_seconds,created_at)
+              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![workspace_id,update.policy_id,digest,sess(update.session_disposition),meta(update.metadata_disposition),archive_kind(update.archive_retention),archive_seconds(update.archive_retention),diag(update.diagnostics_disposition),update.diagnostics_retention_seconds,now])?;
+            let changed=tx.execute("UPDATE workspace_worker_retention_policies SET policy_id=?1,policy_digest=?2,updated_at=?3 WHERE workspace_id=?4 AND policy_digest=?5",
+              params![update.policy_id,digest,now,workspace_id,expected])?;
+            if changed!=1 { return Err(StoreError::InvalidInput(format!("policy-conflict:{}", serde_json::to_string(&(expected, &current.policy_digest)).unwrap()))); }
             tx.commit()?; load_policy(conn,workspace_id)?.ok_or_else(|| StoreError::InvalidInput("updated policy missing".into()))
         }).map_err(map_error)
     }
@@ -243,7 +246,7 @@ impl SqliteWorkspaceStore {
             let plan_id=stable("wrp",&fp); let operation_id=stable("wro",&fp);
             let archive_id=(policy.session_disposition==SessionDisposition::Archive).then(||stable("wra",&fp));
             let state=if blockers.is_empty(){WorkerRemovalPlanState::Planned}else{WorkerRemovalPlanState::Blocked};
-            tx.execute("INSERT OR IGNORE INTO worker_removal_operations(operation_id,plan_id,input_fingerprint,workspace_id,runtime_id,worker_id,worker_revision,policy_id,policy_revision,session_disposition,metadata_disposition,archive_retention_kind,archive_retention_seconds,diagnostics_disposition,diagnostics_retention_seconds,archive_id,blockers_json,state,reason,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?20)",params![operation_id,plan_id,fp,req.workspace_id,req.worker.runtime_id,req.worker.worker_id,worker.updated_at,policy.policy_id,policy.revision,sess(policy.session_disposition),meta(policy.metadata_disposition),archive_kind(policy.archive_retention),archive_seconds(policy.archive_retention),diag(policy.diagnostics_disposition),policy.diagnostics_retention_seconds,archive_id,serde_json::to_string(&blockers).map_err(|e|StoreError::InvalidInput(e.to_string()))?,state_s(state),req.reason,now])?;
+            tx.execute("INSERT OR IGNORE INTO worker_removal_operations(operation_id,plan_id,input_fingerprint,workspace_id,runtime_id,worker_id,worker_updated_at,policy_id,policy_digest,session_disposition,metadata_disposition,archive_retention_kind,archive_retention_seconds,diagnostics_disposition,diagnostics_retention_seconds,archive_id,blockers_json,state,reason,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?20)",params![operation_id,plan_id,fp,req.workspace_id,req.worker.runtime_id,req.worker.worker_id,worker.updated_at,policy.policy_id,policy.policy_digest,sess(policy.session_disposition),meta(policy.metadata_disposition),archive_kind(policy.archive_retention),archive_seconds(policy.archive_retention),diag(policy.diagnostics_disposition),policy.diagnostics_retention_seconds,archive_id,serde_json::to_string(&blockers).map_err(|e|StoreError::InvalidInput(e.to_string()))?,state_s(state),req.reason,now])?;
             let plan=load_plan(&tx,&plan_id)?.ok_or_else(||StoreError::InvalidInput("plan missing".into()))?;
             if plan.input_fingerprint!=fp{return Err(StoreError::InvalidInput(format!("fingerprint:{}",plan.operation_id)));}
             tx.commit()?; Ok(plan)
@@ -270,14 +273,14 @@ impl SqliteWorkspaceStore {
             }
             if !plan.blockers.is_empty(){return Err(StoreError::InvalidInput(format!("blocked:{}",serde_json::to_string(&plan.blockers).unwrap())));}
             let policy=load_policy(&tx,workspace_id)?.ok_or_else(||StoreError::InvalidInput(format!("policy-missing:{workspace_id}")))?;
-            if policy.policy_id!=plan.policy_id||policy.revision!=plan.policy_revision{
-                mark_stale(&tx,&plan,"policy revision changed")?;tx.commit()?;
-                return Err(stale_error(&plan,"policy revision changed"));
+            if policy.policy_id!=plan.policy_id||policy.policy_digest!=plan.policy_digest{
+                mark_stale(&tx,&plan,"policy content changed")?;tx.commit()?;
+                return Err(stale_error(&plan,"policy content changed"));
             }
             let worker=load_worker(&tx,workspace_id,&plan.worker)?.ok_or_else(||StoreError::InvalidInput(format!("stale:{plan_id}:Worker missing")))?;
-            if worker.updated_at!=plan.worker_revision{
-                mark_stale(&tx,&plan,"Worker revision changed")?;tx.commit()?;
-                return Err(stale_error(&plan,"Worker revision changed"));
+            if worker.updated_at!=plan.worker_updated_at{
+                mark_stale(&tx,&plan,"Worker updated_at changed")?;tx.commit()?;
+                return Err(stale_error(&plan,"Worker updated_at changed"));
             }
             if worker.retention_state=="pinned"{
                 mark_stale(&tx,&plan,"hold added")?;tx.commit()?;
@@ -295,7 +298,7 @@ impl SqliteWorkspaceStore {
     }
 
     /// Revalidates Backend authority and derives the complete Runtime request
-    /// from the immutable plan. Callers cannot substitute generation or
+    /// from the immutable plan. Callers cannot substitute Worker timestamps or
     /// dispositions without causing a fingerprint/manifest mismatch.
     pub fn prepare_worker_removal_execution(
         &self,
@@ -327,13 +330,11 @@ impl SqliteWorkspaceStore {
                 workspace_id: plan.workspace_id.clone(),
                 source_runtime_id: plan.worker.runtime_id.clone(),
                 worker_id: worker_id,
-                expected_worker_revision: plan.worker_revision.clone(),
                 source_created_at: worker.created_at,
                 removed_at,
                 effective_profile: worker.profile,
                 retention_class: None,
                 policy_id: plan.policy_id.clone(),
-                policy_revision: plan.policy_revision,
                 session_disposition: plan.session_disposition,
                 diagnostics_disposition: plan.diagnostics_disposition,
             },
@@ -354,7 +355,7 @@ impl SqliteWorkspaceStore {
                  WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3
                    AND state IN ('planned','executing','failed','succeeded')
                    AND (
-                     state='succeeded' OR worker_revision=(
+                     state='succeeded' OR worker_updated_at=(
                        SELECT updated_at FROM worker_registry
                        WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3
                      )
@@ -398,7 +399,6 @@ impl SqliteWorkspaceStore {
                 workspace_id: plan.workspace_id.clone(),
                 source_runtime_id: plan.worker.runtime_id.clone(),
                 worker_id: worker_id,
-                expected_worker_revision: plan.worker_revision.clone(),
                 source_created_at: worker
                     .as_ref()
                     .map(|worker| worker.created_at.clone())
@@ -410,7 +410,6 @@ impl SqliteWorkspaceStore {
                     .unwrap_or_else(|| Some("removed".to_string())),
                 retention_class: None,
                 policy_id: plan.policy_id.clone(),
-                policy_revision: plan.policy_revision,
                 session_disposition: plan.session_disposition,
                 diagnostics_disposition: plan.diagnostics_disposition,
             },
@@ -458,8 +457,7 @@ impl SqliteWorkspaceStore {
             if plan.state != WorkerRemovalPlanState::Executing {
                 return Err(StoreError::InvalidInput(format!("stale:{}:plan state {} is not committable", plan.plan_id, state_s(plan.state))));
             }
-            if result.expected_worker_revision != plan.worker_revision
-                || result.worker_id.to_string() != plan.worker.worker_id
+            if result.worker_id.to_string() != plan.worker.worker_id
                 || result.session_disposition != plan.session_disposition
                 || result.diagnostics_disposition != plan.diagnostics_disposition
             {
@@ -467,15 +465,15 @@ impl SqliteWorkspaceStore {
             }
             if !result.source_removed{return Err(StoreError::InvalidInput("Runtime source was not removed".into()));}
             let worker=load_worker(&tx,workspace_id,&plan.worker)?.ok_or_else(||StoreError::InvalidInput("Worker missing before commit".into()))?;
-            if worker.updated_at!=plan.worker_revision{return Err(StoreError::InvalidInput(format!("stale:{}:Worker revision changed",plan.plan_id)));}
+            if worker.updated_at!=plan.worker_updated_at{return Err(StoreError::InvalidInput(format!("stale:{}:Worker updated_at changed",plan.plan_id)));}
             if worker.retention_state=="pinned" { return Err(StoreError::InvalidInput(format!("stale:{}:hold added",plan.plan_id))); }
             let assigned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.ticket_id=c.ticket_id AND a.assignment_id=c.assignment_id WHERE a.workspace_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3 UNION ALL SELECT 1 FROM ticket_assignment_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND claim_state='pending' AND action IN ('assign','reassign'))",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id],|row|row.get(0))?;
             if assigned { return Err(StoreError::InvalidInput(format!("stale:{}:unfinished work added",plan.plan_id))); }
             let now=Utc::now().to_rfc3339();
             if let Some(a)=&result.archive{
-                if plan.archive_id.as_deref()!=Some(&a.archive_id)||a.workspace_id!=workspace_id||a.source_runtime_id!=plan.worker.runtime_id||a.source_worker_id.to_string()!=plan.worker.worker_id||a.policy_id!=plan.policy_id||a.policy_revision!=plan.policy_revision{return Err(StoreError::InvalidInput("archive manifest mismatch".into()));}
+                if plan.archive_id.as_deref()!=Some(&a.archive_id)||a.workspace_id!=workspace_id||a.source_runtime_id!=plan.worker.runtime_id||a.source_worker_id.to_string()!=plan.worker.worker_id||a.policy_id!=plan.policy_id||a.operation_id!=operation_id||a.input_fingerprint!=fp{return Err(StoreError::InvalidInput("archive manifest mismatch".into()));}
                 let expires_at=match plan.archive_retention { ArchiveRetention::Forever=>None, ArchiveRetention::ForSeconds{seconds}=>{let seconds=i64::try_from(seconds).map_err(|_|StoreError::InvalidInput("archive retention deadline overflow".into()))?;Some((Utc::now()+chrono::Duration::seconds(seconds)).to_rfc3339())} };
-                tx.execute("INSERT OR IGNORE INTO worker_session_archives(archive_id,workspace_id,runtime_id,worker_id,session_id,checksum_sha256,content_bytes,policy_id,policy_revision,operation_id,committed_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![a.archive_id,workspace_id,plan.worker.runtime_id,plan.worker.worker_id,a.source_session_id,a.content_checksum_sha256,a.content_bytes,plan.policy_id,plan.policy_revision,operation_id,now,expires_at])?;
+                tx.execute("INSERT OR IGNORE INTO worker_session_archives(archive_id,workspace_id,runtime_id,worker_id,session_id,checksum_sha256,content_bytes,policy_id,policy_digest,operation_id,committed_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![a.archive_id,workspace_id,plan.worker.runtime_id,plan.worker.worker_id,a.source_session_id,a.content_checksum_sha256,a.content_bytes,plan.policy_id,plan.policy_digest,operation_id,now,expires_at])?;
                 let observe_grants = {
                     let mut statement = tx.prepare(
                         "SELECT grant_id, controller_runtime_id, controller_worker_id,
@@ -529,15 +527,15 @@ impl SqliteWorkspaceStore {
                     let seconds=plan.diagnostics_retention_seconds.ok_or_else(||StoreError::InvalidInput("diagnostics retention deadline missing".into()))?;
                     let seconds=i64::try_from(seconds).map_err(|_|StoreError::InvalidInput("diagnostics retention deadline overflow".into()))?;
                     let expires_at=(Utc::now()+chrono::Duration::seconds(seconds)).to_rfc3339();
-                    tx.execute("INSERT OR IGNORE INTO worker_diagnostics_archives(operation_id,workspace_id,runtime_id,worker_id,policy_id,policy_revision,committed_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![operation_id,workspace_id,plan.worker.runtime_id,plan.worker.worker_id,plan.policy_id,plan.policy_revision,now,expires_at])?;
+                    tx.execute("INSERT OR IGNORE INTO worker_diagnostics_archives(operation_id,workspace_id,runtime_id,worker_id,policy_id,policy_digest,committed_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![operation_id,workspace_id,plan.worker.runtime_id,plan.worker.worker_id,plan.policy_id,plan.policy_digest,now,expires_at])?;
                 }
                 DiagnosticsDisposition::Purge => {}
             }
             if plan.metadata_disposition==MetadataDisposition::Tombstone{
-                tx.execute("INSERT OR IGNORE INTO worker_tombstones(workspace_id,runtime_id,worker_id,display_name,profile,worker_created_at,removed_at,archive_id,policy_id,policy_revision,operation_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,worker.display_name,worker.profile,worker.created_at,now,plan.archive_id,plan.policy_id,plan.policy_revision,operation_id])?;
+                tx.execute("INSERT OR IGNORE INTO worker_tombstones(workspace_id,runtime_id,worker_id,display_name,profile,worker_created_at,removed_at,archive_id,policy_id,policy_digest,operation_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,worker.display_name,worker.profile,worker.created_at,now,plan.archive_id,plan.policy_id,plan.policy_digest,operation_id])?;
             }
             tx.execute("UPDATE worker_workdir_links SET unlinked_at=?4 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND unlinked_at IS NULL",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,now])?;
-            let deleted=tx.execute("DELETE FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND updated_at=?4",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,plan.worker_revision])?;
+            let deleted=tx.execute("DELETE FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND updated_at=?4",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,plan.worker_updated_at])?;
             tx.execute("UPDATE worker_create_reservations SET state='removed',updated_at=?4 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state IN ('reserved','created')",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,now])?;
             if deleted!=1{return Err(StoreError::InvalidInput(format!("stale:{}:removal fence changed",plan.plan_id)));}
             let catalog=commit_worker_catalog_removal(&tx,workspace_id,&plan.worker)?;
@@ -657,7 +655,7 @@ impl SqliteWorkspaceStore {
         workspace_id: &str,
         worker: &RuntimeWorkerRef,
     ) -> crate::Result<Option<WorkerTombstone>> {
-        self.with_conn(|conn|conn.query_row("SELECT display_name,profile,worker_created_at,removed_at,archive_id,policy_id,policy_revision,operation_id FROM worker_tombstones WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",params![workspace_id,worker.runtime_id,worker.worker_id],|r|Ok(WorkerTombstone{workspace_id:workspace_id.into(),worker:worker.clone(),display_name:r.get(0)?,profile:r.get(1)?,created_at:r.get(2)?,removed_at:r.get(3)?,archive_id:r.get(4)?,policy_id:r.get(5)?,policy_revision:r.get::<_,i64>(6)? as u64,operation_id:r.get(7)?})).optional().map_err(StoreError::from))
+        self.with_conn(|conn|conn.query_row("SELECT display_name,profile,worker_created_at,removed_at,archive_id,policy_id,policy_digest,operation_id FROM worker_tombstones WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",params![workspace_id,worker.runtime_id,worker.worker_id],|r|Ok(WorkerTombstone{workspace_id:workspace_id.into(),worker:worker.clone(),display_name:r.get(0)?,profile:r.get(1)?,created_at:r.get(2)?,removed_at:r.get(3)?,archive_id:r.get(4)?,policy_id:r.get(5)?,policy_digest:r.get(6)?,operation_id:r.get(7)?})).optional().map_err(StoreError::from))
     }
 
     pub fn worker_session_archive(
@@ -670,7 +668,7 @@ impl SqliteWorkspaceStore {
             connection
                 .query_row(
                     "SELECT archive_id, checksum_sha256, content_bytes, policy_id,
-                            policy_revision, operation_id, committed_at, expires_at
+                            policy_digest, operation_id, committed_at, expires_at
                      FROM worker_session_archives
                      WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
                        AND session_id = ?4",
@@ -689,7 +687,7 @@ impl SqliteWorkspaceStore {
                             checksum_sha256: row.get(1)?,
                             content_bytes: row.get::<_, i64>(2)? as u64,
                             policy_id: row.get(3)?,
-                            policy_revision: row.get::<_, i64>(4)? as u64,
+                            policy_digest: row.get(4)?,
                             operation_id: row.get(5)?,
                             committed_at: row.get(6)?,
                             expires_at: row.get(7)?,
@@ -789,12 +787,12 @@ fn load_worker(c: &Connection, w: &str, r: &RuntimeWorkerRef) -> crate::Result<O
 }
 fn load_policy(c: &Connection, w: &str) -> crate::Result<Option<WorkerRetentionPolicy>> {
     c.query_row(
-        "SELECT p.policy_id,p.revision,r.session_disposition,r.metadata_disposition,
+        "SELECT p.policy_id,p.policy_digest,r.session_disposition,r.metadata_disposition,
                 r.archive_retention_kind,r.archive_retention_seconds,
                 r.diagnostics_disposition,r.diagnostics_retention_seconds,r.created_at,p.updated_at
          FROM workspace_worker_retention_policies p
-         JOIN workspace_worker_retention_policy_revisions r
-           ON r.workspace_id=p.workspace_id AND r.policy_id=p.policy_id AND r.revision=p.revision
+         JOIN workspace_worker_retention_policy_snapshots r
+           ON r.workspace_id=p.workspace_id AND r.policy_id=p.policy_id AND r.policy_digest=p.policy_digest
          WHERE p.workspace_id=?1",
         params![w],
         |row| {
@@ -806,7 +804,7 @@ fn load_policy(c: &Connection, w: &str) -> crate::Result<Option<WorkerRetentionP
             Ok(WorkerRetentionPolicy {
                 workspace_id: w.into(),
                 policy_id: row.get(0)?,
-                revision: row.get::<_, i64>(1)? as u64,
+                policy_digest: row.get(1)?,
                 session_disposition: parse_s(&session)?,
                 metadata_disposition: parse_m(&metadata)?,
                 archive_retention: parse_archive(&archive_kind, archive_seconds)?,
@@ -829,7 +827,7 @@ fn load_plan_op(c: &Connection, id: &str) -> crate::Result<Option<WorkerRemovalP
 fn load_plan_q(c: &Connection, key: &str, id: &str) -> crate::Result<Option<WorkerRemovalPlan>> {
     let query = format!(
         "SELECT plan_id,operation_id,input_fingerprint,workspace_id,runtime_id,worker_id,
-                worker_revision,policy_id,policy_revision,session_disposition,
+                worker_updated_at,policy_id,policy_digest,session_disposition,
                 metadata_disposition,archive_retention_kind,archive_retention_seconds,
                 diagnostics_disposition,diagnostics_retention_seconds,archive_id,blockers_json,
                 state,reason,created_at,updated_at,failure_category
@@ -852,9 +850,9 @@ fn load_plan_q(c: &Connection, key: &str, id: &str) -> crate::Result<Option<Work
                 runtime_id: row.get(4)?,
                 worker_id: row.get(5)?,
             },
-            worker_revision: row.get(6)?,
+            worker_updated_at: row.get(6)?,
             policy_id: row.get(7)?,
-            policy_revision: row.get::<_, i64>(8)? as u64,
+            policy_digest: row.get(8)?,
             session_disposition: parse_s(&session)?,
             metadata_disposition: parse_m(&metadata)?,
             archive_retention: parse_archive(&archive_kind, archive_seconds)?,
@@ -891,7 +889,7 @@ fn stale_error(plan: &WorkerRemovalPlan, reason: &str) -> StoreError {
 }
 fn fingerprint(
     r: &WorkerRemovalPlanRequest,
-    worker_revision: &str,
+    worker_updated_at: &str,
     i: &WorkerRetentionInventory,
     p: &WorkerRetentionPolicy,
     b: &[WorkerRemovalBlocker],
@@ -900,11 +898,11 @@ fn fingerprint(
         r.workspace_id,
         r.worker.runtime_id,
         r.worker.worker_id,
-        worker_revision,
+        worker_updated_at,
         i.session_id,
         i.segment_ids,
         p.policy_id,
-        p.revision,
+        p.policy_digest,
         p.session_disposition,
         p.metadata_disposition,
         p.archive_retention,
@@ -916,6 +914,21 @@ fn fingerprint(
     .map(|v| hash(&v))
     .map_err(|e| StoreError::InvalidInput(e.to_string()))
 }
+/// Content identity of the complete resolved policy, excluding observation timestamps.
+/// The ordered tuple is shared with schema seeding and migration; no update counter is used.
+pub fn worker_retention_policy_digest(policy: &WorkerRetentionPolicyUpdate) -> String {
+    let bytes = serde_json::to_vec(&serde_json::json!([
+        policy.policy_id,
+        policy.session_disposition,
+        policy.metadata_disposition,
+        policy.archive_retention,
+        policy.diagnostics_disposition,
+        policy.diagnostics_retention_seconds,
+    ]))
+    .expect("retention policy content is serializable");
+    format!("sha256:{}", hash(&bytes))
+}
+
 fn hash(b: &[u8]) -> String {
     Sha256::digest(b)
         .iter()
@@ -977,11 +990,8 @@ fn map_error(e: StoreError) -> WorkerRetentionError {
         };
     }
     if let Some(x) = m.strip_prefix("policy-conflict:") {
-        let mut s = x.split(':');
-        return WorkerRetentionError::PolicyRevisionConflict {
-            expected: s.next().and_then(|v| v.parse().ok()).unwrap_or(0),
-            actual: s.next().and_then(|v| v.parse().ok()).unwrap_or(0),
-        };
+        let (expected, actual) = serde_json::from_str::<(String, String)>(x).unwrap_or_default();
+        return WorkerRetentionError::PolicyDigestConflict { expected, actual };
     }
     if m == "cross-workspace" {
         return WorkerRetentionError::CrossWorkspace;
@@ -1121,7 +1131,7 @@ mod tests {
             c.execute(
                 "INSERT INTO worker_registry(\
                     workspace_id,worker_id,runtime_id,display_name,profile,retention_state,created_at,updated_at\
-                 ) VALUES('w',?1,'r','one','builtin:coder','normal','created','rev1')",
+                 ) VALUES('w',?1,'r','one','builtin:coder','normal','created','2026-08-24T00:00:00Z')",
                 [worker_id().to_string()],
             )?;
             c.execute(
@@ -1169,24 +1179,65 @@ mod tests {
             diagnostics_disposition: DiagnosticsDisposition::Purge,
             diagnostics_retention_seconds: None,
         };
-        let updated = s.update_worker_retention_policy("w", 1, &u).unwrap();
-        assert_eq!(updated.revision, 2);
+        let updated = s
+            .update_worker_retention_policy("w", &p.policy_digest, &u)
+            .unwrap();
+        assert_eq!(updated.policy_digest, worker_retention_policy_digest(&u));
         assert_eq!(
             updated.archive_retention,
             ArchiveRetention::ForSeconds { seconds: 3_600 }
         );
         assert!(matches!(
-            s.update_worker_retention_policy("w", 1, &u),
-            Err(WorkerRetentionError::PolicyRevisionConflict { .. })
+            s.update_worker_retention_policy("w", &p.policy_digest, &u),
+            Err(WorkerRetentionError::PolicyDigestConflict { .. })
         ));
     }
+    #[test]
+    fn identical_policy_content_keeps_digest_and_removal_plan() {
+        let store = setup();
+        let policy = store.worker_retention_policy("w").unwrap().unwrap();
+        let update = WorkerRetentionPolicyUpdate {
+            policy_id: policy.policy_id.clone(),
+            session_disposition: policy.session_disposition,
+            metadata_disposition: policy.metadata_disposition,
+            archive_retention: policy.archive_retention,
+            diagnostics_disposition: policy.diagnostics_disposition,
+            diagnostics_retention_seconds: policy.diagnostics_retention_seconds,
+        };
+        assert_eq!(
+            policy.policy_digest,
+            worker_retention_policy_digest(&update)
+        );
+        let before = store.plan_worker_removal(&req(), &inv()).unwrap();
+        let after = store
+            .update_worker_retention_policy("w", &policy.policy_digest, &update)
+            .unwrap();
+        assert_eq!(policy.policy_digest, after.policy_digest);
+        assert_eq!(before, store.plan_worker_removal(&req(), &inv()).unwrap());
+        store
+            .begin_worker_removal("w", &before.plan_id, &before.input_fingerprint)
+            .unwrap();
+        let mut changed = update.clone();
+        changed.metadata_disposition = MetadataDisposition::Purge;
+        assert_ne!(
+            worker_retention_policy_digest(&update),
+            worker_retention_policy_digest(&changed)
+        );
+        changed = update.clone();
+        changed.archive_retention = ArchiveRetention::ForSeconds { seconds: 3600 };
+        assert_ne!(
+            worker_retention_policy_digest(&update),
+            worker_retention_policy_digest(&changed)
+        );
+    }
+
     #[test]
     fn deterministic_plan_hold_and_cross_workspace() {
         let s = setup();
         let a = s.plan_worker_removal(&req(), &inv()).unwrap();
         let b = s.plan_worker_removal(&req(), &inv()).unwrap();
         assert_eq!(a.plan_id, b.plan_id);
-        assert_eq!(a.worker_revision, "rev1");
+        assert_eq!(a.worker_updated_at, "2026-08-24T00:00:00Z");
         s.with_conn(|c| {
             c.execute(
                 "UPDATE worker_registry SET retention_state='pinned' WHERE workspace_id='w'",
@@ -1226,7 +1277,15 @@ mod tests {
             diagnostics_disposition: DiagnosticsDisposition::Purge,
             diagnostics_retention_seconds: None,
         };
-        s.update_worker_retention_policy("w", 1, &u).unwrap();
+        s.update_worker_retention_policy(
+            "w",
+            &s.worker_retention_policy("w")
+                .unwrap()
+                .unwrap()
+                .policy_digest,
+            &u,
+        )
+        .unwrap();
         assert!(matches!(
             s.begin_worker_removal("w", &p.plan_id, &p.input_fingerprint),
             Err(WorkerRetentionError::StalePlan { .. })
@@ -1295,7 +1354,10 @@ mod tests {
             prepared.runtime_request.session_disposition,
             SessionDisposition::Archive
         );
-        assert_eq!(prepared.runtime_request.policy_revision, 1);
+        assert_eq!(
+            prepared.runtime_request.input_fingerprint,
+            prepared.plan.input_fingerprint
+        );
         assert_eq!(
             prepared.runtime_request.worker_id,
             WorkerId::from_legacy_u64(1)
@@ -1337,7 +1399,7 @@ mod tests {
         .unwrap();
         s.with_conn(|conn| {
             conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit) VALUES('w','ticket-old','ticket-old','Old Ticket','open','task','normal','','planning',1)", [])?;
-            conn.execute("INSERT INTO worker_registry(workspace_id,worker_id,runtime_id,display_name,profile,retention_state,created_at,updated_at) VALUES('w','1','r','old worker','builtin:coder','normal','created','rev1')", [])?;
+            conn.execute("INSERT INTO worker_registry(workspace_id,worker_id,runtime_id,display_name,profile,retention_state,created_at,updated_at) VALUES('w','1','r','old worker','builtin:coder','normal','created','2026-08-24T00:00:00Z')", [])?;
             conn.execute("INSERT INTO worker_create_reservations(workspace_id,allocation_key,worker_id,runtime_id,create_fingerprint,state,created_at,updated_at) VALUES('w','allocation-old',?1,'r','fingerprint','created','created','created')", [worker_id().to_string()])?;
             conn.execute("INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,runtime_id,worker_id,assigned_by,assigned_at) VALUES('w','ticket-old','assignment-old','r','1','test','t')", [])?;
             conn.execute("DELETE FROM worker_registry WHERE workspace_id='w' AND runtime_id='r' AND worker_id='1'", [])?;
@@ -1350,7 +1412,7 @@ mod tests {
         let result = WorkerRetentionExecutionResult {
             operation_id: p.operation_id.clone(),
             input_fingerprint: p.input_fingerprint.clone(),
-            expected_worker_revision: p.worker_revision.clone(),
+
             worker_id: worker_id(),
             session_disposition: p.session_disposition,
             diagnostics_disposition: p.diagnostics_disposition,
@@ -1371,7 +1433,7 @@ mod tests {
                 content_bytes: 1,
                 content_file_count: 1,
                 policy_id: p.policy_id.clone(),
-                policy_revision: p.policy_revision,
+
                 operation_id: p.operation_id.clone(),
                 input_fingerprint: p.input_fingerprint.clone(),
             }),
@@ -1608,7 +1670,11 @@ mod tests {
                 store
                     .update_worker_retention_policy(
                         "w",
-                        1,
+                        &store
+                            .worker_retention_policy("w")
+                            .unwrap()
+                            .unwrap()
+                            .policy_digest,
                         &WorkerRetentionPolicyUpdate {
                             policy_id: "purge".into(),
                             session_disposition: SessionDisposition::Purge,
@@ -1630,7 +1696,6 @@ mod tests {
                 let result = WorkerRetentionExecutionResult {
                     operation_id: plan.operation_id.clone(),
                     input_fingerprint: plan.input_fingerprint.clone(),
-                    expected_worker_revision: plan.worker_revision.clone(),
                     worker_id: worker_id(),
                     session_disposition: plan.session_disposition,
                     diagnostics_disposition: plan.diagnostics_disposition,
@@ -1817,7 +1882,7 @@ mod tests {
         let result = WorkerRetentionExecutionResult {
             operation_id: plan.operation_id.clone(),
             input_fingerprint: plan.input_fingerprint.clone(),
-            expected_worker_revision: plan.worker_revision.clone(),
+
             worker_id: worker_id(),
             session_disposition: plan.session_disposition,
             diagnostics_disposition: plan.diagnostics_disposition,
@@ -1897,7 +1962,7 @@ mod tests {
         let result = WorkerRetentionExecutionResult {
             operation_id: plan.operation_id.clone(),
             input_fingerprint: plan.input_fingerprint.clone(),
-            expected_worker_revision: plan.worker_revision.clone(),
+
             worker_id: worker_id(),
             session_disposition: plan.session_disposition,
             diagnostics_disposition: plan.diagnostics_disposition,
@@ -1949,14 +2014,22 @@ mod tests {
             diagnostics_disposition: DiagnosticsDisposition::Purge,
             diagnostics_retention_seconds: None,
         };
-        s.update_worker_retention_policy("w", 1, &u).unwrap();
+        s.update_worker_retention_policy(
+            "w",
+            &s.worker_retention_policy("w")
+                .unwrap()
+                .unwrap()
+                .policy_digest,
+            &u,
+        )
+        .unwrap();
         let p = s.plan_worker_removal(&req(), &inv()).unwrap();
         s.begin_worker_removal("w", &p.plan_id, &p.input_fingerprint)
             .unwrap();
         let r = WorkerRetentionExecutionResult {
             operation_id: p.operation_id.clone(),
             input_fingerprint: p.input_fingerprint.clone(),
-            expected_worker_revision: p.worker_revision.clone(),
+
             worker_id: worker_id(),
             session_disposition: SessionDisposition::Purge,
             diagnostics_disposition: DiagnosticsDisposition::Purge,
@@ -1980,7 +2053,15 @@ mod tests {
             diagnostics_retention_seconds: None,
         };
         store
-            .update_worker_retention_policy("w", 1, &purge)
+            .update_worker_retention_policy(
+                "w",
+                &store
+                    .worker_retention_policy("w")
+                    .unwrap()
+                    .unwrap()
+                    .policy_digest,
+                &purge,
+            )
             .unwrap();
         let plan = store.plan_worker_removal(&req(), &inv()).unwrap();
         store
@@ -1989,7 +2070,7 @@ mod tests {
         let result = WorkerRetentionExecutionResult {
             operation_id: plan.operation_id.clone(),
             input_fingerprint: plan.input_fingerprint.clone(),
-            expected_worker_revision: plan.worker_revision.clone(),
+
             worker_id: worker_id(),
             session_disposition: SessionDisposition::Purge,
             diagnostics_disposition: DiagnosticsDisposition::Purge,
@@ -2067,7 +2148,7 @@ mod tests {
         let mut result = WorkerRetentionExecutionResult {
             operation_id: plan.operation_id.clone(),
             input_fingerprint: plan.input_fingerprint.clone(),
-            expected_worker_revision: plan.worker_revision.clone(),
+
             worker_id: worker_id(),
             session_disposition: plan.session_disposition,
             diagnostics_disposition: plan.diagnostics_disposition,
@@ -2117,15 +2198,15 @@ mod tests {
             summary_ref: None,
             diagnostics_ref: None,
             created_at: "created".into(),
-            updated_at: "rev2".into(),
+            updated_at: "2026-08-24T00:00:01Z".into(),
         };
         store.upsert_worker_registry(&stale).unwrap();
-        let revision: String = store.with_conn(|conn| conn.query_row(
+        let updated_at: String = store.with_conn(|conn| conn.query_row(
             "SELECT updated_at FROM worker_registry WHERE workspace_id='w' AND runtime_id='r' AND worker_id=?1",
             [worker_id().to_string()],
             |row| row.get(0),
         ).map_err(StoreError::from)).unwrap();
-        assert_eq!(revision, "rev1");
+        assert_eq!(updated_at, "2026-08-24T00:00:00Z");
 
         let assignment = TicketWorkerAssignmentRecord {
             workspace_id: "w".into(),
@@ -2152,7 +2233,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_result_must_match_prepared_worker_revision() {
+    fn runtime_result_must_match_prepared_input_fingerprint() {
         let s = setup();
         let plan = s.plan_worker_removal(&req(), &inv()).unwrap();
         let prepared = s
@@ -2161,7 +2242,7 @@ mod tests {
         let mut runtime_result = WorkerRetentionExecutionResult {
             operation_id: prepared.plan.operation_id.clone(),
             input_fingerprint: prepared.plan.input_fingerprint.clone(),
-            expected_worker_revision: prepared.plan.worker_revision.clone(),
+
             worker_id: worker_id(),
             session_disposition: prepared.plan.session_disposition,
             diagnostics_disposition: prepared.plan.diagnostics_disposition,
@@ -2169,7 +2250,7 @@ mod tests {
             source_removed: true,
             diagnostics_retained: false,
         };
-        runtime_result.expected_worker_revision = "stale-revision".to_string();
+        runtime_result.input_fingerprint = "stale-input-fingerprint".to_string();
         let error = s
             .commit_worker_removal(
                 "w",
@@ -2180,7 +2261,7 @@ mod tests {
             .unwrap_err();
         assert!(
             !error.to_string().is_empty(),
-            "mismatched Runtime revision must be rejected"
+            "mismatched Runtime input fingerprint must be rejected"
         );
     }
 
@@ -2237,7 +2318,7 @@ mod tests {
         store
             .with_conn(|conn| {
                 conn.execute(
-                    "UPDATE worker_registry SET updated_at='rev2' WHERE workspace_id='w' AND runtime_id='r' AND worker_id=?1",
+                    "UPDATE worker_registry SET updated_at='2026-08-24T00:00:01Z' WHERE workspace_id='w' AND runtime_id='r' AND worker_id=?1",
                     [worker_id().to_string()],
                 )?;
                 Ok(())
@@ -2251,7 +2332,7 @@ mod tests {
                 .is_none()
         );
         let replacement = store.plan_worker_removal(&request, &inv()).unwrap();
-        assert_eq!(replacement.worker_revision, "rev2");
+        assert_eq!(replacement.worker_updated_at, "2026-08-24T00:00:01Z");
         assert_ne!(replacement.plan_id, plan.plan_id);
     }
 
@@ -2266,7 +2347,7 @@ mod tests {
         let runtime_result = WorkerRetentionExecutionResult {
             operation_id: prepared.plan.operation_id.clone(),
             input_fingerprint: prepared.plan.input_fingerprint.clone(),
-            expected_worker_revision: prepared.plan.worker_revision.clone(),
+
             worker_id: worker_id(),
             session_disposition: prepared.plan.session_disposition,
             diagnostics_disposition: prepared.plan.diagnostics_disposition,
@@ -2287,7 +2368,7 @@ mod tests {
                 content_bytes: 1,
                 content_file_count: 1,
                 policy_id: prepared.plan.policy_id.clone(),
-                policy_revision: prepared.plan.policy_revision,
+
                 operation_id: prepared.plan.operation_id.clone(),
                 input_fingerprint: prepared.plan.input_fingerprint.clone(),
             }),
@@ -2332,8 +2413,8 @@ mod tests {
             .unwrap();
         assert_eq!(recovered.plan.state, WorkerRemovalPlanState::Succeeded);
         assert_eq!(
-            recovered.runtime_request.expected_worker_revision,
-            plan.worker_revision
+            recovered.runtime_request.input_fingerprint,
+            plan.input_fingerprint
         );
     }
 

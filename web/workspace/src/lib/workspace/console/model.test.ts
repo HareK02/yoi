@@ -1506,7 +1506,7 @@ Deno.test("legacy compaction lifecycle events are inert", () => {
   const running = {
     schema_version: 2,
     compaction_id: "compaction-1",
-    revision: 1,
+
     internal_worker: null,
     state: "running",
     started_at_ms: 1_000,
@@ -1530,7 +1530,7 @@ Deno.test("legacy compaction lifecycle events are inert", () => {
         data: {
           lifecycle: {
             ...running,
-            revision: 2,
+
             state: "done",
             ended_at_ms: 4_000,
             summary: "accepted summary",
@@ -1546,7 +1546,7 @@ Deno.test("legacy compaction lifecycle events are inert", () => {
         data: {
           lifecycle: {
             ...running,
-            revision: 3,
+
             state: "failed",
             ended_at_ms: 5_000,
             error: "legacy failure",
@@ -1580,7 +1580,7 @@ Deno.test("snapshot restores running compaction without staged content", () => {
       parent_session_id: "parent-session",
       kind: { service: { kind: "compaction" } },
     },
-    revision: 1,
+
     session: canonicalSession([]),
     status: "running",
     in_flight: {
@@ -1678,7 +1678,7 @@ Deno.test("snapshot does not guess between multiple compaction services", () => 
         parent_session_id: "parent-session",
         kind: { service: { kind: "compaction" } },
       },
-      revision: 1,
+
       session: canonicalSession([]),
       status: "running" as const,
       in_flight: {
@@ -1737,7 +1737,7 @@ Deno.test("live compaction keeps its first service binding until terminal progre
         event: "internal_worker",
         data: {
           worker: workerA,
-          revision: 1,
+
           event: {
             event: "tool_call_start",
             data: { id: "read-a", name: "ReadEntry" },
@@ -1751,7 +1751,7 @@ Deno.test("live compaction keeps its first service binding until terminal progre
         event: "internal_worker",
         data: {
           worker: workerB,
-          revision: 1,
+
           event: {
             event: "tool_call_start",
             data: { id: "search-b", name: "SearchSessionEntries" },
@@ -1797,7 +1797,7 @@ Deno.test("compaction summary candidate stays private", () => {
         event: "internal_worker",
         data: {
           worker,
-          revision: 1,
+
           event: {
             event: "tool_call_start",
             data: { id: "call-1", name: "write_summary" },
@@ -1811,7 +1811,7 @@ Deno.test("compaction summary candidate stays private", () => {
         event: "internal_worker",
         data: {
           worker,
-          revision: 2,
+
           event: {
             event: "tool_call_done",
             data: {
@@ -1866,7 +1866,7 @@ Deno.test("runtime compaction progress nests service activity and clears it", ()
       event: "internal_worker",
       data: {
         worker,
-        revision: 1,
+
         event: {
           event: "tool_call_done",
           data: {
@@ -1883,7 +1883,7 @@ Deno.test("runtime compaction progress nests service activity and clears it", ()
       event: "internal_worker",
       data: {
         worker,
-        revision: 2,
+
         event: {
           event: "tool_call_done",
           data: {
@@ -1915,7 +1915,7 @@ Deno.test("runtime compaction progress nests service activity and clears it", ()
     eventId: "compaction-service-removed",
     event: {
       event: "internal_worker_removed",
-      data: { worker, revision: 3 },
+      data: { worker },
     } satisfies Event,
   }]);
   assertEquals(projection.internalWorkers, []);
@@ -1946,7 +1946,7 @@ Deno.test("snapshot excludes storage-only compaction extension records", () => {
       payload: {
         schema_version: 2,
         compaction_id: "compaction-orphaned",
-        revision: 2,
+
         internal_worker: {
           session_id: "missing-service",
           name: "Compaction",
@@ -2023,7 +2023,7 @@ Deno.test("back-to-back compactions do not retain prior activity", () => {
         event: "internal_worker",
         data: {
           worker,
-          revision: 1,
+
           event: {
             event: "tool_call_done",
             data: { id: "read-1", name: "ReadEntry", arguments: "{}" },
@@ -2035,7 +2035,7 @@ Deno.test("back-to-back compactions do not retain prior activity", () => {
       eventId: "first-removed",
       event: {
         event: "internal_worker_removed",
-        data: { worker, revision: 2 },
+        data: { worker },
       } satisfies Event,
     },
     {
@@ -3025,7 +3025,7 @@ Deno.test("projectConsole mirrors live TaskCreate and TaskUpdate calls", () => {
   }]);
 });
 
-Deno.test("Internal Worker output stays separate and revision-fenced", () => {
+Deno.test("Internal Worker output stays separate and follows parent stream arrival order", () => {
   const worker = {
     session_id: "child-session",
     name: "research",
@@ -3039,7 +3039,7 @@ Deno.test("Internal Worker output stays separate and revision-fenced", () => {
       event: "internal_worker",
       data: {
         worker,
-        revision: 2,
+
         event: { event: "text_done", data: { text: "child output" } },
       },
     },
@@ -3057,12 +3057,12 @@ Deno.test("Internal Worker output stays separate and revision-fenced", () => {
       event: "internal_worker",
       data: {
         worker,
-        revision: 1,
-        event: { event: "text_done", data: { text: "stale" } },
+
+        event: { event: "text_done", data: { text: "next output" } },
       },
     },
   }]);
-  assertEquals(projection.internalWorkers[0].console.lines.length, 1);
+  assertEquals(projection.internalWorkers[0].console.lines.map((line) => line.body), ["child output", "next output"]);
 
   const views = consoleWorkerViews(projection);
   assertEquals(views.map((view) => [view.sessionId, view.label]), [
@@ -3095,7 +3095,7 @@ Deno.test("live-created Internal Worker receives own metadata without reconnect"
       eventId: "child-snapshot",
       event: {
         event: "internal_worker",
-        data: { worker, revision: 1, event: childSnapshot },
+        data: { worker, event: childSnapshot },
       },
     },
     {
@@ -3104,7 +3104,7 @@ Deno.test("live-created Internal Worker receives own metadata without reconnect"
         event: "internal_worker",
         data: {
           worker,
-          revision: 2,
+
           event: {
             event: "context_usage",
             data: { usage: { tokens: 14_000, source: "estimated" } },
@@ -3137,7 +3137,7 @@ Deno.test("Internal Worker snapshot output continues without entering the parent
   };
   snapshot.data.internal_workers = [{
     worker,
-    revision: 4,
+
     session: canonicalSession([]),
     greeting: {
       worker_name: "research",
@@ -3185,7 +3185,7 @@ Deno.test("Internal Worker snapshot output continues without entering the parent
         event: "internal_worker",
         data: {
           worker,
-          revision: 5,
+
           event: { event: "text_delta", data: { text: "ld**" } },
         },
       },
@@ -3216,7 +3216,7 @@ Deno.test("console Worker views expose only direct Internal Workers", () => {
           parent_session_id: "parent-session",
           kind: "sub_worker",
         },
-        revision: 1,
+
         event: {
           event: "internal_worker",
           data: {
@@ -3226,7 +3226,7 @@ Deno.test("console Worker views expose only direct Internal Workers", () => {
               parent_session_id: "child-session",
               kind: "sub_worker",
             },
-            revision: 1,
+
             event: {
               event: "worker_state",
               data: { snapshot: workerState("running") },
@@ -3248,7 +3248,7 @@ Deno.test("console Worker views expose only direct Internal Workers", () => {
           parent_session_id: "parent-session",
           kind: "sub_worker",
         },
-        revision: 1,
+
         event: {
           event: "worker_state",
           data: { snapshot: workerState("idle") },
@@ -3298,7 +3298,7 @@ Deno.test("parent snapshot authoritatively replaces Internal Worker projections"
       parent_session_id: "parent-session",
       kind: "sub_worker",
     },
-    revision: 4,
+
     session: canonicalSession([{
       kind: "assistant_item",
       ts: 1,
@@ -3343,7 +3343,7 @@ Deno.test("parent snapshot authoritatively replaces Internal Worker projections"
           parent_session_id: "parent-session",
           kind: "sub_worker",
         },
-        revision: 1,
+
         event: {
           event: "worker_state",
           data: { snapshot: workerState("running") },
@@ -3384,12 +3384,12 @@ Deno.test("terminal Internal Worker removal drops descendants and fences late ev
       event: "internal_worker",
       data: {
         worker,
-        revision: 2,
+
         event: {
           event: "internal_worker",
           data: {
             worker: nestedWorker,
-            revision: 1,
+
             event: { event: "text_done", data: { text: "nested" } },
           },
         },
@@ -3406,7 +3406,7 @@ Deno.test("terminal Internal Worker removal drops descendants and fences late ev
     eventId: "removed",
     event: {
       event: "internal_worker_removed",
-      data: { worker, revision: 3 },
+      data: { worker },
     },
   }, {
     eventId: "late",
@@ -3414,7 +3414,7 @@ Deno.test("terminal Internal Worker removal drops descendants and fences late ev
       event: "internal_worker",
       data: {
         worker,
-        revision: 4,
+
         event: { event: "text_done", data: { text: "must stay removed" } },
       },
     },
@@ -3427,7 +3427,7 @@ Deno.test("terminal Internal Worker removal drops descendants and fences late ev
   assertEquals(projection.removedInternalWorkers, {});
 });
 
-Deno.test("stale Internal Worker removal cannot discard a newer projection", () => {
+Deno.test("Internal Worker removal follows arrival order without a synthetic freshness counter", () => {
   const worker = {
     session_id: "child-session",
     name: "child",
@@ -3441,21 +3441,21 @@ Deno.test("stale Internal Worker removal cannot discard a newer projection", () 
       event: "internal_worker",
       data: {
         worker,
-        revision: 4,
+
         event: { event: "text_done", data: { text: "current" } },
       },
     },
   }]);
 
   const projection = projector.append([{
-    eventId: "stale-removal",
+    eventId: "removal",
     event: {
       event: "internal_worker_removed",
-      data: { worker, revision: 3 },
+      data: { worker },
     },
   }]);
-  assertEquals(projection.internalWorkers.length, 1);
-  assertEquals(projection.internalWorkers[0].revision, 4);
+  assertEquals(projection.internalWorkers, []);
+  assertEquals(projection.removedInternalWorkers, { "child-session": true });
 });
 
 Deno.test("snapshot restores TaskStore state from system history", () => {
@@ -3465,7 +3465,7 @@ Deno.test("snapshot restores TaskStore state from system history", () => {
   if (event.event !== "snapshot") throw new Error("snapshot fixture expected");
   event.data.session = {
     pending_submissions: {
-      revision: 0,
+
       notification_count: 0,
       head_id: null,
       submissions: [],
@@ -3717,7 +3717,7 @@ Deno.test("snapshot entry replay is idempotent by identity, not text, including 
   const child = { session_id: "child-session", name: "reviewer", kind: "sub_worker" as const };
   const snapshot = snapshotEvent("/repo") as SnapshotEvent;
   snapshot.data.internal_workers = [{
-    worker: child, revision: 5,
+    worker: child,
     session: { ...snapshot.data.session, entries }, status: "idle",
     in_flight: { blocks: [] }, internal_workers: [],
   }];
@@ -3725,13 +3725,13 @@ Deno.test("snapshot entry replay is idempotent by identity, not text, including 
   for (const [index, entry] of [user, assistant, system].entries()) {
     events.push({ eventId: `parent-${index}`, event: {
       event: "internal_worker", data: {
-        worker: child, revision: 6 + index,
+        worker: child,
         event: { event: "session_entry_committed", data: { entry } },
       },
     } });
   }
   events.push({ eventId: "replayed-user", event: {
-    event: "internal_worker", data: { worker: child, revision: 9, event: {
+    event: "internal_worker", data: { worker: child, event: {
       event: "user_message", data: { entry_id: user.entry_id, segments: user.segments },
     } },
   } });

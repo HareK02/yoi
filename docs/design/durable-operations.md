@@ -77,7 +77,7 @@ The record normally contains:
 - Workspace and operation identity;
 - a fingerprint of stable caller intent;
 - the created resource or result identity;
-- the committed revision and timestamp where relevant.
+- the committed content digest or immutable change ID and timestamp where relevant.
 
 It does not need `pending`, `executing`, or intermediate stages. An exact retry
 returns the recorded result. Reusing the same operation identity with a
@@ -173,7 +173,7 @@ Prefer factual fields over stage names:
 
 - `provider_deleted_at` is evidence that provider deletion succeeded;
 - `child_operation_id` binds delegated work;
-- `result_revision` identifies the committed result;
+- `result_digest` identifies the committed result content;
 - `target_ref_after` records verified merge evidence.
 
 Avoid fields such as `validating`, `closing_session`, `detaching`,
@@ -211,7 +211,7 @@ results.
 Before every retry or side effect, reread live authority and revalidate its
 fence. A previously recorded blocker does not prove that the operation remains
 blocked, and a previously unblocked operation does not retain permission after
-assignment, ownership, revision, or attachment authority changes.
+assignment, ownership, content, or attachment authority changes.
 
 ## Identity and fingerprinting
 
@@ -243,7 +243,7 @@ When an external provider is involved:
 
 1. reserve stable intent and identity if retry needs them;
 2. invoke the provider with the strongest available idempotency, expected-old
-   revision, or stable resource key;
+   content digest, or stable resource key;
 3. verify the provider result through authoritative response or observation;
 4. commit only the checkpoint or result evidence that changes retry behavior;
 5. on retry, reread both the operation and current domain/provider authority
@@ -315,7 +315,7 @@ The durable split is deliberate:
 
 - `backend_jobs` stores immutable bounded input, its fingerprint, the current
   attempt number, and the final structured result or terminal failure;
-- `backend_job_attempts` binds one attempt and input revision to one dedicated
+- `backend_job_attempts` binds one attempt and input digest to one dedicated
   `(Workspace, Runtime, Worker)` identity, a precommitted tracked Runtime
   submission request identity, a deadline, and its bounded outcome;
 - `backend_job_deliveries` records best-effort notification separately from the
@@ -342,7 +342,7 @@ The Ticket checker continues to select `builtin:backend-job` itself.
 
 Job identity/result capability comes from an immutable Host-authored create and
 restore binding, not the Profile name, tag, instruction, Worker display name or
-Runtime placement. Backend checks the exact live Job/attempt/input revision and
+Runtime placement. Backend checks the exact live Job/attempt/input digest and
 authenticated Worker before accepting results or domain operations. Profile
 policy alone never confers a subject grant.
 
@@ -357,14 +357,14 @@ remains attention-required even after its Worker is removed.
 
 Success is accepted only by the structured result boundary. Before Runtime
 input can execute, the attempt is fenced by Workspace, Job ID, attempt ID, input
-revision, bound Runtime Worker identity, and a fixed-size collision-resistant
+digest, bound Runtime Worker identity, and a fixed-size collision-resistant
 tracked submission request identity derived from the attempt. Ordinary Worker
 input and Console mutation are rejected for
 Job-owned Workers, so no later run in the same Session can exercise the result
 capability. Result JSON bytes are bounded before persistence. Worker final prose,
 Idle, Stopped, or a successful model call are not success evidence. Identical
 structured submission is idempotent; conflicting replay, stale or late attempts,
-wrong revisions, and other Workers fail closed.
+wrong input digests, and other Workers fail closed.
 
 On restart, an unbound reservation is redispatched with its stable allocation.
 A dispatched attempt continues only when its bound Worker and precommitted

@@ -17,7 +17,7 @@ function assert(condition: boolean, message: string): void {
 
 const snapshot: SessionSnapshot = {
   pending_submissions: {
-    revision: 0,
+
     notification_count: 0,
     head_id: null,
     submissions: [],

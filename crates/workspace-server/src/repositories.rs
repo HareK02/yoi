@@ -18,7 +18,6 @@ pub struct ConfiguredRepository {
     pub repository_key: String,
     pub provider: String,
     pub source: RepositorySource,
-    pub source_revision: u64,
     pub source_fingerprint: String,
     pub observed_status: RepositoryObservedStatus,
     pub observed_at: Option<String>,
@@ -321,7 +320,6 @@ impl RepositoryRegistryReader {
             kind: repository.provider.clone(),
             provider: repository.provider.clone(),
             source: repository.source.clone(),
-            source_revision: repository.source_revision,
             source_fingerprint: repository.source_fingerprint.clone(),
             observed_status: repository.observed_status,
             observed_at: repository.observed_at.clone(),
@@ -606,7 +604,6 @@ mod tests {
             provider: "git".into(),
             source_fingerprint: crate::repository_source::repository_source_fingerprint(&source),
             source,
-            source_revision: 1,
             observed_status: RepositoryObservedStatus::Unverified,
             observed_at: None,
             path: None,
@@ -638,7 +635,6 @@ mod tests {
             provider: "git".into(),
             source_fingerprint: crate::repository_source::repository_source_fingerprint(&source),
             source,
-            source_revision: 1,
             observed_status: RepositoryObservedStatus::Unverified,
             observed_at: None,
             path: None,
@@ -648,6 +644,10 @@ mod tests {
         let projection = reader.list();
         let summary = &projection.items[0];
         assert_eq!(summary.source.kind, server_api::RepositorySourceKind::Ssh);
+        assert_eq!(
+            summary.source_fingerprint,
+            crate::repository_source::repository_source_fingerprint(&summary.source)
+        );
         assert_eq!(
             summary.observed_status,
             RepositoryObservedStatus::Unverified
@@ -761,7 +761,6 @@ mod tests {
                 &source_descriptor,
             ),
             source: source_descriptor,
-            source_revision: 1,
             observed_status: RepositoryObservedStatus::Unverified,
             observed_at: None,
             path: Some(path.to_path_buf()),

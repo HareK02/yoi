@@ -17,7 +17,7 @@ pub const DEFAULT_BACKEND_RESOURCE_FETCH_TIMEOUT: std::time::Duration =
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RepositorySshAccessSecretCandidate {
     pub credential_id: String,
-    pub credential_revision: u64,
+    pub public_key_fingerprint: String,
     pub private_key: String,
 }
 
@@ -32,7 +32,7 @@ impl std::fmt::Debug for RepositorySshAccessSecretCandidate {
         formatter
             .debug_struct("RepositorySshAccessSecretCandidate")
             .field("credential_id", &self.credential_id)
-            .field("credential_revision", &self.credential_revision)
+            .field("public_key_fingerprint", &self.public_key_fingerprint)
             .field("private_key", &"[REDACTED]")
             .finish()
     }
@@ -89,9 +89,6 @@ pub struct BackendResourceHandle {
     pub operation: BackendResourceOperation,
     pub expires_at_unix_seconds: i64,
     pub nonce: String,
-    pub revision: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation: Option<u64>,
     pub max_bytes: u64,
     pub content_type: String,
     pub redaction: ResourceRedactionPolicy,
@@ -425,8 +422,6 @@ mod tests {
             operation: BackendResourceOperation::FetchArchive,
             expires_at_unix_seconds: 4_102_444_800,
             nonce: "nonce-test".to_string(),
-            revision: sha256_hex(bytes),
-            generation: Some(1),
             max_bytes: 1024,
             content_type: PROFILE_SOURCE_ARCHIVE_CONTENT_TYPE.to_string(),
             redaction: ResourceRedactionPolicy::RuntimeInternalOnly,
@@ -477,7 +472,7 @@ mod tests {
         let secret = RepositorySshAccessSecret {
             credential_candidates: vec![RepositorySshAccessSecretCandidate {
                 credential_id: "credential-1".to_string(),
-                credential_revision: 2,
+                public_key_fingerprint: "key-2".into(),
                 private_key: "PRIVATE KEY secret bytes".to_string(),
             }],
             known_hosts_entry: "host key secret bytes".to_string(),

@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 2;
+#[path = "job_store/legacy_migrations.rs"]
+mod legacy_migrations;
+
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,7 +72,10 @@ impl JobSnapshot {
     pub fn outcome(&self) -> job::JobOutcome {
         job::JobOutcome {
             job_id: self.request.job_id.clone(),
-            input_revision: self.request.input_revision.clone(),
+            input_digest: self
+                .request
+                .input_digest()
+                .expect("validated immutable Job input"),
             attempt_id: self.attempt.attempt_id.clone(),
             attempt: self.attempt.number,
             state: match self.state {
@@ -135,8 +141,8 @@ pub enum JobStoreError {
     ConcurrentLimit,
     #[error("result or lifecycle operation is not bound to the current Job attempt")]
     AttemptMismatch,
-    #[error("result input revision does not match the immutable request")]
-    RevisionMismatch,
+    #[error("result input digest does not match the immutable request")]
+    DigestMismatch,
     #[error("accepted Job result cannot be changed")]
     ResultConflict,
     #[error("invalid Job transition: {0}")]
@@ -176,8 +182,11 @@ impl JobStore {
                 tx.execute_batch(GRANT_SCHEMA)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
-            1 => {
-                tx.execute_batch(GRANT_SCHEMA)?;
+            1 | 2 => {
+                if version == 1 {
+                    tx.execute_batch(GRANT_SCHEMA)?;
+                }
+                legacy_migrations::migrate_legacy_jobs(&tx)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             SCHEMA_VERSION => {}
@@ -370,8 +379,8 @@ impl JobStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let snapshot = require_snapshot(&tx, &bound.job_id)?;
         check_attempt(&snapshot, &bound.attempt_id)?;
-        if snapshot.request.input_revision != bound.input_revision {
-            return Err(JobStoreError::RevisionMismatch);
+        if snapshot.request.input_digest()? != bound.input_digest {
+            return Err(JobStoreError::DigestMismatch);
         }
         let (digest, encoded) =
             job::result_digest(&bound.result, snapshot.request.limits.max_result_bytes)?;
@@ -527,13 +536,13 @@ fn insert_attempt(
     number: u8,
 ) -> Result<(), JobStoreError> {
     conn.execute(
-        "INSERT INTO job_attempts (job_id, number, attempt_id, input_revision, state)
+        "INSERT INTO job_attempts (job_id, number, attempt_id, input_digest, state)
          VALUES (?1, ?2, ?3, ?4, 'reserved')",
         params![
             request.job_id,
             number,
             job::attempt_id(&request.job_id, number),
-            request.input_revision
+            request.input_digest()?
         ],
     )?;
     Ok(())
@@ -669,7 +678,7 @@ CREATE TABLE job_attempts (
     job_id TEXT NOT NULL REFERENCES job_intents(job_id),
     number INTEGER NOT NULL CHECK (number BETWEEN 1 AND 255),
     attempt_id TEXT NOT NULL UNIQUE,
-    input_revision TEXT NOT NULL,
+    input_digest TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('reserved', 'dispatched', 'completed', 'failed', 'unknown', 'cancelled')),
     result_json TEXT,
     result_digest TEXT,
@@ -685,7 +694,7 @@ CREATE TRIGGER job_intent_immutable BEFORE UPDATE OF
     job_id, request_json, fingerprint, serialization_key, max_concurrent ON job_intents
 BEGIN SELECT RAISE(ABORT, 'immutable Job intent'); END;
 CREATE TRIGGER job_attempt_immutable BEFORE UPDATE OF
-    job_id, number, attempt_id, input_revision ON job_attempts
+    job_id, number, attempt_id, input_digest ON job_attempts
 BEGIN SELECT RAISE(ABORT, 'immutable Job attempt identity'); END;
 CREATE TRIGGER job_result_immutable BEFORE UPDATE OF result_json, result_digest ON job_attempts
 WHEN OLD.result_json IS NOT NULL AND
@@ -705,7 +714,6 @@ mod tests {
         JobRequest {
             job_id: id.into(),
             purpose: "fixture".into(),
-            input_revision: "revision-1".into(),
             input_ref: "fixture:input".into(),
             input: json!({"immutable": [1, 2, 3]}),
             instruction: "Produce a structured result".into(),
@@ -725,7 +733,10 @@ mod tests {
         JobResultSubmission {
             job_id: snapshot.request.job_id.clone(),
             attempt_id: snapshot.attempt.attempt_id.clone(),
-            input_revision: snapshot.request.input_revision.clone(),
+            input_digest: snapshot
+                .request
+                .input_digest()
+                .expect("validated immutable Job input"),
             result,
         }
     }
@@ -762,10 +773,10 @@ mod tests {
         for sql in [
             "UPDATE job_intents SET request_json = '{}' WHERE job_id = 'identity'",
             "UPDATE job_intents SET fingerprint = 'changed' WHERE job_id = 'identity'",
-            "UPDATE job_attempts SET input_revision = 'changed' WHERE job_id = 'identity'",
+            "UPDATE job_attempts SET input_digest = 'changed' WHERE job_id = 'identity'",
             "UPDATE job_attempts SET attempt_id = 'changed' WHERE job_id = 'identity'",
             "UPDATE job_intents SET current_attempt = 2 WHERE job_id = 'identity'",
-            "INSERT INTO job_attempts (job_id, number, attempt_id, input_revision, state)
+            "INSERT INTO job_attempts (job_id, number, attempt_id, input_digest, state)
              VALUES ('absent', 1, 'absent:attempt:1', 'r', 'reserved')",
         ] {
             assert!(
@@ -817,9 +828,6 @@ mod tests {
         assert!(!snapshot.acknowledged);
         assert_eq!(store.reserve(original.clone()).unwrap(), snapshot);
         let mut variants = Vec::new();
-        let mut changed = original.clone();
-        changed.input_revision = "revision-2".into();
-        variants.push(changed);
         let mut changed = original.clone();
         changed.input = json!({"changed": true});
         variants.push(changed);
@@ -917,12 +925,16 @@ mod tests {
             Err(JobStoreError::AttemptMismatch)
         ));
         let prior: (String, String, String) = store.conn.query_row(
-            "SELECT state, failure, input_revision FROM job_attempts WHERE job_id = 'retry' AND number = 1",
+            "SELECT state, failure, input_digest FROM job_attempts WHERE job_id = 'retry' AND number = 1",
             [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         ).unwrap();
         assert_eq!(
             prior,
-            ("failed".into(), "timeout".into(), "revision-1".into())
+            (
+                "failed".into(),
+                "timeout".into(),
+                original.input_digest().unwrap()
+            )
         );
         store
             .finish(
@@ -960,10 +972,10 @@ mod tests {
             Err(JobStoreError::AttemptMismatch)
         ));
         let mut invalid = valid.clone();
-        invalid.input_revision = "revision-2".into();
+        invalid.input_digest = "wrong-digest".into();
         assert!(matches!(
             store.accept(&invalid),
-            Err(JobStoreError::RevisionMismatch)
+            Err(JobStoreError::DigestMismatch)
         ));
         let mut invalid = valid.clone();
         invalid.result = json!("x".repeat(32));
@@ -1537,7 +1549,7 @@ mod tests {
         let absent = JobResultSubmission {
             job_id: "missing".into(),
             attempt_id: "attempt".into(),
-            input_revision: "r".into(),
+            input_digest: request("missing").input_digest().unwrap(),
             result: json!({}),
         };
         assert!(matches!(

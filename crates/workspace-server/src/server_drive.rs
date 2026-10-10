@@ -4,7 +4,7 @@ use super::*;
 use futures::StreamExt;
 use server_api::*;
 use sha2::{Digest, Sha256};
-use workspace_drive::{Drive, Mutation, NodeId, Revision};
+use workspace_drive::{Drive, Mutation, NodeId};
 
 fn mutation_actor(context: &ServerRequestContext) -> DriveResult<String> {
     if let Some(source) = &context.runtime_source {
@@ -65,8 +65,11 @@ async fn blocking<T: Send + 'static>(
 fn node_id(value: &str) -> DriveResult<NodeId> {
     value.to_owned().try_into().map_err(|_| failure(400))
 }
-fn revision(value: &str) -> DriveResult<Revision> {
-    value.to_owned().try_into().map_err(|_| failure(400))
+fn last_mutation_id(value: &str) -> DriveResult<String> {
+    if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+        return Err(failure(400));
+    }
+    Ok(value.to_owned())
 }
 fn entry(workspace: &str, reference: &DriveEntryRef) -> DriveResult<NodeId> {
     if reference.workspace_id != workspace {
@@ -188,7 +191,7 @@ fn public_node(node: workspace_drive::Node) -> DriveEntry {
             workspace_drive::Kind::File => DriveEntryKind::File,
             workspace_drive::Kind::Directory => DriveEntryKind::Folder,
         },
-        revision: node.revision.get().to_string(),
+        last_mutation_id: node.last_mutation_id.clone(),
         size: (node.kind == workspace_drive::Kind::File).then_some(node.size as u32),
         content_type: node.content_type,
         updated_by: node.updated_by,
@@ -292,7 +295,7 @@ pub(super) async fn read_text(
     }
     let (node, chunk) = blocking(false, move || {
         let node = drive.metadata(id)?;
-        let chunk = drive.read(id, node.revision, 0, max)?;
+        let chunk = drive.read(id, &node.last_mutation_id, 0, max)?;
         Ok((node, chunk))
     })
     .await?;
@@ -317,12 +320,17 @@ pub(super) async fn read_chunk(
 ) -> DriveResult<BinaryBody> {
     let drive = drive_grants::authorized_drive(api, context, workspace, false).await?;
     let id = scoped_id(workspace, &query.entry_workspace_id, &query.id)?;
-    let revision = revision(&query.expected_revision)?;
+    let last_mutation_id = last_mutation_id(&query.expected_mutation_id)?;
     if query.length == 0 || query.length > DRIVE_CHUNK_MAX_BYTES {
         return Err(failure(413));
     }
     let chunk = blocking(false, move || {
-        drive.read(id, revision, query.offset.into(), query.length as usize)
+        drive.read(
+            id,
+            &last_mutation_id,
+            query.offset.into(),
+            query.length as usize,
+        )
     })
     .await?;
     Ok(chunk.bytes.into())
@@ -352,32 +360,32 @@ fn mutation(workspace: &str, mutation: DriveMutation) -> DriveResult<Mutation> {
         },
         DriveMutation::UpdateText {
             id,
-            expected_revision,
+            expected_mutation_id,
             text,
             content_type,
         } => Mutation::Update {
             id: entry(workspace, &id)?,
-            expected_revision: revision(&expected_revision)?,
+            expected_mutation_id: last_mutation_id(&expected_mutation_id)?,
             content_type: safe_content_type(&content_type)?,
             bytes: text_bytes(text)?,
         },
         DriveMutation::Relocate {
             id,
-            expected_revision,
+            expected_mutation_id,
             parent,
             name,
         } => Mutation::Relocate {
             id: entry(workspace, &id)?,
-            expected_revision: revision(&expected_revision)?,
+            expected_mutation_id: last_mutation_id(&expected_mutation_id)?,
             parent: entry(workspace, &parent)?,
             name,
         },
         DriveMutation::Delete {
             id,
-            expected_revision,
+            expected_mutation_id,
         } => Mutation::Delete {
             id: entry(workspace, &id)?,
-            expected_revision: revision(&expected_revision)?,
+            expected_mutation_id: last_mutation_id(&expected_mutation_id)?,
         },
     })
 }
@@ -413,7 +421,9 @@ fn upload_mutation(
     }
     let content_type = safe_content_type(&query.content_type)?;
     match query.operation {
-        DriveUploadOperation::Create if query.id.is_none() && query.expected_revision.is_none() => {
+        DriveUploadOperation::Create
+            if query.id.is_none() && query.expected_mutation_id.is_none() =>
+        {
             Ok(Mutation::CreateFile {
                 parent: node_id(query.parent_id.as_deref().ok_or_else(|| failure(400))?)?,
                 name: query.name.clone().ok_or_else(|| failure(400))?,
@@ -424,9 +434,9 @@ fn upload_mutation(
         DriveUploadOperation::Update if query.parent_id.is_none() && query.name.is_none() => {
             Ok(Mutation::Update {
                 id: node_id(query.id.as_deref().ok_or_else(|| failure(400))?)?,
-                expected_revision: revision(
+                expected_mutation_id: last_mutation_id(
                     query
-                        .expected_revision
+                        .expected_mutation_id
                         .as_deref()
                         .ok_or_else(|| failure(400))?,
                 )?,
@@ -508,9 +518,9 @@ async fn select_download(
         return Err(failure(400));
     }
     if query
-        .expected_revision
+        .expected_mutation_id
         .as_deref()
-        .is_some_and(|v| v != node.revision.get().to_string())
+        .is_some_and(|v| v != node.last_mutation_id.clone())
     {
         return Err(failure(409));
     }
@@ -528,8 +538,9 @@ pub(super) async fn download(
     let mut offset = 0;
     loop {
         let copy = drive.clone();
+        let node = node.clone();
         let chunk = blocking(false, move || {
-            copy.read(node.id, node.revision, offset, TRANSFER_CHUNK)
+            copy.read(node.id, &node.last_mutation_id, offset, TRANSFER_CHUNK)
         })
         .await?;
         offset += chunk.bytes.len() as u64;
@@ -548,12 +559,18 @@ pub(super) async fn download(
     })
 }
 fn validator(node: &workspace_drive::Node) -> String {
-    format!(
-        "\"drive-{}-{}-{}\"",
-        node.workspace_id,
-        node.id.get(),
-        node.revision.get()
-    )
+    // Request IDs are caller-chosen UTF-8, never interpolate them into HTTP headers.
+    let mut digest = Sha256::new();
+    digest.update(node.workspace_id.as_bytes());
+    digest.update([0]);
+    digest.update(node.id.get().to_be_bytes());
+    digest.update(node.last_mutation_id.as_bytes());
+    let hex: String = digest
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("\"drive-{hex}\"")
 }
 
 pub(super) fn router(service: Arc<ServerApiContractService>) -> Router {
@@ -664,16 +681,17 @@ async fn streaming_download(
         let (drive, node) = select_download(api, &context, &workspace, query).await?;
         // Validate the referenced blob before HTTP success, including a zero-byte file.
         let first_drive = drive.clone();
+        let selected = node.clone();
         let first = blocking(false, move || {
-            first_drive.read(node.id, node.revision, 0, TRANSFER_CHUNK)
+            first_drive.read(selected.id, &selected.last_mutation_id, 0, TRANSFER_CHUNK)
         })
         .await?;
         let id = node.id;
-        let revision = node.revision;
-        let state = (drive, id, revision, Some(first), 0_u64, false);
+        let last_mutation_id = node.last_mutation_id.clone();
+        let state = (drive, id, last_mutation_id, Some(first), 0_u64, false);
         let stream = futures::stream::try_unfold(
             state,
-            |(drive, id, revision, first, offset, done)| async move {
+            |(drive, id, last_mutation_id, first, offset, done)| async move {
                 if done {
                     return Ok(None);
                 }
@@ -681,8 +699,9 @@ async fn streaming_download(
                     Some(chunk) => chunk,
                     None => {
                         let copy = drive.clone();
+                        let expected = last_mutation_id.clone();
                         blocking(false, move || {
-                            copy.read(id, revision, offset, TRANSFER_CHUNK)
+                            copy.read(id, &expected, offset, TRANSFER_CHUNK)
                         })
                         .await
                         .map_err(|_| stream_error())?
@@ -692,7 +711,7 @@ async fn streaming_download(
                 let eof = chunk.eof;
                 Ok::<_, std::io::Error>(Some((
                     axum::body::Bytes::from(chunk.bytes),
-                    (drive, id, revision, None, next, eof),
+                    (drive, id, last_mutation_id, None, next, eof),
                 )))
             },
         );
@@ -732,5 +751,32 @@ async fn streaming_download(
     match result {
         Ok(response) => response,
         Err(error) => error_response(error),
+    }
+}
+
+#[cfg(test)]
+mod validator_tests {
+    use super::*;
+
+    #[test]
+    fn request_identity_is_hashed_before_becoming_an_http_validator() {
+        let mut node = workspace_drive::Node {
+            id: "2".to_string().try_into().unwrap(),
+            workspace_id: "workspace".into(),
+            parent_id: Some("1".to_string().try_into().unwrap()),
+            name: "document".into(),
+            kind: workspace_drive::Kind::File,
+            last_mutation_id: "write/資料 ?\"#&=+".into(),
+            size: 0,
+            content_type: Some("text/plain".into()),
+            updated_by: "actor".into(),
+            updated_at_ms: 0,
+        };
+        let first = validator(&node);
+        assert!(first.parse::<axum::http::HeaderValue>().is_ok());
+        assert!(!first.contains(&node.last_mutation_id));
+        assert_eq!(first, validator(&node));
+        node.last_mutation_id = "another-request".into();
+        assert_ne!(first, validator(&node));
     }
 }

@@ -24,7 +24,7 @@ fn subjects() -> Vec<MergeRequestReviewSubject> {
 fn add_review(
     request: &mut MergeRequest,
     event_id: &str,
-    revision: &str,
+    digest: &str,
     snapshot: &[MergeRequestReviewSubject],
     decision: ReviewDecision,
 ) {
@@ -37,7 +37,7 @@ fn add_review(
         event_id: format!("request-{event_id}"),
         sequence,
         subject_ref: subject.subject_ref.clone(),
-        ticket_item_revision: revision.into(),
+        ticket_content_digest: digest.into(),
         ticket_merge_request_subjects: snapshot.to_vec(),
         requested_by: actor(),
         reviewer: actor(),
@@ -48,7 +48,7 @@ fn add_review(
         sequence: sequence + 1,
         request_event_id: requested.event_id.clone(),
         subject_ref: requested.subject_ref.clone(),
-        ticket_item_revision: revision.into(),
+        ticket_content_digest: digest.into(),
         ticket_merge_request_subjects: snapshot.to_vec(),
         decision,
         body: String::new(),
@@ -84,7 +84,7 @@ fn merged_requests() -> Vec<MergeRequest> {
             add_review(
                 &mut request,
                 &approval_id,
-                "revision-one",
+                "digest-one",
                 &snapshot,
                 ReviewDecision::Approve,
             );
@@ -109,22 +109,17 @@ fn merged_requests() -> Vec<MergeRequest> {
 }
 
 #[test]
-fn postmerge_latest_approval_attests_the_current_revision_without_replacing_integration() {
+fn postmerge_latest_approval_attests_the_current_digest_without_replacing_integration() {
     let mut requests = merged_requests();
     let snapshot = subjects();
     assert_eq!(
-        requirement_approval(
-            &requests,
-            "revision-two",
-            &snapshot,
-            Some("integration-MR-1")
-        ),
-        Err(MergeRequestEvidenceError::ItemRevisionMismatch)
+        requirement_approval(&requests, "digest-two", &snapshot, Some("integration-MR-1")),
+        Err(MergeRequestEvidenceError::TicketContentMismatch)
     );
     add_review(
         &mut requests[0],
         "postmerge",
-        "revision-two",
+        "digest-two",
         &snapshot,
         ReviewDecision::Approve,
     );
@@ -134,28 +129,23 @@ fn postmerge_latest_approval_attests_the_current_revision_without_replacing_inte
         "integration-MR-1"
     );
     assert_eq!(
-        requirement_approval(&requests, "revision-two", &snapshot, None)
+        requirement_approval(&requests, "digest-two", &snapshot, None)
             .unwrap()
             .event_id,
         "postmerge"
     );
     assert_eq!(
-        requirement_approval(&requests, "revision-two", &snapshot, Some("postmerge"))
+        requirement_approval(&requests, "digest-two", &snapshot, Some("postmerge"))
             .unwrap()
             .event_id,
         "postmerge"
     );
     assert_eq!(
-        requirement_approval(
-            &requests,
-            "revision-one",
-            &snapshot,
-            Some("integration-MR-1")
-        ),
+        requirement_approval(&requests, "digest-one", &snapshot, Some("integration-MR-1")),
         Err(MergeRequestEvidenceError::ApprovalNotEffective)
     );
     assert_eq!(
-        requirement_approval(&requests, "revision-two", &snapshot, Some("unknown")),
+        requirement_approval(&requests, "digest-two", &snapshot, Some("unknown")),
         Err(MergeRequestEvidenceError::RequirementApprovalMissing)
     );
 }
@@ -167,80 +157,70 @@ fn later_request_changes_prevents_older_requirement_approval_from_being_effectiv
     add_review(
         &mut requests[0],
         "approved",
-        "revision-two",
+        "digest-two",
         &snapshot,
         ReviewDecision::Approve,
     );
     add_review(
         &mut requests[0],
         "changes",
-        "revision-two",
+        "digest-two",
         &snapshot,
         ReviewDecision::RequestChanges,
     );
     assert_eq!(
-        requirement_approval(&requests, "revision-two", &snapshot, None),
+        requirement_approval(&requests, "digest-two", &snapshot, None),
         Err(MergeRequestEvidenceError::RequirementApprovalMissing)
     );
     assert_eq!(
-        requirement_approval(&requests, "revision-two", &snapshot, Some("approved")),
+        requirement_approval(&requests, "digest-two", &snapshot, Some("approved")),
         Err(MergeRequestEvidenceError::ApprovalNotEffective)
     );
     assert_eq!(
-        requirement_approval(&requests, "revision-two", &snapshot, Some("changes")),
+        requirement_approval(&requests, "digest-two", &snapshot, Some("changes")),
         Err(MergeRequestEvidenceError::ApprovalNotApproved)
     );
     assert!(requests[0].integration_approval().is_ok());
 }
 
 #[test]
-fn changed_revision_or_any_linked_source_invalidates_a_multiple_mr_attestation() {
+fn changed_digest_or_any_linked_source_invalidates_a_multiple_mr_attestation() {
     let requests = merged_requests();
     let original = subjects();
-    assert!(requirement_approval(&requests, "revision-one", &original, None).is_ok());
+    assert!(requirement_approval(&requests, "digest-one", &original, None).is_ok());
     assert_eq!(
-        requirement_approval(
-            &requests,
-            "revision-two",
-            &original,
-            Some("integration-MR-1")
-        ),
-        Err(MergeRequestEvidenceError::ItemRevisionMismatch)
+        requirement_approval(&requests, "digest-two", &original, Some("integration-MR-1")),
+        Err(MergeRequestEvidenceError::TicketContentMismatch)
     );
     let mut changed = original.clone();
     changed[1].subject_ref = "changed-source-two".into();
     assert_eq!(
-        requirement_approval(
-            &requests,
-            "revision-one",
-            &changed,
-            Some("integration-MR-1")
-        ),
+        requirement_approval(&requests, "digest-one", &changed, Some("integration-MR-1")),
         Err(MergeRequestEvidenceError::SourceSnapshotMismatch)
     );
     let mut reversed = original.clone();
     reversed.reverse();
-    assert!(requirement_approval(&requests, "revision-one", &reversed, None).is_ok());
+    assert!(requirement_approval(&requests, "digest-one", &reversed, None).is_ok());
 
     // Even after the caller refreshes the linked request collection, an old
     // attestation cannot authorize completion against a smaller linked set.
     assert_eq!(
         requirement_approval(
             &requests[..1],
-            "revision-one",
+            "digest-one",
             &original[..1],
             Some("integration-MR-1")
         ),
         Err(MergeRequestEvidenceError::SourceSnapshotMismatch)
     );
     assert_eq!(
-        requirement_approval(&requests, "revision-one", &original[..1], None),
+        requirement_approval(&requests, "digest-one", &original[..1], None),
         Err(MergeRequestEvidenceError::SourceSnapshotMismatch)
     );
     assert_eq!(
         requirement_approval(
             &requests,
-            "revision-one",
+            "digest-one",
             &[original[0].clone(), original[0].clone()],
             None
         ),
@@ -249,24 +229,24 @@ fn changed_revision_or_any_linked_source_invalidates_a_multiple_mr_attestation()
 }
 
 #[test]
-fn refreshed_postmerge_approval_can_attest_a_changed_multiple_mr_set_and_revision() {
+fn refreshed_postmerge_approval_can_attest_a_changed_multiple_mr_set_and_digest() {
     let mut requests = merged_requests();
     let mut snapshot = subjects();
     snapshot.pop();
     requests.pop();
     assert_eq!(
-        requirement_approval(&requests, "revision-two", &snapshot, None),
+        requirement_approval(&requests, "digest-two", &snapshot, None),
         Err(MergeRequestEvidenceError::RequirementApprovalMissing)
     );
     add_review(
         &mut requests[0],
         "refreshed-set",
-        "revision-two",
+        "digest-two",
         &snapshot,
         ReviewDecision::Approve,
     );
     assert_eq!(
-        requirement_approval(&requests, "revision-two", &snapshot, None)
+        requirement_approval(&requests, "digest-two", &snapshot, None)
             .unwrap()
             .event_id,
         "refreshed-set"
@@ -282,7 +262,7 @@ fn requirement_approval_must_bind_its_own_mr_source_and_corresponding_request() 
     let original = subjects();
     for (case, expected) in [
         ("missing", MergeRequestEvidenceError::ReviewRequestMissing),
-        ("revision", MergeRequestEvidenceError::ReviewRequestMismatch),
+        ("digest", MergeRequestEvidenceError::ReviewRequestMismatch),
         ("snapshot", MergeRequestEvidenceError::ReviewRequestMismatch),
         ("reviewer", MergeRequestEvidenceError::ReviewRequestMismatch),
         ("source", MergeRequestEvidenceError::ApprovalSourceMismatch),
@@ -294,7 +274,7 @@ fn requirement_approval_must_bind_its_own_mr_source_and_corresponding_request() 
                     review.request_event_id = "absent-request".into();
                 }
                 MergeRequestThreadEvent::ReviewRequested(requested) => match case {
-                    "revision" => requested.ticket_item_revision = "other-revision".into(),
+                    "digest" => requested.ticket_content_digest = "other-digest".into(),
                     "snapshot" => {
                         requested.ticket_merge_request_subjects.pop();
                     }
@@ -309,12 +289,7 @@ fn requirement_approval_must_bind_its_own_mr_source_and_corresponding_request() 
             }
         }
         assert_eq!(
-            requirement_approval(
-                &requests,
-                "revision-one",
-                &original,
-                Some("integration-MR-1")
-            ),
+            requirement_approval(&requests, "digest-one", &original, Some("integration-MR-1")),
             Err(expected),
             "{case}"
         );
@@ -339,14 +314,14 @@ fn revoked_requirement_approval_is_rejected_and_discovery_uses_another_valid_mr(
     assert_eq!(
         requirement_approval(
             &requests,
-            "revision-one",
+            "digest-one",
             &subjects(),
             Some("integration-MR-1")
         ),
         Err(MergeRequestEvidenceError::ApprovalRevoked)
     );
     assert_eq!(
-        requirement_approval(&requests, "revision-one", &subjects(), None)
+        requirement_approval(&requests, "digest-one", &subjects(), None)
             .unwrap()
             .event_id,
         "integration-MR-2"
@@ -441,8 +416,8 @@ fn evidence_error_codes_are_stable_machine_diagnostics_separate_from_messages() 
             "approval_not_effective",
         ),
         (
-            MergeRequestEvidenceError::ItemRevisionMismatch,
-            "item_revision_mismatch",
+            MergeRequestEvidenceError::TicketContentMismatch,
+            "ticket_content_mismatch",
         ),
         (
             MergeRequestEvidenceError::SourceSnapshotMismatch,

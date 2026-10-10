@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 // Synthetic API fixture serving the production static UI; no Worker/Git execution.
 import { extname, join, normalize } from "jsr:@std/path@1.1.4";
 import {
@@ -11,6 +12,11 @@ const root = Deno.args[1];
 const legacy = Deno.args.includes("--legacy");
 const tickets = new Map<string, TicketDetail>();
 const bodies: unknown[] = [];
+function contentDigest(value: TicketDetail): string {
+  return createHash("sha256").update("ticket.content.sha256.v1\0").update(JSON.stringify([
+    value.id, value.title, value.body, value.targets.map(({ repository_key, ref_selector, access }) => ({ repository_key, ref_selector, access })),
+  ])).digest("hex");
+}
 function ticket(key: string) {
   if (!tickets.has(key)) {
     const value: TicketDetail = fixtureDetail(key);
@@ -49,7 +55,9 @@ function ticket(key: string) {
     }
     tickets.set(key, value);
   }
-  const value = structuredClone(tickets.get(key)!);
+  const stored = tickets.get(key)!;
+  stored.content_digest = contentDigest(stored);
+  const value = structuredClone(stored);
   if (legacy) {
     const wire = value as unknown as Record<string, unknown>;
     wire.current_coder = wire.current_worker;
@@ -114,7 +122,6 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
           kind: "git",
           provider: "git",
           source: { kind: "local_path", uri: "/fixture/main" },
-          source_revision: 1,
           source_fingerprint: "fixture",
           observed_status: "ready",
           record_authority: "fixture",
@@ -252,8 +259,11 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
           });
         }
         const stored = tickets.get(key) ?? (ticket(key), tickets.get(key)!);
-        if (body.expected_item_revision && body.expected_item_revision !== stored.item_revision) {
-          return Response.json({ message: "Ticket revision conflict; refresh" }, { status: 409 });
+        if (body.expected_content_digest && body.expected_content_digest !== stored.content_digest) {
+          return Response.json({ message: "Ticket content conflict; refresh" }, { status: 409 });
+        }
+        if ((tm[2] === "/state" || tm[2] === "/close") && body.expected_state !== stored.state) {
+          return Response.json({ message: "Ticket state conflict; refresh" }, { status: 409 });
         }
         if (tm[2] === "/state") {
           stored.state = body.state;
@@ -289,7 +299,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
           if (body.title) stored.title = body.title;
           if (body.body) stored.body = body.body;
         }
-        stored.item_revision += "x";
+        stored.content_digest = contentDigest(stored);
         stored.event_count = stored.events.length;
       }
       return Response.json(ticket(key));

@@ -228,7 +228,7 @@ Deno.test("production Workspace Settings separates read/edit, discloses details,
             const reset = await context.request.put(`${url}/api/w/home-long/settings`, {
               data: {
                 display_name: metadataFixture("home-long").display_name,
-                revision: current.revision,
+                expected_updated_at: current.updated_at,
               },
             });
             assertEquals(reset.status(), 200);

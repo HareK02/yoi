@@ -95,14 +95,14 @@
   let hostname = $state('');
   let port = $state(22);
   let hostKey = $state('');
-  let hostExpectedRevision = $state<number | null>(null);
+  let hostExpectedFingerprint = $state<string | null>(null);
   let hostErrors = $state<RepositoryAccessFieldErrors>({});
   let hostTrustIdInput = $state<HTMLInputElement>();
   let hostKeyInput = $state<HTMLTextAreaElement>();
   let hostFormElement = $state<HTMLFormElement>();
   let hostReturnFocus: HTMLElement | null = null;
   const editingHostTrust = $derived(
-    hostExpectedRevision === null ? null : hostTrusts.find((entry) => entry.host_trust_id === hostTrustId) ?? null
+    hostExpectedFingerprint === null ? null : hostTrusts.find((entry) => entry.host_trust_id === hostTrustId) ?? null
   );
 
   function resetPageState(next: PageProps['data']): void {
@@ -139,7 +139,7 @@
     hostname = '';
     port = 22;
     hostKey = '';
-    hostExpectedRevision = null;
+    hostExpectedFingerprint = null;
     hostErrors = {};
     hostReturnFocus = null;
   }
@@ -460,7 +460,7 @@
     try {
       const body: RotateRepositorySshCredentialRequest = {
         operation_id: operationId('credential-rotate'),
-        expected_revision: credential.current_revision,
+        expected_public_key_fingerprint: credential.public_key_fingerprint,
         private_key: rotatePrivateKey,
         passphrase: rotatePassphrase || null
       };
@@ -504,7 +504,7 @@
     try {
       const body: DeleteRepositorySshCredentialRequest = {
         operation_id: operationId('credential-delete'),
-        expected_revision: credential.current_revision
+        expected_public_key_fingerprint: credential.public_key_fingerprint
       };
       await request(`/credentials/${encodeURIComponent(credential.credential_id)}`, 'DELETE', body, null, `delete ${credential.name}`);
       requireCurrentOperation(operation);
@@ -528,7 +528,7 @@
     hostname = '';
     port = 22;
     hostKey = '';
-    hostExpectedRevision = null;
+    hostExpectedFingerprint = null;
     hostErrors = {};
     hostFormNotice = null;
     await tick();
@@ -542,7 +542,7 @@
     hostname = hostTrust.hostname;
     port = hostTrust.port;
     hostKey = hostTrust.host_key;
-    hostExpectedRevision = hostTrust.current_revision;
+    hostExpectedFingerprint = hostTrust.fingerprint;
     hostErrors = {};
     hostFormNotice = null;
     await tick();
@@ -552,13 +552,13 @@
   async function closeHostEditor(restore = true) {
     const returnFocus = hostReturnFocus;
     const shouldRestoreFocus = restore && focusIsInside(hostFormElement);
-    const fallbackId = hostExpectedRevision !== null ? `rotate-host-${hostTrustId}` : undefined;
+    const fallbackId = hostExpectedFingerprint !== null ? `rotate-host-${hostTrustId}` : undefined;
     hostEditorOpen = false;
     hostTrustId = '';
     hostname = '';
     port = 22;
     hostKey = '';
-    hostExpectedRevision = null;
+    hostExpectedFingerprint = null;
     hostErrors = {};
     hostFormNotice = null;
     hostReturnFocus = null;
@@ -571,7 +571,7 @@
       await focusFirstInvalid(hostFormElement);
       return;
     }
-    const rotating = hostExpectedRevision !== null;
+    const rotating = hostExpectedFingerprint !== null;
     const rotationTarget = editingHostTrust;
     if (rotating && !rotationTarget) {
       hostFormNotice = { tone: 'error', text: 'This pinned host key changed or was removed. Close the editor and try again.' };
@@ -587,7 +587,7 @@
         hostname: rotationTarget?.hostname ?? hostname.trim(),
         port: rotationTarget?.port ?? port,
         host_key: hostKey.trim(),
-        expected_revision: hostExpectedRevision
+        expected_fingerprint: hostExpectedFingerprint
       };
       const saved = await request('/host-trusts', 'POST', body, parseRepositorySshHostTrust, rotating ? 'rotate this pinned SSH host key' : 'pin this SSH host key');
       requireCurrentOperation(operation);
@@ -619,7 +619,7 @@
     try {
       const body: DeleteRepositorySshHostTrustRequest = {
         operation_id: operationId('host-trust-delete'),
-        expected_revision: hostTrust.current_revision
+        expected_fingerprint: hostTrust.fingerprint
       };
       await request(`/host-trusts/${encodeURIComponent(hostTrust.host_trust_id)}`, 'DELETE', body, null, `delete the pin for ${hostTrust.hostname}:${hostTrust.port}`);
       requireCurrentOperation(operation);
@@ -677,7 +677,6 @@
       <details class="repository-access-technical">
         <summary>Technical details</summary>
         <dl>
-          <div><dt>Config revision</dt><dd>{accessProjection.config_revision}</dd></div>
           <div><dt>Projection digest</dt><dd><code>{accessProjection.projection_digest}</code></dd></div>
         </dl>
       </details>
@@ -802,12 +801,6 @@
       </form>
     {/if}
 
-    {#if credentials.length > 0 && !data.credentialsError}
-      <details class="repository-access-technical">
-        <summary>Credential revisions</summary>
-        <dl>{#each credentials as credential (credential.credential_id)}<div><dt>{credential.credential_id}</dt><dd>Revision {credential.current_revision}</dd></div>{/each}</dl>
-      </details>
-    {/if}
   </section>
 
   <section class="repository-access-section" aria-labelledby="host-trust-heading">
@@ -862,30 +855,24 @@
     <a class="inline-link" href={connectionTestHref}>{sshRepository ? `Check ${sshRepository.repository_key} SSH connection` : 'Open Repository settings'}</a>
 
     {#if hostEditorOpen}
-      <form bind:this={hostFormElement} class="repository-access-form" aria-busy={hostExpectedRevision === null ? isPending('add-host-trust') : isPending(`rotate-host-${hostTrustId}`)} novalidate onsubmit={(event) => { event.preventDefault(); void saveHostTrust(); }}>
+      <form bind:this={hostFormElement} class="repository-access-form" aria-busy={hostExpectedFingerprint === null ? isPending('add-host-trust') : isPending(`rotate-host-${hostTrustId}`)} novalidate onsubmit={(event) => { event.preventDefault(); void saveHostTrust(); }}>
         <div class="repository-access-form-heading">
           <div>
-            <h3>{hostExpectedRevision === null ? 'Add pinned host key' : `Rotate key for ${hostname}:${port}`}</h3>
-            <p>{hostExpectedRevision === null ? 'Confirm the host, port, and fingerprint against a trusted source before saving.' : `This keeps the endpoint fixed and replaces its current trusted identity. ${editingHostTrust?.referenced_repositories.length ? `Explicitly referenced by ${editingHostTrust.referenced_repositories.join(', ')}. ` : 'No Repository explicitly references this pin. '}Repositories without an explicit host-key binding may also select it automatically when it is the unique pin matching this host and port.`}</p>
+            <h3>{hostExpectedFingerprint === null ? 'Add pinned host key' : `Rotate key for ${hostname}:${port}`}</h3>
+            <p>{hostExpectedFingerprint === null ? 'Confirm the host, port, and fingerprint against a trusted source before saving.' : `This keeps the endpoint fixed and replaces its current trusted identity. ${editingHostTrust?.referenced_repositories.length ? `Explicitly referenced by ${editingHostTrust.referenced_repositories.join(', ')}. ` : 'No Repository explicitly references this pin. '}Repositories without an explicit host-key binding may also select it automatically when it is the unique pin matching this host and port.`}</p>
           </div>
-          {#if hostExpectedRevision !== null}<div><small>Current fingerprint</small><code>{editingHostTrust?.fingerprint}</code></div>{/if}
+          {#if hostExpectedFingerprint !== null}<div><small>Current fingerprint</small><code>{editingHostTrust?.fingerprint}</code></div>{/if}
         </div>
         {#if hostFormNotice}<p class="repository-access-notice {hostFormNotice.tone}" role={hostFormNotice.tone === 'error' ? 'alert' : 'status'}>{hostFormNotice.text}</p>{/if}
         <div class="repository-access-form-grid">
-          <label><span>Host trust id</span><input bind:this={hostTrustIdInput} bind:value={hostTrustId} disabled={hostExpectedRevision !== null} aria-invalid={Boolean(hostErrors.hostTrustId)} aria-describedby={hostErrors.hostTrustId ? 'host-id-error' : undefined} />{#if hostErrors.hostTrustId}<small id="host-id-error" class="field-error">{hostErrors.hostTrustId}</small>{/if}</label>
-          <label><span>Hostname</span><input bind:value={hostname} disabled={hostExpectedRevision !== null} aria-invalid={Boolean(hostErrors.hostname)} aria-describedby={hostErrors.hostname ? 'hostname-error' : undefined} />{#if hostErrors.hostname}<small id="hostname-error" class="field-error">{hostErrors.hostname}</small>{/if}</label>
-          <label><span>Port</span><input type="number" bind:value={port} disabled={hostExpectedRevision !== null} aria-invalid={Boolean(hostErrors.port)} aria-describedby={hostErrors.port ? 'host-port-error' : undefined} />{#if hostErrors.port}<small id="host-port-error" class="field-error">{hostErrors.port}</small>{/if}</label>
+          <label><span>Host trust id</span><input bind:this={hostTrustIdInput} bind:value={hostTrustId} disabled={hostExpectedFingerprint !== null} aria-invalid={Boolean(hostErrors.hostTrustId)} aria-describedby={hostErrors.hostTrustId ? 'host-id-error' : undefined} />{#if hostErrors.hostTrustId}<small id="host-id-error" class="field-error">{hostErrors.hostTrustId}</small>{/if}</label>
+          <label><span>Hostname</span><input bind:value={hostname} disabled={hostExpectedFingerprint !== null} aria-invalid={Boolean(hostErrors.hostname)} aria-describedby={hostErrors.hostname ? 'hostname-error' : undefined} />{#if hostErrors.hostname}<small id="hostname-error" class="field-error">{hostErrors.hostname}</small>{/if}</label>
+          <label><span>Port</span><input type="number" bind:value={port} disabled={hostExpectedFingerprint !== null} aria-invalid={Boolean(hostErrors.port)} aria-describedby={hostErrors.port ? 'host-port-error' : undefined} />{#if hostErrors.port}<small id="host-port-error" class="field-error">{hostErrors.port}</small>{/if}</label>
           <label class="wide"><span>OpenSSH public host key (Ed25519)</span><textarea bind:this={hostKeyInput} bind:value={hostKey} rows="4" aria-invalid={Boolean(hostErrors.hostKey)} aria-describedby={hostErrors.hostKey ? 'host-key-error host-key-help' : 'host-key-help'}></textarea><small id="host-key-help">The new fingerprint is derived from this key after save; compare the key with a trusted source first.</small>{#if hostErrors.hostKey}<small id="host-key-error" class="field-error">{hostErrors.hostKey}</small>{/if}</label>
         </div>
-        <div class="repository-access-form-actions"><button type="submit" class="primary" disabled={hostExpectedRevision === null ? isPending('add-host-trust') : isPending(`rotate-host-${hostTrustId}`)}>{hostExpectedRevision === null ? (isPending('add-host-trust') ? 'Saving…' : 'Pin host key') : (isPending(`rotate-host-${hostTrustId}`) ? 'Saving…' : 'Save new key')}</button><button type="button" class="secondary" disabled={hostExpectedRevision === null ? isPending('add-host-trust') : isPending(`rotate-host-${hostTrustId}`)} onclick={() => void closeHostEditor()}>Cancel</button></div>
+        <div class="repository-access-form-actions"><button type="submit" class="primary" disabled={hostExpectedFingerprint === null ? isPending('add-host-trust') : isPending(`rotate-host-${hostTrustId}`)}>{hostExpectedFingerprint === null ? (isPending('add-host-trust') ? 'Saving…' : 'Pin host key') : (isPending(`rotate-host-${hostTrustId}`) ? 'Saving…' : 'Save new key')}</button><button type="button" class="secondary" disabled={hostExpectedFingerprint === null ? isPending('add-host-trust') : isPending(`rotate-host-${hostTrustId}`)} onclick={() => void closeHostEditor()}>Cancel</button></div>
       </form>
     {/if}
 
-    {#if hostTrusts.length > 0 && !data.hostTrustsError}
-      <details class="repository-access-technical">
-        <summary>Host key revisions</summary>
-        <dl>{#each hostTrusts as hostTrust (hostTrust.host_trust_id)}<div><dt>{hostTrust.host_trust_id}</dt><dd>Revision {hostTrust.current_revision}</dd></div>{/each}</dl>
-      </details>
-    {/if}
   </section>
 </div>

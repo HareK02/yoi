@@ -77,7 +77,6 @@ impl SystemReminder {
 pub struct PromptRenderProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
-    pub config_revision: u64,
     pub source_digest: String,
     pub projection_digest: String,
     pub logical_name: String,
@@ -176,10 +175,14 @@ pub enum SystemItem {
     },
 
     /// A Host-fetched change to user-managed Subject behavior. Each changed
-    /// revision is appended rather than rewriting prior prompt/session content.
+    /// body is appended rather than rewriting prior prompt/session content.
     SubjectBehaviorRefresh {
         body: String,
-        behavior_revision: u64,
+        /// Exact user-managed behavior acknowledged after durable commit. Old
+        /// logs omit this value; an empty value is not an acknowledgement of a
+        /// nonempty behavior and does not replace their stored rendered body.
+        #[serde(default)]
+        behavior_md: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_provenance: Option<PromptRenderProvenance>,
     },
@@ -292,22 +295,31 @@ mod tests {
     }
 
     #[test]
-    fn subject_behavior_refresh_round_trips_with_revision_and_exact_body() {
+    fn subject_behavior_refresh_round_trips_with_exact_body() {
         let item = SystemItem::SubjectBehaviorRefresh {
             body: "current Subject context".to_string(),
-            behavior_revision: 7,
+            behavior_md: "exact behavior".to_string(),
             prompt_provenance: None,
         };
         let raw = serde_json::to_string(&item).unwrap();
         let parsed: SystemItem = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed.history_text(), "current Subject context");
-        assert!(matches!(
-            parsed,
-            SystemItem::SubjectBehaviorRefresh {
-                behavior_revision: 7,
-                ..
-            }
-        ));
+        assert!(
+            matches!(parsed, SystemItem::SubjectBehaviorRefresh { behavior_md, .. } if behavior_md == "exact behavior")
+        );
+    }
+
+    #[test]
+    fn frozen_subject_behavior_log_reads_old_counter_without_republishing_it() {
+        let old = r#"{"kind":"subject_behavior_refresh","body":"exact archived body","behavior_revision":7}"#;
+        let item: SystemItem = serde_json::from_str(old).unwrap();
+        assert_eq!(item.history_text(), "exact archived body");
+        assert!(
+            serde_json::to_value(item)
+                .unwrap()
+                .get("behavior_revision")
+                .is_none()
+        );
     }
 
     #[test]

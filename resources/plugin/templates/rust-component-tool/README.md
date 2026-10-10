@@ -20,7 +20,7 @@ Inside the Yoi checkout this template uses a local path dependency and declares 
 yoi-plugin-pdk = { path = "../../../../crates/plugin-pdk" }
 ```
 
-If this template is copied to an independent Plugin repository, pin a Yoi source revision with `rev` instead of tracking a branch. Use the repository root `.git` URL, not the browser `/src/branch/...` URL:
+If this template is copied to an independent Plugin repository, pin a Yoi source commit with `rev` instead of tracking a branch. Use the repository root `.git` URL, not the browser `/src/branch/...` URL:
 
 ```toml
 yoi-plugin-pdk = { git = "https://gitea.hareworks.net/Hare/yoi.git", package = "yoi-plugin-pdk", rev = "<pinned-yoi-commit-sha>" }

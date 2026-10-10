@@ -156,7 +156,7 @@ Deno.test("commit formats every working Decodal source without a preview roundtr
   assert(
     source.includes("await formatWorkingSources();") &&
       source.includes("entrypoints: entrypoints()") &&
-      source.includes("Committed formatted revision"),
+      source.includes("Committed formatted source tree"),
     "commit should format first and send the working changes directly to Backend authority",
   );
   assert(
@@ -167,7 +167,7 @@ Deno.test("commit formats every working Decodal source without a preview roundtr
   );
 });
 
-Deno.test("config diagnostics analyze continuously with debounce and generation fencing", async () => {
+Deno.test("config diagnostics analyze continuously with debounce and request cancellation", async () => {
   const source = await Deno.readTextFile(
     new URL(
       "../../src/lib/workspace/config-source/ConfigSourceEditor.svelte",
@@ -179,7 +179,7 @@ Deno.test("config diagnostics analyze continuously with debounce and generation 
     source.includes("setTimeout(() =>") &&
       source.includes("}, 250)") &&
       source.includes("analyzer.analyze(path, value)") &&
-      source.includes("generation === analysisGeneration") &&
+      source.includes("!request.signal.aborted") &&
       source.includes("analysisReady"),
     "source changes should trigger only the latest debounced analysis after snapshot initialization",
   );

@@ -47,13 +47,13 @@ Deno.test("browser fixture preserves decimal identity, bounded reads, binary and
   assertEquals(escaped.text, "\u0000".repeat(65536));
   assertEquals(escaped.truncated, false);
 });
-Deno.test("browser fixture two revisions conflict without committing the losing request", async () => {
+Deno.test("browser fixture two last_mutation_ids conflict without committing the losing request", async () => {
   const { client } = setup();
   const entry = await client.metadata("home-owner", ref("home-owner", "3"));
   await client.mutate("home-owner", "tab-one", {
     operation: "update_text",
     id: entry.entry,
-    expected_revision: entry.revision,
+    expected_mutation_id: entry.last_mutation_id,
     text: "first actor",
     content_type: "text/markdown",
   });
@@ -62,7 +62,7 @@ Deno.test("browser fixture two revisions conflict without committing the losing 
       client.mutate("home-owner", "tab-two", {
         operation: "update_text",
         id: entry.entry,
-        expected_revision: entry.revision,
+        expected_mutation_id: entry.last_mutation_id,
         text: "second actor draft",
         content_type: "text/markdown",
       }),
@@ -113,7 +113,7 @@ Deno.test("browser fixture rename and move retain identity while delete and recr
   const moved = await client.mutate("home-owner", "move", {
     operation: "relocate",
     id: entry.entry,
-    expected_revision: entry.revision,
+    expected_mutation_id: entry.last_mutation_id,
     parent: ref("home-owner", "2"),
     name: "renamed.md",
   });
@@ -122,7 +122,7 @@ Deno.test("browser fixture rename and move retain identity while delete and recr
   await client.mutate("home-owner", "delete", {
     operation: "delete",
     id: entry.entry,
-    expected_revision: entry.revision,
+    expected_mutation_id: entry.last_mutation_id,
   });
   const replacement = await client.mutate("home-owner", "recreate", {
     operation: "create_text",

@@ -23,10 +23,15 @@ fn query(cursor: Option<String>) -> Op {
     })
 }
 
-fn read(id: &str, revision: Option<u64>, offset: Option<usize>, byte_offset: Option<usize>) -> Op {
+fn read(
+    id: &str,
+    change_id: Option<String>,
+    offset: Option<usize>,
+    byte_offset: Option<usize>,
+) -> Op {
     Op::Read(server_api::SubjektivMemoryReadRequest {
         memory_id: id.into(),
-        revision,
+        change_id,
         offset,
         byte_offset,
         limit: Some(1),
@@ -86,7 +91,7 @@ fn neutral_scope_reopen_and_context_attenuation() {
 }
 
 #[test]
-fn shared_query_cursor_and_utf8_fixed_revision_projection() {
+fn shared_query_cursor_and_utf8_fixed_change_projection() {
     let temp = tempfile::tempdir().unwrap();
     let (_manager, store) = open(temp.path(), "local-random-scope");
     let subject = store
@@ -148,7 +153,12 @@ fn shared_query_cursor_and_utf8_fixed_revision_projection() {
         let Response::Read(page) = execute(
             &store,
             &context,
-            read(&first.id, Some(1), offset, byte_offset),
+            read(
+                &first.id,
+                Some(first.change_id.clone()),
+                offset,
+                byte_offset,
+            ),
         )
         .unwrap() else {
             panic!()
@@ -247,7 +257,7 @@ fn explicit_receipts_candidate_batch_and_decision_retries_share_logic() {
             entry_range: Some([1, 1]),
             kind: memory::schema::EvidenceKind::new("model_output"),
             origin: None,
-            excerpt: Some("Use immutable revisions".into()),
+            excerpt: Some("Use immutable changes".into()),
             summary: None,
         }],
         source_refs: vec![memory::schema::SourceEvidenceRef {
@@ -319,7 +329,7 @@ fn explicit_receipts_candidate_batch_and_decision_retries_share_logic() {
                 kind: CandidateKind::Lesson,
                 state: server_api::SubjektivMemoryState::Active,
                 claim: "Preserve correction history".into(),
-                body_md: "Use immutable revisions".into(),
+                body_md: "Use immutable changes".into(),
                 why_useful: "Allows auditing".into(),
                 staleness: None,
                 derived_from: vec![],
@@ -340,4 +350,105 @@ fn explicit_receipts_candidate_batch_and_decision_retries_share_logic() {
         Op::PrepareSurface(serde_json::from_str("{}").unwrap()),
     )
     .unwrap();
+}
+
+#[test]
+fn history_pages_pin_ancestry_and_reject_unknown_heads() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_manager, store) = open(temp.path(), "scope");
+    let subject = store
+        .create_subject(SubjectRole::new("companion").unwrap())
+        .unwrap();
+    let draft = |body: &str| {
+        MemoryDraft::active(CandidateKind::Lesson, "claim", body, "useful", "evidence")
+    };
+    let first = store.create_memory(&subject.id, draft("first")).unwrap();
+    let second = store
+        .revise_memory(
+            &subject.id,
+            &first.id,
+            first.change_id.clone(),
+            draft("second"),
+        )
+        .unwrap();
+    let input = |cursor| server_api::SubjektivMemoryListChangesRequest {
+        memory_id: first.id.clone(),
+        limit: Some(1),
+        cursor,
+    };
+    let page = subjektiv_memory_list_changes(&store, &subject.id, input(None)).unwrap();
+    assert_eq!(page.items[0].change_id, second.change_id);
+    assert!(page.has_more);
+    let third = store
+        .revise_memory(
+            &subject.id,
+            &first.id,
+            second.change_id.clone(),
+            draft("third"),
+        )
+        .unwrap();
+    let next = subjektiv_memory_list_changes(&store, &subject.id, input(page.next_cursor)).unwrap();
+    assert_eq!(next.items[0].change_id, first.change_id);
+    assert_eq!(next.current_change_id, third.change_id);
+    assert!(!next.has_more);
+    let invalid = encode_subjektiv_cursor(
+        "changes",
+        &SubjektivChangeCursor {
+            subject_id: subject.id.clone(),
+            memory_id: first.id.clone(),
+            head_change_id: "not-a-history-entry".into(),
+            offset: 0,
+        },
+    )
+    .unwrap();
+    assert!(subjektiv_memory_list_changes(&store, &subject.id, input(Some(invalid))).is_err());
+    let historic = subjektiv_memory_read(
+        &store,
+        &subject.id,
+        server_api::SubjektivMemoryReadRequest {
+            memory_id: first.id,
+            change_id: Some(second.change_id.clone()),
+            offset: None,
+            byte_offset: None,
+            limit: None,
+            evidence_cursor: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(historic.body_md, "second");
+    assert_eq!(historic.change_id, second.change_id);
+    assert_eq!(historic.current_change_id, third.change_id);
+}
+
+#[test]
+fn query_content_condition_ignores_behavior_and_detects_aba_memory_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_manager, store) = open(temp.path(), "scope");
+    let subject = store
+        .create_subject(SubjectRole::new("companion").unwrap())
+        .unwrap();
+    let draft = |body: &str| {
+        MemoryDraft::active(CandidateKind::Lesson, "claim", body, "useful", "evidence")
+    };
+    let first = store.create_memory(&subject.id, draft("A")).unwrap();
+    store.create_memory(&subject.id, draft("other")).unwrap();
+    let context = HostOperationContext::validated_body(&store, &subject.id, None).unwrap();
+    let Response::Query(page) = execute(&store, &context, query(None)).unwrap() else {
+        panic!()
+    };
+    let cursor = page.next_cursor.unwrap();
+    store
+        .update_subject_behavior(&subject.id, "", "New behavior".into())
+        .unwrap();
+    execute(&store, &context, query(Some(cursor.clone()))).unwrap();
+    let second = store
+        .revise_memory(&subject.id, &first.id, first.change_id.clone(), draft("B"))
+        .unwrap();
+    store
+        .revise_memory(&subject.id, &first.id, second.change_id, draft("A"))
+        .unwrap();
+    assert!(matches!(
+        execute(&store, &context, query(Some(cursor))),
+        Err(OperationError::Conflict(_))
+    ));
 }

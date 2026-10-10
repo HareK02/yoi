@@ -15,7 +15,7 @@ function reconnectSnapshot(text: string): Event {
       session: {
         entries: [],
         pending_submissions: {
-          revision: 0,
+
           head_id: null,
           notification_count: 0,
           submissions: [],

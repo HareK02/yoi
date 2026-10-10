@@ -10,6 +10,9 @@ const toolchain = vi.hoisted(() => ({
   analyze: vi.fn(),
   complete: vi.fn(),
   close: vi.fn(),
+  applyChanges: vi.fn(),
+  changesBetween: vi.fn(),
+  format: vi.fn(),
 }));
 vi.mock("./toolchain.ts", () => ({
   ConfigSourceToolchain: class {
@@ -20,13 +23,15 @@ vi.mock("./toolchain.ts", () => ({
     analyze = toolchain.analyze;
     complete = toolchain.complete;
     close = toolchain.close;
+    applyChanges = toolchain.applyChanges;
+    changesBetween = toolchain.changesBetween;
+    format = toolchain.format;
   },
 }));
 
 const schemaSource = "schema body\n".repeat(6000);
 const tree = {
   snapshot: {
-    revision: 7,
     digest: "sha256:tree",
     entries: {
       "main.dcdl": {
@@ -219,7 +224,6 @@ test("unmount during schema setup closes the toolchain", async () => {
 test("builtin diagnostics show read-only paths without adding editable workspace files", async () => {
   toolchain.analyze.mockResolvedValue([{
     path: "$builtin/profiles/companion.dcdl",
-    revision: 7,
     tree_digest: "sha256:tree",
     kind: "constraint_violation",
     span: { start_byte: 1, end_byte: 4 },
@@ -243,7 +247,6 @@ test("builtin diagnostics show read-only paths without adding editable workspace
 test("unknown builtin diagnostics retain the workspace importer path", async () => {
   toolchain.analyze.mockResolvedValue([{
     path: "main.dcdl",
-    revision: 7,
     tree_digest: "sha256:tree",
     kind: "import",
     span: { start_byte: 8, end_byte: 40 },
@@ -261,6 +264,36 @@ test("unknown builtin diagnostics retain the workspace importer path", async () 
   expect(view.getByRole("navigation", { name: "Virtual configuration paths" }).textContent).not.toContain("$builtin/");
 });
 
+test.each(["resolve", "reject"] as const)(
+  "superseded analysis %s cannot replace the current diagnostics or status",
+  async (settlement) => {
+    let resolveOld!: (value: unknown[]) => void;
+    let rejectOld!: (error: Error) => void;
+    const oldAnalysis = new Promise<unknown[]>((resolve, reject) => {
+      resolveOld = resolve;
+      rejectOld = reject;
+    });
+    toolchain.analyze.mockReturnValueOnce(oldAnalysis);
+    const view = renderEditor();
+    await expectReady(view);
+    await waitFor(() => expect(toolchain.analyze).toHaveBeenCalledOnce());
+    await fireEvent.click(view.getByRole("button", { name: "Create local source" }));
+    await waitFor(() => expect(toolchain.analyze).toHaveBeenCalledTimes(2));
+    if (settlement === "resolve") {
+      resolveOld([{
+        path: "main.dcdl", tree_digest: tree.snapshot.digest, kind: "import", span: { start_byte: 0, end_byte: 1 },
+        message: "Stale diagnostic", labels: [], notes: [],
+      }]);
+    } else rejectOld(new Error("Stale analysis failure"));
+    await oldAnalysis.catch(() => {});
+    await waitFor(() => {
+      expect(view.container.textContent).toContain("Creating local source module.dcdl");
+      expect(view.container.textContent).not.toContain("Stale diagnostic");
+      expect(view.container.textContent).not.toContain("Stale analysis failure");
+    });
+  },
+);
+
 test("unmount during fetch does not start a toolchain", async () => {
   let finishFetch!: (response: Response) => void;
   fetcher.mockReturnValueOnce(
@@ -273,4 +306,71 @@ test("unmount during fetch does not start a toolchain", async () => {
   finishFetch(response());
   await new Promise((resolve) => setTimeout(resolve, 0));
   expect(toolchain.construct).not.toHaveBeenCalled();
+});
+
+
+test("diagnostics from another tree digest are not displayed", async () => {
+  toolchain.analyze.mockResolvedValue([
+    {
+      path: "main.dcdl", tree_digest: "sha256:old-tree", kind: "syntax",
+      span: { start_byte: 0, end_byte: 1 }, message: "Wrong tree diagnostic",
+      labels: [], notes: [],
+    },
+    {
+      path: "main.dcdl", tree_digest: tree.snapshot.digest, kind: "syntax",
+      span: { start_byte: 0, end_byte: 1 }, message: "Current tree diagnostic",
+      labels: [], notes: [],
+    },
+  ]);
+  const view = renderEditor();
+  await expectReady(view);
+  await waitFor(() => expect(view.container.textContent).toContain("Current tree diagnostic"));
+  expect(view.container.textContent).not.toContain("Wrong tree diagnostic");
+});
+
+test.each([409, 422])("failed commit %s preserves the local draft and authoritative base digest for retry", async (status) => {
+  const change = { kind: "create", path: "module.dcdl", content_type: "decodal", content: "{}\n" };
+  const candidate = {
+    digest: "sha256:local-draft",
+    entries: {
+      ...tree.snapshot.entries,
+      "module.dcdl": {
+        path: change.path,
+        content_type: change.content_type,
+        content: change.content,
+        content_digest: "sha256:module",
+      },
+    },
+  };
+  toolchain.applyChanges.mockResolvedValue(candidate);
+  toolchain.changesBetween.mockResolvedValue([change]);
+  toolchain.format.mockImplementation(async (source: string) => source);
+  const view = renderEditor();
+  await expectReady(view);
+  await fireEvent.click(view.getByRole("button", { name: "Create local source" }));
+  const commit = view.getByRole("button", { name: "Commit" });
+  expect(commit).toBeInstanceOf(HTMLButtonElement);
+  fetcher.mockResolvedValueOnce(new Response(
+    status === 409 ? "base content digest mismatch" : "candidate evaluation failed",
+    { status },
+  ));
+  await fireEvent.click(commit);
+  await waitFor(() => expect(view.container.textContent).toContain(
+    status === 409 ? "base content digest mismatch" : "candidate evaluation failed",
+  ));
+  const expectedRequest = {
+    base_digest: tree.snapshot.digest, changes: [change], entrypoints: ["main.dcdl"],
+  };
+  expect(JSON.parse(fetcher.mock.calls[1][1].body)).toEqual(expectedRequest);
+  expect(view.container.querySelector(".cm-content")?.textContent).toContain("{}");
+  expect(commit).toHaveProperty("disabled", false);
+  expect(toolchain.setSnapshot).toHaveBeenCalledOnce();
+  if (status === 409) expect(view.getByRole("alert").textContent).toContain("Discard local candidate");
+
+  fetcher.mockResolvedValueOnce(new Response(JSON.stringify({ ...tree, snapshot: candidate })));
+  await fireEvent.click(commit);
+  await waitFor(() => expect(view.container.textContent).toContain("Committed formatted source tree"));
+  expect(JSON.parse(fetcher.mock.calls[2][1].body)).toEqual(expectedRequest);
+  expect(toolchain.setSnapshot).toHaveBeenLastCalledWith(candidate, tree.contract.schema_bundle);
+  expect(commit).toHaveProperty("disabled", true);
 });

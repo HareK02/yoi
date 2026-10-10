@@ -225,7 +225,6 @@ struct NotificationReceipt {
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PendingActivationState {
-    revision: u64,
     next_activation_sequence: u64,
     /// A prepared activation remains in checkpoints until the same atomic
     /// UserInput record commits the clearing checkpoint. Restore puts it back
@@ -291,7 +290,6 @@ impl PendingActivationState {
             (None, None) => None,
         };
         protocol::PendingSubmissionsSnapshot {
-            revision: self.revision,
             notification_count: u32::try_from(self.pending_notifications.len()).unwrap_or(u32::MAX),
             notification_previews: self
                 .pending_notifications
@@ -702,7 +700,6 @@ impl std::fmt::Debug for WorkspacePromptCatalogResolution {
         formatter
             .debug_struct("WorkspacePromptCatalogResolution")
             .field("workspace_id", &self.projection.workspace_id)
-            .field("config_revision", &self.projection.config_revision)
             .field("source_digest", &self.projection.source_digest)
             .field("projection_digest", &self.projection.projection_digest)
             .finish_non_exhaustive()
@@ -927,7 +924,6 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
     /// launch/session state; this hook never reconstructs historical prompts.
     fn current_prompt_projection(
         &self,
-        _minimum_revision: Option<u64>,
     ) -> Result<Option<WorkspacePromptCatalogResolution>, WorkspaceClientError> {
         Ok(None)
     }
@@ -995,9 +991,8 @@ impl WorkspaceClient for ReviewerChildWorkspaceClient {
 
     fn current_prompt_projection(
         &self,
-        minimum_revision: Option<u64>,
     ) -> Result<Option<WorkspacePromptCatalogResolution>, WorkspaceClientError> {
-        self.inner.current_prompt_projection(minimum_revision)
+        self.inner.current_prompt_projection()
     }
 
     fn execute_binary(
@@ -1809,8 +1804,11 @@ pub(crate) enum PendingSubmissionError {
     ByteLimit,
     #[error("pending submission artifact references exceed {MAX_PENDING_ARTIFACT_REFS}")]
     ArtifactLimit,
-    #[error("pending queue revision conflict: expected {expected}, current {current}")]
-    RevisionConflict { expected: u64, current: u64 },
+    #[error("pending queue content conflict: expected {expected:?}, current {current:?}")]
+    ContentConflict {
+        expected: Vec<String>,
+        current: Vec<String>,
+    },
     #[error("pending queue head conflict: expected {expected}, current {current:?}")]
     HeadConflict {
         expected: String,
@@ -1832,25 +1830,16 @@ impl<St> PendingSubmissionHandle<St>
 where
     St: Store + Clone,
 {
-    fn validate_fence(
+    fn validate_head(
         state: &PendingActivationState,
-        expected_revision: u64,
-        expected_head_id: Option<&str>,
+        expected: &str,
     ) -> Result<(), PendingSubmissionError> {
-        if state.revision != expected_revision {
-            return Err(PendingSubmissionError::RevisionConflict {
-                expected: expected_revision,
-                current: state.revision,
+        let current = state.snapshot().head_id;
+        if current.as_deref() != Some(expected) {
+            return Err(PendingSubmissionError::HeadConflict {
+                expected: expected.to_owned(),
+                current,
             });
-        }
-        if let Some(expected) = expected_head_id {
-            let current = state.snapshot().head_id;
-            if current.as_deref() != Some(expected) {
-                return Err(PendingSubmissionError::HeadConflict {
-                    expected: expected.to_owned(),
-                    current,
-                });
-            }
         }
         Ok(())
     }
@@ -2015,7 +2004,6 @@ where
             payload_digest,
             disposition,
         });
-        current.revision = current.revision.saturating_add(1);
 
         if activate_now {
             current.activating = Some(pending.clone());
@@ -2166,7 +2154,6 @@ where
             source_namespace,
             payload_digest,
         });
-        state.revision = state.revision.saturating_add(1);
         if let Err(error) = self.persist_locked(&state) {
             *state = original;
             return Err(error);
@@ -2202,7 +2189,6 @@ where
         state
             .activating_notifications
             .extend(notifications.iter().cloned());
-        state.revision = state.revision.saturating_add(1);
 
         notifications
             .into_iter()
@@ -2218,7 +2204,7 @@ where
 
     pub(crate) fn prepare_next_activation(
         &self,
-        fence: Option<(u64, &str)>,
+        fence: Option<&str>,
     ) -> Result<Option<PendingActivation>, PendingSubmissionError> {
         let _append_guard = self
             .writer
@@ -2230,8 +2216,8 @@ where
             .state
             .lock()
             .expect("pending activation state poisoned");
-        if let Some((expected_revision, expected_head_id)) = fence {
-            Self::validate_fence(&state, expected_revision, Some(expected_head_id))?;
+        if let Some(expected_head_id) = fence {
+            Self::validate_head(&state, expected_head_id)?;
         }
         if state.activating.is_some() {
             return Ok(None);
@@ -2240,7 +2226,6 @@ where
             return Ok(None);
         };
         state.activating = Some(pending.clone());
-        state.revision = state.revision.saturating_add(1);
         Ok(Some(PendingActivation::Submission(pending)))
     }
 
@@ -2267,7 +2252,6 @@ where
                 .receipts
                 .retain(|receipt| receipt.submission_id != pending.submission_id);
         }
-        state.revision = state.revision.saturating_add(1);
         if let Err(error) = self.persist_locked(&state) {
             tracing::error!(error = %error, "failed to persist aborted pending activation");
         }
@@ -2288,7 +2272,6 @@ where
             receipt.disposition = protocol::SubmissionDisposition::Started;
         }
         committed.activating = None;
-        committed.revision = committed.revision.saturating_add(1);
         pending_activation_extension(&committed)
     }
 
@@ -2311,7 +2294,6 @@ where
                 receipt.disposition = protocol::SubmissionDisposition::Started;
             }
             state.activating = None;
-            state.revision = state.revision.saturating_add(1);
         }
     }
 
@@ -2341,7 +2323,6 @@ where
     pub(crate) fn cancel(
         &self,
         submission_id: &str,
-        expected_revision: u64,
     ) -> Result<protocol::PendingSubmissionsSnapshot, PendingSubmissionError> {
         let _append_guard = self
             .writer
@@ -2353,7 +2334,6 @@ where
             .state
             .lock()
             .expect("pending activation state poisoned");
-        Self::validate_fence(&state, expected_revision, None)?;
         let original = state.clone();
         let Some(index) = state
             .pending
@@ -2366,7 +2346,6 @@ where
             .pending
             .remove(index)
             .expect("located pending submission must exist");
-        state.revision = state.revision.saturating_add(1);
         if let Err(error) = self.persist_locked(&state) {
             *state = original;
             return Err(error);
@@ -2377,7 +2356,7 @@ where
 
     pub(crate) fn clear(
         &self,
-        expected_revision: u64,
+        expected_submission_ids: &[String],
     ) -> Result<protocol::PendingSubmissionsSnapshot, PendingSubmissionError> {
         let _append_guard = self
             .writer
@@ -2389,11 +2368,19 @@ where
             .state
             .lock()
             .expect("pending activation state poisoned");
-        Self::validate_fence(&state, expected_revision, None)?;
         let original = state.clone();
+        let current = state
+            .pending
+            .iter()
+            .map(|pending| pending.submission_id.clone())
+            .collect::<Vec<_>>();
+        if current != expected_submission_ids {
+            return Err(PendingSubmissionError::ContentConflict {
+                expected: expected_submission_ids.to_vec(),
+                current,
+            });
+        }
         let removed = state.pending.drain(..).collect::<Vec<_>>();
-        state.pending_notifications.clear();
-        state.revision = state.revision.saturating_add(1);
         if let Err(error) = self.persist_locked(&state) {
             *state = original;
             return Err(error);
@@ -2502,7 +2489,6 @@ impl<St: Store + Clone> DurableNotificationCommitter for PendingSubmissionHandle
         }
         let mut committed = state.clone();
         committed.activating_notifications.pop_front();
-        committed.revision = committed.revision.saturating_add(1);
         let metadata = new_history_metadata(
             provenance.unwrap_or(WorkerHistoryProvenance::LegacyUnknown),
             None,
@@ -2633,30 +2619,27 @@ struct PreparedFlowProjection {
     selector: String,
     instructions: String,
     definition_id: String,
-    definition_revision: u64,
+    definition_digest: String,
     instance_id: String,
     state_id: String,
 }
 
 /// Sole live owner of committed model-visible Worker history.
 ///
-/// `Engine` borrows this history only while executing a run. The revision is
-/// advanced together with every live rewrite so projections can fence stale
-/// observations without maintaining a second transcript.
+/// `Engine` borrows this history only while executing a run. Features capture
+/// the committed log location and check it under the append lock before writing;
+/// this live view does not maintain an independent freshness counter.
 #[derive(Clone)]
 pub struct WorkerSession {
     session_id: SessionId,
-    revision: u64,
     history: History<SessionHistoryMetadata>,
     pending_activations: Arc<Mutex<PendingActivationState>>,
 }
 
 impl WorkerSession {
     fn new(session_id: SessionId, entries: Vec<HistoryEntry<SessionHistoryMetadata>>) -> Self {
-        let revision = u64::try_from(entries.len()).unwrap_or(u64::MAX);
         Self {
             session_id,
-            revision,
             history: History::from_entries(entries),
             pending_activations: Arc::new(Mutex::new(PendingActivationState::default())),
         }
@@ -2684,13 +2667,11 @@ impl WorkerSession {
             }
             if let Some(activating) = state.activating.take() {
                 state.pending.push_front(activating);
-                state.revision = state.revision.saturating_add(1);
             }
             if !state.activating_notifications.is_empty() {
                 let mut restored = std::mem::take(&mut state.activating_notifications);
                 restored.append(&mut state.pending_notifications);
                 state.pending_notifications = restored;
-                state.revision = state.revision.saturating_add(1);
             }
             *self
                 .pending_activations
@@ -2717,10 +2698,6 @@ impl WorkerSession {
         self.session_id
     }
 
-    pub fn revision(&self) -> u64 {
-        self.revision
-    }
-
     pub fn history(&self) -> &History<SessionHistoryMetadata> {
         &self.history
     }
@@ -2729,13 +2706,8 @@ impl WorkerSession {
         &mut self.history
     }
 
-    fn note_mutation(&mut self) {
-        self.revision = self.revision.saturating_add(1);
-    }
-
     fn replace_history(&mut self, entries: Vec<HistoryEntry<SessionHistoryMetadata>>) {
         self.history.replace_entries(entries);
-        self.note_mutation();
     }
 }
 
@@ -2748,7 +2720,7 @@ pub(crate) enum SystemPromptContribution {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResidentContextRefresh {
     pub body: String,
-    pub revision: u64,
+    pub behavior_md: String,
 }
 
 #[async_trait::async_trait]
@@ -2763,8 +2735,8 @@ pub(crate) trait SystemPromptContributionSource: Send + Sync {
         Ok(None)
     }
 
-    /// Acknowledges that the revision's typed refresh was durably committed.
-    fn confirm_resident_context_revision(&self, _revision: u64) {}
+    /// Acknowledges the exact behavior represented by a durably committed refresh.
+    fn confirm_resident_context_behavior(&self, _behavior_md: &str) {}
 
     /// Invalidates the in-memory representation fence before history may be
     /// compacted or rewound.
@@ -3266,7 +3238,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 .workspace_context
                 .workspace_id()
                 .map(|workspace_id| workspace_id.as_str().to_string()),
-            config_revision: projection.config_revision,
+
             source_digest: projection.source_digest.clone(),
             projection_digest: projection.catalog_digest.clone(),
             logical_name: logical_name.to_string(),
@@ -3283,7 +3255,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let Some(resolution) = self
             .workspace_context
             .client()
-            .current_prompt_projection(None)
+            .current_prompt_projection()
             .map_err(|source| WorkerError::WorkspacePromptProjection {
                 message: source.to_string(),
             })?
@@ -3292,8 +3264,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         };
         let projection = &resolution.projection;
         let current = self.prompts.load();
-        if current.projection().config_revision == projection.config_revision
-            && current.projection().source_digest == projection.source_digest
+        if current.projection().source_digest == projection.source_digest
             && current.projection().catalog_digest == projection.projection_digest
             && Arc::ptr_eq(&current, &resolution.catalog)
         {
@@ -3524,7 +3495,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             std::iter::once(history_entry.item),
             &mut annotate,
         )?;
-        session.note_mutation();
+
         Ok(activation)
     }
 
@@ -3613,7 +3584,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 .map(|id| id.as_str().to_string()),
             worker_id: self.manifest.worker.name.clone(),
             session_id: self.session.session_id().to_string(),
-            session_revision: self.session.revision(),
+
             run_id,
             turn_index: Some(self.engine().turn_count()),
             call_id: None,
@@ -4036,7 +4007,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             Ok(CommittedSessionCapture {
                 session_id: location.session_id.to_string(),
                 segment_id: location.segment_id.to_string(),
-                session_revision: entries.len().try_into().unwrap_or(u64::MAX),
+
                 entry_count: entries.len(),
                 run_exit,
                 history,
@@ -4059,10 +4030,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 .lock()
                 .expect("segment append lock poisoned");
             let location = writer.state.location();
+            // Compare the actual append position while holding the same lock as
+            // the write. Any intervening log append or segment replacement makes
+            // this captured result stale; a separate change counter adds nothing.
             if location.session_id.to_string() != expected.session_id
                 || location.segment_id.to_string() != expected.segment_id
-                || u64::try_from(writer.state.entries_written()).unwrap_or(u64::MAX)
-                    != expected.session_revision
                 || writer.state.entries_written() != expected.entry_count
             {
                 return Ok(false);
@@ -4420,7 +4392,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 std::iter::once(history_entry.item),
                 &mut annotate,
             )?;
-            session.note_mutation();
         }
         self.restore_feature_lifecycle_pending = false;
         Ok(())
@@ -4641,7 +4612,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         snapshot: EmptyTurnRollbackSnapshot,
     ) -> Result<(), StoreError> {
         self.session.history_mut().truncate(snapshot.history_len);
-        self.session.note_mutation();
+
         self.last_run_interrupted = snapshot.last_run_interrupted;
         self.engine_mut()
             .set_active_run_turn_count(snapshot.active_run_turn_count);
@@ -4773,7 +4744,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             selector: selector.to_string(),
             instructions: initial_instructions,
             definition_id: state.instance.definition_id.clone(),
-            definition_revision: state.instance.definition_revision,
+            definition_digest: state.instance.definition_digest.clone(),
             instance_id: state.instance.instance_id.clone(),
             state_id: state.instance.current_state.to_string(),
         };
@@ -4974,7 +4945,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .run_with_annotation(self.session.history_mut(), input_string, &mut annotate)
             .await;
         self.engine = Some(locked.unlock());
-        self.session.note_mutation();
 
         if let Some(input) = &committed_activation_input {
             // A prompt hook may cancel before Engine materializes input/results.
@@ -5194,7 +5164,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 self.session.history_mut().push_entry(entry);
             }
         }
-        self.session.note_mutation();
     }
 
     pub(crate) fn can_schedule_notification_run(&self) -> bool {
@@ -5336,7 +5305,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 entry: to_logged_history_entry(&entry),
             })?;
             self.session.history_mut().push_entry(entry);
-            self.session.note_mutation();
         }
         Ok(())
     }
@@ -5369,7 +5337,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let interrupt_entry =
             HistoryEntry::new(agen::Item::system_message(system_note), interrupt_metadata);
         self.session.history_mut().push_entry(interrupt_entry);
-        self.session.note_mutation();
+
         Ok(())
     }
 
@@ -5507,7 +5475,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                         WorkerHistoryProvenance::FlowInstruction {
                             selector: flow.selector.clone(),
                             definition_id: flow.definition_id.clone(),
-                            definition_revision: flow.definition_revision,
+                            definition_digest: Some(flow.definition_digest.clone()),
                             instance_id: flow.instance_id.clone(),
                             state_id: flow.state_id.clone(),
                         },
@@ -5584,7 +5552,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .resume_with_annotation(self.session.history_mut(), &mut annotate)
             .await;
         self.engine = Some(locked.unlock());
-        self.session.note_mutation();
 
         self.handle_worker_result(result, history_before).await
     }
@@ -5638,7 +5605,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .resume_with_annotation(self.session.history_mut(), &mut annotate)
             .await;
         self.engine = Some(locked.unlock());
-        self.session.note_mutation();
 
         self.handle_worker_result(result, history_before).await
     }
@@ -6414,7 +6380,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     }
 
     /// Runs one parent-owned observable compaction service and returns the new
-    /// Segment ID. Lifecycle revisions are committed before they are broadcast.
+    /// Segment ID. Lifecycle states are committed before they are broadcast.
     pub async fn compact(&mut self, retained_tokens: u64) -> Result<SegmentId, WorkerError> {
         self.compact_with_cancel(retained_tokens, None, CompactionTrigger::RequestThreshold)
             .await
@@ -6434,7 +6400,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let mut lifecycle = CompactionLifecycle {
             schema_version: 3,
             compaction_id: uuid::Uuid::now_v7().to_string(),
-            revision: 1,
             internal_worker: None,
             state: CompactionLifecycleState::Running,
             started_at_ms: segment_log::now_millis(),
@@ -6516,7 +6481,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 ) {
                     self.try_record_metric(&metric);
                 }
-                lifecycle.revision = lifecycle.revision.saturating_add(1);
                 lifecycle.state = if matches!(&error, WorkerError::CompactCancelled) {
                     CompactionLifecycleState::Interrupted
                 } else {
@@ -6873,7 +6837,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 handle.clone(),
             ))
             .map_err(|error| WorkerError::InvalidState(error.to_string()))?;
-        lifecycle.revision = lifecycle.revision.saturating_add(1);
         lifecycle.internal_worker = Some(internal_ref);
         let cleanup = PendingCompactionCleanup {
             session_id: handle.session_id_string(),
@@ -7293,7 +7256,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // their blocks from `SegmentStart.history`. No per-item
         // broadcast is required.
         let _ = &compact_introduced_system_messages;
-        lifecycle.revision = lifecycle.revision.saturating_add(1);
         lifecycle.state = CompactionLifecycleState::Done;
         lifecycle.ended_at_ms = Some(segment_log::now_millis());
         Ok((
@@ -9948,7 +9910,7 @@ permission = "read"
             .memory
             .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "workspace-a".to_string(),
-                settings_revision: 7,
+
                 language: "Japanese".to_string(),
             })
             .unwrap();
@@ -9964,7 +9926,7 @@ permission = "read"
             restored.feature.memory.workspace_settings(),
             Some(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "workspace-a".to_string(),
-                settings_revision: 7,
+
                 language: "Japanese".to_string(),
             })
         );
@@ -10068,7 +10030,7 @@ mod build_summary_prompt_tests {
         availability: memory::backend::MemoryResidentSummaryAvailability,
         content: Option<String>,
         load_count: Arc<AtomicUsize>,
-        behavior_revision: Option<Arc<AtomicUsize>>,
+        behavior_md: Option<Arc<Mutex<String>>>,
     }
 
     impl WorkspaceClient for RestoreSubjectResidentClient {
@@ -10100,11 +10062,10 @@ mod build_summary_prompt_tests {
                 body: serde_json::to_string(
                     &server_api::SubjektivMemoryBackendResponse::ResidentContext(
                         server_api::SubjektivResidentContextOutput {
-                            behavior_md: "restore behavior".to_string(),
-                            behavior_revision: self
-                                .behavior_revision
-                                .as_ref()
-                                .map_or(1, |revision| revision.load(Ordering::SeqCst) as u64),
+                            behavior_md: self.behavior_md.as_ref().map_or_else(
+                                || "restore behavior".to_string(),
+                                |body| body.lock().unwrap().clone(),
+                            ),
                             memory_surface: memory::backend::MemoryResidentSummaryOutput {
                                 availability: self.availability,
                                 content: self.content.clone(),
@@ -10127,7 +10088,7 @@ mod build_summary_prompt_tests {
             availability,
             content: content.map(str::to_string),
             load_count: Arc::clone(&load_count),
-            behavior_revision: None,
+            behavior_md: None,
         });
         let source = crate::feature::builtin::memory::ordinary_subjektiv_resident_summary_source(
             manifest,
@@ -10417,7 +10378,6 @@ mod build_summary_prompt_tests {
                 selector: "builtin:coder-review".parse().unwrap(),
                 workspace_id: "workspace-test".to_string(),
                 flow_id: "flow-source-1".to_string(),
-                revision: 3,
                 content_digest: definition.content_digest.clone(),
                 definition,
             };
@@ -10818,7 +10778,7 @@ mod build_summary_prompt_tests {
                 .bind_backend_job(crate::BackendJobExecutionBinding {
                     job_id: "job-1".into(),
                     attempt_id: "attempt-1".into(),
-                    input_revision: None,
+                    input_digest: None,
                     subjektiv_consolidation: false
                 })
                 .is_err()
@@ -10833,7 +10793,7 @@ mod build_summary_prompt_tests {
         let binding = crate::BackendJobExecutionBinding {
             job_id: "job-1".into(),
             attempt_id: "attempt-1".into(),
-            input_revision: Some("revision-1".into()),
+            input_digest: Some("revision-1".into()),
             subjektiv_consolidation: true,
         };
         worker.bind_backend_job(binding.clone()).unwrap();
@@ -11983,7 +11943,10 @@ mod build_summary_prompt_tests {
             WorkerHistoryProvenance::FlowInstruction { .. }
         ));
         assert_eq!(projected[1].annotation.origin, input_provenance);
-        assert_eq!(state.instance.definition_revision, 3);
+        assert_eq!(
+            state.instance.definition_digest,
+            state.definition.content_digest
+        );
         assert_eq!(state.instance.current_state.as_str(), "implement");
         assert_eq!(workspace_client.requests.lock().unwrap().len(), 1);
 
@@ -13022,7 +12985,7 @@ permission = "write"
             .memory
             .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "workspace-test".to_string(),
-                settings_revision: 1,
+
                 language: "English".to_string(),
             })
             .unwrap();
@@ -13119,7 +13082,7 @@ permission = "write"
             .subjektiv
             .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "workspace-test".to_string(),
-                settings_revision: 1,
+
                 language: "English".to_string(),
             })
             .unwrap();
@@ -13317,7 +13280,7 @@ permission = "write"
         memory
             .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "workspace-test".to_string(),
-                settings_revision: 3,
+
                 language: "Japanese".to_string(),
             })
             .unwrap();
@@ -13633,7 +13596,7 @@ permission = "write"
                 .append_if_current(
                     &stale.location(),
                     "test.feature",
-                    serde_json::json!({"revision": "stale"}),
+                    serde_json::json!({"result": "stale"}),
                 )
                 .unwrap()
         );
@@ -13644,7 +13607,7 @@ permission = "write"
                 .append_if_current(
                     &current.location(),
                     "test.feature",
-                    serde_json::json!({"revision": "current"}),
+                    serde_json::json!({"result": "current"}),
                 )
                 .unwrap()
         );
@@ -13927,9 +13890,7 @@ permission = "write"
                 .is_ok()
         );
 
-        handle
-            .cancel(&accepted.submission_id, handle.snapshot().revision)
-            .unwrap();
+        handle.cancel(&accepted.submission_id).unwrap();
         assert_eq!(
             handle
                 .writer
@@ -14039,9 +14000,7 @@ permission = "write"
                 format!("{}…", "界".repeat(240))
             ]
         );
-        let after = handle
-            .cancel(&submit.submission_id, before.revision)
-            .unwrap();
+        let after = handle.cancel(&submit.submission_id).unwrap();
         assert!(after.submissions.is_empty());
         assert_eq!(after.notification_previews, before.notification_previews);
         let entries = handle.persisted_entries_for_test();
@@ -14192,21 +14151,19 @@ permission = "write"
 
         let fence = handle.snapshot();
         assert!(matches!(
-            handle.cancel(&accepted.submission_id, fence.revision.saturating_sub(1)),
-            Err(PendingSubmissionError::RevisionConflict { .. })
+            handle.clear(&["stale-submission".to_owned()]),
+            Err(PendingSubmissionError::ContentConflict { .. })
         ));
         assert!(matches!(
-            handle.prepare_next_activation(Some((fence.revision, "wrong-head"))),
+            handle.prepare_next_activation(Some("wrong-head")),
             Err(PendingSubmissionError::HeadConflict { .. })
         ));
         assert_eq!(handle.snapshot(), fence);
 
-        let snapshot = handle
-            .cancel(&accepted.submission_id, handle.snapshot().revision)
-            .unwrap();
+        let snapshot = handle.cancel(&accepted.submission_id).unwrap();
         assert!(snapshot.submissions.is_empty());
         assert!(matches!(
-            handle.cancel(&accepted.submission_id, handle.snapshot().revision),
+            handle.cancel(&accepted.submission_id),
             Err(PendingSubmissionError::NotFound(_))
         ));
 
@@ -14224,9 +14181,72 @@ permission = "write"
             Err(PendingSubmissionError::CountLimit)
         ));
         assert_eq!(handle.snapshot().submissions.len(), MAX_PENDING_SUBMISSIONS);
-        let cleared = handle.clear(handle.snapshot().revision).unwrap();
+        let cleared = handle
+            .clear(
+                &handle
+                    .snapshot()
+                    .submissions
+                    .iter()
+                    .map(|submission| submission.submission_id.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
         assert!(cleared.submissions.is_empty());
         assert_eq!(cleared.notification_count, 0);
+    }
+
+    #[test]
+    fn pending_queue_fences_use_target_state_and_exact_fifo_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        let first = handle
+            .accept("first".into(), vec![Segment::text("one")], false)
+            .unwrap();
+        let observed = vec![first.submission_id.clone()];
+        let second = handle
+            .accept("second".into(), vec![Segment::text("two")], false)
+            .unwrap();
+        handle
+            .accept_notification("notice".into(), "keep this".into())
+            .unwrap();
+        assert!(matches!(
+            handle.clear(&observed),
+            Err(PendingSubmissionError::ContentConflict { .. })
+        ));
+        assert!(matches!(
+            handle.clear(&[second.submission_id.clone(), first.submission_id.clone()]),
+            Err(PendingSubmissionError::ContentConflict { .. })
+        ));
+        assert_eq!(handle.snapshot().submissions.len(), 2);
+        handle.cancel(&second.submission_id).unwrap();
+        let activation = handle
+            .prepare_next_activation(Some(&first.submission_id))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            handle.cancel(&first.submission_id),
+            Err(PendingSubmissionError::NotFound(_))
+        ));
+        let PendingActivation::Submission(submission) = activation;
+        handle.abort_activation(submission);
+        let cleared = handle.clear(&observed).unwrap();
+        assert!(cleared.submissions.is_empty());
+        assert_eq!(cleared.notification_count, 1);
+        assert_eq!(cleared.notification_previews, ["keep this"]);
+        let entries = handle.persisted_entries_for_test();
+        let payload = entries
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                LogEntry::Extension {
+                    domain, payload, ..
+                } if domain == SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN => Some(payload),
+                _ => None,
+            })
+            .unwrap();
+        assert!(payload.get("revision").is_none());
+        let restored: PendingActivationState = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(restored.snapshot(), cleared);
     }
 
     #[test]
@@ -14477,7 +14497,7 @@ permission = "write"
         assert_eq!(checkpoint.notification_receipts.len(), 2);
         assert_eq!(checkpoint.pending.len(), 1);
         assert_eq!(checkpoint.receipts.len(), 2);
-        assert_eq!(checkpoint.revision, handle.state.lock().unwrap().revision);
+        assert_eq!(checkpoint.snapshot(), handle.snapshot());
         let restored = PendingSubmissionHandle {
             state: Arc::new(Mutex::new(checkpoint)),
             writer: handle.writer.clone(),
@@ -14979,7 +14999,7 @@ permission = "write"
             .subjektiv
             .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "workspace-test".into(),
-                settings_revision: 1,
+
                 language: "English".into(),
             })
             .unwrap();
@@ -15006,7 +15026,7 @@ permission = "write"
         .await
         .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let behavior_revision = Arc::new(AtomicUsize::new(1));
+        let behavior_md = Arc::new(Mutex::new("restore behavior".to_string()));
         let resident_source = || {
             crate::feature::builtin::memory::ordinary_subjektiv_resident_summary_source(
                 &manifest,
@@ -15015,7 +15035,7 @@ permission = "write"
                         availability: memory::backend::MemoryResidentSummaryAvailability::Ready,
                         content: Some("literal /prepare()".into()),
                         load_count: Arc::default(),
-                        behavior_revision: Some(behavior_revision.clone()),
+                        behavior_md: Some(behavior_md.clone()),
                     },
                 ))),
                 Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),
@@ -15049,7 +15069,7 @@ permission = "write"
             .unwrap(),
         );
         original.materialize_durable_session_head().await.unwrap();
-        behavior_revision.store(2, Ordering::SeqCst);
+        *behavior_md.lock().unwrap() = "updated behavior".to_string();
         *client.sink.lock().unwrap() = Some(original.sink());
         let pending = original.pending_submission_handle();
         pending
@@ -15738,7 +15758,6 @@ permission = "write"
     fn restoring_an_in_flight_activation_requeues_it_at_the_fifo_head() {
         let mut session = WorkerSession::new(session_store::new_session_id(), Vec::new());
         let state = PendingActivationState {
-            revision: 4,
             next_activation_sequence: 3,
             invocation_receipts: Vec::new(),
             invocation_recovery_blocked: false,

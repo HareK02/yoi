@@ -261,8 +261,6 @@ pub struct BackendJobRequest {
     pub job_id: String,
     /// Stable machine-readable use-site name, for example `ticket_item_check`.
     pub purpose: String,
-    /// Revision fenced by the structured result.
-    pub input_revision: String,
     /// Durable domain reference used to reload or explain the input.
     pub input_ref: String,
     /// Bounded immutable input snapshot. This must not contain credentials.
@@ -295,7 +293,6 @@ impl BackendJobRequest {
         Self {
             job_id: request.job_id,
             purpose: request.purpose,
-            input_revision: request.input_revision,
             input_ref: request.input_ref,
             input: request.input,
             instruction: request.instruction,
@@ -347,7 +344,6 @@ impl BackendJobRequest {
         job::JobRequest {
             job_id: self.job_id.clone(),
             purpose: self.purpose.clone(),
-            input_revision: self.input_revision.clone(),
             input_ref: self.input_ref.clone(),
             input: self.input.clone(),
             instruction: self.instruction.clone(),
@@ -369,6 +365,10 @@ impl BackendJobRequest {
             .as_ref()
             .map(|grant| subjektiv_serialization_key(&grant.subject_id))
             .or_else(|| self.serialization_key.clone())
+    }
+
+    pub fn input_digest(&self) -> Result<String> {
+        self.to_job_request().input_digest().map_err(backend_error)
     }
 
     pub fn fingerprint(&self) -> Result<String> {
@@ -436,7 +436,7 @@ pub struct BackendJobAttemptRecord {
     pub job_id: String,
     pub attempt_id: String,
     pub attempt: u8,
-    pub input_revision: String,
+    pub input_digest: String,
     pub state: BackendJobAttemptState,
     pub worker: Option<RuntimeWorkerRef>,
     pub runtime_run_id: Option<String>,
@@ -492,7 +492,7 @@ impl BackendJobResultAcceptance {
 fn job_outcome(job: &BackendJobRecord, attempt: &BackendJobAttemptRecord) -> job::JobOutcome {
     job::JobOutcome {
         job_id: job.request.job_id.clone(),
-        input_revision: job.request.input_revision.clone(),
+        input_digest: attempt.input_digest.clone(),
         attempt_id: attempt.attempt_id.clone(),
         attempt: attempt.attempt,
         state: job.state.into(),
@@ -566,7 +566,6 @@ mod tests {
         BackendJobRequest {
             job_id: "ticket-check:T-1:r7".to_string(),
             purpose: "ticket_item_check".to_string(),
-            input_revision: "7".to_string(),
             input_ref: "ticket://T-1/revisions/7".to_string(),
             input: serde_json::json!({"title": "Check me"}),
             instruction: "Check this immutable Ticket snapshot.".to_string(),
@@ -595,7 +594,7 @@ mod tests {
                 "job_id": "ticket-check:T-1:r7",
                 "attempt_id": "ticket-check:T-1:r7:attempt:2",
                 "attempt": 2,
-                "input_revision": "7",
+                "input_digest": "7",
                 "state": "reserved",
                 "worker": {"runtime_id": "runtime-a", "worker_id": "worker-a"},
                 "runtime_run_id": "run-a",
@@ -687,7 +686,7 @@ mod tests {
             reservation.outcome(),
             job::JobOutcome {
                 job_id: reservation.job.request.job_id.clone(),
-                input_revision: "7".into(),
+                input_digest: "7".into(),
                 attempt_id: "ticket-check:T-1:r7:attempt:2".into(),
                 attempt: 2,
                 state: job::JobState::Pending,
@@ -767,11 +766,11 @@ mod tests {
         let encoded = serde_json::to_string(&request).unwrap();
         assert_eq!(
             encoded,
-            r#"{"job_id":"ticket-check:T-1:r7","purpose":"ticket_item_check","input_revision":"7","input_ref":"ticket://T-1/revisions/7","input":{"title":"Check me"},"instruction":"Check this immutable Ticket snapshot.","profile":"builtin:backend-job","source_worker":{"runtime_id":"runtime-a","worker_id":"worker-a"},"notification_target":{"runtime_id":"runtime-a","worker_id":"worker-a"},"limits":{"max_concurrent_jobs":8,"timeout_seconds":120,"max_result_bytes":16384,"max_attempts":2}}"#
+            r#"{"job_id":"ticket-check:T-1:r7","purpose":"ticket_item_check","input_ref":"ticket://T-1/revisions/7","input":{"title":"Check me"},"instruction":"Check this immutable Ticket snapshot.","profile":"builtin:backend-job","source_worker":{"runtime_id":"runtime-a","worker_id":"worker-a"},"notification_target":{"runtime_id":"runtime-a","worker_id":"worker-a"},"limits":{"max_concurrent_jobs":8,"timeout_seconds":120,"max_result_bytes":16384,"max_attempts":2}}"#
         );
         assert_eq!(
             request.fingerprint().unwrap(),
-            "sha256:920187fa9efa111a97c4d6869d134943e45b52edb2861cad19a0a173233c8f60"
+            "sha256:250b626572e954d2aa2228364274c946d9f6b176eb0f0a205157e55031581147"
         );
         let neutral = request.to_job_request();
         neutral.validate().unwrap();
@@ -785,7 +784,7 @@ mod tests {
         );
         assert_eq!(
             request.worker_input("attempt-1").unwrap(),
-            "Check this immutable Ticket snapshot.\n\nBackend Job envelope (immutable):\njob_id: ticket-check:T-1:r7\nattempt_id: attempt-1\ninput_revision: 7\ninput_ref: ticket://T-1/revisions/7\ninput_json: {\"title\":\"Check me\"}\n\nReturn success only through the structured Backend Job result capability. Final prose and Worker Idle/Stopped state are not result authority."
+            "Check this immutable Ticket snapshot.\n\nBackend Job envelope (immutable):\njob_id: ticket-check:T-1:r7\nattempt_id: attempt-1\ninput_digest: sha256:7d0f26b7fc612e982fd7acf2b64f29d2e8f65c7e1292683e36d7dcac38905c50\ninput_ref: ticket://T-1/revisions/7\ninput_json: {\"title\":\"Check me\"}\n\nReturn success only through the structured Backend Job result capability. Final prose and Worker Idle/Stopped state are not result authority."
         );
     }
 
@@ -794,13 +793,13 @@ mod tests {
         let submission = BackendJobResultSubmission {
             job_id: "job-1".into(),
             attempt_id: "job-1:attempt:1".into(),
-            input_revision: "7".into(),
+            input_digest: "7".into(),
             result: serde_json::json!({"ok": true}),
         };
         let encoded = serde_json::to_string(&submission).unwrap();
         assert_eq!(
             encoded,
-            r#"{"job_id":"job-1","attempt_id":"job-1:attempt:1","input_revision":"7","result":{"ok":true}}"#
+            r#"{"job_id":"job-1","attempt_id":"job-1:attempt:1","input_digest":"7","result":{"ok":true}}"#
         );
         let neutral: job::JobResultSubmission = serde_json::from_str(&encoded).unwrap();
         assert_eq!(neutral, submission);
@@ -832,12 +831,14 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_covers_revision_profile_limits_and_notification_provenance() {
+    fn fingerprint_covers_input_profile_limits_and_notification_provenance() {
         let request = request();
         let first = request.fingerprint().unwrap();
         assert_eq!(first, request.fingerprint().unwrap());
         for mutate in [
-            |request: &mut BackendJobRequest| request.input_revision = "8".to_string(),
+            |request: &mut BackendJobRequest| {
+                request.input = serde_json::json!({"title":"changed"})
+            },
             |request: &mut BackendJobRequest| request.purpose = "alternate_check".to_string(),
             |request: &mut BackendJobRequest| request.limits.max_attempts = 3,
             |request: &mut BackendJobRequest| request.notification_target = None,

@@ -241,7 +241,7 @@ function parseToolchainContract(value: unknown): ToolchainContract {
 }
 
 export function parseConfigTreeSnapshot(value: unknown): ConfigTreeSnapshot {
-  const item = record(value, ["revision", "digest", "entries"]);
+  const item = record(value, ["digest", "entries"]);
   const entriesRecord = objectValue(item.entries);
   const entries = Object.entries(entriesRecord);
   if (entries.length > MAX_ENTRY_COUNT) throw schemaError();
@@ -253,7 +253,6 @@ export function parseConfigTreeSnapshot(value: unknown): ConfigTreeSnapshot {
     parsedEntries[boundedPath] = parsed;
   }
   return {
-    revision: safeInteger(item.revision),
     digest: boundedString(item.digest, MAX_DIGEST_BYTES),
     entries: parsedEntries,
   };
@@ -299,13 +298,13 @@ export async function fetchConfigEntry(
   );
 }
 
-export async function fetchConfigRevision(
+export async function fetchConfigHistory(
   workspaceId: string,
-  revision: number,
+  contentDigest: string,
   fetcher: typeof fetch = fetch,
 ): Promise<ConfigTreeSnapshot> {
   return await readJson(
-    await fetcher(`${sourceTreeUrl(workspaceId)}/revisions/${revision}`, {
+    await fetcher(`${sourceTreeUrl(workspaceId)}/history/${encodeURIComponent(contentDigest)}`, {
       headers: { accept: "application/json" },
     }),
     parseConfigTreeSnapshot,

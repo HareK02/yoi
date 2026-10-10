@@ -167,14 +167,10 @@ function parseCatalogEntry(
 function parseProjection(value: unknown): SkillProjectionIdentity {
   const record = strictObject(
     value,
-    ["config_revision", "tree_digest"],
+    ["tree_digest"],
     "Skill projection identity",
   );
   return {
-    config_revision: safeInteger(
-      record.config_revision,
-      "Skill config revision",
-    ),
     tree_digest: boundedString(
       record.tree_digest,
       "Skill tree digest",
@@ -205,14 +201,12 @@ function parseProvenance(
       "kind",
       "id",
       "virtual_path",
-      "revision",
       "source_digest",
       "tree_digest",
     ],
     "Skill provenance",
     [
       "virtual_path",
-      "revision",
       "source_digest",
       "tree_digest",
     ],
@@ -239,9 +233,6 @@ function parseProvenance(
     "Skill provenance tree digest",
     SKILL_API_LIMITS.maxDigestBytes,
   );
-  const revision = record.revision === undefined
-    ? undefined
-    : safeInteger(record.revision, "Skill provenance revision");
 
   if (
     !id.startsWith(`${kind}:`) || virtualPath === undefined ||
@@ -250,17 +241,14 @@ function parseProvenance(
     throw contractError("invalid Skill provenance");
   }
   if (kind === "builtin") {
-    if (revision !== undefined || treeDigest !== undefined) {
+    if (treeDigest !== undefined) {
       throw contractError("invalid built-in Skill provenance");
     }
   } else {
-    if (revision === undefined || treeDigest === undefined) {
+    if (treeDigest === undefined) {
       throw contractError("incomplete Workspace Skill provenance");
     }
-    if (
-      revision !== projection.config_revision ||
-      treeDigest !== projection.tree_digest
-    ) {
+    if (treeDigest !== projection.tree_digest) {
       throw contractError("stale Workspace Skill projection");
     }
   }
@@ -269,7 +257,6 @@ function parseProvenance(
     kind,
     id,
     virtual_path: virtualPath,
-    revision,
     source_digest: sourceDigest,
     tree_digest: treeDigest,
   };

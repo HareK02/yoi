@@ -5,7 +5,6 @@ fn request() -> JobRequest {
     JobRequest {
         job_id: "check:r7".into(),
         purpose: "snapshot_check".into(),
-        input_revision: "7".into(),
         input_ref: "snapshot://7".into(),
         input: json!({"title": "Check me"}),
         instruction: "Check this immutable snapshot.".into(),
@@ -13,6 +12,25 @@ fn request() -> JobRequest {
         serialization_key: None,
         limits: JobLimits::default(),
     }
+}
+
+#[test]
+fn input_content_identity_is_computed_and_old_counter_is_not_accepted() {
+    let original = request();
+    let mut changed = original.clone();
+    changed.input = json!({"title": "changed"});
+    assert_ne!(
+        original.input_digest().unwrap(),
+        changed.input_digest().unwrap()
+    );
+    changed.instruction.push_str(" Extra instruction.");
+    assert_eq!(
+        changed.input_digest().unwrap(),
+        fingerprint(&changed.input).unwrap()
+    );
+    let mut old = serde_json::to_value(&original).unwrap();
+    old["input_revision"] = json!(7);
+    assert!(serde_json::from_value::<JobRequest>(old).is_err());
 }
 
 #[test]
@@ -53,7 +71,7 @@ fn shared_lifecycle_enums_round_trip_all_host_states() {
 fn outcome_is_a_neutral_read_snapshot_with_optional_result_and_failure() {
     let mut outcome = JobOutcome {
         job_id: "job-1".into(),
-        input_revision: "7".into(),
+        input_digest: request().input_digest().unwrap(),
         attempt_id: "job-1:attempt:2".into(),
         attempt: 2,
         state: JobState::Pending,
@@ -66,7 +84,7 @@ fn outcome_is_a_neutral_read_snapshot_with_optional_result_and_failure() {
     assert_eq!(
         encoded,
         json!({
-            "job_id": "job-1", "input_revision": "7", "attempt_id": "job-1:attempt:2",
+            "job_id": "job-1", "input_digest": request().input_digest().unwrap(), "attempt_id": "job-1:attempt:2",
             "attempt": 2, "state": "pending", "attempt_state": "dispatching",
             "result": null, "failure_category": null, "failure_detail": null
         })
@@ -124,7 +142,7 @@ fn outcome_is_a_neutral_read_snapshot_with_optional_result_and_failure() {
 fn neutral_request_and_result_have_strict_round_trip_contracts() {
     let request = request();
     let encoded = serde_json::to_value(&request).unwrap();
-    assert_eq!(encoded.as_object().unwrap().len(), 8);
+    assert_eq!(encoded.as_object().unwrap().len(), 7);
     assert!(encoded.get("serialization_key").is_none());
     assert_eq!(
         serde_json::from_value::<JobRequest>(encoded.clone()).unwrap(),
@@ -137,10 +155,11 @@ fn neutral_request_and_result_have_strict_round_trip_contracts() {
     with_provenance["source_worker"] = json!({});
     assert!(serde_json::from_value::<JobRequest>(with_provenance).is_err());
 
+    let input_digest = request.input_digest().unwrap();
     let submission = JobResultSubmission {
         job_id: request.job_id,
         attempt_id: "check:r7:attempt:1".into(),
-        input_revision: request.input_revision,
+        input_digest,
         result: json!({"ok": true}),
     };
     let mut encoded = serde_json::to_value(&submission).unwrap();
@@ -168,7 +187,6 @@ fn fingerprint_covers_every_immutable_field_and_preserves_replay() {
     for mutate in [
         |r: &mut JobRequest| r.job_id.push('x'),
         |r: &mut JobRequest| r.purpose.push('x'),
-        |r: &mut JobRequest| r.input_revision.push('x'),
         |r: &mut JobRequest| r.input_ref.push('x'),
         |r: &mut JobRequest| r.input = json!({"title": "changed"}),
         |r: &mut JobRequest| r.instruction.push('x'),
@@ -216,7 +234,6 @@ fn registry_profiles_are_not_authority_or_a_fixed_allowlist() {
 fn validation_enforces_utf8_bytes_and_metadata_bounds() {
     let mut r = request();
     r.job_id = "x".repeat(256);
-    r.input_revision = "x".repeat(256);
     r.purpose = "x".repeat(MAX_JOB_PURPOSE_BYTES);
     r.input_ref = "x".repeat(MAX_JOB_REFERENCE_BYTES);
     r.instruction = "x".repeat(MAX_JOB_INSTRUCTION_BYTES);
@@ -225,7 +242,6 @@ fn validation_enforces_utf8_bytes_and_metadata_bounds() {
     r.validate().unwrap();
     for mutate in [
         |r: &mut JobRequest| r.job_id.push('x'),
-        |r: &mut JobRequest| r.input_revision.push('x'),
         |r: &mut JobRequest| r.purpose.push('x'),
         |r: &mut JobRequest| r.input_ref.push('x'),
         |r: &mut JobRequest| r.instruction.push('x'),
@@ -287,7 +303,7 @@ fn result_digest_and_failure_detail_bound_exact_utf8_encoding() {
 }
 
 #[test]
-fn worker_input_is_revision_and_attempt_bound_not_final_prose_authority() {
+fn worker_input_is_content_and_attempt_bound_not_final_prose_authority() {
     let request = request();
     let attempt = attempt_id(&request.job_id, 2);
     assert_eq!(attempt, "check:r7:attempt:2");
@@ -297,7 +313,7 @@ fn worker_input_is_revision_and_attempt_bound_not_final_prose_authority() {
         "Job envelope (immutable):",
         "job_id: check:r7",
         "attempt_id: check:r7:attempt:2",
-        "input_revision: 7",
+        "input_digest: sha256:",
         "input_ref: snapshot://7",
         r#"input_json: {"title":"Check me"}"#,
         "structured Job result capability",

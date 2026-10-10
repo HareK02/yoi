@@ -509,12 +509,11 @@ fn native_merge_request_tools(
 }
 
 #[derive(Default)]
-struct MergeRequestRevisionState {
-    revisions: HashMap<String, String>,
-    mutation_sequence: u64,
+struct MergeRequestObservationState {
+    content_digests: HashMap<String, String>,
 }
 
-type MergeRequestRevisions = Arc<Mutex<MergeRequestRevisionState>>;
+type MergeRequestObservations = Arc<Mutex<MergeRequestObservationState>>;
 
 /// Mount only the Merge Request operations enabled for this Worker as a native
 /// collection plus route-bound item objects. The ordinary Tool definitions remain
@@ -542,7 +541,7 @@ pub fn mount_workspace_http_merge_request_wip(
         .filter(|tool| tool.projection.surface == NativeMergeRequestSurface::Item)
         .cloned()
         .collect::<Vec<_>>();
-    let revisions = Arc::new(Mutex::new(MergeRequestRevisionState::default()));
+    let observations = Arc::new(Mutex::new(MergeRequestObservationState::default()));
 
     let collection_descriptor = merge_request_descriptor(
         &collection_tools,
@@ -574,7 +573,7 @@ pub fn mount_workspace_http_merge_request_wip(
             tools: merge_request_operation_map(collection_tools),
             permissions: permissions.clone(),
             collection_route: collection_route.clone(),
-            revisions: Arc::clone(&revisions),
+            observations: Arc::clone(&observations),
         }),
     })?;
 
@@ -593,7 +592,7 @@ pub fn mount_workspace_http_merge_request_wip(
             tools: merge_request_operation_map(item_tools),
             permissions,
             collection_route: collection_route.clone(),
-            revisions,
+            observations,
         }),
     })?;
     registry.replace_compatibility_tools(&collection_route, claimed_tools)?;
@@ -613,7 +612,7 @@ struct MergeRequestCollectionWipHandler {
     tools: HashMap<String, NativeMergeRequestTool>,
     permissions: Option<ToolPermissionConfig>,
     collection_route: String,
-    revisions: MergeRequestRevisions,
+    observations: MergeRequestObservations,
 }
 
 #[async_trait]
@@ -643,7 +642,7 @@ impl WipOperationHandler for MergeRequestCollectionWipHandler {
                         )
                     })?
                     .to_string();
-                record_merge_request_observation(&self.revisions, &reference, &response, true);
+                record_merge_request_observation(&self.observations, &reference, &response, true);
                 if let Some(object) = response.as_object_mut() {
                     object.insert(
                         "path".into(),
@@ -663,7 +662,7 @@ struct MergeRequestItemResolver {
     tools: HashMap<String, NativeMergeRequestTool>,
     permissions: Option<ToolPermissionConfig>,
     collection_route: String,
-    revisions: MergeRequestRevisions,
+    observations: MergeRequestObservations,
 }
 
 impl WipDynamicItemResolver for MergeRequestItemResolver {
@@ -671,14 +670,13 @@ impl WipDynamicItemResolver for MergeRequestItemResolver {
         if !is_merge_request_route_reference(item_reference) {
             return None;
         }
-        let revision = self
-            .revisions
+        let content_digest = self
+            .observations
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .revisions
+            .content_digests
             .get(item_reference)
-            .cloned()
-            .unwrap_or_else(|| "unobserved".into());
+            .cloned();
         let route = format!("{}/{}", self.collection_route, item_reference);
         Some(WipDynamicItem {
             object: Object {
@@ -686,13 +684,15 @@ impl WipDynamicItemResolver for MergeRequestItemResolver {
                 description: Some("Authoritative Merge Request bound to this object route".into()),
                 interfaces: vec![crate::wip::root_reference(MERGE_REQUEST_ITEM_INTERFACE)],
                 r#ref: Some(format!("merge-request:{item_reference}")),
-                validator: Some(merge_request_route_validator(&route, &revision)),
+                validator: content_digest
+                    .as_deref()
+                    .map(|digest| merge_request_route_validator(&route, digest)),
             },
             handler: Arc::new(MergeRequestItemWipHandler {
                 tools: self.tools.clone(),
                 permissions: self.permissions.clone(),
                 merge_request_id: item_reference.into(),
-                revisions: Arc::clone(&self.revisions),
+                observations: Arc::clone(&self.observations),
             }),
         })
     }
@@ -702,7 +702,7 @@ struct MergeRequestItemWipHandler {
     tools: HashMap<String, NativeMergeRequestTool>,
     permissions: Option<ToolPermissionConfig>,
     merge_request_id: String,
-    revisions: MergeRequestRevisions,
+    observations: MergeRequestObservations,
 }
 
 #[async_trait]
@@ -737,7 +737,7 @@ impl WipOperationHandler for MergeRequestItemWipHandler {
             tool.kind.mutating(),
         )?;
         record_merge_request_observation(
-            &self.revisions,
+            &self.observations,
             &self.merge_request_id,
             &response,
             tool.kind.mutating(),
@@ -911,23 +911,22 @@ fn merge_request_reference(response: &Value) -> Option<&str> {
 }
 
 fn record_merge_request_observation(
-    revisions: &MergeRequestRevisions,
+    observations: &MergeRequestObservations,
     reference: &str,
     response: &Value,
     mutation: bool,
 ) {
-    let mut state = revisions.lock().unwrap_or_else(|error| error.into_inner());
-    let revision = if mutation {
-        state.mutation_sequence = state.mutation_sequence.saturating_add(1);
-        format!(
-            "{}#mutation-{}",
-            merge_request_response_fingerprint(response),
-            state.mutation_sequence
-        )
+    let mut state = observations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if mutation {
+        state.content_digests.remove(reference);
     } else {
-        merge_request_response_fingerprint(response)
-    };
-    state.revisions.insert(reference.to_string(), revision);
+        state.content_digests.insert(
+            reference.to_string(),
+            merge_request_response_fingerprint(response),
+        );
+    }
 }
 
 fn merge_request_response_fingerprint(response: &Value) -> String {
@@ -947,11 +946,11 @@ fn is_merge_request_route_reference(reference: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
 }
 
-fn merge_request_route_validator(route: &str, revision: &str) -> Vec<u8> {
+fn merge_request_route_validator(route: &str, content_digest: &str) -> Vec<u8> {
     let mut digest = Sha256::new();
     digest.update(route.as_bytes());
     digest.update([0]);
-    digest.update(revision.as_bytes());
+    digest.update(content_digest.as_bytes());
     digest.finalize().to_vec()
 }
 
@@ -1428,7 +1427,7 @@ mod tests {
             tools: HashMap::new(),
             permissions: None,
             collection_route: "/merge-requests".into(),
-            revisions: Arc::new(Mutex::new(MergeRequestRevisionState::default())),
+            observations: Arc::new(Mutex::new(MergeRequestObservationState::default())),
         };
         assert!(
             resolver
@@ -1574,16 +1573,16 @@ mod tests {
 
     #[test]
     fn successful_observations_and_mutations_stale_only_affected_merge_requests() {
-        let revisions = Arc::new(Mutex::new(MergeRequestRevisionState::default()));
+        let observations = Arc::new(Mutex::new(MergeRequestObservationState::default()));
         let resolver = MergeRequestItemResolver {
             tools: HashMap::new(),
             permissions: None,
             collection_route: "/merge-requests".into(),
-            revisions: Arc::clone(&revisions),
+            observations: Arc::clone(&observations),
         };
         let first = resolver.resolve("MR-1").unwrap().object.validator;
         record_merge_request_observation(
-            &revisions,
+            &observations,
             "MR-1",
             &json!({"merge_request_id": "MR-1", "updated_at": "rev-1"}),
             false,
@@ -1592,13 +1591,42 @@ mod tests {
         assert_ne!(first, observed);
         let other = resolver.resolve("MR-2").unwrap().object.validator;
         record_merge_request_observation(
-            &revisions,
+            &observations,
             "MR-1",
             &json!({"event_id": "review-1"}),
             true,
         );
         assert_ne!(observed, resolver.resolve("MR-1").unwrap().object.validator);
         assert_eq!(other, resolver.resolve("MR-2").unwrap().object.validator);
+    }
+
+    #[test]
+    fn merge_request_observation_digest_survives_identical_reads_without_mutation_counters() {
+        let observations = Arc::new(Mutex::new(MergeRequestObservationState::default()));
+        let resolver = MergeRequestItemResolver {
+            tools: HashMap::new(),
+            permissions: None,
+            collection_route: "/merge-requests".into(),
+            observations: Arc::clone(&observations),
+        };
+        let response = json!({"merge_request_id": "MR-1", "state": "open", "thread": []});
+        assert!(resolver.resolve("MR-1").unwrap().object.validator.is_none());
+        record_merge_request_observation(&observations, "MR-1", &response, false);
+        let observed = resolver.resolve("MR-1").unwrap().object.validator;
+        assert!(observed.is_some());
+        record_merge_request_observation(&observations, "MR-1", &response, false);
+        assert_eq!(resolver.resolve("MR-1").unwrap().object.validator, observed);
+        for _ in 0..2 {
+            record_merge_request_observation(
+                &observations,
+                "MR-1",
+                &json!({"event_id": "same-review"}),
+                true,
+            );
+            assert!(resolver.resolve("MR-1").unwrap().object.validator.is_none());
+        }
+        record_merge_request_observation(&observations, "MR-1", &response, false);
+        assert_eq!(resolver.resolve("MR-1").unwrap().object.validator, observed);
     }
 
     #[test]
@@ -1681,7 +1709,7 @@ mod tests {
     }
 
     #[test]
-    fn schemas_hide_revision_and_commit_authority() {
+    fn schemas_hide_content_digest_and_commit_authority() {
         let schemas = [
             schemars::schema_for!(OpenMergeRequestInput),
             schemars::schema_for!(CompleteMergeRequestInput),
@@ -1689,7 +1717,7 @@ mod tests {
         for s in schemas {
             let j = serde_json::to_string(&s).unwrap();
             for banned in [
-                "revision_id",
+                "content_digest_id",
                 "attempt_id",
                 "base_commit",
                 "head_commit",

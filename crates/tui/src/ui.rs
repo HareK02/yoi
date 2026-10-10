@@ -2187,7 +2187,6 @@ mod tests {
     fn set_pending_submission(app: &mut App, id: &str) {
         app.handle_worker_event(Event::PendingSubmissionsChanged {
             pending: protocol::PendingSubmissionsSnapshot {
-                revision: 1,
                 notification_count: 0,
                 notification_previews: vec![],
                 head_id: Some(id.into()),
@@ -2320,7 +2319,6 @@ mod tests {
                 parent_session_id: Some("parent-session".into()),
                 kind: protocol::InternalWorkerKind::SubWorker,
             },
-            revision: 1,
             event: Box::new(protocol::Event::TextDelta {
                 text: "child transcript".into(),
             }),

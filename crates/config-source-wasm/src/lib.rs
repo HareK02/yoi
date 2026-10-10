@@ -230,25 +230,49 @@ mod tests {
     use config_source::{ConfigContentType, ConfigEntry};
 
     fn snapshot() -> ConfigTreeSnapshot {
-        ConfigTreeSnapshot::from_entries(
-            7,
-            [
-                ConfigEntry::new(
-                    VirtualPath::parse("main.dcdl").unwrap(),
-                    ConfigContentType::Decodal,
-                    "{}",
-                )
-                .unwrap(),
-                // A same-suffix workspace file must not be an unknown builtin fallback.
-                ConfigEntry::new(
-                    VirtualPath::parse("profiles/missing.dcdl").unwrap(),
-                    ConfigContentType::Decodal,
-                    "{}",
-                )
-                .unwrap(),
-            ],
-        )
+        ConfigTreeSnapshot::from_entries([
+            ConfigEntry::new(
+                VirtualPath::parse("main.dcdl").unwrap(),
+                ConfigContentType::Decodal,
+                "{}",
+            )
+            .unwrap(),
+            // A same-suffix workspace file must not be an unknown builtin fallback.
+            ConfigEntry::new(
+                VirtualPath::parse("profiles/missing.dcdl").unwrap(),
+                ConfigContentType::Decodal,
+                "{}",
+            )
+            .unwrap(),
+        ])
         .unwrap()
+    }
+
+    #[test]
+    fn wasm_analysis_uses_applied_tree_content_identity() {
+        let base = snapshot();
+        let path = VirtualPath::parse("main.dcdl").unwrap();
+        let change = ConfigTreeChange::Update {
+            path: path.clone(),
+            expected_digest: base.entries[&path].content_digest.clone(),
+            content: "{ broken = ; }".into(),
+        };
+        let changed = base.apply(&[change]).unwrap();
+        let diagnostics = session_environment(changed.clone()).analyze(&path, None);
+        assert!(!diagnostics.is_empty());
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.tree_digest == changed.digest)
+        );
+        assert_ne!(changed.digest, base.digest);
+        let restored = changed.apply(&changed.changes_to(&base)).unwrap();
+        assert_eq!(restored.digest, base.digest);
+        assert!(
+            session_environment(restored)
+                .analyze(&path, None)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -301,7 +325,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(diagnostic.path, path);
-        assert_eq!(diagnostic.revision, 7);
         assert_eq!(diagnostic.tree_digest, snapshot.digest);
         assert!(
             diagnostic

@@ -3,7 +3,7 @@
   import { parseRuntimeCleanupPlan } from '#lib/workspace/api/runtime-workers.ts';
   import { parseWorkingDirectoryListResponse } from '#lib/workspace/api/workdirs.ts';
   import { canRemoveWorkdir, removalCause, removalGuard, removeWorkdir, WorkdirRemovalError } from '#lib/workspace/settings/workdir-removal.ts';
-  import { formatCurrentWorkdirRevision } from '#lib/workspace/settings/workdir-revision.ts';
+  import { formatCurrentWorkdirCheckout } from '#lib/workspace/settings/workdir-checkout.ts';
   import type { CleanupWorkdirCandidate, RuntimeCleanupPlanResponse, WorkingDirectorySummary } from '#lib/workspace/sidebar/types.ts';
   import type { PageProps } from './$types';
 
@@ -30,10 +30,10 @@
   function repositoryKey(workdir: WorkingDirectorySummary): string | null {
     return workdir.source.kind === 'repository' ? workdir.source.repository_key : null;
   }
-  function currentRevision(workdir: WorkingDirectorySummary): string {
+  function currentCheckout(workdir: WorkingDirectorySummary): string {
     const key = repositoryKey(workdir);
     const provider = key ? data.repositories?.items.find((repository) => repository.repository_key === key)?.provider ?? null : null;
-    return formatCurrentWorkdirRevision(workdir, provider);
+    return formatCurrentWorkdirCheckout(workdir, provider);
   }
   function cleanupCandidate(workdir: WorkingDirectorySummary): CleanupWorkdirCandidate | undefined {
     return cleanupCandidates.find((candidate) => candidate.workdir_id === workdir.working_directory_id);
@@ -131,7 +131,7 @@
           <tr>
             <th>Workdir</th>
             <th>Repository</th>
-            <th>Revision</th>
+            <th>Checkout</th>
             <th>Status</th>
             <th>Cleanliness</th>
             <th>Occupied by</th>
@@ -147,7 +147,7 @@
                 <small><code>{workdir.working_directory_id}</code></small>
               </td>
               <td>{repositoryKey(workdir) ?? 'External'}</td>
-              <td><code>{currentRevision(workdir)}</code></td>
+              <td><code>{currentCheckout(workdir)}</code></td>
               <td>{workdir.status}</td>
               <td>{workdir.cleanliness ?? 'unknown'}</td>
               <td>

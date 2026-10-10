@@ -270,7 +270,7 @@
                 {/each}
               </select>
             </label>
-            <label>Ref selector<input bind:value={target.ref_selector} placeholder={selectedRepository?.default_selector ?? "branch, tag, or revision"} /></label>
+            <label>Ref selector<input bind:value={target.ref_selector} placeholder={selectedRepository?.default_selector ?? "branch, tag, or commit"} /></label>
             <label>Access
               <select bind:value={target.access}>
                 <option value="read_write">Read and write</option>

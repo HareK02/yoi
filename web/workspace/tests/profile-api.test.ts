@@ -44,8 +44,6 @@ const diagnostic = {
 function profileSettingsFixture(): Record<string, unknown> {
   return {
     workspace_id: "workspace 1",
-    registry_revision: "config-source:7:tree:projection",
-    config_revision: 7,
     tree_digest: "tree",
     projection_digest: "projection",
     default_profile: "workspace:coder",
@@ -68,7 +66,6 @@ function profileSettingsFixture(): Record<string, unknown> {
       content_digest: "sha256:source",
       provenance: "project_profile_source_tree",
       editable: false,
-      revision: "config-source:7",
       size_bytes: 128,
       diagnostics: [],
     }],
@@ -86,7 +83,7 @@ Deno.test("profile settings requests use scoped API and strictly validate respon
 
   try {
     const response = await fetchProfileSettings("workspace 1");
-    assertEquals(response.config_revision, 7);
+    assertEquals(response.tree_digest, "tree");
     assertEquals(response.sources[0].provenance, "project_profile_source_tree");
     assertEquals(requests.length, 1);
     assertEquals(requests[0].url, "/api/w/workspace%201/settings/profiles");
@@ -103,7 +100,7 @@ Deno.test("workspace metadata requests use generated DTO shapes", async () => {
     workspace_id: "workspace 1",
     display_name: "Workspace",
     created_at: "2026-01-01T00:00:00Z",
-    revision: "sha256:metadata",
+    updated_at: "2026-01-02T00:00:00Z",
     source: "workspace-config",
     diagnostics: [diagnostic],
   };
@@ -118,13 +115,13 @@ Deno.test("workspace metadata requests use generated DTO shapes", async () => {
 
   try {
     assertEquals(
-      (await fetchWorkspaceMetadata("workspace 1")).revision,
-      "sha256:metadata",
+      (await fetchWorkspaceMetadata("workspace 1")).updated_at,
+      "2026-01-02T00:00:00Z",
     );
     assertEquals(
       (await updateWorkspaceMetadata("workspace 1", {
         display_name: "Renamed",
-        revision: "sha256:metadata",
+        expected_updated_at: "2026-01-02T00:00:00Z",
       })).workspace.workspace_id,
       "workspace 1",
     );
@@ -135,7 +132,10 @@ Deno.test("workspace metadata requests use generated DTO shapes", async () => {
     assertEquals(requests[1].init?.method, "PUT");
     assertEquals(
       requests[1].init?.body,
-      JSON.stringify({ display_name: "Renamed", revision: "sha256:metadata" }),
+      JSON.stringify({
+        display_name: "Renamed",
+        expected_updated_at: "2026-01-02T00:00:00Z",
+      }),
     );
   } finally {
     globalThis.fetch = originalFetch;
@@ -152,7 +152,6 @@ Deno.test("Workspace signing identity requests use flat settings routes", async 
         workspace_id: "workspace 1",
         key_id: "workspace-signing-key",
         algorithm: "ed25519",
-        revision: 1,
         state: "pending_provisioning",
         created_at: "2026-01-01T00:00:00Z",
       },
@@ -182,7 +181,7 @@ Deno.test("profile settings parser rejects missing, mistyped, stale, and invalid
   );
 
   const mistyped = profileSettingsFixture();
-  mistyped.config_revision = "7";
+  mistyped.tree_digest = 7;
   assertThrows(
     () => parseProfileSettingsResponse(mistyped),
     ProfileApiError,
@@ -212,7 +211,6 @@ Deno.test("Workspace signing identity parser validates active and pending public
       algorithm: "ed25519",
       public_key: "public-key",
       public_key_fingerprint: "sha256:fingerprint",
-      revision: 1,
       state: "active",
       created_at: "2026-01-01T00:00:00Z",
       provisioned_at: "2026-01-01T00:00:00Z",
@@ -224,7 +222,6 @@ Deno.test("Workspace signing identity parser validates active and pending public
       algorithm: "ed25519",
       public_key: "public-key",
       public_key_fingerprint: "sha256:fingerprint",
-      revision: 1,
     },
   };
   assertEquals(
@@ -237,7 +234,6 @@ Deno.test("Workspace signing identity parser validates active and pending public
         workspace_id: "workspace-1",
         key_id: "WK-1",
         algorithm: "ed25519",
-        revision: 1,
         state: "pending_provisioning",
         created_at: "2026-01-01T00:00:00Z",
       },

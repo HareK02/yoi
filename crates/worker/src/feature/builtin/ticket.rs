@@ -63,7 +63,7 @@ impl WorkspaceTicketReadKind {
                 "Query authoritative Workspace Tickets with bounded typed filters, stable snippets, evidence summaries, and cursor metadata."
             }
             Self::Show => {
-                "Show one authoritative Workspace Ticket with its item revision, paged thread, links, historical implementation reports, and current Merge Request readiness evidence."
+                "Show one authoritative Workspace Ticket with its content digest, paged thread, links, historical implementation reports, and current Merge Request readiness evidence."
             }
         }
     }
@@ -292,8 +292,8 @@ struct WorkspaceCompleteTicketInput {
     ticket: String,
     /// Stable key for exact replay of this completion decision.
     operation_key: String,
-    /// Current item revision from ShowTicket.
-    expected_item_revision: String,
+    /// SHA-256 of the current editable Ticket content from ShowTicket.
+    expected_content_digest: String,
     expected_state: TicketWorkflowState,
     /// Required explanation of the completion decision; MR approval is not a prerequisite.
     reason: String,
@@ -308,8 +308,8 @@ struct WorkspaceTicketStateUpdateInput {
     /// Ticket reference. Prefer `T-*`.
     ticket: String,
     operation_key: String,
-    /// Current item revision from ShowTicket.
-    expected_item_revision: String,
+    /// SHA-256 of the current editable Ticket content from ShowTicket.
+    expected_content_digest: String,
     expected_state: TicketWorkflowState,
     /// Progress-display state only: this does not start Workers or integrate Merge Requests.
     state: TicketWorkflowState,
@@ -326,8 +326,8 @@ struct WorkspaceTicketCloseInput {
     ticket: String,
     /// Stable key for exact replay of this close decision.
     operation_key: String,
-    /// Current item revision from ShowTicket.
-    expected_item_revision: String,
+    /// SHA-256 of the current editable Ticket content from ShowTicket.
+    expected_content_digest: String,
     expected_state: TicketWorkflowState,
     /// Required explanation for closing this Ticket.
     resolution: String,
@@ -381,13 +381,13 @@ struct WorkspaceTicketDecisionTool {
 fn validate_ticket_decision(
     ticket: &str,
     operation_key: &str,
-    revision: &str,
+    content_digest: &str,
     reason: &str,
 ) -> Result<(), ToolError> {
     for (name, value) in [
         ("ticket", ticket),
         ("operation_key", operation_key),
-        ("expected_item_revision", revision),
+        ("expected_content_digest", content_digest),
         ("reason", reason),
     ] {
         if value.trim().is_empty() {
@@ -412,7 +412,7 @@ impl Tool for WorkspaceTicketDecisionTool {
                 validate_ticket_decision(
                     &value.ticket,
                     &value.operation_key,
-                    &value.expected_item_revision,
+                    &value.expected_content_digest,
                     &value.reason,
                 )?;
                 let mut body = serde_json::to_value(&value)
@@ -428,12 +428,12 @@ impl Tool for WorkspaceTicketDecisionTool {
                 validate_ticket_decision(
                     &value.ticket,
                     &value.operation_key,
-                    &value.expected_item_revision,
+                    &value.expected_content_digest,
                     &value.resolution,
                 )?;
                 let body = json!({
                     "operation_key": value.operation_key,
-                    "expected_item_revision": value.expected_item_revision,
+                    "expected_content_digest": value.expected_content_digest,
                     "expected_state": value.expected_state,
                     "state": TicketWorkflowState::Closed,
                     "reason": value.resolution,
@@ -447,7 +447,7 @@ impl Tool for WorkspaceTicketDecisionTool {
                 validate_ticket_decision(
                     &value.ticket,
                     &value.operation_key,
-                    &value.expected_item_revision,
+                    &value.expected_content_digest,
                     &value.reason,
                 )?;
                 let mut body = serde_json::to_value(&value)
@@ -1005,7 +1005,7 @@ impl WorkspaceHttpTicketBackend {
         )?;
         serde_json::to_value(ticket::TicketStateUpdate {
             operation_key: uuid::Uuid::now_v7().to_string(),
-            expected_item_revision: ticket::ticket_item_revision(&snapshot),
+            expected_content_digest: ticket::ticket_content_digest(&snapshot),
             expected_state,
             state,
             reason: reason.into(),
@@ -1205,7 +1205,7 @@ impl WorkspaceHttpTicketBackend {
                 )?;
                 let body = serde_json::to_value(ticket::TicketCompletion {
                     operation_key: uuid::Uuid::now_v7().to_string(),
-                    expected_item_revision: ticket::ticket_item_revision(&snapshot),
+                    expected_content_digest: ticket::ticket_content_digest(&snapshot),
                     expected_state: snapshot.meta.workflow_state,
                     reason: resolution.as_str().to_owned(),
                     references: Vec::new(),
@@ -1763,13 +1763,12 @@ fn native_ticket_tools(
 }
 
 #[derive(Default)]
-struct TicketRevisionState {
-    revisions: HashMap<String, String>,
+struct TicketObservationState {
+    content_digests: HashMap<String, String>,
     aliases_by_canonical: HashMap<String, BTreeSet<String>>,
-    mutation_sequence: u64,
 }
 
-type TicketRevisions = Arc<Mutex<TicketRevisionState>>;
+type TicketObservations = Arc<Mutex<TicketObservationState>>;
 
 /// Mount the enabled Ticket Feature surface as native collection and route-bound
 /// item objects. Only tools already enabled for this Worker are projected and
@@ -1797,7 +1796,7 @@ pub fn mount_workspace_http_ticket_wip(
         .filter(|tool| tool.projection.surface == NativeTicketSurface::Item)
         .cloned()
         .collect::<Vec<_>>();
-    let revisions = Arc::new(Mutex::new(TicketRevisionState::default()));
+    let observations = Arc::new(Mutex::new(TicketObservationState::default()));
 
     let collection_descriptor = ticket_descriptor(
         &collection_tools,
@@ -1824,7 +1823,7 @@ pub fn mount_workspace_http_ticket_wip(
             tools: operation_map(collection_tools),
             permissions: permissions.clone(),
             collection_route: collection_route.clone(),
-            revisions: Arc::clone(&revisions),
+            observations: Arc::clone(&observations),
         }),
     })?;
 
@@ -1843,7 +1842,7 @@ pub fn mount_workspace_http_ticket_wip(
             tools: operation_map(item_tools),
             permissions,
             collection_route: collection_route.clone(),
-            revisions,
+            observations,
         }),
     })?;
     registry.replace_compatibility_tools(&collection_route, claimed_tools)?;
@@ -1861,7 +1860,7 @@ struct TicketCollectionWipHandler {
     tools: HashMap<String, NativeTicketTool>,
     permissions: Option<ToolPermissionConfig>,
     collection_route: String,
-    revisions: TicketRevisions,
+    observations: TicketObservations,
 }
 
 #[async_trait]
@@ -1879,7 +1878,7 @@ impl WipOperationHandler for TicketCollectionWipHandler {
         match operation {
             "query" => add_ticket_paths(&mut response, &self.collection_route),
             "create" => {
-                record_ticket_observation(&self.revisions, None, &response, true);
+                record_ticket_observation(&self.observations, None, &response, true);
                 if let Some(reference) = ticket_reference(&response).map(ToOwned::to_owned) {
                     response.as_object_mut().map(|object| {
                         object.insert(
@@ -1901,7 +1900,7 @@ struct TicketItemResolver {
     tools: HashMap<String, NativeTicketTool>,
     permissions: Option<ToolPermissionConfig>,
     collection_route: String,
-    revisions: TicketRevisions,
+    observations: TicketObservations,
 }
 
 impl WipDynamicItemResolver for TicketItemResolver {
@@ -1909,14 +1908,13 @@ impl WipDynamicItemResolver for TicketItemResolver {
         if !is_ticket_route_reference(item_reference) {
             return None;
         }
-        let revision = self
-            .revisions
+        let content_digest = self
+            .observations
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .revisions
+            .content_digests
             .get(item_reference)
-            .cloned()
-            .unwrap_or_else(|| "unobserved".into());
+            .cloned();
         let route = format!("{}/{}", self.collection_route, item_reference);
         Some(WipDynamicItem {
             object: Object {
@@ -1924,13 +1922,15 @@ impl WipDynamicItemResolver for TicketItemResolver {
                 description: Some("Authoritative Ticket bound to this object route".into()),
                 interfaces: vec![crate::wip::root_reference(TICKET_ITEM_INTERFACE)],
                 r#ref: Some(format!("ticket:{item_reference}")),
-                validator: Some(route_validator(&route, &revision)),
+                validator: content_digest
+                    .as_deref()
+                    .map(|digest| route_validator(&route, digest)),
             },
             handler: Arc::new(TicketItemWipHandler {
                 tools: self.tools.clone(),
                 permissions: self.permissions.clone(),
                 ticket_reference: item_reference.into(),
-                revisions: Arc::clone(&self.revisions),
+                observations: Arc::clone(&self.observations),
             }),
         })
     }
@@ -1940,7 +1940,7 @@ struct TicketItemWipHandler {
     tools: HashMap<String, NativeTicketTool>,
     permissions: Option<ToolPermissionConfig>,
     ticket_reference: String,
-    revisions: TicketRevisions,
+    observations: TicketObservations,
 }
 
 #[async_trait]
@@ -1960,13 +1960,13 @@ impl WipOperationHandler for TicketItemWipHandler {
         let output = execute_native_ticket_tool(tool, &self.permissions, input, context).await?;
         let response = ticket_tool_output_json(output)?;
         record_ticket_observation(
-            &self.revisions,
+            &self.observations,
             Some(&self.ticket_reference),
             &response,
             tool.projection.mutating,
         );
         if tool.projection.mutating {
-            record_affected_ticket_mutations(&self.revisions, &self.ticket_reference, &response);
+            record_affected_ticket_mutations(&self.observations, &self.ticket_reference, &response);
         }
         Ok(WipOperationOutput::native(
             json_to_wip(&response).map_err(WipOperationError::OutcomeUnknown)?,
@@ -2122,23 +2122,16 @@ fn ticket_reference(response: &Value) -> Option<&str> {
         .filter(|reference| is_canonical_ticket_resource_key(reference))
 }
 
-fn response_revision(response: &Value) -> Option<&str> {
-    response
-        .get("item_revision")
-        .or_else(|| response.get("revision"))
-        .or_else(|| response.get("updated_at"))
-        .or_else(|| response.get("meta").and_then(|meta| meta.get("updated_at")))
-        .and_then(Value::as_str)
-}
-
 fn record_ticket_observation(
-    revisions: &TicketRevisions,
+    observations: &TicketObservations,
     bound_reference: Option<&str>,
     response: &Value,
     mutation: bool,
 ) {
     let observed_canonical = ticket_reference(response).map(ToOwned::to_owned);
-    let mut state = revisions.lock().unwrap_or_else(|error| error.into_inner());
+    let mut state = observations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let existing_bound_group = bound_reference.and_then(|reference| {
         state
             .aliases_by_canonical
@@ -2180,29 +2173,22 @@ fn record_ticket_observation(
         aliases.insert(reference.to_string());
     }
 
-    let revision = if mutation {
-        state.mutation_sequence = state.mutation_sequence.saturating_add(1);
-        format!(
-            "{}#mutation-{}",
-            response_revision(response).unwrap_or("observed"),
-            state.mutation_sequence
-        )
-    } else if let Some(revision) = response_revision(response) {
-        revision.to_string()
-    } else {
-        aliases
-            .iter()
-            .find_map(|alias| state.revisions.get(alias).cloned())
-            .unwrap_or_else(|| "observed".into())
-    };
+    // Mutation receipts are not full representations. Forget the observed
+    // content rather than manufacturing a local change counter.
     for alias in &aliases {
-        state.revisions.insert(alias.clone(), revision.clone());
+        if mutation {
+            state.content_digests.remove(alias);
+        } else {
+            let bytes = Sha256::digest(response.to_string().as_bytes());
+            let digest = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+            state.content_digests.insert(alias.clone(), digest);
+        }
     }
     state.aliases_by_canonical.insert(group_key, aliases);
 }
 
 fn record_affected_ticket_mutations(
-    revisions: &TicketRevisions,
+    observations: &TicketObservations,
     bound_reference: &str,
     response: &Value,
 ) {
@@ -2228,7 +2214,7 @@ fn record_affected_ticket_mutations(
         );
     }
     for reference in affected.difference(&subject_references) {
-        record_ticket_observation(revisions, Some(reference), &Value::Null, true);
+        record_ticket_observation(observations, Some(reference), &Value::Null, true);
     }
 }
 
@@ -2239,11 +2225,11 @@ fn is_ticket_route_reference(reference: &str) -> bool {
             && reference.bytes().all(|byte| byte.is_ascii_alphanumeric()))
 }
 
-fn route_validator(route: &str, revision: &str) -> Vec<u8> {
+fn route_validator(route: &str, content_digest: &str) -> Vec<u8> {
     let mut digest = Sha256::new();
     digest.update(route.as_bytes());
     digest.update([0]);
-    digest.update(revision.as_bytes());
+    digest.update(content_digest.as_bytes());
     digest.finalize().to_vec()
 }
 
@@ -2427,7 +2413,7 @@ mod tests {
     fn decision_input() -> Value {
         json!({
             "ticket": "T-718", "operation_key": "decision-1",
-            "expected_item_revision": "revision-1", "expected_state": "planning",
+            "expected_content_digest": "content_digest-1", "expected_state": "planning",
             "reason": "No repository changes are needed"
         })
     }
@@ -2482,8 +2468,8 @@ mod tests {
             let request: ticket::TicketStateUpdate = serde_json::from_value(body.clone()).unwrap();
             assert!(uuid::Uuid::parse_str(&request.operation_key).is_ok());
             assert_eq!(
-                request.expected_item_revision,
-                ticket::ticket_item_revision(&snapshot)
+                request.expected_content_digest,
+                ticket::ticket_content_digest(&snapshot)
             );
             assert_eq!(request.expected_state, TicketWorkflowState::Planning);
             assert_eq!(request.state, TicketWorkflowState::Closed);
@@ -2592,8 +2578,8 @@ mod tests {
             assert!(uuid::Uuid::parse_str(&request.operation_key).is_ok());
             assert!(keys.insert(request.operation_key));
             assert_eq!(
-                request.expected_item_revision,
-                ticket::ticket_item_revision(&snapshot)
+                request.expected_content_digest,
+                ticket::ticket_content_digest(&snapshot)
             );
             assert_eq!(request.expected_state, TicketWorkflowState::Ready);
             assert_eq!(request.reason, "Resolved without repository changes");
@@ -2643,7 +2629,7 @@ mod tests {
         );
         for field in [
             "operation_key",
-            "expected_item_revision",
+            "expected_content_digest",
             "expected_state",
             "resolution",
         ] {
@@ -2660,13 +2646,19 @@ mod tests {
                 .iter()
                 .any(|p| p.name == "references" && !p.required)
         );
-        let revisions = Arc::new(Mutex::new(TicketRevisionState::default()));
+        let observations = Arc::new(Mutex::new(TicketObservationState::default()));
         let resolver = TicketItemResolver {
             tools: operation_map(tools),
             permissions: None,
             collection_route: "/tickets".into(),
-            revisions,
+            observations,
         };
+        record_ticket_observation(
+            &resolver.observations,
+            Some("T-718"),
+            &json!({"ticket": "T-718", "body": "observed requirements"}),
+            false,
+        );
         let bound = resolver.resolve("T-718").unwrap();
         let before = bound.object.validator;
         let other = resolver.resolve("T-719").unwrap().object.validator;
@@ -2702,7 +2694,7 @@ mod tests {
         assert_eq!(
             body,
             json!({
-                "operation_key": "decision-1", "expected_item_revision": "revision-1",
+                "operation_key": "decision-1", "expected_content_digest": "content_digest-1",
                 "expected_state": "planning", "state": "closed",
                 "reason": "No repository changes are needed", "references": []
             })
@@ -2794,7 +2786,7 @@ mod tests {
         assert_eq!(
             body,
             json!({
-                "operation_key": "decision-1", "expected_item_revision": "revision-1",
+                "operation_key": "decision-1", "expected_content_digest": "content_digest-1",
                 "expected_state": "planning", "reason": "No repository changes are needed", "references": []
             })
         );
@@ -2859,7 +2851,7 @@ mod tests {
             assert!(validator.is_valid(&valid));
             for field in [
                 "operation_key",
-                "expected_item_revision",
+                "expected_content_digest",
                 "expected_state",
                 reason_field,
             ] {
@@ -2875,7 +2867,7 @@ mod tests {
             for field in [
                 reason_field,
                 "operation_key",
-                "expected_item_revision",
+                "expected_content_digest",
                 "ticket",
             ] {
                 let mut invalid = valid.clone();
@@ -2968,7 +2960,7 @@ mod tests {
     #[tokio::test]
     async fn native_ticket_completion_binds_subject_and_stales_only_its_ticket_not_mrs() {
         let client = decision_client(200, TicketWorkflowState::Done);
-        let revisions = Arc::new(Mutex::new(TicketRevisionState::default()));
+        let observations = Arc::new(Mutex::new(TicketObservationState::default()));
         let tools =
             native_ticket_tools(client.clone(), TicketFeatureAccess::work_report()).unwrap();
         let descriptor = ticket_descriptor(&tools, "Ticket", "bound").unwrap();
@@ -2980,7 +2972,7 @@ mod tests {
         assert!(!complete.parameters.iter().any(|p| p.name == "ticket"));
         for field in [
             "operation_key",
-            "expected_item_revision",
+            "expected_content_digest",
             "expected_state",
             "reason",
         ] {
@@ -2995,8 +2987,14 @@ mod tests {
             tools: operation_map(tools),
             permissions: None,
             collection_route: "/tickets".into(),
-            revisions: revisions.clone(),
+            observations: observations.clone(),
         };
+        record_ticket_observation(
+            &resolver.observations,
+            Some("T-718"),
+            &json!({"ticket": "T-718", "body": "observed requirements"}),
+            false,
+        );
         let bound = resolver.resolve("T-718").unwrap();
         let before = bound.object.validator;
         let other = resolver.resolve("T-719").unwrap().object.validator;
@@ -3138,12 +3136,12 @@ mod tests {
                 .is_err()
         );
 
-        let revisions = Arc::new(Mutex::new(TicketRevisionState::default()));
+        let observations = Arc::new(Mutex::new(TicketObservationState::default()));
         let resolver = TicketItemResolver {
             tools: HashMap::new(),
             permissions: None,
             collection_route: "/tickets".into(),
-            revisions,
+            observations,
         };
         assert!(resolver.resolve("T-42").is_some());
         assert!(resolver.resolve("00001TICKET").is_some());
@@ -3202,36 +3200,36 @@ mod tests {
 
     #[test]
     fn ticket_alias_validators_refresh_together_after_mutation() {
-        let revisions = Arc::new(Mutex::new(TicketRevisionState::default()));
+        let observations = Arc::new(Mutex::new(TicketObservationState::default()));
         let resolver = TicketItemResolver {
             tools: HashMap::new(),
             permissions: None,
             collection_route: "/tickets".into(),
-            revisions: Arc::clone(&revisions),
+            observations: Arc::clone(&observations),
         };
         let unobserved_internal = resolver.resolve("00001TICKET").unwrap().object.validator;
         record_ticket_observation(
-            &revisions,
+            &observations,
             Some("00001TICKET"),
             &json!({"ticket": "00001TICKET", "ok": true}),
             true,
         );
-        assert_ne!(
+        assert_eq!(
             unobserved_internal,
             resolver.resolve("00001TICKET").unwrap().object.validator,
-            "a first mutation through an internal-id route must stale that route"
+            "an unobserved route stays unvalidated after mutation"
         );
 
         record_ticket_observation(
-            &revisions,
+            &observations,
             Some("00001TICKET"),
-            &json!({"ticket": "T-42", "item_revision": "rev-1"}),
+            &json!({"ticket": "T-42", "content_digest": "rev-1"}),
             false,
         );
         let canonical_v1 = resolver.resolve("T-42").unwrap().object.validator;
         let internal_v1 = resolver.resolve("00001TICKET").unwrap().object.validator;
         record_ticket_observation(
-            &revisions,
+            &observations,
             Some("T-42"),
             &json!({"ticket": "T-42", "updated_at": "rev-2"}),
             true,
@@ -3247,13 +3245,42 @@ mod tests {
     }
 
     #[test]
+    fn ticket_observation_digest_is_content_based_and_repeated_mutations_only_invalidate() {
+        let observations = Arc::new(Mutex::new(TicketObservationState::default()));
+        let resolver = TicketItemResolver {
+            tools: HashMap::new(),
+            permissions: None,
+            collection_route: "/tickets".into(),
+            observations: Arc::clone(&observations),
+        };
+        let response = json!({"ticket": "T-42", "body": "actual content", "state": "planning"});
+        assert!(resolver.resolve("T-42").unwrap().object.validator.is_none());
+        record_ticket_observation(&observations, Some("T-42"), &response, false);
+        let observed = resolver.resolve("T-42").unwrap().object.validator;
+        assert!(observed.is_some());
+        record_ticket_observation(&observations, Some("T-42"), &response, false);
+        assert_eq!(resolver.resolve("T-42").unwrap().object.validator, observed);
+        for _ in 0..2 {
+            record_ticket_observation(
+                &observations,
+                Some("T-42"),
+                &json!({"operation_key": "same-replay"}),
+                true,
+            );
+            assert!(resolver.resolve("T-42").unwrap().object.validator.is_none());
+        }
+        record_ticket_observation(&observations, Some("T-42"), &response, false);
+        assert_eq!(resolver.resolve("T-42").unwrap().object.validator, observed);
+    }
+
+    #[test]
     fn related_ticket_mutations_invalidate_target_and_queue_observations() {
-        let revisions = Arc::new(Mutex::new(TicketRevisionState::default()));
+        let observations = Arc::new(Mutex::new(TicketObservationState::default()));
         for ticket in ["T-42", "T-43", "T-44"] {
             record_ticket_observation(
-                &revisions,
+                &observations,
                 Some(ticket),
-                &json!({"ticket": ticket, "item_revision": "rev-1"}),
+                &json!({"ticket": ticket, "content_digest": "rev-1"}),
                 false,
             );
         }
@@ -3261,12 +3288,12 @@ mod tests {
             tools: HashMap::new(),
             permissions: None,
             collection_route: "/tickets".into(),
-            revisions: Arc::clone(&revisions),
+            observations: Arc::clone(&observations),
         };
         let target_v1 = resolver.resolve("T-43").unwrap().object.validator;
         let queued_v1 = resolver.resolve("T-44").unwrap().object.validator;
         record_affected_ticket_mutations(
-            &revisions,
+            &observations,
             "T-42",
             &json!({
                 "ticket": "T-42",

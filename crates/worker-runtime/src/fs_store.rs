@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
+// Frozen source schemas: do not move their meaning when adding a migration.
+const AGGREGATE_SCHEMA_VERSION: u32 = 9;
 const PREVIOUS_SCHEMA_VERSION: u32 = 8;
 const LEGACY_SCHEMA_VERSION: u32 = 7;
 const OLDEST_SCHEMA_VERSION: u32 = 6;
@@ -609,8 +611,8 @@ fn plan_runtime_store_migration(
             format!("Runtime store schema version {schema_version} is out of range"),
         )
     })?;
-    let staging = migration_sibling(root, "schema-v9-staging")?;
-    let backup = migration_sibling(root, "pre-schema-v9-backup")?;
+    let staging = migration_sibling(root, "schema-v10-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v10-backup")?;
     if staging.exists() || backup.exists() {
         return Err(runtime_store_corrupt(
             root,
@@ -639,12 +641,15 @@ fn plan_runtime_store_migration(
     }
     if !matches!(
         current_schema_version,
-        OLDEST_SCHEMA_VERSION | LEGACY_SCHEMA_VERSION | PREVIOUS_SCHEMA_VERSION
+        OLDEST_SCHEMA_VERSION
+            | LEGACY_SCHEMA_VERSION
+            | PREVIOUS_SCHEMA_VERSION
+            | AGGREGATE_SCHEMA_VERSION
     ) {
         return Err(runtime_store_corrupt(
             &runtime_path,
             format!(
-                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
+                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
             ),
         ));
     }
@@ -969,11 +974,30 @@ fn validate_migrated_worker_documents(
 }
 
 fn migrate_worker_record(
-    identity_document: serde_json::Value,
+    mut identity_document: serde_json::Value,
     source_schema_version: u32,
     mapping: Option<&LegacyWorkerIdentityMapping>,
     identity_path: &Path,
 ) -> Result<WorkerAggregateRecord, RuntimeError> {
+    if source_schema_version == AGGREGATE_SCHEMA_VERSION {
+        migrate_v9_restore_guard(&mut identity_document, identity_path)?;
+        remove_legacy_job_input_counter(&mut identity_document);
+        migrate_legacy_request_evidence(&mut identity_document)
+            .map_err(|message| runtime_store_corrupt(identity_path, message.into()))?;
+        identity_document["schema_version"] = serde_json::Value::from(SCHEMA_VERSION);
+        let aggregate: WorkerAggregateRecord =
+            serde_json::from_value(identity_document).map_err(|error| {
+                runtime_store_corrupt(
+                    identity_path,
+                    format!("decode migrated schema-v9 Worker aggregate: {error}"),
+                )
+            })?;
+        aggregate.clone().validate(identity_path)?;
+        return Ok(aggregate);
+    }
+    remove_legacy_job_input_counter(&mut identity_document);
+    migrate_legacy_request_evidence(&mut identity_document)
+        .map_err(|message| runtime_store_corrupt(identity_path, message.into()))?;
     if source_schema_version == PREVIOUS_SCHEMA_VERSION {
         let identity: WorkerIdentityRecord =
             serde_json::from_value(identity_document).map_err(|error| {
@@ -984,8 +1008,18 @@ fn migrate_worker_record(
             })?;
         identity.validate_for_schema(identity_path, PREVIOUS_SCHEMA_VERSION)?;
         let execution_path = identity_path.with_file_name(WORKER_EXECUTION_FILE);
-        let execution: WorkerExecutionRecord =
+        let mut execution_document: serde_json::Value =
             read_bounded_json(&execution_path, "read schema-v8 Worker execution record")?;
+        remove_legacy_job_input_counter(&mut execution_document);
+        migrate_legacy_request_evidence(&mut execution_document)
+            .map_err(|message| runtime_store_corrupt(&execution_path, message.into()))?;
+        let execution: WorkerExecutionRecord =
+            serde_json::from_value(execution_document).map_err(|error| {
+                runtime_store_corrupt(
+                    &execution_path,
+                    format!("decode migrated schema-v8 execution: {error}"),
+                )
+            })?;
         execution.validate_for_schema(&identity, &execution_path, PREVIOUS_SCHEMA_VERSION)?;
         return Ok(WorkerAggregateRecord::from_v8(identity, execution));
     }
@@ -1014,6 +1048,114 @@ fn migrate_worker_record(
     identity.validate_for_schema(identity_path, PREVIOUS_SCHEMA_VERSION)?;
     execution.validate_for_schema(&identity, &execution_path, PREVIOUS_SCHEMA_VERSION)?;
     Ok(WorkerAggregateRecord::from_v8(identity, execution))
+}
+
+// Frozen schema-v9 conversion. Preserve the exact token and all Restore owners
+// and receipts; generating a fresh token here would lose retry/admission authority.
+fn migrate_v9_restore_guard(
+    document: &mut serde_json::Value,
+    path: &Path,
+) -> Result<(), RuntimeError> {
+    let Some(guard) = document.get_mut("restore_guard") else {
+        return Ok(());
+    };
+    let guard = guard.as_object_mut().ok_or_else(|| {
+        runtime_store_corrupt(path, "schema-v9 restore_guard must be an object".into())
+    })?;
+    let token = guard.remove("generation").ok_or_else(|| {
+        runtime_store_corrupt(path, "schema-v9 restore_guard is missing generation".into())
+    })?;
+    if !token.as_str().is_some_and(|token| !token.is_empty())
+        || guard.contains_key("observation_token")
+    {
+        return Err(runtime_store_corrupt(
+            path,
+            "schema-v9 Restore observation token is invalid or ambiguous".into(),
+        ));
+    }
+    guard.insert("observation_token".into(), token);
+    Ok(())
+}
+
+// Legacy Runtime Job bindings never held input JSON, so the old caller-selected
+// counter cannot become a content digest. Retain Job/attempt identity and leave
+// content identity unknown until the host supplies its immutable intent.
+fn remove_legacy_job_input_counter(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(job) = object
+                .get_mut("backend_job")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                job.remove("input_revision");
+            }
+            for value in object.values_mut() {
+                remove_legacy_job_input_counter(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                remove_legacy_job_input_counter(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+// Frozen schema 6..9 request migration. Preserve concrete source/config digests,
+// contents, operation ownership and fingerprints. Unknown legacy SSH key identity
+// stays empty and cannot pass the materializer's live-authority validation.
+fn migrate_legacy_request_evidence(value: &mut serde_json::Value) -> Result<(), &'static str> {
+    match value {
+        serde_json::Value::Object(object) => {
+            if object.contains_key("credential_id") && object.contains_key("credential_revision") {
+                let counter = object.remove("credential_revision").expect("checked field");
+                if !counter.as_u64().is_some_and(|value| value > 0) {
+                    return Err("invalid legacy SSH credential evidence");
+                }
+                object
+                    .entry("public_key_fingerprint")
+                    .or_insert_with(|| serde_json::json!(""));
+            }
+            if object.contains_key("host_trust_id") && object.contains_key("host_trust_revision") {
+                let counter = object.remove("host_trust_revision").expect("checked field");
+                if !counter.as_u64().is_some_and(|value| value > 0) {
+                    return Err("invalid legacy SSH host trust evidence");
+                }
+                object
+                    .entry("host_key_fingerprint")
+                    .or_insert_with(|| serde_json::json!(""));
+            }
+            if let Some(settings) = object
+                .get_mut("memory_settings")
+                .and_then(serde_json::Value::as_object_mut)
+                && let Some(counter) = settings.remove("settings_revision")
+                && !counter.as_u64().is_some_and(|value| value > 0)
+            {
+                return Err("invalid legacy Memory settings evidence");
+            }
+            if object.contains_key("source_fingerprint") {
+                object.remove("source_revision");
+            }
+            if object.contains_key("config_projection_digest") {
+                object.remove("config_revision");
+            }
+            if object.contains_key("resource_id") && object.contains_key("nonce") {
+                object.remove("revision");
+                object.remove("generation");
+            }
+            for value in object.values_mut() {
+                migrate_legacy_request_evidence(value)?;
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                migrate_legacy_request_evidence(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn runtime_worker_name(worker_id: WorkerId) -> String {
@@ -1216,6 +1358,9 @@ fn migrate_runtime_document(
         serde_json::Value::from(SCHEMA_VERSION),
     );
     object.remove("workers");
+    // This legacy cache is not Runtime lifecycle or restore authority. Bundles
+    // are reacquired from Workspace content authority, never renumbered/rehash-pinned here.
+    object.remove("config_bundles");
     object.remove("next_worker_sequence");
     let snapshot: RuntimeSnapshot = serde_json::from_value(document.clone()).map_err(|error| {
         runtime_store_corrupt(
@@ -1325,8 +1470,14 @@ fn remove_runtime_migration_directory(path: &Path) -> Result<(), RuntimeError> {
 }
 
 fn recover_runtime_store_migration(root: &Path) -> Result<(), RuntimeError> {
-    let staging = migration_sibling(root, "schema-v9-staging")?;
-    let backup = migration_sibling(root, "pre-schema-v9-backup")?;
+    for suffix in ["schema-v9-staging", "pre-schema-v9-backup"] {
+        let earlier = migration_sibling(root, suffix)?;
+        if earlier.exists() {
+            return Err(runtime_store_corrupt(root, "unfinished schema-v9 migration requires explicit recovery before schema-v10 startup".into()));
+        }
+    }
+    let staging = migration_sibling(root, "schema-v10-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v10-backup")?;
     let root_exists = migration_directory_exists(root)?;
     let staging_exists = migration_directory_exists(&staging)?;
     let backup_exists = migration_directory_exists(&backup)?;
@@ -1528,8 +1679,8 @@ fn migrate_runtime_store(
     if !plan.migration_required {
         return Ok(plan);
     }
-    let staging = migration_sibling(root, "schema-v9-staging")?;
-    let backup = migration_sibling(root, "pre-schema-v9-backup")?;
+    let staging = migration_sibling(root, "schema-v10-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v10-backup")?;
     if staging.exists() || backup.exists() {
         return Err(runtime_store_corrupt(
             root,
@@ -2875,7 +3026,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime-store");
         write_empty_schema_v8_store(&root);
-        let staging = migration_sibling(&root, "schema-v9-staging").unwrap();
+        let staging = migration_sibling(&root, "schema-v10-staging").unwrap();
         fs::create_dir_all(&staging).unwrap();
         fs::write(staging.join("partial"), b"partial").unwrap();
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
@@ -2890,7 +3041,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime-store");
         write_empty_schema_v8_store(&root);
-        let backup = migration_sibling(&root, "pre-schema-v9-backup").unwrap();
+        let backup = migration_sibling(&root, "pre-schema-v10-backup").unwrap();
         fs::rename(&root, &backup).unwrap();
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
 
@@ -2904,10 +3055,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime-store");
         write_empty_schema_v8_store(&root);
-        let staging = migration_sibling(&root, "schema-v9-staging").unwrap();
+        let staging = migration_sibling(&root, "schema-v10-staging").unwrap();
         copy_runtime_tree(&root, &root, &staging).unwrap();
         migrate_runtime_store_in_place(&staging, "test-runtime").unwrap();
-        let backup = migration_sibling(&root, "pre-schema-v9-backup").unwrap();
+        let backup = migration_sibling(&root, "pre-schema-v10-backup").unwrap();
         fs::rename(&root, &backup).unwrap();
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
 
@@ -2922,10 +3073,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime-store");
         write_empty_schema_v8_store(&root);
-        let staging = migration_sibling(&root, "schema-v9-staging").unwrap();
+        let staging = migration_sibling(&root, "schema-v10-staging").unwrap();
         fs::create_dir_all(&staging).unwrap();
         fs::write(staging.join(RUNTIME_FILE), b"{\"schema_version\":8}").unwrap();
-        let backup = migration_sibling(&root, "pre-schema-v9-backup").unwrap();
+        let backup = migration_sibling(&root, "pre-schema-v10-backup").unwrap();
         fs::rename(&root, &backup).unwrap();
 
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
@@ -2942,12 +3093,126 @@ mod tests {
         let root = temp.path().join("runtime-store");
         write_empty_schema_v8_store(&root);
         migrate_runtime_store_in_place(&root, "test-runtime").unwrap();
-        let backup = migration_sibling(&root, "pre-schema-v9-backup").unwrap();
+        let backup = migration_sibling(&root, "pre-schema-v10-backup").unwrap();
         write_empty_schema_v8_store(&backup);
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
 
         store.store.load_runtime_state().unwrap();
         assert!(!backup.exists());
+    }
+
+    #[test]
+    fn earlier_migration_backup_cannot_be_mistaken_for_a_fresh_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runtime-store");
+        let backup = migration_sibling(&root, "pre-schema-v9-backup").unwrap();
+        write_empty_schema_v8_store(&backup);
+        let error = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap_err();
+        assert!(error.to_string().contains("explicit recovery"));
+        assert!(!root.exists());
+        assert!(backup.join(RUNTIME_FILE).exists());
+    }
+
+    #[test]
+    fn legacy_request_migration_preserves_content_and_never_invents_key_identity() {
+        let mut document = serde_json::json!({"request": {
+            "memory_settings": {"workspace_id":"workspace-a", "language":"English", "settings_revision":2},
+            "repository": {"source_revision":1, "source_fingerprint":"source-content"},
+            "materialization": {"operation_id":"op-a", "config_revision":2, "config_projection_digest":"projection-content", "ssh": {
+                "host_trust_id":"host-a", "host_trust_revision":3,
+                "credential_candidates":[{"credential_id":"credential-a", "credential_revision":4}]
+            }}
+        }});
+        migrate_legacy_request_evidence(&mut document).unwrap();
+        let request = &document["request"];
+        assert_eq!(request["memory_settings"]["language"], "English");
+        assert!(
+            request["memory_settings"]
+                .get("settings_revision")
+                .is_none()
+        );
+        assert_eq!(
+            request["repository"]["source_fingerprint"],
+            "source-content"
+        );
+        assert_eq!(
+            request["materialization"]["config_projection_digest"],
+            "projection-content"
+        );
+        assert_eq!(
+            request["materialization"]["ssh"]["host_key_fingerprint"],
+            ""
+        );
+        assert_eq!(
+            request["materialization"]["ssh"]["credential_candidates"][0]["public_key_fingerprint"],
+            ""
+        );
+    }
+
+    #[test]
+    fn schema_v9_restore_token_migrates_durably_without_rotating_admission_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runtime-store");
+        write_empty_schema_v8_store(&root);
+        let runtime_path = root.join(RUNTIME_FILE);
+        let mut runtime: serde_json::Value = read_json(&runtime_path, "read test Runtime").unwrap();
+        runtime["schema_version"] = serde_json::json!(AGGREGATE_SCHEMA_VERSION);
+        fs::write(&runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+        let worker_id = WorkerId::now_v7();
+        let path = root
+            .join(WORKERS_DIR)
+            .join(worker_id.to_string())
+            .join(WORKER_FILE);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let aggregate = migrate_worker_record(
+            schema_v7_worker_document(worker_id),
+            LEGACY_SCHEMA_VERSION,
+            None,
+            &path,
+        )
+        .unwrap();
+        let mut legacy = serde_json::to_value(&aggregate).unwrap();
+        let token = legacy["restore_guard"]["observation_token"].take();
+        legacy["restore_guard"]
+            .as_object_mut()
+            .unwrap()
+            .remove("observation_token");
+        legacy["restore_guard"]["generation"] = token.clone();
+        legacy["schema_version"] = serde_json::json!(AGGREGATE_SCHEMA_VERSION);
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
+        store.store.load_runtime_state().unwrap();
+        drop(store);
+        let migrated: serde_json::Value = read_json(&path, "read migrated Worker").unwrap();
+        assert_eq!(migrated["schema_version"], SCHEMA_VERSION);
+        assert_eq!(migrated["restore_guard"]["observation_token"], token);
+        assert!(migrated["restore_guard"].get("generation").is_none());
+        let store = FsRuntimeStore::open_or_create(root, "test-runtime").unwrap();
+        store.store.load_runtime_state().unwrap();
+        assert_eq!(
+            read_json::<serde_json::Value>(&path, "read restarted Worker").unwrap(),
+            migrated
+        );
+    }
+
+    #[test]
+    fn frozen_restore_guard_conversion_preserves_receipts_and_rejects_ambiguous_identity() {
+        let path = Path::new("worker.json");
+        let mut document = serde_json::json!({"restore_guard": {
+            "generation": "opaque-admission-token", "active_request_id": "restore-a",
+            "owners": {"restore-a": {"fingerprint": "intent", "receipt": {"accepted": true}}}
+        }});
+        let owners = document["restore_guard"]["owners"].clone();
+        migrate_v9_restore_guard(&mut document, path).unwrap();
+        assert_eq!(document["restore_guard"]["owners"], owners);
+        assert_eq!(document["restore_guard"]["active_request_id"], "restore-a");
+        assert_eq!(
+            document["restore_guard"]["observation_token"],
+            "opaque-admission-token"
+        );
+        let mut ambiguous =
+            serde_json::json!({"restore_guard": {"generation": "old", "observation_token": "new"}});
+        assert!(migrate_v9_restore_guard(&mut ambiguous, path).is_err());
     }
 
     #[test]
@@ -3047,7 +3312,7 @@ mod tests {
         ));
         assert!(!worker_dir.join(WORKER_EXECUTION_FILE).exists());
         let aggregate: WorkerAggregateRecord =
-            read_bounded_json(&identity_path, "read schema-v9 aggregate").unwrap();
+            read_bounded_json(&identity_path, "read schema-v10 aggregate").unwrap();
         assert_eq!(aggregate.schema_version, SCHEMA_VERSION);
     }
 

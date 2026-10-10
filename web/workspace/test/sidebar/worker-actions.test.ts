@@ -138,7 +138,7 @@ Deno.test("sidebar Delete executes the authoritative runtime cleanup plan", asyn
         workspace_id: "team",
         runtime_id: worker.runtime_id,
         generated_at: "2026-01-01T00:00:00Z",
-        revision: "7",
+
         digest: "digest-7",
         workers: [{
           target_id: "worker-target",
@@ -171,7 +171,7 @@ Deno.test("sidebar Delete executes the authoritative runtime cleanup plan", asyn
         workspace_id: "team",
         runtime_id: worker.runtime_id,
         generated_at: "2026-01-01T00:00:01Z",
-        revision: "8",
+
         digest: "digest-8",
         workers: [],
         workdirs: [],
@@ -189,7 +189,7 @@ Deno.test("sidebar Delete executes the authoritative runtime cleanup plan", asyn
   ]);
   assertEquals(requests[1]?.init?.method, "POST");
   assertEquals(JSON.parse(String(requests[1]?.init?.body)), {
-    expected_plan_revision: "7",
+
     expected_plan_digest: "digest-7",
     worker_target_ids: ["worker-target"],
     workdir_target_ids: [],
@@ -204,7 +204,7 @@ Deno.test("sidebar Delete reports cleanup-plan blocking reasons", async () => {
         workspace_id: "team",
         runtime_id: worker.runtime_id,
         generated_at: "2026-01-01T00:00:00Z",
-        revision: "8",
+
         digest: "digest-8",
         workers: [{
           target_id: "worker-target",

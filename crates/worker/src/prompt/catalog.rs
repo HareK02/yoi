@@ -30,7 +30,7 @@ const BUILTIN_TOOLCHAIN_FINGERPRINT: &str = "builtin:prompts:decodal-0.4";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectivePromptCatalog {
     pub templates: BTreeMap<String, String>,
-    pub config_revision: u64,
+
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_digest: String,
     pub schema_fingerprint: String,
@@ -41,7 +41,7 @@ pub struct EffectivePromptCatalog {
 impl EffectivePromptCatalog {
     pub fn new(
         templates: BTreeMap<String, String>,
-        config_revision: u64,
+
         schema_fingerprint: impl Into<String>,
         toolchain_fingerprint: impl Into<String>,
     ) -> Result<Self, CatalogError> {
@@ -49,7 +49,7 @@ impl EffectivePromptCatalog {
         let catalog_digest = catalog_digest(&templates)?;
         Ok(Self {
             templates,
-            config_revision,
+
             source_digest: String::new(),
             schema_fingerprint: schema_fingerprint.into(),
             toolchain_fingerprint: toolchain_fingerprint.into(),
@@ -59,7 +59,7 @@ impl EffectivePromptCatalog {
 
     pub fn from_projection(
         prompts: &serde_json::Value,
-        config_revision: u64,
+
         schema_fingerprint: impl Into<String>,
         toolchain_fingerprint: impl Into<String>,
     ) -> Result<Self, CatalogError> {
@@ -68,12 +68,7 @@ impl EffectivePromptCatalog {
         if let Some(default_prompt) = templates.remove("default_prompt") {
             templates.insert("default".to_string(), default_prompt);
         }
-        Self::new(
-            templates,
-            config_revision,
-            schema_fingerprint,
-            toolchain_fingerprint,
-        )
+        Self::new(templates, schema_fingerprint, toolchain_fingerprint)
     }
 
     pub fn verify_digest(&self) -> Result<(), CatalogError> {
@@ -279,7 +274,7 @@ pub enum CatalogError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspacePromptProjection {
     pub workspace_id: String,
-    pub config_revision: u64,
+
     pub source_digest: String,
     pub projection_digest: String,
     pub schema_fingerprint: String,
@@ -325,7 +320,7 @@ impl WorkspacePromptProjection {
         }
         Ok(Self {
             workspace_id,
-            config_revision: catalog.config_revision,
+
             source_digest,
             projection_digest,
             schema_fingerprint: catalog.schema_fingerprint.clone(),
@@ -345,8 +340,7 @@ impl WorkspacePromptProjection {
             self.projection_digest.clone(),
             self.catalog.clone(),
         )?;
-        if rebuilt.config_revision != self.config_revision
-            || rebuilt.schema_fingerprint != self.schema_fingerprint
+        if rebuilt.schema_fingerprint != self.schema_fingerprint
             || rebuilt.toolchain_fingerprint != self.toolchain_fingerprint
         {
             return Err(CatalogError::InvalidTemplateCatalog(
@@ -365,7 +359,6 @@ pub struct PromptCatalog {
 impl std::fmt::Debug for PromptCatalog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PromptCatalog")
-            .field("config_revision", &self.projection.config_revision)
             .field("catalog_digest", &self.projection.catalog_digest)
             .finish_non_exhaustive()
     }
@@ -376,7 +369,6 @@ impl PromptCatalog {
         let templates = builtin_prompt_templates()?;
         let projection = EffectivePromptCatalog::new(
             templates,
-            0,
             BUILTIN_TOOLCHAIN_FINGERPRINT,
             BUILTIN_TOOLCHAIN_FINGERPRINT,
         )?;
@@ -580,7 +572,7 @@ pub fn prompt_schema_source() -> Result<String, CatalogError> {
 pub fn builtin_prompt_templates() -> Result<BTreeMap<String, String>, CatalogError> {
     let mut entries = Vec::new();
     collect_builtin_entries(&BUILTIN_PROMPT_SOURCES, "", &mut entries)?;
-    let snapshot = ConfigTreeSnapshot::from_entries(0, entries)
+    let snapshot = ConfigTreeSnapshot::from_entries(entries)
         .map_err(|error| CatalogError::BuiltinTree(error.to_string()))?;
     let entry = VirtualPath::parse(BUILTIN_CATALOG_ENTRY)
         .map_err(|error| CatalogError::BuiltinTree(error.to_string()))?;
@@ -825,7 +817,7 @@ mod tests {
         assert!(common.contains("normal non-force push"));
         assert!(common.contains("Moving only the target ref does not invalidate approval"));
         assert!(common.contains("take precedence over stale Memory"));
-        assert!(coder.contains("Never invent an add-revision operation"));
+        assert!(coder.contains("Never invent an operation to append another source candidate"));
         assert!(orchestrator.contains("Target-only movement preserves source approval"));
         assert!(reviewer.contains("target-only movement does not invalidate approval"));
     }
@@ -913,7 +905,7 @@ mod tests {
             ("first".to_string(), "FIRST".to_string()),
             ("second".to_string(), "SECOND".to_string()),
         ]);
-        let projection = EffectivePromptCatalog::new(templates, 42, "schema", "toolchain").unwrap();
+        let projection = EffectivePromptCatalog::new(templates, "schema", "toolchain").unwrap();
         projection.verify_digest().unwrap();
         let mut tampered = projection.clone();
         tampered
@@ -929,7 +921,6 @@ mod tests {
     fn workspace_prompt_projection_round_trips_and_rejects_tampered_metadata() {
         let catalog = EffectivePromptCatalog::new(
             BTreeMap::from([("default".to_string(), "PROMPT".to_string())]),
-            8,
             "schema",
             "toolchain",
         )
@@ -947,7 +938,7 @@ mod tests {
         restored.validate().unwrap();
 
         let mut tampered = restored;
-        tampered.config_revision += 1;
+        tampered.schema_fingerprint = "tampered-schema".into();
         assert!(tampered.validate().is_err());
     }
 
@@ -955,11 +946,14 @@ mod tests {
     fn catalog_source_preserves_workspace_projection_for_subworkers() {
         let templates = BTreeMap::from([("template".to_string(), "OVERRIDE".to_string())]);
         let catalog = PromptCatalog::from_projection(
-            EffectivePromptCatalog::new(templates, 9, "schema", "toolchain").unwrap(),
+            EffectivePromptCatalog::new(templates, "schema", "toolchain").unwrap(),
         )
         .unwrap();
         let child = PromptCatalog::load(&catalog.source()).unwrap();
-        assert_eq!(child.projection.config_revision, 9);
+        assert_eq!(
+            child.projection.catalog_digest,
+            catalog.projection.catalog_digest
+        );
         assert_eq!(child.projection.templates["template"], "OVERRIDE");
     }
 

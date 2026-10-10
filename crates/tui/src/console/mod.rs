@@ -2625,7 +2625,6 @@ mod tests {
         let mut app = App::new("test".into());
         app.handle_worker_event(Event::PendingSubmissionsChanged {
             pending: protocol::PendingSubmissionsSnapshot {
-                revision: 2,
                 notification_count: 0,
                 notification_previews: vec![],
                 head_id: Some("submission-1".into()),
@@ -2646,7 +2645,6 @@ mod tests {
         assert!(matches!(
             continue_next,
             Some(Method::ContinuePending {
-                expected_revision: 2,
                 ref expected_head_id,
             }) if expected_head_id == "submission-1"
         ));
@@ -2659,7 +2657,6 @@ mod tests {
         assert!(matches!(
             cancel,
             Some(Method::CancelPendingSubmission {
-                expected_revision: 2,
                 ref submission_id,
             }) if submission_id == "submission-1"
         ));
@@ -2671,8 +2668,8 @@ mod tests {
         assert!(matches!(
             clear,
             Some(Method::ClearPendingSubmissions {
-                expected_revision: 2
-            })
+                ref expected_submission_ids
+            }) if expected_submission_ids == &["submission-1"]
         ));
         assert_eq!(app.queued_input_count(), 1);
     }
@@ -2682,7 +2679,6 @@ mod tests {
         let mut app = App::new("test".into());
         app.handle_worker_event(Event::PendingSubmissionsChanged {
             pending: protocol::PendingSubmissionsSnapshot {
-                revision: 2,
                 notification_count: 0,
                 notification_previews: vec![],
                 head_id: Some("submission-1".into()),
@@ -3355,7 +3351,6 @@ mod tests {
                 parent_session_id: Some("parent-session".into()),
                 kind: protocol::InternalWorkerKind::SubWorker,
             },
-            revision: 1,
             event: Box::new(Event::WorkerState {
                 snapshot: WorkerStatus::Running.into(),
             }),
@@ -3471,7 +3466,6 @@ mod tests {
                 parent_session_id: Some("parent-session".into()),
                 kind: protocol::InternalWorkerKind::SubWorker,
             },
-            revision: 1,
             event: Box::new(Event::WorkerState {
                 snapshot: WorkerStatus::Running.into(),
             }),
@@ -3497,7 +3491,6 @@ mod tests {
                 parent_session_id: Some("parent-session".into()),
                 kind: protocol::InternalWorkerKind::SubWorker,
             },
-            revision: 1,
             event: Box::new(Event::WorkerState {
                 snapshot: WorkerStatus::Running.into(),
             }),
@@ -3537,7 +3530,6 @@ mod tests {
                 parent_session_id: Some("parent-session".into()),
                 kind: protocol::InternalWorkerKind::SubWorker,
             },
-            revision: 1,
             event: Box::new(Event::WorkerState {
                 snapshot: WorkerStatus::Running.into(),
             }),

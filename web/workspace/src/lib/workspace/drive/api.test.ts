@@ -44,13 +44,13 @@ Deno.test("Drive metadata rejects cross-workspace refs and unsafe latest links",
   const good = entry();
   const parsed = parseDriveEntry(good, "alpha");
   equal(parsed.entry, good.entry);
-  equal(parsed.revision, good.revision);
+  equal(parsed.last_mutation_id, good.last_mutation_id);
   equal(parsed.latest_url, good.latest_url);
   for (
     const patch of [
       { entry: ref("2", "beta") },
       { parent: ref("1", "beta") },
-      { revision: 4 },
+      { last_mutation_id: 4 },
       { kind: "directory" },
       { size: -1 },
       { size: DRIVE_FILE_MAX_BYTES + 1 },
@@ -200,7 +200,7 @@ Deno.test("Drive client uses current routes with same-origin authentication and 
   assert(called);
   equal(
     driveDownloadUrl("alpha", ref("9007199254740993"), "9007199254740995"),
-    "/api/w/alpha/drive/download?entry_workspace_id=alpha&id=9007199254740993&expected_revision=9007199254740995",
+    "/api/w/alpha/drive/download?entry_workspace_id=alpha&id=9007199254740993&expected_mutation_id=9007199254740995",
   );
 });
 Deno.test("Drive upload over 16 MiB is rejected before fetching", async () => {
@@ -244,7 +244,7 @@ Deno.test("Drive mutation network abort or malformed reply remains unknown after
         client.mutate("alpha", "req", {
           operation: "delete",
           id: ref(),
-          expected_revision: "9007199254740993",
+          expected_mutation_id: "9007199254740993",
         }),
       (error) => {
         assert(error instanceof DriveRequestError);
@@ -268,7 +268,7 @@ Deno.test("Drive typed conflict proves not committed and read responses cannot t
       client.mutate("alpha", "req", {
         operation: "delete",
         id: ref(),
-        expected_revision: "1",
+        expected_mutation_id: "1",
       }),
     (error) => {
       assert(error instanceof DriveRequestError);
@@ -285,7 +285,10 @@ Deno.test("Drive typed conflict proves not committed and read responses cannot t
 Deno.test("Drive image preview fetches authenticated bounded binary rather than metadata URL", async () => {
   const image = { ...entry(), content_type: "image/png" };
   const client = createDriveClient((url, init) => {
-    equal(String(url), driveDownloadUrl("alpha", ref(), image.revision));
+    equal(
+      String(url),
+      driveDownloadUrl("alpha", ref(), image.last_mutation_id),
+    );
     equal((init as RequestInit | undefined)?.credentials, "same-origin");
     equal((init as RequestInit | undefined)?.cache, "no-store");
     return Promise.resolve(new Response(new Uint8Array([0, 1, 2])));
@@ -310,7 +313,7 @@ Deno.test("Drive malformed mutation response target parent name or operation kin
       mutation: {
         operation: "update_text",
         id: ref(),
-        expected_revision: "1",
+        expected_mutation_id: "1",
         text: "abc",
         content_type: "text/plain",
       },
@@ -320,7 +323,7 @@ Deno.test("Drive malformed mutation response target parent name or operation kin
       mutation: {
         operation: "update_text",
         id: ref(),
-        expected_revision: "1",
+        expected_mutation_id: "1",
         text: "abc",
         content_type: "text/plain",
       },
@@ -330,7 +333,7 @@ Deno.test("Drive malformed mutation response target parent name or operation kin
       mutation: {
         operation: "relocate",
         id: ref(),
-        expected_revision: "1",
+        expected_mutation_id: "1",
         parent: ref("4"),
         name: "moved.txt",
       },
@@ -340,7 +343,7 @@ Deno.test("Drive malformed mutation response target parent name or operation kin
       mutation: {
         operation: "relocate",
         id: ref(),
-        expected_revision: "1",
+        expected_mutation_id: "1",
         parent: ref("4"),
         name: "moved.txt",
       },
@@ -350,7 +353,7 @@ Deno.test("Drive malformed mutation response target parent name or operation kin
       mutation: {
         operation: "relocate",
         id: ref(),
-        expected_revision: "1",
+        expected_mutation_id: "1",
         parent: ref("4"),
         name: "moved.txt",
       },
@@ -392,14 +395,14 @@ Deno.test("Drive malformed mutation response target parent name or operation kin
       mutation: {
         operation: "update_text",
         id: ref(),
-        expected_revision: "1",
+        expected_mutation_id: "1",
         text: "abc",
         content_type: "text/plain",
       },
       response: null,
     },
     {
-      mutation: { operation: "delete", id: ref(), expected_revision: "1" },
+      mutation: { operation: "delete", id: ref(), expected_mutation_id: "1" },
       response: entry(),
     },
   ];
@@ -422,7 +425,7 @@ Deno.test("Drive malformed upload update and create identity remains unknown aft
       target: {
         operation: "update",
         id: ref(),
-        expected_revision: "1",
+        expected_mutation_id: "1",
         content_type: "text/plain",
       },
       response: entry("3"),
@@ -431,7 +434,7 @@ Deno.test("Drive malformed upload update and create identity remains unknown aft
       target: {
         operation: "update",
         id: ref(),
-        expected_revision: "1",
+        expected_mutation_id: "1",
         content_type: "text/plain",
       },
       response: entry("2", "alpha", "2", "folder"),
@@ -467,7 +470,7 @@ Deno.test("Drive malformed upload update and create identity remains unknown aft
       target: {
         operation: "update",
         id: ref(),
-        expected_revision: "1",
+        expected_mutation_id: "1",
         content_type: "text/plain",
       },
       response: null,
@@ -507,4 +510,23 @@ Deno.test("Drive bounded text roundtrip accepts worst-case JSON escaping without
     "valid 64 KiB UTF-8 text must survive JSON escapes",
   );
   equal(result.entry.size, 64 * 1024);
+});
+
+Deno.test("Drive committed request identity remains UTF-8 and URL encoded rather than numeric", () => {
+  const id = 'write/資料 ?"#&=+';
+  const value = { ...entry(), last_mutation_id: id };
+  equal(parseDriveEntry(value, "alpha").last_mutation_id, id);
+  const url = new URL(
+    driveDownloadUrl("alpha", value.entry, id),
+    "https://example.test",
+  );
+  equal(url.searchParams.get("expected_mutation_id"), id);
+  equal(url.searchParams.size, 3);
+  equal(url.hash, "");
+  for (
+    const bad of ["", "\nrequest", "\x7f", "é".repeat(65), "x".repeat(129)]
+  ) {
+    throws(() => parseDriveEntry({ ...value, last_mutation_id: bad }, "alpha"));
+    throws(() => driveDownloadUrl("alpha", value.entry, bad));
+  }
 });

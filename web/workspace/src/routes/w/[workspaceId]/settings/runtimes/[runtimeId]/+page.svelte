@@ -25,6 +25,7 @@
   let showPublicKey = $state(false);
   let revealedPublicKey = $state<string | null>(null);
   let publicKey = $state('');
+  let workspaceTrustId = $state('');
   let displayName = $state('');
   let endpoint = $state('');
   let editingMetadata = $state(false);
@@ -49,6 +50,7 @@
     showPublicKey = false;
     revealedPublicKey = null;
     publicKey = '';
+    workspaceTrustId = '';
     displayName = data.runtimeDetail?.runtime.label ?? '';
     endpoint = data.runtimeDetail?.endpoint ?? '';
     editingMetadata = false;
@@ -201,12 +203,14 @@
           identity_id: operation.runtimeId,
           public_key: key,
         },
+        workspace_trust_id: workspaceTrustId,
         display_name: data.runtimeDetail.runtime.label,
         endpoint: data.runtimeDetail.endpoint,
-        expected_revision: binding.revision,
+        expected_binding_id: binding.binding_id,
       });
       if (!isCurrentRoute(operation)) return;
       publicKey = '';
+      workspaceTrustId = '';
       showPublicKey = false;
       revealedPublicKey = null;
       successMessage = action === 'create'
@@ -233,7 +237,7 @@
   async function revokeTrust(): Promise<void> {
     if (busyAction !== null || !data.runtimeDetail) return;
     const trust = data.runtimeDetail.trust_key;
-    if (trust.revision == null || trust.status !== 'active') {
+    if (trust.binding_id == null || trust.status !== 'active') {
       requestError = 'Only active Workspace trust can be revoked.';
       return;
     }
@@ -248,7 +252,7 @@
     const operation = routeFence.capture(data.runtimeId);
     busyAction = 'revoke';
     const request: RevokeRuntimeTrustKeyRequest = {
-      expected_revision: trust.revision,
+      expected_binding_id: trust.binding_id,
     };
 
     try {
@@ -289,8 +293,8 @@
 
     const routeOperation = routeFence.capture(data.runtimeId);
     const trust = data.runtimeDetail.trust_key;
-    if (trust.revision == null) {
-      deleteRuntimeError = 'The authoritative Runtime binding revision is unavailable. Reload before removal.';
+    if (trust.binding_id == null) {
+      deleteRuntimeError = 'The authoritative Runtime binding identity is unavailable. Reload before removal.';
       return;
     }
     const operationId = runtimeRemovalAttempt.operationId();
@@ -302,7 +306,7 @@
         routeOperation.runtimeId,
         {
           operation_id: operationId,
-          expected_binding_revision: trust.revision,
+          expected_binding_id: trust.binding_id,
         },
       );
       if (!isCurrentRoute(routeOperation)) return;
@@ -405,11 +409,9 @@
         <div><dt>Connection state</dt><dd>{runtime.management.binding?.connection_state ?? 'Not configured'}</dd></div>
         <div><dt>Workspace signing key</dt><dd><code>{runtime.management.binding?.workspace_key_id ?? '—'}</code></dd></div>
         <div><dt>Verified</dt><dd>{formatTimestamp(runtime.management.binding?.verification?.verified_at)}</dd></div>
-        <div><dt>Verified binding revision</dt><dd>{runtime.management.binding?.verification?.binding_revision?.toString() ?? '—'}</dd></div>
         <div><dt>Last verification check</dt><dd>{runtime.management.binding?.verification?.last_outcome ?? '—'} · {formatTimestamp(runtime.management.binding?.verification?.last_checked_at)}</dd></div>
         <div><dt>Runtime key status</dt><dd>{trust.status}</dd></div>
         <div><dt>Fingerprint</dt><dd><code>{trust.fingerprint ?? '—'}</code></dd></div>
-        <div><dt>Revision</dt><dd>{trust.revision?.toString() ?? '—'}</dd></div>
         <div><dt>Created</dt><dd>{formatTimestamp(trust.created_at)}</dd></div>
         <div><dt>Updated</dt><dd>{formatTimestamp(trust.updated_at)}</dd></div>
         <div><dt>Revoked</dt><dd>{formatTimestamp(trust.revoked_at)}</dd></div>
@@ -503,6 +505,15 @@
           </div>
         {:else}
           <form class="runtime-trust-form" onsubmit={saveTrustKey}>
+          <label for="runtime-workspace-trust-id-input">Workspace trust ID</label>
+          <input
+            id="runtime-workspace-trust-id-input"
+            bind:value={workspaceTrustId}
+            required
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <p>Copy the Runtime-issued <code>workspace_trust_id</code> from <code>trust-workspace add/show</code> for the current enrollment. Do not use a key fingerprint or a revoked enrollment ID.</p>
           <label for="runtime-public-key-input">Runtime public key</label>
           <textarea
             id="runtime-public-key-input"
@@ -570,13 +581,12 @@
         <div class="runtime-audit-table-wrap">
           <table class="runtime-audit-table">
             <thead>
-              <tr><th>Action</th><th>Revision</th><th>Fingerprint</th><th>Actor</th><th>Time</th></tr>
+              <tr><th>Action</th><th>Fingerprint</th><th>Actor</th><th>Time</th></tr>
             </thead>
             <tbody>
               {#each detail.recent_audit as entry}
                 <tr>
                   <td>{entry.action}</td>
-                  <td>{entry.revision.toString()}</td>
                   <td><code>{entry.new_fingerprint ?? entry.old_fingerprint ?? '—'}</code></td>
                   <td><code>{entry.actor_account_id}</code></td>
                   <td>{formatTimestamp(entry.at)}</td>

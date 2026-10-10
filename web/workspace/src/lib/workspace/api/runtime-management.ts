@@ -27,16 +27,20 @@ import type {
 } from "#lib/generated/runtime-api.ts";
 import { workspaceApiPath } from "./http.ts";
 
-export type WorkspaceRuntimeList = Omit<WorkspaceRuntimeListResponse, "diagnostics"> & {
-  diagnostics: Diagnostic[];
-};
-export type ValidatedWorkspaceRuntimeDetail = Omit<
-  WorkspaceRuntimeDetail,
-  "recent_audit"
-> & {
-  recent_audit: RuntimeTrustAuditEntry[];
-};
-export type RuntimeTrustConflictKind = "stale_revision" | "fingerprint_in_use";
+export type WorkspaceRuntimeList =
+  & Omit<WorkspaceRuntimeListResponse, "diagnostics">
+  & {
+    diagnostics: Diagnostic[];
+  };
+export type ValidatedWorkspaceRuntimeDetail =
+  & Omit<
+    WorkspaceRuntimeDetail,
+    "recent_audit"
+  >
+  & {
+    recent_audit: RuntimeTrustAuditEntry[];
+  };
+export type RuntimeTrustConflictKind = "stale_binding" | "fingerprint_in_use";
 export type RuntimeTrustConflictResponse = RuntimeManagementApiError & {
   error: RuntimeTrustConflictKind;
 };
@@ -83,7 +87,7 @@ const AUDIT_ACTIONS = new Set<RuntimeTrustAuditAction>([
   "revoked",
 ]);
 const CONFLICT_KINDS = new Set<RuntimeTrustConflictKind>([
-  "stale_revision",
+  "stale_binding",
   "fingerprint_in_use",
 ]);
 const BINDING_STATES = new Set<WorkspaceRuntimeBindingState>([
@@ -226,8 +230,8 @@ function safeInteger(value: unknown, path: string, minimum = 0): number {
   return value;
 }
 
-function safeRevision(value: unknown, path: string): number {
-  return safeInteger(value, path, 1);
+function boundedIdentity(value: unknown, path: string): string {
+  return boundedString(value, path, LIMITS.idBytes);
 }
 
 function optionalNullableString(
@@ -240,20 +244,20 @@ function optionalNullableString(
   return boundedString(value, path, maxBytes, allowEmpty);
 }
 
-function optionalRevision(
+function optionalIdentity(
   value: unknown,
   path: string,
-): number | undefined {
+): string | undefined {
   if (value === undefined || value === null) return undefined;
-  return safeRevision(value, path);
+  return boundedIdentity(value, path);
 }
 
-function optionalNullableRevision(
+function optionalNullableIdentity(
   value: unknown,
   path: string,
-): number | null | undefined {
+): string | null | undefined {
   if (value === undefined || value === null) return value;
-  return safeRevision(value, path);
+  return boundedIdentity(value, path);
 }
 
 function timestamp(value: unknown, path: string): string {
@@ -333,12 +337,11 @@ function runtimeVerification(
       "verified_at",
       "last_checked_at",
       "last_outcome",
-      "binding_revision",
+      "binding_id",
       "workspace_key_id",
-      "workspace_identity_revision",
-      "workspace_trust_generation",
+      "workspace_public_key_fingerprint",
+      "workspace_trust_id",
       "runtime_public_key_fingerprint",
-      "runtime_identity_revision",
     ],
     [],
     path,
@@ -366,31 +369,27 @@ function runtimeVerification(
       128,
     ),
     last_outcome: lastOutcome,
-    binding_revision: safeRevision(
-      item.binding_revision,
-      `${path}.binding_revision`,
+    binding_id: boundedIdentity(
+      item.binding_id,
+      `${path}.binding_id`,
     ),
     workspace_key_id: boundedString(
       item.workspace_key_id,
       `${path}.workspace_key_id`,
       LIMITS.idBytes,
     ),
-    workspace_identity_revision: safeRevision(
-      item.workspace_identity_revision,
-      `${path}.workspace_identity_revision`,
+    workspace_public_key_fingerprint: boundedIdentity(
+      item.workspace_public_key_fingerprint,
+      `${path}.workspace_public_key_fingerprint`,
     ),
-    workspace_trust_generation: safeRevision(
-      item.workspace_trust_generation,
-      `${path}.workspace_trust_generation`,
+    workspace_trust_id: boundedIdentity(
+      item.workspace_trust_id,
+      `${path}.workspace_trust_id`,
     ),
     runtime_public_key_fingerprint: boundedString(
       item.runtime_public_key_fingerprint,
       `${path}.runtime_public_key_fingerprint`,
       LIMITS.fingerprintBytes,
-    ),
-    runtime_identity_revision: safeRevision(
-      item.runtime_identity_revision,
-      `${path}.runtime_identity_revision`,
     ),
   };
 }
@@ -403,8 +402,8 @@ function runtimeBinding(
   const item = object(value, path);
   exactKeys(
     item,
-    ["state", "connection_state", "revision"],
-    ["workspace_key_id", "workspace_key_generation", "verification"],
+    ["state", "connection_state", "binding_id"],
+    ["workspace_key_id", "workspace_trust_id", "verification"],
     path,
   );
   const workspaceKeyId = optionalNullableString(
@@ -412,15 +411,15 @@ function runtimeBinding(
     `${path}.workspace_key_id`,
     LIMITS.idBytes,
   );
-  const workspaceKeyGeneration = optionalNullableRevision(
-    item.workspace_key_generation,
-    `${path}.workspace_key_generation`,
+  const workspaceTrustId = optionalNullableIdentity(
+    item.workspace_trust_id,
+    `${path}.workspace_trust_id`,
   );
   const state = enumValue(item.state, `${path}.state`, BINDING_STATES);
   if (
     requiresWorkspaceIdentity &&
     state !== "revoked" &&
-    (workspaceKeyId == null || workspaceKeyGeneration == null)
+    (workspaceKeyId == null || workspaceTrustId == null)
   ) {
     return fail(path, "requires Workspace signing key identity metadata");
   }
@@ -429,14 +428,14 @@ function runtimeBinding(
     `${path}.connection_state`,
     CONNECTION_STATES,
   );
-  const revision = safeRevision(item.revision, `${path}.revision`);
+  const binding_id = boundedIdentity(item.binding_id, `${path}.binding_id`);
   const verification = item.verification === undefined
     ? undefined
     : runtimeVerification(item.verification, `${path}.verification`);
   if (
-    verification !== undefined && verification.binding_revision !== revision
+    verification !== undefined && verification.binding_id !== binding_id
   ) {
-    return fail(path, "verification must match the current binding revision");
+    return fail(path, "verification must match the current binding binding_id");
   }
   if (
     requiresWorkspaceIdentity &&
@@ -453,13 +452,13 @@ function runtimeBinding(
   return {
     state,
     connection_state: connectionState,
-    revision,
+    binding_id,
     ...(workspaceKeyId === undefined
       ? {}
       : { workspace_key_id: workspaceKeyId }),
-    ...(workspaceKeyGeneration === undefined
+    ...(workspaceTrustId === undefined
       ? {}
-      : { workspace_key_generation: workspaceKeyGeneration }),
+      : { workspace_trust_id: workspaceTrustId }),
     ...(verification === undefined ? {} : { verification }),
   };
 }
@@ -566,7 +565,7 @@ function trustKey(value: unknown, path: string): RuntimeTrustKeyState {
   exactKeys(
     item,
     ["status"],
-    ["fingerprint", "revision", "created_at", "updated_at", "revoked_at"],
+    ["fingerprint", "binding_id", "created_at", "updated_at", "revoked_at"],
     path,
   );
   const result: RuntimeTrustKeyState = {
@@ -576,7 +575,7 @@ function trustKey(value: unknown, path: string): RuntimeTrustKeyState {
       `${path}.fingerprint`,
       LIMITS.fingerprintBytes,
     ),
-    revision: optionalNullableRevision(item.revision, `${path}.revision`),
+    binding_id: optionalNullableIdentity(item.binding_id, `${path}.binding_id`),
     created_at: optionalNullableTimestamp(
       item.created_at,
       `${path}.created_at`,
@@ -594,12 +593,12 @@ function trustKey(value: unknown, path: string): RuntimeTrustKeyState {
   const hasBinding = result.status !== "unconfigured";
   if (
     hasBinding &&
-    (result.fingerprint == null || result.revision == null ||
+    (result.fingerprint == null || result.binding_id == null ||
       result.created_at == null || result.updated_at == null)
   ) {
     fail(
       path,
-      "must include fingerprint, revision, created_at, and updated_at",
+      "must include fingerprint, binding_id, created_at, and updated_at",
     );
   }
   if (
@@ -623,7 +622,7 @@ function auditEntry(value: unknown, path: string): RuntimeTrustAuditEntry {
   const item = object(value, path);
   exactKeys(
     item,
-    ["action", "actor_account_id", "revision", "at"],
+    ["action", "actor_account_id", "binding_id", "at"],
     ["old_fingerprint", "new_fingerprint"],
     path,
   );
@@ -644,7 +643,7 @@ function auditEntry(value: unknown, path: string): RuntimeTrustAuditEntry {
       `${path}.new_fingerprint`,
       LIMITS.fingerprintBytes,
     ),
-    revision: safeRevision(item.revision, `${path}.revision`),
+    binding_id: boundedIdentity(item.binding_id, `${path}.binding_id`),
     at: timestamp(item.at, `${path}.at`),
   };
 }
@@ -764,7 +763,7 @@ export function parseRuntimeTrustConflict(
   exactKeys(
     response,
     ["error", "message"],
-    ["current_revision", "current_fingerprint"],
+    ["current_binding_id", "current_fingerprint"],
     "Runtime trust conflict",
   );
   return {
@@ -778,9 +777,9 @@ export function parseRuntimeTrustConflict(
       "Runtime trust conflict.message",
       LIMITS.conflictMessageBytes,
     ),
-    current_revision: optionalRevision(
-      response.current_revision,
-      "Runtime trust conflict.current_revision",
+    current_binding_id: optionalIdentity(
+      response.current_binding_id,
+      "Runtime trust conflict.current_binding_id",
     ),
     current_fingerprint: optionalNullableString(
       response.current_fingerprint,
@@ -867,16 +866,6 @@ export function parseRuntimeRemovalOperationResponse(
   };
 }
 
-function revisionForJson(revision: number | null): number | null {
-  if (revision === null) return null;
-  if (!Number.isSafeInteger(revision) || revision < 1) {
-    throw new RuntimeTrustRequestError(
-      "Runtime trust revision is not a safe integer",
-    );
-  }
-  return revision;
-}
-
 async function readBoundedJson(response: Response): Promise<unknown> {
   const contentLength = response.headers.get("content-length");
   if (contentLength !== null) {
@@ -959,22 +948,25 @@ function requestErrorFrom(
   }
 }
 
+function throwRuntimeTrustConflict(payload: unknown): never {
+  let conflict: RuntimeTrustConflictResponse;
+  try {
+    conflict = parseRuntimeTrustConflict(payload);
+  } catch {
+    throw new RuntimeTrustRequestError(
+      "Runtime trust conflict response was invalid",
+    );
+  }
+  throw new RuntimeTrustConflictError(conflict);
+}
+
 async function finishMutation(
   response: Response,
   workspaceId: string,
   runtimeId: string,
 ): Promise<WorkspaceRuntimeDetail> {
   const payload = await readBoundedJson(response);
-  if (response.status === 409) {
-    try {
-      throw new RuntimeTrustConflictError(parseRuntimeTrustConflict(payload));
-    } catch (error) {
-      if (error instanceof RuntimeTrustConflictError) throw error;
-      throw new RuntimeTrustRequestError(
-        "Runtime trust conflict response was invalid",
-      );
-    }
-  }
+  if (response.status === 409) throwRuntimeTrustConflict(payload);
   if (!response.ok) throw requestErrorFrom(payload, response.status);
   let detail: WorkspaceRuntimeDetail;
   try {
@@ -998,15 +990,17 @@ export async function createRemoteRuntime(
   request: CreateRemoteRuntimeRequest,
   fetchImpl: typeof fetch = fetch,
 ): Promise<WorkspaceRuntimeResource> {
+  const enrollmentId = boundedIdentity(request.workspace_trust_id, "workspace_trust_id");
   const response = await fetchImpl(
     workspaceApiPath(workspaceId, "/runtimes"),
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(request),
+      body: JSON.stringify({ ...request, workspace_trust_id: enrollmentId }),
     },
   );
   const payload = await readBoundedJson(response);
+  if (response.status === 409) throwRuntimeTrustConflict(payload);
   if (!response.ok) throw requestErrorFrom(payload, response.status);
   const runtime = runtimeResource(payload, "Runtime create response");
   if (runtime.runtime_id !== request.public_bundle.identity_id) {
@@ -1173,7 +1167,10 @@ export async function revokeRuntimeTrustKey(
       method: "DELETE",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        expected_revision: revisionForJson(request.expected_revision),
+        expected_binding_id: boundedIdentity(
+          request.expected_binding_id,
+          "expected_binding_id",
+        ),
       }),
     },
   );

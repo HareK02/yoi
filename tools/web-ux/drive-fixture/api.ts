@@ -21,7 +21,7 @@ export type FixtureLog = {
   method: string;
   requestId: string | null;
   nodeId: string | null;
-  expectedRevision: string | null;
+  expectedMutationId: string | null;
 };
 const encoder = new TextEncoder();
 const rootId = "9007199254740993";
@@ -68,7 +68,7 @@ export function createDriveFixture() {
           parent: parent === null ? null : ref(parent),
           name,
           kind,
-          revision: "1",
+          last_mutation_id: "1",
           size: kind === "file" ? bytes.length : null,
           content_type: contentType,
           updated_by: "fixture-worker",
@@ -140,16 +140,13 @@ export function createDriveFixture() {
     state.next = id.includes("paged") ? 300n : 100n;
     return state;
   }
-  function bump(node: Node) {
-    node.entry.revision = String(BigInt(node.entry.revision) + 1n);
-  }
-  function mutate(id: string, mutation: DriveMutation): DriveEntry | null {
+  function mutate(id: string, requestId: string, mutation: DriveMutation): DriveEntry | null {
     const state = ws(id);
     const target = "id" in mutation ? state.nodes.get(mutation.id.node_id) : null;
     if ("id" in mutation && (mutation.id.workspace_id !== id || !target)) throw "not_found";
     if (
-      target && "expected_revision" in mutation &&
-      target.entry.revision !== mutation.expected_revision
+      target && "expected_mutation_id" in mutation &&
+      target.entry.last_mutation_id !== mutation.expected_mutation_id
     ) throw "conflict";
     if ("parent" in mutation) {
       const parent = state.nodes.get(mutation.parent.node_id);
@@ -177,14 +174,14 @@ export function createDriveFixture() {
     if (mutation.operation === "relocate") {
       target!.entry.parent = mutation.parent;
       target!.entry.name = mutation.name;
-      bump(target!);
+      target!.entry.last_mutation_id = requestId;
       return target!.entry;
     }
     if (mutation.operation === "update_text") {
       target!.bytes = encoder.encode(mutation.text);
       target!.entry.size = target!.bytes.length;
       target!.entry.content_type = mutation.content_type;
-      bump(target!);
+      target!.entry.last_mutation_id = requestId;
       return target!.entry;
     }
     const nodeId = String(state.next++);
@@ -196,7 +193,7 @@ export function createDriveFixture() {
       parent: mutation.parent,
       name: mutation.name,
       kind: mutation.operation === "create_folder" ? "folder" : "file",
-      revision: "1",
+      last_mutation_id: requestId,
       size: mutation.operation === "create_folder" ? null : bytes.length,
       content_type: mutation.operation === "create_text" ? mutation.content_type : null,
       updated_by: "fixture-user",
@@ -233,7 +230,7 @@ export function createDriveFixture() {
       method: request.method,
       requestId: url.searchParams.get("request_id"),
       nodeId: url.searchParams.get("id") ?? url.searchParams.get("parent_id"),
-      expectedRevision: url.searchParams.get("expected_revision"),
+      expectedMutationId: url.searchParams.get("expected_mutation_id"),
     };
     log.push(event);
     if (id.includes("denied")) return failure("denied");
@@ -287,7 +284,7 @@ export function createDriveFixture() {
         event.requestId = requestId;
         if (payload) {
           event.nodeId = payload.mutation.id?.node_id ?? payload.mutation.parent?.node_id ?? null;
-          event.expectedRevision = payload.mutation.expected_revision ?? null;
+          event.expectedMutationId = payload.mutation.expected_mutation_id ?? null;
         }
         if (state.receipts.has(requestId)) return Response.json(state.receipts.get(requestId));
         const fault = faults.get(id);
@@ -296,7 +293,7 @@ export function createDriveFixture() {
           return failure("conflict");
         }
         let entry: DriveEntry | null;
-        if (path === "/mutate") entry = mutate(id, payload.mutation);
+        if (path === "/mutate") entry = mutate(id, requestId, payload.mutation);
         else {
           const bytes = new Uint8Array(await request.arrayBuffer());
           if (bytes.length > 16 * 1024 * 1024) return failure("limit");
@@ -308,17 +305,17 @@ export function createDriveFixture() {
           ) return failure("invalid");
           const content_type = url.searchParams.get("content_type")!;
           if (url.searchParams.get("operation") === "create") {
-            entry = mutate(id, {
+            entry = mutate(id, requestId, {
               operation: "create_text",
               parent: { workspace_id: id, node_id: url.searchParams.get("parent_id")! },
               name: url.searchParams.get("name")!,
               text: "",
               content_type,
             });
-          } else {entry = mutate(id, {
+          } else {entry = mutate(id, requestId, {
               operation: "update_text",
               id: { workspace_id: id, node_id: url.searchParams.get("id")! },
-              expected_revision: url.searchParams.get("expected_revision")!,
+              expected_mutation_id: url.searchParams.get("expected_mutation_id")!,
               text: "",
               content_type,
             });}
@@ -370,8 +367,8 @@ export function createDriveFixture() {
     }
     if (path === "/download" || path === "/read-chunk") {
       if (
-        url.searchParams.has("expected_revision") &&
-        url.searchParams.get("expected_revision") !== node.entry.revision
+        url.searchParams.has("expected_mutation_id") &&
+        url.searchParams.get("expected_mutation_id") !== node.entry.last_mutation_id
       ) return failure("conflict");
       if (faults.get(id) === "image_error" && node.entry.content_type?.startsWith("image/")) {
         return failure("storage_unavailable");

@@ -11,6 +11,7 @@ schemars = { workspace = true, features = ["chrono04"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
+ticket = { path = "../ticket" }
 uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]

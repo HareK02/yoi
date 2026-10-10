@@ -103,11 +103,15 @@ impl AuthenticatedInputSource {
 
 /// Caller-owned identity for one state-changing Worker command.
 ///
-/// A controller accepts command ids in strictly increasing order. Exact retries
-/// of an accepted id must retain the same command kind.
+/// Commands operate on the controller state at admission time, not a caller's
+/// previously observed Run. A controller accepts command ids in strictly
+/// increasing order; retrying an accepted id cannot apply it to a later Run.
+/// Exact retries must retain the same command kind. Removed preconditions are
+/// rejected at the wire boundary rather than treated as arrival-time commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct WorkerCommandEnvelope {
     pub command_id: u64,
 }
@@ -312,16 +316,15 @@ pub enum Method {
     /// are immutable and therefore cannot be cancelled here.
     CancelPendingSubmission {
         submission_id: String,
-        expected_revision: u64,
     },
-    /// Remove every queued submission while preserving the active run.
+    /// Remove exactly the observed ordered set of submissions, preserving the
+    /// active run. Reject if the FIFO content changed before admission.
     ClearPendingSubmissions {
-        expected_revision: u64,
+        expected_submission_ids: Vec<String>,
     },
     /// Activate the next queued submission while the Worker is idle. This is an
     /// explicit recovery operation and never resumes a paused run implicitly.
     ContinuePending {
-        expected_revision: u64,
         expected_head_id: String,
     },
     Resume {
@@ -365,7 +368,7 @@ pub enum Method {
     ListCompletions {
         kind: CompletionKind,
         prefix: String,
-        /// Client query generation. Echoed verbatim so identical-prefix ABA
+        /// Client query identity. Echoed verbatim so identical-prefix ABA
         /// responses cannot cross edits, target switches, or permission changes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
@@ -766,7 +769,6 @@ pub enum InternalWorkerKind {
 pub struct CompactionLifecycle {
     pub schema_version: u32,
     pub compaction_id: String,
-    pub revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub internal_worker: Option<InternalWorkerRef>,
     pub state: CompactionLifecycleState,
@@ -806,14 +808,13 @@ pub struct InternalWorkerRef {
     pub kind: InternalWorkerKind,
 }
 
-/// Reconnect state for one visible Internal Worker. The revision fences live
-/// `Event::InternalWorker` updates that raced with parent snapshot assembly.
+/// Reconnect state for one visible Internal Worker. The parent serializes
+/// snapshot publication and subsequent live events on the same ordered stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct InternalWorkerSnapshot {
     pub worker: InternalWorkerRef,
-    pub revision: u64,
     pub session: SessionSnapshot,
     /// Public execution metadata for this child. Older snapshots and service
     /// workers may omit it; clients must never substitute the parent's values.
@@ -869,12 +870,11 @@ pub struct PendingSubmissionSummary {
     pub byte_len: u64,
 }
 
-/// Revisioned session-owned FIFO projection used by snapshots and live events.
+/// Session-owned FIFO content projection used by snapshots and live events.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct PendingSubmissionsSnapshot {
-    pub revision: u64,
     #[serde(default)]
     pub notification_count: u32,
     /// Ordered display-only previews of waiting notifications, each bounded like
@@ -1356,7 +1356,7 @@ pub enum Event {
     Snapshot {
         session: SessionSnapshot,
         greeting: Greeting,
-        /// Full revisioned live execution state. `Stopped` remains Runtime
+        /// Full live execution state. `Stopped` remains Runtime
         /// catalog authority and is deliberately not represented here.
         state: WorkerStateSnapshot,
         /// Unfinished model output that has already streamed in the current
@@ -1370,10 +1370,10 @@ pub enum Event {
     },
     /// A live event from a parent-owned Internal Worker. The payload reuses the
     /// normal Worker event vocabulary while the wrapper carries stable origin
-    /// identity and a per-child revision fence.
+    /// identity. Apply in arrival order on the parent's serialized stream; a
+    /// reconnect snapshot replaces the projection before live events resume.
     InternalWorker {
         worker: InternalWorkerRef,
-        revision: u64,
         event: Box<Event>,
     },
     /// Terminal removal fence for one parent-owned Internal Worker session.
@@ -1383,7 +1383,6 @@ pub enum Event {
     /// the projection.
     InternalWorkerRemoved {
         worker: InternalWorkerRef,
-        revision: u64,
     },
     /// Server-side segment log rotated to a fresh `SegmentStart`.
     ///
@@ -2277,6 +2276,28 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_commands_reject_removed_nested_preconditions() {
+        for method in ["pause", "cancel", "resume", "compact", "shutdown"] {
+            let wire = serde_json::json!({
+                "method": method,
+                "params": { "command": { "command_id": 11 } }
+            });
+            // Current commands are arrival-time operations, not Run-bound CAS.
+            assert!(serde_json::from_value::<Method>(wire.clone()).is_ok());
+            for field in [
+                "expected_execution_generation",
+                "expected_worker_state_revision",
+            ] {
+                let mut old_command = wire.clone();
+                old_command["params"]["command"][field] = serde_json::json!(1);
+                let error = serde_json::from_value::<Method>(old_command)
+                    .expect_err("removed command preconditions must not be silently ignored");
+                assert!(error.to_string().contains(field), "{method}: {error}");
+            }
+        }
+    }
+
+    #[test]
     fn lifecycle_methods_roundtrip_with_command_identity() {
         for method in [
             Method::Pause {
@@ -3048,7 +3069,6 @@ mod tests {
         CompactionLifecycle {
             schema_version: 2,
             compaction_id: "0192f0e8-4d84-7d6e-a000-000000000000".into(),
-            revision: 1,
             internal_worker: None,
             state,
             started_at_ms: 1_700_000_000_000,
@@ -3069,7 +3089,9 @@ mod tests {
         assert_eq!(parsed["event"], "compact_start");
         assert_eq!(parsed["data"]["lifecycle"]["state"], "running");
         let decoded: Event = serde_json::from_str(&json).unwrap();
-        assert!(matches!(decoded, Event::CompactStart { lifecycle } if lifecycle.revision == 1));
+        assert!(
+            matches!(decoded, Event::CompactStart { lifecycle } if lifecycle.state == CompactionLifecycleState::Running)
+        );
     }
 
     #[test]
@@ -3292,7 +3314,6 @@ mod tests {
                 parent_session_id: Some("parent-session".into()),
                 kind: InternalWorkerKind::SubWorker,
             },
-            revision: 7,
             event: Box::new(Event::TextDone {
                 text: "result".into(),
             }),
@@ -3300,14 +3321,9 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let decoded: Event = serde_json::from_str(&json).unwrap();
         match decoded {
-            Event::InternalWorker {
-                worker,
-                revision,
-                event,
-            } => {
+            Event::InternalWorker { worker, event } => {
                 assert_eq!(worker.session_id, "session-1");
                 assert_eq!(worker.parent_session_id.as_deref(), Some("parent-session"));
-                assert_eq!(revision, 7);
                 assert!(matches!(*event, Event::TextDone { ref text } if text == "result"));
             }
             other => panic!("expected internal Worker event, got {other:?}"),
@@ -3323,21 +3339,20 @@ mod tests {
                 parent_session_id: Some("parent-session".into()),
                 kind: InternalWorkerKind::SubWorker,
             },
-            revision: 8,
         };
         let json = serde_json::to_string(&event).unwrap();
         let decoded: Event = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             decoded,
-            Event::InternalWorkerRemoved { worker, revision }
-                if worker.session_id == "session-1" && revision == 8
+            Event::InternalWorkerRemoved { worker }
+                if worker.session_id == "session-1"
         ));
     }
 
     #[test]
     fn pending_notification_previews_are_optional_and_roundtrip() {
         let legacy = serde_json::json!({
-            "revision": 1, "notification_count": 1,
+            "notification_count": 1,
             "head_id": "notification-head", "submissions": []
         });
         let mut snapshot: PendingSubmissionsSnapshot =

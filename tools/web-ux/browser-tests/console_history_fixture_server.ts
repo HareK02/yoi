@@ -164,6 +164,9 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   if (url.pathname === `/api/w/${workspaceId}/working-directories`) {
     return json({ workspace_id: workspaceId, items: [], diagnostics: [] });
   }
+  if (url.pathname === `/api/w/${workspaceId}/workers`) {
+    return json({ workspace_id: workspaceId, limit: 200, items: [worker], source: "fixture", diagnostics: [] });
+  }
   if (
     url.pathname === `/api/w/${workspaceId}/workers/${workerResourceKey}` ||
     url.pathname === `/api/w/${workspaceId}/runtimes/${runtimeId}/workers/${workerId}`
@@ -191,7 +194,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
       identity: { session_id: "session-a", segment_id: "segment-a", entry_count: 36 },
       snapshot: {
         pending_submissions: {
-          revision: 0,
+
           notification_count: hasNotifications ? 2 : 0,
           ...(hasNotifications && pendingMode !== "legacy" ? { notification_previews: ["First notification", "Long notification — " + "notification text ".repeat(30)] } : {}),
           head_id: submissions[0]?.submission_id ?? null,

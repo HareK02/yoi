@@ -352,7 +352,7 @@ fn operation_error(error: subjektiv::api::OperationError) -> SubjektivHostError 
             } else if message.contains("candidate_decision_conflict") {
                 "candidate_decision_conflict"
             } else {
-                "revision_conflict"
+                "change_conflict"
             }
             .into(),
             message,
@@ -655,7 +655,7 @@ impl LocalSubjectHost {
                 worker_id: Some(self.worker_id.to_string()),
                 flow_selector: None,
                 flow_definition_id: None,
-                flow_definition_revision: None,
+                flow_definition_fingerprint: None,
             };
             anchor.origin = Some(origin.clone());
             source.origin = Some(origin);
@@ -835,8 +835,7 @@ impl SubjektivHost for LocalSubjectHost {
             job::DEFAULT_MAX_RESULT_BYTES,
         )
         .map_err(operation_error)?;
-        let subject = self
-            .catalog
+        self.catalog
             .store
             .subject(&self.binding.subject_id)
             .map_err(domain_error)?
@@ -847,7 +846,7 @@ impl SubjektivHost for LocalSubjectHost {
         };
         let request=job::JobRequest {
             job_id:format!("subjektiv-consolidation:{}",uuid::Uuid::now_v7()),purpose:"subjektiv_consolidation".into(),
-            input_revision:subject.store_revision.to_string(),input_ref:format!("subjektiv://{}/consolidation",self.binding.subject_id),
+            input_ref:format!("subjektiv://{}/consolidation",self.binding.subject_id),
             input:serde_json::json!({"subject_id":self.binding.subject_id,"candidate_ids":grant.candidate_ids}),
             instruction:"Resolve ONLY candidate_ids with MemoryStagingList/Read, recall and MemoryApplyCandidate. Already resolved IDs are durable receipts; do not repeat them. Leave new candidates for a later Job. When the entire immutable batch has a disposition, call SubmitJobResult with result: {subject_id, candidate_ids}. The Host awaits clean-context surface generation and verifies actual receipts/outcome before accepting success; never supply surface claims.".into(),
             profile:"builtin:standalone-subjektiv-consolidation".into(),serialization_key:Some(format!("subjektiv:{}",self.binding.subject_id)),

@@ -3,8 +3,8 @@
 ## Scope and ownership
 
 Drive is a Workspace-owned **latest-version document tree**, not a mounted or
-POSIX-compatible filesystem. `workspace-drive` owns storage, hierarchy, revision
-conflicts, mutation receipts, bounded reads/search, and garbage collection.
+POSIX-compatible filesystem. `workspace-drive` owns storage, hierarchy, conflicting
+changes, mutation receipts, bounded reads/search, and garbage collection.
 `WorkspaceApi::drive` is the trusted Server adapter. The authorized HTTP API and
 Backend-managed grants are documented below. Worker Tools/WIP, Web UI, and full
 end-to-end routing belong to T-723–725.
@@ -52,10 +52,11 @@ operations. External edits of the store are outside the Drive operation contract
 Migration 1 registers `workspace-drive` through FeatureStorage. Each scoped DB
 contains its Workspace binding, nodes, deletion tombstone, and mutation receipts.
 SQLite `AUTOINCREMENT` node IDs are stable, scoped to a Workspace and never
-reused after deletion. They are opaque application IDs, not inodes. IDs and
-revisions serialize as canonical positive **decimal strings**, preserving signed
-64-bit precision across JavaScript DTO boundaries. Restore preserves
-`sqlite_sequence` as well as IDs and revisions.
+reused after deletion. They are opaque application IDs, not inodes. Node IDs serialize as canonical positive **decimal strings**, preserving signed
+64-bit precision across JavaScript DTO boundaries. `last_mutation_id` is the
+existing request ID of the last committed mutation, not a counter or timestamp.
+The immutable root has an empty value. Restore preserves `sqlite_sequence`,
+node IDs, request IDs and receipts.
 
 The DB is the only tree/latest-reference authority. Each node has one parent;
 root is the sole parentless directory, has empty name, and cannot be renamed,
@@ -68,17 +69,19 @@ Parents must be directories in this scoped Workspace. Self/descendant moves are
 rejected. Ordinary folder deletion is **empty-only**, never implicitly recursive.
 Workspace destruction is the separate fenced purge operation.
 
-Every update/move/delete requires `expected_revision`. A stale revision or
+Every update/move/delete requires `expected_mutation_id`. The same IMMEDIATE
+transaction compares it with the node’s last successful request ID before writing.
+A different committed request or
 same-name/request-identity competitor returns `Conflict`; it never falls back to
 unconditional writes. Root mutations and malformed requests are `Invalid`;
-missing/deleted IDs are `NotFound`. Revision exhaustion fails rather than wrapping.
+missing/deleted IDs are `NotFound`. No update counter is allocated or incremented.
 Actor identity is trusted caller input (the authorization adapter supplies it),
 and successful mutations record actor and UTC epoch milliseconds.
 
 `BEGIN IMMEDIATE` is held for validation, blob operations, metadata mutation and
 receipt insertion. It serializes the whole Workspace hierarchy and all blob
 read/upload/GC activity across independent processes. A→B/B→A, parent deletion
-versus child creation, and same-revision updates therefore have one valid winner.
+versus child creation, and updates based on the same observation therefore have one valid winner.
 FeatureStorage configures foreign keys, WAL, `synchronous=FULL`, and a 5-second
 busy timeout. Busy/SQL/I/O failures remain errors; they do not mean an empty Drive.
 Before opening SQLite or admitting a Feature handle, FeatureStorage creates and
@@ -122,7 +125,7 @@ publication is not power-loss durability. The small adapter compensates:
 1. Create/validate Host directories; `sync_all` their entries and parents.
 2. Use LocalFileSystem to atomically create the immutable blob.
 3. `sync_all` the published file, then its containing directory.
-4. Only after both succeed, update the DB reference/revision and insert the
+4. Only after both succeed, update the DB reference/last committed request and insert the
    receipt in the **same SQL transaction**.
 5. SQLite commit is the sole success/publication point.
 
@@ -188,9 +191,9 @@ page; an empty matching page can still have continuation. Name search is exact
 substring matching. Optional bounded text search inspects only UTF-8 `text/*`
 files no larger than 64 KiB, never images/large files. No index/embedding exists.
 
-Each read supplies node ID **and the selected revision**, and is locked to that
+Each read supplies node ID **and the observed committed mutation**, and is locked to that
 blob for the entire chunk. The SQLite lock excludes upload/GC while reading.
-After an update the old revision expires: the next chunk returns `Conflict` (or
+After an update the previous observation expires: the next chunk returns `Conflict` (or
 `NotFound` after deletion), not the new generation. No long-lived read lease or
 full-history retention is promised. Binary ranges are byte-based and exact;
 text reads require UTF-8 character-aligned offsets/ranges and reject split or
@@ -254,7 +257,7 @@ DB-plus-object snapshot is implemented. Use this administrative procedure:
    scope and Host blob roots. Use `ScopedFeatureStorage::restore` for its snapshot
    format, or restore the entire stopped deployment consistently. Never restore
    just `server.db` or create a new empty Drive DB over surviving blobs.
-6. Restore blobs from the matching generation; restore internal IDs, revisions,
+6. Restore blobs from the matching generation; restore internal IDs, committed request IDs,
    receipts and `sqlite_sequence` unchanged. Validate references/lengths and
    sanitized metadata/text/binary reads before reopening admission. Resume GC
    only after validation. A deletion tombstone must not be cleared on restore.
@@ -301,12 +304,13 @@ wins first is ordered first. A mutation committing before revocation is valid;
 a revoked cached handle cannot commit later. Upload admission also checks access
 before consuming the body, but that admission is not a lease: publication always
 rechecks current access. Download checks authorization separately for every
-chunk, and stops on revocation, deletion, revision expiry or storage failure.
+chunk, and stops on revocation, deletion, a changed committed request or storage failure.
 
 References contain **both** Workspace ID and stable decimal node ID. JSON uses
 `DriveEntryRef`; flat GET/binary queries require `entry_workspace_id` matching the
-route Workspace before resolving `id`/`parent_id`. IDs/revisions are canonical
-positive decimal strings within signed 64-bit range; file sizes/offsets are
+route Workspace before resolving `id`/`parent_id`. Node IDs are canonical
+positive decimal strings within signed 64-bit range. Mutation IDs are request
+strings (1–128 UTF-8 bytes, no control characters); file sizes/offsets are
 bounded `u32`. List/search cursors carry Workspace identity and the last node ID;
 they are continuation hints, not capabilities or snapshots. Returned `latest_url`
 is a relative authenticated URL bound to Workspace and ID, independent of logical
@@ -321,7 +325,7 @@ most one bounded binary file in memory before calling T-721; they are not
 constant-memory object-store multipart uploads and are never expanded to
 JSON/base64. Runtime source-proof verification separately buffers a bounded body
 before granting trusted ingress, as in other signed Server operations. Web
-downloads stream **64 KiB** revision-fixed chunks; they do not materialize the
+downloads stream **64 KiB** committed-request-bound chunks; they do not materialize the
 whole file. Generated Rust clients retain their explicit bounded-response policy
 and return exact `BinaryBody` bytes. Worker JSON-facing adapters can request
 bounded text or binary chunks through this same contract, but Tools/WIP and
@@ -330,12 +334,12 @@ base64 JSON blobs.
 
 Downloads validate bare MIME types and always use `Content-Disposition:
 attachment` with percent-encoded UTF-8 names, `nosniff`, a sandbox/default-none
-CSP, `private, no-store`, and a Workspace/node/revision ETag. Arbitrary HTML/SVG
+CSP, `private, no-store`, and a SHA-256 ETag over Workspace, node ID and committed request ID. Arbitrary HTML/SVG
 bytes are storable, not safe app-origin inline previews. Content length is exact;
 if a later chunk loses authority or expires, the response stream fails rather
 than returning another generation or a successful truncated file. Even an empty
 file validates its referenced blob before HTTP success. Conditional 304/range
-HTTP semantics are not added; revision-selected chunk reads are explicit.
+HTTP semantics are not added; observation-bound chunk reads are explicit.
 
 Errors use fixed, path-free typed codes: `denied`, `not_found`, `conflict`,
 `invalid`, `limit`, `storage_unavailable`, `outcome_unknown`. SQL/commit/task
@@ -366,3 +370,22 @@ done
 The existing BinaryBody contract also supports binary **success responses**,
 including declared response headers, without changing binary request bytes or
 JSON/error behavior. It exports inline OpenAPI binary bodies, not JSON byte arrays.
+
+## Upgrade to receipt-bound mutation checks
+
+Migration 2 obtains each non-root node’s latest request ID from its existing
+committed receipt, transforms historical receipt payloads, and drops the old
+update counter. The current-state receipt must be unique; missing or ambiguous
+evidence aborts and rolls back the entire migration. Equal timestamps do not
+change the result. No content, node identity, request fingerprint or blob is
+regenerated. Deleted nodes’ receipts and AUTOINCREMENT history remain intact.
+
+The frozen migration module retains old SQL/JSON names and proven predecessor
+correspondence only to verify existing receipts against their original request
+fingerprints. This evidence never authorizes a new mutation. Active node CAS and
+HTTP contracts do not accept the old numeric precondition. Exact pre-upgrade
+Update/Relocate/Delete replays are accepted only when the complete actor/payload
+and mapped predecessor reproduce the original fingerprint. If that evidence
+cannot be established, recover the committed result through `request_status`;
+changing the actor, payload or precondition and reusing its ID is a conflict,
+not permission to execute it again.

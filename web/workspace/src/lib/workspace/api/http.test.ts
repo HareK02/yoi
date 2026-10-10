@@ -93,7 +93,6 @@ Deno.test("loadWorkspaceSkillCatalog fetches lightweight catalog", async () => {
           JSON.stringify({
             authority: "workspace-config-skills-v1",
             projection: {
-              config_revision: 7,
               tree_digest: "tree-digest",
             },
             entries: [{
@@ -105,7 +104,6 @@ Deno.test("loadWorkspaceSkillCatalog fetches lightweight catalog", async () => {
                 kind: "workspace",
                 id: "workspace:triage-errors",
                 virtual_path: "skills/triage-errors/SKILL.md",
-                revision: 7,
                 source_digest: "source-digest",
                 tree_digest: "tree-digest",
               },

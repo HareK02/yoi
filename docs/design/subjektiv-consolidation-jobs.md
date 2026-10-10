@@ -10,7 +10,7 @@ planned in T-708/T-709 are outside this Backend change.
 
 The existing backlog/byte thresholds and missing/stale/failed surface policy
 remain the launch decision. A Job captures an immutable bounded batch (up to 100
-candidate IDs) plus the Subject store revision. Selection also reserves the Job's
+candidate IDs) plus the Subject `memory_fingerprint`. Selection also reserves the Job's
 16 KiB result budget, accounting for JSON-escaped IDs appearing in both the batch
 claim and compact verified outcomes. Excess candidates remain staged for a later
 batch. An empty batch is valid for a
@@ -39,7 +39,7 @@ may snapshot remaining candidates once all previous Workers are safely cleaned.
 
 ## Memory and surface completion
 
-`MemoryApplyCandidate` still uses the existing expected-revision checks, atomic
+`MemoryApplyCandidate` still uses the existing `expected_change_id` checks, atomic
 apply/close and immutable decision receipts. Partial application survives model
 failure, timeout, lost response, retry, Worker deletion and Backend recovery.
 Job replay is not a second memory apply: resolved candidates retain their
@@ -51,9 +51,9 @@ clean-context surface editor and publish-or-recorded-failure, then adds the actu
 structured surface outcome. It does **not** schedule a Worker-owned post-Run task.
 The result call serializes and caches the exact generated outcome for ambiguous
 submission replay. The Backend verifies every batch disposition and the current
-store revision, generation ownership and persisted ready/failed surface fields;
+Memory-input fingerprint, generation-run ownership and persisted ready/failed surface fields;
 it enriches the durable result with actual immutable candidate disposition
-summaries (`candidate_id` and `action`). Full reasons, affected revisions and
+summaries (`candidate_id` and `action`). Full reasons, affected change references and
 source edges remain in the existing immutable receipt store; they are not copied
 into a bounded Job result. Exact replay uses the same verified compact projection.
 Thus confirmed-memory consolidation and surface readiness are separate outcomes.
@@ -87,7 +87,7 @@ Subject-body/ordinary/Workspace-Memory Workers are never selected by this key.
 
 The Job runner uses its existing durable dispatch allocation, tracked input,
 T-701 registry-bound restore/recovery, deadlines, unknown outcomes, result replay,
-delivery and T-690 cleanup. Job results, candidate receipts, Memory revisions,
+delivery and T-690 cleanup. Job results, candidate receipts, Memory changes,
 provenance and surfaces remain in their existing Backend stores after Worker
 removal. No live dogfood Worker or environment is stopped/updated by development
 validation.

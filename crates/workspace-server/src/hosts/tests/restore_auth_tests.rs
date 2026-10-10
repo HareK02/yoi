@@ -22,17 +22,20 @@ async fn restore_capabilities_authorize_runtime_routes_without_relaxing_request_
     let runtime_identity = RuntimeIdentityMaterial::generate("runtime-test").unwrap();
     let signer = RuntimeVerificationSigner::from_identity(&runtime_identity).unwrap();
     let now = Utc::now().timestamp();
+    let workspace_public_key_fingerprint =
+        crate::workspace_signing_identity::public_key_fingerprint(&workspace_identity.public_key)
+            .unwrap();
+    let binding_id = "binding-restore-test".to_string();
     let verifications = Arc::new(InMemoryWorkspaceRuntimeVerificationAuthority::default());
     verifications
         .record(WorkspaceRuntimeVerificationRecord {
             workspace_id: "workspace-test".into(),
             runtime_id: "runtime-test".into(),
-            binding_revision: 1,
+            binding_id: binding_id.clone(),
+            workspace_trust_id: "trust-restore-test".to_string(),
             workspace_key_id: "workspace-key".into(),
-            workspace_identity_revision: 1,
-            workspace_trust_generation: 1,
+            workspace_public_key_fingerprint: workspace_public_key_fingerprint.clone(),
             runtime_public_key_fingerprint: signer.public_key_fingerprint().to_owned(),
-            runtime_identity_revision: 1,
             verified_at: now,
         })
         .unwrap();
@@ -52,8 +55,7 @@ async fn restore_capabilities_authorize_runtime_routes_without_relaxing_request_
                     .map(|byte| format!("{byte:02x}"))
                     .collect::<String>()
             ),
-            identity_revision: 1,
-            trust_generation: 1,
+            trust_id: "trust-restore-test".to_string(),
             state: WorkspaceIssuerTrustState::Active,
             registered_at_unix: now,
             updated_at_unix: now,
@@ -73,7 +75,7 @@ async fn restore_capabilities_authorize_runtime_routes_without_relaxing_request_
     );
     let worker_id = EmbeddedWorkerId::from_legacy_u64(1).to_string();
     let body = serde_json::to_vec(&runtime_api::WorkerRestoreCoordinationRequest {
-        expected_observation_token: "observed-generation".into(),
+        expected_observation_token: "observed-runtime-state".into(),
         request_id: "restore-request".into(),
         preparation: None,
     })
@@ -90,14 +92,35 @@ async fn restore_capabilities_authorize_runtime_routes_without_relaxing_request_
             "wrong-operation",
             "wrong-worker",
             "wrong-body",
+            "wrong-key-fingerprint",
+            "wrong-binding-id",
+            "wrong-trust-id",
         ] {
             let claims = WorkspaceCapabilityClaims {
                 issuer: "https://backend.test".into(),
                 issuer_workspace_id: "workspace-test".into(),
                 issuer_key_id: "workspace-key".into(),
-                issuer_identity_revision: 1,
-                trust_generation: 1,
-                binding_revision: 1,
+                issuer_public_key_fingerprint: if case == "wrong-key-fingerprint" {
+                    format!(
+                        "sha256:{}",
+                        Sha256::digest(b"another-workspace-key")
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>()
+                    )
+                } else {
+                    workspace_public_key_fingerprint.clone()
+                },
+                binding_id: if case == "wrong-binding-id" {
+                    "binding-retired".to_string()
+                } else {
+                    binding_id.clone()
+                },
+                trust_id: if case == "wrong-trust-id" {
+                    "trust-retired".to_string()
+                } else {
+                    "trust-restore-test".to_string()
+                },
                 runtime_id: "runtime-test".into(),
                 worker_id: if case == "wrong-worker" {
                     Some(EmbeddedWorkerId::from_legacy_u64(2).to_string())
@@ -153,22 +176,36 @@ async fn restore_capabilities_authorize_runtime_routes_without_relaxing_request_
             } else {
                 assert_eq!(
                     status,
-                    StatusCode::UNAUTHORIZED,
+                    if case == "wrong-binding-id" {
+                        StatusCode::FORBIDDEN
+                    } else {
+                        StatusCode::UNAUTHORIZED
+                    },
                     "{path} {case}: {}",
                     error.error.message
                 );
-                assert_eq!(error.error.code, "unauthorized");
+                assert_eq!(
+                    error.error.code,
+                    if case == "wrong-binding-id" {
+                        "workspace_runtime_verification_stale"
+                    } else {
+                        "unauthorized"
+                    }
+                );
                 let expected = match case {
-                    "wrong-operation" => "does not authorize this operation",
-                    "wrong-worker" => "targets another Worker",
-                    "wrong-body" => "does not bind this request body",
+                    "wrong-operation" => Some("does not authorize this operation"),
+                    "wrong-worker" => Some("targets another Worker"),
+                    "wrong-body" => Some("does not bind this request body"),
+                    "wrong-key-fingerprint" | "wrong-binding-id" | "wrong-trust-id" => None,
                     _ => unreachable!(),
                 };
-                assert!(
-                    error.error.message.contains(expected),
-                    "{path} {case}: {}",
-                    error.error.message
-                );
+                if let Some(expected) = expected {
+                    assert!(
+                        error.error.message.contains(expected),
+                        "{path} {case}: {}",
+                        error.error.message
+                    );
+                }
             }
         }
     }

@@ -24,7 +24,7 @@ pub const SUBJEKTIV_NESTED_EVIDENCE_MAX_BYTES: usize = 40 * 1024;
 #[serde(deny_unknown_fields)]
 struct SubjektivQueryCursor {
     subject_id: String,
-    store_revision: u64,
+    memory_fingerprint: String,
     query: Option<String>,
     kinds: Vec<String>,
     states: Vec<String>,
@@ -33,10 +33,10 @@ struct SubjektivQueryCursor {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SubjektivRevisionCursor {
+struct SubjektivChangeCursor {
     subject_id: String,
     memory_id: String,
-    max_revision: u64,
+    head_change_id: String,
     offset: usize,
 }
 
@@ -45,8 +45,8 @@ struct SubjektivRevisionCursor {
 struct SubjektivEvidenceCursor {
     subject_id: String,
     memory_id: String,
-    revision: u64,
-    /// Candidate/derivation reference offset within the immutable revision.
+    change_id: String,
+    /// Candidate/derivation reference offset within the immutable change_id.
     offset: usize,
     /// Nested offsets keep compatible historical candidates with more anchors
     /// resumable without admitting new over-limit records.
@@ -92,14 +92,14 @@ pub fn subjektiv_surface_prepare_response(
     server_api::SubjektivSurfacePrepareResponse {
         generation_id: generation.id,
         current_snapshot_id: None,
-        store_revision: generation.store_revision,
+        memory_fingerprint: generation.memory_fingerprint,
         active_memory_count: generation.active_memory_count,
         materials: generation
             .materials
             .into_iter()
             .map(|material| server_api::SubjektivSurfaceMaterial {
                 memory_id: material.memory_id,
-                revision: material.revision,
+                change_id: material.change_id.clone(),
                 kind: material.kind,
                 body_md: material.body_md,
                 why_useful: material.why_useful,
@@ -120,7 +120,7 @@ pub fn subjektiv_candidate_summary(
         candidate_id: candidate.id,
         kind: candidate.kind,
         claim: candidate.claim,
-        revision_proposal: candidate.revision_proposal.map(subjektiv_proposal_metadata),
+        change_proposal: candidate.change_proposal.map(subjektiv_proposal_metadata),
         created_at: candidate.created_at,
     }
 }
@@ -137,30 +137,26 @@ pub fn subjektiv_candidate(
         source: candidate.source,
         evidence: candidate.evidence,
         source_refs: candidate.source_refs,
-        revision_proposal: candidate.revision_proposal.map(subjektiv_proposal_metadata),
+        change_proposal: candidate.change_proposal.map(subjektiv_proposal_metadata),
         created_at: candidate.created_at,
     }
 }
 
 pub fn subjektiv_proposal_metadata(
-    proposal: crate::RevisionProposal,
-) -> server_api::SubjektivMemoryRevisionProposalMetadata {
-    server_api::SubjektivMemoryRevisionProposalMetadata {
+    proposal: crate::ChangeProposal,
+) -> server_api::SubjektivMemoryChangeProposalMetadata {
+    server_api::SubjektivMemoryChangeProposalMetadata {
         memory_id: proposal.memory_id,
-        expected_revision: proposal.expected_revision,
+        expected_change_id: proposal.expected_change_id.clone(),
         intent: match proposal.intent {
-            crate::RevisionProposalIntent::Revise => {
-                server_api::SubjektivMemoryRevisionIntent::Revise
+            crate::ChangeProposalIntent::Revise => server_api::SubjektivMemoryChangeIntent::Revise,
+            crate::ChangeProposalIntent::Resolve => {
+                server_api::SubjektivMemoryChangeIntent::Resolve
             }
-            crate::RevisionProposalIntent::Resolve => {
-                server_api::SubjektivMemoryRevisionIntent::Resolve
+            crate::ChangeProposalIntent::Retract => {
+                server_api::SubjektivMemoryChangeIntent::Retract
             }
-            crate::RevisionProposalIntent::Retract => {
-                server_api::SubjektivMemoryRevisionIntent::Retract
-            }
-            crate::RevisionProposalIntent::Reopen => {
-                server_api::SubjektivMemoryRevisionIntent::Reopen
-            }
+            crate::ChangeProposalIntent::Reopen => server_api::SubjektivMemoryChangeIntent::Reopen,
         },
         change_reason: proposal.change_reason,
     }
@@ -172,15 +168,13 @@ pub fn subjektiv_candidate_decision(
     let decision = match input.decision {
         server_api::SubjektivMemoryCandidateDecision::Apply { target, memory } => {
             let target = match target {
-                server_api::SubjektivMemoryApplyTarget::Create => {
-                    crate::MemoryRevisionTarget::Create
-                }
+                server_api::SubjektivMemoryApplyTarget::Create => crate::MemoryChangeTarget::Create,
                 server_api::SubjektivMemoryApplyTarget::Revise {
                     memory_id,
-                    expected_revision,
-                } => crate::MemoryRevisionTarget::Revise {
+                    expected_change_id,
+                } => crate::MemoryChangeTarget::Revise {
                     memory_id,
-                    expected_revision,
+                    expected_change_id,
                 },
             };
             crate::CandidateDecision::Apply {
@@ -196,9 +190,9 @@ pub fn subjektiv_candidate_decision(
                     derived_from: memory
                         .derived_from
                         .into_iter()
-                        .map(|reference| crate::MemoryRevisionRef {
+                        .map(|reference| crate::MemoryChangeRef {
                             memory_id: reference.memory_id,
-                            revision: reference.revision,
+                            change_id: reference.change_id.clone(),
                         })
                         .collect(),
                     change_reason: memory.change_reason,
@@ -225,9 +219,9 @@ pub fn subjektiv_candidate_decision(
             },
             affected_memory: affected_memory
                 .into_iter()
-                .map(|reference| crate::MemoryRevisionRef {
+                .map(|reference| crate::MemoryChangeRef {
                     memory_id: reference.memory_id,
-                    revision: reference.revision,
+                    change_id: reference.change_id.clone(),
                 })
                 .collect(),
         },
@@ -281,17 +275,17 @@ pub fn subjektiv_candidate_decision_response(
             .into_iter()
             .map(|reference| server_api::SubjektivMemoryAffectedRef {
                 memory_id: reference.memory_id,
-                revision: reference.revision,
+                change_id: reference.change_id.clone(),
                 operation,
             })
             .collect(),
         memory: receipt
             .memory
-            .map(|memory| server_api::SubjektivMemoryRevisionRef {
+            .map(|memory| server_api::SubjektivMemoryChangeRef {
                 memory_id: memory.id,
-                revision: memory.revision,
+                change_id: memory.change_id.clone(),
             }),
-        store_revision: receipt.store_revision,
+        memory_fingerprint: receipt.memory_fingerprint,
         surface_dirty: receipt.surface_dirty,
     }
 }
@@ -316,10 +310,19 @@ pub fn subjektiv_memory_query(
         .filter(|value| !value.is_empty());
     let kinds = canonical_subjektiv_kinds(input.kinds)?;
     let states = canonical_subjektiv_states(input.states)?;
-    let subject = store
+    let _subject = store
         .subject(subject_id)
         .map_err(subjektiv_store_error)?
         .ok_or_else(|| OperationError::SubjectNotFound(subject_id.to_string()))?;
+    let all_records = store
+        .list_memories(subject_id)
+        .map_err(subjektiv_store_error)?;
+    let memory_fingerprint = crate::memory_identity_fingerprint(
+        &all_records
+            .iter()
+            .map(|r| (r.id.clone(), r.change_id.clone()))
+            .collect::<Vec<_>>(),
+    );
     let mut offset = 0;
     if let Some(cursor) = input.cursor {
         let cursor: SubjektivQueryCursor = decode_subjektiv_cursor("query", &cursor)?;
@@ -333,7 +336,7 @@ pub fn subjektiv_memory_query(
             )
             .into());
         }
-        if cursor.store_revision != subject.store_revision {
+        if cursor.memory_fingerprint != memory_fingerprint {
             return Err(OperationError::Conflict(
                 "stale_cursor: subjektiv query cursor is stale because Memory changed; restart the query".into(),
             )
@@ -344,9 +347,7 @@ pub fn subjektiv_memory_query(
 
     let kind_filter = kinds.iter().cloned().collect::<HashSet<_>>();
     let state_filter = states.iter().cloned().collect::<HashSet<_>>();
-    let records = store
-        .list_memories(subject_id)
-        .map_err(subjektiv_store_error)?
+    let records = all_records
         .into_iter()
         .filter(|record| {
             kind_filter.contains(record.kind.as_str())
@@ -369,7 +370,7 @@ pub fn subjektiv_memory_query(
         .iter()
         .map(|record| server_api::SubjektivMemoryQueryItem {
             id: record.id.clone(),
-            revision: record.revision,
+            change_id: record.change_id.clone(),
             kind: record.kind.clone(),
             state: api_memory_state(record.state),
             claim: record.claim.clone(),
@@ -383,7 +384,7 @@ pub fn subjektiv_memory_query(
                 "query",
                 &SubjektivQueryCursor {
                     subject_id: subject_id.to_string(),
-                    store_revision: subject.store_revision,
+                    memory_fingerprint: memory_fingerprint,
                     query,
                     kinds,
                     states,
@@ -407,18 +408,18 @@ pub fn subjektiv_memory_read(
     let current = store
         .scoped_memory(subject_id, &input.memory_id)
         .map_err(subjektiv_store_error)?;
-    let record = match input.revision {
-        Some(0) => {
-            return Err(
-                OperationError::InvalidInput("revision must be a positive integer".into()).into(),
-            );
+    let record = match input.change_id.clone() {
+        Some(id) if id.trim().is_empty() => {
+            return Err(OperationError::InvalidInput(
+                "change_id must be nonempty".into(),
+            ));
         }
-        Some(revision) => store
-            .scoped_memory_revision(subject_id, &input.memory_id, revision)
+        Some(change_id) => store
+            .scoped_memory_change(subject_id, &input.memory_id, change_id.clone())
             .map_err(subjektiv_store_error)?
             .ok_or_else(|| {
                 OperationError::InvalidInput(format!(
-                    "memory_revision_not_found: Memory `{}` has no revision {revision}",
+                    "memory_change_not_found: Memory `{}` has no change_id {change_id}",
                     input.memory_id
                 ))
             })?,
@@ -433,9 +434,9 @@ pub fn subjektiv_memory_read(
     }
     let body_offset = input.offset.unwrap_or(0);
     let body_byte_offset = input.byte_offset.unwrap_or(0);
-    if (body_offset > 0 || body_byte_offset > 0) && input.revision.is_none() {
+    if (body_offset > 0 || body_byte_offset > 0) && input.change_id.is_none() {
         return Err(OperationError::InvalidInput(
-            "body continuation requires the exact revision returned by the first read".into(),
+            "body continuation requires the exact change_id returned by the first read".into(),
         )
         .into());
     }
@@ -477,10 +478,10 @@ pub fn subjektiv_memory_read(
             let cursor: SubjektivEvidenceCursor = decode_subjektiv_cursor("evidence", &cursor)?;
             if cursor.subject_id != subject_id
                 || cursor.memory_id != record.id
-                || cursor.revision != record.revision
+                || cursor.change_id != record.change_id
             {
                 return Err(OperationError::InvalidInput(
-                    "subjektiv evidence cursor does not match subject, Memory, or revision".into(),
+                    "subjektiv evidence cursor does not match subject, Memory, or change_id".into(),
                 )
                 .into());
             }
@@ -570,9 +571,9 @@ pub fn subjektiv_memory_read(
         }
         let derived_index = evidence_offset - record.source_candidate_ids.len();
         let reference = &record.derived_from[derived_index];
-        derived_from.push(server_api::SubjektivMemoryRevisionRef {
+        derived_from.push(server_api::SubjektivMemoryChangeRef {
             memory_id: reference.memory_id.clone(),
-            revision: reference.revision,
+            change_id: reference.change_id.clone(),
         });
         next_evidence_offset += 1;
     } else if nested_evidence_offset != 0 || nested_source_ref_offset != 0 {
@@ -592,7 +593,7 @@ pub fn subjektiv_memory_read(
                 &SubjektivEvidenceCursor {
                     subject_id: subject_id.to_string(),
                     memory_id: record.id.clone(),
-                    revision: record.revision,
+                    change_id: record.change_id.clone(),
                     offset: next_evidence_offset,
                     evidence_offset: next_nested_evidence_offset,
                     source_ref_offset: next_nested_source_ref_offset,
@@ -603,8 +604,8 @@ pub fn subjektiv_memory_read(
 
     let mut response = server_api::SubjektivMemoryReadResponse {
         memory_id: record.id,
-        revision: record.revision,
-        current_revision: current.revision,
+        change_id: record.change_id.clone(),
+        current_change_id: current.change_id.clone(),
         kind: record.kind,
         state: api_memory_state(record.state),
         claim: record.claim,
@@ -635,36 +636,41 @@ pub fn subjektiv_memory_read(
     Ok(response)
 }
 
-pub fn subjektiv_memory_list_revisions(
+pub fn subjektiv_memory_list_changes(
     store: &crate::SubjektivStore,
     subject_id: &str,
-    input: server_api::SubjektivMemoryListRevisionsRequest,
-) -> OperationResult<server_api::SubjektivMemoryListRevisionsResponse> {
+    input: server_api::SubjektivMemoryListChangesRequest,
+) -> OperationResult<server_api::SubjektivMemoryListChangesResponse> {
     let limit = bounded_subjektiv_limit(input.limit, SUBJEKTIV_QUERY_DEFAULT_LIMIT)?;
     let current = store
         .scoped_memory(subject_id, &input.memory_id)
         .map_err(subjektiv_store_error)?;
-    let (max_revision, offset) = if let Some(cursor) = input.cursor {
-        let cursor: SubjektivRevisionCursor = decode_subjektiv_cursor("revisions", &cursor)?;
+    let (head_change_id, offset) = if let Some(cursor) = input.cursor {
+        let cursor: SubjektivChangeCursor = decode_subjektiv_cursor("changes", &cursor)?;
         if cursor.subject_id != subject_id || cursor.memory_id != input.memory_id {
             return Err(OperationError::InvalidInput(
-                "subjektiv revision cursor does not match subject or Memory".into(),
+                "subjektiv change_id cursor does not match subject or Memory".into(),
             )
             .into());
         }
-        (cursor.max_revision, cursor.offset)
+        (cursor.head_change_id, cursor.offset)
     } else {
-        (current.revision, 0)
+        (current.change_id.clone(), 0)
     };
     let records = store
-        .list_memory_revisions(subject_id, &input.memory_id)
+        .list_memory_changes(subject_id, &input.memory_id)
         .map_err(subjektiv_store_error)?
         .into_iter()
-        .filter(|record| record.revision <= max_revision)
+        .skip_while(|record| record.change_id != head_change_id)
         .collect::<Vec<_>>();
+    if records.is_empty() {
+        return Err(OperationError::InvalidInput(
+            "subjektiv history cursor refers to an unknown change".into(),
+        ));
+    }
     if offset > records.len() {
         return Err(OperationError::InvalidInput(
-            "subjektiv revision cursor offset is invalid".into(),
+            "subjektiv change_id cursor offset is invalid".into(),
         )
         .into());
     }
@@ -672,8 +678,8 @@ pub fn subjektiv_memory_list_revisions(
     let has_more = end < records.len();
     let items = records[offset..end]
         .iter()
-        .map(|record| server_api::SubjektivMemoryRevisionItem {
-            revision: record.revision,
+        .map(|record| server_api::SubjektivMemoryChangeItem {
+            change_id: record.change_id.clone(),
             kind: record.kind.clone(),
             state: api_memory_state(record.state),
             claim: record.claim.clone(),
@@ -684,19 +690,19 @@ pub fn subjektiv_memory_list_revisions(
     let next_cursor = has_more
         .then(|| {
             encode_subjektiv_cursor(
-                "revisions",
-                &SubjektivRevisionCursor {
+                "changes",
+                &SubjektivChangeCursor {
                     subject_id: subject_id.to_string(),
                     memory_id: input.memory_id.clone(),
-                    max_revision,
+                    head_change_id,
                     offset: end,
                 },
             )
         })
         .transpose()?;
-    Ok(server_api::SubjektivMemoryListRevisionsResponse {
+    Ok(server_api::SubjektivMemoryListChangesResponse {
         memory_id: input.memory_id,
-        current_revision: current.revision,
+        current_change_id: current.change_id.clone(),
         items,
         next_cursor,
         has_more,
@@ -708,25 +714,25 @@ pub fn subjektiv_memory_validate_proposal(
     subject_id: &str,
     input: server_api::SubjektivMemoryValidateProposalRequest,
 ) -> OperationResult<server_api::SubjektivMemoryProposalValidationResponse> {
-    if input.expected_revision == 0 {
+    if input.expected_change_id.trim().is_empty() {
         return Err(
-            OperationError::InvalidInput("expected_revision must be positive".into()).into(),
+            OperationError::InvalidInput("expected_change_id must be nonempty".into()).into(),
         );
     }
     let current = store
         .scoped_memory(subject_id, &input.memory_id)
         .map_err(subjektiv_store_error)?;
-    if current.revision != input.expected_revision {
+    if current.change_id != input.expected_change_id {
         return Err(OperationError::Conflict(format!(
-            "revision_conflict: Memory `{}` expected {}, current {}",
-            input.memory_id, input.expected_revision, current.revision
+            "change_conflict: Memory `{}` expected {}, current {}",
+            input.memory_id, input.expected_change_id, current.change_id
         ))
         .into());
     }
     validate_subjektiv_proposal_transition(current.state, input.intent)?;
     Ok(server_api::SubjektivMemoryProposalValidationResponse {
         memory_id: input.memory_id,
-        current_revision: current.revision,
+        current_change_id: current.change_id.clone(),
         kind: current.kind,
         state: api_memory_state(current.state),
         intent: input.intent,
@@ -821,10 +827,10 @@ pub fn subjektiv_memory_stage_explicit(
         .proposal
         .as_ref()
         .map(|proposal| {
-            crate::RevisionProposal::new(
+            crate::ChangeProposal::new(
                 domain_proposal_intent(proposal.intent),
                 proposal.memory_id.clone(),
-                proposal.expected_revision,
+                proposal.expected_change_id.clone(),
                 proposal.change_reason.clone(),
             )
         })
@@ -836,7 +842,7 @@ pub fn subjektiv_memory_stage_explicit(
             .map_err(subjektiv_store_error)?;
         if current.kind != input.kind {
             return Err(OperationError::InvalidInput(
-                "revision proposal kind must be derived from its target Memory".into(),
+                "change_id proposal kind must be derived from its target Memory".into(),
             )
             .into());
         }
@@ -859,7 +865,7 @@ pub fn subjektiv_memory_stage_explicit(
     let mut staging = crate::SubjectStagingRecord::attach(&attribution.subject_id, staging);
     if let Some(proposal) = proposal.clone() {
         staging
-            .attach_revision_proposal(proposal)
+            .attach_change_proposal(proposal)
             .map_err(subjektiv_store_error)?;
     }
     let (staged, _) = store
@@ -873,7 +879,7 @@ pub fn subjektiv_memory_stage_explicit(
             .as_ref()
             .map(|proposal| server_api::SubjektivMemoryProposalTarget {
                 memory_id: proposal.memory_id.clone(),
-                expected_revision: proposal.expected_revision,
+                expected_change_id: proposal.expected_change_id.clone(),
             }),
         intent: proposal
             .as_ref()
@@ -883,10 +889,10 @@ pub fn subjektiv_memory_stage_explicit(
 
 pub fn validate_subjektiv_proposal_transition(
     state: crate::MemoryState,
-    intent: server_api::SubjektivMemoryRevisionIntent,
+    intent: server_api::SubjektivMemoryChangeIntent,
 ) -> OperationResult<()> {
     use crate::MemoryState::{Active, Resolved};
-    use server_api::SubjektivMemoryRevisionIntent::{Reopen, Resolve, Retract, Revise};
+    use server_api::SubjektivMemoryChangeIntent::{Reopen, Resolve, Retract, Revise};
     let valid = match intent {
         Revise => matches!(state, Active | Resolved),
         Resolve => state == Active,
@@ -979,32 +985,24 @@ pub fn subjektiv_memory_state_name(state: crate::MemoryState) -> &'static str {
 }
 
 pub fn domain_proposal_intent(
-    intent: server_api::SubjektivMemoryRevisionIntent,
-) -> crate::RevisionProposalIntent {
+    intent: server_api::SubjektivMemoryChangeIntent,
+) -> crate::ChangeProposalIntent {
     match intent {
-        server_api::SubjektivMemoryRevisionIntent::Revise => crate::RevisionProposalIntent::Revise,
-        server_api::SubjektivMemoryRevisionIntent::Resolve => {
-            crate::RevisionProposalIntent::Resolve
-        }
-        server_api::SubjektivMemoryRevisionIntent::Retract => {
-            crate::RevisionProposalIntent::Retract
-        }
-        server_api::SubjektivMemoryRevisionIntent::Reopen => crate::RevisionProposalIntent::Reopen,
+        server_api::SubjektivMemoryChangeIntent::Revise => crate::ChangeProposalIntent::Revise,
+        server_api::SubjektivMemoryChangeIntent::Resolve => crate::ChangeProposalIntent::Resolve,
+        server_api::SubjektivMemoryChangeIntent::Retract => crate::ChangeProposalIntent::Retract,
+        server_api::SubjektivMemoryChangeIntent::Reopen => crate::ChangeProposalIntent::Reopen,
     }
 }
 
 pub fn api_proposal_intent(
-    intent: crate::RevisionProposalIntent,
-) -> server_api::SubjektivMemoryRevisionIntent {
+    intent: crate::ChangeProposalIntent,
+) -> server_api::SubjektivMemoryChangeIntent {
     match intent {
-        crate::RevisionProposalIntent::Revise => server_api::SubjektivMemoryRevisionIntent::Revise,
-        crate::RevisionProposalIntent::Resolve => {
-            server_api::SubjektivMemoryRevisionIntent::Resolve
-        }
-        crate::RevisionProposalIntent::Retract => {
-            server_api::SubjektivMemoryRevisionIntent::Retract
-        }
-        crate::RevisionProposalIntent::Reopen => server_api::SubjektivMemoryRevisionIntent::Reopen,
+        crate::ChangeProposalIntent::Revise => server_api::SubjektivMemoryChangeIntent::Revise,
+        crate::ChangeProposalIntent::Resolve => server_api::SubjektivMemoryChangeIntent::Resolve,
+        crate::ChangeProposalIntent::Retract => server_api::SubjektivMemoryChangeIntent::Retract,
+        crate::ChangeProposalIntent::Reopen => server_api::SubjektivMemoryChangeIntent::Reopen,
     }
 }
 
@@ -1189,6 +1187,7 @@ pub fn bounded_subjektiv_evidence_origin(
         &mut origin.worker_id,
         &mut origin.flow_selector,
         &mut origin.flow_definition_id,
+        &mut origin.flow_definition_fingerprint,
     ] {
         if let Some(value) = field.take() {
             *field = Some(bounded_utf8_bytes(value, SUBJEKTIV_ANCHOR_TEXT_MAX_BYTES));
@@ -1294,10 +1293,10 @@ pub fn subjektiv_store_error(error: crate::SubjektivError) -> OperationError {
         crate::SubjektivError::SubjectScopeMismatch { .. } => {
             OperationError::PermissionDenied(format!("subject_scope_mismatch: {error}"))
         }
-        crate::SubjektivError::RevisionConflict { .. }
+        crate::SubjektivError::MemoryChangeConflict { .. }
         | crate::SubjektivError::SubjectBehaviorConflict { .. }
         | crate::SubjektivError::SurfaceGenerationConflict(_) => {
-            OperationError::Conflict(format!("revision_conflict: {error}"))
+            OperationError::Conflict(format!("change_conflict: {error}"))
         }
         crate::SubjektivError::CandidateResolved(_)
         | crate::SubjektivError::DecisionRequestConflict(_) => {

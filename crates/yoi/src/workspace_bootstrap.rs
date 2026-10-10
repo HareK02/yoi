@@ -358,7 +358,6 @@ mod tests {
             kind: "git".to_string(),
             provider: "builtin:git".to_string(),
             source,
-            source_revision: 1,
             source_fingerprint: "fingerprint".to_string(),
             observed_status: server_api::RepositoryObservedStatus::Unverified,
             observed_at: None,
@@ -407,7 +406,6 @@ mod tests {
             let body = serde_json::json!({
                 "workspace": workspace_summary("workspace-a", "Research"),
                 "repository": null,
-                "config_revision": 0,
                 "request_fingerprint": "fingerprint",
                 "replayed": replayed,
             });
@@ -430,14 +428,12 @@ mod tests {
                 "provider": "builtin:git",
                 "source": {"kind": "local_path", "uri": "/checkout/platform"},
                 "default_ref": "develop",
-                "source_revision": 1,
                 "source_fingerprint": "fingerprint",
                 "observed_status": "unverified",
                 "observed_at": null,
                 "created_at": "2026-01-01T00:00:00Z",
                 "updated_at": "2026-01-01T00:00:00Z",
             },
-            "config_revision": 1,
             "request_fingerprint": "fingerprint",
             "replayed": false,
         });

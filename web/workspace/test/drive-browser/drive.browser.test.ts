@@ -10,7 +10,7 @@ const ready = (page: Page) =>
 const button = (page: Page, name: string) =>
   page.getByRole("button", { name, exact: true });
 const draft = (page: Page) =>
-  page.getByRole("textbox", { name: /^Draft \(expected revision/ });
+  page.getByRole("textbox", { name: /^Draft$/ });
 const preview = (page: Page) =>
   page.getByRole("article", { name: "Current saved content" });
 function gate() {
@@ -135,7 +135,7 @@ async function safeFulfill(
   } catch { /* selection intentionally canceled this old request */ }
 }
 
-Deno.test("production Drive two tabs retain losing CAS draft and never retry with a newer revision", () =>
+Deno.test("production Drive two tabs retain losing CAS draft and never retry with a newer observation", () =>
   harness(async (origin, browser) => {
     const context = await browser.newContext();
     const first = await context.newPage(), second = await context.newPage();
@@ -151,7 +151,7 @@ Deno.test("production Drive two tabs retain losing CAS draft and never retry wit
       await first.getByText("Published — DB commit confirmed", { exact: false })
         .last().waitFor();
       await button(second, "Save").click();
-      await second.getByText("Revision conflict — your draft is retained.", {
+      await second.getByText("Content changed — your draft is retained.", {
         exact: true,
       })
         .waitFor();
@@ -167,7 +167,7 @@ Deno.test("production Drive two tabs retain losing CAS draft and never retry wit
         "Second actor unsaved draft",
       );
       assert(
-        (await second.getByText("Draft (expected revision 1)", { exact: false })
+        (await second.getByText("Draft", { exact: false })
           .count()) > 0,
       );
       assert(
@@ -187,7 +187,7 @@ Deno.test("production Drive two tabs retain losing CAS draft and never retry wit
       const casWrites = (await logs(origin)).filter((x) =>
         x.path === "/mutate"
       );
-      assertEquals(casWrites.map((x) => [x.nodeId, x.expectedRevision]), [[
+      assertEquals(casWrites.map((x) => [x.nodeId, x.expectedMutationId]), [[
         "3",
         "1",
       ], ["3", "1"]]);
@@ -229,7 +229,7 @@ Deno.test("production Drive delayed old read cannot replace another file or work
         .last().waitFor();
       const mutation = (await logs(origin)).filter((x) => x.path === "/mutate");
       assertEquals(
-        mutation.map((x) => [x.workspace, x.nodeId, x.expectedRevision]),
+        mutation.map((x) => [x.workspace, x.nodeId, x.expectedMutationId]),
         [[
           "home-owner",
           "4",
@@ -330,12 +330,14 @@ Deno.test("production Drive delayed old save and status preserve destination dra
       const pinnedWrites = (await logs(origin)).filter((x) =>
         x.path === "/mutate"
       );
-      assertEquals(pinnedWrites.map((x) => [x.nodeId, x.expectedRevision]), [
+      assertEquals(pinnedWrites.map((x) => [x.nodeId, x.expectedMutationId]), [
         ["3", "1"],
         ["4", "1"],
-        ["3", "2"],
-        ["4", "2"],
+        ["3", pinnedWrites[0].requestId],
+        ["4", pinnedWrites[1].requestId],
       ]);
+      assert(pinnedWrites.every((x) => typeof x.requestId === "string" && x.requestId.length > 0));
+      assertEquals(new Set(pinnedWrites.map((x) => x.requestId)).size, 4);
     } finally {
       release.release();
       await handled;

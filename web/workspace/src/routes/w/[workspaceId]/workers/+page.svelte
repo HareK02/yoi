@@ -12,7 +12,7 @@
   } from '#lib/workspace/api/runtime-workers.ts';
   import { workerHref } from '#lib/workspace/resource-links.ts';
   import { formatWorkdirPermissions } from '#lib/workspace/settings/workdir-permissions.ts';
-  import { formatCurrentWorkdirRevision } from '#lib/workspace/settings/workdir-revision.ts';
+  import { formatCurrentWorkdirCheckout } from '#lib/workspace/settings/workdir-checkout.ts';
   import { canOpenWorkerConsole } from '#lib/workspace/sidebar/workers.ts';
   import { liveWorkerState } from '#lib/workspace/sidebar/worker-state.ts';
   import type { CleanupWorkerCandidate, RuntimeCleanupPlanResponse, Worker } from '#lib/workspace/sidebar/types.ts';
@@ -48,17 +48,17 @@
     workers = initial.workers?.items ?? [];
     cleanupPlans = initial.cleanupPlans;
     let previousCatalog: string | undefined;
-    let previousObservation: number | undefined;
+    let previousRequest: AbortSignal | null | undefined;
     let previousRefreshing: boolean | undefined;
     const scope = actionScope();
     const unsubscribe = workspaceWorkersStore(id).subscribe((state) => {
       if (!scope.isCurrent()) return;
-      const observationChanged = previousObservation !== state.observationVersion;
+      const observationChanged = previousRequest !== state.catalogRequest;
       const refreshStarted = state.catalogRefreshing && previousRefreshing !== true;
       const refreshCompleted = !state.catalogRefreshing && previousRefreshing === true;
       const catalog = state.catalogWorkers === null ? undefined : JSON.stringify(state.catalogWorkers);
       const catalogChanged = catalog !== previousCatalog;
-      previousObservation = state.observationVersion;
+      previousRequest = state.catalogRequest;
       previousRefreshing = state.catalogRefreshing;
       previousCatalog = catalog;
       catalogRefreshing = state.catalogRefreshing;
@@ -210,7 +210,7 @@
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
-            expected_plan_revision: plan.revision,
+
             expected_plan_digest: plan.digest,
             worker_target_ids: [candidate.target_id],
             workdir_target_ids: [],
@@ -261,7 +261,7 @@
       if (directory.source.kind === 'external_grant') {
         return `${alias}: ${label} · ${formatWorkdirPermissions(effective_permissions)}`;
       }
-      return `${alias}: ${label} · ${formatCurrentWorkdirRevision(directory, provider)}`;
+      return `${alias}: ${label} · ${formatCurrentWorkdirCheckout(directory, provider)}`;
     }).join(', ');
   }
 </script>

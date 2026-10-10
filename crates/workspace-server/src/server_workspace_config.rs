@@ -268,7 +268,8 @@ fn tree(api: &WorkspaceApi) -> ConfigResult<crate::config_source::WorkspaceConfi
 fn validator(
     grant: &WorkspaceConfigGrantResponse,
     link: &WorkerWorkdirLinkRecord,
-    snapshot: &ConfigTreeSnapshot,
+    state: &crate::config_source::WorkspaceConfigState,
+    applied_schema_fingerprint: &str,
     path: &str,
 ) -> String {
     let bound = serde_json::to_vec(&(
@@ -280,8 +281,10 @@ fn validator(
         &link.connection_id,
         effective_access(grant, link),
         path,
-        snapshot.revision,
-        &snapshot.digest,
+        &state.snapshot.digest,
+        &state.contract.fingerprint,
+        &state.projection_digest,
+        applied_schema_fingerprint,
     ))
     .expect("bounded configuration validator tuple");
     format!(
@@ -313,6 +316,11 @@ pub(super) async fn observe(
     let _guard = lock(api, worker).await?;
     let (grant, link) = resolve(api, worker, &request.connection_id)?;
     let state = tree(api)?;
+    let schema_fingerprint = api
+        .config_schema_registry
+        .compose()
+        .map_err(pre_error)?
+        .fingerprint;
     let snapshot = &state.snapshot;
     let writable = effective_access(&grant, &link) == Access::ReadWrite;
     // Build only bounded metadata (the canonical tree itself is bounded by config-source).
@@ -386,7 +394,7 @@ pub(super) async fn observe(
                 }
             }
             WorkspaceConfigNode {
-                validator: validator(&grant, &link, snapshot, &path),
+                validator: validator(&grant, &link, &state, &schema_fingerprint, &path),
                 path,
                 kind,
                 digest: entry.map(|entry| entry.content_digest.clone()),
@@ -402,8 +410,7 @@ pub(super) async fn observe(
         .collect();
     Ok(WorkspaceConfigObserveResponse {
         connection_id: link.connection_id.clone(),
-        validator: validator(&grant, &link, snapshot, ""),
-        revision: snapshot.revision,
+        validator: validator(&grant, &link, &state, &schema_fingerprint, ""),
         digest: snapshot.digest.clone(),
         entrypoints: state
             .contract
@@ -423,7 +430,12 @@ pub(super) async fn read(
     let _guard = lock(api, worker).await?;
     let (grant, link) = resolve(api, worker, &request.connection_id)?;
     let state = tree(api)?;
-    let expected = validator(&grant, &link, &state.snapshot, &request.path);
+    let schema_fingerprint = api
+        .config_schema_registry
+        .compose()
+        .map_err(pre_error)?
+        .fingerprint;
+    let expected = validator(&grant, &link, &state, &schema_fingerprint, &request.path);
     check_validator(&request.validator, &expected)?;
     let path =
         config_source::VirtualPath::parse(&request.path).map_err(|_| fail(400, "invalid_path"))?;
@@ -476,9 +488,14 @@ pub(super) async fn commit(
         return Err(fail(403, "access_denied"));
     }
     let state = tree(api)?;
+    let schema_fingerprint = api
+        .config_schema_registry
+        .compose()
+        .map_err(pre_error)?
+        .fingerprint;
     check_validator(
         &request.validator,
-        &validator(&grant, &link, &state.snapshot, ""),
+        &validator(&grant, &link, &state, &schema_fingerprint, ""),
     )?;
     let canonical = config_commit_request_from_api(request.request).map_err(pre_error)?;
     // Evaluation/semantic validation are pure preparation. Bound this stage
@@ -496,6 +513,13 @@ pub(super) async fn commit(
         .map_err(|_| fail(503, "evaluation_timeout"))?
         .map_err(|_| fail(500, "evaluation_unavailable"))?
         .map_err(pre_error)?;
+    if candidate.base_digest != state.snapshot.digest
+        || candidate.base_toolchain_fingerprint != state.contract.fingerprint
+        || candidate.base_projection_digest != state.projection_digest
+        || candidate.contract.schema_bundle.fingerprint != schema_fingerprint
+    {
+        return Err(fail(409, "stale_validator"));
+    }
     // Recheck durable authority before the first auxiliary/canonical effects.
     let (current_grant, current_link) = resolve(api, worker, &request.connection_id)?;
     if current_grant != grant || current_link.capabilities != link.capabilities {
@@ -506,8 +530,7 @@ pub(super) async fn commit(
     let state = persist_workspace_config_candidate(api, &api.config.workspace_id, &candidate)
         .map_err(|_| unknown())?;
     Ok(WorkspaceConfigCommitResponse {
-        validator: validator(&grant, &link, &state.snapshot, ""),
-        revision: state.snapshot.revision,
+        validator: validator(&grant, &link, &state, &schema_fingerprint, ""),
         digest: state.snapshot.digest,
     })
 }

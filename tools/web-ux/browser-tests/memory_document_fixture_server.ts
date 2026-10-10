@@ -26,7 +26,7 @@ const subjectPageCursor = "fixture-subject-page-2";
 const emptySubjectPageCursor = "fixture-empty-subject-page";
 const errorSubjectPageCursor = "fixture-error-subject-page";
 const memoryPageCursor = "fixture-memory-page-2";
-const revisionPageCursor = "fixture-revision-page-2";
+const changePageCursor = "fixture-change-page-2";
 const createdSubjectIds = new Set<string>();
 const subjectCreateRequests: unknown[] = [];
 let createdSubjectCount = 0;
@@ -51,7 +51,7 @@ const surfaceBodyMd =
 
 const detailBodyMd = `# Committed Memory detail
 
-This immutable revision preserves its candidate evidence, source refs, and derivation refs.
+This immutable change preserves its candidate evidence, source refs, and derivation refs.
 
 | Local table overflow | Value |
 | --- | --- |
@@ -70,18 +70,17 @@ const subjects = [
     representativeSubjectId,
     "Release coordination",
     "active",
-    42,
+    "fingerprint-current",
     "Prefer explicit evidence over assumptions.\nAsk before irreversible actions, and state uncertainty plainly.",
-    3,
     connectedWorker("Release coordination Worker with a deliberately long display name"),
   ),
-  subject(emptySubjectId, "Empty ready subject", "active", 0),
-  subject(staleSubjectId, "Stale surface subject", "active", 19),
-  subject(failedSubjectId, "Failed surface subject", "active", 8),
-  subject(ungeneratedSubjectId, "Ungenerated subject", "active", 0),
-  subject(errorSubjectId, "Unavailable subject", "retired", 3),
+  subject(emptySubjectId, "Empty ready subject", "active", "fingerprint-0"),
+  subject(staleSubjectId, "Stale surface subject", "active", "fingerprint-19"),
+  subject(failedSubjectId, "Failed surface subject", "active", "fingerprint-8"),
+  subject(ungeneratedSubjectId, "Ungenerated subject", "active", "fingerprint-0"),
+  subject(errorSubjectId, "Unavailable subject", "retired", "fingerprint-3"),
 ];
-const pagedSubject = subject(pagedSubjectId, "Subject on the next page", "active", 1);
+const pagedSubject = subject(pagedSubjectId, "Subject on the next page", "active", "fingerprint-1");
 
 function connectedWorker(displayName: string) {
   return {
@@ -111,18 +110,16 @@ function subject(
   id: string,
   role: string,
   state: "active" | "retired",
-  storeRevision: number,
+  memoryFingerprint: string,
   behaviorMd = "",
-  behaviorRevision = 0,
   currentWorker?: ReturnType<typeof connectedWorker>,
 ) {
   return {
     id,
     role,
     behavior_md: behaviorMd,
-    behavior_revision: behaviorRevision,
     state,
-    store_revision: storeRevision,
+    memory_fingerprint: memoryFingerprint,
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-02T03:04:05Z",
     ...(currentWorker ? { current_worker: currentWorker } : {}),
@@ -134,14 +131,14 @@ function memoriesFor(subjectId: string) {
   if (subjectId === emptySubjectId || subjectId === ungeneratedSubjectId) return [];
   if (subjectId === staleSubjectId) {
     return [
-      memorySummary("stale-memory-1", 2, "lesson", "resolved", "A resolved stale-surface lesson"),
+      memorySummary("stale-memory-1", "change-earlier", "lesson", "resolved", "A resolved stale-surface lesson"),
     ];
   }
   if (subjectId === failedSubjectId) {
     return [
       memorySummary(
         "failed-memory-1",
-        1,
+        "change-original",
         "constraint",
         "retracted",
         "A retracted failed-surface constraint",
@@ -151,21 +148,21 @@ function memoriesFor(subjectId: string) {
   return [
     memorySummary(
       representativeMemoryId,
-      3,
+      "change-current",
       "decision",
       "active",
       "Keep subject Memory provenance typed and visible",
     ),
     memorySummary(
       "memory-resolved-0002",
-      2,
+      "change-earlier",
       "lesson",
       "resolved",
       "The bounded reader must preserve continuations",
     ),
     memorySummary(
       "memory-retracted-0003",
-      1,
+      "change-original",
       "working_assumption",
       "retracted",
       "Memory list end marker for scroll validation",
@@ -175,18 +172,18 @@ function memoriesFor(subjectId: string) {
 
 function memorySummary(
   id: string,
-  revision: number,
+  changeId: string,
   kind: string,
   state: string,
   claim: string,
 ) {
   return {
     id,
-    revision,
+    change_id: changeId,
     kind,
     state,
     claim,
-    excerpt: `Read-only ${state} Memory with exact revision and provenance metadata.`,
+    excerpt: `Read-only ${state} Memory with exact change ID and provenance metadata.`,
     updated_at: "2026-01-02T03:04:05Z",
   };
 }
@@ -200,10 +197,10 @@ function surfaceFor(subjectId: string) {
         snapshot_id: "surface-snapshot-0042",
         body_md: surfaceBodyMd,
         memory_refs: [
-          { memory_id: representativeMemoryId, revision: 3 },
-          { memory_id: derivedMemoryId, revision: 4 },
+          { memory_id: representativeMemoryId, change_id: "change-current" },
+          { memory_id: derivedMemoryId, change_id: "change-parent" },
         ],
-        built_from_store_revision: 42,
+        built_from_memory_fingerprint: "fingerprint-current",
         created_at: "2026-01-02T03:04:05Z",
       },
     };
@@ -216,7 +213,7 @@ function surfaceFor(subjectId: string) {
         snapshot_id: "surface-snapshot-empty",
         body_md: "",
         memory_refs: [],
-        built_from_store_revision: 0,
+        built_from_memory_fingerprint: "fingerprint-0",
         created_at: "2026-01-02T03:04:05Z",
       },
     };
@@ -226,27 +223,28 @@ function surfaceFor(subjectId: string) {
   return { subject_id: subjectId, availability: "ungenerated" };
 }
 
-function memoryDetail(memoryId: string, requestedRevision: number | null) {
-  const revision = requestedRevision && requestedRevision <= 3 ? requestedRevision : 3;
-  const states = { 1: "retracted", 2: "resolved", 3: "active" } as const;
+function memoryDetail(memoryId: string, requestedChangeId: string | null) {
+  const currentChangeId = memoryId === derivedMemoryId ? "change-parent" : "change-current";
+  const changeId = requestedChangeId ?? currentChangeId;
+  const states: Record<string, string> = { "change-original": "retracted", "change-earlier": "resolved", "change-current": "active", "change-parent": "active" };
   return {
     memory_id: memoryId,
-    revision,
-    current_revision: 3,
+    change_id: changeId,
+    current_change_id: currentChangeId,
     kind: "decision",
-    state: states[revision as keyof typeof states],
-    claim: revision === 3
+    state: states[changeId],
+    claim: changeId === "change-current"
       ? "Keep subject Memory provenance typed and visible"
-      : `Historical provenance decision, revision ${revision}`,
+      : `Historical provenance decision, change ${changeId}`,
     body_md: detailBodyMd,
     why_useful:
       "Future readers can audit why a committed Memory exists without exposing unbounded session content.",
     staleness: null,
-    change_reason: revision === 3
+    change_reason: changeId === "change-current"
       ? "Clarified the durable read contract."
-      : "Immutable historical revision.",
+      : "Immutable historical change.",
     created_at: "2026-01-01T00:00:00Z",
-    updated_at: `2026-01-0${revision}T03:04:05Z`,
+    updated_at: "2026-01-02T03:04:05Z",
     body_offset: 0,
     body_byte_offset: 0,
     body_truncated: false,
@@ -264,7 +262,6 @@ function memoryDetail(memoryId: string, requestedRevision: number | null) {
           worker_id: "worker-fixture",
           flow_selector: "builtin:coder-review",
           flow_definition_id: "flow-definition-fixture",
-          flow_definition_revision: 7,
         },
         excerpt: "Use normal explicit subject routes and preserve provenance.",
         summary: "The product contract was explicitly requested.",
@@ -279,20 +276,20 @@ function memoryDetail(memoryId: string, requestedRevision: number | null) {
         origin: { kind: "human_input", account_id: "account-fixture" },
         evidence_kind: "message",
         label: "Memory information design source",
-        summary: "Bounded source reference retained with the committed revision.",
+        summary: "Bounded source reference retained with the committed change.",
       }],
       source_refs_total: 1,
       source_refs_truncated: false,
     }],
-    derived_from: [{ memory_id: derivedMemoryId, revision: 4 }],
+    derived_from: [{ memory_id: derivedMemoryId, change_id: "change-parent" }],
     evidence_has_more: false,
   };
 }
 
-function revisions(memoryId: string, cursor: string | null) {
+function changes(memoryId: string, cursor: string | null) {
   const all = [
     {
-      revision: 3,
+      change_id: "change-current",
       kind: "decision",
       state: "active",
       claim: "Keep subject Memory provenance typed and visible",
@@ -300,28 +297,28 @@ function revisions(memoryId: string, cursor: string | null) {
       updated_at: "2026-01-03T03:04:05Z",
     },
     {
-      revision: 2,
+      change_id: "change-earlier",
       kind: "decision",
       state: "resolved",
-      claim: "Historical provenance decision, revision 2",
+      claim: "Historical provenance decision, change change-earlier",
       change_reason: "Resolved after endpoint integration.",
       updated_at: "2026-01-02T03:04:05Z",
     },
     {
-      revision: 1,
+      change_id: "change-original",
       kind: "decision",
       state: "retracted",
-      claim: "Historical provenance decision, revision 1",
+      claim: "Historical provenance decision, change change-original",
       change_reason: "Retracted the legacy shape.",
       updated_at: "2026-01-01T03:04:05Z",
     },
   ];
-  const continued = cursor === revisionPageCursor;
+  const continued = cursor === changePageCursor;
   return {
     memory_id: memoryId,
-    current_revision: 3,
+    current_change_id: "change-current",
     items: continued ? all.slice(2) : all.slice(0, 2),
-    ...(continued ? {} : { next_cursor: revisionPageCursor }),
+    ...(continued ? {} : { next_cursor: changePageCursor }),
     has_more: !continued,
   };
 }
@@ -410,6 +407,9 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   if (url.pathname === `/api/w/${workspaceId}/working-directories`) {
     return json({ workspace_id: workspaceId, items: [], diagnostics: [] });
   }
+  if (url.pathname === `/api/w/${workspaceId}/workers`) {
+    return json({ workspace_id: workspaceId, limit: 200, items: [], source: "fixture", diagnostics: [] });
+  }
   if (url.pathname === `/api/w/${workspaceId}/workers/launch-options`) {
     return json({
       workspace_id: workspaceId,
@@ -462,7 +462,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
       }
       createdSubjectCount += 1;
       const id = `created-subject-${String(createdSubjectCount).padStart(4, "0")}`;
-      const created = subject(id, payload.role, "active", 0, payload.behavior_md);
+      const created = subject(id, payload.role, "active", "fingerprint-empty", payload.behavior_md);
       createdSubjectIds.add(id);
       subjects.unshift(created);
       return json(created, 201);
@@ -493,21 +493,20 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
 
     if (parts.length === 2 && parts[1] === "behavior" && request.method === "PATCH") {
       const payload = await request.json().catch(() => null) as {
-        expected_behavior_revision?: unknown;
+        expected_behavior_md?: unknown;
         behavior_md?: unknown;
       } | null;
       if (
         !payload ||
-        typeof payload.expected_behavior_revision !== "number" ||
+        typeof payload.expected_behavior_md !== "string" ||
         typeof payload.behavior_md !== "string"
       ) {
         return json({ error: "Bad Request", message: "invalid behavior update" }, 400);
       }
-      if (payload.expected_behavior_revision !== foundSubject.behavior_revision) {
-        return json({ error: "Conflict", message: "subject behavior revision conflict" }, 409);
+      if (payload.expected_behavior_md !== foundSubject.behavior_md) {
+        return json({ error: "Conflict", message: "subject behavior content conflict" }, 409);
       }
       foundSubject.behavior_md = payload.behavior_md;
-      foundSubject.behavior_revision += 1;
       foundSubject.updated_at = "2026-01-03T04:05:06Z";
       return json(foundSubject);
     }
@@ -518,7 +517,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
       const paginated = subjectId === representativeSubjectId;
       const continued = paginated && url.searchParams.get("cursor") === memoryPageCursor;
       const items = continued
-        ? [memorySummary("memory-page-two", 1, "lesson", "active", "Memory on the next page")]
+        ? [memorySummary("memory-page-two", "change-original", "lesson", "active", "Memory on the next page")]
         : memoriesFor(subjectId);
       return json({
         items,
@@ -528,12 +527,14 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
     }
     if (parts.length >= 3 && parts[1] === "memories") {
       const memoryId = parts[2];
-      if (parts.length === 4 && parts[3] === "revisions") {
-        return json(revisions(memoryId, url.searchParams.get("cursor")));
+      if (parts.length === 4 && parts[3] === "changes") {
+        return json(changes(memoryId, url.searchParams.get("cursor")));
       }
       if (parts.length === 3) {
-        const requested = url.searchParams.get("revision");
-        return json(memoryDetail(memoryId, requested === null ? null : Number(requested)));
+        const requested = url.searchParams.get("change_id");
+        const knownChanges = memoryId === derivedMemoryId ? ["change-parent"] : ["change-original", "change-earlier", "change-current"];
+        if (requested !== null && !knownChanges.includes(requested)) return json({}, 404);
+        return json(memoryDetail(memoryId, requested));
       }
     }
   }

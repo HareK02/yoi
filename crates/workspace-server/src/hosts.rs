@@ -564,7 +564,7 @@ pub enum WorkerSpawnIntent {
         job_id: String,
         attempt_id: String,
         purpose: String,
-        input_revision: String,
+        input_digest: String,
         subjektiv_consolidation: bool,
     },
     TicketRole {
@@ -1723,8 +1723,8 @@ impl RuntimeRegistry {
                             "workspace_prompt_projection_notification_failed",
                             HostDiagnosticSeverity::Warning,
                             format!(
-                                "runtime '{}' rejected Workspace Prompt projection revision {}: {message}",
-                                runtime.runtime_id(), projection.config_revision
+                                "runtime '{}' rejected Workspace Prompt projection digest {}: {message}",
+                                runtime.runtime_id(), projection.projection_digest
                             ),
                         )
                     })
@@ -3614,22 +3614,33 @@ impl WorkspaceRuntimeAuthorization {
                 "Workspace Runtime binding is missing its Workspace key".to_string(),
             )
         })?;
-        let trust_generation = binding.workspace_key_generation.ok_or_else(|| {
+        let workspace_public_key_fingerprint = binding
+            .workspace_public_key_fingerprint
+            .as_deref()
+            .ok_or_else(|| {
+                diagnostic(
+                    "workspace_runtime_authorization_invalid",
+                    HostDiagnosticSeverity::Error,
+                    "Workspace Runtime binding is missing its Workspace public key fingerprint"
+                        .to_string(),
+                )
+            })?;
+        let workspace_trust_id = binding.workspace_trust_id.as_deref().ok_or_else(|| {
             diagnostic(
                 "workspace_runtime_authorization_invalid",
                 HostDiagnosticSeverity::Error,
-                "Workspace Runtime binding is missing its trust generation".to_string(),
+                "Workspace Runtime binding is missing its Workspace trust ID".to_string(),
             )
         })?;
         if identity.state != "active"
             || identity.key_id != workspace_key_id
-            || identity.revision != trust_generation
+            || identity.public_key_fingerprint.as_deref() != Some(workspace_public_key_fingerprint)
             || !self
                 .store
                 .workspace_runtime_verification_matches(
                     &binding,
-                    identity.revision,
-                    trust_generation,
+                    workspace_public_key_fingerprint,
+                    workspace_trust_id,
                 )
                 .map_err(|error| {
                     diagnostic(
@@ -3650,9 +3661,9 @@ impl WorkspaceRuntimeAuthorization {
             issuer: self.backend_url.clone(),
             issuer_workspace_id: binding.workspace_id.clone(),
             issuer_key_id: identity.key_id,
-            issuer_identity_revision: identity.revision,
-            trust_generation,
-            binding_revision: binding.binding_revision,
+            issuer_public_key_fingerprint: workspace_public_key_fingerprint.to_string(),
+            trust_id: workspace_trust_id.to_string(),
+            binding_id: binding.binding_id.clone(),
             runtime_id: binding.runtime_id.clone(),
             worker_id: worker_id.map(str::to_string),
             operation: operation.to_string(),
@@ -5726,13 +5737,13 @@ fn runtime_create_worker_request(
             WorkerSpawnIntent::BackendJob {
                 job_id,
                 attempt_id,
-                input_revision,
+                input_digest,
                 subjektiv_consolidation,
                 ..
             } => Some(worker_runtime::catalog::BackendJobExecutionBinding {
                 job_id: job_id.clone(),
                 attempt_id: attempt_id.clone(),
-                input_revision: Some(input_revision.clone()),
+                input_digest: Some(input_digest.clone()),
                 subjektiv_consolidation: *subjektiv_consolidation,
             }),
             _ => None,
@@ -5824,7 +5835,6 @@ fn builtin_profile_config_bundle(
         metadata: ConfigBundleMetadata {
             id,
             digest: String::new(),
-            revision: "workspace-runtime-v0".to_string(),
             workspace_id: workspace_id.to_string(),
             created_at: "runtime-generated".to_string(),
             provenance: ConfigBundleProvenance {
@@ -6771,7 +6781,6 @@ mod tests {
     fn test_memory_settings() -> manifest::WorkspaceMemorySettingsSnapshot {
         manifest::WorkspaceMemorySettingsSnapshot {
             workspace_id: "workspace-test".to_string(),
-            settings_revision: 1,
             language: "English".to_string(),
         }
     }
@@ -7040,7 +7049,6 @@ mod tests {
             metadata: worker_runtime::config_bundle::ConfigBundleMetadata {
                 id: "bundle-1".to_string(),
                 digest: String::new(),
-                revision: "rev-1".to_string(),
                 workspace_id: "local:test".to_string(),
                 created_at: "2026-06-26T00:00:00Z".to_string(),
                 provenance: worker_runtime::config_bundle::ConfigBundleProvenance {
@@ -7137,10 +7145,9 @@ mod tests {
         let observed = Arc::new(Mutex::new(Vec::new()));
         let expected = RepositoryRefObservation {
             repository_id: "repository-1".to_string(),
-            source_revision: 7,
             source_fingerprint: "sha256:source".to_string(),
             selector: "refs/heads/published".to_string(),
-            revision_ref: "0123456789012345678901234567890123456789".to_string(),
+            resolved_ref: "0123456789012345678901234567890123456789".to_string(),
             observed_at_epoch_seconds: 42,
         };
         let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
@@ -7159,7 +7166,6 @@ mod tests {
                     kind: server_api::RepositorySourceKind::LocalPath,
                     uri: "/provider/repository.git".to_string(),
                 },
-                source_revision: 7,
                 source_fingerprint: "sha256:source".to_string(),
                 selector: None,
             },
@@ -7259,7 +7265,7 @@ mod tests {
         runtime_id: String,
         host_id: String,
         workers: Vec<InternalWorkerSummary>,
-        observed_prompt_revisions: Arc<Mutex<Vec<u64>>>,
+        observed_prompt_digests: Arc<Mutex<Vec<String>>>,
     }
 
     impl FixtureRuntime {
@@ -7295,7 +7301,7 @@ mod tests {
                     workdir_attachments: Vec::new(),
                     diagnostics: Vec::new(),
                 }],
-                observed_prompt_revisions: Arc::new(Mutex::new(Vec::new())),
+                observed_prompt_digests: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -7309,10 +7315,10 @@ mod tests {
             &self,
             projection: worker::WorkspacePromptProjection,
         ) -> Result<(), String> {
-            self.observed_prompt_revisions
+            self.observed_prompt_digests
                 .lock()
                 .map_err(|_| "prompt projection observations poisoned".to_string())?
-                .push(projection.config_revision);
+                .push(projection.projection_digest);
             Ok(())
         }
 
@@ -7404,14 +7410,14 @@ mod tests {
     fn registry_gate_rejects_cached_runtime_immediately_after_binding_revocation() {
         let remote =
             FixtureRuntime::with_worker("runtime-a", "host-a", "worker-a", "worker from runtime a");
-        let remote_observed = remote.observed_prompt_revisions.clone();
+        let remote_observed = remote.observed_prompt_digests.clone();
         let embedded = FixtureRuntime::with_worker(
             EMBEDDED_RUNTIME_ID,
             "embedded-host",
             "embedded-worker",
             "embedded worker",
         );
-        let embedded_observed = embedded.observed_prompt_revisions.clone();
+        let embedded_observed = embedded.observed_prompt_digests.clone();
         let registry = RuntimeRegistry::new(vec![Arc::new(remote), Arc::new(embedded)]);
         let active = Arc::new(Mutex::new(true));
         let gate_state = active.clone();
@@ -7437,14 +7443,14 @@ mod tests {
                 "default".to_string(),
                 "workspace prompt".to_string(),
             )]),
-            12,
             "schema",
             "toolchain",
         )
         .unwrap();
+        let expected_digest = catalog.catalog_digest.clone();
         let projection = worker::WorkspacePromptProjection::new(
             "workspace-a",
-            "source-12",
+            "source-content",
             catalog.catalog_digest.clone(),
             catalog,
         )
@@ -7455,28 +7461,28 @@ mod tests {
                 .is_empty()
         );
         assert!(remote_observed.lock().unwrap().is_empty());
-        assert_eq!(*embedded_observed.lock().unwrap(), vec![12]);
+        assert_eq!(*embedded_observed.lock().unwrap(), vec![expected_digest]);
     }
 
     #[test]
-    fn registry_broadcasts_workspace_prompt_projection_revisions() {
+    fn registry_broadcasts_workspace_prompt_projection_digests() {
         let runtime =
             FixtureRuntime::with_worker("runtime-a", "host-a", "worker-a", "worker from runtime a");
-        let observed = runtime.observed_prompt_revisions.clone();
+        let observed = runtime.observed_prompt_digests.clone();
         let registry = RuntimeRegistry::new(vec![Arc::new(runtime)]);
         let catalog = worker::EffectivePromptCatalog::new(
             std::collections::BTreeMap::from([(
                 "default".to_string(),
                 "workspace prompt".to_string(),
             )]),
-            12,
             "schema",
             "toolchain",
         )
         .unwrap();
+        let expected_digest = catalog.catalog_digest.clone();
         let projection = worker::WorkspacePromptProjection::new(
             "workspace-a",
-            "source-12",
+            "source-content",
             catalog.catalog_digest.clone(),
             catalog,
         )
@@ -7485,7 +7491,7 @@ mod tests {
         let diagnostics = registry.observe_workspace_prompt_projection(projection);
 
         assert!(diagnostics.is_empty());
-        assert_eq!(*observed.lock().unwrap(), vec![12]);
+        assert_eq!(*observed.lock().unwrap(), vec![expected_digest]);
     }
 
     #[test]

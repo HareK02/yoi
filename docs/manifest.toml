@@ -274,7 +274,6 @@ permission = "write"
 # # Backendがresolved Manifestへbindする。手書き/Profile入力では指定しない。
 # # [feature.memory.workspace_settings]
 # # workspace_id = "workspace-id"
-# # settings_revision = 1
 # # language = "日本語"
 #
 # Query結果/抜粋の上限とconsolidation eligibility/thresholdはoperation/Backend
@@ -306,10 +305,9 @@ permission = "write"
 # # ref = "codex-oauth/gpt-5.6-luna"
 #
 # # Backendがresolved Manifestへbindする。Profile・Browser・model入力では指定しない。
-# # language/settings revisionのtrusted snapshotであり、subject identityではない。
+# # Workspace identity/language設定のtrusted snapshotであり、subject identityではない。
 # # [feature.subjektiv.workspace_settings]
 # # workspace_id = "workspace-id"
-# # settings_revision = 1
 # # language = "日本語"
 #
 # Surface selection/generation/injection、candidate consolidation eligibility、recall

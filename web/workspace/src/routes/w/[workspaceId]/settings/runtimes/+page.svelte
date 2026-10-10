@@ -19,6 +19,7 @@
 
   let { data }: PageProps = $props();
   let runtimePublicBundle = $state('');
+  let workspaceTrustId = $state('');
   let displayName = $state('');
   let endpoint = $state('');
   let runtimeFingerprint = $state<string | null>(null);
@@ -144,11 +145,13 @@
       }
       await createRemoteRuntime(data.workspaceId, {
         public_bundle: publicBundle,
+        workspace_trust_id: workspaceTrustId,
         display_name: displayName || null,
         endpoint,
-        expected_revision: null,
+        expected_binding_id: null,
       });
       runtimePublicBundle = '';
+      workspaceTrustId = '';
       runtimeFingerprint = null;
       displayName = '';
       endpoint = '';
@@ -168,14 +171,14 @@
     runtime: WorkspaceRuntimeResource,
   ): RuntimeConnectionTestResponse | undefined {
     const result = testResults[runtime.runtime_id];
-    return result?.binding_revision === runtime.management?.binding?.revision
+    return result?.binding_id === runtime.management?.binding?.binding_id
       ? result
       : undefined;
   }
 
   async function testRuntime(runtime: WorkspaceRuntimeResource): Promise<void> {
-    const bindingRevision = runtime.management?.binding?.revision;
-    if (typeof bindingRevision !== 'number') return;
+    const bindingId = runtime.management?.binding?.binding_id;
+    if (typeof bindingId !== 'string') return;
     const generation = ++connectionTestGeneration;
     requestError = null;
     busyRuntimeId = runtime.runtime_id;
@@ -183,7 +186,7 @@
       const result = await testRuntimeConnection(data.workspaceId, runtime.runtime_id);
       if (
         generation !== connectionTestGeneration ||
-        result.binding_revision !== bindingRevision
+        result.binding_id !== bindingId
       ) {
         await invalidateAll();
         return;
@@ -258,9 +261,15 @@
           </button>
           <pre>yoi-runtime trust-workspace add --bundle {workspaceBundleFilename()}</pre>
           <small>
+            Copy the Runtime-issued <code>workspace_trust_id</code> from <code>trust-workspace add/show</code>.
+            It identifies this enrollment, not the Workspace key fingerprint.
             Pass the same <code>--fs-root</code> and <code>--fs-runtime-dir</code> options used by the Runtime
             service. Existing Workspace trust entries are preserved.
           </small>
+          <label>
+            Workspace trust ID
+            <input bind:value={workspaceTrustId} required autocomplete="off" spellcheck="false" />
+          </label>
         {:else}
           <p class="section-state">Loading Workspace public identity…</p>
         {/if}
@@ -285,10 +294,10 @@
               spellcheck="false"
               placeholder={runtimeBundlePlaceholder}
             ></textarea>
-            <button type="button" disabled={busyRuntimeId !== null} onclick={previewRuntimeFingerprint}>
-              Preview fingerprint
-            </button>
           </label>
+          <button class="settings-form-wide" type="button" disabled={busyRuntimeId !== null} onclick={previewRuntimeFingerprint}>
+            Preview fingerprint
+          </button>
           {#if runtimeFingerprint}
             <dl class="runtime-facts">
               <div>
@@ -321,7 +330,7 @@
       <div class="settings-action-row">
         <button
           type="submit"
-          disabled={busyRuntimeId !== null || !data.signingIdentity?.public_bundle || !runtimeFingerprint}
+          disabled={busyRuntimeId !== null || !data.signingIdentity?.public_bundle || !runtimeFingerprint || !workspaceTrustId}
         >Register Runtime</button>
         <button type="button" disabled={busyRuntimeId !== null} onclick={() => showAddRuntime = false}>
           Cancel

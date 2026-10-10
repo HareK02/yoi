@@ -3,7 +3,7 @@ use rusqlite::{OptionalExtension, params};
 use server_api::{
     WORKSPACE_DELETION_MAX_BLOCKER_MESSAGE_BYTES, WORKSPACE_DELETION_MAX_BLOCKERS,
     WORKSPACE_DELETION_MAX_CHILD_OPERATION_IDS, WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES,
-    WORKSPACE_DELETION_MAX_RESOURCE_VALUE_BYTES, WORKSPACE_DELETION_MAX_REVISION_BYTES,
+    WORKSPACE_DELETION_MAX_RESOURCE_VALUE_BYTES, WORKSPACE_DELETION_MAX_UPDATED_AT_BYTES,
     WorkspaceDeletionBlocker, WorkspaceDeletionBlockerKind, WorkspaceDeletionOperationResponse,
     WorkspaceDeletionPreflightResponse, WorkspaceDeletionRequest, WorkspaceDeletionResourceCounts,
     WorkspaceDeletionState,
@@ -22,7 +22,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "backend_job_attempts",
     "backend_jobs",
     "external_workdir_grants",
-    "flow_source_revisions",
+    "flow_source_contents",
     "flow_sources",
     "memory_staging_records",
     "memory_staging_resolutions",
@@ -39,11 +39,12 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "runtime_removal_operations",
     "repository_secret_audit_events",
     "repository_secret_operations",
-    "repository_ssh_credential_revisions",
+    "repository_secret_legacy_receipts",
+    "repository_ssh_credential_keys",
     "repository_ssh_credentials",
-    "repository_ssh_host_trust_revisions",
+    "repository_ssh_host_trust_keys",
     "repository_ssh_host_trusts",
-    "server_secret_versions",
+    "server_secret_objects",
     "ticket_assignment_operations",
     "ticket_assignment_work_releases",
     "ticket_assignment_ticket_tombstones",
@@ -63,7 +64,8 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "typed_ticket_targets",
     "typed_tickets",
     "workdir_create_credential_candidates",
-    "workdir_create_credential_revision_retentions",
+    "workdir_create_credential_retentions",
+    "workdir_create_legacy_ssh_archives",
     "workdir_create_operations",
     "workdir_registry",
     "workdir_removal_operations",
@@ -88,7 +90,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "workspace_config_entries",
     "workspace_config_grants",
     "workspace_drive_grants",
-    "workspace_config_tree_revisions",
+    "workspace_config_tree_history",
     "workspace_config_trees",
     "workspace_create_operations",
     "workspace_memory_documents",
@@ -102,7 +104,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "workspace_signing_identity_audit",
     "workspace_signing_identity_provisioning_operations",
     "workspace_worker_retention_policies",
-    "workspace_worker_retention_policy_revisions",
+    "workspace_worker_retention_policy_snapshots",
 ];
 
 #[derive(Debug, Clone)]
@@ -198,7 +200,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
             Ok(WorkspaceDeletionPreflightResponse {
                 workspace_id: workspace.workspace_id,
                 display_name: workspace.display_name,
-                expected_revision: workspace.updated_at,
+                expected_workspace_updated_at: workspace.updated_at,
                 can_delete: blockers.is_empty(),
                 resources,
                 blockers,
@@ -213,7 +215,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
         request: &WorkspaceDeletionRequest,
     ) -> Result<WorkspaceDeletionReservation> {
         validate_operation_id(&request.operation_id)?;
-        if request.expected_revision.len() > WORKSPACE_DELETION_MAX_REVISION_BYTES
+        if request.expected_workspace_updated_at.len() > WORKSPACE_DELETION_MAX_UPDATED_AT_BYTES
             || request.confirmation.len() > server_api::WORKSPACE_DELETION_MAX_CONFIRMATION_BYTES
         {
             return Err(Error::InvalidInput(
@@ -245,7 +247,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                     "confirmation must exactly match the displayed Workspace name".to_string(),
                 ));
             }
-            if workspace.updated_at != request.expected_revision {
+            if workspace.updated_at != request.expected_workspace_updated_at {
                 return Err(Error::WorkspaceConfigConflict(
                     "Workspace metadata changed; reload deletion impact before confirming".to_string(),
                 ));
@@ -273,7 +275,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
             tx.execute(
                 "INSERT INTO workspace_deletion_operations (
                     operation_id, request_fingerprint, workspace_id, workspace_display_name,
-                    workspace_revision, owner_account_id, actor_account_id,
+                    workspace_updated_at, owner_account_id, actor_account_id,
                     state, resource_counts_json,
                     child_operation_ids_json, blockers_json, failure_category,
                     created_at, updated_at, completed_at
@@ -283,7 +285,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                     fingerprint,
                     workspace_id,
                     workspace.display_name,
-                    request.expected_revision,
+                    request.expected_workspace_updated_at,
                     workspace.owner_account_id,
                     actor_account_id,
                     serde_json::to_string(&resources).map_err(|error| Error::Store(error.to_string()))?,
@@ -293,7 +295,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
             let changed = tx.execute(
                 "UPDATE workspaces SET state = 'deleting', updated_at = ?2
                  WHERE workspace_id = ?1 AND updated_at = ?3 AND state = 'active'",
-                params![workspace_id, now, request.expected_revision],
+                params![workspace_id, now, request.expected_workspace_updated_at],
             )?;
             if changed != 1 {
                 return Err(Error::WorkspaceConfigConflict(
@@ -766,7 +768,7 @@ fn resource_counts(
         workdirs: table_count(conn, "workdir_registry", workspace_id)?,
         repositories: table_count(conn, "repositories", workspace_id)?,
         runtime_bindings: table_count(conn, "workspace_runtime_bindings", workspace_id)?,
-        secrets: table_count(conn, "server_secret_versions", workspace_id)?,
+        secrets: table_count(conn, "server_secret_objects", workspace_id)?,
         artifacts: table_count(conn, "artifacts", workspace_id)?,
     })
 }
@@ -826,7 +828,7 @@ fn request_fingerprint(
 ) -> String {
     let canonical = format!(
         "workspace-delete-v1\0{actor_account_id}\0{workspace_id}\0{}\0{}\0{}",
-        request.operation_id, request.expected_revision, request.confirmation
+        request.operation_id, request.expected_workspace_updated_at, request.confirmation
     );
     encode_hex(&Sha256::digest(canonical.as_bytes()))
 }
@@ -959,7 +961,7 @@ mod tests {
             .expect("preflight");
         let request = WorkspaceDeletionRequest {
             operation_id: "delete-workspace-a".to_string(),
-            expected_revision: preflight.expected_revision,
+            expected_workspace_updated_at: preflight.expected_workspace_updated_at,
             confirmation: "Alpha".to_string(),
         };
         let first = store
@@ -1073,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_confirmation_and_revision_are_required_before_reservation() {
+    fn owner_confirmation_and_updated_at_are_required_before_reservation() {
         let (store, owner, workspace_id) = setup();
         store.with_conn(|conn| {
             conn.execute(
@@ -1093,7 +1095,7 @@ mod tests {
             .expect("preflight");
         let mut request = WorkspaceDeletionRequest {
             operation_id: "delete-alpha-guarded".to_string(),
-            expected_revision: "stale".to_string(),
+            expected_workspace_updated_at: "stale".to_string(),
             confirmation: "Alpha".to_string(),
         };
         assert!(matches!(
@@ -1106,7 +1108,7 @@ mod tests {
             request_fingerprint(&owner, &workspace_id, &request),
             request_fingerprint(&owner, &workspace_id, &other_operation)
         );
-        request.expected_revision = preflight.expected_revision;
+        request.expected_workspace_updated_at = preflight.expected_workspace_updated_at;
         request.confirmation = "delete Alpha".to_string();
         assert!(matches!(
             store.reserve_workspace_deletion(&owner, &workspace_id, &request),
@@ -1130,11 +1132,11 @@ mod tests {
                 conn.execute(
                     "INSERT INTO workdir_create_operations (
                         workspace_id, operation_id, request_fingerprint, repository_id,
-                        selector, requested_runtime_id, resolved_runtime_id, config_revision,
+                        selector, requested_runtime_id, resolved_runtime_id,
                         config_projection_digest, working_directory_id, state, created_at, updated_at
                      ) VALUES (
                         ?1, 'workdir-create', 'fingerprint', 'repository-pending',
-                        'develop', 'runtime-a', 'runtime-a', 1,
+                        'develop', 'runtime-a', 'runtime-a',
                         'projection', 'workdir-pending', 'pending', '1', '1'
                      )",
                     params![workspace_id],
@@ -1160,7 +1162,7 @@ mod tests {
         );
         let request = WorkspaceDeletionRequest {
             operation_id: "delete-with-pending-creates".to_string(),
-            expected_revision: preflight.expected_revision,
+            expected_workspace_updated_at: preflight.expected_workspace_updated_at,
             confirmation: "Alpha".to_string(),
         };
         assert!(matches!(
@@ -1295,7 +1297,7 @@ mod tests {
         }));
         let request = WorkspaceDeletionRequest {
             operation_id: "delete-pinned".to_string(),
-            expected_revision: preflight.expected_revision,
+            expected_workspace_updated_at: preflight.expected_workspace_updated_at,
             confirmation: "Alpha".to_string(),
         };
         assert!(matches!(
@@ -1338,7 +1340,7 @@ mod tests {
     }
 
     #[test]
-    fn last_accessible_workspace_and_revision_conflicts_fail_closed() {
+    fn last_accessible_workspace_and_updated_at_conflicts_fail_closed() {
         let (store, owner, workspace_id) = setup();
         let other = "workspace-b";
         let preflight = store
@@ -1352,7 +1354,7 @@ mod tests {
                         other,
                         &WorkspaceDeletionRequest {
                             operation_id: "delete-beta".to_string(),
-                            expected_revision: preflight.expected_revision,
+                            expected_workspace_updated_at: preflight.expected_workspace_updated_at,
                             confirmation: "Beta".to_string(),
                         },
                     )

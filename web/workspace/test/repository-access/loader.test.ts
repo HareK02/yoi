@@ -21,7 +21,6 @@ type LoadedPage = {
 
 const projectionFixture = {
   workspace_id: "workspace-1",
-  config_revision: 1,
   projection_digest: "sha256:projection",
   bindings: [],
 };
@@ -31,7 +30,6 @@ const credentialFixture = {
   name: "Workspace default",
   public_key_algorithm: "ssh-ed25519",
   public_key_fingerprint: "SHA256:credential",
-  current_revision: 1,
   status: "active",
   created_at: "2026-01-01T00:00:00Z",
   rotated_at: null,
@@ -39,7 +37,6 @@ const credentialFixture = {
 };
 const publicKeyFixture = {
   credential_id: "workspace-default",
-  current_revision: 1,
   public_key_algorithm: "ssh-ed25519",
   public_key_fingerprint: "SHA256:credential",
   public_key: "ssh-ed25519 AAAA-workspace-default",
@@ -52,7 +49,6 @@ const hostTrustFixture = {
   key_algorithm: "ssh-ed25519",
   host_key: "ssh-ed25519 AAAA-host",
   fingerprint: "SHA256:host",
-  current_revision: 1,
   created_at: "2026-01-01T00:00:00Z",
   updated_at: "2026-01-01T00:00:00Z",
   referenced_repositories: [],

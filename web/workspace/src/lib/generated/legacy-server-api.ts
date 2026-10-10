@@ -24,7 +24,6 @@ export type WorkspaceRepositoryRecord = {
   provider: string | null;
   source: RepositorySource;
   default_ref: string | null;
-  source_revision: number;
   source_fingerprint: string;
   observed_status: RepositoryObservedStatus;
   observed_at: string | null;
@@ -35,7 +34,6 @@ export type WorkspaceRepositoryRecord = {
 export type WorkspaceCreateResponse = {
   workspace: WorkspaceSummary;
   repository: WorkspaceRepositoryRecord | null;
-  config_revision: number;
   request_fingerprint: string;
   replayed: boolean;
 };
@@ -92,9 +90,9 @@ export type WorkspaceDeletionPreflightResponse = {
   workspace_id: string;
   display_name: string;
   /**
-   * Opaque persisted Workspace metadata revision used as a CAS fence.
+   * Observed Workspace metadata update timestamp used as a CAS fence.
    */
-  expected_revision: string;
+  expected_workspace_updated_at: string;
   can_delete: boolean;
   resources: WorkspaceDeletionResourceCounts;
   blockers: Array<WorkspaceDeletionBlocker>;
@@ -102,7 +100,7 @@ export type WorkspaceDeletionPreflightResponse = {
 
 export type WorkspaceDeletionRequest = {
   operation_id: string;
-  expected_revision: string;
+  expected_workspace_updated_at: string;
   confirmation: string;
 };
 
@@ -155,14 +153,14 @@ export type WorkspaceMetadataSettingsResponse = {
   workspace_id: string;
   display_name: string;
   created_at: string;
-  revision: string;
+  updated_at: string;
   source: string;
   diagnostics: Array<Diagnostic>;
 };
 
 export type UpdateWorkspaceMetadataRequest = {
   display_name: string;
-  revision: string;
+  expected_updated_at: string;
 };
 
 export type WorkspaceMetadataMutationResponse = {
@@ -178,7 +176,6 @@ export type WorkspaceSigningIdentityPublic = {
   algorithm: string;
   public_key?: string;
   public_key_fingerprint?: string;
-  revision: number;
   state: WorkspaceSigningIdentityState;
   created_at: string;
   provisioned_at?: string;
@@ -191,7 +188,6 @@ export type WorkspacePublicIdentityBundle = {
   algorithm: string;
   public_key: string;
   public_key_fingerprint: string;
-  revision: number;
 };
 
 export type WorkspaceSigningIdentityResponse = {
@@ -209,7 +205,6 @@ export type ConfigEntry = {
 };
 
 export type ConfigTreeSnapshot = {
-  revision: number;
   digest: string;
   entries: { [key in string]: ConfigEntry };
 };
@@ -267,7 +262,6 @@ export type WorkspaceConfigTreeResponse = {
 };
 
 export type ConfigCommitRequest = {
-  base_revision: number;
   base_digest: string;
   changes: Array<ConfigTreeChange>;
   entrypoints: Array<string>;
@@ -316,7 +310,6 @@ export type WorkspaceConfigNode = {
 export type WorkspaceConfigObserveResponse = {
   connection_id: string;
   validator: string;
-  revision: number;
   digest: string;
   /**
    * Canonical commit entrypoints from this exact metadata snapshot.
@@ -347,7 +340,6 @@ export type WorkspaceConfigCommitRequest = {
 
 export type WorkspaceConfigCommitResponse = {
   validator: string;
-  revision: number;
   digest: string;
 };
 
@@ -376,8 +368,6 @@ export type WorkspaceConfigGrantResponse = {
 
 export type ProfileSettingsResponse = {
   workspace_id: string;
-  registry_revision: string;
-  config_revision?: number | null;
   tree_digest?: string | null;
   projection_digest?: string | null;
   default_profile?: string | null;
@@ -406,7 +396,6 @@ export type WorkspaceProfileSourceSummary = {
   content_digest: string;
   provenance: WorkspaceProfileSourceProvenance;
   editable: boolean;
-  revision: string;
   size_bytes: number;
   diagnostics: Array<Diagnostic>;
 };
@@ -445,7 +434,7 @@ export type RepositorySshConnectionProbeResponse = {
   port: number;
   trust_state: RepositorySshConnectionTrustState;
   host_trust_id: string;
-  expected_host_trust_revision: number | null;
+  expected_host_key_fingerprint: string | null;
   candidates: Array<RepositorySshHostKeyCandidate>;
 };
 
@@ -453,7 +442,7 @@ export type ConfirmRepositorySshHostTrustRequest = {
   operation_id: string;
   runtime_id: string;
   host_key: string;
-  expected_host_trust_revision: number | null;
+  expected_host_key_fingerprint: string | null;
 };
 
 export type RepositoryLogResponse = {

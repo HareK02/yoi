@@ -164,6 +164,12 @@ impl WorkerHandle {
             ))
     }
 
+    /// Hold through protocol subscription and initial snapshot capture so child
+    /// events cannot overtake the parent's snapshot publication boundary.
+    pub fn protocol_snapshot_publish_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.spawned_registry.protocol_snapshot_publish_guard()
+    }
+
     pub fn snapshot_event(&self) -> Event {
         self.snapshot_event_with_entry_subscription().0
     }
@@ -546,7 +552,7 @@ fn notification_coalesce_remaining<St: Store + Clone>(
 fn prepare_pending_run<St: Store + Clone>(
     pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
     notify_buffer: &NotifyBuffer,
-    fence: Option<(u64, &str)>,
+    fence: Option<&str>,
     allow_notification_run: bool,
 ) -> Result<Option<PendingRun>, crate::worker::PendingSubmissionError> {
     Ok(match pending_submissions.prepare_next_activation(fence)? {
@@ -2619,24 +2625,8 @@ async fn controller_loop<C, St>(
                     pending: pending_submissions.snapshot(),
                 });
             }
-            Method::CancelPendingSubmission {
-                submission_id,
-                expected_revision,
-            } => match pending_submissions.cancel(&submission_id, expected_revision) {
-                Ok(pending_snapshot) => {
-                    let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
-                        pending: pending_snapshot,
-                    });
-                }
-                Err(error) => {
-                    let _ = working_event_tx.send(Event::Error {
-                        code: ErrorCode::InvalidRequest,
-                        message: error.to_string(),
-                    });
-                }
-            },
-            Method::ClearPendingSubmissions { expected_revision } => {
-                match pending_submissions.clear(expected_revision) {
+            Method::CancelPendingSubmission { submission_id } => {
+                match pending_submissions.cancel(&submission_id) {
                     Ok(pending_snapshot) => {
                         let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
                             pending: pending_snapshot,
@@ -2650,10 +2640,22 @@ async fn controller_loop<C, St>(
                     }
                 }
             }
-            Method::ContinuePending {
-                expected_revision,
-                expected_head_id,
-            } => {
+            Method::ClearPendingSubmissions {
+                expected_submission_ids,
+            } => match pending_submissions.clear(&expected_submission_ids) {
+                Ok(pending_snapshot) => {
+                    let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
+                        pending: pending_snapshot,
+                    });
+                }
+                Err(error) => {
+                    let _ = working_event_tx.send(Event::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: error.to_string(),
+                    });
+                }
+            },
+            Method::ContinuePending { expected_head_id } => {
                 if shared_state.catalog_status() != WorkerStatus::Idle {
                     let _ = working_event_tx.send(Event::Error {
                         code: ErrorCode::InvalidRequest,
@@ -2664,7 +2666,7 @@ async fn controller_loop<C, St>(
                 match prepare_pending_run(
                     &pending_submissions,
                     &notify_buffer,
-                    Some((expected_revision, &expected_head_id)),
+                    Some(&expected_head_id),
                     true,
                 ) {
                     Ok(Some(next)) => pending = Some(next),
@@ -3023,8 +3025,9 @@ async fn controller_loop<C, St>(
             },
 
             Method::Shutdown { command } => {
-                // Shutdown ignores the state-revision fence but remains bound to the
-                // current execution generation and command payload identity.
+                // Shutdown applies to this controller at admission time, not
+                // a caller-observed Run. Exact command-id/kind retries remain
+                // valid so every shutdown path can reach the cleanup barrier.
                 if let Err(disposition) = validate_shutdown_command(command, &shared_state) {
                     acknowledge_command(
                         &working_event_tx,
@@ -3619,9 +3622,8 @@ where
                     }
                     Some(Method::CancelPendingSubmission {
                         submission_id,
-                        expected_revision,
                     }) => {
-                        match pending_submissions.cancel(&submission_id, expected_revision) {
+                        match pending_submissions.cancel(&submission_id) {
                             Ok(pending) => {
                                 let _ = working_event_tx.send(Event::PendingSubmissionsChanged { pending });
                             }
@@ -3633,8 +3635,8 @@ where
                             }
                         }
                     }
-                    Some(Method::ClearPendingSubmissions { expected_revision }) => {
-                        match pending_submissions.clear(expected_revision) {
+                    Some(Method::ClearPendingSubmissions { expected_submission_ids }) => {
+                        match pending_submissions.clear(&expected_submission_ids) {
                             Ok(pending) => {
                                 let _ = working_event_tx.send(Event::PendingSubmissionsChanged { pending });
                             }
@@ -4009,7 +4011,7 @@ mod tests {
                 assert_eq!(request.path, "/api/w/workspace-1/drive/root");
                 Ok(crate::worker::WorkspaceResponse { status: 200, body: serde_json::json!({
                     "entry": {"workspace_id": "workspace-1", "node_id": "1"},
-                    "parent": null, "name": "", "kind": "folder", "revision": "1",
+                    "parent": null, "name": "", "kind": "folder", "last_mutation_id": "",
                     "size": null, "content_type": null, "updated_by": "test",
                     "updated_at": "2026-10-08T00:00:00Z",
                     "latest_url": "/api/w/workspace-1/drive/download?entry_workspace_id=workspace-1&id=1"

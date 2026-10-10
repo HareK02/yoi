@@ -59,12 +59,12 @@
             <div><dt>Repository</dt><dd>{mergeRequest.repository_key}</dd></div>
             <div><dt>State</dt><dd>{mergeRequest.state}</dd></div>
             <div><dt>Source selector</dt><dd><code>{mergeRequest.selector_from ?? "requires repair"}</code></dd></div>
-            <div><dt>Live source revision</dt><dd>{mergeRequest.source.status}{mergeRequest.source.ref ? ` · ${mergeRequest.source.ref}` : ""}</dd></div>
+            <div><dt>Live source ref</dt><dd>{mergeRequest.source.status}{mergeRequest.source.ref ? ` · ${mergeRequest.source.ref}` : ""}</dd></div>
             {#if mergeRequest.source.diagnostic}
               <div><dt>Source observation error</dt><dd>{mergeRequest.source.diagnostic.code}: {mergeRequest.source.diagnostic.message}</dd></div>
             {/if}
             <div><dt>Target selector</dt><dd><code>{mergeRequest.selector_to}</code></dd></div>
-            <div><dt>Target revision</dt><dd>{mergeRequest.target.status}{mergeRequest.target.ref ? ` · ${mergeRequest.target.ref}` : ""}</dd></div>
+            <div><dt>Target ref</dt><dd>{mergeRequest.target.status}{mergeRequest.target.ref ? ` · ${mergeRequest.target.ref}` : ""}</dd></div>
             <div><dt>Updated</dt><dd>{prettyDate(mergeRequest.updated_at)}</dd></div>
           </dl>
         </section>

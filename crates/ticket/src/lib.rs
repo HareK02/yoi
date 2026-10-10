@@ -88,8 +88,8 @@ pub enum TicketError {
     InvalidReadWriteTargetCount(usize),
     #[error("ticket target authority is unavailable")]
     TargetAuthorityUnavailable,
-    #[error("stale ticket item revision: expected `{expected}`, found `{actual}`")]
-    StaleItemRevision { expected: String, actual: String },
+    #[error("stale ticket content: expected `{expected}`, found `{actual}`")]
+    StaleContent { expected: String, actual: String },
     #[error("stale ticket workflow state: expected `{expected}`, found `{actual}`")]
     StaleWorkflowState { expected: String, actual: String },
     #[error("invalid ticket workflow transition `{from}` -> `{to}`")]
@@ -473,7 +473,7 @@ impl TicketStateChange {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TicketCompletion {
-    pub expected_item_revision: String,
+    pub expected_content_digest: String,
     pub expected_state: TicketWorkflowState,
     pub operation_key: String,
     pub reason: String,
@@ -483,7 +483,7 @@ pub struct TicketCompletion {
     pub author: Option<String>,
 }
 
-/// External state mutation with item/state CAS and an immutable operation receipt.
+/// External state mutation with content/state CAS and an immutable operation receipt.
 /// Exact replay returns the current authoritative Ticket without a new event or
 /// reapplying the recorded state, even after later edits or reopening.
 /// Setting `state` to Closed also stores `reason` as the resolution; reopening
@@ -491,7 +491,7 @@ pub struct TicketCompletion {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TicketStateUpdate {
-    pub expected_item_revision: String,
+    pub expected_content_digest: String,
     pub expected_state: TicketWorkflowState,
     pub state: TicketWorkflowState,
     pub operation_key: String,
@@ -505,7 +505,7 @@ pub struct TicketStateUpdate {
 impl From<TicketCompletion> for TicketStateUpdate {
     fn from(request: TicketCompletion) -> Self {
         Self {
-            expected_item_revision: request.expected_item_revision,
+            expected_content_digest: request.expected_content_digest,
             expected_state: request.expected_state,
             state: TicketWorkflowState::Done,
             operation_key: request.operation_key,
@@ -516,17 +516,69 @@ impl From<TicketCompletion> for TicketStateUpdate {
     }
 }
 
-/// Canonical item revision shared by Ticket authority, item checkers, and Merge
-/// Request review records. Only persisted item_edit event indexes advance it.
-pub fn ticket_item_revision(ticket: &Ticket) -> String {
-    let index = ticket
-        .events
+/// SHA-256 of the actual editable Ticket requirements: identity, title, body,
+/// and ordered repository targets. Comments, timestamps, workflow state, and
+/// event order are not requirements. Restoring identical content restores its
+/// digest; state CAS and operation receipts are independent preconditions.
+pub fn ticket_content_digest(ticket: &Ticket) -> String {
+    content_digest(
+        &ticket.meta.id,
+        &ticket.meta.title,
+        ticket.document.body.as_str(),
+        &ticket.meta.targets,
+    )
+}
+
+fn content_digest(id: &str, title: &str, body: &str, targets: &[TicketTarget]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ticket.content.sha256.v1\0");
+    digest.update(
+        serde_json::to_vec(&(id, title, body, targets)).expect("Ticket content serializes"),
+    );
+    digest
+        .finalize()
         .iter()
-        .filter(|event| event.kind == TicketEventKind::Other("item_edit".to_owned()))
-        .filter_map(|event| event.attributes.get("event_sequence")?.parse::<i64>().ok())
-        .max()
-        .unwrap_or(0);
-    format!("{}:{index}", ticket.meta.id)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Read the same content inside the caller's SQLite transaction. Review and
+/// Ticket mutation authorities must use this instead of event indexes or time.
+pub fn sqlite_ticket_content_digest(
+    connection: &Connection,
+    workspace_id: &str,
+    ticket_id: &str,
+) -> Result<Option<String>> {
+    let item: Option<(String, String)> = connection
+        .query_row(
+            "SELECT title,body FROM typed_tickets WHERE workspace_id=?1 AND ticket_id=?2",
+            params![workspace_id, ticket_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_err)?;
+    let Some((title, body)) = item else {
+        return Ok(None);
+    };
+    let mut statement = connection.prepare(
+        "SELECT repository_key,ref_selector,access FROM typed_ticket_targets WHERE workspace_id=?1 AND ticket_id=?2 ORDER BY ordinal",
+    ).map_err(sqlite_err)?;
+    let targets = statement
+        .query_map(params![workspace_id, ticket_id], |row| {
+            let access: String = row.get(2)?;
+            let access = TicketTargetAccess::parse(&access).ok_or_else(|| {
+                rusqlite::Error::InvalidColumnType(2, "access".into(), rusqlite::types::Type::Text)
+            })?;
+            Ok(TicketTarget {
+                repository_key: row.get(0)?,
+                ref_selector: row.get(1)?,
+                access,
+            })
+        })
+        .map_err(sqlite_err)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(sqlite_err)?;
+    Ok(Some(content_digest(ticket_id, &title, &body, &targets)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -2402,7 +2454,7 @@ impl SqliteTicketBackend {
         ]
         .map(|key| self.event_attributes.get(key));
         let mut digest = Sha256::new();
-        digest.update(b"ticket.state-update.v1\0");
+        digest.update(b"ticket.state-update.v2\0");
         digest.update(
             serde_json::to_vec(&(ticket_id, request, body, source))
                 .map_err(|error| TicketError::Conflict(error.to_string()))?,
@@ -2437,7 +2489,7 @@ impl SqliteTicketBackend {
         body: MarkdownText,
     ) -> Result<Ticket> {
         validate_required_event_value("operation_key", &request.operation_key)?;
-        validate_required_event_value("expected_item_revision", &request.expected_item_revision)?;
+        validate_required_event_value("expected_content_digest", &request.expected_content_digest)?;
         validate_state_change(&TicketStateChange {
             from: request.expected_state.to_string(),
             to: request.state.to_string(),
@@ -2457,7 +2509,7 @@ impl SqliteTicketBackend {
                 .attributes
                 .get("fingerprint_version")
                 .map(String::as_str)
-                != Some("state-update-v1")
+                != Some("state-update-v2")
                 || event.attributes.get("request_fingerprint") != Some(&fingerprint)
             {
                 return Err(TicketError::OperationFingerprintMismatch {
@@ -2471,10 +2523,10 @@ impl SqliteTicketBackend {
         // Exact recorded replay is independent of today's live role/assignment.
         // Parent transport authenticates identity before restoring receipt context.
         self.require_active_source_assignment(conn, ticket_id)?;
-        let actual = ticket_item_revision(&previous);
-        if actual != request.expected_item_revision {
-            return Err(TicketError::StaleItemRevision {
-                expected: request.expected_item_revision.clone(),
+        let actual = ticket_content_digest(&previous);
+        if actual != request.expected_content_digest {
+            return Err(TicketError::StaleContent {
+                expected: request.expected_content_digest.clone(),
                 actual,
             });
         }
@@ -2526,11 +2578,11 @@ impl SqliteTicketBackend {
                     ("request_fingerprint".to_owned(), fingerprint),
                     (
                         "fingerprint_version".to_owned(),
-                        "state-update-v1".to_owned(),
+                        "state-update-v2".to_owned(),
                     ),
                     (
-                        "expected_item_revision".to_owned(),
-                        request.expected_item_revision.clone(),
+                        "expected_content_digest".to_owned(),
+                        request.expected_content_digest.clone(),
                     ),
                 ]),
             },
@@ -3449,7 +3501,7 @@ impl TicketBackend for SqliteTicketBackend {
             let ticket_id = self.resolve_ticket_id(conn, id)?;
             let previous = self.load_ticket(conn, &ticket_id)?;
             let request = TicketStateUpdate {
-                expected_item_revision: ticket_item_revision(&previous),
+                expected_content_digest: ticket_content_digest(&previous),
                 expected_state: from,
                 state: to,
                 operation_key: self.next_legacy_state_operation_key(conn, &ticket_id)?,
@@ -3634,7 +3686,7 @@ impl TicketBackend for SqliteTicketBackend {
             let ticket_id = self.resolve_ticket_id(conn, id)?;
             let previous = self.load_ticket(conn, &ticket_id)?;
             let request = TicketStateUpdate {
-                expected_item_revision: ticket_item_revision(&previous),
+                expected_content_digest: ticket_content_digest(&previous),
                 expected_state: previous.meta.workflow_state,
                 state: TicketWorkflowState::Closed,
                 operation_key: self.next_legacy_state_operation_key(conn, &ticket_id)?,
@@ -5626,13 +5678,22 @@ mod tests {
     }
 
     #[test]
-    fn item_revision_uses_canonical_max_item_edit_index_not_edit_count_or_content_hash() {
+    fn content_digest_matches_sqlite_and_ignores_event_order() {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
         let (reference, ticket) = backend
-            .create_with_snapshot(NewTicket::new("Revision format"))
+            .create_with_snapshot(NewTicket::new("Content digest"))
             .unwrap();
-        assert_eq!(ticket_item_revision(&ticket), format!("{}:0", reference.id));
+        assert_eq!(ticket_content_digest(&ticket).len(), 64);
+        assert_eq!(
+            sqlite_ticket_content_digest(
+                &backend.open_connection().unwrap(),
+                &backend.workspace_id,
+                &reference.id
+            )
+            .unwrap(),
+            Some(ticket_content_digest(&ticket))
+        );
         backend
             .add_event(
                 reference.id.clone().into(),
@@ -5648,7 +5709,10 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(ticket_item_revision(&first), format!("{}:2", reference.id));
+        assert_ne!(
+            ticket_content_digest(&first),
+            ticket_content_digest(&ticket)
+        );
         backend
             .add_event(
                 reference.id.clone().into(),
@@ -5664,13 +5728,23 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(ticket_item_revision(&second), format!("{}:4", reference.id));
+        assert_ne!(
+            ticket_content_digest(&second),
+            ticket_content_digest(&first)
+        );
+        let digest = ticket_content_digest(&second);
+        assert_eq!(
+            sqlite_ticket_content_digest(
+                &backend.open_connection().unwrap(),
+                &backend.workspace_id,
+                &reference.id
+            )
+            .unwrap(),
+            Some(digest.clone())
+        );
         let mut reordered = second;
         reordered.events.reverse();
-        assert_eq!(
-            ticket_item_revision(&reordered),
-            format!("{}:4", reference.id)
-        );
+        assert_eq!(ticket_content_digest(&reordered), digest);
     }
 
     #[test]
@@ -5983,18 +6057,18 @@ mod tests {
         assert_eq!(event.from.as_deref(), Some("planning"));
         assert_eq!(event.reason.as_deref(), Some("finished"));
         assert_eq!(
-            event.attributes.get("expected_item_revision"),
-            Some(&ticket_item_revision(&ticket))
+            event.attributes.get("expected_content_digest"),
+            Some(&ticket_content_digest(&ticket))
         );
         assert_eq!(
             event
                 .attributes
                 .get("fingerprint_version")
                 .map(String::as_str),
-            Some("state-update-v1")
+            Some("state-update-v2")
         );
         let request = TicketStateUpdate {
-            expected_item_revision: ticket_item_revision(&ticket),
+            expected_content_digest: ticket_content_digest(&ticket),
             expected_state: TicketWorkflowState::Planning,
             state: TicketWorkflowState::Done,
             operation_key: event.attributes["operation_key"].clone(),
@@ -6023,8 +6097,8 @@ mod tests {
         assert_eq!(close.body, resolution);
         assert_eq!(closed.resolution, Some(resolution));
         assert_eq!(
-            close.attributes.get("expected_item_revision"),
-            Some(&ticket_item_revision(&done))
+            close.attributes.get("expected_content_digest"),
+            Some(&ticket_content_digest(&done))
         );
         assert_ne!(
             close.attributes["operation_key"],
@@ -6175,13 +6249,59 @@ mod tests {
 
     fn completion_request(ticket: &Ticket, key: &str) -> TicketCompletion {
         TicketCompletion {
-            expected_item_revision: ticket_item_revision(ticket),
+            expected_content_digest: ticket_content_digest(ticket),
             expected_state: ticket.meta.workflow_state,
             operation_key: key.to_owned(),
             reason: "Acceptance criteria met".to_owned(),
             references: Vec::new(),
             author: Some("tester".to_owned()),
         }
+    }
+
+    #[test]
+    fn frozen_counter_receipts_remain_immutable_and_cannot_be_reinterpreted_as_content_requests() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+        let (reference, ticket) = backend
+            .create_with_snapshot(NewTicket::new("Old receipt"))
+            .unwrap();
+        let request = completion_request(&ticket, "old-operation");
+        backend.complete(&reference.id, request.clone()).unwrap();
+        let connection = backend.open_connection().unwrap();
+        // Frozen pre-content fixture. Its old fingerprint cannot prove a new
+        // content-based request, and migration must not rewrite immutable audit.
+        connection.execute(
+            "UPDATE typed_ticket_event_attributes SET value='state-update-v1' WHERE ticket_id=?1 AND key='fingerprint_version'",
+            [&reference.id],
+        ).unwrap();
+        connection.execute(
+            "UPDATE typed_ticket_event_attributes SET key='expected_item_revision',value='T:0' WHERE ticket_id=?1 AND key='expected_content_digest'",
+            [&reference.id],
+        ).unwrap();
+        let before = backend.show(reference.id.clone().into()).unwrap();
+        migrate_sqlite_ticket_schema(&connection).unwrap();
+        assert_eq!(backend.show(reference.id.clone().into()).unwrap(), before);
+        assert!(matches!(
+            backend.complete(&reference.id, request),
+            Err(TicketError::OperationFingerprintMismatch { .. }),
+        ));
+        assert_eq!(backend.show(reference.id.clone().into()).unwrap(), before);
+        let fresh = backend
+            .complete(
+                &reference.id,
+                completion_request(&before, "fresh-operation"),
+            )
+            .unwrap();
+        assert_eq!(fresh.events.len(), before.events.len() + 1);
+        assert_eq!(
+            fresh
+                .events
+                .last()
+                .unwrap()
+                .attributes
+                .get("expected_content_digest"),
+            Some(&ticket_content_digest(&before))
+        );
     }
 
     #[test]
@@ -6316,7 +6436,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             backend.complete(&reference.id, request),
-            Err(TicketError::StaleItemRevision { .. })
+            Err(TicketError::StaleContent { .. })
         ));
         assert_eq!(backend.show(reference.id.clone().into()).unwrap(), edited);
         let mut request = completion_request(&edited, "complete");
@@ -6440,7 +6560,7 @@ mod tests {
                 ..request.clone()
             },
             TicketCompletion {
-                expected_item_revision: "other-revision".to_owned(),
+                expected_content_digest: "other-content".to_owned(),
                 ..request.clone()
             },
             TicketCompletion {
@@ -6562,13 +6682,13 @@ mod tests {
     }
 
     #[test]
-    fn item_revision_tracks_target_edits_and_aba_but_not_comments_or_state() {
+    fn content_digest_tracks_targets_and_restored_content_not_comments_or_state() {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
         let (reference, ticket) = backend
-            .create_with_snapshot(NewTicket::new("Revision"))
+            .create_with_snapshot(NewTicket::new("Content"))
             .unwrap();
-        let revision = ticket_item_revision(&ticket);
+        let digest = ticket_content_digest(&ticket);
         backend
             .add_event(
                 reference.id.clone().into(),
@@ -6576,11 +6696,11 @@ mod tests {
             )
             .unwrap();
         let commented = backend.show(reference.id.clone().into()).unwrap();
-        assert_eq!(ticket_item_revision(&commented), revision);
+        assert_eq!(ticket_content_digest(&commented), digest);
         let completed = backend
             .complete(&reference.id, completion_request(&ticket, "complete"))
             .unwrap();
-        assert_eq!(ticket_item_revision(&completed), revision);
+        assert_eq!(ticket_content_digest(&completed), digest);
         backend
             .edit_item(
                 reference.id.clone().into(),
@@ -6601,7 +6721,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_ne!(ticket_item_revision(&restored), revision);
+        assert_eq!(ticket_content_digest(&restored), digest);
     }
 
     #[test]
@@ -6618,7 +6738,7 @@ mod tests {
                 ..request.clone()
             },
             TicketCompletion {
-                expected_item_revision: "".to_owned(),
+                expected_content_digest: "".to_owned(),
                 ..request.clone()
             },
             TicketCompletion {
@@ -7081,8 +7201,8 @@ mod tests {
         assert_eq!(close.from.as_deref(), Some("planning"));
         assert_eq!(close.to.as_deref(), Some("closed"));
         assert_eq!(
-            close.attributes.get("expected_item_revision"),
-            Some(&format!("{}:0", record.meta.id))
+            close.attributes.get("expected_content_digest"),
+            Some(&ticket_content_digest(&record))
         );
         assert!(close.attributes.contains_key("operation_key"));
     }

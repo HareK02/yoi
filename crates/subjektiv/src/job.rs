@@ -65,7 +65,7 @@ struct ConsolidationResult {
 struct SurfaceResult {
     availability: String,
     generation_id: String,
-    store_revision: u64,
+    memory_fingerprint: String,
     #[serde(default)]
     snapshot_id: Option<String>,
     #[serde(default)]
@@ -105,7 +105,7 @@ pub fn validate_result(
         .validate_job_surface_outcome(
             subject_id,
             &result.surface.generation_id,
-            result.surface.store_revision,
+            result.surface.memory_fingerprint,
             &result.surface.availability,
             result.surface.snapshot_id.as_deref(),
             result.surface.reason_code.as_deref(),
@@ -118,7 +118,7 @@ pub fn validate_result(
 }
 
 /// Enriches a previously verified result with compact durable dispositions. Full
-/// reasons, affected revisions and provenance remain in the receipt store. This
+/// reasons, affected changes and provenance remain in the receipt store. This
 /// deterministic projection neither applies candidates nor creates a new ledger.
 pub fn with_dispositions(
     store: &SubjektivStore,

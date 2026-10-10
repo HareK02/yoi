@@ -35,9 +35,8 @@ function subject() {
     id: "subject-1",
     role: "Release coordinator",
     behavior_md: "Prefer explicit evidence.",
-    behavior_revision: 2,
     state: "active" as const,
-    store_revision: 9,
+    memory_fingerprint: "fingerprint-9",
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-02T03:04:05Z",
   };
@@ -122,9 +121,9 @@ test("creates one Subject with the exact role and navigates to its generated det
     id: "generated-subject-1",
     role: "  Review lead  ",
     behavior_md: "Challenge unsupported assumptions.",
-    behavior_revision: 0,
+
     state: "active",
-    store_revision: 0,
+    memory_fingerprint: "fingerprint-0",
     created_at: "2026-01-03T00:00:00Z",
     updated_at: "2026-01-03T00:00:00Z",
   }, { status: 201 }));
@@ -254,8 +253,8 @@ test("renders a ready resident surface and committed Memory lifecycle states", a
           snapshot_id: "snapshot-1",
           body_md:
             "# Resident context\n\nUse the **current** committed record.",
-          memory_refs: [{ memory_id: "memory-1", revision: 3 }],
-          built_from_store_revision: 9,
+          memory_refs: [{ memory_id: "memory-1", change_id: "change-current" }],
+          built_from_memory_fingerprint: "fingerprint-9",
           created_at: "2026-01-02T03:04:05Z",
         },
       }),
@@ -263,7 +262,7 @@ test("renders a ready resident surface and committed Memory lifecycle states", a
         items: [
           {
             id: "memory-1",
-            revision: 3,
+            change_id: "change-current",
             kind: "decision" as const,
             state: "active" as const,
             claim: "Current decision",
@@ -272,7 +271,7 @@ test("renders a ready resident surface and committed Memory lifecycle states", a
           },
           {
             id: "memory-2",
-            revision: 2,
+            change_id: "change-earlier",
             kind: "lesson" as const,
             state: "resolved" as const,
             claim: "Resolved lesson",
@@ -281,7 +280,7 @@ test("renders a ready resident surface and committed Memory lifecycle states", a
           },
           {
             id: "memory-3",
-            revision: 1,
+            change_id: "change-original",
             kind: "constraint" as const,
             state: "retracted" as const,
             claim: "Retracted constraint",
@@ -309,7 +308,7 @@ test("renders a ready resident surface and committed Memory lifecycle states", a
   expect(screen.getByText("Connected", { exact: true })).not.toBeNull();
   expect(screen.getByText("Release Worker", { exact: true })).not.toBeNull();
   expect(screen.getByText("3 on this page", { exact: true })).not.toBeNull();
-  expect(screen.getByText("Subject store revision", { exact: true })).not
+  expect(screen.getByText("Memory fingerprint", { exact: true })).not
     .toBeNull();
   expect(screen.getByText(/not a Memory count/)).not.toBeNull();
   expect(screen.getAllByText("Active", { exact: true }).length).toBeGreaterThan(
@@ -329,7 +328,6 @@ test("edits and clears user-managed behavior with CAS while distinguishing save 
     return Response.json({
       ...subject(),
       behavior_md: request.behavior_md,
-      behavior_revision: request.expected_behavior_revision + 1,
     });
   });
   vi.stubGlobal("fetch", fetchMock);
@@ -360,11 +358,11 @@ test("edits and clears user-managed behavior with CAS while distinguishing save 
   expect(path).toBe("/api/w/workspace-1/subjektiv/subjects/subject-1/behavior");
   expect(init.method).toBe("PATCH");
   expect(init.body).toBe(
-    '{"expected_behavior_revision":2,"behavior_md":"Ask before irreversible actions."}',
+    '{"expected_behavior_md":"Prefer explicit evidence.","behavior_md":"Ask before irreversible actions."}',
   );
   await waitFor(() => {
     expect(
-      screen.getByText(/Behavior storage confirmed at revision 3/).textContent,
+      screen.getByText(/Behavior storage confirmed/).textContent,
     )
       .toContain("does not confirm application");
   });
@@ -380,7 +378,7 @@ test("edits and clears user-managed behavior with CAS while distinguishing save 
   await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
   const secondBody =
     (fetchMock.mock.calls[1] as unknown as [string, RequestInit])[1].body;
-  expect(secondBody).toBe('{"expected_behavior_revision":3,"behavior_md":""}');
+  expect(secondBody).toBe('{"expected_behavior_md":"Ask before irreversible actions.","behavior_md":""}');
   await waitFor(() =>
     expect(screen.getByText("No behavior is set.")).not.toBeNull()
   );
@@ -411,7 +409,6 @@ test.each([
       return Response.json({
         ...nextSubject,
         behavior_md: request.behavior_md,
-        behavior_revision: request.expected_behavior_revision + 1,
       });
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -453,11 +450,11 @@ test.each([
       `/api/w/${workspaceId}/subjektiv/subjects/${id}/behavior`,
     );
     expect(JSON.parse(String(init.body))).toEqual({
-      expected_behavior_revision: 2,
+      expected_behavior_md: "Only B behavior.",
       behavior_md: "Only B behavior.",
     });
     await waitFor(() =>
-      expect(screen.getByText(/storage confirmed at revision 3/)).not.toBeNull()
+      expect(screen.getByText(/storage confirmed/)).not.toBeNull()
     );
   },
 );
@@ -498,8 +495,7 @@ test.each(["success", "failure"])(
       outcome === "success"
         ? Response.json({
           ...subject(),
-          behavior_md: "Late A response",
-          behavior_revision: 3,
+          behavior_md: "Prefer explicit evidence.",
         })
         : Response.json({
           error: "Forbidden",
@@ -524,11 +520,10 @@ test.each(["success", "failure"])(
       Response.json({
         ...nextSubject,
         behavior_md: "Updated B behavior.",
-        behavior_revision: 3,
       }),
     );
     await waitFor(() =>
-      expect(screen.getByText(/storage confirmed at revision 3/)).not.toBeNull()
+      expect(screen.getByText(/storage confirmed/)).not.toBeNull()
     );
     expect(
       screen.getByRole("article", { name: "User-managed Subject behavior" })
@@ -557,14 +552,12 @@ test("a refreshed loader snapshot fences old saves even after returning to the s
   const fresh = {
     ...subject(),
     behavior_md: "Fresh A loader",
-    behavior_revision: 4,
   };
   await view.rerender({ data: subjectPageData(fresh) } as never);
   resolveRequest(
     Response.json({
       ...subject(),
-      behavior_md: "Stale A response",
-      behavior_revision: 3,
+      behavior_md: "Prefer explicit evidence.",
     }),
   );
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -589,6 +582,28 @@ test("a refreshed loader snapshot fences old saves even after returning to the s
   ).toBeNull();
 });
 
+test.each([409, 503])("behavior save rejection %s preserves the draft and observed CAS text", async (status) => {
+  const fetchMock = vi.fn(async () => Response.json({ message: "save rejected" }, { status }));
+  vi.stubGlobal("fetch", fetchMock);
+  render(SubjectPage, { data: subjectPageData() } as never);
+  await fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+  const textarea = screen.getByRole("textbox", { name: "Subject behavior" });
+  await fireEvent.input(textarea, { target: { value: "  Unsaved\nbehavior.\n" } });
+  await fireEvent.click(screen.getByRole("button", { name: "Save behavior" }));
+  await waitFor(() => expect(screen.getByRole("alert")).not.toBeNull());
+  expect(textarea).toHaveProperty("value", "  Unsaved\nbehavior.\n");
+  expect(screen.queryByText(/storage confirmed/)).toBeNull();
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  expect(fetchMock.mock.calls[0]).toEqual([
+    "/api/w/workspace-1/subjektiv/subjects/subject-1/behavior",
+    {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expected_behavior_md: "Prefer explicit evidence.", behavior_md: "  Unsaved\nbehavior.\n" }),
+    },
+  ]);
+});
+
 test("candidate-only Subjects show no committed Memories, not an inferred candidate count", () => {
   // The store regression candidate_decisions_reject_conflicts_and_roll_back_partial_writes
   // stages a candidate without committing a Memory. Its public read projection is
@@ -598,7 +613,7 @@ test("candidate-only Subjects show no committed Memories, not an inferred candid
       workspaceId: "workspace-1",
       subjectId: "subject-1",
       cursor: null,
-      subject: result({ ...subject(), store_revision: 0 }),
+      subject: result({ ...subject(), memory_fingerprint: "fingerprint-0" }),
       surface: result({ subject_id: "subject-1", availability: "ungenerated" }),
       memories: result({ limit: 100, items: [], has_more: false }),
     },
@@ -620,7 +635,7 @@ test("candidate-only Subjects show no committed Memories, not an inferred candid
 test.each(["ready", "ungenerated", "stale", "failed"] as const)(
   "user behavior and diagnostic disclosures stay independent of %s generated Memory",
   async (availability) => {
-    const record = { ...subject(), store_revision: 0 };
+    const record = { ...subject(), memory_fingerprint: "fingerprint-0" };
     const view = render(SubjectPage, {
       data: {
         ...subjectPageData(record),
@@ -633,7 +648,7 @@ test.each(["ready", "ungenerated", "stale", "failed"] as const)(
                 snapshot_id: "empty-snapshot",
                 body_md: "",
                 memory_refs: [],
-                built_from_store_revision: 0,
+                built_from_memory_fingerprint: "fingerprint-0",
                 created_at: "2026-01-02T03:04:05Z",
               },
             }
@@ -654,7 +669,7 @@ test.each(["ready", "ungenerated", "stale", "failed"] as const)(
       "details.subject-technical-details",
     ) as HTMLDetailsElement;
     expect(technical.open).toBe(false);
-    expect(technical.textContent).toContain("Subject store revision");
+    expect(technical.textContent).toContain("Memory fingerprint");
     if (availability === "ready") {
       expect(screen.getByText("Resident context is current but empty.")).not
         .toBeNull();
@@ -663,7 +678,7 @@ test.each(["ready", "ungenerated", "stale", "failed"] as const)(
       expect(
         view.container.querySelector("details.surface-details")?.textContent,
       )
-        .toContain("Generated from Subject revision");
+        .toContain("Generated from Memory fingerprint");
     }
     await fireEvent.click(screen.getByRole("button", { name: "Edit" }));
     await fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
@@ -693,7 +708,7 @@ test("distinguishes ready-empty, stale, failed, unavailable, and request error s
           snapshot_id: "snapshot-empty",
           body_md: "",
           memory_refs: [],
-          built_from_store_revision: 9,
+          built_from_memory_fingerprint: "fingerprint-9",
           created_at: "2026-01-02T03:04:05Z",
         },
       }),
@@ -760,18 +775,18 @@ test("distinguishes ready-empty, stale, failed, unavailable, and request error s
   );
 });
 
-test("renders committed Memory detail, provenance, derivation, and immutable revisions", async () => {
+test("renders committed Memory detail, provenance, derivation, and immutable changes", async () => {
   render(MemoryDetailPage, {
     data: {
       workspaceId: "workspace-1",
       subjectId: "subject-1",
       memoryId: "memory-1",
-      revisionCursor: "revision-current",
+      changeCursor: "a/current",
       subject: result(subject()),
       memory: result({
         memory_id: "memory-1",
-        revision: 2,
-        current_revision: 3,
+        change_id: "z/earlier & context",
+        current_change_id: "a/current",
         kind: "decision" as const,
         state: "resolved" as const,
         claim: "Keep provenance typed",
@@ -782,7 +797,9 @@ test("renders committed Memory detail, provenance, derivation, and immutable rev
         updated_at: "2026-01-02T03:04:05Z",
         body_offset: 0,
         body_byte_offset: 0,
-        body_truncated: false,
+        body_truncated: true,
+        body_next_offset: 2,
+        body_next_byte_offset: 0,
         source_candidate_ids: ["candidate-1"],
         source_candidates: [{
           candidate_id: "candidate-1",
@@ -802,28 +819,29 @@ test("renders committed Memory detail, provenance, derivation, and immutable rev
           source_refs_total: 1,
           source_refs_truncated: false,
         }],
-        derived_from: [{ memory_id: "memory-parent", revision: 4 }],
-        evidence_has_more: false,
+        derived_from: [{ memory_id: "memory-parent", change_id: "parent/source & context" }],
+        evidence_has_more: true,
+        evidence_next_cursor: "evidence/next",
       }),
-      revisions: result({
+      changes: result({
         memory_id: "memory-1",
-        current_revision: 3,
+        current_change_id: "a/current",
         items: [{
-          revision: 3,
+          change_id: "a/current",
           kind: "decision" as const,
           state: "active" as const,
           claim: "Current claim",
           change_reason: "Clarified",
           updated_at: "2026-01-03T00:00:00Z",
         }, {
-          revision: 2,
+          change_id: "z/earlier & context",
           kind: "decision" as const,
           state: "resolved" as const,
           claim: "Earlier claim",
           change_reason: "Resolved",
           updated_at: "2026-01-02T00:00:00Z",
         }],
-        next_cursor: "revision-next",
+        next_cursor: "change-next",
         has_more: true,
       }),
     },
@@ -836,11 +854,29 @@ test("renders committed Memory detail, provenance, derivation, and immutable rev
   expect(screen.getByText("candidate-1")).not.toBeNull();
   expect(screen.getByText("Decision discussion")).not.toBeNull();
   expect(screen.getByText("memory-parent")).not.toBeNull();
-  expect(screen.getByRole("heading", { name: "Revision history" })).not
+  expect(screen.getByRole("heading", { name: "Change history" })).not
     .toBeNull();
-  expect(screen.getByText("Historical revision")).not.toBeNull();
-  expect(screen.getByRole("navigation", { name: "Revision history pages" }))
+  expect(screen.getByText("Historical change")).not.toBeNull();
+  expect(screen.getByRole("navigation", { name: "Change history pages" }))
     .not.toBeNull();
-  expect(screen.getByRole("link", { name: /Next page/ }).getAttribute("href"))
-    .toContain("revision_cursor=revision-next");
+  const historicalLink = screen.getByRole("link", { name: /Memory change z\/earlier/ });
+  expect(historicalLink.getAttribute("aria-current")).toBe("page");
+  expect(historicalLink.getAttribute("href")).toBe("/w/workspace-1/memory/subject-1/memory-1?change_id=z%2Fearlier%20%26%20context");
+  const currentLink = screen.getByRole("link", { name: /Memory change a\/current/ });
+  expect(currentLink.getAttribute("aria-current")).toBeNull();
+  expect(currentLink.textContent).toContain("Current");
+  expect(screen.getByRole("link", { name: /memory-parent/ }).getAttribute("href")).toBe("/w/workspace-1/memory/subject-1/memory-parent?change_id=parent%2Fsource%20%26%20context");
+  const bodyHref = screen.getByRole("link", { name: "View next body segment" }).getAttribute("href");
+  const bodyQuery = new URL(bodyHref!, "https://example.com").searchParams;
+  expect(bodyQuery.get("change_id")).toBe("z/earlier & context");
+  expect(bodyQuery.get("offset")).toBe("2");
+  expect(bodyQuery.get("byte_offset")).toBe("0");
+  const evidenceHref = screen.getByRole("link", { name: "View next evidence page" }).getAttribute("href");
+  const evidenceQuery = new URL(evidenceHref!, "https://example.com").searchParams;
+  expect(evidenceQuery.get("change_id")).toBe("z/earlier & context");
+  expect(evidenceQuery.get("evidence_cursor")).toBe("evidence/next");
+  const nextHref = screen.getByRole("link", { name: /Next page/ }).getAttribute("href");
+  const nextQuery = new URL(nextHref!, "https://example.com").searchParams;
+  expect(nextQuery.get("change_cursor")).toBe("change-next");
+  expect(nextQuery.get("change_id")).toBe("z/earlier & context");
 });

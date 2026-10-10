@@ -21,7 +21,7 @@ A Feature database is an API/ownership isolation boundary inside the trusted Ser
 
 ## Registration and repository example
 
-Registration is trusted startup code. Merely constructing or registering storage is lazy and creates no directory or database; the first `open` applies migrations.
+Registration is trusted startup code. Merely constructing or registering storage is lazy and creates no directory or database; the first `open` applies migrations. The simplified example below demonstrates storage ownership and transaction atomicity, not the production subjektiv schema or Memory-change API; those contracts are described in [subjektiv-store.md](subjektiv-store.md).
 
 ```rust
 use rusqlite::{Transaction, params};
@@ -37,7 +37,7 @@ fn create_subject_memory(tx: &Transaction<'_>) -> StorageResult<()> {
     tx.execute_batch(
         "CREATE TABLE subjects (
              subject_id TEXT PRIMARY KEY,
-             revision INTEGER NOT NULL
+             state TEXT NOT NULL CHECK (state IN ('active', 'retired'))
          );
          CREATE TABLE memories (
              subject_id TEXT NOT NULL,
@@ -75,18 +75,13 @@ impl SubjektivRepository {
         body: &str,
         intervention_id: &str,
     ) -> StorageResult<()> {
-        // Candidate application, memory revision, and intervention recording are
+        // Candidate content and intervention recording are
         // one atomic transaction in the subjektiv Feature database.
         self.database.transaction(|tx| {
             tx.execute(
                 "INSERT INTO memories (subject_id, memory_id, body)
                  VALUES (?1, ?2, ?3)",
                 params![subject_id, memory_id, body],
-            )?;
-            tx.execute(
-                "UPDATE subjects SET revision = revision + 1
-                 WHERE subject_id = ?1",
-                [subject_id],
             )?;
             tx.execute(
                 "INSERT INTO interventions (intervention_id, subject_id, detail)

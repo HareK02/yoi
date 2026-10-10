@@ -127,7 +127,7 @@ async fn make_worker_with_body(
         .clone();
     templates.insert("test".to_string(), body.to_string());
     let projection =
-        EffectivePromptCatalog::new(templates, 1, "test-schema", "test-toolchain").unwrap();
+        EffectivePromptCatalog::new(templates, "test-schema", "test-toolchain").unwrap();
     let loader = PromptCatalogSource::builtins_only().with_effective_catalog(projection);
 
     let worker =
@@ -162,7 +162,7 @@ async fn template_parse_rejects_invalid_syntax() {
         .clone();
     templates.insert("broken".to_string(), "{{ unclosed".to_string());
     let error =
-        EffectivePromptCatalog::new(templates, 1, "test-schema", "test-toolchain").unwrap_err();
+        EffectivePromptCatalog::new(templates, "test-schema", "test-toolchain").unwrap_err();
     assert!(error.to_string().contains("does not compile"));
 }
 

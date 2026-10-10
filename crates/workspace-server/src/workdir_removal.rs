@@ -75,7 +75,7 @@ pub struct WorkdirRemovalOperation {
     pub source_actor: String,
     pub reason: String,
     pub state: WorkdirRemovalOperationState,
-    pub attempt_count: u64,
+    pub attempt_id: Option<String>,
     pub retryable: bool,
     pub disposition: Option<WorkdirRemovalDisposition>,
     pub failure_category: Option<String>,
@@ -202,9 +202,9 @@ impl SqliteWorkspaceStore {
                 r#"INSERT INTO workdir_removal_operations (
                     workspace_id, operation_id, request_fingerprint, workdir_id, runtime_id,
                     repository_id, materialization_fingerprint, source_actor, reason, state,
-                    attempt_count, retryable, disposition, failure_category,
+                    attempt_id, retryable, disposition, failure_category,
                     created_at, updated_at, completed_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', 0, 1, NULL, NULL, ?10, ?10, NULL)"#,
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', NULL, 1, NULL, NULL, ?10, ?10, NULL)"#,
                 params![
                     intent.workspace_id,
                     intent.operation_id,
@@ -248,14 +248,14 @@ impl SqliteWorkspaceStore {
         request_fingerprint: &str,
         owner: WorkdirRemovalAttemptOwner,
         expected_prior_owner: Option<WorkdirRemovalAttemptOwner>,
-        expected_attempt_count: u64,
+        expected_attempt_id: Option<&str>,
     ) -> Result<WorkdirRemovalOperation> {
         self.begin_workdir_removal_attempt_inner(
             workspace_id,
             operation_id,
             request_fingerprint,
             owner,
-            Some((expected_prior_owner, expected_attempt_count)),
+            Some((expected_prior_owner, expected_attempt_id)),
         )
     }
 
@@ -265,7 +265,7 @@ impl SqliteWorkspaceStore {
         operation_id: &str,
         request_fingerprint: &str,
         owner: WorkdirRemovalAttemptOwner,
-        recovery_expected: Option<(Option<WorkdirRemovalAttemptOwner>, u64)>,
+        recovery_expected: Option<(Option<WorkdirRemovalAttemptOwner>, Option<&str>)>,
     ) -> Result<WorkdirRemovalOperation> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -282,17 +282,17 @@ impl SqliteWorkspaceStore {
                     "Workdir removal operation `{operation_id}` is not retryable"
                 )));
             }
-            if let Some((expected_owner, expected_attempt_count)) = recovery_expected {
+            if let Some((expected_owner, expected_attempt_id)) = recovery_expected {
                 if operation.state != WorkdirRemovalOperationState::Pending
                     || operation.attempt_owner != expected_owner
-                    || operation.attempt_count != expected_attempt_count
+                    || operation.attempt_id.as_deref() != expected_attempt_id
                 {
                     return Err(Error::WorkdirAttachmentConflict(format!(
                         "Workdir removal operation `{operation_id}` changed after orphan proof"
                     )));
                 }
             } else if operation.state == WorkdirRemovalOperationState::Pending
-                && operation.attempt_count > 0
+                && operation.attempt_id.is_some()
             {
                 return Err(Error::WorkdirAttachmentConflict(format!(
                     "Workdir removal operation `{operation_id}` already has an active attempt"
@@ -300,7 +300,7 @@ impl SqliteWorkspaceStore {
             }
             let now = Utc::now().to_rfc3339();
             tx.execute(
-                "UPDATE workdir_removal_operations SET state='pending', attempt_count=attempt_count+1, retryable=1, failure_category=NULL, disposition=NULL, attempt_owner_pid=?1, attempt_owner_start_marker=?2, updated_at=?3, completed_at=NULL WHERE workspace_id=?4 AND operation_id=?5 AND request_fingerprint=?6",
+                "UPDATE workdir_removal_operations SET state='pending', attempt_id=?7, retryable=1, failure_category=NULL, disposition=NULL, attempt_owner_pid=?1, attempt_owner_start_marker=?2, updated_at=?3, completed_at=NULL WHERE workspace_id=?4 AND operation_id=?5 AND request_fingerprint=?6",
                 params![
                     owner.process_id,
                     i64::try_from(owner.process_start_marker).map_err(|_| {
@@ -312,6 +312,7 @@ impl SqliteWorkspaceStore {
                     workspace_id,
                     operation_id,
                     request_fingerprint,
+                    uuid::Uuid::now_v7().to_string(),
                 ],
             )?;
             let operation =
@@ -462,6 +463,7 @@ impl SqliteWorkspaceStore {
                 tx.commit()?;
                 return Ok(current);
             }
+            require_matching_attempt(operation, &current)?;
             let now = Utc::now().to_rfc3339();
             tx.execute(
                 "UPDATE workdir_removal_operations SET state='failed', retryable=?1, disposition=?2, failure_category=?3, attempt_owner_pid=NULL, attempt_owner_start_marker=NULL, updated_at=?4 WHERE workspace_id=?5 AND operation_id=?6 AND request_fingerprint=?7",
@@ -519,6 +521,7 @@ impl SqliteWorkspaceStore {
                 tx.commit()?;
                 return Ok(current);
             }
+            require_matching_attempt(operation, &current)?;
             if delete_registry {
                 let registry = load_workdir_record(
                     &tx,
@@ -614,6 +617,22 @@ impl SqliteWorkspaceStore {
     ) -> Result<Option<WorkdirRemovalOperation>> {
         self.with_conn(|conn| load_operation(conn, workspace_id, operation_id))
     }
+}
+
+fn require_matching_attempt(
+    expected: &WorkdirRemovalOperation,
+    current: &WorkdirRemovalOperation,
+) -> Result<()> {
+    if current.state != WorkdirRemovalOperationState::Pending
+        || expected.attempt_id != current.attempt_id
+        || expected.attempt_owner != current.attempt_owner
+    {
+        return Err(Error::WorkdirAttachmentConflict(format!(
+            "Workdir removal operation `{}` execution attempt changed",
+            expected.operation_id
+        )));
+    }
+    Ok(())
 }
 
 fn require_no_removal_blockers(
@@ -804,7 +823,7 @@ fn load_operation(
 fn operation_select_sql() -> &'static str {
     r#"SELECT operation_id, request_fingerprint, workspace_id, workdir_id, runtime_id,
               repository_id, materialization_fingerprint, source_actor, reason, state,
-              attempt_count, retryable, disposition, failure_category,
+              attempt_id, retryable, disposition, failure_category,
               attempt_owner_pid, attempt_owner_start_marker,
               created_at, updated_at, completed_at
        FROM workdir_removal_operations"#
@@ -816,7 +835,7 @@ fn read_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkdirRemovalOpe
         .get::<_, Option<String>>(12)?
         .map(|value| parse_disposition(&value))
         .transpose()?;
-    let attempt_count = row.get::<_, i64>(10)?;
+    let attempt_id = row.get::<_, Option<String>>(10)?;
     let attempt_owner_pid = row.get::<_, Option<i64>>(14)?;
     let attempt_owner_start_marker = row.get::<_, Option<i64>>(15)?;
     let attempt_owner = match (attempt_owner_pid, attempt_owner_start_marker) {
@@ -848,9 +867,7 @@ fn read_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkdirRemovalOpe
         source_actor: row.get(7)?,
         reason: row.get(8)?,
         state,
-        attempt_count: attempt_count
-            .try_into()
-            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(10, attempt_count))?,
+        attempt_id,
         retryable: row.get(11)?,
         disposition,
         failure_category: row.get(13)?,
@@ -942,7 +959,6 @@ mod tests {
                     uri: "/repository-a".to_string(),
                 },
                 default_ref: Some("develop".to_string()),
-                source_revision: 1,
                 source_fingerprint: "source-a".to_string(),
                 observed_status: RepositoryObservedStatus::Unverified,
                 observed_at: None,
@@ -1006,7 +1022,7 @@ mod tests {
                 attempt_owner(),
             )
             .unwrap();
-        assert_eq!(first.attempt_count, 1);
+        assert!(first.attempt_id.is_some());
         let failed = store
             .fail_workdir_removal_operation(&first, "runtime_unavailable", true)
             .unwrap();
@@ -1019,7 +1035,7 @@ mod tests {
                 attempt_owner(),
             )
             .unwrap();
-        assert_eq!(retry.attempt_count, 2);
+        assert_ne!(retry.attempt_id, first.attempt_id);
         let completed = store.commit_workdir_removal_removed(&retry).unwrap();
         assert_eq!(
             completed.disposition,
@@ -1040,6 +1056,58 @@ mod tests {
             )
             .unwrap();
         assert_eq!(replay, completed);
+    }
+
+    #[tokio::test]
+    async fn recovery_and_completion_are_fenced_by_attempt_identity() {
+        let (store, workdir) = seeded_store().await;
+        let intent = workdir_removal_intent(&workdir, "workspace-api", "remove Workdir").unwrap();
+        let reserved = store.reserve_workdir_removal_operation(&intent).unwrap();
+        let first = store
+            .begin_workdir_removal_attempt(
+                &reserved.workspace_id,
+                &reserved.operation_id,
+                &reserved.request_fingerprint,
+                attempt_owner(),
+            )
+            .unwrap();
+        let recovered = store
+            .reclaim_workdir_removal_attempt_for_recovery(
+                &first.workspace_id,
+                &first.operation_id,
+                &first.request_fingerprint,
+                attempt_owner(),
+                first.attempt_owner,
+                first.attempt_id.as_deref(),
+            )
+            .unwrap();
+        assert_ne!(first.attempt_id, recovered.attempt_id);
+        assert!(matches!(
+            store.reclaim_workdir_removal_attempt_for_recovery(
+                &first.workspace_id,
+                &first.operation_id,
+                &first.request_fingerprint,
+                attempt_owner(),
+                first.attempt_owner,
+                first.attempt_id.as_deref(),
+            ),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert!(matches!(
+            store.fail_workdir_removal_operation(&first, "late_failure", true),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert!(matches!(
+            store.commit_workdir_removal_removed(&first),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert!(
+            store
+                .get_workdir_registry("workspace-a", "workdir-a")
+                .unwrap()
+                .is_some()
+        );
+        store.commit_workdir_removal_removed(&recovered).unwrap();
     }
 
     #[tokio::test]
@@ -1109,16 +1177,14 @@ mod tests {
             selector: Some("develop".to_string()),
             requested_runtime_id: Some("runtime-a".to_string()),
             resolved_runtime_id: "runtime-a".to_string(),
-            config_revision: 1,
             config_projection_digest: "projection-a".to_string(),
             source_kind: Some("local_path".to_string()),
             source_uri: Some("/repository-a".to_string()),
-            source_revision: Some(1),
             source_fingerprint: Some("source-a".to_string()),
             credential_id: None,
-            credential_revision: None,
+            credential_fingerprint: None,
             host_trust_id: None,
-            host_trust_revision: None,
+            host_trust_fingerprint: None,
             repository_access_mode: None,
             credential_candidates: Vec::new(),
             working_directory_id: "workdir-a".to_string(),
@@ -1382,7 +1448,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retry.state, WorkdirRemovalOperationState::Pending);
-        assert_eq!(retry.attempt_count, 1);
+        assert!(retry.attempt_id.is_some());
         assert_eq!(retry.disposition, None);
         assert_eq!(retry.failure_category, None);
         assert!(retry.retryable);

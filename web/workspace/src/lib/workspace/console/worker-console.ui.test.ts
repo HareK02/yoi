@@ -504,7 +504,7 @@ Deno.test("workspace Memory surfaces use read-only scoped memory APIs", async ()
       subjectIndexPage.includes(">Subjects</h1>") &&
       subjectIndexPage.includes("Worker connection") &&
       subjectIndexPage.includes("subject.current_worker") &&
-      !subjectIndexPage.includes("subject.store_revision") &&
+      !subjectIndexPage.includes("subject.memory_fingerprint") &&
       subjectIndexPage.includes('data-memory-view="subjects"'),
     "Memory product entry should list explicit typed subjects",
   );
@@ -513,7 +513,7 @@ Deno.test("workspace Memory surfaces use read-only scoped memory APIs", async ()
       subjectPageLoad.includes("`${subjectPath}/memories`") &&
       subjectPage.includes("DocumentMarkdown from") &&
       subjectPage.includes("Resident context") &&
-      subjectPage.includes("Subject store revision") &&
+      subjectPage.includes("Memory fingerprint") &&
       subjectPage.includes("Current Memories") &&
       subjectPage.includes("surface?.availability === 'ready'") &&
       subjectPage.includes("surface?.availability === 'ungenerated'") &&
@@ -524,15 +524,15 @@ Deno.test("workspace Memory surfaces use read-only scoped memory APIs", async ()
     "Subject page should combine strict resident-surface and current-Memory reads without a nested vertical scroller",
   );
   assert(
-    memoryDetailLoad.includes("`${memoryPath}/revisions`") &&
+    memoryDetailLoad.includes("`${memoryPath}/changes`") &&
       memoryDetailLoad.includes("parseSubjektivMemoryReadResponse") &&
       memoryDetailPage.includes("Candidate provenance") &&
       memoryDetailPage.includes("Source refs") &&
       memoryDetailPage.includes("Derived from") &&
-      memoryDetailPage.includes("Revision history") &&
+      memoryDetailPage.includes("Change history") &&
       memoryDetailPage.includes("DocumentMarkdown from") &&
       !memoryDetailPage.includes("overflow-y"),
-    "Committed Memory detail should preserve bounded provenance and immutable revisions without mutation controls",
+    "Committed Memory detail should preserve bounded provenance and immutable changes without mutation controls",
   );
 });
 

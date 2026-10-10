@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 
 use crate::auth::RuntimeAuthError;
 
-const WORKSPACE_TOKEN_PREFIX: &str = "yoi-workspace-v1";
-const WORKSPACE_SIGNING_INPUT_PREFIX: &str = "yoi.workspace.capability.v1.";
+const WORKSPACE_TOKEN_PREFIX: &str = "yoi-workspace-v2";
+const WORKSPACE_SIGNING_INPUT_PREFIX: &str = "yoi.workspace.capability.v2.";
 const WORKSPACE_SIGNING_ALGORITHM: &str = "ed25519";
 const MAX_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_ID_BYTES: usize = 256;
@@ -42,8 +42,7 @@ pub struct WorkspaceIssuerTrustRecord {
     pub algorithm: String,
     pub public_key: String,
     pub public_key_fingerprint: String,
-    pub identity_revision: u64,
-    pub trust_generation: u64,
+    pub trust_id: String,
     pub state: WorkspaceIssuerTrustState,
     pub registered_at_unix: i64,
     pub updated_at_unix: i64,
@@ -52,13 +51,11 @@ pub struct WorkspaceIssuerTrustRecord {
 impl WorkspaceIssuerTrustRecord {
     pub fn from_bundle(
         bundle: WorkspacePublicIdentityBundle,
-        trust_generation: u64,
+        trust_id: String,
         now_unix: i64,
     ) -> Result<Self, WorkspaceIssuerTrustError> {
         validate_bundle(&bundle)?;
-        if trust_generation == 0 {
-            return Err(WorkspaceIssuerTrustError::InvalidTrustGeneration);
-        }
+        validate_id(&trust_id)?;
         Ok(Self {
             workspace_id: bundle.workspace_id,
             backend_url: bundle.backend_url,
@@ -66,8 +63,7 @@ impl WorkspaceIssuerTrustRecord {
             algorithm: bundle.algorithm,
             public_key: bundle.public_key,
             public_key_fingerprint: bundle.public_key_fingerprint,
-            identity_revision: bundle.revision,
-            trust_generation,
+            trust_id,
             state: WorkspaceIssuerTrustState::Active,
             registered_at_unix: now_unix,
             updated_at_unix: now_unix,
@@ -82,9 +78,54 @@ impl WorkspaceIssuerTrustRecord {
             algorithm: self.algorithm.clone(),
             public_key: self.public_key.clone(),
             public_key_fingerprint: self.public_key_fingerprint.clone(),
-            revision: self.identity_revision,
         }
     }
+}
+
+// Frozen pre-ID enrollment format. It is never accepted as live authority.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyWorkspaceIssuerTrustRecord {
+    workspace_id: String,
+    backend_url: String,
+    key_id: String,
+    algorithm: String,
+    public_key: String,
+    public_key_fingerprint: String,
+    identity_revision: u64,
+    trust_generation: u64,
+    state: WorkspaceIssuerTrustState,
+    registered_at_unix: i64,
+    updated_at_unix: i64,
+}
+
+/// Migrate a pre-ID enrollment as revoked. Only an explicit operator replacement
+/// can accept new trust; no legacy capability can authorize its own migration.
+pub fn migrate_legacy_workspace_issuer_trust_record(
+    value: serde_json::Value,
+) -> Result<WorkspaceIssuerTrustRecord, WorkspaceIssuerTrustError> {
+    let legacy: LegacyWorkspaceIssuerTrustRecord =
+        serde_json::from_value(value).map_err(|_| WorkspaceIssuerTrustError::InvalidIdentifier)?;
+    if legacy.identity_revision == 0 || legacy.trust_generation == 0 {
+        return Err(WorkspaceIssuerTrustError::InvalidIdentifier);
+    }
+    let mut record = WorkspaceIssuerTrustRecord::from_bundle(
+        WorkspacePublicIdentityBundle {
+            workspace_id: legacy.workspace_id,
+            backend_url: legacy.backend_url,
+            key_id: legacy.key_id,
+            algorithm: legacy.algorithm,
+            public_key: legacy.public_key,
+            public_key_fingerprint: legacy.public_key_fingerprint,
+        },
+        uuid::Uuid::now_v7().to_string(),
+        legacy.registered_at_unix,
+    )?;
+    // Both old Active and Revoked records require new enrollment acceptance.
+    let _old_state = legacy.state;
+    record.state = WorkspaceIssuerTrustState::Revoked;
+    record.updated_at_unix = legacy.updated_at_unix;
+    Ok(record)
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -103,16 +144,10 @@ pub enum WorkspaceIssuerTrustError {
     InvalidPublicKey,
     #[error("Workspace signing public key fingerprint does not match the public key")]
     PublicKeyFingerprintMismatch,
-    #[error("Workspace signing identity revision must be greater than zero")]
-    InvalidIdentityRevision,
-    #[error("Workspace issuer trust generation must be greater than zero")]
-    InvalidTrustGeneration,
-    #[error("Workspace signing identity replacement revision is stale")]
-    StaleIdentityRevision,
+    #[error("Workspace signing key identity cannot name different key material")]
+    KeyIdentityMismatch,
     #[error("Workspace issuer trust record limit was reached")]
     TrustRecordLimitExceeded,
-    #[error("Workspace issuer trust generation overflow")]
-    TrustGenerationOverflow,
 }
 
 pub fn validate_workspace_issuer_trust_records(
@@ -160,7 +195,11 @@ pub fn add_workspace_issuer_trust(
     if records.len() >= MAX_WORKSPACE_ISSUER_TRUST_RECORDS {
         return Err(WorkspaceIssuerTrustError::TrustRecordLimitExceeded);
     }
-    let record = WorkspaceIssuerTrustRecord::from_bundle(bundle, 1, now_unix)?;
+    let record = WorkspaceIssuerTrustRecord::from_bundle(
+        bundle,
+        uuid::Uuid::now_v7().to_string(),
+        now_unix,
+    )?;
     records.push(record.clone());
     records.sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
     Ok((WorkspaceIssuerTrustMutation::Added, record))
@@ -179,22 +218,14 @@ pub fn replace_workspace_issuer_trust(
     if record.state == WorkspaceIssuerTrustState::Active && record.public_bundle() == bundle {
         return Ok((WorkspaceIssuerTrustMutation::Unchanged, record.clone()));
     }
-    if bundle.revision < record.identity_revision {
-        return Err(WorkspaceIssuerTrustError::StaleIdentityRevision);
-    }
-    if bundle.revision == record.identity_revision
-        && (bundle.key_id != record.key_id
-            || bundle.public_key != record.public_key
-            || bundle.public_key_fingerprint != record.public_key_fingerprint)
+    if bundle.key_id == record.key_id
+        && bundle.public_key_fingerprint != record.public_key_fingerprint
     {
-        return Err(WorkspaceIssuerTrustError::StaleIdentityRevision);
+        return Err(WorkspaceIssuerTrustError::KeyIdentityMismatch);
     }
-    let generation = record
-        .trust_generation
-        .checked_add(1)
-        .ok_or(WorkspaceIssuerTrustError::TrustGenerationOverflow)?;
+    let trust_id = uuid::Uuid::now_v7().to_string();
     let registered_at_unix = record.registered_at_unix;
-    *record = WorkspaceIssuerTrustRecord::from_bundle(bundle, generation, now_unix)?;
+    *record = WorkspaceIssuerTrustRecord::from_bundle(bundle, trust_id, now_unix)?;
     record.registered_at_unix = registered_at_unix;
     Ok((WorkspaceIssuerTrustMutation::Replaced, record.clone()))
 }
@@ -212,10 +243,7 @@ pub fn revoke_workspace_issuer_trust(
     if record.state == WorkspaceIssuerTrustState::Revoked {
         return Ok((WorkspaceIssuerTrustMutation::Unchanged, record.clone()));
     }
-    record.trust_generation = record
-        .trust_generation
-        .checked_add(1)
-        .ok_or(WorkspaceIssuerTrustError::TrustGenerationOverflow)?;
+    record.trust_id = uuid::Uuid::now_v7().to_string();
     record.state = WorkspaceIssuerTrustState::Revoked;
     record.updated_at_unix = now_unix;
     Ok((WorkspaceIssuerTrustMutation::Revoked, record.clone()))
@@ -246,9 +274,6 @@ fn validate_bundle(
     if bundle.algorithm != WORKSPACE_SIGNING_ALGORITHM {
         return Err(WorkspaceIssuerTrustError::UnsupportedAlgorithm);
     }
-    if bundle.revision == 0 {
-        return Err(WorkspaceIssuerTrustError::InvalidIdentityRevision);
-    }
     let public_key = crate::auth::decode_public_key(&bundle.public_key)
         .map_err(|_| WorkspaceIssuerTrustError::InvalidPublicKey)?;
     let fingerprint = format!("sha256:{}", hex_lower(&Sha256::digest(&public_key)));
@@ -276,8 +301,8 @@ pub const WORKSPACE_VERIFICATION_CHALLENGE_PATH: &str =
 pub const WORKSPACE_VERIFICATION_ACK_PATH: &str =
     "/v1/workspace-runtime-verification/acknowledgement";
 pub const WORKSPACE_VERIFICATION_OPERATION: &str = "workspace.runtime.verify";
-const RUNTIME_VERIFICATION_TOKEN_PREFIX: &str = "yoi-runtime-verification-v1";
-const RUNTIME_VERIFICATION_SIGNING_INPUT_PREFIX: &str = "yoi.runtime.verification.v1.";
+const RUNTIME_VERIFICATION_TOKEN_PREFIX: &str = "yoi-runtime-verification-v2";
+const RUNTIME_VERIFICATION_SIGNING_INPUT_PREFIX: &str = "yoi.runtime.verification.v2.";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -285,12 +310,11 @@ pub struct WorkspaceRuntimeVerificationChallenge {
     pub challenge_id: String,
     pub workspace_id: String,
     pub runtime_id: String,
-    pub binding_revision: u64,
+    pub binding_id: String,
     pub workspace_key_id: String,
-    pub workspace_identity_revision: u64,
-    pub workspace_trust_generation: u64,
+    pub workspace_public_key_fingerprint: String,
+    pub workspace_trust_id: String,
     pub runtime_public_key_fingerprint: String,
-    pub runtime_identity_revision: u64,
     pub workspace_nonce: String,
     pub expires_at: i64,
 }
@@ -301,12 +325,11 @@ pub struct WorkspaceRuntimeVerificationResponse {
     pub challenge_id: String,
     pub workspace_id: String,
     pub runtime_id: String,
-    pub binding_revision: u64,
+    pub binding_id: String,
     pub workspace_key_id: String,
-    pub workspace_identity_revision: u64,
-    pub workspace_trust_generation: u64,
+    pub workspace_public_key_fingerprint: String,
+    pub workspace_trust_id: String,
     pub runtime_public_key_fingerprint: String,
-    pub runtime_identity_revision: u64,
     pub workspace_nonce: String,
     pub runtime_nonce: String,
     pub expires_at: i64,
@@ -319,12 +342,11 @@ pub struct WorkspaceRuntimeVerificationAcknowledgement {
     pub challenge_id: String,
     pub workspace_id: String,
     pub runtime_id: String,
-    pub binding_revision: u64,
+    pub binding_id: String,
     pub workspace_key_id: String,
-    pub workspace_identity_revision: u64,
-    pub workspace_trust_generation: u64,
+    pub workspace_public_key_fingerprint: String,
+    pub workspace_trust_id: String,
     pub runtime_public_key_fingerprint: String,
-    pub runtime_identity_revision: u64,
     pub workspace_nonce: String,
     pub runtime_nonce: String,
     pub response_digest: String,
@@ -338,7 +360,7 @@ pub struct WorkspaceRuntimeVerificationReceipt {
     pub challenge_id: String,
     pub workspace_id: String,
     pub runtime_id: String,
-    pub binding_revision: u64,
+    pub binding_id: String,
     pub accepted_at: i64,
 }
 
@@ -347,16 +369,24 @@ pub struct WorkspaceRuntimeVerificationReceipt {
 pub struct WorkspaceRuntimeVerificationRecord {
     pub workspace_id: String,
     pub runtime_id: String,
-    pub binding_revision: u64,
+    pub binding_id: String,
     pub workspace_key_id: String,
-    pub workspace_identity_revision: u64,
-    pub workspace_trust_generation: u64,
+    pub workspace_public_key_fingerprint: String,
+    pub workspace_trust_id: String,
     pub runtime_public_key_fingerprint: String,
-    pub runtime_identity_revision: u64,
     pub verified_at: i64,
 }
 
 pub trait WorkspaceRuntimeVerificationAuthority: fmt::Debug + Send + Sync {
+    fn begin(
+        &self,
+        challenge: WorkspaceRuntimeVerificationChallenge,
+    ) -> Result<(), WorkspaceCapabilityVerificationError>;
+    fn acknowledge(
+        &self,
+        challenge_id: &str,
+        record: WorkspaceRuntimeVerificationRecord,
+    ) -> Result<(), WorkspaceCapabilityVerificationError>;
     fn get(
         &self,
         workspace_id: &str,
@@ -370,36 +400,63 @@ pub trait WorkspaceRuntimeVerificationAuthority: fmt::Debug + Send + Sync {
 
 #[derive(Debug, Default)]
 pub struct InMemoryWorkspaceRuntimeVerificationAuthority {
-    records: Mutex<HashMap<(String, String), WorkspaceRuntimeVerificationRecord>>,
+    state: Mutex<WorkspaceRuntimeVerificationDocument>,
 }
 
 impl WorkspaceRuntimeVerificationAuthority for InMemoryWorkspaceRuntimeVerificationAuthority {
+    fn begin(
+        &self,
+        challenge: WorkspaceRuntimeVerificationChallenge,
+    ) -> Result<(), WorkspaceCapabilityVerificationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| WorkspaceCapabilityVerificationError::VerificationAuthorityUnavailable)?;
+        begin_verification(&mut state, challenge)
+    }
+    fn acknowledge(
+        &self,
+        challenge_id: &str,
+        record: WorkspaceRuntimeVerificationRecord,
+    ) -> Result<(), WorkspaceCapabilityVerificationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| WorkspaceCapabilityVerificationError::VerificationAuthorityUnavailable)?;
+        acknowledge_verification(&mut state, challenge_id, record)
+    }
     fn get(
         &self,
         workspace_id: &str,
         runtime_id: &str,
     ) -> Result<Option<WorkspaceRuntimeVerificationRecord>, WorkspaceCapabilityVerificationError>
     {
-        Ok(self
-            .records
+        let state = self
+            .state
             .lock()
-            .map_err(|_| WorkspaceCapabilityVerificationError::VerificationAuthorityUnavailable)?
-            .get(&(workspace_id.to_string(), runtime_id.to_string()))
+            .map_err(|_| WorkspaceCapabilityVerificationError::VerificationAuthorityUnavailable)?;
+        Ok(state
+            .records
+            .iter()
+            .find(|record| record.workspace_id == workspace_id && record.runtime_id == runtime_id)
             .cloned())
     }
-
     fn record(
         &self,
         record: WorkspaceRuntimeVerificationRecord,
     ) -> Result<(), WorkspaceCapabilityVerificationError> {
         validate_verification_record(&record)?;
-        self.records
+        let mut state = self
+            .state
             .lock()
-            .map_err(|_| WorkspaceCapabilityVerificationError::VerificationAuthorityUnavailable)?
-            .insert(
-                (record.workspace_id.clone(), record.runtime_id.clone()),
-                record,
-            );
+            .map_err(|_| WorkspaceCapabilityVerificationError::VerificationAuthorityUnavailable)?;
+        state.records.retain(|current| {
+            current.workspace_id != record.workspace_id || current.runtime_id != record.runtime_id
+        });
+        if state.records.len() >= MAX_WORKSPACE_ISSUER_TRUST_RECORDS {
+            return Err(WorkspaceCapabilityVerificationError::TrustRecordLimitExceeded);
+        }
+        state.records.push(record);
         Ok(())
     }
 }
@@ -410,11 +467,36 @@ pub struct FileWorkspaceRuntimeVerificationAuthority {
     lock: Arc<Mutex<()>>,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkspaceRuntimeVerificationDocument {
     version: u32,
     records: Vec<WorkspaceRuntimeVerificationRecord>,
+    #[serde(default)]
+    pending: Vec<WorkspaceRuntimeVerificationChallenge>,
+}
+
+// Frozen verification evidence from before trust/binding IDs. Never promote
+// counters into IDs or keep a pre-ID acknowledgement usable after migration.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyVerificationDocument {
+    version: u32,
+    records: Vec<LegacyVerificationRecord>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct LegacyVerificationRecord {
+    workspace_id: String,
+    runtime_id: String,
+    binding_revision: u64,
+    workspace_key_id: String,
+    workspace_identity_revision: u64,
+    workspace_trust_generation: u64,
+    runtime_public_key_fingerprint: String,
+    runtime_identity_revision: u64,
+    verified_at: i64,
 }
 
 impl FileWorkspaceRuntimeVerificationAuthority {
@@ -430,12 +512,36 @@ impl FileWorkspaceRuntimeVerificationAuthority {
     ) -> Result<WorkspaceRuntimeVerificationDocument, WorkspaceCapabilityVerificationError> {
         match fs::read(&self.path) {
             Ok(bytes) => {
-                let document: WorkspaceRuntimeVerificationDocument = serde_json::from_slice(&bytes)
+                let raw: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+                    WorkspaceCapabilityVerificationError::VerificationAuthorityUnavailable
+                })?;
+                if raw.get("version").and_then(serde_json::Value::as_u64) == Some(1) {
+                    let legacy: LegacyVerificationDocument =
+                        serde_json::from_value(raw).map_err(|_| {
+                            WorkspaceCapabilityVerificationError::VerificationAuthorityUnavailable
+                        })?;
+                    if legacy.version != 1
+                        || legacy.records.len() > MAX_WORKSPACE_ISSUER_TRUST_RECORDS
+                    {
+                        return Err(
+                            WorkspaceCapabilityVerificationError::VerificationAuthorityUnavailable,
+                        );
+                    }
+                    let migrated = WorkspaceRuntimeVerificationDocument {
+                        version: 2,
+                        records: Vec::new(),
+                        pending: Vec::new(),
+                    };
+                    self.write(&migrated)?;
+                    return Ok(migrated);
+                }
+                let document: WorkspaceRuntimeVerificationDocument = serde_json::from_value(raw)
                     .map_err(|_| {
                         WorkspaceCapabilityVerificationError::VerificationAuthorityUnavailable
                     })?;
-                if document.version != 1
+                if document.version != 2
                     || document.records.len() > MAX_WORKSPACE_ISSUER_TRUST_RECORDS
+                    || document.pending.len() > MAX_WORKSPACE_ISSUER_TRUST_RECORDS
                 {
                     return Err(
                         WorkspaceCapabilityVerificationError::VerificationAuthorityUnavailable,
@@ -452,12 +558,23 @@ impl FileWorkspaceRuntimeVerificationAuthority {
                         );
                     }
                 }
+                let mut pending_identities = HashSet::new();
+                for challenge in &document.pending {
+                    validate_verification_challenge(challenge)?;
+                    if !pending_identities.insert((&challenge.workspace_id, &challenge.runtime_id))
+                    {
+                        return Err(
+                            WorkspaceCapabilityVerificationError::VerificationAuthorityUnavailable,
+                        );
+                    }
+                }
                 Ok(document)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Ok(WorkspaceRuntimeVerificationDocument {
-                    version: 1,
+                    version: 2,
                     records: Vec::new(),
+                    pending: Vec::new(),
                 })
             }
             Err(_) => Err(WorkspaceCapabilityVerificationError::VerificationAuthorityUnavailable),
@@ -495,6 +612,32 @@ impl FileWorkspaceRuntimeVerificationAuthority {
 }
 
 impl WorkspaceRuntimeVerificationAuthority for FileWorkspaceRuntimeVerificationAuthority {
+    fn begin(
+        &self,
+        challenge: WorkspaceRuntimeVerificationChallenge,
+    ) -> Result<(), WorkspaceCapabilityVerificationError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| WorkspaceCapabilityVerificationError::VerificationAuthorityUnavailable)?;
+        let mut document = self.read()?;
+        begin_verification(&mut document, challenge)?;
+        self.write(&document)
+    }
+    fn acknowledge(
+        &self,
+        challenge_id: &str,
+        record: WorkspaceRuntimeVerificationRecord,
+    ) -> Result<(), WorkspaceCapabilityVerificationError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| WorkspaceCapabilityVerificationError::VerificationAuthorityUnavailable)?;
+        let mut document = self.read()?;
+        acknowledge_verification(&mut document, challenge_id, record)?;
+        self.write(&document)
+    }
+
     fn get(
         &self,
         workspace_id: &str,
@@ -530,6 +673,64 @@ impl WorkspaceRuntimeVerificationAuthority for FileWorkspaceRuntimeVerificationA
     }
 }
 
+fn begin_verification(
+    document: &mut WorkspaceRuntimeVerificationDocument,
+    challenge: WorkspaceRuntimeVerificationChallenge,
+) -> Result<(), WorkspaceCapabilityVerificationError> {
+    validate_verification_challenge(&challenge)?;
+    if let Some(pending) = document.pending.iter().find(|pending| {
+        pending.workspace_id == challenge.workspace_id && pending.runtime_id == challenge.runtime_id
+    }) {
+        if pending.challenge_id == challenge.challenge_id && pending != &challenge {
+            return Err(WorkspaceCapabilityVerificationError::VerificationChallengeMismatch);
+        }
+    }
+    if document.pending.len() >= MAX_WORKSPACE_ISSUER_TRUST_RECORDS {
+        return Err(WorkspaceCapabilityVerificationError::TrustRecordLimitExceeded);
+    }
+    document.pending.retain(|pending| {
+        pending.workspace_id != challenge.workspace_id || pending.runtime_id != challenge.runtime_id
+    });
+    document.records.retain(|record| {
+        record.workspace_id != challenge.workspace_id || record.runtime_id != challenge.runtime_id
+    });
+    document.pending.push(challenge);
+    Ok(())
+}
+
+fn acknowledge_verification(
+    document: &mut WorkspaceRuntimeVerificationDocument,
+    challenge_id: &str,
+    record: WorkspaceRuntimeVerificationRecord,
+) -> Result<(), WorkspaceCapabilityVerificationError> {
+    validate_verification_record(&record)?;
+    let index = document
+        .pending
+        .iter()
+        .position(|pending| {
+            pending.workspace_id == record.workspace_id
+                && pending.runtime_id == record.runtime_id
+                && pending.challenge_id == challenge_id
+                && pending.binding_id == record.binding_id
+                && pending.workspace_key_id == record.workspace_key_id
+                && pending.workspace_public_key_fingerprint
+                    == record.workspace_public_key_fingerprint
+                && pending.workspace_trust_id == record.workspace_trust_id
+                && pending.runtime_public_key_fingerprint == record.runtime_public_key_fingerprint
+                && record.verified_at < pending.expires_at
+        })
+        .ok_or(WorkspaceCapabilityVerificationError::VerificationChallengeMismatch)?;
+    if document.records.len() >= MAX_WORKSPACE_ISSUER_TRUST_RECORDS {
+        return Err(WorkspaceCapabilityVerificationError::TrustRecordLimitExceeded);
+    }
+    document.pending.remove(index);
+    document.records.retain(|current| {
+        current.workspace_id != record.workspace_id || current.runtime_id != record.runtime_id
+    });
+    document.records.push(record);
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeVerificationResponseClaims {
@@ -548,12 +749,11 @@ struct WorkspaceRuntimeVerificationResponseUnsigned {
     challenge_id: String,
     workspace_id: String,
     runtime_id: String,
-    binding_revision: u64,
+    binding_id: String,
     workspace_key_id: String,
-    workspace_identity_revision: u64,
-    workspace_trust_generation: u64,
+    workspace_public_key_fingerprint: String,
+    workspace_trust_id: String,
     runtime_public_key_fingerprint: String,
-    runtime_identity_revision: u64,
     workspace_nonce: String,
     runtime_nonce: String,
     expires_at: i64,
@@ -565,12 +765,11 @@ impl WorkspaceRuntimeVerificationResponse {
             challenge_id: self.challenge_id.clone(),
             workspace_id: self.workspace_id.clone(),
             runtime_id: self.runtime_id.clone(),
-            binding_revision: self.binding_revision,
+            binding_id: self.binding_id.clone(),
             workspace_key_id: self.workspace_key_id.clone(),
-            workspace_identity_revision: self.workspace_identity_revision,
-            workspace_trust_generation: self.workspace_trust_generation,
+            workspace_public_key_fingerprint: self.workspace_public_key_fingerprint.clone(),
+            workspace_trust_id: self.workspace_trust_id.clone(),
             runtime_public_key_fingerprint: self.runtime_public_key_fingerprint.clone(),
-            runtime_identity_revision: self.runtime_identity_revision,
             workspace_nonce: self.workspace_nonce.clone(),
             runtime_nonce: self.runtime_nonce.clone(),
             expires_at: self.expires_at,
@@ -636,7 +835,6 @@ impl RuntimeVerificationSigner {
         validate_verification_challenge(challenge)?;
         if challenge.runtime_id != self.runtime_id
             || challenge.runtime_public_key_fingerprint != self.public_key_fingerprint
-            || challenge.runtime_identity_revision == 0
             || challenge.expires_at <= now_unix
         {
             return Err(WorkspaceCapabilityVerificationError::VerificationChallengeMismatch);
@@ -645,12 +843,11 @@ impl RuntimeVerificationSigner {
             challenge_id: challenge.challenge_id.clone(),
             workspace_id: challenge.workspace_id.clone(),
             runtime_id: challenge.runtime_id.clone(),
-            binding_revision: challenge.binding_revision,
+            binding_id: challenge.binding_id.clone(),
             workspace_key_id: challenge.workspace_key_id.clone(),
-            workspace_identity_revision: challenge.workspace_identity_revision,
-            workspace_trust_generation: challenge.workspace_trust_generation,
+            workspace_public_key_fingerprint: challenge.workspace_public_key_fingerprint.clone(),
+            workspace_trust_id: challenge.workspace_trust_id.clone(),
             runtime_public_key_fingerprint: challenge.runtime_public_key_fingerprint.clone(),
-            runtime_identity_revision: challenge.runtime_identity_revision,
             workspace_nonce: challenge.workspace_nonce.clone(),
             runtime_nonce,
             expires_at: challenge.expires_at,
@@ -678,12 +875,11 @@ impl RuntimeVerificationSigner {
             challenge_id: unsigned.challenge_id,
             workspace_id: unsigned.workspace_id,
             runtime_id: unsigned.runtime_id,
-            binding_revision: unsigned.binding_revision,
+            binding_id: unsigned.binding_id,
             workspace_key_id: unsigned.workspace_key_id,
-            workspace_identity_revision: unsigned.workspace_identity_revision,
-            workspace_trust_generation: unsigned.workspace_trust_generation,
+            workspace_public_key_fingerprint: unsigned.workspace_public_key_fingerprint,
+            workspace_trust_id: unsigned.workspace_trust_id,
             runtime_public_key_fingerprint: unsigned.runtime_public_key_fingerprint,
-            runtime_identity_revision: unsigned.runtime_identity_revision,
             workspace_nonce: unsigned.workspace_nonce,
             runtime_nonce: unsigned.runtime_nonce,
             expires_at: unsigned.expires_at,
@@ -699,6 +895,12 @@ pub fn verify_runtime_verification_response(
     now_unix: i64,
 ) -> Result<(), WorkspaceCapabilityVerificationError> {
     validate_verification_challenge(challenge)?;
+    let public_key = crate::auth::decode_public_key(runtime_public_key)
+        .map_err(|_| WorkspaceCapabilityVerificationError::InvalidSignature)?;
+    let fingerprint = format!("sha256:{}", hex_lower(&Sha256::digest(&public_key)));
+    if fingerprint != challenge.runtime_public_key_fingerprint {
+        return Err(WorkspaceCapabilityVerificationError::VerificationChallengeMismatch);
+    }
     let signed = crate::auth::decode_signed_json_token::<RuntimeVerificationResponseClaims>(
         &response.response_proof,
         RUNTIME_VERIFICATION_TOKEN_PREFIX,
@@ -725,12 +927,11 @@ pub fn verify_runtime_verification_response(
         || response.challenge_id != challenge.challenge_id
         || response.workspace_id != challenge.workspace_id
         || response.runtime_id != challenge.runtime_id
-        || response.binding_revision != challenge.binding_revision
+        || response.binding_id != challenge.binding_id
         || response.workspace_key_id != challenge.workspace_key_id
-        || response.workspace_identity_revision != challenge.workspace_identity_revision
-        || response.workspace_trust_generation != challenge.workspace_trust_generation
+        || response.workspace_public_key_fingerprint != challenge.workspace_public_key_fingerprint
+        || response.workspace_trust_id != challenge.workspace_trust_id
         || response.runtime_public_key_fingerprint != challenge.runtime_public_key_fingerprint
-        || response.runtime_identity_revision != challenge.runtime_identity_revision
         || response.workspace_nonce != challenge.workspace_nonce
         || response.runtime_nonce.is_empty()
     {
@@ -745,9 +946,9 @@ pub struct WorkspaceCapabilityClaims {
     pub issuer: String,
     pub issuer_workspace_id: String,
     pub issuer_key_id: String,
-    pub issuer_identity_revision: u64,
-    pub trust_generation: u64,
-    pub binding_revision: u64,
+    pub issuer_public_key_fingerprint: String,
+    pub trust_id: String,
+    pub binding_id: String,
     pub runtime_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_id: Option<String>,
@@ -763,7 +964,7 @@ pub struct WorkspaceCapabilityClaims {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceCapabilityExpectation<'a> {
     pub workspace_id: &'a str,
-    pub binding_revision: u64,
+    pub binding_id: &'a str,
     pub runtime_id: &'a str,
     pub worker_id: Option<&'a str>,
     pub operation: &'a str,
@@ -778,9 +979,9 @@ pub struct VerifiedWorkspaceCapability {
     pub issuer: String,
     pub workspace_id: String,
     pub issuer_key_id: String,
-    pub issuer_identity_revision: u64,
-    pub trust_generation: u64,
-    pub binding_revision: u64,
+    pub issuer_public_key_fingerprint: String,
+    pub trust_id: String,
+    pub binding_id: String,
     pub runtime_id: String,
     pub worker_id: Option<String>,
     pub operation: String,
@@ -794,7 +995,7 @@ pub trait WorkspaceClaimReplayProtection: Send + Sync {
     fn consume_once(
         &self,
         workspace_id: &str,
-        trust_generation: u64,
+        trust_id: &str,
         token_id: &str,
         expires_at: i64,
         now_unix: i64,
@@ -803,14 +1004,14 @@ pub trait WorkspaceClaimReplayProtection: Send + Sync {
 
 #[derive(Default)]
 pub struct InMemoryWorkspaceClaimReplayProtection {
-    consumed: Mutex<HashMap<(String, u64, String), i64>>,
+    consumed: Mutex<HashMap<(String, String, String), i64>>,
 }
 
 impl WorkspaceClaimReplayProtection for InMemoryWorkspaceClaimReplayProtection {
     fn consume_once(
         &self,
         workspace_id: &str,
-        trust_generation: u64,
+        trust_id: &str,
         token_id: &str,
         expires_at: i64,
         now_unix: i64,
@@ -822,7 +1023,7 @@ impl WorkspaceClaimReplayProtection for InMemoryWorkspaceClaimReplayProtection {
         consumed.retain(|_, expiry| *expiry > now_unix);
         let key = (
             workspace_id.to_string(),
-            trust_generation,
+            trust_id.to_string(),
             token_id.to_string(),
         );
         if consumed.contains_key(&key) {
@@ -853,6 +1054,22 @@ struct WorkspaceClaimReplayDocument {
 #[serde(deny_unknown_fields)]
 struct WorkspaceClaimReplayEntry {
     workspace_id: String,
+    trust_id: String,
+    token_id: String,
+    expires_at: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyReplayDocument {
+    version: u32,
+    entries: Vec<LegacyReplayEntry>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct LegacyReplayEntry {
+    workspace_id: String,
     trust_generation: u64,
     token_id: String,
     expires_at: i64,
@@ -869,18 +1086,38 @@ impl FileWorkspaceClaimReplayProtection {
     fn read(&self) -> Result<WorkspaceClaimReplayDocument, WorkspaceCapabilityVerificationError> {
         match fs::read(&self.path) {
             Ok(bytes) => {
-                let document: WorkspaceClaimReplayDocument = serde_json::from_slice(&bytes)
-                    .map_err(|_| {
+                let raw: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+                    WorkspaceCapabilityVerificationError::ReplayAuthorityUnavailable
+                })?;
+                if raw.get("version").and_then(serde_json::Value::as_u64) == Some(1) {
+                    let legacy: LegacyReplayDocument =
+                        serde_json::from_value(raw).map_err(|_| {
+                            WorkspaceCapabilityVerificationError::ReplayAuthorityUnavailable
+                        })?;
+                    if legacy.version != 1 || legacy.entries.len() > MAX_REPLAY_ENTRIES {
+                        return Err(
+                            WorkspaceCapabilityVerificationError::ReplayAuthorityUnavailable,
+                        );
+                    }
+                    let migrated = WorkspaceClaimReplayDocument {
+                        version: 2,
+                        entries: Vec::new(),
+                    };
+                    self.write(&migrated)?;
+                    return Ok(migrated);
+                }
+                let document: WorkspaceClaimReplayDocument =
+                    serde_json::from_value(raw).map_err(|_| {
                         WorkspaceCapabilityVerificationError::ReplayAuthorityUnavailable
                     })?;
-                if document.version != 1 || document.entries.len() > MAX_REPLAY_ENTRIES {
+                if document.version != 2 || document.entries.len() > MAX_REPLAY_ENTRIES {
                     return Err(WorkspaceCapabilityVerificationError::ReplayAuthorityUnavailable);
                 }
                 Ok(document)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Ok(WorkspaceClaimReplayDocument {
-                    version: 1,
+                    version: 2,
                     entries: Vec::new(),
                 })
             }
@@ -921,7 +1158,7 @@ impl WorkspaceClaimReplayProtection for FileWorkspaceClaimReplayProtection {
     fn consume_once(
         &self,
         workspace_id: &str,
-        trust_generation: u64,
+        trust_id: &str,
         token_id: &str,
         expires_at: i64,
         now_unix: i64,
@@ -934,7 +1171,7 @@ impl WorkspaceClaimReplayProtection for FileWorkspaceClaimReplayProtection {
         document.entries.retain(|entry| entry.expires_at > now_unix);
         if document.entries.iter().any(|entry| {
             entry.workspace_id == workspace_id
-                && entry.trust_generation == trust_generation
+                && entry.trust_id == trust_id
                 && entry.token_id == token_id
         }) {
             return Ok(false);
@@ -944,7 +1181,7 @@ impl WorkspaceClaimReplayProtection for FileWorkspaceClaimReplayProtection {
         }
         document.entries.push(WorkspaceClaimReplayEntry {
             workspace_id: workspace_id.to_string(),
-            trust_generation,
+            trust_id: trust_id.to_string(),
             token_id: token_id.to_string(),
             expires_at,
         });
@@ -1019,14 +1256,14 @@ impl WorkspaceCapabilityVerifier {
         if record.backend_url != claims.issuer {
             return Err(WorkspaceCapabilityVerificationError::WrongIssuer);
         }
-        if record.trust_generation != claims.trust_generation {
-            return Err(WorkspaceCapabilityVerificationError::StaleTrustGeneration);
+        if record.trust_id != claims.trust_id {
+            return Err(WorkspaceCapabilityVerificationError::WrongTrustIdentity);
         }
         if record.key_id != claims.issuer_key_id {
             return Err(WorkspaceCapabilityVerificationError::WrongIssuerKey);
         }
-        if record.identity_revision != claims.issuer_identity_revision {
-            return Err(WorkspaceCapabilityVerificationError::StaleIdentityRevision);
+        if record.public_key_fingerprint != claims.issuer_public_key_fingerprint {
+            return Err(WorkspaceCapabilityVerificationError::WrongIssuerKey);
         }
 
         crate::auth::verify_signed_json_token(
@@ -1045,8 +1282,8 @@ impl WorkspaceCapabilityVerifier {
         if claims.runtime_id != expected.runtime_id {
             return Err(WorkspaceCapabilityVerificationError::WrongRuntime);
         }
-        if claims.binding_revision != expected.binding_revision {
-            return Err(WorkspaceCapabilityVerificationError::StaleBindingRevision);
+        if claims.binding_id != expected.binding_id {
+            return Err(WorkspaceCapabilityVerificationError::WrongBindingIdentity);
         }
         if claims.worker_id.as_deref() != expected.worker_id {
             return Err(WorkspaceCapabilityVerificationError::WrongWorker);
@@ -1076,7 +1313,7 @@ impl WorkspaceCapabilityVerifier {
         }
         if !self.replay.consume_once(
             &claims.issuer_workspace_id,
-            claims.trust_generation,
+            &claims.trust_id,
             &claims.jti,
             claims.exp,
             expected.now_unix,
@@ -1088,9 +1325,9 @@ impl WorkspaceCapabilityVerifier {
             issuer: claims.issuer,
             workspace_id: claims.issuer_workspace_id,
             issuer_key_id: claims.issuer_key_id,
-            issuer_identity_revision: claims.issuer_identity_revision,
-            trust_generation: claims.trust_generation,
-            binding_revision: claims.binding_revision,
+            issuer_public_key_fingerprint: claims.issuer_public_key_fingerprint,
+            trust_id: claims.trust_id,
+            binding_id: claims.binding_id,
             runtime_id: claims.runtime_id,
             worker_id: claims.worker_id,
             operation: claims.operation,
@@ -1126,20 +1363,18 @@ pub enum WorkspaceCapabilityVerificationError {
     WrongIssuer,
     #[error("Workspace capability issuer trust is revoked")]
     IssuerRevoked,
-    #[error("Workspace capability trust generation is stale")]
-    StaleTrustGeneration,
+    #[error("Workspace capability trust identity does not match current trust")]
+    WrongTrustIdentity,
     #[error("Workspace capability issuer key does not match trust")]
     WrongIssuerKey,
-    #[error("Workspace capability identity revision is stale")]
-    StaleIdentityRevision,
     #[error("Workspace capability signature is invalid")]
     InvalidSignature,
     #[error("Workspace capability targets another Workspace")]
     WrongWorkspace,
     #[error("Workspace capability targets another Runtime")]
     WrongRuntime,
-    #[error("Workspace capability binding revision is stale")]
-    StaleBindingRevision,
+    #[error("Workspace capability binding identity does not match the verified binding")]
+    WrongBindingIdentity,
     #[error("Workspace capability targets another Worker")]
     WrongWorker,
     #[error("Workspace capability does not authorize this operation")]
@@ -1239,10 +1474,9 @@ fn validate_trust_record(
         algorithm: record.algorithm.clone(),
         public_key: record.public_key.clone(),
         public_key_fingerprint: record.public_key_fingerprint.clone(),
-        revision: record.identity_revision,
     })
     .map_err(|_| WorkspaceCapabilityVerificationError::TrustRecordCorrupt)?;
-    if record.trust_generation == 0 {
+    if validate_id(&record.trust_id).is_err() {
         return Err(WorkspaceCapabilityVerificationError::TrustRecordCorrupt);
     }
     Ok(())
@@ -1255,6 +1489,8 @@ fn validate_verification_record(
         record.workspace_id.as_str(),
         record.runtime_id.as_str(),
         record.workspace_key_id.as_str(),
+        record.binding_id.as_str(),
+        record.workspace_trust_id.as_str(),
     ] {
         if value.is_empty()
             || value.len() > MAX_ID_BYTES
@@ -1266,10 +1502,11 @@ fn validate_verification_record(
             return Err(WorkspaceCapabilityVerificationError::VerificationAuthorityUnavailable);
         }
     }
-    if record.binding_revision == 0
-        || record.workspace_identity_revision == 0
-        || record.workspace_trust_generation == 0
-        || record.runtime_identity_revision == 0
+    if record.binding_id.is_empty()
+        || record.workspace_public_key_fingerprint.is_empty()
+        || record.workspace_trust_id.is_empty()
+        || !is_key_fingerprint(&record.workspace_public_key_fingerprint)
+        || !is_key_fingerprint(&record.runtime_public_key_fingerprint)
         || record.verified_at <= 0
         || record.runtime_public_key_fingerprint.len() > 128
         || !record.runtime_public_key_fingerprint.starts_with("sha256:")
@@ -1287,6 +1524,8 @@ fn validate_verification_challenge(
         challenge.workspace_id.as_str(),
         challenge.runtime_id.as_str(),
         challenge.workspace_key_id.as_str(),
+        challenge.binding_id.as_str(),
+        challenge.workspace_trust_id.as_str(),
         challenge.workspace_nonce.as_str(),
     ] {
         if value.is_empty()
@@ -1299,10 +1538,11 @@ fn validate_verification_challenge(
             return Err(WorkspaceCapabilityVerificationError::VerificationChallengeMismatch);
         }
     }
-    if challenge.binding_revision == 0
-        || challenge.workspace_identity_revision == 0
-        || challenge.workspace_trust_generation == 0
-        || challenge.runtime_identity_revision == 0
+    if challenge.binding_id.is_empty()
+        || challenge.workspace_public_key_fingerprint.is_empty()
+        || challenge.workspace_trust_id.is_empty()
+        || !is_key_fingerprint(&challenge.workspace_public_key_fingerprint)
+        || !is_key_fingerprint(&challenge.runtime_public_key_fingerprint)
         || challenge.runtime_public_key_fingerprint.len() > 128
         || !challenge
             .runtime_public_key_fingerprint
@@ -1336,6 +1576,8 @@ fn validate_claim_shape(
     for value in [
         claims.issuer_workspace_id.as_str(),
         claims.issuer_key_id.as_str(),
+        claims.binding_id.as_str(),
+        claims.trust_id.as_str(),
         claims.runtime_id.as_str(),
         claims.jti.as_str(),
     ] {
@@ -1360,9 +1602,9 @@ fn validate_claim_shape(
             return Err(WorkspaceCapabilityVerificationError::InvalidIdentifier);
         }
     }
-    if claims.issuer_identity_revision == 0
-        || claims.trust_generation == 0
-        || claims.binding_revision == 0
+    if !is_key_fingerprint(&claims.issuer_public_key_fingerprint)
+        || claims.trust_id.is_empty()
+        || claims.binding_id.is_empty()
     {
         return Err(WorkspaceCapabilityVerificationError::MalformedClaims);
     }
@@ -1388,6 +1630,15 @@ fn validate_claim_shape(
         return Err(WorkspaceCapabilityVerificationError::InvalidBodyDigest);
     }
     Ok(())
+}
+
+fn is_key_fingerprint(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn is_sha256_digest(value: &str) -> bool {
@@ -1416,7 +1667,6 @@ mod tests {
     fn identity(
         workspace_id: &str,
         key_id: &str,
-        revision: u64,
     ) -> (Ed25519KeyPair, WorkspacePublicIdentityBundle) {
         let material = RuntimeIdentityMaterial::generate(key_id).unwrap();
         let signing_key = material.signing_key().unwrap();
@@ -1435,7 +1685,6 @@ mod tests {
                 algorithm: WORKSPACE_SIGNING_ALGORITHM.to_string(),
                 public_key: material.public_key,
                 public_key_fingerprint,
-                revision,
             },
         )
     }
@@ -1445,9 +1694,9 @@ mod tests {
             issuer: record.backend_url.clone(),
             issuer_workspace_id: record.workspace_id.clone(),
             issuer_key_id: record.key_id.clone(),
-            issuer_identity_revision: record.identity_revision,
-            trust_generation: record.trust_generation,
-            binding_revision: 7,
+            issuer_public_key_fingerprint: record.public_key_fingerprint.clone(),
+            trust_id: record.trust_id.clone(),
+            binding_id: "binding-test".into(),
             runtime_id: "runtime-1".to_string(),
             worker_id: Some("worker-1".to_string()),
             operation: "worker.submit".to_string(),
@@ -1463,7 +1712,7 @@ mod tests {
     fn expectation<'a>(body_digest: &'a str) -> WorkspaceCapabilityExpectation<'a> {
         WorkspaceCapabilityExpectation {
             workspace_id: "workspace-1",
-            binding_revision: 7,
+            binding_id: "binding-test",
             runtime_id: "runtime-1",
             worker_id: Some("worker-1"),
             operation: "worker.submit",
@@ -1475,13 +1724,13 @@ mod tests {
     }
 
     #[test]
-    fn trust_mutations_are_idempotent_generation_fenced_and_reject_stale_keys() {
-        let (_, bundle_v1) = identity("workspace-1", "WK-1", 1);
+    fn trust_mutations_are_idempotent_identity_fenced_and_reject_key_id_reuse() {
+        let (_, bundle_v1) = identity("workspace-1", "WK-1");
         let mut records = Vec::new();
         let (mutation, first) =
             add_workspace_issuer_trust(&mut records, bundle_v1.clone(), 10).unwrap();
         assert_eq!(mutation, WorkspaceIssuerTrustMutation::Added);
-        assert_eq!(first.trust_generation, 1);
+        assert!(!first.trust_id.is_empty());
         let (mutation, replay) =
             add_workspace_issuer_trust(&mut records, bundle_v1.clone(), 11).unwrap();
         assert_eq!(mutation, WorkspaceIssuerTrustMutation::Unchanged);
@@ -1494,19 +1743,19 @@ mod tests {
             WorkspaceCapabilityVerificationError::TrustRecordLimitExceeded
         );
 
-        let (_, stale_other_key) = identity("workspace-1", "WK-stale", 1);
+        let (_, stale_other_key) = identity("workspace-1", "WK-1");
         assert_eq!(
             replace_workspace_issuer_trust(&mut records, stale_other_key, 12).unwrap_err(),
-            WorkspaceIssuerTrustError::StaleIdentityRevision
+            WorkspaceIssuerTrustError::KeyIdentityMismatch
         );
-        let (_, bundle_v2) = identity("workspace-1", "WK-2", 2);
+        let (_, bundle_v2) = identity("workspace-1", "WK-2");
         let (mutation, replaced) =
             replace_workspace_issuer_trust(&mut records, bundle_v2, 13).unwrap();
         assert_eq!(mutation, WorkspaceIssuerTrustMutation::Replaced);
-        assert_eq!(replaced.trust_generation, 2);
+        assert_ne!(replaced.trust_id, first.trust_id);
         assert_eq!(replaced.registered_at_unix, 10);
         let (_, revoked) = revoke_workspace_issuer_trust(&mut records, "workspace-1", 14).unwrap();
-        assert_eq!(revoked.trust_generation, 3);
+        assert_ne!(revoked.trust_id, replaced.trust_id);
         assert_eq!(revoked.state, WorkspaceIssuerTrustState::Revoked);
         let (mutation, same) =
             revoke_workspace_issuer_trust(&mut records, "workspace-1", 15).unwrap();
@@ -1515,11 +1764,13 @@ mod tests {
     }
 
     #[test]
-    fn verifier_binds_workspace_key_generation_runtime_worker_operation_and_body() {
-        let (key_1, bundle_1) = identity("workspace-1", "WK-1", 1);
-        let (key_2, bundle_2) = identity("workspace-2", "WK-2", 1);
-        let record_1 = WorkspaceIssuerTrustRecord::from_bundle(bundle_1, 1, 1).unwrap();
-        let record_2 = WorkspaceIssuerTrustRecord::from_bundle(bundle_2, 1, 1).unwrap();
+    fn verifier_binds_workspace_key_trust_identity_runtime_worker_operation_and_body() {
+        let (key_1, bundle_1) = identity("workspace-1", "WK-1");
+        let (key_2, bundle_2) = identity("workspace-2", "WK-2");
+        let record_1 =
+            WorkspaceIssuerTrustRecord::from_bundle(bundle_1, "trust-test".into(), 1).unwrap();
+        let record_2 =
+            WorkspaceIssuerTrustRecord::from_bundle(bundle_2, "trust-test".into(), 1).unwrap();
         let verifier = WorkspaceCapabilityVerifier::new(
             vec![record_1.clone(), record_2.clone()],
             Arc::new(InMemoryWorkspaceClaimReplayProtection::default()),
@@ -1546,7 +1797,7 @@ mod tests {
         );
         let workspace_2_expectation = WorkspaceCapabilityExpectation {
             workspace_id: "workspace-2",
-            binding_revision: 7,
+            binding_id: "binding-test".into(),
             runtime_id: "runtime-1",
             worker_id: Some("worker-1"),
             operation: "worker.submit",
@@ -1590,9 +1841,10 @@ mod tests {
             ),
             (
                 "binding",
-                (|claims: &mut WorkspaceCapabilityClaims| claims.binding_revision = 8)
-                    as ClaimsMutation,
-                WorkspaceCapabilityVerificationError::StaleBindingRevision,
+                (|claims: &mut WorkspaceCapabilityClaims| {
+                    claims.binding_id = "other-binding".into()
+                }) as ClaimsMutation,
+                WorkspaceCapabilityVerificationError::WrongBindingIdentity,
             ),
             (
                 "issuer",
@@ -1644,9 +1896,10 @@ mod tests {
     }
 
     #[test]
-    fn verifier_rejects_replay_revocation_stale_generation_expiry_and_future_claims() {
-        let (key, bundle) = identity("workspace-1", "WK-1", 1);
-        let record = WorkspaceIssuerTrustRecord::from_bundle(bundle, 2, 1).unwrap();
+    fn verifier_rejects_replay_revocation_old_trust_expiry_and_future_claims() {
+        let (key, bundle) = identity("workspace-1", "WK-1");
+        let record =
+            WorkspaceIssuerTrustRecord::from_bundle(bundle, "trust-test".into(), 1).unwrap();
         let replay = Arc::new(InMemoryWorkspaceClaimReplayProtection::default());
         let verifier = WorkspaceCapabilityVerifier::new(vec![record.clone()], replay).unwrap();
         let body = workspace_request_body_digest(br#"{"content":"hello"}"#);
@@ -1658,11 +1911,11 @@ mod tests {
         );
 
         let mut stale = claims(&record, "stale");
-        stale.trust_generation = 1;
+        stale.trust_id = "retired-trust".into();
         let token = issue_workspace_capability_token(&key, &stale).unwrap();
         assert_eq!(
             verifier.verify(&token, &expectation(&body)).unwrap_err(),
-            WorkspaceCapabilityVerificationError::StaleTrustGeneration
+            WorkspaceCapabilityVerificationError::WrongTrustIdentity
         );
 
         let mut expired = claims(&record, "expired");
@@ -1685,7 +1938,7 @@ mod tests {
 
         let mut revoked = record;
         revoked.state = WorkspaceIssuerTrustState::Revoked;
-        revoked.trust_generation += 1;
+        revoked.trust_id = "revoked-trust".into();
         let revoked_verifier = WorkspaceCapabilityVerifier::new(
             vec![revoked.clone()],
             Arc::new(InMemoryWorkspaceClaimReplayProtection::default()),
@@ -1701,24 +1954,86 @@ mod tests {
     }
 
     #[test]
+    fn reaccepting_the_same_key_does_not_reactivate_old_capabilities() {
+        let (key, bundle) = identity("workspace-1", "WK-1");
+        let mut records = Vec::new();
+        let (_, first) = add_workspace_issuer_trust(&mut records, bundle.clone(), 10).unwrap();
+        let token = issue_workspace_capability_token(&key, &claims(&first, "old-token")).unwrap();
+        revoke_workspace_issuer_trust(&mut records, "workspace-1", 11).unwrap();
+        let (_, reaccepted) = replace_workspace_issuer_trust(&mut records, bundle, 12).unwrap();
+        assert_ne!(first.trust_id, reaccepted.trust_id);
+        let verifier = WorkspaceCapabilityVerifier::new(
+            records,
+            Arc::new(InMemoryWorkspaceClaimReplayProtection::default()),
+        )
+        .unwrap();
+        let body = workspace_request_body_digest(br#"{"content":"hello"}"#);
+        assert_eq!(
+            verifier.verify(&token, &expectation(&body)).unwrap_err(),
+            WorkspaceCapabilityVerificationError::WrongTrustIdentity
+        );
+    }
+
+    #[test]
+    fn frozen_enrollment_migration_requires_explicit_reacceptance() {
+        let (_, bundle) = identity("workspace-1", "WK-1");
+        let record =
+            WorkspaceIssuerTrustRecord::from_bundle(bundle, "trust-test".into(), 10).unwrap();
+        for state in ["active", "revoked"] {
+            let mut legacy = serde_json::to_value(&record).unwrap();
+            legacy.as_object_mut().unwrap().remove("trust_id");
+            legacy["identity_revision"] = serde_json::json!(1);
+            legacy["trust_generation"] = serde_json::json!(2);
+            legacy["state"] = serde_json::json!(state);
+            assert!(serde_json::from_value::<WorkspaceIssuerTrustRecord>(legacy.clone()).is_err());
+            let migrated = migrate_legacy_workspace_issuer_trust_record(legacy).unwrap();
+            assert_eq!(migrated.state, WorkspaceIssuerTrustState::Revoked);
+            assert_eq!(migrated.public_bundle(), record.public_bundle());
+        }
+    }
+
+    #[test]
+    fn frozen_verification_file_is_invalidated_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verification.json");
+        fs::write(&path, serde_json::to_vec(&serde_json::json!({"version":1,"records":[{
+            "workspace_id":"workspace-1","runtime_id":"runtime-1","binding_revision":1,
+            "workspace_key_id":"WK-1","workspace_identity_revision":1,"workspace_trust_generation":1,
+            "runtime_public_key_fingerprint":"sha256:old","runtime_identity_revision":1,"verified_at":10
+        }]})).unwrap()).unwrap();
+        let authority = FileWorkspaceRuntimeVerificationAuthority::new(&path);
+        assert!(authority.get("workspace-1", "runtime-1").unwrap().is_none());
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(migrated["version"], 2);
+        assert_eq!(migrated["records"], serde_json::json!([]));
+        assert!(
+            FileWorkspaceRuntimeVerificationAuthority::new(&path)
+                .get("workspace-1", "runtime-1")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn file_replay_protection_survives_reconstruction() {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("workspace-replay.json");
         let first = FileWorkspaceClaimReplayProtection::new(&path);
         assert!(
             first
-                .consume_once("workspace-a", 3, "token-a", 1_000, 100)
+                .consume_once("workspace-a", "trust-a", "token-a", 1_000, 100)
                 .unwrap()
         );
         let restored = FileWorkspaceClaimReplayProtection::new(&path);
         assert!(
             !restored
-                .consume_once("workspace-a", 3, "token-a", 1_000, 101)
+                .consume_once("workspace-a", "trust-a", "token-a", 1_000, 101)
                 .unwrap()
         );
         assert!(
             restored
-                .consume_once("workspace-a", 4, "token-a", 1_000, 101)
+                .consume_once("workspace-a", "trust-b", "token-a", 1_000, 101)
                 .unwrap()
         );
     }
@@ -1731,12 +2046,11 @@ mod tests {
         let record = WorkspaceRuntimeVerificationRecord {
             workspace_id: "workspace-a".to_string(),
             runtime_id: "runtime-a".to_string(),
-            binding_revision: 7,
+            binding_id: "binding-test".into(),
             workspace_key_id: "WK-a".to_string(),
-            workspace_identity_revision: 2,
-            workspace_trust_generation: 3,
-            runtime_public_key_fingerprint: "sha256:runtime".to_string(),
-            runtime_identity_revision: 1,
+            workspace_public_key_fingerprint: format!("sha256:{}", "a".repeat(64)),
+            workspace_trust_id: "trust-test".into(),
+            runtime_public_key_fingerprint: format!("sha256:{}", "b".repeat(64)),
             verified_at: 100,
         };
         authority.record(record.clone()).unwrap();
@@ -1761,12 +2075,11 @@ mod tests {
             challenge_id: "challenge-1".to_string(),
             workspace_id: "workspace-a".to_string(),
             runtime_id: "runtime-1".to_string(),
-            binding_revision: 7,
+            binding_id: "binding-test".into(),
             workspace_key_id: "WK-1".to_string(),
-            workspace_identity_revision: 2,
-            workspace_trust_generation: 3,
+            workspace_public_key_fingerprint: format!("sha256:{}", "a".repeat(64)),
+            workspace_trust_id: "trust-test".into(),
             runtime_public_key_fingerprint: public_key_fingerprint,
-            runtime_identity_revision: 1,
             workspace_nonce: "workspace-nonce".to_string(),
             expires_at: 1_100,
         };
@@ -1781,8 +2094,39 @@ mod tests {
         )
         .unwrap();
 
+        // A valid signature from a different key must not authenticate the
+        // fingerprint named by this challenge, even when the response repeats it.
+        let other_identity = RuntimeIdentityMaterial::generate("runtime-1").unwrap();
+        let mut wrong_key = response.clone();
+        wrong_key.response_proof = crate::auth::sign_json_token(
+            RUNTIME_VERIFICATION_TOKEN_PREFIX,
+            RUNTIME_VERIFICATION_SIGNING_INPUT_PREFIX,
+            &other_identity.signing_key().unwrap(),
+            &RuntimeVerificationResponseClaims {
+                response: response.unsigned(),
+                method: "POST".into(),
+                path_and_query: WORKSPACE_VERIFICATION_CHALLENGE_PATH.into(),
+                body_digest: workspace_request_body_digest(
+                    &serde_json::to_vec(&challenge).unwrap(),
+                ),
+                iat: 1_000,
+                exp: challenge.expires_at,
+                jti: "different-key-proof".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            verify_runtime_verification_response(
+                &wrong_key,
+                &challenge,
+                &other_identity.public_key,
+                1_001,
+            ),
+            Err(WorkspaceCapabilityVerificationError::VerificationChallengeMismatch)
+        );
+
         let mut tampered = response.clone();
-        tampered.binding_revision += 1;
+        tampered.binding_id = "other-binding".into();
         assert_eq!(
             verify_runtime_verification_response(
                 &tampered,

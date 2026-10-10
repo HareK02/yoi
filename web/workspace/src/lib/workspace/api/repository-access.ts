@@ -36,7 +36,6 @@ export function parseRepositorySshCredential(
     "name",
     "public_key_algorithm",
     "public_key_fingerprint",
-    "current_revision",
     "status",
     "created_at",
     "rotated_at",
@@ -47,7 +46,6 @@ export function parseRepositorySshCredential(
   readString(record, "name", path);
   readString(record, "public_key_algorithm", path);
   readString(record, "public_key_fingerprint", path);
-  readRevision(record, "current_revision", path);
   readString(record, "status", path);
   readString(record, "created_at", path);
   readNullableString(record, "rotated_at", path);
@@ -61,13 +59,11 @@ export function parseRepositorySshPublicKey(
 ): RepositorySshPublicKey {
   const record = readRecord(value, path, [
     "credential_id",
-    "current_revision",
     "public_key_algorithm",
     "public_key_fingerprint",
     "public_key",
   ]);
   readString(record, "credential_id", path);
-  readRevision(record, "current_revision", path);
   readString(record, "public_key_algorithm", path);
   readString(record, "public_key_fingerprint", path);
   readString(record, "public_key", path);
@@ -94,7 +90,6 @@ export function parseRepositorySshHostTrust(
     "key_algorithm",
     "host_key",
     "fingerprint",
-    "current_revision",
     "created_at",
     "updated_at",
     "referenced_repositories",
@@ -112,7 +107,6 @@ export function parseRepositorySshHostTrust(
   readString(record, "key_algorithm", path);
   readString(record, "host_key", path);
   readString(record, "fingerprint", path);
-  readRevision(record, "current_revision", path);
   readString(record, "created_at", path);
   readString(record, "updated_at", path);
   readStringArray(record, "referenced_repositories", path);
@@ -125,12 +119,10 @@ export function parseRepositoryAccessProjection(
   const path = "access_projection";
   const record = readRecord(value, path, [
     "workspace_id",
-    "config_revision",
     "projection_digest",
     "bindings",
   ]);
   readString(record, "workspace_id", path);
-  readRevision(record, "config_revision", path);
   readString(record, "projection_digest", path);
   const bindings = readArray(record.bindings, `${path}.bindings`);
   bindings.forEach((binding, index) => {
@@ -247,19 +239,4 @@ function readInteger(
     throw new RepositoryAccessSchemaError(`${path}.${key}`, "a safe integer");
   }
   return value;
-}
-
-function readRevision(
-  record: Record<string, unknown>,
-  key: string,
-  path: string,
-): number {
-  const revision = readInteger(record, key, path);
-  if (revision < 0) {
-    throw new RepositoryAccessSchemaError(
-      `${path}.${key}`,
-      "a non-negative safe integer",
-    );
-  }
-  return revision;
 }

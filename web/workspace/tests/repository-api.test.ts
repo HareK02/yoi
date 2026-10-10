@@ -13,7 +13,6 @@ const repository = {
   kind: "git",
   provider: "git",
   source: { kind: "local_path", uri: "/srv/main" },
-  source_revision: 1,
   source_fingerprint: "sha256:main",
   observed_status: "ready",
   record_authority: "workspace-control-plane",

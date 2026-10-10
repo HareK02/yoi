@@ -108,8 +108,9 @@ pub struct EvidenceOrigin {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_definition_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub flow_definition_revision: Option<u64>,
+    /// SHA-256 of the exact pinned Flow definition content, when available.
+    /// Historical origins without captured definition content leave this absent.
+    pub flow_definition_fingerprint: Option<String>,
 }
 
 /// Host-resolved source/evidence metadata for an individual staging claim.
@@ -155,6 +156,33 @@ pub fn split_frontmatter(content: &str) -> Result<(&str, &str), RecordLintError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flow_origin_captures_content_identity_without_a_state_counter() {
+        let origin: EvidenceOrigin = serde_json::from_value(serde_json::json!({
+            "kind": "flow_instruction",
+            "flow_definition_id": "flow-definition",
+            "flow_definition_fingerprint": "a".repeat(64)
+        }))
+        .unwrap();
+        assert_eq!(
+            origin.flow_definition_fingerprint.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+        let value = serde_json::to_value(&origin).unwrap();
+        assert_eq!(value["flow_definition_fingerprint"], "a".repeat(64));
+        let historical: EvidenceOrigin = serde_json::from_value(serde_json::json!({
+            "kind": "flow_instruction", "flow_definition_id": "flow-definition"
+        }))
+        .unwrap();
+        assert!(historical.flow_definition_fingerprint.is_none());
+        assert!(
+            serde_json::to_value(historical)
+                .unwrap()
+                .get("flow_definition_fingerprint")
+                .is_none()
+        );
+    }
 
     #[test]
     fn splits_simple() {

@@ -43,13 +43,13 @@ Public entry inputs are **Workspace-bound** references:
 {"workspace_id":"workspace-id","node_id":"9007199254740993"}
 ```
 
-Node IDs and revisions remain canonical positive decimal **strings**, including
+Node IDs remain canonical positive decimal **strings**, including
 values above JavaScript's safe-integer range. Renaming/moving preserves IDs and
 authenticated latest URLs. Deleting/recreating the same name allocates a new ID.
 
 | Tool | Input/use |
 | --- | --- |
-| `DriveMetadata` | `entry`: one live entry and its observed revision |
+| `DriveMetadata` | `entry`: one live entry and its last committed request ID |
 | `DriveList` | optional `parent` (default root), `limit` 1–200, opaque `after` |
 | `DriveSearch` | `query`, optional `include_text`, `limit` 1–128, opaque `after` |
 | `DriveRead` | `entry`, optional `max_bytes` 1–65,536; reports `truncated` |
@@ -59,7 +59,7 @@ authenticated latest URLs. Deleting/recreating the same name allocates a new ID.
 | `DriveEdit` | observed `entry`, `old_string`, `new_string`, optional `replace_all` |
 | `DriveRelocate` | observed `entry`, destination `parent`, new/current `name` |
 | `DriveDelete` | observed `entry`; folder deletion follows Backend rules |
-| `DriveViewImage` | `entry`; bounded revision-fixed image bytes, not a URL |
+| `DriveViewImage` | `entry`; bounded committed-request-bound image bytes, not a URL |
 | `DriveSaveWorkdir` | explicit `target_workdir` alias, relative `path`, destination `parent`, `name`, optional `content_type` (octet-stream by default) |
 | `DriveRequestStatus` | `request_id` from an uncertain mutation |
 
@@ -76,7 +76,7 @@ all Drive versions. Restored workers observe again before mutating.
 `DriveEdit` uses the same pure `fs_operation::text` rules as Workdir and Workspace
 config: nonempty `old_string`, different replacement, exactly one nonoverlapping
 match unless `replace_all=true`, and bounded resulting text. It fetches a full
-<=64 KiB preimage and verifies the **previously observed** revision. It cannot edit
+<=64 KiB preimage and verifies the **previously observed** committed request ID. It cannot edit
 truncated content. The Backend's atomic CAS still decides the first winner.
 
 ## Native WIP 0.2.0
@@ -103,7 +103,7 @@ Direct entry paths returned by discovery are:
 Use the returned path rather than hand-constructing it. A file exposes metadata,
 read, write/edit, relocate/delete and view_image; a folder exposes metadata,
 list, create_folder/create_text, save_workdir and relocate/delete where valid.
-A native target binds its entry or creation parent: no ID or revision argument is
+A native target binds its entry or creation parent: no ID or mutation-precondition argument is
 needed. Relocate's `parent` is a WIP typed entry path. Each entry is self-scoped;
 Host captures target, scope object, descriptor, validator and handler together.
 Client retains and supplies metadata automatically. Do not copy validators or
@@ -116,8 +116,8 @@ selected path. No Worker index/embedding or eager body injection is added.
 
 ## Conflicts, unknown outcomes and publication
 
-Mutations use a Host-generated request identity, observed node ID and exact
-revision. Conflict never causes an adapter to replace the expected revision with
+Mutations use a Host-generated request identity, observed node ID and last
+committed request ID. Conflict never causes an adapter to replace that observation with
 latest and retry. Observe explicitly, reconsider the edit and submit a deliberate
 new operation. Native Client stale handling likewise does not replay dispatch.
 
@@ -144,7 +144,7 @@ Backend's **DB-publication commit**, not merely blob transfer completion.
 ## Images and historical observations
 
 ViewImage reads <=10 MiB PNG/JPEG/GIF/WebP bytes in <=64 KiB Drive chunks at the
-metadata revision. Every chunk is authorized and revision-fixed. An intervening
+metadata’s last committed request ID. Every chunk is authorized and committed-request-bound. An intervening
 update expires the read; no mixed-generation image is attached. Media is detected
 from bytes using the existing image helper, not the filename or a download URL.
 

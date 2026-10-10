@@ -282,16 +282,20 @@ impl SystemItemAppendHandle {
             .push(item);
     }
 
-    /// Queue a revisioned Subject behavior refresh. The caller receives this
+    /// Queue a Subject behavior refresh with its exact represented behavior. The caller receives this
     /// narrow operation only at a pre-request boundary, and the host commits it
     /// before exposing it to the model.
-    pub fn append_subject_behavior_refresh(&self, body: impl Into<String>, behavior_revision: u64) {
+    pub fn append_subject_behavior_refresh(
+        &self,
+        body: impl Into<String>,
+        behavior_md: impl Into<String>,
+    ) {
         self.pending
             .lock()
             .expect("system-item append queue poisoned")
             .push(SystemItem::SubjectBehaviorRefresh {
                 body: body.into(),
-                behavior_revision,
+                behavior_md: behavior_md.into(),
                 prompt_provenance: None,
             });
     }
@@ -511,7 +515,7 @@ pub struct HookInvocationContext {
     pub workspace_id: Option<String>,
     pub worker_id: String,
     pub session_id: String,
-    pub session_revision: u64,
+
     pub run_id: Option<String>,
     pub turn_index: Option<usize>,
     pub call_id: Option<String>,
@@ -990,7 +994,7 @@ mod tests {
         let handle = RestoreSystemItemAppendHandle::new(Arc::clone(&pending));
         let provenance = session_store::PromptRenderProvenance {
             workspace_id: Some("workspace".into()),
-            config_revision: 1,
+
             source_digest: "source".into(),
             projection_digest: "projection".into(),
             logical_name: "internal.resident_memory_restore_section".into(),
@@ -1081,7 +1085,7 @@ mod tests {
                 workspace_id: Some("workspace".into()),
                 worker_id: "worker".into(),
                 session_id: "session".into(),
-                session_revision: 4,
+
                 run_id: None,
                 turn_index: None,
                 call_id: None,

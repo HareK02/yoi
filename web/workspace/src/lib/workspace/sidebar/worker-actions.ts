@@ -239,7 +239,7 @@ export async function deleteSidebarWorker(
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        expected_plan_revision: plan.revision,
+
         expected_plan_digest: plan.digest,
         worker_target_ids: [candidate.target_id],
         workdir_target_ids: [],

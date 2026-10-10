@@ -50,7 +50,7 @@
     </a>
   </header>
   <p>
-    These launch profiles are derived from the active Workspace configuration revision. Edit Profile declarations and Decodal sources in the shared configuration editor.
+    These launch profiles are derived from the active Workspace configuration. Edit Profile declarations and Decodal sources in the shared configuration editor.
   </p>
 
   {#if loading}
@@ -59,7 +59,7 @@
     <p class="status-message error">{message}</p>
   {:else if profileSettings}
     <p class="settings-note">
-      Revision {profileSettings.config_revision ?? "unknown"} · tree {profileSettings.tree_digest ?? "unknown"} · projection {profileSettings.projection_digest ?? "unknown"}
+      Tree {profileSettings.tree_digest ?? "unknown"} · projection {profileSettings.projection_digest ?? "unknown"}
     </p>
     <ul class="settings-profile-list">
       {#each profileSettings.profiles as profile (profile.profile_id)}

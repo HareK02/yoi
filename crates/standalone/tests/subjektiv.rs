@@ -273,7 +273,7 @@ impl ScriptedClient {
             "SubmitMemorySurface",
             json!({"points":[{
                 "body_md":format!("- {}", material["body_md"].as_str().unwrap()),
-                "memory_refs":[{"memory_id":material["memory_id"], "revision":material["revision"]}]
+                "memory_refs":[{"memory_id":material["memory_id"], "change_id":material["change_id"]}]
             }]}),
         )
     }
@@ -1155,7 +1155,7 @@ async fn automatic_generic_consolidation_applies_candidate_publishes_surface_and
         );
         let memory = store.list_memories(&subject.id).unwrap().pop().unwrap();
         assert_eq!(memory.claim, claim);
-        assert_eq!(memory.revision, 1);
+        assert!(!memory.change_id.is_empty());
         assert_eq!(memory.source_candidate_ids, vec![ids[0].as_str().unwrap()]);
         let surface = store.resident_surface(&subject.id).unwrap();
         assert_eq!(surface.availability, subjektiv::SurfaceAvailability::Ready);
@@ -1167,14 +1167,14 @@ async fn automatic_generic_consolidation_applies_candidate_publishes_surface_and
         assert!(snapshot.body_md.contains(claim));
         assert_eq!(
             snapshot.memory_refs,
-            vec![subjektiv::MemoryRevisionRef {
+            vec![subjektiv::MemoryChangeRef {
                 memory_id: memory.id.clone(),
-                revision: 1
+                change_id: memory.change_id.clone()
             }]
         );
         assert_eq!(
-            snapshot.built_from_store_revision,
-            accepted["surface"]["store_revision"].as_u64().unwrap()
+            snapshot.built_from_memory_fingerprint,
+            accepted["surface"]["memory_fingerprint"].as_str().unwrap()
         );
         memory
     });
@@ -1260,7 +1260,7 @@ async fn transport_loss_after_candidate_apply_preserves_memory_and_later_job_onl
         let memory = store.list_memories(&subject.id).unwrap();
         assert_eq!(memory.len(), 1);
         assert_eq!(memory[0].claim, claim);
-        assert_eq!(memory[0].revision, 1);
+        assert!(!memory[0].change_id.is_empty());
         assert_ne!(
             store.resident_surface(&subject.id).unwrap().availability,
             subjektiv::SurfaceAvailability::Ready

@@ -46,7 +46,7 @@ export function ref(id = "2", ws = "alpha"): DriveEntryRef {
 export function entry(
   id = "2",
   ws = "alpha",
-  revision = "9007199254740993",
+  last_mutation_id = "9007199254740993",
   kind: "file" | "folder" = "file",
 ): DriveEntry {
   return {
@@ -54,7 +54,7 @@ export function entry(
     parent: id === "1" ? null : ref("1", ws),
     name: id === "1" ? "" : "note.txt",
     kind,
-    revision,
+    last_mutation_id,
     size: kind === "file" ? 3 : null,
     content_type: kind === "file" ? "text/plain" : null,
     updated_by: "user:test",

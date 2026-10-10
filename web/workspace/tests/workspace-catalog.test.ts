@@ -82,7 +82,6 @@ Deno.test("workspace catalog enriches each visible workspace without dropping si
           kind: "git",
           provider: "git",
           source: { kind: "local_path", uri: "/srv/alpha" },
-          source_revision: 1,
           source_fingerprint: "sha256:alpha",
           observed_status: "ready",
           default_selector: "develop",

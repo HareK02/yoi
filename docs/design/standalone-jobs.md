@@ -4,13 +4,13 @@
 
 Base: `3c424fd17d1a5e8bb5542de2d0ad88f55338e0ea` (current origin/develop; T-704 integrated). T-709's subjektiv consumer is not part of this change.
 
-The reusable `job` crate owns the transport-neutral immutable request (registry Profile selector, input snapshot/reference/revision, caller Job ID, instruction, serialization key and bounded limits), result envelope/digest and validation. Backend retains its existing SQLite state machine, Runtime binding, domain grants, authorization, unknown-outcome and cleanup implementation; its adapter uses the shared request validation and result contract, not a second runner.
+The reusable `job` crate owns the transport-neutral immutable request (registry Profile selector, input snapshot/reference and SHA-256 digest, caller Job ID, instruction, serialization key and bounded limits), result envelope/digest and validation. Backend retains its existing SQLite state machine, Runtime binding, domain grants, authorization, unknown-outcome and cleanup implementation; its adapter uses the shared request validation and result contract, not a second runner.
 
 Standalone owns a separate adapter, not a WorkspaceClient impersonation. `StandaloneHost` owns a Job service and its connection lifecycle. The concrete local placement is `<standalone state directory>/<WorkerId>/jobs.sqlite3` (using the existing Worker directory layout; alongside, not inside, interactive sessions). The `standalone` crate owns the versioned local schema: durable intents, immutable attempts, execution state, accepted result/digest, cancellation and consumer acknowledgement. A single Host connection is protected by the existing Worker lease. SQLite transactions serialize reserve, dispatch, result acceptance and terminal transitions. No subjektiv tables or fake Workspace/Runtime registry are created.
 
 Local adapter states follow the existing intent/attempt/result distinctions. Exact immutable request replay returns the same Job, never starts another attempt. Explicit retry creates a bounded new attempt only for known failure; unknown outcomes require caller reconciliation and never auto-replay. Unstarted pending attempts remain pending on shutdown/reopen. Interrupted dispatch/running attempts without an accepted result become unknown; accepted results survive restart and remain available until consumer acknowledgement. Cancellation is durable and never auto-resumed. Consumer acknowledgement/delivery failure is separate from model success and never reruns the model.
 
-Execution uses the existing private Internal Worker substrate with a new Host-facing bounded Job entry point. It gets a distinct ephemeral session, explicitly resolved selected Profile/system prompt/model, no ambient parent tools, filesystem, Workspace or Feature connections, and only a Job/attempt/revision-bound structured result submission capability. Profiles requiring unavailable tools/features are explicitly rejected rather than silently stripped. Result authority is independent of Profile name; final prose, Idle and Worker termination are never success evidence. This first generic adapter grants no domain operations; future consumers must provide explicit domain capabilities rather than gaining them through a profile tag.
+Execution uses the existing private Internal Worker substrate with a new Host-facing bounded Job entry point. It gets a distinct ephemeral session, explicitly resolved selected Profile/system prompt/model, no ambient parent tools, filesystem, Workspace or Feature connections, and only a Job/attempt/input-digest-bound structured result submission capability. Profiles requiring unavailable tools/features are explicitly rejected rather than silently stripped. Result authority is independent of Profile name; final prose, Idle and Worker termination are never success evidence. This first generic adapter grants no domain operations; future consumers must provide explicit domain capabilities rather than gaining them through a profile tag.
 
 The Host limits concurrent active resources independently of caller limits, enforces timeout/turn/output limits, routes cancellation into the Internal Worker lifecycle and waits for resource cleanup. Accepted results are committed before resource release; required domain postprocessing must finish before submission (or be independently durable in its consumer). No daemon, pool, subprocess, HTTP/WS listener or Server dependency is introduced.
 
@@ -35,7 +35,7 @@ is success authority; merely returning from `wait` is not. The injected-client
 entry point resolves/validates the same selected Profile and model configuration;
 it replaces only the model transport for embedders/tests.
 
-A typical generic consumer supplies its own stable Job ID/revision/reference,
+A typical generic consumer supplies its own stable Job ID/reference and immutable input,
 immutable JSON input, instruction and registry Profile:
 
 ```rust,ignore
@@ -82,7 +82,7 @@ choosing `builtin:subjektiv-memory-consolidation` alone grants nothing.
 
 Every run uses the existing private Internal Worker substrate, a distinct identity
 and ephemeral Session. Only `SubmitJobResult` is installed by a FeatureModule.
-Its model input is `{result: ...}`; Job/attempt/input-revision bindings come from
+Its model input is `{result: ...}`; Job/attempt/input-digest bindings come from
 the Host capability, not model arguments. The sink checks those bindings, the
 current persisted attempt, deadline, byte limit and result digest. Exact result
 replay is idempotent; changed/foreign/stale results are rejected. Submission is
@@ -103,7 +103,7 @@ default / 64 KiB absolute byte limits, not a larger standalone exception.
 
 Local schema version **1** is owned only by `standalone::job_store`: `job_intents`
 contains immutable serialized intent/fingerprint, serialization key, current
-attempt and acknowledgement; `job_attempts` contains immutable identity/revision,
+attempt and acknowledgement; `job_attempts` contains immutable identity/input digest,
 execution state, failure and accepted result/digest. Foreign keys, immutable
 identity/result triggers, transactions, `WAL` and `synchronous=FULL` protect the
 boundary. No Server schema or subjektiv/Memory schema is copied or opened.

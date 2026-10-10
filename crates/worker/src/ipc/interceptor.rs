@@ -210,11 +210,8 @@ impl WorkerInterceptor {
         let Some(source) = self.resident_context_source.as_ref() else {
             return;
         };
-        if let SystemItem::SubjectBehaviorRefresh {
-            behavior_revision, ..
-        } = item
-        {
-            source.confirm_resident_context_revision(*behavior_revision);
+        if let SystemItem::SubjectBehaviorRefresh { behavior_md, .. } = item {
+            source.confirm_resident_context_behavior(behavior_md);
         }
     }
 
@@ -373,7 +370,7 @@ impl WorkerInterceptor {
         let projection = prompts.projection();
         let provenance = |logical_name: &str| session_store::PromptRenderProvenance {
             workspace_id: self.prompt_workspace_id.clone(),
-            config_revision: projection.config_revision,
+
             source_digest: projection.source_digest.clone(),
             projection_digest: projection.catalog_digest.clone(),
             logical_name: logical_name.to_string(),
@@ -487,7 +484,7 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
         let projection = prompts.projection();
         let provenance = session_store::PromptRenderProvenance {
             workspace_id: self.prompt_workspace_id.clone(),
-            config_revision: projection.config_revision,
+
             source_digest: projection.source_digest.clone(),
             projection_digest: projection.catalog_digest.clone(),
             logical_name: "internal.notify_wrapper".to_string(),
@@ -954,13 +951,13 @@ mod tests {
             input
                 .system_items()
                 .expect("test interceptor has durable append authority")
-                .append_subject_behavior_refresh("current Subject context", 7);
+                .append_subject_behavior_refresh("current Subject context", "Ask when uncertain.");
             Ok(HookPreRequestAction::Continue)
         }
     }
 
     struct ConfirmRecordingResidentSource {
-        confirmed: Arc<Mutex<Vec<u64>>>,
+        confirmed: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait]
@@ -969,8 +966,8 @@ mod tests {
             SystemPromptContribution::Unavailable
         }
 
-        fn confirm_resident_context_revision(&self, revision: u64) {
-            self.confirmed.lock().unwrap().push(revision);
+        fn confirm_resident_context_behavior(&self, behavior_md: &str) {
+            self.confirmed.lock().unwrap().push(behavior_md.to_owned());
         }
     }
 
@@ -1478,7 +1475,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subject_behavior_revision_is_confirmed_only_after_durable_commit() {
+    async fn subject_behavior_is_confirmed_only_after_durable_commit() {
         let mut builder = HookRegistryBuilder::new();
         builder.add_pre_llm_request(AppendingSubjectBehaviorHook);
         let committed = Arc::new(Mutex::new(Vec::new()));
@@ -1511,19 +1508,49 @@ mod tests {
             .unwrap();
 
         assert!(matches!(action, PreRequestAction::ContinueWith(_)));
-        assert_eq!(*confirmed.lock().unwrap(), [7]);
+        assert_eq!(*confirmed.lock().unwrap(), ["Ask when uncertain."]);
         assert!(matches!(
             committed.lock().unwrap().as_slice(),
             [SystemItem::SubjectBehaviorRefresh {
-                behavior_revision: 7,
+                behavior_md,
                 prompt_provenance: Some(_),
                 ..
-            }]
+            }] if behavior_md == "Ask when uncertain."
         ));
     }
 
+    #[test]
+    fn behavior_ack_uses_raw_content_including_clear_not_rendered_context() {
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let confirmed = Arc::new(Mutex::new(Vec::new()));
+        let source: Arc<dyn SystemPromptContributionSource> =
+            Arc::new(ConfirmRecordingResidentSource {
+                confirmed: Arc::clone(&confirmed),
+            });
+        let interceptor = WorkerInterceptor::new(
+            Arc::new(HookRegistryBuilder::new().build()),
+            None,
+            None,
+            NotifyBuffer::new(),
+            Arc::new(Mutex::new(Vec::new())),
+            test_prompts(),
+            Some(Arc::new(RecordingSystemItemCommitter {
+                committed: Arc::clone(&committed),
+            })),
+        )
+        .with_resident_context_source(Some(source));
+        let items = ["raw behavior", ""].map(|behavior_md| SystemItem::SubjectBehaviorRefresh {
+            body: "same rendered context".into(),
+            behavior_md: behavior_md.into(),
+            prompt_provenance: None,
+        });
+        interceptor.commit_system_items(&items).unwrap();
+        assert_eq!(*confirmed.lock().unwrap(), ["raw behavior", ""]);
+        assert_eq!(committed.lock().unwrap().len(), 2);
+    }
+
     #[tokio::test]
-    async fn failed_subject_behavior_persistence_does_not_confirm_revision() {
+    async fn failed_subject_behavior_persistence_does_not_confirm_behavior() {
         let mut builder = HookRegistryBuilder::new();
         builder.add_pre_llm_request(AppendingSubjectBehaviorHook);
         let confirmed = Arc::new(Mutex::new(Vec::new()));
@@ -1897,7 +1924,6 @@ mod tests {
         );
         let mut projection = crate::prompt::catalog::EffectivePromptCatalog::new(
             templates,
-            2,
             projection.schema_fingerprint.clone(),
             projection.toolchain_fingerprint.clone(),
         )
@@ -1926,7 +1952,10 @@ mod tests {
             panic!("notification Prompt provenance was not committed");
         };
         assert_eq!(provenance.workspace_id.as_deref(), Some("workspace-a"));
-        assert_eq!(provenance.config_revision, 2);
+        assert_eq!(
+            provenance.projection_digest,
+            prompts.load().projection().catalog_digest
+        );
         assert_eq!(provenance.source_digest, "source-2");
         assert_eq!(provenance.logical_name, "internal.notify_wrapper");
     }
@@ -1953,7 +1982,6 @@ mod tests {
         );
         let mut projection = crate::prompt::catalog::EffectivePromptCatalog::new(
             templates,
-            3,
             projection.schema_fingerprint.clone(),
             projection.toolchain_fingerprint.clone(),
         )

@@ -24,12 +24,12 @@ size independently of persistence metadata.
   retain their existing validator, identity and save boundary in the provider.
 - Workspace settings grants, access mode and connection lifetime remain in Backend.
   The settings adapter binds the read to captured entry metadata and generates a
-  canonical commit using the same tree revision/digest. Decodal validation,
+  canonical commit using the same tree digest. Decodal validation,
   formatting and atomic multi-file persistence remain in the canonical Backend
   commit. Content type, create/delete/rename/apply_changes and attach are settings
   operations, not ordinary OS file operations.
 
-The core does not perform I/O, authorize anything, or own revision/existence
+The core does not perform I/O, authorize anything, or own content/existence
 mirrors. Providers invoke pure processing inside their existing consistency
 boundary; it must not be used to turn a checked edit into an unchecked
 Read–Write sequence.

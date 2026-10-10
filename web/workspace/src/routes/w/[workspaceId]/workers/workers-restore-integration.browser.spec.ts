@@ -88,7 +88,6 @@ function plan(state: string) {
     workspace_id: workspaceId,
     runtime_id: runtimeId,
     generated_at: "2026-10-06T00:00:00Z",
-    revision: state,
     digest: state,
     diagnostics: [],
     workdirs: [],

@@ -27,8 +27,15 @@ pub const MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_PATH_BYTES: usize = 512;
 pub const MAX_IMPORT_DEPTH: usize = 32;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, ts_rs::TS)]
 pub struct VirtualPath(String);
+
+impl<'de> Deserialize<'de> for VirtualPath {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl VirtualPath {
     pub fn parse(value: impl AsRef<str>) -> Result<Self, ConfigTreeError> {
@@ -267,27 +274,46 @@ impl ConfigEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ts_rs::TS)]
 pub struct ConfigTreeSnapshot {
-    #[ts(type = "number")]
-    pub revision: u64,
+    /// SHA-256 of ordered virtual paths, content types and complete source bytes.
+    /// Identifies tree content, not an edit sequence or freshness counter.
     pub digest: String,
     pub entries: BTreeMap<VirtualPath, ConfigEntry>,
 }
 
+impl<'de> Deserialize<'de> for ConfigTreeSnapshot {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct SnapshotContent {
+            digest: String,
+            entries: BTreeMap<VirtualPath, ConfigEntry>,
+        }
+        let content = SnapshotContent::deserialize(deserializer)?;
+        let snapshot = Self {
+            digest: content.digest,
+            entries: content.entries,
+        };
+        snapshot.validate().map_err(serde::de::Error::custom)?;
+        Ok(snapshot)
+    }
+}
+
 impl ConfigTreeSnapshot {
     pub fn empty() -> Self {
-        Self::from_entries(0, Vec::new()).expect("empty config snapshot is valid")
+        Self::from_entries(Vec::new()).expect("empty config snapshot is valid")
     }
 
     pub fn from_entries(
-        revision: u64,
         entries: impl IntoIterator<Item = ConfigEntry>,
     ) -> Result<Self, ConfigTreeError> {
         let mut ordered = BTreeMap::new();
         let mut total = 0usize;
         for entry in entries {
             validate_workspace_path(&entry.path)?;
+            if digest_bytes(entry.content.as_bytes()) != entry.content_digest {
+                return Err(ConfigTreeError::EntryDigestMismatch(entry.path));
+            }
             if entry.content.len() > MAX_ENTRY_BYTES {
                 return Err(ConfigTreeError::LimitExceeded("entry bytes"));
             }
@@ -306,10 +332,23 @@ impl ConfigTreeSnapshot {
         }
         let digest = snapshot_digest(&ordered);
         Ok(Self {
-            revision,
             digest,
             entries: ordered,
         })
+    }
+
+    /// Verify external snapshot metadata against the complete source content.
+    pub fn validate(&self) -> Result<(), ConfigTreeError> {
+        for (path, entry) in &self.entries {
+            if path != &entry.path {
+                return Err(ConfigTreeError::EntryPathMismatch(path.clone()));
+            }
+        }
+        let rebuilt = Self::from_entries(self.entries.values().cloned())?;
+        if self.digest != rebuilt.digest {
+            return Err(ConfigTreeError::TreeDigestMismatch);
+        }
+        Ok(())
     }
 
     pub fn list_prefix(&self, prefix: Option<&VirtualPath>) -> Vec<&ConfigEntry> {
@@ -364,7 +403,11 @@ impl ConfigTreeSnapshot {
         changes
     }
 
+    /// Apply an atomic batch. Each expected_digest compares the target's complete
+    /// source bytes only; it is not a tree precondition. Callers needing whole-tree
+    /// CAS must also compare the authoritative tree digest under their write lock.
     pub fn apply(&self, changes: &[ConfigTreeChange]) -> Result<Self, ConfigTreeError> {
+        self.validate()?;
         if changes.len() > MAX_CHANGE_COUNT {
             return Err(ConfigTreeError::LimitExceeded("change count"));
         }
@@ -440,7 +483,7 @@ impl ConfigTreeSnapshot {
                 }
             }
         }
-        Self::from_entries(self.revision, entries.into_values())
+        Self::from_entries(entries.into_values())
     }
 }
 
@@ -788,8 +831,6 @@ pub struct ConfigDiagnosticLabel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 pub struct ConfigDiagnostic {
     pub path: VirtualPath,
-    #[ts(type = "number")]
-    pub revision: u64,
     pub tree_digest: String,
     pub kind: String,
     pub span: ConfigSpan,
@@ -1436,7 +1477,6 @@ impl SnapshotEnvironment {
     ) -> ConfigDiagnostic {
         ConfigDiagnostic {
             path,
-            revision: self.snapshot.revision,
             tree_digest: self.snapshot.digest.clone(),
             kind: kind.into(),
             span: ConfigSpan {
@@ -1572,13 +1612,39 @@ impl SnapshotImportLoader {
             import_edges: BTreeMap::new(),
         }
     }
+    /// Translate an Engine cache identity back to its actual virtual source path.
+    /// Only exact keys produced by this loader are recognized; ordinary source
+    /// paths (including paths containing '@') are not split heuristically.
+    fn source_path(&self, key: &str) -> Result<VirtualPath, ConfigTreeError> {
+        if let Some(entry) = self
+            .snapshot
+            .entries
+            .values()
+            .find(|entry| snapshot_import_cache_key(entry) == key)
+        {
+            return Ok(entry.path.clone());
+        }
+        for resource in BUILTIN_PROFILE_RESOURCES {
+            let path = format!("$builtin/{}", resource.path);
+            if key
+                == format!(
+                    "config-source://{path}@{}",
+                    digest_bytes(resource.source.as_bytes())
+                )
+            {
+                return VirtualPath::parse(path);
+            }
+        }
+        VirtualPath::parse(key)
+    }
+
     pub fn resolve(
         &self,
         current_key: Option<&str>,
         specifier: &str,
     ) -> Result<VirtualPath, ConfigTreeError> {
         let current = current_key
-            .map(VirtualPath::parse)
+            .map(|key| self.source_path(key))
             .transpose()?
             .ok_or_else(|| ConfigTreeError::InvalidImport(specifier.into()))?;
         resolve_import(&current, specifier)
@@ -1594,11 +1660,10 @@ impl ImportLoader for SnapshotImportLoader {
         let path = self.resolve(current_key, specifier).map_err(import_error)?;
         // Guard the import graph before returning a module to Decodal. In particular,
         // cycles hidden inside lazy object fields must not recurse during materialization.
-        let current = current_key
-            .expect("resolve requires a source context")
-            .split("@sha256:")
-            .next()
-            .unwrap();
+        let current = self
+            .source_path(current_key.expect("resolve requires a source context"))
+            .map_err(import_error)?
+            .to_string();
         if self
             .import_edges
             .entry(current.to_string())
@@ -1614,7 +1679,7 @@ impl ImportLoader for SnapshotImportLoader {
                 // A language service can keep using its loader after a diagnostic.
                 // Only successful edges may be cached as already validated.
                 self.import_edges
-                    .get_mut(current)
+                    .get_mut(&current)
                     .unwrap()
                     .remove(path.as_str());
                 return Err(diagnostic);
@@ -1651,7 +1716,10 @@ impl ImportLoader for SnapshotImportLoader {
                 return Err(import_error(ConfigTreeError::LimitExceeded("total bytes")));
             }
             return Ok(LoadedImport::source(
-                format!("{path}@{}", digest_bytes(resource.source.as_bytes())),
+                format!(
+                    "config-source://{path}@{}",
+                    digest_bytes(resource.source.as_bytes())
+                ),
                 path.as_str(),
                 resource.source,
             ));
@@ -1747,9 +1815,16 @@ fn validate_import_graph(
 
 fn snapshot_import_cache_key(entry: &ConfigEntry) -> String {
     // The source id remains the virtual path for diagnostics and relative-import
-    // resolution. The cache identity also includes immutable source content so
-    // equal paths from different revisions cannot alias in an Engine cache.
-    format!("{}@{}", entry.path, entry.content_digest)
+    // resolution. Cache identity binds path, import interpretation and source bytes,
+    // so changed content or content type cannot alias in an Engine cache.
+    // The URI-like prefix is rejected by VirtualPath, keeping engine identities
+    // disjoint from literal paths even when a path spells another entry's digest.
+    format!(
+        "config-source://{}@{}@{}",
+        entry.path,
+        entry.content_type.media_type(),
+        entry.content_digest
+    )
 }
 
 fn is_builtin_path(path: &VirtualPath) -> bool {
@@ -1881,7 +1956,6 @@ fn project_engine_diagnostic(
         .unwrap_or(fallback_path);
     ConfigDiagnostic {
         path,
-        revision: snapshot.revision,
         tree_digest: snapshot.digest.clone(),
         span: ConfigSpan {
             start_byte: diagnostic.span.start,
@@ -1911,7 +1985,6 @@ fn project_diagnostic(
 ) -> ConfigDiagnostic {
     ConfigDiagnostic {
         path: fallback_path,
-        revision: snapshot.revision,
         tree_digest: snapshot.digest.clone(),
         kind: diagnostic_kind(diagnostic.kind).to_string(),
         span: ConfigSpan {
@@ -2174,6 +2247,12 @@ pub enum ConfigTreeError {
     NotFound(VirtualPath),
     #[error("virtual config entry changed: {0}")]
     EntryConflict(VirtualPath),
+    #[error("virtual config entry content digest mismatch: {0}")]
+    EntryDigestMismatch(VirtualPath),
+    #[error("virtual config entry path does not match its tree key: {0}")]
+    EntryPathMismatch(VirtualPath),
+    #[error("virtual config tree content digest mismatch")]
+    TreeDigestMismatch,
     #[error("virtual config path changed more than once in one candidate: {0}")]
     PathChangedMoreThanOnce(VirtualPath),
     #[error("duplicate virtual config path")]
@@ -2254,13 +2333,10 @@ mod tests {
 
     #[test]
     fn candidate_changes_are_atomic_ordered_and_conflict_checked() {
-        let base = ConfigTreeSnapshot::from_entries(
-            7,
-            [
-                entry("profiles/a.dcdl", "{ a = 1; }"),
-                entry("shared.dcdl", "{}"),
-            ],
-        )
+        let base = ConfigTreeSnapshot::from_entries([
+            entry("profiles/a.dcdl", "{ a = 1; }"),
+            entry("shared.dcdl", "{}"),
+        ])
         .unwrap();
         let updated = base
             .apply(&[
@@ -2297,29 +2373,95 @@ mod tests {
     }
 
     #[test]
+    fn source_edits_use_content_preconditions_and_preserve_equal_tree_identity() {
+        let base = ConfigTreeSnapshot::from_entries([entry("main.dcdl", "{ x = 1; }")]).unwrap();
+        let expected_digest = base.entries[&path("main.dcdl")].content_digest.clone();
+        let update = |source: &str| ConfigTreeChange::Update {
+            path: path("main.dcdl"),
+            expected_digest: expected_digest.clone(),
+            content: source.into(),
+        };
+        assert_eq!(base.apply(&[]).unwrap(), base);
+        assert_eq!(base.apply(&[update("{ x = 1; }")]).unwrap(), base);
+        let changed = base.apply(&[update("{ x = 2; }")]).unwrap();
+        assert!(matches!(
+            changed.apply(&[update("{ x = 3; }")]),
+            Err(ConfigTreeError::EntryConflict(_))
+        ));
+        let restored = changed.apply(&changed.changes_to(&base)).unwrap();
+        assert_eq!(restored, base);
+        assert!(restored.apply(&[update("{ x = 3; }")]).is_ok());
+
+        // Equal evaluated values are not equal source trees.
+        let whitespace_edit = base.apply(&[update("{ x = 1; }\n")]).unwrap();
+        assert_ne!(whitespace_edit.digest, base.digest);
+        let contract = ToolchainContract::new(1, vec![path("main.dcdl")], 1);
+        assert_eq!(
+            SnapshotEnvironment::new(base)
+                .evaluate_contract(&contract)
+                .unwrap(),
+            SnapshotEnvironment::new(whitespace_edit)
+                .evaluate_contract(&contract)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn snapshot_json_rejects_forged_content_identity() {
+        let snapshot = ConfigTreeSnapshot::from_entries([entry("main.dcdl", "{}")]).unwrap();
+        let original = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            original
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["digest", "entries"]
+        );
+        assert_eq!(
+            serde_json::from_value::<ConfigTreeSnapshot>(original.clone()).unwrap(),
+            snapshot
+        );
+        for mutation in ["body", "entry_digest", "tree_digest", "entry_path"] {
+            let mut wire = original.clone();
+            match mutation {
+                "body" => wire["entries"]["main.dcdl"]["content"] = "{ changed = true; }".into(),
+                "entry_digest" => {
+                    wire["entries"]["main.dcdl"]["content_digest"] = "sha256:forged".into()
+                }
+                "tree_digest" => wire["digest"] = "sha256:forged".into(),
+                "entry_path" => wire["entries"]["main.dcdl"]["path"] = "other.dcdl".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                serde_json::from_value::<ConfigTreeSnapshot>(wire).is_err(),
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
     fn snapshot_digest_is_deterministic() {
-        let left = ConfigTreeSnapshot::from_entries(
-            1,
-            [entry("z.dcdl", "{}"), entry("a.dcdl", "{ x = 1; }")],
-        )
+        let left = ConfigTreeSnapshot::from_entries([
+            entry("z.dcdl", "{}"),
+            entry("a.dcdl", "{ x = 1; }"),
+        ])
         .unwrap();
-        let right = ConfigTreeSnapshot::from_entries(
-            99,
-            [entry("a.dcdl", "{ x = 1; }"), entry("z.dcdl", "{}")],
-        )
+        let right = ConfigTreeSnapshot::from_entries([
+            entry("a.dcdl", "{ x = 1; }"),
+            entry("z.dcdl", "{}"),
+        ])
         .unwrap();
         assert_eq!(left.digest, right.digest);
     }
 
     #[test]
     fn entrypoint_can_assert_empty_workspace_schema_global() {
-        let snapshot = ConfigTreeSnapshot::from_entries(
-            1,
-            [entry(
-                "main.dcdl",
-                "{ answer = 42; } as WorkspaceConfigSchema",
-            )],
-        )
+        let snapshot = ConfigTreeSnapshot::from_entries([entry(
+            "main.dcdl",
+            "{ answer = 42; } as WorkspaceConfigSchema",
+        )])
         .unwrap();
         let contract = ToolchainContract::new(1, vec![path("main.dcdl")], 1);
         SnapshotEnvironment::new(snapshot)
@@ -2373,7 +2515,7 @@ mod tests {
 
     #[test]
     fn completion_projects_workspace_schema_fields_into_config_objects() {
-        let snapshot = ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "{}")]).unwrap();
+        let snapshot = ConfigTreeSnapshot::from_entries([entry("main.dcdl", "{}")]).unwrap();
         let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
             "builtin:profile",
             "profile",
@@ -2458,7 +2600,7 @@ mod tests {
 
     #[test]
     fn completion_projects_array_element_and_nested_profile_fields() {
-        let snapshot = ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "{}")]).unwrap();
+        let snapshot = ConfigTreeSnapshot::from_entries([entry("main.dcdl", "{}")]).unwrap();
         let environment = SnapshotEnvironment::new(snapshot)
             .with_schema_bundle(profile_entries_completion_schema());
         for (marked_source, expected, prefix_len) in [
@@ -2544,7 +2686,7 @@ mod tests {
 
     #[test]
     fn completion_tracks_fixed_array_positions_and_nested_array_ranges() {
-        let snapshot = ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "{}")]).unwrap();
+        let snapshot = ConfigTreeSnapshot::from_entries([entry("main.dcdl", "{}")]).unwrap();
         let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
             "builtin:profile",
             "profile",
@@ -2617,7 +2759,7 @@ mod tests {
 
     #[test]
     fn completion_preserves_general_schema_member_behavior() {
-        let snapshot = ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "{}")]).unwrap();
+        let snapshot = ConfigTreeSnapshot::from_entries([entry("main.dcdl", "{}")]).unwrap();
         let environment = SnapshotEnvironment::new(snapshot)
             .with_schema_bundle(profile_entries_completion_schema());
         for source in [
@@ -2642,7 +2784,7 @@ mod tests {
     #[test]
     fn completion_array_schema_retains_nested_profile_diagnostics() {
         let valid = "{ profile = { default_profile = \"default\"; entries = [{ selector = \"default\"; profile = { slug = \"default\"; worker = { mode = \"interactive\"; }; }; }]; }; } as WorkspaceConfigSchema";
-        let snapshot = ConfigTreeSnapshot::from_entries(7, [entry("main.dcdl", valid)]).unwrap();
+        let snapshot = ConfigTreeSnapshot::from_entries([entry("main.dcdl", valid)]).unwrap();
         let environment = SnapshotEnvironment::new(snapshot)
             .with_schema_bundle(profile_entries_completion_schema());
         assert!(environment.analyze(&path("main.dcdl"), None).is_empty());
@@ -2663,7 +2805,7 @@ mod tests {
                 diagnostics.iter().any(|diagnostic| {
                     diagnostic.kind == "constraint_violation"
                         && diagnostic.path == path("main.dcdl")
-                        && diagnostic.revision == 7
+                        && diagnostic.tree_digest == environment.snapshot().digest
                         && diagnostic.span.end_byte > diagnostic.span.start_byte
                         && (diagnostic.message.contains(field)
                             || diagnostic
@@ -2690,7 +2832,7 @@ mod tests {
         )])
         .unwrap();
         let source = "{ profile = { defaults = {}; entries = [{ selector = \"default\"; profile = {}; }]; }; } as WorkspaceConfigSchema";
-        let snapshot = ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", source)]).unwrap();
+        let snapshot = ConfigTreeSnapshot::from_entries([entry("main.dcdl", source)]).unwrap();
         let environment = SnapshotEnvironment::new(snapshot).with_schema_bundle(schema.clone());
         assert!(environment.analyze(&path("main.dcdl"), None).is_empty());
         let contract = ToolchainContract::with_schema_bundle(1, vec![path("main.dcdl")], 1, schema);
@@ -2760,13 +2902,10 @@ mod tests {
     fn actual_profile_schema_diagnoses_nested_values_without_materializing_omissions() {
         let schema = actual_profile_schema();
         let source = "{ profile = { entries = [{ selector = \"project:alpha\"; profile = {}; }]; }; } as WorkspaceConfigSchema";
-        let snapshot = ConfigTreeSnapshot::from_entries(
-            8,
-            [
-                entry("main.dcdl", source),
-                entry("recipe.dcdl", "{ worker = { mode = 42; }; }"),
-            ],
-        )
+        let snapshot = ConfigTreeSnapshot::from_entries([
+            entry("main.dcdl", source),
+            entry("recipe.dcdl", "{ worker = { mode = 42; }; }"),
+        ])
         .unwrap();
         let environment = SnapshotEnvironment::new(snapshot).with_schema_bundle(schema.clone());
         let contract = ToolchainContract::with_schema_bundle(1, vec![path("main.dcdl")], 1, schema);
@@ -2814,7 +2953,7 @@ mod tests {
                 "{diagnostic:?}"
             );
             assert_eq!(diagnostic.path, path(expected_path), "{diagnostic:?}");
-            assert_eq!(diagnostic.revision, 8);
+            assert_eq!(diagnostic.tree_digest, environment.snapshot().digest);
             let diagnostic_source = if expected_path == "main.dcdl" {
                 &source
             } else {
@@ -2874,10 +3013,10 @@ mod tests {
                 let source = format!(
                     r#"{{ profile.entries = [{{ selector = "project:scoped"; profile = {form}; }}]; }} as WorkspaceConfigSchema"#
                 );
-                let snapshot = ConfigTreeSnapshot::from_entries(
-                    9,
-                    [entry("main.dcdl", &source), entry("scoped.dcdl", recipe)],
-                )
+                let snapshot = ConfigTreeSnapshot::from_entries([
+                    entry("main.dcdl", &source),
+                    entry("scoped.dcdl", recipe),
+                ])
                 .unwrap();
                 let schema = actual_profile_schema();
                 let environment =
@@ -2967,10 +3106,10 @@ mod tests {
                 let source = format!(
                     r#"{{ profile.entries = [{{ selector = "project:corpus"; profile = {form}; }}]; }} as WorkspaceConfigSchema"#
                 );
-                let snapshot = ConfigTreeSnapshot::from_entries(
-                    10,
-                    [entry("main.dcdl", &source), entry("recipe.dcdl", &recipe)],
-                )
+                let snapshot = ConfigTreeSnapshot::from_entries([
+                    entry("main.dcdl", &source),
+                    entry("recipe.dcdl", &recipe),
+                ])
                 .unwrap();
                 let schema = actual_profile_schema();
                 let environment =
@@ -3001,7 +3140,7 @@ mod tests {
         }
         let source = "{} as WorkspaceConfigSchema";
         let environment = SnapshotEnvironment::new(
-            ConfigTreeSnapshot::from_entries(10, [entry("main.dcdl", source)]).unwrap(),
+            ConfigTreeSnapshot::from_entries([entry("main.dcdl", source)]).unwrap(),
         )
         .with_schema_bundle(actual_profile_schema());
         for (profile_path, prefix, label) in [
@@ -3051,7 +3190,7 @@ mod tests {
             .unwrap(),
         ])
         .unwrap();
-        let snapshot = ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "{}")]).unwrap();
+        let snapshot = ConfigTreeSnapshot::from_entries([entry("main.dcdl", "{}")]).unwrap();
         let environment = SnapshotEnvironment::new(snapshot).with_schema_bundle(schema);
         for (marked_source, expected) in [
             ("{ ed| } as WorkspaceConfigSchema", "editor"),
@@ -3148,14 +3287,11 @@ mod tests {
 
     #[test]
     fn relative_imports_and_completion_share_the_snapshot_namespace() {
-        let snapshot = ConfigTreeSnapshot::from_entries(
-            1,
-            [
-                entry("profiles/main.dcdl", r#"import "../shared/value.dcdl""#),
-                entry("shared/value.dcdl", "{ answer = 42; }"),
-                entry("other.dcdl", "{}"),
-            ],
-        )
+        let snapshot = ConfigTreeSnapshot::from_entries([
+            entry("profiles/main.dcdl", r#"import "../shared/value.dcdl""#),
+            entry("shared/value.dcdl", "{ answer = 42; }"),
+            entry("other.dcdl", "{}"),
+        ])
         .unwrap();
         assert_eq!(
             resolve_import(&path("profiles/main.dcdl"), "../shared/value.dcdl").unwrap(),
@@ -3207,7 +3343,7 @@ mod tests {
     #[test]
     fn workspace_schema_applies_defaults_with_asymmetric_decodal_validation() {
         let snapshot =
-            ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "{ web = {}; }")]).unwrap();
+            ConfigTreeSnapshot::from_entries([entry("main.dcdl", "{ web = {}; }")]).unwrap();
         let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
             "builtin:web",
             "web",
@@ -3239,8 +3375,7 @@ mod tests {
             ("{ web = {}; custom = 42; }", "custom"),
             ("{ web = { typo = true; }; }", "typo"),
         ] {
-            let snapshot =
-                ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", source)]).unwrap();
+            let snapshot = ConfigTreeSnapshot::from_entries([entry("main.dcdl", source)]).unwrap();
             let diagnostics = SnapshotEnvironment::new(snapshot)
                 .evaluate_contract(&ToolchainContract::with_schema_bundle(
                     1,
@@ -3258,13 +3393,10 @@ mod tests {
 
     #[test]
     fn workspace_schema_supports_typed_associative_collections() {
-        let snapshot = ConfigTreeSnapshot::from_entries(
-            1,
-            [entry(
-                "main.dcdl",
-                "{ features = { web = { enabled = true; }; tickets = { enabled = false; }; }; }",
-            )],
-        )
+        let snapshot = ConfigTreeSnapshot::from_entries([entry(
+            "main.dcdl",
+            "{ features = { web = { enabled = true; }; tickets = { enabled = false; }; }; }",
+        )])
         .unwrap();
         let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
             "builtin:features",
@@ -3315,8 +3447,7 @@ mod tests {
                 "constraintviolation",
             ),
         ] {
-            let snapshot =
-                ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", source)]).unwrap();
+            let snapshot = ConfigTreeSnapshot::from_entries([entry("main.dcdl", source)]).unwrap();
             let diagnostics = SnapshotEnvironment::new(snapshot)
                 .evaluate_contract(&ToolchainContract::with_schema_bundle(
                     1,
@@ -3335,7 +3466,7 @@ mod tests {
     fn language_service_and_formatter_accept_decodal_0_4_schema_syntax() {
         let source =
             "{} as { features = {...{ enabled = Bool; }}; web = { enabled = Bool; ...Unknown }; }";
-        let snapshot = ConfigTreeSnapshot::from_entries(1, [entry("schema.dcdl", source)]).unwrap();
+        let snapshot = ConfigTreeSnapshot::from_entries([entry("schema.dcdl", source)]).unwrap();
         let environment = SnapshotEnvironment::new(snapshot);
         let diagnostics = environment.analyze(&path("schema.dcdl"), None);
         assert!(
@@ -3370,13 +3501,10 @@ mod tests {
 
     #[test]
     fn workspace_schema_preserves_fields_only_where_rest_is_explicit() {
-        let snapshot = ConfigTreeSnapshot::from_entries(
-            1,
-            [entry(
-                "main.dcdl",
-                "{ web = { enabled = true; extension_value = 42; }; }",
-            )],
-        )
+        let snapshot = ConfigTreeSnapshot::from_entries([entry(
+            "main.dcdl",
+            "{ web = { enabled = true; extension_value = 42; }; }",
+        )])
         .unwrap();
         let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
             "builtin:web",
@@ -3402,8 +3530,7 @@ mod tests {
 
     #[test]
     fn unresolved_unknown_cannot_be_materialized() {
-        let snapshot =
-            ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "Unknown")]).unwrap();
+        let snapshot = ConfigTreeSnapshot::from_entries([entry("main.dcdl", "Unknown")]).unwrap();
         let diagnostics = SnapshotEnvironment::new(snapshot)
             .evaluate_contract(&ToolchainContract::new(1, vec![path("main.dcdl")], 1))
             .unwrap_err();
@@ -3413,11 +3540,9 @@ mod tests {
 
     #[test]
     fn workspace_schema_type_mismatch_is_a_decodal_diagnostic() {
-        let snapshot = ConfigTreeSnapshot::from_entries(
-            1,
-            [entry("main.dcdl", "{ web = { enabled = 1; }; }")],
-        )
-        .unwrap();
+        let snapshot =
+            ConfigTreeSnapshot::from_entries([entry("main.dcdl", "{ web = { enabled = 1; }; }")])
+                .unwrap();
         let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
             "builtin:web",
             "web",
@@ -3459,9 +3584,82 @@ mod tests {
         let first = text_entry("skills/debug-rust/SKILL.md", "first");
         let second = text_entry("skills/debug-rust/SKILL.md", "second");
         let first_key = snapshot_import_cache_key(&first);
-        assert!(first_key.starts_with("skills/debug-rust/SKILL.md@sha256:"));
+        assert!(
+            first_key.starts_with("config-source://skills/debug-rust/SKILL.md@text/plain@sha256:")
+        );
         assert!(first_key.ends_with(&first.content_digest));
         assert_ne!(first_key, snapshot_import_cache_key(&second));
+        let different_type = entry("skills/debug-rust/SKILL.md", "first");
+        assert_ne!(first_key, snapshot_import_cache_key(&different_type));
+    }
+
+    #[test]
+    fn cached_import_identity_resolves_relative_paths_and_keeps_literal_at_paths() {
+        let source = entry("profiles/name@sha256:literal.dcdl", "{}");
+        let loader =
+            SnapshotImportLoader::new(ConfigTreeSnapshot::from_entries([source.clone()]).unwrap());
+        for key in [
+            source.path.as_str().to_owned(),
+            snapshot_import_cache_key(&source),
+        ] {
+            assert_eq!(
+                loader.resolve(Some(&key), "./shared.dcdl").unwrap(),
+                path("profiles/shared.dcdl")
+            );
+            assert_eq!(loader.source_path(&key).unwrap(), source.path);
+        }
+    }
+
+    #[test]
+    fn snapshot_json_rejects_cache_identity_paths_even_with_valid_content_digests() {
+        let source = entry("a.dcdl", "{}");
+        // Build adversarial JSON with a correct tree digest, bypassing the private
+        // constructor only to describe the untrusted input at this boundary.
+        let forged = ConfigEntry::new(
+            VirtualPath(snapshot_import_cache_key(&source)),
+            ConfigContentType::Decodal,
+            r#"import "./shared.dcdl""#,
+        )
+        .unwrap();
+        let snapshot = ConfigTreeSnapshot::from_entries([source, forged]).unwrap();
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let error = serde_json::from_str::<ConfigTreeSnapshot>(&json).unwrap_err();
+        assert!(error.to_string().contains("config-source://"), "{error}");
+        for invalid in [
+            "../escape",
+            "/absolute",
+            "a//b",
+            "a\\b",
+            "config-source://entry",
+        ] {
+            assert!(serde_json::from_value::<VirtualPath>(serde_json::json!(invalid)).is_err());
+        }
+        let path: VirtualPath = serde_json::from_str(r#""profiles/name@digest.dcdl""#).unwrap();
+        assert_eq!(path.as_str(), "profiles/name@digest.dcdl");
+    }
+
+    #[test]
+    fn literal_path_matching_another_entries_digest_keeps_its_relative_import_base() {
+        let source = entry("a.dcdl", "{}");
+        let literal_path = format!("a.dcdl@text/x-decodal@{}", source.content_digest);
+        let snapshot = ConfigTreeSnapshot::from_entries([
+            entry("main.dcdl", "{}"),
+            source.clone(),
+            entry(&literal_path, r#"import "./shared.dcdl""#),
+            entry("a.dcdl@text/shared.dcdl", "{ answer = 42; }"),
+        ])
+        .unwrap();
+        let loader = SnapshotImportLoader::new(snapshot.clone());
+        assert_eq!(
+            loader
+                .resolve(Some(&literal_path), "./shared.dcdl")
+                .unwrap(),
+            path("a.dcdl@text/shared.dcdl")
+        );
+        assert!(VirtualPath::parse(snapshot_import_cache_key(&source)).is_err());
+        SnapshotEnvironment::new(snapshot)
+            .evaluate_contract(&ToolchainContract::new(1, vec![path("main.dcdl")], 1))
+            .expect("literal paths must not alias engine cache identities");
     }
 
     #[test]
@@ -3476,9 +3674,7 @@ mod tests {
             "---\n",
             "# Debug Rust\n",
         );
-        let snapshot = ConfigTreeSnapshot::from_entries(
-            3,
-            [
+        let snapshot = ConfigTreeSnapshot::from_entries([
                 entry(
                     "main.dcdl",
                     r#"{ skill = import "./skills/debug-rust/SKILL.md" as { frontmatter = { name = String; description = String; ...Unknown }; content = String; }; }"#,
@@ -3512,13 +3708,10 @@ mod tests {
                 content: source.to_string(),
             }
         );
-        let snapshot = ConfigTreeSnapshot::from_entries(
-            1,
-            [
-                entry("main.dcdl", r#"import "./skills/plain/SKILL.md""#),
-                text_entry("skills/plain/SKILL.md", source),
-            ],
-        )
+        let snapshot = ConfigTreeSnapshot::from_entries([
+            entry("main.dcdl", r#"import "./skills/plain/SKILL.md""#),
+            text_entry("skills/plain/SKILL.md", source),
+        ])
         .unwrap();
         let result = SnapshotEnvironment::new(snapshot)
             .evaluate_contract(&ToolchainContract::new(1, vec![path("main.dcdl")], 1))
@@ -3536,16 +3729,13 @@ mod tests {
             project_markdown_document("---\nname: missing-close\nbody\n").unwrap_err(),
             "opening YAML frontmatter delimiter has no closing delimiter"
         );
-        let snapshot = ConfigTreeSnapshot::from_entries(
-            1,
-            [
-                entry("main.dcdl", r#"import "./skills/broken/SKILL.md""#),
-                text_entry(
-                    "skills/broken/SKILL.md",
-                    "---\nname: [unterminated\n---\nbody\n",
-                ),
-            ],
-        )
+        let snapshot = ConfigTreeSnapshot::from_entries([
+            entry("main.dcdl", r#"import "./skills/broken/SKILL.md""#),
+            text_entry(
+                "skills/broken/SKILL.md",
+                "---\nname: [unterminated\n---\nbody\n",
+            ),
+        ])
         .unwrap();
         let diagnostics = SnapshotEnvironment::new(snapshot)
             .evaluate_contract(&ToolchainContract::new(1, vec![path("main.dcdl")], 1))
@@ -3557,7 +3747,7 @@ mod tests {
 
     #[test]
     fn builtin_imports_are_ordinary_values_with_confined_transitive_sources() {
-        let snapshot = ConfigTreeSnapshot::from_entries(1, [
+        let snapshot = ConfigTreeSnapshot::from_entries([
             entry("main.dcdl", r#"import "$builtin/profiles/companion.dcdl" // { worker = { mode = "wip"; }; feature = { workspace_config = { enabled = true; }; }; }"#),
             entry("profiles/base.dcdl", "{ slug = \"workspace-shadow\"; }"),
         ]).unwrap();
@@ -3583,13 +3773,10 @@ mod tests {
         );
 
         // Intersections conflict on explicit builtin values, exactly like any other import.
-        let snapshot = ConfigTreeSnapshot::from_entries(
-            1,
-            [entry(
-                "main.dcdl",
-                r#"import "$builtin/profiles/companion.dcdl" & { slug = "different"; }"#,
-            )],
-        )
+        let snapshot = ConfigTreeSnapshot::from_entries([entry(
+            "main.dcdl",
+            r#"import "$builtin/profiles/companion.dcdl" & { slug = "different"; }"#,
+        )])
         .unwrap();
         assert!(
             SnapshotEnvironment::new(snapshot)
@@ -3612,13 +3799,10 @@ mod tests {
             "builtin:companion",
         ] {
             let source = format!("import {specifier:?}");
-            let snapshot = ConfigTreeSnapshot::from_entries(
-                1,
-                [
-                    entry("main.dcdl", &source),
-                    entry("profiles/base.dcdl", "{ spoof = true; }"),
-                ],
-            )
+            let snapshot = ConfigTreeSnapshot::from_entries([
+                entry("main.dcdl", &source),
+                entry("profiles/base.dcdl", "{ spoof = true; }"),
+            ])
             .unwrap();
             let diagnostics = SnapshotEnvironment::new(snapshot)
                 .evaluate_contract(&contract)
@@ -3684,7 +3868,7 @@ mod tests {
 
     #[test]
     fn builtin_values_do_not_bypass_cycle_or_path_limits() {
-        let snapshot = ConfigTreeSnapshot::from_entries(1, [
+        let snapshot = ConfigTreeSnapshot::from_entries([
             entry("main.dcdl", r#"{ builtin = import "$builtin/profiles/companion.dcdl"; cycle = import "./cycle.dcdl"; }"#),
             entry("cycle.dcdl", r#"import "./main.dcdl""#),
         ]).unwrap();
@@ -3718,7 +3902,7 @@ mod tests {
     #[test]
     fn rejected_import_graph_edges_stay_rejected_after_diagnostics() {
         let mut loader = SnapshotImportLoader::new(
-            ConfigTreeSnapshot::from_entries(1, [entry("a.dcdl", "{}"), entry("b.dcdl", "{}")])
+            ConfigTreeSnapshot::from_entries([entry("a.dcdl", "{}"), entry("b.dcdl", "{}")])
                 .unwrap(),
         );
         loader.load(Some("a.dcdl"), "./b.dcdl").unwrap();
@@ -3760,7 +3944,7 @@ mod tests {
             entries.push(entry(&format!("{index}.dcdl"), &source));
         }
         let diagnostics =
-            SnapshotEnvironment::new(ConfigTreeSnapshot::from_entries(1, entries).unwrap())
+            SnapshotEnvironment::new(ConfigTreeSnapshot::from_entries(entries).unwrap())
                 .evaluate_contract(&ToolchainContract::new(1, vec![path("0.dcdl")], 1))
                 .unwrap_err();
         assert!(
@@ -3781,7 +3965,7 @@ mod tests {
             entries.push(text_entry(&format!("unused/{i}.txt"), ""));
         }
         let environment =
-            SnapshotEnvironment::new(ConfigTreeSnapshot::from_entries(1, entries).unwrap());
+            SnapshotEnvironment::new(ConfigTreeSnapshot::from_entries(entries).unwrap());
         let diagnostics = environment.evaluate_contract(&contract).unwrap_err();
         assert!(diagnostics[0].message.contains("entry count"));
         let mut entries = vec![entry(
@@ -3798,20 +3982,17 @@ mod tests {
             entries.push(text_entry(&format!("unused/{i}.txt"), &"a".repeat(bytes)));
         }
         let environment =
-            SnapshotEnvironment::new(ConfigTreeSnapshot::from_entries(1, entries).unwrap());
+            SnapshotEnvironment::new(ConfigTreeSnapshot::from_entries(entries).unwrap());
         let diagnostics = environment.evaluate_contract(&contract).unwrap_err();
         assert!(diagnostics[0].message.contains("total bytes"));
     }
 
     #[test]
     fn host_environment_evaluation_uses_only_snapshot_imports() {
-        let snapshot = ConfigTreeSnapshot::from_entries(
-            3,
-            [
-                entry("profiles/main.dcdl", r#"import "./shared.dcdl""#),
-                entry("profiles/shared.dcdl", "{ answer = 42; }"),
-            ],
-        )
+        let snapshot = ConfigTreeSnapshot::from_entries([
+            entry("profiles/main.dcdl", r#"import "./shared.dcdl""#),
+            entry("profiles/shared.dcdl", "{ answer = 42; }"),
+        ])
         .unwrap();
         let contract = ToolchainContract::new(
             DEFAULT_SCHEMA_VERSION,
@@ -3826,13 +4007,10 @@ mod tests {
 
     #[test]
     fn candidate_evaluation_rejects_invalid_unreferenced_decodal_source() {
-        let snapshot = ConfigTreeSnapshot::from_entries(
-            1,
-            [
-                entry("workspace.dcdl", "{ answer = 42; }"),
-                entry("unused.dcdl", "{ broken = ; }"),
-            ],
-        )
+        let snapshot = ConfigTreeSnapshot::from_entries([
+            entry("workspace.dcdl", "{ answer = 42; }"),
+            entry("unused.dcdl", "{ broken = ; }"),
+        ])
         .unwrap();
         let diagnostics = SnapshotEnvironment::new(snapshot)
             .evaluate_contract(&ToolchainContract::new(1, vec![path("workspace.dcdl")], 1))
@@ -3844,7 +4022,7 @@ mod tests {
     #[test]
     fn missing_import_and_cycles_are_structured_failures() {
         let missing =
-            ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", r#"import "./missing.dcdl""#)])
+            ConfigTreeSnapshot::from_entries([entry("main.dcdl", r#"import "./missing.dcdl""#)])
                 .unwrap();
         let contract = ToolchainContract::new(1, vec![path("main.dcdl")], 1);
         let diagnostics = SnapshotEnvironment::new(missing)
@@ -3852,13 +4030,10 @@ mod tests {
             .unwrap_err();
         assert_eq!(diagnostics[0].kind, "import");
 
-        let cycle = ConfigTreeSnapshot::from_entries(
-            1,
-            [
-                entry("a.dcdl", r#"import "./b.dcdl""#),
-                entry("b.dcdl", r#"import "./a.dcdl""#),
-            ],
-        )
+        let cycle = ConfigTreeSnapshot::from_entries([
+            entry("a.dcdl", r#"import "./b.dcdl""#),
+            entry("b.dcdl", r#"import "./a.dcdl""#),
+        ])
         .unwrap();
         let diagnostics = SnapshotEnvironment::new(cycle)
             .evaluate_contract(&ToolchainContract::new(1, vec![path("a.dcdl")], 1))

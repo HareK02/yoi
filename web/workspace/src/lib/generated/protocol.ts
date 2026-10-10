@@ -115,7 +115,7 @@ export type CommandEvent = { "kind": "started", command_id: string, tool_call_id
 
 export type CompactionLifecycleState = "running" | "done" | "failed" | "interrupted";
 
-export type CompactionLifecycle = { schema_version: number, compaction_id: string, revision: number, internal_worker?: InternalWorkerRef | null, state: CompactionLifecycleState,
+export type CompactionLifecycle = { schema_version: number, compaction_id: string, internal_worker?: InternalWorkerRef | null, state: CompactionLifecycleState,
 /**
  * Milliseconds since the Unix epoch.
  */
@@ -240,7 +240,7 @@ export type PendingSubmissionSummary = { submission_id: string,
  */
 preview?: string | null, accepted_at_ms: number, segment_count: number, byte_len: number, };
 
-export type PendingSubmissionsSnapshot = { revision: number, notification_count: number,
+export type PendingSubmissionsSnapshot = { notification_count: number,
 /**
  * Ordered display-only previews of waiting notifications, each bounded like
  * PendingSubmissionSummary::preview. Older runtimes omit this field.
@@ -281,7 +281,7 @@ export type InternalWorkerKind = "sub_worker" | { "service": { kind: string, } }
 
 export type InternalWorkerRef = { session_id: string, name: string, parent_session_id?: string | null, kind: InternalWorkerKind, };
 
-export type InternalWorkerSnapshot = { worker: InternalWorkerRef, revision: number, session: SessionSnapshot,
+export type InternalWorkerSnapshot = { worker: InternalWorkerRef, session: SessionSnapshot,
 /**
  * Public execution metadata for this child. Older snapshots and service
  * workers may omit it; clients must never substitute the parent's values.
@@ -416,9 +416,9 @@ export type SubscriptionFramePayload = { "frame": "request", "message": Subscrip
 
 export type SubscriptionFrame = { protocol_version: number, } & ({ "frame": "request", "message": SubscriptionRequest } | { "frame": "response", "message": SubscriptionResponse } | { "frame": "event", "message": SubscriptionEvent } | { "frame": "worker_protocol", "message": SubscriptionWorkerProtocolMethod });
 
-export type Method = { "method": "submit", "params": { submission_request_id: string, input: Array<Segment>, } } | { "method": "notify", "params": { notification_request_id: string, message: string, } } | { "method": "worker_event", "params": WorkerEvent } | { "method": "list_pending_submissions" } | { "method": "cancel_pending_submission", "params": { submission_id: string, expected_revision: number, } } | { "method": "clear_pending_submissions", "params": { expected_revision: number, } } | { "method": "continue_pending", "params": { expected_revision: number, expected_head_id: string, } } | { "method": "resume", "params": { command: WorkerCommandEnvelope, } } | { "method": "cancel", "params": { command: WorkerCommandEnvelope, } } | { "method": "pause", "params": { command: WorkerCommandEnvelope, } } | { "method": "compact", "params": { command: WorkerCommandEnvelope, } } | { "method": "list_rewind_targets" } | { "method": "rewind_to", "params": { target: RewindTargetId, expected_head_entries: number, } } | { "method": "shutdown", "params": { command: WorkerCommandEnvelope, } } | { "method": "list_completions", "params": { kind: CompletionKind, prefix: string,
+export type Method = { "method": "submit", "params": { submission_request_id: string, input: Array<Segment>, } } | { "method": "notify", "params": { notification_request_id: string, message: string, } } | { "method": "worker_event", "params": WorkerEvent } | { "method": "list_pending_submissions" } | { "method": "cancel_pending_submission", "params": { submission_id: string, } } | { "method": "clear_pending_submissions", "params": { expected_submission_ids: Array<string>, } } | { "method": "continue_pending", "params": { expected_head_id: string, } } | { "method": "resume", "params": { command: WorkerCommandEnvelope, } } | { "method": "cancel", "params": { command: WorkerCommandEnvelope, } } | { "method": "pause", "params": { command: WorkerCommandEnvelope, } } | { "method": "compact", "params": { command: WorkerCommandEnvelope, } } | { "method": "list_rewind_targets" } | { "method": "rewind_to", "params": { target: RewindTargetId, expected_head_entries: number, } } | { "method": "shutdown", "params": { command: WorkerCommandEnvelope, } } | { "method": "list_completions", "params": { kind: CompletionKind, prefix: string,
 /**
- * Client query generation. Echoed verbatim so identical-prefix ABA
+ * Client query identity. Echoed verbatim so identical-prefix ABA
  * responses cannot cross edits, target switches, or permission changes.
  */
 request_id?: string | null, context?: CompletionContext | null, } } | { "method": "list_workers" } | { "method": "restore_worker", "params": { name: string, } } | { "method": "register_peer", "params": { name: string, } };
@@ -455,7 +455,7 @@ output?: string | null, disposition?: ToolResultDisposition | null, is_error: bo
  */
 timestamp_ms?: number | null, input_tokens: number | null, output_tokens: number | null, cache_read_input_tokens?: number | null, } } | { "event": "context_usage", "data": { usage?: ContextUsage | null, } } | { "event": "run_end", "data": { result: RunResult, } } | { "event": "error", "data": { code: ErrorCode, message: string, } } | { "event": "snapshot", "data": { session: SessionSnapshot, greeting: Greeting,
 /**
- * Full revisioned live execution state. `Stopped` remains Runtime
+ * Full live execution state. `Stopped` remains Runtime
  * catalog authority and is deliberately not represented here.
  */
 state: WorkerStateSnapshot,
@@ -468,4 +468,4 @@ in_flight?: InFlightSnapshot,
  * Parent-owned Internal Worker sessions visible to this client.
  * Service-private Internal Workers are deliberately excluded.
  */
-internal_workers?: Array<InternalWorkerSnapshot>, } } | { "event": "internal_worker", "data": { worker: InternalWorkerRef, revision: number, event: Event, } } | { "event": "internal_worker_removed", "data": { worker: InternalWorkerRef, revision: number, } } | { "event": "segment_rotated", "data": { session: SessionSnapshot, } } | { "event": "worker_state", "data": { snapshot: WorkerStateSnapshot, } } | { "event": "command_acknowledged", "data": { acknowledgement: WorkerCommandAcknowledgement, } } | { "event": "command", "data": { event: CommandEvent, } } | { "event": "completions", "data": { kind: CompletionKind, prefix: string, request_id?: string | null, context?: CompletionContext | null, entries: Array<CompletionEntry>, } } | { "event": "rewind_targets", "data": { head_entries: number, targets: Array<RewindTarget>, } } | { "event": "rewind_applied", "data": { session: SessionSnapshot, input: Array<Segment>, summary: RewindSummary, } } | { "event": "workers_listed", "data": { workers: unknown, } } | { "event": "worker_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compaction_progress", "data": { compaction: InFlightCompaction | null, } } | { "event": "compact_start", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_done", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_failed", "data": { lifecycle: CompactionLifecycle, } } | { "event": "shutdown" };
+internal_workers?: Array<InternalWorkerSnapshot>, } } | { "event": "internal_worker", "data": { worker: InternalWorkerRef, event: Event, } } | { "event": "internal_worker_removed", "data": { worker: InternalWorkerRef, } } | { "event": "segment_rotated", "data": { session: SessionSnapshot, } } | { "event": "worker_state", "data": { snapshot: WorkerStateSnapshot, } } | { "event": "command_acknowledged", "data": { acknowledgement: WorkerCommandAcknowledgement, } } | { "event": "command", "data": { event: CommandEvent, } } | { "event": "completions", "data": { kind: CompletionKind, prefix: string, request_id?: string | null, context?: CompletionContext | null, entries: Array<CompletionEntry>, } } | { "event": "rewind_targets", "data": { head_entries: number, targets: Array<RewindTarget>, } } | { "event": "rewind_applied", "data": { session: SessionSnapshot, input: Array<Segment>, summary: RewindSummary, } } | { "event": "workers_listed", "data": { workers: unknown, } } | { "event": "worker_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compaction_progress", "data": { compaction: InFlightCompaction | null, } } | { "event": "compact_start", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_done", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_failed", "data": { lifecycle: CompactionLifecycle, } } | { "event": "shutdown" };

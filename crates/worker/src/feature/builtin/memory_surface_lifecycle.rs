@@ -161,18 +161,23 @@ impl SubjektivSurfaceLifecycleFeature {
 
 impl FeatureModule for SubjektivSurfaceLifecycleFeature {
     fn descriptor(&self) -> FeatureDescriptor {
-        FeatureDescriptor::builtin("subjektiv-memory-surface-lifecycle", "subjektiv Memory Surface Lifecycle")
-            .with_description("Rebuilds one bounded subject Memory surface after each committed consolidation run.")
-            .with_background_task(BackgroundTaskDeclaration::worker_managed(
-                TASK_NAME,
-                "Generate and publish a current subject Memory surface from bounded confirmed revisions.",
-            ))
+        FeatureDescriptor::builtin(
+            "subjektiv-memory-surface-lifecycle",
+            "subjektiv Memory Surface Lifecycle",
+        )
+        .with_description(
+            "Rebuilds one bounded subject Memory surface after each committed consolidation run.",
+        )
+        .with_background_task(BackgroundTaskDeclaration::worker_managed(
+            TASK_NAME,
+            "Generate and publish a current subject Memory surface from bounded confirmed changes.",
+        ))
     }
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
         let declaration = BackgroundTaskDeclaration::worker_managed(
             TASK_NAME,
-            "Generate and publish a current subject Memory surface from bounded confirmed revisions.",
+            "Generate and publish a current subject Memory surface from bounded confirmed changes.",
         );
         let mut spec = BackgroundTaskSpec::single_flight(declaration, TASK_TIMEOUT);
         spec.trigger = BackgroundTaskTrigger::RunCommitted;
@@ -240,16 +245,17 @@ impl SubjektivSurfaceLifecycleTask {
                 if let Some(snapshot_id) = &generation.current_snapshot_id {
                     return Ok(serde_json::json!({
                         "availability": "ready", "generation_id": generation.generation_id,
-                        "store_revision": generation.store_revision, "snapshot_id": snapshot_id,
+                        "memory_fingerprint": generation.memory_fingerprint, "snapshot_id": snapshot_id,
                     }));
                 }
             }
             // Preparation is Backend-fenced to the live attempt and immutable batch.
-            // Only a ready snapshot is immutable within its store revision. Never
+            // Only a ready snapshot is immutable within its Memory fingerprint. Never
             // reuse a failed marker, which a later generation can replace.
             if let Some(surface) = reusable_surface.filter(|surface| {
                 surface["availability"] == "ready"
-                    && surface["store_revision"].as_u64() == Some(generation.store_revision)
+                    && surface["memory_fingerprint"].as_str()
+                        == Some(generation.memory_fingerprint.as_str())
             }) {
                 return Ok(surface.clone());
             }
@@ -307,7 +313,7 @@ impl SubjektivSurfaceLifecycleTask {
                 Ok(output) => {
                     return Ok(serde_json::json!({
                         "availability": "ready", "generation_id": generation.generation_id,
-                        "store_revision": output.built_from_store_revision, "snapshot_id": output.snapshot_id,
+                        "memory_fingerprint": output.built_from_memory_fingerprint, "snapshot_id": output.snapshot_id,
                     }));
                 }
                 Err(SubjektivHostError::Conflict { .. })
@@ -418,23 +424,24 @@ impl SubjektivSurfaceLifecycleTask {
             .await
             .map_err(surface_hook_error)?;
         // Success must attest the actual persisted marker, not merely receipt of
-        // a failure notification. A protected ready surface or moved revision
+        // a failure notification. A protected ready surface or moved fingerprint
         // must yield a Backend rejection/non-failed status, never a failed claim.
         let confirmed_status = if job_confirmation_required {
             "failed_confirmed"
         } else {
             "failed"
         };
-        if failure.status != confirmed_status || failure.store_revision != generation.store_revision
+        if failure.status != confirmed_status
+            || failure.memory_fingerprint != generation.memory_fingerprint
         {
             return Err(HookError::new(
                 HookErrorCategory::Internal,
-                "Backend did not confirm a failed surface for this generation's revision; no Job result was submitted",
+                "Backend did not confirm a failed surface for this generation's fingerprint; no Job result was submitted",
             ));
         }
         Ok(serde_json::json!({
             "availability": "failed", "generation_id": generation.generation_id,
-            "store_revision": failure.store_revision, "reason_code": reason_code,
+            "memory_fingerprint": failure.memory_fingerprint, "reason_code": reason_code,
         }))
     }
 }
@@ -604,7 +611,7 @@ mod tests {
     ) -> server_api::SubjektivSurfaceMaterial {
         server_api::SubjektivSurfaceMaterial {
             memory_id: id.into(),
-            revision: 1,
+            change_id: "change-1".into(),
             kind,
             body_md,
             why_useful: "budget fixture".into(),
@@ -619,7 +626,7 @@ mod tests {
         server_api::SubjektivSurfacePrepareResponse {
             generation_id: "generation-1".into(),
             current_snapshot_id: None,
-            store_revision: 1,
+            memory_fingerprint: "memory-set-1".into(),
             active_memory_count: materials.len(),
             materials,
             body_token_budget: 1_024,
@@ -646,9 +653,9 @@ mod tests {
         job_results: Mutex<Vec<serde_json::Value>>,
         result_responses:
             Mutex<std::collections::VecDeque<Result<WorkspaceResponse, WorkspaceClientError>>>,
-        current_revision: AtomicUsize,
+        current_fingerprint: Mutex<Option<String>>,
         failure_status: Mutex<String>,
-        failure_revision: AtomicUsize,
+        failure_fingerprint: Mutex<Option<String>>,
         ready_snapshot: Mutex<Option<String>>,
     }
 
@@ -662,9 +669,9 @@ mod tests {
                 failure_reasons: Mutex::new(Vec::new()),
                 job_results: Mutex::new(Vec::new()),
                 result_responses: Mutex::new(Default::default()),
-                current_revision: AtomicUsize::new(0),
+                current_fingerprint: Mutex::new(None),
                 failure_status: Mutex::new("failed".into()),
-                failure_revision: AtomicUsize::new(0),
+                failure_fingerprint: Mutex::new(None),
                 ready_snapshot: Mutex::new(None),
             }
         }
@@ -676,13 +683,12 @@ mod tests {
             }
         }
 
-        fn revision(&self, fallback: usize) -> u64 {
-            let current = self.current_revision.load(Ordering::SeqCst);
-            if current == 0 {
-                fallback as u64
-            } else {
-                current as u64
-            }
+        fn fingerprint(&self, fallback: usize) -> String {
+            self.current_fingerprint
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| format!("memory-set-{fallback}"))
         }
 
         fn response(value: server_api::SubjektivMemoryBackendResponse) -> WorkspaceResponse {
@@ -741,7 +747,7 @@ mod tests {
                     let mut prepared =
                         generation(self.input_token_budget, vec![material("memory-1", 32)]);
                     prepared.generation_id = format!("generation-{call}");
-                    prepared.store_revision = self.revision(call);
+                    prepared.memory_fingerprint = self.fingerprint(call);
                     prepared.current_snapshot_id = self.ready_snapshot.lock().unwrap().clone();
                     Ok(Self::response(
                         server_api::SubjektivMemoryBackendResponse::SurfacePrepared(prepared),
@@ -760,7 +766,7 @@ mod tests {
                         server_api::SubjektivMemoryBackendResponse::SurfacePublished(
                             server_api::SubjektivSurfacePublishResponse {
                                 snapshot_id: format!("surface-{call}"),
-                                built_from_store_revision: self.revision(call),
+                                built_from_memory_fingerprint: self.fingerprint(call),
                                 empty: false,
                             },
                         ),
@@ -771,12 +777,14 @@ mod tests {
                     Ok(Self::response(
                         server_api::SubjektivMemoryBackendResponse::SurfaceFailed(
                             server_api::SubjektivSurfaceFailureResponse {
-                                store_revision: if self.failure_revision.load(Ordering::SeqCst) > 0
-                                {
-                                    self.failure_revision.load(Ordering::SeqCst) as u64
-                                } else {
-                                    self.revision(self.prepare_calls.load(Ordering::SeqCst))
-                                },
+                                memory_fingerprint: self
+                                    .failure_fingerprint
+                                    .lock()
+                                    .unwrap()
+                                    .clone()
+                                    .unwrap_or_else(|| {
+                                        self.fingerprint(self.prepare_calls.load(Ordering::SeqCst))
+                                    }),
                                 status: self.failure_status.lock().unwrap().clone(),
                             },
                         ),
@@ -814,7 +822,7 @@ mod tests {
                         serde_json::json!({
                             "points": [{
                                 "body_md": "- Keep the confirmed constraint.",
-                                "memory_refs": [{"memory_id": "memory-1", "revision": 1}]
+                                "memory_refs": [{"memory_id": "memory-1", "change_id": "change-1"}]
                             }]
                         })
                         .to_string(),
@@ -863,7 +871,7 @@ permission = "write"
             .subjektiv
             .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "workspace-1".into(),
-                settings_revision: 1,
+
                 language: "English".into(),
             })
             .unwrap();
@@ -899,7 +907,7 @@ permission = "write"
             .start_run_committed(HookInvocationContext {
                 worker_id: "worker-1".into(),
                 session_id: "session-1".into(),
-                session_revision: 1,
+
                 run_id: Some("run-1".into()),
                 ..Default::default()
             })
@@ -1146,7 +1154,10 @@ permission = "write"
                 results[0]["result"]["surface"]["generation_id"],
                 "generation-1"
             );
-            assert_eq!(results[0]["result"]["surface"]["store_revision"], 1);
+            assert_eq!(
+                results[0]["result"]["surface"]["memory_fingerprint"],
+                "memory-set-1"
+            );
             assert_eq!(workspace.prepare_calls.load(Ordering::SeqCst), 1);
             assert!(
                 tool.execute(
@@ -1289,7 +1300,7 @@ permission = "write"
     async fn job_result_definitive_rejection_allows_correction_and_reuses_current_ready_surface() {
         for status in [400, 403, 422] {
             let workspace = Arc::new(SurfaceWorkspaceClient::new(0));
-            workspace.current_revision.store(1, Ordering::SeqCst);
+            *workspace.current_fingerprint.lock().unwrap() = Some("memory-set-1".into());
             workspace
                 .result_responses
                 .lock()
@@ -1317,7 +1328,7 @@ permission = "write"
             assert_eq!(
                 workspace.prepare_calls.load(Ordering::SeqCst),
                 2,
-                "reuse must verify current revision"
+                "reuse must verify current Memory fingerprint"
             );
             assert_eq!(
                 workspace.publish_calls.load(Ordering::SeqCst),
@@ -1338,7 +1349,7 @@ permission = "write"
     async fn job_result_rejection_rebuilds_conflicting_or_stale_surfaces() {
         for status in [400, 409] {
             let workspace = Arc::new(SurfaceWorkspaceClient::new(0));
-            workspace.current_revision.store(1, Ordering::SeqCst);
+            *workspace.current_fingerprint.lock().unwrap() = Some("memory-set-1".into());
             workspace
                 .result_responses
                 .lock()
@@ -1350,14 +1361,20 @@ permission = "write"
                     .await
                     .is_err()
             );
-            workspace.current_revision.store(2, Ordering::SeqCst);
+            *workspace.current_fingerprint.lock().unwrap() = Some("memory-set-2".into());
             tool.execute(CORRECT_RESULT, agen::tool::ToolExecutionContext::direct())
                 .await
                 .unwrap();
             let results = workspace.job_results.lock().unwrap();
             assert_eq!(results.len(), 2);
-            assert_eq!(results[0]["result"]["surface"]["store_revision"], 1);
-            assert_eq!(results[1]["result"]["surface"]["store_revision"], 2);
+            assert_eq!(
+                results[0]["result"]["surface"]["memory_fingerprint"],
+                "memory-set-1"
+            );
+            assert_eq!(
+                results[1]["result"]["surface"]["memory_fingerprint"],
+                "memory-set-2"
+            );
             assert_ne!(
                 results[0]["result"]["surface"]["generation_id"],
                 results[1]["result"]["surface"]["generation_id"]
@@ -1415,18 +1432,18 @@ permission = "write"
     }
 
     #[tokio::test]
-    async fn job_result_never_submits_unconfirmed_failure_or_wrong_revision() {
-        for (status, revision) in [
-            ("failed", 0),
-            ("ready", 0),
-            ("stale", 0),
-            ("failed_confirmed", 2),
+    async fn job_result_never_submits_unconfirmed_failure_or_wrong_fingerprint() {
+        for (status, fingerprint) in [
+            ("failed", "memory-set-1"),
+            ("ready", "memory-set-1"),
+            ("stale", "memory-set-1"),
+            ("failed_confirmed", "memory-set-2"),
         ] {
             let workspace = Arc::new(SurfaceWorkspaceClient::with_input_token_budget(1));
-            workspace.current_revision.store(1, Ordering::SeqCst);
+            *workspace.current_fingerprint.lock().unwrap() = Some("memory-set-1".into());
             let tool = job_result_tool(workspace.clone());
             *workspace.failure_status.lock().unwrap() = status.into();
-            workspace.failure_revision.store(revision, Ordering::SeqCst);
+            *workspace.failure_fingerprint.lock().unwrap() = Some(fingerprint.into());
             assert!(
                 tool.execute(CORRECT_RESULT, agen::tool::ToolExecutionContext::direct())
                     .await
@@ -1435,7 +1452,7 @@ permission = "write"
             assert!(workspace.job_results.lock().unwrap().is_empty());
             // Nothing was dispatched/sealed: a real confirmed outcome remains retryable.
             *workspace.failure_status.lock().unwrap() = "failed_confirmed".into();
-            workspace.failure_revision.store(0, Ordering::SeqCst);
+            *workspace.failure_fingerprint.lock().unwrap() = None;
             tool.execute(CORRECT_RESULT, agen::tool::ToolExecutionContext::direct())
                 .await
                 .unwrap();

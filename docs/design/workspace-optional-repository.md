@@ -26,7 +26,7 @@ conflict. No schema migration is needed for the existing fingerprint/Workspace
 receipts.
 
 A replay is not a historical snapshot. It returns the current Workspace and
-config revision. If creation supplied a Repository, it returns the current
+config content snapshot. If creation supplied a Repository, it returns the current
 record **at the originally requested key**. Removal or renaming away from that
 key produces `repository: null`; registration at that key later returns that
 current record. Replay never re-registers or resets an asset. If creation omitted

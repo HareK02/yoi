@@ -7,7 +7,6 @@ export type RepositorySshCredential = {
   name: string;
   public_key_algorithm: string;
   public_key_fingerprint: string;
-  current_revision: number;
   status: string;
   created_at: string;
   rotated_at: string | null;
@@ -30,7 +29,6 @@ export type GenerateRepositorySshCredentialRequest = {
 
 export type RepositorySshPublicKey = {
   credential_id: string;
-  current_revision: number;
   public_key_algorithm: string;
   public_key_fingerprint: string;
   public_key: string;
@@ -38,14 +36,14 @@ export type RepositorySshPublicKey = {
 
 export type RotateRepositorySshCredentialRequest = {
   operation_id: string;
-  expected_revision: number;
+  expected_public_key_fingerprint: string;
   private_key: string;
   passphrase: string | null;
 };
 
 export type DeleteRepositorySshCredentialRequest = {
   operation_id: string;
-  expected_revision: number;
+  expected_public_key_fingerprint: string;
 };
 
 export type RepositorySshHostTrust = {
@@ -56,7 +54,6 @@ export type RepositorySshHostTrust = {
   key_algorithm: string;
   host_key: string;
   fingerprint: string;
-  current_revision: number;
   created_at: string;
   updated_at: string;
   referenced_repositories: Array<string>;
@@ -68,12 +65,12 @@ export type PutRepositorySshHostTrustRequest = {
   hostname: string;
   port: number;
   host_key: string;
-  expected_revision: number | null;
+  expected_fingerprint: string | null;
 };
 
 export type DeleteRepositorySshHostTrustRequest = {
   operation_id: string;
-  expected_revision: number;
+  expected_fingerprint: string;
 };
 
 export type RepositoryAccessMode = "read_only" | "read_write";
@@ -87,7 +84,6 @@ export type RepositorySshAccessBinding = {
 
 export type RepositoryAccessProjection = {
   workspace_id: string;
-  config_revision: number;
   projection_digest: string;
   bindings: Array<RepositorySshAccessBinding>;
 };

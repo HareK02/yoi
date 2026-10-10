@@ -487,7 +487,7 @@ async fn standalone_restore_recovers_only_a_proven_stale_lease() -> TestResult {
             source: manifest::ProfileRegistrySource::User,
             name: "user-standalone".to_string(),
             path: None,
-            provenance: Some("user-config-revision-7".to_string()),
+            provenance: Some("user-config-digest".to_string()),
         },
         profile: Some(manifest::ProfileMetadata {
             name: Some("User standalone".to_string()),

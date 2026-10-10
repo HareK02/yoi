@@ -14,7 +14,7 @@ use crate::feature::{
 };
 
 pub const SUBMIT_JOB_RESULT_TOOL: &str = "SubmitJobResult";
-const DESCRIPTION: &str = "Submit this Host Job's bounded structured result. Job, attempt and input revision are immutable Host bindings. Only result is accepted as input; final prose is not success.";
+const DESCRIPTION: &str = "Submit this Host Job's bounded structured result. Job, attempt and input digest are immutable Host bindings. Only result is accepted as input; final prose is not success.";
 
 /// Host acceptance authority. Implementations must validate the immutable fences and commit
 /// acceptance durably before returning Ok. Err may mean an unknown outcome; identical retries
@@ -64,7 +64,7 @@ struct SubmissionState {
 pub struct JobResultFeature {
     job_id: String,
     attempt_id: String,
-    input_revision: String,
+    input_digest: String,
     max_result_bytes: u32,
     sink: Arc<dyn JobResultSink>,
     state: Arc<Mutex<SubmissionState>>,
@@ -86,7 +86,7 @@ impl JobResultFeature {
         Ok(Self {
             job_id: request.job_id.clone(),
             attempt_id,
-            input_revision: request.input_revision.clone(),
+            input_digest: request.input_digest()?,
             max_result_bytes: request.limits.max_result_bytes,
             sink,
             state: Arc::default(),
@@ -216,7 +216,7 @@ impl Tool for JobResultFeature {
         let submission = ::job::JobResultSubmission {
             job_id: self.job_id.clone(),
             attempt_id: self.attempt_id.clone(),
-            input_revision: self.input_revision.clone(),
+            input_digest: self.input_digest.clone(),
             result: prepared,
         };
         let mut accepted = self.accepted.lock().expect("Job result state poisoned");

@@ -832,7 +832,7 @@ mod tests {
                 WorkerHistoryProvenance::FlowInstruction {
                     selector: "builtin:coder-review".into(),
                     definition_id: "coder-review".into(),
-                    definition_revision: 3,
+                    definition_digest: Some("sha256:flow-source".into()),
                     instance_id: "instance".into(),
                     state_id: "implement".into(),
                 },

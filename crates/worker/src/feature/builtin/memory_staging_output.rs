@@ -386,7 +386,7 @@ fn evidence_origin(origin: &protocol::SessionEntryProvenance) -> EvidenceOrigin 
         worker_id: None,
         flow_selector: None,
         flow_definition_id: None,
-        flow_definition_revision: None,
+        flow_definition_fingerprint: None,
     }
 }
 

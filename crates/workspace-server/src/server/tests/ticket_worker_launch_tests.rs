@@ -183,8 +183,7 @@ impl LaunchFixture {
                         .public_key_fingerprint
                         .clone()
                         .unwrap(),
-                    identity_revision: workspace_identity.revision,
-                    trust_generation: workspace_identity.revision,
+                    trust_id: "trust-launch-test".to_string(),
                     state: WorkspaceIssuerTrustState::Active,
                     registered_at_unix: 1,
                     updated_at_unix: 1,
@@ -206,11 +205,12 @@ impl LaunchFixture {
                 base_url: endpoint.clone(),
                 public_key: runtime_identity.public_key.clone(),
                 public_key_fingerprint: signer.public_key_fingerprint().to_string(),
-                binding_revision: 1,
+                binding_id: "binding-launch-test".to_string(),
                 state: StoredRuntimeBindingState::Configured,
                 authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
                 workspace_key_id: Some(workspace_identity.key_id),
-                workspace_key_generation: Some(workspace_identity.revision),
+                workspace_public_key_fingerprint: workspace_identity.public_key_fingerprint.clone(),
+                workspace_trust_id: Some("trust-launch-test".to_string()),
                 created_at: TEST_CREATED_AT.into(),
                 updated_at: TEST_CREATED_AT.into(),
                 revoked_at: None,
@@ -220,6 +220,13 @@ impl LaunchFixture {
                 .store
                 .upsert_workspace_runtime_binding_record(binding.clone(), false)
                 .await
+                .unwrap();
+            let binding = fixture
+                .api
+                .store
+                .get_workspace_runtime_binding(TEST_WORKSPACE_ID, &fixture.runtime_id)
+                .await
+                .unwrap()
                 .unwrap();
             fixture.runtime_server = Some(tokio::spawn(async move {
                 worker_runtime::http_server::serve_runtime_http_with_workspace_auth(
@@ -471,7 +478,6 @@ async fn worker_launch_uses_published_project_profile_and_workspace_default_on_r
         .unwrap();
     let main = config_source::VirtualPath::parse("main.dcdl").unwrap();
     let request = crate::config_source::ConfigCommitRequest {
-        base_revision: state.snapshot.revision,
         base_digest: state.snapshot.digest.clone(),
         entrypoints: state.contract.entrypoints.clone(),
         changes: vec![config_source::ConfigTreeChange::Update {
@@ -1025,7 +1031,7 @@ async fn choosing_reviewer_profile_does_not_register_a_reviewer_child_or_grant_m
         .request_review(merge_request::RequestMergeRequestReview {
             merge_request_id: mr_id.into(),
             ticket_id: ticket_id.clone(),
-            ticket_item_revision: ticket_item_checker::item_revision(
+            ticket_content_digest: ticket_item_checker::content_digest(
                 &browser_ticket_backend(&fixture.api)
                     .unwrap()
                     .show(ticket_id.clone().into())

@@ -8,7 +8,7 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 const MAX_BODY_BYTES: usize = 16 * 1024;
 const DOMAIN_TABLES: [&str; 5] = [
     "merge_requests",
@@ -103,7 +103,7 @@ pub struct ReviewRequestedEvent {
     pub sequence: u64,
     pub subject_ref: String,
     #[serde(default)]
-    pub ticket_item_revision: String,
+    pub ticket_content_digest: String,
     #[serde(default)]
     pub ticket_merge_request_subjects: Vec<MergeRequestReviewSubject>,
     pub requested_by: WorkerIdentity,
@@ -118,7 +118,7 @@ pub struct ReviewEvent {
     pub request_event_id: String,
     pub subject_ref: String,
     #[serde(default)]
-    pub ticket_item_revision: String,
+    pub ticket_content_digest: String,
     #[serde(default)]
     pub ticket_merge_request_subjects: Vec<MergeRequestReviewSubject>,
     pub decision: ReviewDecision,
@@ -249,7 +249,7 @@ pub enum MergeRequestEvidenceError {
     ReviewRequestMissing,
     ReviewRequestMismatch,
     ApprovalNotEffective,
-    ItemRevisionMismatch,
+    TicketContentMismatch,
     SourceSnapshotMismatch,
     RequirementApprovalMissing,
 }
@@ -268,7 +268,7 @@ impl MergeRequestEvidenceError {
             Self::ReviewRequestMissing => "review_request_missing",
             Self::ReviewRequestMismatch => "review_request_mismatch",
             Self::ApprovalNotEffective => "approval_not_effective",
-            Self::ItemRevisionMismatch => "item_revision_mismatch",
+            Self::TicketContentMismatch => "ticket_content_mismatch",
             Self::SourceSnapshotMismatch => "source_snapshot_mismatch",
             Self::RequirementApprovalMissing => "requirement_approval_missing",
         }
@@ -290,14 +290,14 @@ impl MergeRequestEvidenceError {
                 "Reviewer approval does not match linked ReviewRequested evidence"
             }
             Self::ApprovalNotEffective => "Reviewer approval is not the effective review",
-            Self::ItemRevisionMismatch => {
-                "Reviewer approval does not attest the current Ticket revision"
+            Self::TicketContentMismatch => {
+                "Reviewer approval does not attest the current Ticket digest"
             }
             Self::SourceSnapshotMismatch => {
                 "Reviewer approval does not attest the exact linked source set"
             }
             Self::RequirementApprovalMissing => {
-                "no effective Reviewer approval attests the current Ticket revision and exact linked source set"
+                "no effective Reviewer approval attests the current Ticket digest and exact linked source set"
             }
         }
     }
@@ -382,7 +382,7 @@ impl MergeRequest {
             })
             .ok_or(MergeRequestEvidenceError::ReviewRequestMissing)?;
         if requested.subject_ref != review.subject_ref
-            || requested.ticket_item_revision != review.ticket_item_revision
+            || requested.ticket_content_digest != review.ticket_content_digest
             || requested.ticket_merge_request_subjects != review.ticket_merge_request_subjects
             || requested.reviewer != review.reviewer
             || requested.sequence >= review.sequence
@@ -393,7 +393,7 @@ impl MergeRequest {
     }
 }
 
-/// Finds an effective approval of the authoritative current Ticket revision and
+/// Finds an effective approval of the authoritative current Ticket digest and
 /// exact linked source snapshot. Callers supply all linked requests and resolved
 /// source refs (recorded merged refs for completion); this function does not read
 /// authority, resolve selectors, require merged state, or mutate lifecycle state.
@@ -401,7 +401,7 @@ impl MergeRequest {
 /// attestation. Snapshot ordering is immaterial, but duplicate ids are rejected.
 pub fn requirement_approval<'a>(
     requests: &'a [MergeRequest],
-    item_revision: &str,
+    content_digest: &str,
     subjects: &[MergeRequestReviewSubject],
     event_id: Option<&str>,
 ) -> Result<&'a ReviewEvent, MergeRequestEvidenceError> {
@@ -436,8 +436,10 @@ pub fn requirement_approval<'a>(
                 {
                     return Err(MergeRequestEvidenceError::ApprovalNotEffective);
                 }
-                if review.ticket_item_revision != item_revision || item_revision.trim().is_empty() {
-                    return Err(MergeRequestEvidenceError::ItemRevisionMismatch);
+                if review.ticket_content_digest != content_digest
+                    || content_digest.trim().is_empty()
+                {
+                    return Err(MergeRequestEvidenceError::TicketContentMismatch);
                 }
                 if !same_source_snapshot(&review.ticket_merge_request_subjects, subjects) {
                     return Err(MergeRequestEvidenceError::SourceSnapshotMismatch);
@@ -508,7 +510,7 @@ pub struct OpenMergeRequest {
 pub struct RequestMergeRequestReview {
     pub merge_request_id: String,
     pub ticket_id: String,
-    pub ticket_item_revision: String,
+    pub ticket_content_digest: String,
     pub ticket_merge_request_subjects: Vec<MergeRequestReviewSubject>,
     pub subject_ref: String,
     pub child_session_id: String,
@@ -604,6 +606,7 @@ pub struct CompleteMergeRequest {
 pub struct TicketCompletionEvent {
     pub operation_id: String,
     pub ticket_id: String,
+    /// Frozen historical payload only; not a content attestation or live API.
     pub item_revision: String,
     pub merge_request_ids: Vec<String>,
     pub requirement_approval_event_id: String,
@@ -805,11 +808,11 @@ impl MergeRequestStore {
         }
         let mut c = self.lock()?;
         let t = c.transaction()?;
-        let current_revision = current_ticket_revision(&t, &i.auth.workspace_id, &i.ticket_id)?
+        let current_digest = current_ticket_content_digest(&t, &i.auth.workspace_id, &i.ticket_id)?
             .ok_or(MergeRequestError::NotFound)?;
-        if current_revision != i.ticket_item_revision {
+        if current_digest != i.ticket_content_digest {
             return Err(MergeRequestError::Conflict(
-                "Ticket item revision changed before review request".into(),
+                "Ticket item digest changed before review request".into(),
             ));
         }
         let current_mr = load_mr(&t, &i.auth.workspace_id, &i.merge_request_id)?
@@ -848,7 +851,7 @@ impl MergeRequestStore {
             event_id: Uuid::now_v7().to_string(),
             sequence: next_seq(&t, &mr.workspace_id, &mr.merge_request_id)?,
             subject_ref: i.subject_ref,
-            ticket_item_revision: i.ticket_item_revision,
+            ticket_content_digest: i.ticket_content_digest,
             ticket_merge_request_subjects: i.ticket_merge_request_subjects,
             requested_by: WorkerIdentity {
                 runtime_id: i.auth.runtime_id,
@@ -944,12 +947,12 @@ impl MergeRequestStore {
                 "review grant invalid".into(),
             ));
         };
-        let (ticket_item_revision, ticket_merge_request_subjects) = load_mr(&t, &ws, &mr)?
+        let (ticket_content_digest, ticket_merge_request_subjects) = load_mr(&t, &ws, &mr)?
             .and_then(|request| {
                 request.thread.into_iter().find_map(|event| match event {
                     MergeRequestThreadEvent::ReviewRequested(event) if event.event_id == req => {
                         Some((
-                            event.ticket_item_revision,
+                            event.ticket_content_digest,
                             event.ticket_merge_request_subjects,
                         ))
                     }
@@ -982,7 +985,7 @@ impl MergeRequestStore {
             sequence: next_seq(&t, &ws, &mr)?,
             request_event_id: req,
             subject_ref: subject,
-            ticket_item_revision,
+            ticket_content_digest,
             ticket_merge_request_subjects,
             decision: i.decision,
             body: i.body,
@@ -1056,13 +1059,12 @@ impl MergeRequestStore {
         }
         if let Some(review) = &review {
             let connection = self.lock()?;
-            let current_revision =
-                current_ticket_revision(&connection, &i.auth.workspace_id, &i.ticket_id)?
+            let current_digest =
+                current_ticket_content_digest(&connection, &i.auth.workspace_id, &i.ticket_id)?
                     .ok_or(MergeRequestError::NotFound)?;
-            if review.ticket_item_revision != current_revision {
+            if review.ticket_content_digest != current_digest {
                 b.push(
-                    "approval predates the current Ticket revision; fresh review is required"
-                        .into(),
+                    "approval predates the current Ticket digest; fresh review is required".into(),
                 );
             }
         }
@@ -1147,12 +1149,12 @@ impl MergeRequestStore {
             ));
         }
         let connection = self.lock()?;
-        let current_revision =
-            current_ticket_revision(&connection, &mr.workspace_id, &i.ticket_id)?
+        let current_digest =
+            current_ticket_content_digest(&connection, &mr.workspace_id, &i.ticket_id)?
                 .ok_or(MergeRequestError::NotFound)?;
-        if review.ticket_item_revision != current_revision {
+        if review.ticket_content_digest != current_digest {
             return Err(MergeRequestError::NotReady(
-                "approval predates the current Ticket revision; fresh review is required".into(),
+                "approval predates the current Ticket digest; fresh review is required".into(),
             ));
         }
         let state: Option<String> = connection
@@ -1227,12 +1229,12 @@ impl MergeRequestStore {
                 "current effective review does not approve the source ref".into(),
             ));
         }
-        let current_revision =
-            current_ticket_revision(&transaction, &mr.workspace_id, &i.ticket_id)?
+        let current_digest =
+            current_ticket_content_digest(&transaction, &mr.workspace_id, &i.ticket_id)?
                 .ok_or(MergeRequestError::NotFound)?;
-        if review.ticket_item_revision != current_revision {
+        if review.ticket_content_digest != current_digest {
             return Err(MergeRequestError::NotReady(
-                "approval predates the current Ticket revision; fresh review is required".into(),
+                "approval predates the current Ticket digest; fresh review is required".into(),
             ));
         }
         let state: Option<String> = transaction
@@ -1655,34 +1657,13 @@ fn linked_merge_request_ids(
         .map_err(Into::into)
 }
 
-fn current_ticket_revision(
+fn current_ticket_content_digest(
     connection: &Connection,
     workspace_id: &str,
     ticket_id: &str,
 ) -> Result<Option<String>, MergeRequestError> {
-    let event_index = connection
-        .query_row(
-            "SELECT event_index
-               FROM typed_ticket_events
-              WHERE workspace_id=?1 AND ticket_id=?2
-                AND kind IN ('create','item_edit')
-              ORDER BY event_index DESC
-              LIMIT 1",
-            params![workspace_id, ticket_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?;
-    if let Some(event_index) = event_index {
-        return Ok(Some(format!("{ticket_id}:{event_index}")));
-    }
-    connection
-        .query_row(
-            "SELECT updated_at FROM typed_tickets WHERE workspace_id=?1 AND ticket_id=?2",
-            params![workspace_id, ticket_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(Into::into)
+    ticket::sqlite_ticket_content_digest(connection, workspace_id, ticket_id)
+        .map_err(|error| MergeRequestError::Operation(error.to_string()))
 }
 
 fn load_mr(c: &Connection, w: &str, m: &str) -> Result<Option<MergeRequest>, MergeRequestError> {
@@ -1773,10 +1754,80 @@ pub fn migrate(c: &Connection) -> Result<(), MergeRequestError> {
     match schema_state(c)? {
         SchemaState::Fresh => fresh(c),
         SchemaState::Current(SCHEMA_VERSION) => verify(c),
+        SchemaState::Current(12) => migrate_v12_content_attestations(c),
         SchemaState::Current(v) => Err(MergeRequestError::Operation(format!(
             "unsupported schema {v}"
         ))),
     }
+}
+
+/// Frozen v12 migration: historical counters cannot prove the reviewed content.
+/// Preserve request/review identities and integration evidence, but do not
+/// manufacture content attestations from today's Ticket. Fresh review is needed.
+fn migrate_v12_content_attestations(c: &Connection) -> Result<(), MergeRequestError> {
+    let transaction = c.unchecked_transaction()?;
+    verify(&transaction)?;
+    // Keep the exact historical audit bytes independently of the current DTO
+    // projection. An unknown content attestation must not erase its old evidence.
+    transaction.execute_batch(
+        "CREATE TABLE merge_request_legacy_review_archive (
+            workspace_id TEXT NOT NULL,
+            merge_request_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            PRIMARY KEY(workspace_id, merge_request_id, event_id)
+        );
+        INSERT INTO merge_request_legacy_review_archive
+            SELECT workspace_id,merge_request_id,event_id,payload_json
+            FROM merge_request_thread_events WHERE kind IN ('review_requested','review');
+        CREATE TRIGGER merge_request_legacy_review_archive_no_update
+            BEFORE UPDATE ON merge_request_legacy_review_archive
+            BEGIN SELECT RAISE(ABORT, 'historical review evidence is immutable'); END;
+        CREATE TRIGGER merge_request_legacy_review_archive_no_delete
+            BEFORE DELETE ON merge_request_legacy_review_archive
+            BEGIN SELECT RAISE(ABORT, 'historical review evidence is retained'); END;",
+    )?;
+    let rows = {
+        let mut statement = transaction.prepare(
+            "SELECT workspace_id,merge_request_id,event_id,payload_json FROM merge_request_thread_events WHERE kind IN ('review_requested','review')",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (workspace_id, merge_request_id, event_id, payload) in rows {
+        let mut value: serde_json::Value = json(&payload)?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| MergeRequestError::Corrupt("review payload is not an object".into()))?;
+        object.remove("ticket_item_revision");
+        object.insert(
+            "ticket_content_digest".into(),
+            serde_json::Value::String(String::new()),
+        );
+        transaction.execute(
+            "UPDATE merge_request_thread_events SET payload_json=?4 WHERE workspace_id=?1 AND merge_request_id=?2 AND event_id=?3",
+            params![workspace_id, merge_request_id, event_id, value.to_string()],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE merge_request_review_grants SET status='revoked',revoked_at=COALESCE(revoked_at,issued_at) WHERE status='issued'",
+        [],
+    )?;
+    transaction.execute(
+        "UPDATE merge_request_schema SET version=?1 WHERE singleton=1",
+        params![SCHEMA_VERSION],
+    )?;
+    verify(&transaction)?;
+    transaction.commit()?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

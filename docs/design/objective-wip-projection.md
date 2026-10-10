@@ -15,7 +15,7 @@ There is no Feature Object or `/features/objective` compatibility alias. Legacy 
 
 `<objective-reference>` is either a canonical `O-<digits>` key or an existing canonical internal alphanumeric ID. Only one direct child segment is accepted. Nested suffixes, Ticket keys, and unrelated or hidden prefixes do not resolve as Objective objects.
 
-The Backend remains authoritative for existence, `O-*`/internal-ID resolution, Workspace scope, validation, audit events, revision generation, pagination, body/event bounds, and linked-Ticket validation. A discovered route is not independent authority; every operation still uses the Worker's current `WorkspaceClient`.
+The Backend remains authoritative for existence, `O-*`/internal-ID resolution, Workspace scope, validation, audit events, pagination, body/event bounds, and linked-Ticket validation. A discovered route is not independent authority; every operation still uses the Worker's current `WorkspaceClient`.
 
 ## Current operation inventory
 
@@ -44,9 +44,9 @@ The item operations intentionally do not accept an Objective `id`. The handler i
 
 `query` retains the ordinary Worker limit of 1–100 and returns stable snippets, canonical `O-*` references, linked `T-*` references, `next_cursor`, and `has_more`. Each result also includes its canonical item path. It does not expand Objective bodies, complete events, or Ticket records.
 
-`read` retains the ordinary Worker event limit of 1–50 and projects the Backend-bounded body, `body_truncated`, authoritative `revision`, linked-Ticket summaries, bounded events, and event pagination. Internal Objective, Ticket, and event-storage IDs are removed from model-visible results.
+`read` retains the ordinary Worker event limit of 1–50 and projects the Backend-bounded body, `body_truncated`, linked-Ticket summaries, bounded events, and event pagination. Internal Objective, Ticket, and event-storage IDs are removed from model-visible results.
 
-`create` returns the authoritative Objective detail plus its canonical item path. Mutations return the authoritative post-operation detail. The revision observed in a successful read or mutation updates the item's object validator. The common Host validator contract rejects stale object/interface calls before dispatch, and the call response carries the refreshed route validator.
+`create` returns the authoritative Objective detail plus its canonical item path. Mutations return the authoritative post-operation detail. The Object publishes fixed operation signatures, not the Objective's mutable content: editing content does not invalidate an unchanged Object/Interface contract. The adapter therefore keeps no content-freshness cache or synthetic change identifier. Each invocation checks current permission and dispatches to current Backend authority; `edit` evaluates its explicit `old_string`/uniqueness conditions there. Reads always fetch current Backend data rather than replaying cached content. Host validators still protect route and Interface signatures before dispatch.
 
 Linked Ticket references remain strings passed to the existing Objective Backend operation. Their presence does not publish a Ticket object, grant Ticket read or mutation authority, or require a Ticket-native WIP projection.
 

@@ -756,7 +756,7 @@ mod tests {
             workspace_id: Some("workspace".into()),
             worker_id: "worker".into(),
             session_id: "session".into(),
-            session_revision: 3,
+
             run_id: Some("run".into()),
             turn_index: Some(2),
             call_id: None,

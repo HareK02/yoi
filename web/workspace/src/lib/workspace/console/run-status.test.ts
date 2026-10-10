@@ -163,7 +163,7 @@ Deno.test("new invoke and legacy snapshot reset run activity", () => {
           entries: [],
           greeting: { text: "", profile: "" },
           state: {
-            revision: 0,
+
             last_command_id: 0,
             state: { kind: "idle" },
           },

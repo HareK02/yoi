@@ -44,7 +44,7 @@ fn response(value: impl Serialize) -> WorkspaceResponse {
         body: serde_json::to_string(&value).unwrap(),
     }
 }
-fn entry(id: &str, revision: &str) -> DriveEntry {
+fn entry(id: &str, last_mutation_id: &str) -> DriveEntry {
     DriveEntry {
         entry: DriveEntryRef {
             workspace_id: "workspace".into(),
@@ -56,7 +56,7 @@ fn entry(id: &str, revision: &str) -> DriveEntry {
         }),
         name: "note.md".into(),
         kind: DriveEntryKind::File,
-        revision: revision.into(),
+        last_mutation_id: last_mutation_id.into(),
         size: Some(5),
         content_type: Some("text/markdown".into()),
         updated_by: "worker".into(),
@@ -83,7 +83,7 @@ async fn execute(
 }
 
 #[test]
-fn drive_feature_activation_never_creates_authority_and_schemas_hide_revisions() {
+fn drive_feature_activation_never_creates_authority_and_schemas_hide_last_mutation_ids() {
     let client = Client::new(Vec::new());
     let router = Arc::new(WorkdirSessionRouter::new());
     assert!(DriveFeature::configured(client.clone(), false, router.clone()).is_none());
@@ -100,7 +100,7 @@ fn drive_feature_activation_never_creates_authority_and_schemas_hide_revisions()
         let (meta, _) = definition();
         assert_eq!(name, meta.name);
         let schema = meta.input_schema.to_string();
-        assert!(!schema.contains("expected_revision"), "{name}");
+        assert!(!schema.contains("expected_mutation_id"), "{name}");
         assert!(!schema.contains("grant_id"), "{name}");
     }
     assert_eq!(feature.descriptor().instructions.len(), 1);
@@ -139,7 +139,7 @@ async fn foreign_or_unobserved_entry_cannot_dispatch_mutation() {
 }
 
 #[tokio::test]
-async fn stale_edit_returns_conflict_without_upgrading_revision_or_dispatching_write() {
+async fn stale_edit_returns_conflict_without_upgrading_last_mutation_id_or_dispatching_write() {
     let old = entry("2", "1");
     let current = entry("2", "2");
     let client = Client::new(vec![response(DriveReadTextResponse {
@@ -157,7 +157,10 @@ async fn stale_edit_returns_conflict_without_upgrading_revision_or_dispatching_w
     .await;
     assert!(matches!(result, Err(DriveError::Conflict)));
     assert_eq!(client.requests.lock().unwrap().len(), 1);
-    assert_eq!(feature.observed(&old.entry, None).unwrap().revision, "1");
+    assert_eq!(
+        feature.observed(&old.entry, None).unwrap().last_mutation_id,
+        "1"
+    );
 }
 
 #[tokio::test]
@@ -192,8 +195,8 @@ async fn shared_edit_rules_reject_ambiguous_and_truncated_preimages_without_muta
 }
 
 #[tokio::test]
-async fn successful_mutation_uses_observed_decimal_revision_and_requires_next_explicit_observation()
-{
+async fn successful_mutation_uses_observed_committed_request_id_and_requires_next_explicit_observation()
+ {
     let old = entry("9007199254740993", "9007199254740993");
     let updated = entry("9007199254740993", "9007199254740994");
     let client = Client::new(Vec::new());
@@ -220,7 +223,7 @@ async fn successful_mutation_uses_observed_decimal_revision_and_requires_next_ex
         .unwrap();
     let requests = client.requests.lock().unwrap();
     let body: Value = serde_json::from_str(requests[0].body.as_ref().unwrap()).unwrap();
-    assert_eq!(body["mutation"]["expected_revision"], "9007199254740993");
+    assert_eq!(body["mutation"]["expected_mutation_id"], "9007199254740993");
     assert_eq!(body["mutation"]["id"]["node_id"], "9007199254740993");
     drop(requests);
     assert!(feature.observed(&old.entry, None).is_err());
@@ -296,7 +299,7 @@ async fn uncommitted_receipt_snapshot_does_not_turn_unknown_into_failure_or_retr
 
 fn invalid_completions(id: &str) -> Vec<DriveMutationResponse> {
     let mut invalid_entry = entry("2", "2");
-    invalid_entry.revision = "not-a-revision".into();
+    invalid_entry.last_mutation_id = "\ninvalid-request-id".into();
     vec![
         DriveMutationResponse {
             request_id: "another-request".into(),
@@ -340,7 +343,7 @@ async fn invalid_mutation_completion_recovers_from_original_receipt_without_rese
             .await
             .unwrap();
         assert_eq!(output.value["request_id"], id);
-        assert_eq!(output.value["entry"]["metadata"]["revision"], "2");
+        assert_eq!(output.value["entry"]["metadata"]["last_mutation_id"], "2");
         let requests = client.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(
@@ -354,7 +357,7 @@ async fn invalid_mutation_completion_recovers_from_original_receipt_without_rese
         assert!(requests[1].path.ends_with(&format!("/requests/{id}")));
         let body: Value = serde_json::from_str(requests[0].body.as_ref().unwrap()).unwrap();
         assert_eq!(body["request_id"], id);
-        assert_eq!(body["mutation"]["expected_revision"], "1");
+        assert_eq!(body["mutation"]["expected_mutation_id"], "1");
     }
 }
 
@@ -499,7 +502,7 @@ async fn drive_native_entry_is_directly_resolvable_but_never_indexable_and_binds
         !operations
             .iter()
             .flat_map(|op| &op.parameters)
-            .any(|parameter| parameter.name == "expected_revision")
+            .any(|parameter| parameter.name == "expected_mutation_id")
     );
     assert_eq!(client.requests.lock().unwrap().len(), 1);
 }
@@ -556,7 +559,7 @@ fn chunk(bytes: Vec<u8>) -> crate::worker::WorkspaceBinaryResponse {
     }
 }
 #[tokio::test]
-async fn multi_chunk_image_uses_one_revision_and_never_exposes_binary_in_text_content() {
+async fn multi_chunk_image_uses_one_last_mutation_id_and_never_exposes_binary_in_text_content() {
     let mut metadata = entry("2", "9007199254740993");
     let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
     bytes.resize(DRIVE_CHUNK_MAX_BYTES as usize + 13, 42);
@@ -578,7 +581,11 @@ async fn multi_chunk_image_uses_one_revision_and_never_exposes_binary_in_text_co
     let requests = client.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     for request in &*requests {
-        assert!(request.path.contains("expected_revision=9007199254740993"));
+        assert!(
+            request
+                .path
+                .contains("expected_mutation_id=9007199254740993")
+        );
         assert_eq!(request.max_response_bytes, DRIVE_CHUNK_MAX_BYTES as usize);
     }
     assert!(requests[0].path.split('&').any(|pair| pair == "offset=0"));
@@ -590,7 +597,7 @@ async fn multi_chunk_image_uses_one_revision_and_never_exposes_binary_in_text_co
     );
 }
 #[tokio::test]
-async fn expired_revision_or_partial_chunk_aborts_image_without_rebinding_or_retrying() {
+async fn expired_last_mutation_id_or_partial_chunk_aborts_image_without_rebinding_or_retrying() {
     for next in [
         crate::worker::WorkspaceBinaryResponse {
             status: 409,
@@ -618,12 +625,12 @@ async fn expired_revision_or_partial_chunk_aborts_image_without_rebinding_or_ret
         assert!(
             requests
                 .iter()
-                .all(|request| request.path.contains("expected_revision=3&"))
+                .all(|request| request.path.contains("expected_mutation_id=3&"))
         );
         assert_eq!(
             client.json.requests.lock().unwrap().len(),
             1,
-            "must not fetch a new revision"
+            "must not fetch a new last_mutation_id"
         );
     }
 }
@@ -642,7 +649,7 @@ async fn oversized_images_and_unknown_arguments_fail_before_binary_transfer() {
         execute(
             &feature,
             "DriveRead",
-            json!({"entry":metadata.entry,"expected_revision":"1"})
+            json!({"entry":metadata.entry,"expected_mutation_id":"1"})
         )
         .await
         .is_err()

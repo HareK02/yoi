@@ -259,7 +259,7 @@ Visual review
 ```
 
 画像をTicketやGitへ大量にcommitしない。artifact pathとsource
-revisionを結び付け、必要なreviewerが同じ条件を再現できるようにする。認証profile、cookie、token、secret、private
+commitを結び付け、必要なreviewerが同じ条件を再現できるようにする。認証profile、cookie、token、secret、private
 response bodyをartifactやhandoffへ含めない。
 
 ## Toolの位置付け

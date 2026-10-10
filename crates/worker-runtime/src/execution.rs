@@ -693,7 +693,7 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
     }
 
     /// Observe a newer immutable Workspace Prompt projection. Profile-backed
-    /// execution uses this as a revision notification; other backends may
+    /// execution uses this as a content projection notification; other backends may
     /// safely ignore it.
     fn observe_workspace_prompt_projection(
         &self,

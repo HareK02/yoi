@@ -46,7 +46,7 @@ export type CaptureOptions = {
   headed?: boolean;
 };
 
-type SourceState = { revision: string | null; dirty: boolean | null };
+type SourceState = { commitSha: string | null; dirty: boolean | null };
 type ErrorCollector = { errors: CaptureError[]; observed: number; limit: number };
 
 const CAPTURE_ERROR_LIMIT = 100;
@@ -88,18 +88,18 @@ function timestampId(): string {
 
 async function sourceState(): Promise<SourceState> {
   try {
-    const [revision, status] = await Promise.all([
+    const [commit, status] = await Promise.all([
       new Deno.Command("git", { args: ["rev-parse", "HEAD"], stdout: "piped", stderr: "null" })
         .output(),
       new Deno.Command("git", { args: ["status", "--porcelain"], stdout: "piped", stderr: "null" })
         .output(),
     ]);
     return {
-      revision: revision.success ? new TextDecoder().decode(revision.stdout).trim() : null,
+      commitSha: commit.success ? new TextDecoder().decode(commit.stdout).trim() : null,
       dirty: status.success ? new TextDecoder().decode(status.stdout).trim().length > 0 : null,
     };
   } catch {
-    return { revision: null, dirty: null };
+    return { commitSha: null, dirty: null };
   }
 }
 

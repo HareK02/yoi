@@ -25,14 +25,13 @@
   let mounted = false;
   let busy = $state(false);
   let workingChanges = $state<ConfigTreeChange[]>([]);
-  let baseRevision = $state(0);
   let baseDigest = $state("");
   let renamePath = $state("");
   let baseSnapshot = $state.raw<WorkspaceConfigTreeResponse["snapshot"] | null>(null);
   let conflict = $state(false);
   let toolchain = $state.raw<ConfigSourceToolchain | null>(null);
   let analysisReady = $state(false);
-  let analysisGeneration = 0;
+  let analysisRequest: AbortController | null = null;
 
   const paths = $derived(
     treeState ? Object.keys(treeState.snapshot.entries).toSorted() : [],
@@ -48,6 +47,7 @@
     void reload();
     return () => {
       mounted = false;
+      analysisRequest?.abort();
       toolchain?.close();
     };
   });
@@ -57,20 +57,23 @@
     const path = selectedPath;
     const value = source;
     const ready = analysisReady;
-    const generation = ++analysisGeneration;
+    const digest = treeState?.snapshot.digest;
+    analysisRequest?.abort();
+    const request = new AbortController();
+    analysisRequest = request;
     diagnostics = [];
     if (!analyzer || !path || !ready) return;
 
     const timer = setTimeout(() => {
       void analyzer.analyze(path, value).then((result) => {
-        if (generation === analysisGeneration) diagnostics = result;
+        if (!request.signal.aborted) diagnostics = result.filter((diagnostic) => diagnostic.tree_digest === digest);
       }).catch((error) => {
-        if (generation === analysisGeneration) status = `Analyze failed: ${String(error)}`;
+        if (!request.signal.aborted) status = `Analyze failed: ${String(error)}`;
       });
     }, 250);
     return () => {
       clearTimeout(timer);
-      if (generation === analysisGeneration) analysisGeneration += 1;
+      request.abort();
     };
   });
 
@@ -78,7 +81,7 @@
     loadState = "loading";
     status = "Loading source tree…";
     analysisReady = false;
-    analysisGeneration += 1;
+    analysisRequest?.abort();
     try {
       const remote = await fetchConfigTree(workspaceId);
       if (!mounted) return;
@@ -94,14 +97,13 @@
       }
       source = selectedPath ? treeState.snapshot.entries[selectedPath].content : "";
       baseSnapshot = $state.snapshot(treeState.snapshot);
-      baseRevision = treeState.snapshot.revision;
       baseDigest = treeState.snapshot.digest;
       analysisReady = true;
       workingChanges = [];
       renamePath = selectedPath;
       diagnostics = [];
       conflict = false;
-      status = `Revision ${treeState.snapshot.revision} · ${treeState.snapshot.digest.slice(0, 20)}…`;
+      status = `Tree digest ${treeState.snapshot.digest.slice(0, 20)}…`;
       loadState = "ready";
     } catch (error) {
       if (!mounted) return;
@@ -197,7 +199,7 @@
 
   function recordCommitError(error: unknown) {
     const message = String(error);
-    conflict = message.includes("conflict") || message.includes("base revision/digest mismatch");
+    conflict = message.includes("conflict") || message.includes("base content digest mismatch");
     status = conflict ? `${message} Reload the authoritative tree before editing again.` : message;
   }
 
@@ -211,7 +213,6 @@
         return;
       }
       treeState = await commitConfigTree(workspaceId, {
-        base_revision: baseRevision,
         base_digest: baseDigest,
         changes: workingChanges,
         entrypoints: entrypoints(),
@@ -219,12 +220,11 @@
       workingChanges = [];
       conflict = false;
       baseSnapshot = $state.snapshot(treeState.snapshot);
-      baseRevision = treeState.snapshot.revision;
       baseDigest = treeState.snapshot.digest;
       await toolchain?.setSnapshot(treeState.snapshot, treeState.contract.schema_bundle);
       source = treeState.snapshot.entries[selectedPath]?.content ?? "";
       diagnostics = [];
-      status = `Committed formatted revision ${treeState.snapshot.revision}.`;
+      status = `Committed formatted source tree · ${treeState.snapshot.digest.slice(0, 20)}…`;
     } catch (error) {
       recordCommitError(error);
     } finally {
@@ -241,7 +241,6 @@
     const localChanges = [...workingChanges];
     const remote = await fetchConfigTree(workspaceId);
     baseSnapshot = structuredClone(remote.snapshot);
-    baseRevision = remote.snapshot.revision;
     baseDigest = remote.snapshot.digest;
     await toolchain.setSnapshot(remote.snapshot, remote.contract.schema_bundle);
     try {
@@ -251,10 +250,10 @@
       selectedPath = candidate.entries[selectedPath] ? selectedPath : Object.keys(candidate.entries).toSorted()[0] ?? "";
       source = selectedPath ? candidate.entries[selectedPath].content : "";
       conflict = false;
-      status = "Local changes reapplied to the latest revision. Commit to persist them.";
+      status = "Local changes reapplied to the latest source tree. Commit to persist them.";
     } catch (error) {
       conflict = true;
-      status = `Local changes conflict with the latest revision: ${String(error)}. Discard local changes or resolve against a fresh reload.`;
+      status = `Local changes conflict with the latest source tree: ${String(error)}. Discard local changes or resolve against a fresh reload.`;
     }
   }
 

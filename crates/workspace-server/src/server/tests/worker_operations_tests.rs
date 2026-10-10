@@ -184,7 +184,6 @@ async fn handle_resolution_rejects_unknown_foreign_and_internal_only_workers() {
             &source.worker_ref,
             protocol::Event::InternalWorker {
                 worker: internal.clone(),
-                revision: 1,
                 event: Box::new(protocol::Event::WorkerState {
                     snapshot: protocol::WorkerStateSnapshot::initial(),
                 }),
@@ -522,7 +521,6 @@ async fn browser_protocol_sender_rejects_job_input_and_all_live_methods() {
     let request = BackendJobRequest {
         job_id: "worker-operation-read-only-job".into(),
         purpose: "operation_boundary_test".into(),
-        input_revision: "revision-1".into(),
         input_ref: "test://worker-operation/input".into(),
         input: serde_json::json!({"immutable": true}),
         instruction: "Return a structured result.".into(),
@@ -755,7 +753,6 @@ async fn generic_management_aliases_cannot_bypass_worker_grants_or_target_bound_
             TEST_WORKSPACE_ID.into(),
             "offline-runtime".into(),
             ExecuteRuntimeCleanupRequest {
-                expected_plan_revision: "irrelevant".into(),
                 expected_plan_digest: "irrelevant".into(),
                 worker_target_ids: Vec::new(),
                 workdir_target_ids: Vec::new(),
@@ -875,7 +872,6 @@ async fn browser_protocol_connection_and_cleanup_reject_cookie_origin_mismatch()
         &api,
         EMBEDDED_WORKER_RUNTIME_ID,
         ExecuteRuntimeCleanupRequest {
-            expected_plan_revision: "irrelevant".into(),
             expected_plan_digest: "irrelevant".into(),
             worker_target_ids: Vec::new(),
             workdir_target_ids: Vec::new(),
@@ -1112,7 +1108,7 @@ async fn restore_guard_stale_ssh_intent_does_not_issue_workspace_resource() {
                 hostname: "example.invalid".into(),
                 port: 22,
                 host_key: public_key,
-                expected_revision: None,
+                expected_fingerprint: None,
             },
             "owner-account",
         )
@@ -1642,7 +1638,7 @@ async fn restore_guard_cross_runtime_ssh_completion_retries_pinned_snapshot_at_w
                 hostname: "example.invalid".into(),
                 port: 22,
                 host_key: public_key,
-                expected_revision: None,
+                expected_fingerprint: None,
             },
             "owner-account",
         )
@@ -1678,7 +1674,7 @@ async fn restore_guard_cross_runtime_ssh_completion_retries_pinned_snapshot_at_w
     );
     assert_ne!(first.materialization.runtime_id, identity.runtime_id);
     // Rotate current host trust while the accepted operation is uncertain. Its
-    // original credential/trust revisions, source and binding must remain pinned.
+    // original credential/trust fingerprints, source and binding must remain pinned.
     let alternate = api
         .repository_secrets
         .generate_credential(
@@ -1697,12 +1693,13 @@ async fn restore_guard_cross_runtime_ssh_completion_retries_pinned_snapshot_at_w
         .unwrap()
         .unwrap()
         .public_key;
-    let original_trust_revision = first
+    let original_trust_fingerprint = first
         .materialization
         .ssh
         .as_ref()
         .unwrap()
-        .host_trust_revision;
+        .host_key_fingerprint
+        .clone();
     api.repository_secrets
         .put_host_trust(
             api.workspace_id(),
@@ -1712,7 +1709,7 @@ async fn restore_guard_cross_runtime_ssh_completion_retries_pinned_snapshot_at_w
                 hostname: "example.invalid".into(),
                 port: 22,
                 host_key: alternate_public,
-                expected_revision: Some(original_trust_revision),
+                expected_fingerprint: Some(original_trust_fingerprint),
             },
             "owner-account",
         )

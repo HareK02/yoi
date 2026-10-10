@@ -31,7 +31,7 @@ pub(super) fn active_grant(
         || attempt.state != BackendJobAttemptState::Dispatched
         || attempt.worker.as_ref() != Some(worker)
         || job.current_attempt != attempt.attempt
-        || attempt.input_revision != job.request.input_revision
+        || attempt.input_digest != job.request.input_digest()?
         || chrono::DateTime::parse_from_rfc3339(&attempt.deadline_at)
             .map_err(|e| Error::Store(format!("invalid Job deadline: {e}")))?
             <= Utc::now()
@@ -161,7 +161,7 @@ pub(super) fn dispatch(
     total_bytes: u64,
 ) -> ApiResult<MemoryConsolidationOutput> {
     let store = open_subjektiv_store(api)?;
-    let subject = store
+    store
         .subject(subject_id)
         .map_err(subjektiv_store_error)?
         .ok_or_else(|| Error::SubjektivSubjectNotFound(subject_id.into()))?;
@@ -177,7 +177,6 @@ pub(super) fn dispatch(
     let request = BackendJobRequest {
         job_id: format!("subjektiv-consolidation:{}", Uuid::new_v4()),
         purpose: PURPOSE.into(),
-        input_revision: subject.store_revision.to_string(),
         input_ref: format!("subjektiv://{subject_id}/consolidation"),
         input: serde_json::json!({"subject_id": subject_id, "candidate_ids": candidate_ids}),
         instruction: "Resolve ONLY the immutable candidate_ids batch using MemoryStagingList/Read, confirmed Memory reads and MemoryApplyCandidate. Already resolved candidates are retained receipts, not work to repeat. Leave newly arriving candidates to a subsequent Job. When every batch candidate has a durable disposition, call SubmitBackendJobResult with {subject_id, candidate_ids}; its Host capability awaits bounded clean-context surface generation and adds the actual surface outcome before submission. Final prose is not completion.".into(),

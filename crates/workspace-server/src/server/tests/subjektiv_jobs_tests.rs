@@ -1,6 +1,6 @@
 use super::*;
 use crate::subjektiv::{
-    CandidateDecision, CandidateDecisionRequest, MemoryDraft, MemoryRevisionTarget, SubjectRole,
+    CandidateDecision, CandidateDecisionRequest, MemoryChangeTarget, MemoryDraft, SubjectRole,
     SubjectStagingRecord, SurfaceAvailability,
 };
 use memory::extract::{CandidateKind, ExtractedCandidate, StagingEvidence, StagingRecord};
@@ -16,7 +16,7 @@ fn stage(store: &crate::subjektiv::SubjektivStore, subject: &str, id: &str) {
         worker_id: None,
         flow_selector: None,
         flow_definition_id: None,
-        flow_definition_revision: None,
+        flow_definition_fingerprint: None,
     };
     let record = StagingRecord::from_candidate(
         id,
@@ -173,7 +173,7 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
         candidate_id: "candidate-first".into(),
         reason: "retain the learned constraint".into(),
         decision: CandidateDecision::Apply {
-            target: MemoryRevisionTarget::Create,
+            target: MemoryChangeTarget::Create,
             draft: MemoryDraft::active(
                 CandidateKind::Constraint,
                 "Keep committed memory",
@@ -191,7 +191,7 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
         receipt.memory.as_ref().unwrap().id,
         replay.memory.as_ref().unwrap().id
     );
-    assert_eq!(receipt.store_revision, replay.store_revision);
+    assert_eq!(receipt.memory_fingerprint, replay.memory_fingerprint);
     let generation = store
         .prepare_job_surface_generation(
             &subject.id,
@@ -211,13 +211,13 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
     .await
     .unwrap();
     assert!(
-        matches!(failed, server_api::SubjektivMemoryBackendResponse::SurfaceFailed(output) if output.status == "failed_confirmed" && output.store_revision == generation.store_revision)
+        matches!(failed, server_api::SubjektivMemoryBackendResponse::SurfaceFailed(output) if output.status == "failed_confirmed" && output.memory_fingerprint == generation.memory_fingerprint)
     );
-    let result = serde_json::json!({"subject_id": subject.id, "candidate_ids": ["candidate-first"], "surface": {"availability":"failed", "generation_id":generation.id, "store_revision":generation.store_revision,"reason_code":"editor_failed"}});
+    let result = serde_json::json!({"subject_id": subject.id, "candidate_ids": ["candidate-first"], "surface": {"availability":"failed", "generation_id":generation.id, "memory_fingerprint":generation.memory_fingerprint,"reason_code":"editor_failed"}});
     let submission = BackendJobResultSubmission {
         job_id: job.request.job_id.clone(),
         attempt_id: attempt.attempt_id.clone(),
-        input_revision: job.request.input_revision.clone(),
+        input_digest: job.request.input_digest().unwrap(),
         result,
     };
     assert!(
@@ -359,8 +359,8 @@ async fn subjektiv_job_surface_only_requires_attempt_owned_generation_and_real_o
     let submission = BackendJobResultSubmission {
         job_id: job.request.job_id.clone(),
         attempt_id: attempt.attempt_id.clone(),
-        input_revision: job.request.input_revision.clone(),
-        result: serde_json::json!({"subject_id":subject.id,"candidate_ids":[],"surface":{"availability":"ready","generation_id":generation.id,"store_revision":generation.store_revision,"snapshot_id":snapshot.id}}),
+        input_digest: job.request.input_digest().unwrap(),
+        result: serde_json::json!({"subject_id":subject.id,"candidate_ids":[],"surface":{"availability":"ready","generation_id":generation.id,"memory_fingerprint":generation.memory_fingerprint,"snapshot_id":snapshot.id}}),
     };
     api.accept_backend_job_result(worker, &submission).unwrap();
     wait_for_backend_job_worker_cleanup(
@@ -395,7 +395,6 @@ async fn backend_job_profile_resolution_rejects_ungranted_requirements_without_f
     let mut request = BackendJobRequest {
         job_id: "profile-resolution".into(),
         purpose: "any-purpose".into(),
-        input_revision: "1".into(),
         input_ref: "test://profiles".into(),
         input: serde_json::json!({}),
         instruction: "return structured result".into(),
@@ -450,7 +449,7 @@ async fn backend_job_project_recipe_is_resolved_and_delivered_without_system_ove
     let entrypoint = state.contract.entrypoints.first().unwrap();
     let root = state.snapshot.entries.get(entrypoint).unwrap();
     let config = config_commit_request_from_api(server_api::ConfigCommitRequest {
-        base_revision: state.snapshot.revision, base_digest: state.snapshot.digest.clone(),
+        base_digest: state.snapshot.digest.clone(),
         entrypoints: state.contract.entrypoints.iter().map(|p| p.as_str().into()).collect(),
         changes: vec![server_api::ConfigTreeChange::Update {
             path: entrypoint.as_str().into(), expected_digest: root.content_digest.clone(),
@@ -464,7 +463,6 @@ async fn backend_job_project_recipe_is_resolved_and_delivered_without_system_ove
     let request = BackendJobRequest {
         job_id: "project-recipe-job".into(),
         purpose: "no-profile-switch".into(),
-        input_revision: "r1".into(),
         input_ref: "test://recipe".into(),
         input: serde_json::json!({}),
         instruction: "Submit the result".into(),
@@ -671,8 +669,8 @@ async fn subjektiv_job_long_receipts_and_escaped_ids_fit_result_budget_without_l
     let submission = BackendJobResultSubmission {
         job_id: job.request.job_id.clone(),
         attempt_id: attempt.attempt_id.clone(),
-        input_revision: job.request.input_revision.clone(),
-        result: serde_json::json!({"subject_id":subject.id,"candidate_ids":ids,"surface":{"availability":"ready","generation_id":generation.id,"store_revision":generation.store_revision,"snapshot_id":snapshot.id}}),
+        input_digest: job.request.input_digest().unwrap(),
+        result: serde_json::json!({"subject_id":subject.id,"candidate_ids":ids,"surface":{"availability":"ready","generation_id":generation.id,"memory_fingerprint":generation.memory_fingerprint,"snapshot_id":snapshot.id}}),
     };
     seed_worker_session_for_cleanup(dir.path(), worker);
     let accepted = api.accept_backend_job_result(worker, &submission).unwrap();

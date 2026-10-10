@@ -82,9 +82,6 @@ pub struct WorkspaceConfigNode {
 pub struct WorkspaceConfigObserveResponse {
     pub connection_id: String,
     pub validator: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub revision: u64,
     pub digest: String,
     /// Canonical commit entrypoints from this exact metadata snapshot.
     pub entrypoints: Vec<String>,
@@ -121,9 +118,6 @@ pub struct WorkspaceConfigCommitRequest {
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceConfigCommitResponse {
     pub validator: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub revision: u64,
     pub digest: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -178,11 +172,11 @@ mod tests {
 
     #[test]
     fn workspace_config_observation_is_metadata_only_and_has_same_snapshot_cas_inputs() {
-        let value = serde_json::json!({"connection_id":"c", "validator":"v", "revision":7, "digest":"d", "entrypoints":["main.dcdl"], "nodes":[{"path":"", "kind":"directory", "validator":"v", "digest":null, "content_type":null, "operations":["apply_changes"]}]});
+        let value = serde_json::json!({"connection_id":"c", "validator":"v", "digest":"d", "entrypoints":["main.dcdl"], "nodes":[{"path":"", "kind":"directory", "validator":"v", "digest":null, "content_type":null, "operations":["apply_changes"]}]});
         let response: WorkspaceConfigObserveResponse =
             serde_json::from_value(value.clone()).unwrap();
         assert_eq!(serde_json::to_value(response).unwrap(), value);
-        for field in ["revision", "digest", "entrypoints"] {
+        for field in ["validator", "digest", "entrypoints"] {
             let mut missing = value.clone();
             missing.as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<WorkspaceConfigObserveResponse>(missing).is_err());
@@ -206,6 +200,19 @@ mod tests {
             serde_json::to_value(WorkspaceConfigCurrentResponse(None)).unwrap(),
             serde_json::Value::Null
         );
+    }
+
+    #[test]
+    fn workspace_config_commit_response_is_content_based() {
+        let value = serde_json::json!({"validator":"v", "digest":"d"});
+        let response: WorkspaceConfigCommitResponse =
+            serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(), value);
+        for field in ["validator", "digest"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<WorkspaceConfigCommitResponse>(missing).is_err());
+        }
     }
 
     #[test]

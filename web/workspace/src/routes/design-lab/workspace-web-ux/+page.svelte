@@ -228,7 +228,7 @@
     <details class="disclosure">
       <summary>Technical details</summary>
       <dl class="technical-values">
-        <div><dt>Revision</dt><dd><code>rev_01J8WZ7C8AV6P3Y2N0M4KQ9B1F</code></dd></div>
+        <div><dt>Observed</dt><dd><time datetime="2026-10-09T14:32:00Z">2026-10-09 14:32 UTC</time></dd></div>
         <BevelLine as="div" direction="x" length="100%" decorative />
         <div><dt>Digest</dt><dd><code>sha256:2f8d9bb168afb7b19f447463f3fbe8b4728d8e87a64eaf1afbea1ca4d4c41f21</code></dd></div>
       </dl>

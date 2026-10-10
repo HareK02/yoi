@@ -972,7 +972,7 @@ impl WorkerAuditBase {
     ) -> Self {
         self.memory_settings = settings.map(|snapshot| memory::audit::MemorySettingsAudit {
             workspace_id: snapshot.workspace_id.clone(),
-            settings_revision: snapshot.settings_revision,
+
             language: snapshot.language.clone(),
         });
         self
@@ -1292,7 +1292,7 @@ permission = "write"
         config
             .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "workspace-1".to_string(),
-                settings_revision: 1,
+
                 language: "English".to_string(),
             })
             .unwrap();
@@ -1365,7 +1365,7 @@ permission = "write"
             .start_run_committed(HookInvocationContext {
                 worker_id: "worker-1".to_string(),
                 session_id: "session-1".to_string(),
-                session_revision: 1,
+
                 run_id: Some("run-1".to_string()),
                 ..Default::default()
             })
@@ -1456,7 +1456,7 @@ permission = "write"
         config
             .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "workspace-1".to_string(),
-                settings_revision: 1,
+
                 language: "English".to_string(),
             })
             .unwrap();
@@ -2002,7 +2002,7 @@ permission = "write"
         CommittedSessionCapture {
             session_id: "session-1".to_string(),
             segment_id: "segment-1".to_string(),
-            session_revision: history_len.try_into().unwrap(),
+
             entry_count: history_len,
             run_exit: CommittedRunExit::Finished,
             history: (0..history_len)

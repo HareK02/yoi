@@ -1489,7 +1489,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         for (field, value) in [
             ("workspace_id", serde_json::json!("workspace-a")),
-            ("settings_revision", serde_json::json!(2)),
             ("language", serde_json::json!("Japanese")),
         ] {
             let artifact = serde_json::json!({

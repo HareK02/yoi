@@ -20,7 +20,7 @@ fn create(parent: NodeId, name: &str) -> Mutation {
 fn migration_enforces_workspace_parent_and_unique_names() {
     let t = tempfile::tempdir().unwrap();
     let d = fixture(&t);
-    assert_eq!(d.database.schema_version().unwrap(), 1);
+    assert_eq!(d.database.schema_version().unwrap(), 2);
     let root = d.root().unwrap();
     d.mutate("a", "actor", create(root.id, "a")).unwrap();
     assert!(matches!(
@@ -28,7 +28,7 @@ fn migration_enforces_workspace_parent_and_unique_names() {
         Err(Error::Conflict)
     ));
     let result=d.database.try_transaction::<_,Error>(|tx| {
-        tx.execute("INSERT INTO drive_nodes(workspace_id,parent_id,name,kind,revision,size,updated_by,updated_at_ms)
+        tx.execute("INSERT INTO drive_nodes(workspace_id,parent_id,name,kind,last_mutation_id,size,updated_by,updated_at_ms)
             VALUES ('other',?1,'bad','directory',1,0,'actor',0)",[root.id.0])?;
         Ok(())
     });
@@ -66,7 +66,7 @@ fn saved_blob_before_metadata_failure_is_not_published_and_restart_collects_it()
         .mutate("failed", "actor", create(root.id, "failed"))
         .unwrap();
     assert_eq!(
-        d.read(result.node.id, result.node.revision, 0, 100)
+        d.read(result.node.id, &result.node.last_mutation_id, 0, 100)
             .unwrap()
             .bytes,
         b"persisted"
@@ -117,10 +117,11 @@ fn collection_cannot_remove_in_flight_upload_or_selected_read() {
         .node;
     let go = Arc::new(std::sync::Barrier::new(2));
     let g = go.clone();
+    let selected = first.clone();
     let reader = std::thread::spawn(move || {
         g.wait();
         for _ in 0..20 {
-            match other.read(first.id, first.revision, 0, 100) {
+            match other.read(selected.id, &selected.last_mutation_id, 0, 100) {
                 Ok(chunk) => assert_eq!(chunk.bytes, b"persisted"),
                 Err(Error::Conflict) => {}
                 e => panic!("unexpected selected read outcome: {e:?}"),
@@ -137,7 +138,7 @@ fn collection_cannot_remove_in_flight_upload_or_selected_read() {
                 "actor",
                 Mutation::Update {
                     id: current.id,
-                    expected_revision: current.revision,
+                    expected_mutation_id: current.last_mutation_id.clone(),
                     content_type: "text/plain".into(),
                     bytes: vec![i; 1024],
                 },
@@ -149,7 +150,9 @@ fn collection_cannot_remove_in_flight_upload_or_selected_read() {
     d.collect(None, 200).unwrap();
     assert_eq!(d.blobs.list(None, 200).unwrap().len(), 1);
     assert_eq!(
-        d.read(current.id, current.revision, 0, 1024).unwrap().bytes,
+        d.read(current.id, &current.last_mutation_id, 0, 1024)
+            .unwrap()
+            .bytes,
         vec![19; 1024]
     );
 }
@@ -191,7 +194,7 @@ fn attached_server_authority_serializes_deletion_with_cached_drive_mutations() {
         Err(Error::Fenced)
     ));
     assert!(matches!(
-        d.read(child.id, child.revision, 0, 100),
+        d.read(child.id, &child.last_mutation_id, 0, 100),
         Err(Error::Fenced)
     ));
     assert!(matches!(d.collect(None, 10), Err(Error::Fenced)));
@@ -228,7 +231,7 @@ fn restarted_collection_removes_crashed_staging_without_removing_referenced_hard
     let d = fixture(&t);
     assert_eq!(d.collect(None, 200).unwrap().removed, 2);
     assert_eq!(
-        d.read(n.id, n.revision, 0, 100).unwrap().bytes,
+        d.read(n.id, &n.last_mutation_id, 0, 100).unwrap().bytes,
         b"persisted"
     );
     assert_eq!(std::fs::read_dir(blobs).unwrap().count(), 1);
@@ -257,7 +260,7 @@ fn interrupted_full_permission_and_sync_failed_uploads_do_not_publish_metadata_o
         );
         let mutation = Mutation::Update {
             id: original.id,
-            expected_revision: original.revision,
+            expected_mutation_id: original.last_mutation_id.clone(),
             content_type: "text/plain".into(),
             bytes: b"failed replacement".to_vec(),
         };
@@ -281,7 +284,7 @@ fn interrupted_full_permission_and_sync_failed_uploads_do_not_publish_metadata_o
         d.blobs = Arc::new(blob::BlobStore::open(&t.path().join("blobs")).unwrap());
         d.collect(None, 200).unwrap();
         assert_eq!(
-            d.read(original.id, original.revision, 0, 100)
+            d.read(original.id, &original.last_mutation_id, 0, 100)
                 .unwrap()
                 .bytes,
             b"persisted"
@@ -292,7 +295,7 @@ fn interrupted_full_permission_and_sync_failed_uploads_do_not_publish_metadata_o
         );
         let replaced = d.mutate("failed", "actor", mutation).unwrap().node;
         assert_eq!(
-            d.read(replaced.id, replaced.revision, 0, 100)
+            d.read(replaced.id, &replaced.last_mutation_id, 0, 100)
                 .unwrap()
                 .bytes,
             b"failed replacement"
@@ -360,12 +363,12 @@ fn bound_authorizer_checks_every_read_write_and_receipt_replay_without_caching()
     assert!(bound.search("file", true, None, 10).is_ok());
     assert!(
         bound
-            .read(result.node.id, result.node.revision, 0, 100)
+            .read(result.node.id, &result.node.last_mutation_id, 0, 100)
             .is_ok()
     );
     assert!(
         bound
-            .read_text(result.node.id, result.node.revision, 0, 100)
+            .read_text(result.node.id, &result.node.last_mutation_id, 0, 100)
             .is_ok()
     );
     assert!(bound.request_status("request").is_ok());
@@ -388,11 +391,11 @@ fn bound_authorizer_checks_every_read_write_and_receipt_replay_without_caching()
         Err(Error::Denied)
     ));
     assert!(matches!(
-        clone.read(result.node.id, result.node.revision, 0, 100),
+        clone.read(result.node.id, &result.node.last_mutation_id, 0, 100),
         Err(Error::Denied)
     ));
     assert!(matches!(
-        clone.read_text(result.node.id, result.node.revision, 0, 100),
+        clone.read_text(result.node.id, &result.node.last_mutation_id, 0, 100),
         Err(Error::Denied)
     ));
     assert!(matches!(

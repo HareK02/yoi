@@ -93,9 +93,9 @@ async function download(
   entry: DriveEntry,
 ): Promise<Uint8Array> {
   const response = await fetchFn(
-    driveDownloadUrl(ws, entry.entry, entry.revision),
+    driveDownloadUrl(ws, entry.entry, entry.last_mutation_id),
   );
-  assert(response.status === 200, "download must succeed at exact revision");
+  assert(response.status === 200, "download must succeed at exact last_mutation_id");
   equal(
     response.headers.get("x-content-type-options"),
     "nosniff",
@@ -203,7 +203,7 @@ equal(
 const updated = await saved(owner, ws, "web-edit", {
   operation: "update_text",
   id: markdown.entry,
-  expected_revision: markdown.revision,
+  expected_mutation_id: markdown.last_mutation_id,
   text: "# 更新\n",
   content_type: "text/markdown",
 });
@@ -274,7 +274,7 @@ const binaryUpdated = await owner.upload(
   {
     operation: "update",
     id: empty.entry,
-    expected_revision: empty.revision,
+    expected_mutation_id: empty.last_mutation_id,
     content_type: "image/png",
   },
 );
@@ -313,12 +313,12 @@ equal(
   "paged traversal must contain each file once",
 );
 
-// Two authenticated accounts read the same revision, then race real HTTP writes.
+// Two authenticated accounts read the same last_mutation_id, then race real HTTP writes.
 const secondRead = await second.readText(ws, updated.entry);
 equal(
-  secondRead.entry.revision,
-  updated.revision,
-  "second actor must observe same revision",
+  secondRead.entry.last_mutation_id,
+  updated.last_mutation_id,
+  "second actor must observe same last_mutation_id",
 );
 const drafts = ["# actor A draft\n", "# actor B draft\n"];
 const race = await Promise.allSettled(
@@ -326,7 +326,7 @@ const race = await Promise.allSettled(
     saved(client, ws, `web-race-${index}`, {
       operation: "update_text",
       id: updated.entry,
-      expected_revision: updated.revision,
+      expected_mutation_id: updated.last_mutation_id,
       text: drafts[index],
       content_type: "text/markdown",
     })
@@ -335,7 +335,7 @@ const race = await Promise.allSettled(
 equal(
   race.filter((result) => result.status === "fulfilled").length,
   1,
-  "same-revision two-actor CAS must have exactly one winner",
+  "same-last_mutation_id two-actor CAS must have exactly one winner",
 );
 const loser = race.find((result) => result.status === "rejected");
 assert(
@@ -358,14 +358,14 @@ const stableUrl = markdown.latest_url;
 const renamed = await saved(owner, ws, "web-rename", {
   operation: "relocate",
   id: latest.entry.entry,
-  expected_revision: latest.entry.revision,
+  expected_mutation_id: latest.entry.last_mutation_id,
   parent: folder.entry,
   name: "改名.md",
 });
 const moved = await saved(owner, ws, "web-move", {
   operation: "relocate",
   id: renamed.entry,
-  expected_revision: renamed.revision,
+  expected_mutation_id: renamed.last_mutation_id,
   parent: root.entry,
   name: renamed.name,
 });
@@ -397,7 +397,7 @@ await rejected(
 const deleted = await owner.mutate(ws, "web-delete", {
   operation: "delete",
   id: moved.entry,
-  expected_revision: moved.revision,
+  expected_mutation_id: moved.last_mutation_id,
 });
 equal(deleted.entry, null, "delete must remove live metadata");
 await rejected(() => owner.readText(ws, moved.entry), "not_found");

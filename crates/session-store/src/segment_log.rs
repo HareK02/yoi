@@ -1156,7 +1156,7 @@ mod tests {
             )))],
             extensions: vec![SessionExtension::new(
                 "flow.runtime.v1",
-                serde_json::json!({ "state": "implement", "revision": 0 }),
+                serde_json::json!({ "state": "implement" }),
             )],
         };
         let json = serde_json::to_string(&entry).unwrap();

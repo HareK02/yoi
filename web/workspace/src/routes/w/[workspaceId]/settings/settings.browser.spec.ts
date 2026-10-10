@@ -114,6 +114,10 @@ test("saved settings have no editable form, badges or raw data expanded; each te
   );
   expect(document.querySelectorAll("details[open]")).toHaveLength(0);
   expect(document.querySelector(".badge")).toBeNull();
+  expect(screen.queryByText("Revision", { exact: true })).toBeNull();
+  expect(
+    screen.getByText(identityFixture().public_bundle!.public_key_fingerprint),
+  ).toBeTruthy();
   expect(api.mock.calls).toHaveLength(2);
   expect(api.mock.calls.some(([path]) => String(path).includes("deletion")))
     .toBe(false);
@@ -133,7 +137,7 @@ test("Edit focuses the field; Cancel discards the draft and returns focus withou
   expect(api.mock.calls.every(([, init]) => !init?.method)).toBe(true);
 });
 
-test("save uses the current revision, publishes confirmed name and invalidates the Workspace header", async () => {
+test("save uses the observed update timestamp, publishes confirmed name and invalidates the Workspace header", async () => {
   const api = mockApi();
   mount();
   await fireEvent.input(await openName(), {
@@ -152,15 +156,15 @@ test("save uses the current revision, publishes confirmed name and invalidates t
     )),
   ).toEqual({
     display_name: "Renamed Workspace",
-    revision: metadataFixture().revision,
+    expected_updated_at: metadataFixture().updated_at,
   });
   expect(invalidate).toHaveBeenCalledWith("/api/w/home-owner/workspace");
 });
 
-test("failed save preserves the draft and saved name; Reload saved name recovers from revision conflicts", async () => {
+test("failed save preserves the draft and saved name; Reload saved name recovers from metadata conflicts", async () => {
   mockApi((request) =>
     request.method === "PUT"
-      ? new Response("Revision conflict", { status: 409 })
+      ? new Response("Metadata conflict", { status: 409 })
       : null
   );
   mount();
@@ -168,7 +172,7 @@ test("failed save preserves the draft and saved name; Reload saved name recovers
   await fireEvent.input(input, { target: { value: "Keep draft" } });
   await fireEvent.click(screen.getByRole("button", { name: "Save name" }));
   expect((await screen.findByRole("alert")).textContent).toBe(
-    "Revision conflict",
+    "Metadata conflict",
   );
   expect(input.value).toBe("Keep draft");
   expect(screen.getByText(`Current: ${metadataFixture().display_name}`))
@@ -435,7 +439,7 @@ test("reload resumes persisted deletion without sending another POST", async () 
     "yoi:workspace-deletion:home-owner",
     JSON.stringify({
       operation_id: "op-test",
-      expected_revision: metadataFixture().revision,
+      expected_workspace_updated_at: metadataFixture().updated_at,
       confirmation: metadataFixture().display_name,
     }),
   );
@@ -501,7 +505,7 @@ test("slow identity keeps the name usable and old identity responses cannot leak
 test("a completed deletion request from an unmounted Workspace cannot navigate away from the new scope", async () => {
   const request = {
     operation_id: "op-test",
-    expected_revision: metadataFixture().revision,
+    expected_workspace_updated_at: metadataFixture().updated_at,
     confirmation: metadataFixture().display_name,
   };
   sessionStorage.setItem(

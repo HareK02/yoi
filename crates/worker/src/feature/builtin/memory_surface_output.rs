@@ -64,7 +64,7 @@ impl MemorySurfaceOutputState {
         let allowed = self
             .materials
             .iter()
-            .map(|material| (material.memory_id.as_str(), material.revision))
+            .map(|material| (material.memory_id.as_str(), material.change_id.as_str()))
             .collect::<HashSet<_>>();
         let mut bodies = Vec::with_capacity(points.len());
         for point in points {
@@ -81,16 +81,20 @@ impl MemorySurfaceOutputState {
             }
             let mut point_refs = HashSet::new();
             for reference in &point.memory_refs {
-                if !point_refs.insert((reference.memory_id.as_str(), reference.revision)) {
+                if !point_refs.insert((reference.memory_id.as_str(), reference.change_id.as_str()))
+                {
                     return Err(ToolError::InvalidArgument(format!(
                         "duplicate surface point ref {}@{}",
-                        reference.memory_id, reference.revision
+                        reference.memory_id,
+                        reference.change_id.as_str()
                     )));
                 }
-                if !allowed.contains(&(reference.memory_id.as_str(), reference.revision)) {
+                if !allowed.contains(&(reference.memory_id.as_str(), reference.change_id.as_str()))
+                {
                     return Err(ToolError::InvalidArgument(format!(
                         "surface ref {}@{} is not in the generation materials",
-                        reference.memory_id, reference.revision
+                        reference.memory_id,
+                        reference.change_id.as_str()
                     )));
                 }
             }
@@ -218,7 +222,7 @@ mod tests {
     fn material(id: &str) -> server_api::SubjektivSurfaceMaterial {
         server_api::SubjektivSurfaceMaterial {
             memory_id: id.into(),
-            revision: 1,
+            change_id: "change-1".into(),
             kind: CandidateKind::Constraint,
             body_md: "Keep the boundary.".into(),
             why_useful: "Avoid regression.".into(),
@@ -229,9 +233,9 @@ mod tests {
     fn point(id: &str) -> server_api::SubjektivSurfacePoint {
         server_api::SubjektivSurfacePoint {
             body_md: "- Keep the boundary unless it changes.".into(),
-            memory_refs: vec![server_api::SubjektivMemoryRevisionRef {
+            memory_refs: vec![server_api::SubjektivMemoryChangeRef {
                 memory_id: id.into(),
-                revision: 1,
+                change_id: "change-1".into(),
             }],
         }
     }

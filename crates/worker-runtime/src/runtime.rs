@@ -457,7 +457,7 @@ impl Runtime {
             state
         };
         state.execution_backend = execution_backend;
-        // Initialize legacy generations durably before exposing an observation.
+        // Initialize legacy observation tokens durably before exposing an observation.
         state.persist_workers()?;
         let runtime = Self {
             inner: Arc::new(Mutex::new(state)),
@@ -761,7 +761,7 @@ impl Runtime {
                 .zip(&ssh.credential_candidates)
                 .any(|(secret, metadata)| {
                     secret.credential_id != metadata.credential_id
-                        || secret.credential_revision != metadata.credential_revision
+                        || secret.public_key_fingerprint != metadata.public_key_fingerprint
                 })
         {
             return Err(RuntimeError::InvalidRequest(
@@ -2157,7 +2157,8 @@ impl Runtime {
                     && candidate.pending_stop.is_none()
                     && candidate.restore_guard.active_request_id.is_none();
                 if coordinate && request.preparation.is_none() && !recovering_pending {
-                    if candidate.restore_guard.generation != request.expected_observation_token
+                    if candidate.restore_guard.observation_token
+                        != request.expected_observation_token
                         || candidate.restore_guard.active_request_id.is_some()
                         || candidate.has_pending_lifecycle_operation()
                     {
@@ -2176,7 +2177,7 @@ impl Runtime {
                     ));
                 }
                 state.ensure_running()?;
-                if candidate.restore_guard.generation != request.expected_observation_token
+                if candidate.restore_guard.observation_token != request.expected_observation_token
                     || candidate.restore_guard.active_request_id.is_some()
                     || (candidate.has_pending_lifecycle_operation() && !recovering_pending)
                 {
@@ -2283,7 +2284,7 @@ impl Runtime {
             return worker.restore_guard.owners[id].request.clone();
         }
         runtime_api::WorkerRestoreRequest {
-            expected_observation_token: worker.restore_guard.generation.clone(),
+            expected_observation_token: worker.restore_guard.observation_token.clone(),
             request_id: uuid::Uuid::now_v7().to_string(),
             preparation: worker
                 .workspace_id
@@ -5531,7 +5532,7 @@ impl RuntimeState {
             ProfileSelector::Builtin(name) | ProfileSelector::Named(name) => Some(name.clone()),
         };
         Ok(SubscriptionWorker {
-            restore_observation_token: Some(worker.restore_guard.generation.clone()),
+            restore_observation_token: Some(worker.restore_guard.observation_token.clone()),
             worker_id,
             runtime_id: None,
             resource_key: None,
@@ -5806,7 +5807,6 @@ impl RuntimeState {
             InternalWorkerActivity {
                 status: Some(snapshot.status),
                 parent_session_id: snapshot.worker.parent_session_id.clone(),
-                revision: snapshot.revision,
             },
         );
         for child in &snapshot.internal_workers {
@@ -5854,42 +5854,22 @@ impl RuntimeState {
     fn remove_internal_worker_subtree(
         activity: &mut InternalWorkerActivityProjection,
         worker: &protocol::InternalWorkerRef,
-        revision: u64,
     ) {
-        let known_revision = activity
-            .workers
-            .get(&worker.session_id)
-            .map(|worker| worker.revision)
-            .into_iter()
-            .chain(
-                activity
-                    .removed_workers
-                    .get(&worker.session_id)
-                    .map(|worker| worker.revision),
-            )
-            .max();
-        if known_revision.is_some_and(|known_revision| revision <= known_revision) {
-            return;
-        }
-
         for session_id in Self::internal_worker_subtree_ids(activity, &worker.session_id) {
             let active = activity.workers.remove(&session_id);
             let removed = activity.removed_workers.remove(&session_id);
-            let (worker_revision, parent_session_id) = if session_id == worker.session_id {
-                (revision, worker.parent_session_id.clone())
+            let parent_session_id = if session_id == worker.session_id {
+                worker.parent_session_id.clone()
             } else if let Some(active) = active {
-                (active.revision, active.parent_session_id)
+                active.parent_session_id
             } else if let Some(removed) = removed {
-                (removed.revision, removed.parent_session_id)
+                removed.parent_session_id
             } else {
                 continue;
             };
             activity.removed_workers.insert(
                 session_id,
-                RemovedInternalWorkerActivity {
-                    revision: worker_revision,
-                    parent_session_id,
-                },
+                RemovedInternalWorkerActivity { parent_session_id },
             );
         }
     }
@@ -5897,37 +5877,25 @@ impl RuntimeState {
     fn touch_internal_worker_activity(
         activity: &mut InternalWorkerActivityProjection,
         worker: &protocol::InternalWorkerRef,
-        revision: u64,
     ) {
         activity
             .workers
             .entry(worker.session_id.clone())
-            .and_modify(|activity| {
-                activity.parent_session_id = worker.parent_session_id.clone();
-                activity.revision = revision;
-            })
+            .and_modify(|activity| activity.parent_session_id = worker.parent_session_id.clone())
             .or_insert_with(|| InternalWorkerActivity {
                 status: None,
                 parent_session_id: worker.parent_session_id.clone(),
-                revision,
             });
     }
 
     fn project_internal_worker_event(
         activity: &mut InternalWorkerActivityProjection,
         worker: &protocol::InternalWorkerRef,
-        revision: u64,
         event: &protocol::Event,
     ) {
-        if activity.removed_workers.contains_key(&worker.session_id)
-            || activity
-                .workers
-                .get(&worker.session_id)
-                .is_some_and(|current| revision <= current.revision)
-        {
+        if activity.removed_workers.contains_key(&worker.session_id) {
             return;
         }
-
         match event {
             protocol::Event::Snapshot {
                 state,
@@ -5940,7 +5908,6 @@ impl RuntimeState {
                     InternalWorkerActivity {
                         status: Some(state.catalog_status()),
                         parent_session_id: worker.parent_session_id.clone(),
-                        revision,
                     },
                 );
                 for child in internal_workers {
@@ -5949,23 +5916,16 @@ impl RuntimeState {
             }
             protocol::Event::InternalWorker {
                 worker: nested_worker,
-                revision: nested_revision,
                 event,
             } => {
-                Self::touch_internal_worker_activity(activity, worker, revision);
-                Self::project_internal_worker_event(
-                    activity,
-                    nested_worker,
-                    *nested_revision,
-                    event,
-                );
+                Self::touch_internal_worker_activity(activity, worker);
+                Self::project_internal_worker_event(activity, nested_worker, event);
             }
             protocol::Event::InternalWorkerRemoved {
                 worker: removed_worker,
-                revision: removed_revision,
             } => {
-                Self::touch_internal_worker_activity(activity, worker, revision);
-                Self::remove_internal_worker_subtree(activity, removed_worker, *removed_revision);
+                Self::touch_internal_worker_activity(activity, worker);
+                Self::remove_internal_worker_subtree(activity, removed_worker);
             }
             protocol::Event::WorkerState { snapshot }
             | protocol::Event::CommandAcknowledged {
@@ -5979,11 +5939,10 @@ impl RuntimeState {
                     InternalWorkerActivity {
                         status: Some(snapshot.catalog_status()),
                         parent_session_id: worker.parent_session_id.clone(),
-                        revision,
                     },
                 );
             }
-            _ => Self::touch_internal_worker_activity(activity, worker, revision),
+            _ => Self::touch_internal_worker_activity(activity, worker),
         }
     }
 
@@ -6001,15 +5960,11 @@ impl RuntimeState {
                     Self::internal_worker_snapshot_statuses(activity, child);
                 }
             }
-            protocol::Event::InternalWorker {
-                worker,
-                revision,
-                event,
-            } => {
-                Self::project_internal_worker_event(activity, worker, *revision, event);
+            protocol::Event::InternalWorker { worker, event } => {
+                Self::project_internal_worker_event(activity, worker, event);
             }
-            protocol::Event::InternalWorkerRemoved { worker, revision } => {
-                Self::remove_internal_worker_subtree(activity, worker, *revision);
+            protocol::Event::InternalWorkerRemoved { worker } => {
+                Self::remove_internal_worker_subtree(activity, worker);
             }
             _ => {}
         }
@@ -6057,12 +6012,10 @@ impl RuntimeState {
 struct InternalWorkerActivity {
     status: Option<protocol::WorkerStatus>,
     parent_session_id: Option<String>,
-    revision: u64,
 }
 
 #[derive(Debug, Clone)]
 struct RemovedInternalWorkerActivity {
-    revision: u64,
     parent_session_id: Option<String>,
 }
 
@@ -6111,8 +6064,9 @@ pub(crate) struct RestoreRequestOwner {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RestoreGuard {
-    generation: String,
+    observation_token: String,
     active_request_id: Option<String>,
     owners: BTreeMap<String, RestoreRequestOwner>,
 }
@@ -6120,7 +6074,7 @@ pub(crate) struct RestoreGuard {
 impl Default for RestoreGuard {
     fn default() -> Self {
         Self {
-            generation: uuid::Uuid::now_v7().to_string(),
+            observation_token: uuid::Uuid::now_v7().to_string(),
             active_request_id: None,
             owners: BTreeMap::new(),
         }
@@ -6129,7 +6083,7 @@ impl Default for RestoreGuard {
 
 impl RestoreGuard {
     fn rotate(&mut self) {
-        self.generation = uuid::Uuid::now_v7().to_string();
+        self.observation_token = uuid::Uuid::now_v7().to_string();
     }
 
     fn finish(&mut self, result: RuntimeWorkerRestoreResult) {
@@ -6199,7 +6153,7 @@ impl WorkerRecord {
 
     fn summary(&self) -> WorkerSummary {
         WorkerSummary {
-            restore_observation_token: Some(self.restore_guard.generation.clone()),
+            restore_observation_token: Some(self.restore_guard.observation_token.clone()),
             worker_ref: self.worker_ref.clone(),
             worker_id: self.worker_id,
             status: self.status,
@@ -6217,7 +6171,7 @@ impl WorkerRecord {
 
     fn detail(&self) -> WorkerDetail {
         WorkerDetail {
-            restore_observation_token: Some(self.restore_guard.generation.clone()),
+            restore_observation_token: Some(self.restore_guard.observation_token.clone()),
             worker_ref: self.worker_ref.clone(),
             worker_id: self.worker_id,
             status: self.status,
@@ -6740,11 +6694,6 @@ fn validate_create_workspace_scope(
             snapshot.workspace_id
         )));
     }
-    if snapshot.settings_revision == 0 {
-        return Err(RuntimeError::InvalidRequest(
-            "Memory settings revision must be at least 1".to_string(),
-        ));
-    }
     if !manifest::is_normalized_workspace_memory_language(&snapshot.language) {
         return Err(RuntimeError::InvalidRequest(
             "Memory settings language must be a normalized bounded UTF-8 value".to_string(),
@@ -6953,12 +6902,10 @@ mod tests {
 
     fn internal_worker_status_event(
         worker: protocol::InternalWorkerRef,
-        revision: u64,
         status: protocol::WorkerStatus,
     ) -> protocol::Event {
         protocol::Event::InternalWorker {
             worker,
-            revision,
             event: Box::new(protocol::Event::WorkerState {
                 snapshot: status.into(),
             }),
@@ -6967,13 +6914,11 @@ mod tests {
 
     fn internal_worker_snapshot(
         worker: protocol::InternalWorkerRef,
-        revision: u64,
         status: protocol::WorkerStatus,
         internal_workers: Vec<protocol::InternalWorkerSnapshot>,
     ) -> protocol::InternalWorkerSnapshot {
         protocol::InternalWorkerSnapshot {
             worker,
-            revision,
             status,
             greeting: None,
             session: protocol::SessionSnapshot {
@@ -7017,7 +6962,6 @@ mod tests {
             &mut activity,
             &internal_worker_status_event(
                 internal_worker_ref("child-a", None),
-                1,
                 protocol::WorkerStatus::Running,
             ),
         ));
@@ -7025,7 +6969,6 @@ mod tests {
             &mut activity,
             &internal_worker_status_event(
                 internal_worker_ref("child-b", None),
-                1,
                 protocol::WorkerStatus::Running,
             ),
         ));
@@ -7033,7 +6976,6 @@ mod tests {
             &mut activity,
             &internal_worker_status_event(
                 internal_worker_ref("child-a", None),
-                2,
                 protocol::WorkerStatus::Idle,
             ),
         ));
@@ -7041,7 +6983,6 @@ mod tests {
             &mut activity,
             &internal_worker_status_event(
                 internal_worker_ref("child-b", None),
-                2,
                 protocol::WorkerStatus::Stopped,
             ),
         ));
@@ -7053,10 +6994,8 @@ mod tests {
         let direct_child = internal_worker_ref("child", None);
         let nested_running = protocol::Event::InternalWorker {
             worker: direct_child.clone(),
-            revision: 1,
             event: Box::new(internal_worker_status_event(
                 internal_worker_ref("grandchild", Some("child")),
-                1,
                 protocol::WorkerStatus::Running,
             )),
         };
@@ -7067,10 +7006,8 @@ mod tests {
 
         let nested_idle = protocol::Event::InternalWorker {
             worker: direct_child,
-            revision: 2,
             event: Box::new(internal_worker_status_event(
                 internal_worker_ref("grandchild", Some("child")),
-                2,
                 protocol::WorkerStatus::Idle,
             )),
         };
@@ -7087,7 +7024,6 @@ mod tests {
             &mut activity,
             &internal_worker_status_event(
                 internal_worker_ref("child-a", None),
-                1,
                 protocol::WorkerStatus::Running,
             ),
         );
@@ -7101,44 +7037,23 @@ mod tests {
     }
 
     #[test]
-    fn internal_worker_removal_is_revision_fenced_until_parent_snapshot() {
+    fn internal_worker_removal_is_session_fenced_until_parent_snapshot() {
         let mut activity = InternalWorkerActivityProjection::default();
         let child_a = internal_worker_ref("child-a", None);
         let child_b = internal_worker_ref("child-b", None);
 
         assert!(RuntimeState::update_internal_worker_activity(
             &mut activity,
-            &internal_worker_status_event(child_a.clone(), 2, protocol::WorkerStatus::Running),
+            &internal_worker_status_event(child_a.clone(), protocol::WorkerStatus::Running),
         ));
         assert!(!RuntimeState::update_internal_worker_activity(
             &mut activity,
-            &internal_worker_status_event(child_b.clone(), 1, protocol::WorkerStatus::Running),
+            &internal_worker_status_event(child_b.clone(), protocol::WorkerStatus::Running),
         ));
 
         assert!(!RuntimeState::update_internal_worker_activity(
             &mut activity,
-            &protocol::Event::InternalWorkerRemoved {
-                worker: child_a.clone(),
-                revision: 1,
-            },
-        ));
-        assert!(activity.workers.contains_key("child-a"));
-
-        assert!(!RuntimeState::update_internal_worker_activity(
-            &mut activity,
-            &protocol::Event::InternalWorkerRemoved {
-                worker: child_a.clone(),
-                revision: 2,
-            },
-        ));
-        assert!(activity.workers.contains_key("child-a"));
-
-        assert!(!RuntimeState::update_internal_worker_activity(
-            &mut activity,
-            &protocol::Event::InternalWorkerRemoved {
-                worker: child_a,
-                revision: 3,
-            },
+            &protocol::Event::InternalWorkerRemoved { worker: child_a },
         ));
         assert!(!activity.workers.contains_key("child-a"));
         assert!(activity.removed_workers.contains_key("child-a"));
@@ -7148,14 +7063,13 @@ mod tests {
             &mut activity,
             &protocol::Event::InternalWorkerRemoved {
                 worker: child_b.clone(),
-                revision: 2,
             },
         ));
         assert!(!activity.has_running_worker());
 
         assert!(!RuntimeState::update_internal_worker_activity(
             &mut activity,
-            &internal_worker_status_event(child_b.clone(), 3, protocol::WorkerStatus::Running),
+            &internal_worker_status_event(child_b.clone(), protocol::WorkerStatus::Running),
         ));
         assert!(!activity.workers.contains_key("child-b"));
         assert!(!activity.has_running_worker());
@@ -7164,7 +7078,6 @@ mod tests {
             &mut activity,
             &parent_snapshot(vec![internal_worker_snapshot(
                 child_b,
-                4,
                 protocol::WorkerStatus::Running,
                 Vec::new(),
             )]),
@@ -7182,16 +7095,14 @@ mod tests {
 
         assert!(!RuntimeState::update_internal_worker_activity(
             &mut activity,
-            &internal_worker_status_event(child.clone(), 1, protocol::WorkerStatus::Idle),
+            &internal_worker_status_event(child.clone(), protocol::WorkerStatus::Idle),
         ));
         assert!(RuntimeState::update_internal_worker_activity(
             &mut activity,
             &protocol::Event::InternalWorker {
                 worker: child.clone(),
-                revision: 2,
                 event: Box::new(internal_worker_status_event(
                     grandchild.clone(),
-                    1,
                     protocol::WorkerStatus::Running,
                 )),
             },
@@ -7200,13 +7111,10 @@ mod tests {
             &mut activity,
             &protocol::Event::InternalWorker {
                 worker: child.clone(),
-                revision: 3,
                 event: Box::new(protocol::Event::InternalWorker {
                     worker: grandchild.clone(),
-                    revision: 2,
                     event: Box::new(internal_worker_status_event(
                         great_grandchild,
-                        1,
                         protocol::WorkerStatus::Running,
                     )),
                 }),
@@ -7217,10 +7125,8 @@ mod tests {
             &mut activity,
             &protocol::Event::InternalWorker {
                 worker: child.clone(),
-                revision: 4,
                 event: Box::new(protocol::Event::InternalWorkerRemoved {
                     worker: grandchild.clone(),
-                    revision: 3,
                 }),
             },
         ));
@@ -7235,10 +7141,8 @@ mod tests {
             &mut activity,
             &protocol::Event::InternalWorker {
                 worker: child,
-                revision: 5,
                 event: Box::new(internal_worker_status_event(
                     grandchild,
-                    4,
                     protocol::WorkerStatus::Running,
                 )),
             },
@@ -7338,7 +7242,6 @@ mod tests {
             workspace_api: None,
             memory_settings: Some(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "local".to_string(),
-                settings_revision: 1,
                 language: "English".to_string(),
             }),
             subjektiv_attached: false,
@@ -7367,7 +7270,7 @@ mod tests {
         request.backend_job = Some(crate::catalog::BackendJobExecutionBinding {
             job_id: "job-1".into(),
             attempt_id: "attempt-1".into(),
-            input_revision: Some("revision-1".into()),
+            input_digest: Some(format!("sha256:{}", "a".repeat(64))),
             subjektiv_consolidation: false,
         });
         let owner = scope("local", "server-job-test");
@@ -7416,7 +7319,7 @@ mod tests {
         request.backend_job = Some(crate::catalog::BackendJobExecutionBinding {
             job_id: "job-1".into(),
             attempt_id: "attempt-1".into(),
-            input_revision: None,
+            input_digest: None,
             subjektiv_consolidation: true,
         });
         assert!(validate_create_worker_request(&request).is_err());
@@ -7444,7 +7347,6 @@ mod tests {
                         kind: server_api::RepositorySourceKind::Ssh,
                         uri: "ssh://git@example.test/repo.git".to_string(),
                     },
-                    source_revision: 1,
                     source_fingerprint: "sha256:source".to_string(),
                     selector: None,
                 },
@@ -7455,16 +7357,15 @@ mod tests {
                     workspace_id: "workspace-1".to_string(),
                     runtime_id: "runtime-1".to_string(),
                     operation_id: "operation-1".to_string(),
-                    config_revision: 1,
                     config_projection_digest: "sha256:projection".to_string(),
                     ssh: Some(RepositorySshMaterializationAccess {
                         credential_candidates: vec![RepositorySshCredentialCandidate {
                             credential_id: "credential-1".to_string(),
-                            credential_revision: 1,
+                            public_key_fingerprint: "key-1".into(),
                             private_key: SensitiveString::new("private-key-bytes"),
                         }],
                         host_trust_id: "host-trust-1".to_string(),
-                        host_trust_revision: 1,
+                        host_key_fingerprint: "key-1".into(),
                         access: server_api::RepositoryAccessMode::ReadOnly,
                         expires_at_epoch_seconds: u64::MAX,
                         repository_id: "repository-1".to_string(),
@@ -7512,8 +7413,6 @@ mod tests {
             operation: crate::resource::BackendResourceOperation::FetchOnce,
             expires_at_unix_seconds: i64::MAX,
             nonce: "repository-access-1".to_string(),
-            revision: "1".to_string(),
-            generation: None,
             max_bytes: crate::resource::DEFAULT_REPOSITORY_SSH_ACCESS_MAX_BYTES,
             content_type: crate::resource::REPOSITORY_SSH_ACCESS_CONTENT_TYPE.to_string(),
             redaction: crate::resource::ResourceRedactionPolicy::RuntimeInternalOnly,
@@ -7544,12 +7443,12 @@ mod tests {
                             credential_candidates: vec![
                                 crate::resource::RepositorySshAccessSecretCandidate {
                                     credential_id: "credential-1".to_string(),
-                                    credential_revision: 1,
+                                    public_key_fingerprint: "key-1".into(),
                                     private_key: "private-key-bytes-1".to_string(),
                                 },
                                 crate::resource::RepositorySshAccessSecretCandidate {
                                     credential_id: "credential-2".to_string(),
-                                    credential_revision: 3,
+                                    public_key_fingerprint: "key-3".into(),
                                     private_key: "private-key-bytes-2".to_string(),
                                 },
                             ],
@@ -7567,23 +7466,22 @@ mod tests {
                 workspace_id: "workspace-1".to_string(),
                 runtime_id: "runtime-1".to_string(),
                 operation_id: "operation-1".to_string(),
-                config_revision: 1,
                 config_projection_digest: "sha256:projection".to_string(),
                 ssh: Some(RepositorySshMaterializationAccess {
                     credential_candidates: vec![
                         RepositorySshCredentialCandidate {
                             credential_id: "credential-1".to_string(),
-                            credential_revision: 1,
+                            public_key_fingerprint: "key-1".into(),
                             private_key: SensitiveString::default(),
                         },
                         RepositorySshCredentialCandidate {
                             credential_id: "credential-2".to_string(),
-                            credential_revision: 3,
+                            public_key_fingerprint: "key-3".into(),
                             private_key: SensitiveString::default(),
                         },
                     ],
                     host_trust_id: "host-trust-1".to_string(),
-                    host_trust_revision: 1,
+                    host_key_fingerprint: "key-1".into(),
                     access: server_api::RepositoryAccessMode::ReadOnly,
                     expires_at_epoch_seconds: u64::MAX,
                     repository_id: "repository-1".to_string(),
@@ -7652,12 +7550,12 @@ mod tests {
                             credential_candidates: vec![
                                 crate::resource::RepositorySshAccessSecretCandidate {
                                     credential_id: "credential-1".to_string(),
-                                    credential_revision: 1,
+                                    public_key_fingerprint: "key-1".into(),
                                     private_key: "create-private-key-bytes-1".to_string(),
                                 },
                                 crate::resource::RepositorySshAccessSecretCandidate {
                                     credential_id: "credential-2".to_string(),
-                                    credential_revision: 3,
+                                    public_key_fingerprint: "key-3".into(),
                                     private_key: "create-private-key-bytes-2".to_string(),
                                 },
                             ],
@@ -7677,7 +7575,6 @@ mod tests {
                     kind: server_api::RepositorySourceKind::Ssh,
                     uri: "ssh://git@example.test/repo.git".to_string(),
                 },
-                source_revision: 1,
                 source_fingerprint: "sha256:source".to_string(),
                 selector: None,
             },
@@ -7688,23 +7585,22 @@ mod tests {
                 workspace_id: "workspace-1".to_string(),
                 runtime_id: "runtime-1".to_string(),
                 operation_id: "operation-create".to_string(),
-                config_revision: 1,
                 config_projection_digest: "sha256:projection".to_string(),
                 ssh: Some(RepositorySshMaterializationAccess {
                     credential_candidates: vec![
                         RepositorySshCredentialCandidate {
                             credential_id: "credential-1".to_string(),
-                            credential_revision: 1,
+                            public_key_fingerprint: "key-1".into(),
                             private_key: SensitiveString::default(),
                         },
                         RepositorySshCredentialCandidate {
                             credential_id: "credential-2".to_string(),
-                            credential_revision: 3,
+                            public_key_fingerprint: "key-3".into(),
                             private_key: SensitiveString::default(),
                         },
                     ],
                     host_trust_id: "host-trust-1".to_string(),
-                    host_trust_revision: 1,
+                    host_key_fingerprint: "key-1".into(),
                     access: server_api::RepositoryAccessMode::ReadOnly,
                     expires_at_epoch_seconds: u64::MAX,
                     repository_id: "repository-1".to_string(),
@@ -7751,7 +7647,6 @@ mod tests {
         });
         request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
             workspace_id: workspace_id.to_string(),
-            settings_revision: 1,
             language: "English".to_string(),
         });
         request
@@ -7769,14 +7664,12 @@ mod tests {
 
         request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
             workspace_id: "workspace-b".to_string(),
-            settings_revision: 1,
             language: "English".to_string(),
         });
         assert!(validate_create_workspace_scope(&request, Some("workspace-a")).is_err());
 
         request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
             workspace_id: "workspace-a".to_string(),
-            settings_revision: 2,
             language: " english ".to_string(),
         });
         assert!(validate_create_workspace_scope(&request, Some("workspace-a")).is_err());
@@ -7791,7 +7684,6 @@ mod tests {
             metadata: ConfigBundleMetadata {
                 id: "bundle-1".to_string(),
                 digest: String::new(),
-                revision: "rev-1".to_string(),
                 workspace_id: "workspace-1".to_string(),
                 created_at: "2026-06-26T00:00:00Z".to_string(),
                 provenance: ConfigBundleProvenance {
@@ -8350,7 +8242,6 @@ mod tests {
                     kind: server_api::RepositorySourceKind::LocalPath,
                     uri: "/unused-test-repository".into(),
                 },
-                source_revision: 1,
                 source_fingerprint: "sha256:test-source".into(),
                 selector: None,
             },
@@ -8368,7 +8259,6 @@ mod tests {
                 workspace_id: "workspace-a".into(),
                 runtime_id: "runtime-1".into(),
                 operation_id: "operation-1".into(),
-                config_revision: 1,
                 config_projection_digest: "sha256:test-projection".into(),
                 ssh: None,
             },
@@ -8842,7 +8732,6 @@ mod tests {
                 &created.worker_ref,
                 internal_worker_status_event(
                     internal_worker_ref("child-live", None),
-                    1,
                     protocol::WorkerStatus::Running,
                 ),
             )
@@ -8861,7 +8750,6 @@ mod tests {
                 &created.worker_ref,
                 protocol::Event::InternalWorkerRemoved {
                     worker: internal_worker_ref("child-live", None),
-                    revision: 2,
                 },
             )
             .unwrap();
@@ -8879,7 +8767,6 @@ mod tests {
                 &created.worker_ref,
                 internal_worker_status_event(
                     internal_worker_ref("child-live", None),
-                    3,
                     protocol::WorkerStatus::Running,
                 ),
             )
@@ -8900,7 +8787,6 @@ mod tests {
                 &created.worker_ref,
                 parent_snapshot(vec![internal_worker_snapshot(
                     internal_worker_ref("child-live", None),
-                    4,
                     protocol::WorkerStatus::Running,
                     Vec::new(),
                 )]),
@@ -9427,7 +9313,6 @@ mod tests {
         bundle.prompt_catalog = Some(
             worker::EffectivePromptCatalog::new(
                 BTreeMap::from([("default".to_string(), "workspace prompt".to_string())]),
-                7,
                 "schema",
                 "toolchain",
             )
@@ -10287,7 +10172,6 @@ mod tests {
                     workspace_id: "workspace-a".into(),
                     runtime_id: "peer-runtime".into(),
                     operation_id: format!("worker-restore:{}", request.request_id),
-                    config_revision: 1,
                     config_projection_digest: "snapshot".into(),
                     ssh: None,
                 },
@@ -10405,7 +10289,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_guard_protocol_state_aba_rotates_generation() {
+    fn restore_guard_protocol_state_aba_rotates_observation_token() {
         let (runtime, backend) = runtime_and_backend();
         let worker = runtime.create_worker(task_request("state ABA")).unwrap();
         let request = runtime.test_restore_request(&worker.worker_ref);
@@ -11160,7 +11044,7 @@ mod tests {
 
     #[cfg(feature = "fs-store")]
     #[test]
-    fn restore_guard_generation_and_terminal_receipt_survive_restart() {
+    fn restore_guard_observation_token_and_terminal_receipt_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
         let options =
             FsRuntimeStoreOptions::new(dir.path().join("runtime")).with_runtime_id("guard-test");
@@ -11177,7 +11061,7 @@ mod tests {
             .restore_worker_operation(&worker.worker_ref, request.clone())
             .unwrap();
         runtime.stop_worker(&worker.worker_ref, None).unwrap();
-        let generation = runtime
+        let observation_token = runtime
             .worker_detail(&worker.worker_ref)
             .unwrap()
             .restore_observation_token;
@@ -11188,7 +11072,7 @@ mod tests {
                 .worker_detail(&worker.worker_ref)
                 .unwrap()
                 .restore_observation_token,
-            generation
+            observation_token
         );
         assert_eq!(
             restarted
@@ -12680,7 +12564,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("unsupported Runtime store schema version 2; expected 6, 7, 8, or 9")
+                .contains("unsupported Runtime store schema version 2; expected 6, 7, 8, 9, or 10")
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -12722,7 +12606,7 @@ mod tests {
         let worker_aggregate: serde_json::Value =
             serde_json::from_slice(&std::fs::read(worker_store_dir.join("worker.json")).unwrap())
                 .unwrap();
-        assert_eq!(worker_aggregate["schema_version"], serde_json::json!(9));
+        assert_eq!(worker_aggregate["schema_version"], serde_json::json!(10));
         assert_eq!(worker_aggregate["status"], serde_json::json!("stopped"));
         assert_eq!(
             worker_aggregate["execution_state"]["state"],
@@ -13072,7 +12956,7 @@ mod tests {
             .unwrap()
             .remove("restore_guard")
             .unwrap();
-        assert_ne!(guard["generation"], old_guard["generation"]);
+        assert_ne!(guard["observation_token"], old_guard["observation_token"]);
         assert!(guard["active_request_id"].is_null());
         assert_eq!(
             guard["owners"]
@@ -13669,7 +13553,7 @@ mod tests {
         );
         let migrated_aggregate: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&worker_path).unwrap()).unwrap();
-        assert_eq!(migrated_aggregate["schema_version"], serde_json::json!(9));
+        assert_eq!(migrated_aggregate["schema_version"], serde_json::json!(10));
         assert!(migrated_aggregate.get("request").is_none());
         assert!(migrated_aggregate.get("execution").is_none());
         assert_eq!(

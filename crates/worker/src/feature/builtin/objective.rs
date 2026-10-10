@@ -5,8 +5,10 @@
 //! local `.yoi/objectives` paths, so model-visible Objective tools go through
 //! the scoped Workspace API.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
 use async_trait::async_trait;
@@ -536,14 +538,6 @@ const OBJECTIVE_TOOL_NAMES: [&str; 7] = [
     "ObjectiveUnlinkTicket",
 ];
 
-#[derive(Default)]
-struct ObjectiveRevisionState {
-    revisions: HashMap<String, String>,
-    aliases_by_canonical: HashMap<String, BTreeSet<String>>,
-}
-
-type ObjectiveRevisions = Arc<Mutex<ObjectiveRevisionState>>;
-
 /// Contribute the Objective Feature's native collection and item projections to
 /// the Host-owned WIP registry. Ordinary Objective tools remain registered for
 /// Tool mode and are claimed only from the WIP compatibility projection.
@@ -555,14 +549,13 @@ pub fn mount_workspace_http_objective_wip(
 ) -> Result<(), WipMountError> {
     let collection_route = namespace_route.root().to_string();
     let backend = WorkspaceHttpObjectiveBackend::new(client);
-    let revisions = Arc::new(Mutex::new(ObjectiveRevisionState::default()));
+
     let collection_descriptor = objective_collection_descriptor();
     let collection_validator = descriptor_validator(&collection_descriptor);
     let collection_handler = Arc::new(ObjectiveCollectionWipHandler {
         backend: backend.clone(),
         permissions: permissions.clone(),
         collection_route: collection_route.clone(),
-        revisions: Arc::clone(&revisions),
     });
     registry.mount(WipProjection {
         route: collection_route.clone(),
@@ -600,7 +593,6 @@ pub fn mount_workspace_http_objective_wip(
             backend,
             permissions,
             collection_route: collection_route.clone(),
-            revisions,
         }),
     })?;
     registry.replace_compatibility_tools(&collection_route, OBJECTIVE_TOOL_NAMES)?;
@@ -611,7 +603,6 @@ struct ObjectiveCollectionWipHandler {
     backend: WorkspaceHttpObjectiveBackend,
     permissions: Option<ToolPermissionConfig>,
     collection_route: String,
-    revisions: ObjectiveRevisions,
 }
 
 #[async_trait]
@@ -695,7 +686,7 @@ impl WipOperationHandler for ObjectiveCollectionWipHandler {
                     .create_value(&input)
                     .await
                     .map_err(map_backend_error)?;
-                record_revision(&self.revisions, None, &response);
+
                 if let Some(reference) = response
                     .get("objective")
                     .and_then(Json::as_str)
@@ -723,7 +714,6 @@ struct ObjectiveItemResolver {
     backend: WorkspaceHttpObjectiveBackend,
     permissions: Option<ToolPermissionConfig>,
     collection_route: String,
-    revisions: ObjectiveRevisions,
 }
 
 impl WipDynamicItemResolver for ObjectiveItemResolver {
@@ -731,14 +721,6 @@ impl WipDynamicItemResolver for ObjectiveItemResolver {
         if !is_objective_route_reference(item_reference) {
             return None;
         }
-        let revision = self
-            .revisions
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .revisions
-            .get(item_reference)
-            .cloned()
-            .unwrap_or_else(|| "unobserved".into());
         let route = format!("{}/{}", self.collection_route, item_reference);
         Some(WipDynamicItem {
             object: Object {
@@ -746,13 +728,14 @@ impl WipDynamicItemResolver for ObjectiveItemResolver {
                 description: Some("Authoritative Objective bound to this object route".into()),
                 interfaces: vec![crate::wip::root_reference(OBJECTIVE_ITEM_INTERFACE)],
                 r#ref: Some(format!("objective:{item_reference}")),
-                validator: Some(route_validator(&route, &revision)),
+                // The Object publishes fixed operation signatures, not Objective content.
+                // Each operation reads/writes current Backend state under its authority.
+                validator: Some(route_validator(&route, "objective-item")),
             },
             handler: Arc::new(ObjectiveItemWipHandler {
                 backend: self.backend.clone(),
                 permissions: self.permissions.clone(),
                 objective_reference: item_reference.to_string(),
-                revisions: Arc::clone(&self.revisions),
             }),
         })
     }
@@ -762,7 +745,6 @@ struct ObjectiveItemWipHandler {
     backend: WorkspaceHttpObjectiveBackend,
     permissions: Option<ToolPermissionConfig>,
     objective_reference: String,
-    revisions: ObjectiveRevisions,
 }
 
 #[async_trait]
@@ -832,7 +814,7 @@ impl WipOperationHandler for ObjectiveItemWipHandler {
             }
             _ => return Err(operation_not_found()),
         };
-        record_revision(&self.revisions, Some(&self.objective_reference), &response);
+
         Ok(WipOperationOutput::native(
             json_to_wip(&response).map_err(WipOperationError::OutcomeUnknown)?,
         ))
@@ -1022,36 +1004,6 @@ fn string_list_argument(
     }
 }
 
-fn record_revision(revisions: &ObjectiveRevisions, bound_reference: Option<&str>, response: &Json) {
-    let (Some(revision), Some(canonical)) = (
-        response.get("revision").and_then(Json::as_str),
-        response.get("objective").and_then(Json::as_str),
-    ) else {
-        return;
-    };
-    let mut state = revisions.lock().unwrap_or_else(|error| error.into_inner());
-    state
-        .aliases_by_canonical
-        .entry(canonical.to_string())
-        .or_default()
-        .insert(canonical.to_string());
-    if let Some(reference) = bound_reference {
-        state
-            .aliases_by_canonical
-            .entry(canonical.to_string())
-            .or_default()
-            .insert(reference.to_string());
-    }
-    let aliases = state
-        .aliases_by_canonical
-        .get(canonical)
-        .cloned()
-        .unwrap_or_default();
-    for alias in aliases {
-        state.revisions.insert(alias, revision.to_string());
-    }
-}
-
 fn is_objective_route_reference(reference: &str) -> bool {
     is_canonical_resource_key(reference, "O-")
         || (reference.len() >= 8
@@ -1059,11 +1011,11 @@ fn is_objective_route_reference(reference: &str) -> bool {
             && reference.bytes().all(|byte| byte.is_ascii_alphanumeric()))
 }
 
-fn route_validator(route: &str, revision: &str) -> Vec<u8> {
+fn route_validator(route: &str, signature: &str) -> Vec<u8> {
     let mut digest = Sha256::new();
     digest.update(route.as_bytes());
     digest.update([0]);
-    digest.update(revision.as_bytes());
+    digest.update(signature.as_bytes());
     digest.finalize().to_vec()
 }
 
@@ -1115,7 +1067,7 @@ fn objective_collection_descriptor() -> InterfaceDescriptor {
                     parameter("state", false, TypeExpr::String),
                     parameter("linked_tickets", false, list_of(TypeExpr::String)),
                 ],
-                returns: json_return("Created Objective with revision and bounded context"),
+                returns: json_return("Created Objective with bounded context"),
             },
         ],
     }
@@ -1182,7 +1134,7 @@ fn operation(
             details: None,
         }),
         parameters,
-        returns: json_return("Authoritative Objective detail with revision and bounded context"),
+        returns: json_return("Authoritative Objective detail with bounded context"),
     }
 }
 
@@ -1293,7 +1245,7 @@ fn parse_input<T: for<'de> Deserialize<'de>>(input: &str) -> Result<T, ToolError
 }
 
 const LIST_DESCRIPTION: &str = "Query authoritative Objectives with bounded typed filters, stable snippets, linked-Ticket context, and cursor metadata.";
-const SHOW_DESCRIPTION: &str = "Show one authoritative Objective with its revision, full linked-Ticket context, bounded body, and paged event metadata.";
+const SHOW_DESCRIPTION: &str = "Show one authoritative Objective with full linked-Ticket context, bounded body, and paged event metadata.";
 const CREATE_DESCRIPTION: &str =
     "Create an Objective record through Backend Workspace API authority.";
 const EDIT_DESCRIPTION: &str =
@@ -1549,17 +1501,16 @@ mod tests {
         }
     }
 
-    fn objective_response(revision: &str) -> crate::worker::WorkspaceResponse {
+    fn objective_response(title: &str) -> crate::worker::WorkspaceResponse {
         crate::worker::WorkspaceResponse {
             status: 200,
             body: json!({
                 "id": "00001OBJECTIVE",
                 "resource_key": "O-3",
-                "title": "Objective",
+                "title": title,
                 "body": "Body",
                 "body_truncated": false,
                 "state": "active",
-                "revision": revision,
                 "created_at": null,
                 "updated_at": null,
                 "linked_ticket_summaries": [],
@@ -1635,7 +1586,7 @@ mod tests {
                 "body": "Body",
                 "body_truncated": false,
                 "state": "active",
-                "revision": "rev-1",
+
                 "created_at": null,
                 "updated_at": null,
                 "linked_ticket_summaries": [],
@@ -1704,7 +1655,6 @@ mod tests {
                     "body": "Body",
                     "body_truncated": false,
                     "state": "active",
-                    "revision": format!("rev-{mutation}"),
                     "created_at": null,
                     "updated_at": null,
                     "linked_ticket_summaries": [],
@@ -1798,15 +1748,13 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_objective_routes_accept_only_objective_references_and_refresh_revision() {
-        let revisions = Arc::new(Mutex::new(ObjectiveRevisionState::default()));
+    fn dynamic_objective_routes_accept_only_objective_references() {
         let resolver = ObjectiveItemResolver {
             backend: WorkspaceHttpObjectiveBackend::new(Arc::new(
                 crate::worker::TestWorkspaceHttpClient::new("workspace", "http://backend"),
             )),
             permissions: None,
             collection_route: "/objectives".into(),
-            revisions: Arc::clone(&revisions),
         };
         let initial = resolver.resolve("O-3").unwrap();
         assert_eq!(initial.object.name, "O-3");
@@ -1814,22 +1762,10 @@ mod tests {
         assert!(resolver.resolve("T-3").is_none());
         assert!(resolver.resolve("O-3/other").is_none());
 
-        record_revision(
-            &revisions,
-            Some("00001OBJECTIVE"),
-            &json!({"objective": "O-3", "revision": "rev-1"}),
+        assert_ne!(
+            initial.object.validator,
+            resolver.resolve("O-4").unwrap().object.validator
         );
-        let canonical_rev_1 = resolver.resolve("O-3").unwrap().object.validator;
-        let internal_rev_1 = resolver.resolve("00001OBJECTIVE").unwrap().object.validator;
-        record_revision(
-            &revisions,
-            Some("O-3"),
-            &json!({"objective": "O-3", "revision": "rev-2"}),
-        );
-        let canonical_rev_2 = resolver.resolve("O-3").unwrap().object.validator;
-        let internal_rev_2 = resolver.resolve("00001OBJECTIVE").unwrap().object.validator;
-        assert_ne!(canonical_rev_1, canonical_rev_2);
-        assert_ne!(internal_rev_1, internal_rev_2);
     }
 
     #[test]
@@ -1948,7 +1884,6 @@ mod tests {
                 rules: Vec::new(),
             }),
             objective_reference: "O-3".into(),
-            revisions: Arc::new(Mutex::new(ObjectiveRevisionState::default())),
         };
         let result = denied
             .call(
@@ -1972,7 +1907,6 @@ mod tests {
             backend,
             permissions: None,
             collection_route: "/objectives".into(),
-            revisions: Arc::new(Mutex::new(ObjectiveRevisionState::default())),
         };
         let result = collection
             .call(
@@ -2009,12 +1943,11 @@ mod tests {
             objective_response("rev-4"),
         ]));
         let backend = WorkspaceHttpObjectiveBackend::new(client.clone());
-        let revisions = Arc::new(Mutex::new(ObjectiveRevisionState::default()));
+
         let collection = ObjectiveCollectionWipHandler {
             backend: backend.clone(),
             permissions: None,
             collection_route: "/objectives".into(),
-            revisions: Arc::clone(&revisions),
         };
         let context = || WipCallContext {
             execution: ToolExecutionContext::direct(),
@@ -2035,7 +1968,6 @@ mod tests {
             backend,
             permissions: None,
             objective_reference: "O-3".into(),
-            revisions,
         };
         assert!(item.call("read", &BTreeMap::new(), context()).await.is_ok());
         assert!(
@@ -2100,7 +2032,6 @@ mod tests {
             backend: WorkspaceHttpObjectiveBackend::new(client),
             permissions: None,
             objective_reference: "O-404".into(),
-            revisions: Arc::new(Mutex::new(ObjectiveRevisionState::default())),
         };
         for (operation, arguments) in [
             ("read", BTreeMap::new()),
@@ -2171,7 +2102,6 @@ mod tests {
             )),
             permissions: None,
             collection_route: "/objectives".into(),
-            revisions: Arc::new(Mutex::new(ObjectiveRevisionState::default())),
         };
         let output = match handler
             .call(
@@ -2198,7 +2128,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn native_edit_binds_target_from_route_and_publishes_new_revision() {
+    async fn native_edit_returns_updated_content_without_changing_object_signatures() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
@@ -2217,7 +2147,7 @@ mod tests {
                 "body": "Body",
                 "body_truncated": false,
                 "state": "active",
-                "revision": "rev-2",
+
                 "created_at": null,
                 "updated_at": null,
                 "linked_ticket_summaries": [],
@@ -2233,7 +2163,7 @@ mod tests {
             )
             .unwrap();
         });
-        let revisions = Arc::new(Mutex::new(ObjectiveRevisionState::default()));
+
         let backend = WorkspaceHttpObjectiveBackend::new(Arc::new(
             crate::worker::TestWorkspaceHttpClient::new("workspace", base_url),
         ));
@@ -2241,14 +2171,12 @@ mod tests {
             backend: backend.clone(),
             permissions: None,
             collection_route: "/objectives".into(),
-            revisions: Arc::clone(&revisions),
         };
         let before = resolver.resolve("O-3").unwrap().object.validator;
         let handler = ObjectiveItemWipHandler {
             backend,
             permissions: None,
             objective_reference: "O-3".into(),
-            revisions,
         };
         let output = match handler
             .call(
@@ -2267,9 +2195,9 @@ mod tests {
         server.join().unwrap();
         let output = crate::wip::wip_to_json(&output.value).unwrap();
         assert_eq!(output["objective"], "O-3");
-        assert_eq!(output["revision"], "rev-2");
+        assert_eq!(output["title"], "Changed");
         let after = resolver.resolve("O-3").unwrap().object.validator;
-        assert_ne!(before, after);
+        assert_eq!(before, after);
     }
 
     #[test]

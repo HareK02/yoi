@@ -67,7 +67,6 @@ export function cleanupPlan(workspaceId: string, runtimeId: string): RuntimeClea
     diagnostics: [],
     digest: "fixture-cleanup",
     generated_at: "2026-01-02T00:00:00Z",
-    revision: "1",
     workers: [],
     workdirs: [],
   };

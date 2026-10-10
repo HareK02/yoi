@@ -68,6 +68,14 @@ export function parseDriveDecimal(value: unknown): string {
   ) invalid();
   return result;
 }
+function parseMutationId(value: unknown, allowRoot = false): string {
+  const result = string(value, 128);
+  if (
+    (!allowRoot && !result) || new TextEncoder().encode(result).length > 128 ||
+    /[\x00-\x1f\x7f-\x9f]/.test(result)
+  ) invalid();
+  return result;
+}
 function hasControl(value: string, includeSpace = false): boolean {
   return Array.from(value).some((char) =>
     char.charCodeAt(0) <= (includeSpace ? 32 : 31)
@@ -158,7 +166,7 @@ export function parseDriveEntry(
     parent,
     kind: v.kind,
     name: string(v.name, 255),
-    revision: parseDriveDecimal(v.revision),
+    last_mutation_id: parseMutationId(v.last_mutation_id, parent === null),
     size: size as number | null,
     content_type: v.content_type === null ? null : mime(v.content_type),
     updated_by: string(v.updated_by),
@@ -293,7 +301,7 @@ export type DriveUploadTarget =
   | {
     operation: "update";
     id: DriveEntryRef;
-    expected_revision: string;
+    expected_mutation_id: string;
     content_type: string;
   };
 export type DrivePageOptions = { after?: string | null; limit?: number };
@@ -349,14 +357,14 @@ export interface DriveClient {
 export function driveDownloadUrl(
   workspaceId: string,
   ref: DriveEntryRef,
-  revision?: string,
+  last_mutation_id?: string,
 ): string {
   return `${base(workspaceId)}/download${
     query({
       ...refQuery(ref, workspaceId),
-      expected_revision: revision === undefined
+      expected_mutation_id: last_mutation_id === undefined
         ? null
-        : parseDriveDecimal(revision),
+        : parseMutationId(last_mutation_id),
     })
   }`;
 }
@@ -375,7 +383,7 @@ function name(value: string): string {
 function validateMutation(value: DriveMutation, workspaceId: string): void {
   if ("id" in value) {
     parseDriveEntryRef(value.id, workspaceId);
-    parseDriveDecimal(value.expected_revision);
+    parseMutationId(value.expected_mutation_id);
   }
   if ("parent" in value) parseDriveEntryRef(value.parent, workspaceId);
   if ("name" in value) name(value.name);
@@ -514,7 +522,7 @@ export function createDriveClient(fetchFn: typeof fetch = fetch): DriveClient {
         entry.size === null || entry.size > DRIVE_RESPONSE_MAX_BYTES
       ) throw new DriveRequestError("limit", "not_committed");
       const res = await response(
-        driveDownloadUrl(ws, entry.entry, entry.revision),
+        driveDownloadUrl(ws, entry.entry, entry.last_mutation_id),
         { signal },
       );
       await checked(res);
@@ -578,7 +586,7 @@ export function createDriveClient(fetchFn: typeof fetch = fetch): DriveClient {
         }
         : {
           id: parseDriveEntryRef(target.id, ws).node_id,
-          expected_revision: parseDriveDecimal(target.expected_revision),
+          expected_mutation_id: parseMutationId(target.expected_mutation_id),
         };
       signal?.throwIfAborted();
       const digest = await crypto.subtle.digest(

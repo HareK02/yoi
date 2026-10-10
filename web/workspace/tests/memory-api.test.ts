@@ -5,7 +5,7 @@ declare const Deno: {
 import {
   createSubjektivSubject,
   parseMemoryStagingListResponse,
-  parseSubjektivMemoryListRevisionsResponse,
+  parseSubjektivMemoryListChangesResponse,
   parseSubjektivMemoryQueryResponse,
   parseSubjektivMemoryReadResponse,
   parseSubjektivResidentSurfaceResponse,
@@ -75,9 +75,8 @@ function subject(id = "subject-1") {
     id,
     role: "Release coordinator",
     behavior_md: "Prefer explicit evidence.",
-    behavior_revision: 2,
     state: "active",
-    store_revision: 12,
+    memory_fingerprint: "fingerprint-12",
     created_at: "2026-09-01T00:00:00Z",
     updated_at: "2026-09-02T00:00:00Z",
   };
@@ -110,7 +109,7 @@ function currentWorker() {
 function queryItem(id = "memory-1") {
   return {
     id,
-    revision: 3,
+    change_id: "change-current",
     kind: "decision",
     state: "active",
     claim: "Keep provenance typed.",
@@ -127,12 +126,11 @@ function detailFixture() {
     worker_id: "worker-1",
     flow_selector: "builtin:coder-review",
     flow_definition_id: "flow-1",
-    flow_definition_revision: 7,
   };
   return {
     memory_id: "memory-1",
-    revision: 2,
-    current_revision: 3,
+    change_id: "change-earlier",
+    current_change_id: "change-current",
     kind: "decision",
     state: "resolved",
     claim: "Keep provenance typed.",
@@ -173,13 +171,13 @@ function detailFixture() {
       source_refs_total: 2,
       source_refs_truncated: true,
     }],
-    derived_from: [{ memory_id: "memory-parent", revision: 4 }],
+    derived_from: [{ memory_id: "memory-parent", change_id: "change-parent" }],
     evidence_next_cursor: "evidence-page-2",
     evidence_has_more: true,
   };
 }
 
-Deno.test("Subject parsers enforce identity, exact enums, safe revisions, and bounds", () => {
+Deno.test("Subject parsers enforce identity, exact enums, bounded fingerprints, and bounds", () => {
   assertEquals(
     parseSubjektivSubjectResponse(subject(), "subject-1"),
     subject(),
@@ -196,9 +194,9 @@ Deno.test("Subject parsers enforce identity, exact enums, safe revisions, and bo
     () =>
       parseSubjektivSubjectResponse({
         ...subject(),
-        store_revision: Number.MAX_SAFE_INTEGER + 1,
+        memory_fingerprint: 12,
       }),
-    "safe integer",
+    "bounded identifier",
   );
   assertThrows(
     () => parseSubjektivSubjectResponse({ ...subject(), id: "x".repeat(513) }),
@@ -313,7 +311,7 @@ Deno.test("Subject behavior update uses CAS and preserves exact text", async () 
     return Response.json({
       ...subject("subject/one"),
       behavior_md: "Line one.\nLine two.",
-      behavior_revision: 3,
+
     });
   }) as typeof fetch;
 
@@ -321,9 +319,8 @@ Deno.test("Subject behavior update uses CAS and preserves exact text", async () 
     fetchFn,
     "workspace one",
     "subject/one",
-    { expected_behavior_revision: 2, behavior_md: "Line one.\nLine two." },
+    { expected_behavior_md: "Prefer explicit evidence.", behavior_md: "Line one.\nLine two." },
   );
-  assertEquals(updated.behavior_revision, 3);
   assertEquals(updated.behavior_md, "Line one.\nLine two.");
   assertEquals(
     requests[0].path,
@@ -332,20 +329,20 @@ Deno.test("Subject behavior update uses CAS and preserves exact text", async () 
   assertEquals(requests[0].init?.method, "PATCH");
   assertEquals(
     requests[0].init?.body,
-    '{"expected_behavior_revision":2,"behavior_md":"Line one.\\nLine two."}',
+    '{"expected_behavior_md":"Prefer explicit evidence.","behavior_md":"Line one.\\nLine two."}',
   );
 });
 
 Deno.test("Subject behavior update reports conflicts without claiming Worker application", async () => {
   const conflictFetch =
     (async () =>
-      Response.json({ message: "revision conflict" }, {
+      Response.json({ message: "behavior content conflict" }, {
         status: 409,
       })) as typeof fetch;
   await assertSubjectCreateRejects(
     () =>
       updateSubjektivSubjectBehavior(conflictFetch, "workspace", "subject", {
-        expected_behavior_revision: 1,
+        expected_behavior_md: "old",
         behavior_md: "new",
       }),
     "rejected",
@@ -459,7 +456,7 @@ Deno.test("Resident surface parser accepts ready-empty and enforces snapshot inv
       snapshot_id: "snapshot-empty",
       body_md: "",
       memory_refs: [],
-      built_from_store_revision: 0,
+      built_from_memory_fingerprint: "fingerprint-0",
       created_at: "2026-09-02T00:00:00Z",
     },
   };
@@ -506,7 +503,7 @@ Deno.test("Resident surface parser accepts ready-empty and enforces snapshot inv
   );
 });
 
-Deno.test("Current Memory list parser rejects unknown variants, unsafe integers, cursors, and oversized pages", () => {
+Deno.test("Current Memory list parser rejects unknown variants, invalid change IDs, cursors, and oversized pages", () => {
   const response = {
     items: [queryItem()],
     has_more: true,
@@ -533,9 +530,9 @@ Deno.test("Current Memory list parser rejects unknown variants, unsafe integers,
     () =>
       parseSubjektivMemoryQueryResponse({
         ...response,
-        items: [{ ...queryItem(), revision: 0 }],
+        items: [{ ...queryItem(), change_id: "" }],
       }),
-    "positive safe integer",
+    "bounded identifier",
   );
   assertThrows(
     () =>
@@ -572,7 +569,7 @@ Deno.test("Memory detail parser preserves body/evidence continuation, sources, o
   );
   assertEquals(parsed.derived_from, [{
     memory_id: "memory-parent",
-    revision: 4,
+    change_id: "change-parent",
   }]);
 });
 
@@ -586,9 +583,9 @@ Deno.test("Memory detail parser fails closed on identity, variants, bounds, and 
     () =>
       parseSubjektivMemoryReadResponse({
         ...fixture,
-        current_revision: Number.MAX_SAFE_INTEGER + 1,
+        current_change_id: 3,
       }),
-    "safe integer",
+    "bounded identifier",
   );
   const missingBodyContinuation = structuredClone(fixture) as Record<
     string,
@@ -637,26 +634,26 @@ Deno.test("Memory detail parser fails closed on identity, variants, bounds, and 
   );
 });
 
-Deno.test("Memory revision parser preserves immutable states and checks response identity", () => {
+Deno.test("Memory change parser preserves immutable states and checks response identity", () => {
   const response = {
     memory_id: "memory-1",
-    current_revision: 3,
+    current_change_id: "change-current",
     items: [{
-      revision: 3,
+      change_id: "change-current",
       kind: "decision",
       state: "active",
       claim: "Current claim.",
       change_reason: "Clarified wording.",
       updated_at: "2026-09-03T00:00:00Z",
     }, {
-      revision: 2,
+      change_id: "change-earlier",
       kind: "decision",
       state: "resolved",
       claim: "Earlier claim.",
       change_reason: "Resolved.",
       updated_at: "2026-09-02T00:00:00Z",
     }, {
-      revision: 1,
+      change_id: "change-original",
       kind: "decision",
       state: "retracted",
       claim: "Original claim.",
@@ -666,16 +663,16 @@ Deno.test("Memory revision parser preserves immutable states and checks response
     has_more: false,
   };
   assertEquals(
-    parseSubjektivMemoryListRevisionsResponse(response, "memory-1"),
+    parseSubjektivMemoryListChangesResponse(response, "memory-1"),
     response,
   );
   assertThrows(
-    () => parseSubjektivMemoryListRevisionsResponse(response, "memory-2"),
+    () => parseSubjektivMemoryListChangesResponse(response, "memory-2"),
     "identity does not match",
   );
   assertThrows(
     () =>
-      parseSubjektivMemoryListRevisionsResponse({
+      parseSubjektivMemoryListChangesResponse({
         ...response,
         items: [{ ...response.items[0], state: "archived" }],
       }),
@@ -683,12 +680,59 @@ Deno.test("Memory revision parser preserves immutable states and checks response
   );
   assertThrows(
     () =>
-      parseSubjektivMemoryListRevisionsResponse({
+      parseSubjektivMemoryListChangesResponse({
         ...response,
-        items: [{ ...response.items[0], revision: 4 }],
+        items: [response.items[0], response.items[0]],
       }),
-    "future revision",
+    "Memory changes must be unique",
   );
+});
+
+Deno.test("Memory changes preserve server order without interpreting opaque identities", () => {
+  const item = { kind: "decision", state: "active", claim: "Claim", change_reason: "Reason", updated_at: "2026-09-01T00:00:00Z" };
+  const response = {
+    memory_id: "memory-1",
+    current_change_id: "a/current",
+    items: [{ ...item, change_id: "z/earlier" }, { ...item, change_id: "a/current" }],
+    has_more: false,
+  };
+  assertEquals(parseSubjektivMemoryListChangesResponse(response), response);
+  assertEquals(parseSubjektivMemoryReadResponse({ ...detailFixture(), change_id: "z/earlier", current_change_id: "a/current" }).change_id, "z/earlier");
+});
+
+Deno.test("Memory identities reject numeric counters, empty and oversized strings, and legacy fields", () => {
+  for (const value of [3, "", "x".repeat(513)]) {
+    assertThrows(() => parseSubjektivMemoryReadResponse({ ...detailFixture(), change_id: value }), "bounded identifier");
+    assertThrows(() => parseSubjektivMemoryReadResponse({ ...detailFixture(), current_change_id: value }), "bounded identifier");
+    assertThrows(() => parseSubjektivSubjectResponse({ ...subject(), memory_fingerprint: value }), "bounded identifier");
+  }
+  assertThrows(() => parseSubjektivMemoryReadResponse({ ...detailFixture(), revision: 2 }), "unknown field");
+  assertThrows(() => parseSubjektivSubjectResponse({ ...subject(), behavior_revision: 2 }), "unknown field");
+  assertThrows(() => parseSubjektivSubjectResponse({ ...subject(), store_revision: 12 }), "unknown field");
+});
+
+Deno.test("Behavior CAS sends the observed text byte-for-byte including empty content", async () => {
+  for (const expected of ["", "  Previous\nbehavior.\n"]) {
+    let body: unknown;
+    const fetchFn = (async (_path: string | URL | Request, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body));
+      return Response.json({ ...subject(), behavior_md: "Replacement" });
+    }) as typeof fetch;
+    await updateSubjektivSubjectBehavior(fetchFn, "workspace", "subject-1", { expected_behavior_md: expected, behavior_md: "Replacement" });
+    assertEquals(body, { expected_behavior_md: expected, behavior_md: "Replacement" });
+  }
+});
+
+Deno.test("Behavior saves with mismatched response text have unknown outcome and are not retried", async () => {
+  let calls = 0;
+  const fetchFn = (async () => {
+    calls += 1;
+    return Response.json(subject());
+  }) as typeof fetch;
+  await assertSubjectCreateRejects(() => updateSubjektivSubjectBehavior(fetchFn, "workspace", "subject-1", {
+    expected_behavior_md: "Prefer explicit evidence.", behavior_md: "Replacement",
+  }), "unknown_outcome", "could not be confirmed");
+  assertEquals(calls, 1);
 });
 
 Deno.test("Legacy staging parser remains strict for deprecated compatibility", () => {

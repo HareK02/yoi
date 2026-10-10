@@ -2,7 +2,7 @@
 //!
 //! The tool intentionally accepts only the result value. Workspace and Worker
 //! identity come from the authenticated Workspace client, while Job, attempt,
-//! and input revision are resolved from the Backend-owned binding.
+//! and input digest are resolved from the Backend-owned binding.
 
 use crate::feature::background::BackgroundTaskCancellation;
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ use crate::feature::{
 use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
 
 const TOOL_NAME: &str = "SubmitBackendJobResult";
-const TOOL_DESCRIPTION: &str = "Submit the bounded structured result for this Backend-owned Job attempt. Workspace, Job, attempt, input revision, and source Worker identity are resolved and fenced by Backend authority; normal final prose is not success.";
+const TOOL_DESCRIPTION: &str = "Submit the bounded structured result for this Backend-owned Job attempt. Workspace, Job, attempt, input digest, and source Worker identity are resolved and fenced by Backend authority; normal final prose is not success.";
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -194,7 +194,7 @@ impl Tool for SubmitResultTool {
             let sealed = submission.sealed.as_mut().expect("sealed before dispatch");
             if definitive_rejection && !was_previously_sealed {
                 // Only a definitively unaccepted request can be corrected. Reuse
-                // a ready snapshot after a new preparation confirms its revision;
+                // a ready snapshot after a new preparation confirms its Memory fingerprint;
                 // a conflict invalidates even that snapshot. Failed outcomes are
                 // rebuilt, since another generation can replace their marker.
                 submission.reusable_surface = if response.status != 409 {

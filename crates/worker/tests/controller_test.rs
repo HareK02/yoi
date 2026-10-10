@@ -867,7 +867,7 @@ async fn backend_job_capability_is_explicit_and_preserves_profile_features() {
                 .bind_backend_job(worker::BackendJobExecutionBinding {
                     job_id: "job-1".into(),
                     attempt_id: "attempt-1".into(),
-                    input_revision: Some("input-1".into()),
+                    input_digest: Some("input-1".into()),
                     subjektiv_consolidation: false,
                 })
                 .unwrap();
@@ -913,7 +913,6 @@ async fn consolidation_job_preserves_custom_instruction_and_explicit_tool_policy
         .subjektiv
         .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
             workspace_id: "workspace-1".into(),
-            settings_revision: 1,
             language: "English".into(),
         })
         .unwrap();
@@ -932,7 +931,7 @@ async fn consolidation_job_preserves_custom_instruction_and_explicit_tool_policy
         .bind_backend_job(worker::BackendJobExecutionBinding {
             job_id: "job-1".into(),
             attempt_id: "attempt-1".into(),
-            input_revision: None,
+            input_digest: None,
             subjektiv_consolidation: true,
         })
         .unwrap();
@@ -1897,7 +1896,6 @@ async fn submit_while_running_or_paused_is_durably_queued() {
     assert_eq!(snapshot.head_id, pending.head_id);
     handle
         .send(Method::ContinuePending {
-            expected_revision: snapshot.revision,
             expected_head_id: snapshot.head_id.unwrap(),
         })
         .await
@@ -3506,7 +3504,6 @@ async fn paused_submit_waits_for_cancel_and_continue_pending() {
     assert_eq!(pending.submissions.len(), 1);
     handle
         .send(Method::ContinuePending {
-            expected_revision: pending.revision,
             expected_head_id: pending.head_id.unwrap(),
         })
         .await

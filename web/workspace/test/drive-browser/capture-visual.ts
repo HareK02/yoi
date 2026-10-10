@@ -55,31 +55,31 @@ for (const scheme of ["light", "dark"]) {
   }
   if (stage === "after") {
     routes.push({
-      id: "drive-form-revision",
-      label: "Pinned rename and replace form revisions",
+      id: "drive-form-observation",
+      label: "Pinned rename and replace form observations",
       path: "/w/home-owner/drive/3",
-      goal: "Show the form's locked read revision and explicit destination/file controls.",
+      goal: "Show the form's locked read observation and explicit destination/file controls.",
       dataState:
-        "Revision 1 read from fixture metadata; no mutation is sent by these capture interactions.",
+        "Initial committed request read from fixture metadata; no mutation is sent by these capture interactions.",
       ready: { kind: "selector", selector: '.drive-page[data-drive-ready="true"]' },
       capturePoints: [
         {
           id: "rename",
-          label: "Rename / move pinned revision",
+          label: "Rename / move pinned observation",
           fullPage: true,
           interaction: [
             { action: "click", selector: '.drive-menu > summary[aria-label="More actions"]' },
             { action: "click", selector: '.drive-toolbar button:has-text("Rename / move")' },
             {
               action: "wait",
-              ready: { kind: "selector", selector: '.drive-form:has-text("Expected revision 1.")' },
+              ready: { kind: "selector", selector: '.drive-form:has-text("Changes by another writer will not be overwritten.")' },
             },
             { action: "press", selector: ".drive-form input:not([inputmode])", key: "Shift" },
           ],
         },
         {
           id: "replace",
-          label: "Replace file pinned revision",
+          label: "Replace file pinned observation",
           fullPage: true,
           interaction: [
             { action: "click", selector: '.drive-form button:has-text("Cancel form")' },
@@ -87,7 +87,7 @@ for (const scheme of ["light", "dark"]) {
             { action: "click", selector: '.drive-toolbar button:has-text("Replace file")' },
             {
               action: "wait",
-              ready: { kind: "selector", selector: '.drive-form:has-text("Expected revision 1.")' },
+              ready: { kind: "selector", selector: '.drive-form:has-text("Changes by another writer will not be overwritten.")' },
             },
             { action: "press", selector: ".drive-form input[type=file]", key: "Shift" },
           ],
@@ -367,7 +367,7 @@ for (const scheme of ["light", "dark"]) {
       if (
         [
           "drive-markdown",
-          "drive-form-revision",
+          "drive-form-observation",
           "drive-image",
           "drive-image-error",
           "drive-truncated",

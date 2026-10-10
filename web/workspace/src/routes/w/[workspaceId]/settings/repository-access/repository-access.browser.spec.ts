@@ -18,7 +18,6 @@ const defaultCredential = {
   name: "Workspace default",
   public_key_algorithm: "ssh-ed25519",
   public_key_fingerprint: "SHA256:default",
-  current_revision: 3,
   status: "active",
   created_at: "2026-01-01T00:00:00Z",
   rotated_at: null,
@@ -31,7 +30,6 @@ const deployCredential = {
   name: "Deploy key",
   public_key_algorithm: "ssh-ed25519",
   public_key_fingerprint: "SHA256:deploy",
-  current_revision: 2,
   status: "active",
   created_at: "2026-01-01T00:00:00Z",
   rotated_at: null,
@@ -46,7 +44,6 @@ const hostTrust = {
   key_algorithm: "ssh-ed25519",
   host_key: "ssh-ed25519 AAAA-current",
   fingerprint: "SHA256:host-current",
-  current_revision: 4,
   created_at: "2026-01-01T00:00:00Z",
   updated_at: "2026-01-01T00:00:00Z",
   referenced_repositories: [],
@@ -62,7 +59,6 @@ function pageData(workspaceId = "workspace-1") {
     credentialsError: null,
     publicKeys: [{
       credential_id: "workspace-default",
-      current_revision: 3,
       public_key_algorithm: "ssh-ed25519",
       public_key_fingerprint: "SHA256:default",
       public_key: "ssh-ed25519 AAAA-default",
@@ -72,7 +68,6 @@ function pageData(workspaceId = "workspace-1") {
     hostTrustsError: null,
     accessProjection: {
       workspace_id: workspaceId,
-      config_revision: 1,
       projection_digest: "sha256:projection",
       bindings: [],
     },
@@ -144,7 +139,6 @@ test("fences a deferred editor while an unrelated host draft remains active afte
     if (url.endsWith("/credentials/generated/public-key")) {
       return Promise.resolve(Response.json({
         credential_id: "generated",
-        current_revision: 1,
         public_key_algorithm: "ssh-ed25519",
         public_key_fingerprint: "SHA256:generated",
         public_key: "ssh-ed25519 AAAA-generated",
@@ -202,7 +196,6 @@ test("fences a deferred editor while an unrelated host draft remains active afte
     credential_id: "generated",
     name: "Generated key",
     public_key_fingerprint: "SHA256:generated",
-    current_revision: 1,
   }));
   expect(await screen.findByText("Generated key")).not.toBeNull();
   expect(screen.getByRole("heading", { name: "Add pinned host key" })).not
@@ -321,7 +314,6 @@ test("rerendering for another Workspace resets local state and fences stale resp
     }],
     accessProjection: {
       workspace_id: "workspace-2",
-      config_revision: 7,
       projection_digest: "sha256:workspace-b",
       bindings: [],
     },
@@ -335,7 +327,6 @@ test("rerendering for another Workspace resets local state and fences stale resp
 
   stalePublicKey.resolve(Response.json({
     credential_id: "deploy",
-    current_revision: 2,
     public_key_algorithm: "ssh-ed25519",
     public_key_fingerprint: "SHA256:deploy",
     public_key: "ssh-ed25519 AAAA-stale",
@@ -363,7 +354,6 @@ test("retries public-key loading after a post-rotation refresh failure", async (
       return Promise.resolve(Response.json({
         ...deployCredential,
         public_key_fingerprint: "SHA256:deploy-new",
-        current_revision: 3,
         rotated_at: "2026-02-01T00:00:00Z",
       }));
     }
@@ -374,7 +364,6 @@ test("retries public-key loading after a post-rotation refresh failure", async (
       }
       return Promise.resolve(Response.json({
         credential_id: "deploy",
-        current_revision: 3,
         public_key_algorithm: "ssh-ed25519",
         public_key_fingerprint: "SHA256:deploy-new",
         public_key: newPublicKey,
@@ -388,7 +377,6 @@ test("retries public-key loading after a post-rotation refresh failure", async (
   const data = pageData();
   data.publicKeys.push({
     credential_id: "deploy",
-    current_revision: 2,
     public_key_algorithm: "ssh-ed25519",
     public_key_fingerprint: "SHA256:deploy",
     public_key: "ssh-ed25519 AAAA-old-deploy",
@@ -454,7 +442,7 @@ test("locks a rotation to its host and port and discloses explicit and automatic
   const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
   expect(body.hostname).toBe("github.com");
   expect(body.port).toBe(22);
-  expect(body.expected_revision).toBe(4);
+  expect(body.expected_fingerprint).toBe("SHA256:host-current");
   expect(
     (screen.getByRole("button", { name: "Saving…" }) as HTMLButtonElement)
       .disabled,
@@ -474,7 +462,6 @@ test("locks a rotation to its host and port and discloses explicit and automatic
     ...hostTrust,
     host_key: "ssh-ed25519 AAAA-new",
     fingerprint: "SHA256:host-new",
-    current_revision: 5,
   }));
   expect(await within(row).findByText(/Rotated the key for github.com:22/)).not
     .toBeNull();

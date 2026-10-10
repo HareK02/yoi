@@ -35,11 +35,24 @@ fn auth_repo(repository_id: &str) -> MergeRequestAuth {
         ..auth()
     }
 }
+fn content_digest(title: &str) -> String {
+    let connection = Connection::open_in_memory().unwrap();
+    connection.execute_batch("CREATE TABLE typed_tickets(workspace_id TEXT,ticket_id TEXT,title TEXT,body TEXT); CREATE TABLE typed_ticket_targets(workspace_id TEXT,ticket_id TEXT,ordinal INTEGER,repository_key TEXT,ref_selector TEXT,access TEXT);").unwrap();
+    connection
+        .execute(
+            "INSERT INTO typed_tickets VALUES('W','T',?1,'Requirements')",
+            [title],
+        )
+        .unwrap();
+    ticket::sqlite_ticket_content_digest(&connection, "W", "T")
+        .unwrap()
+        .unwrap()
+}
 fn fixture() -> (tempfile::TempDir, MergeRequestStore) {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("db");
     let c = Connection::open(&p).unwrap();
-    c.execute_batch("CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY);CREATE TABLE repositories(workspace_id TEXT,repository_id TEXT,PRIMARY KEY(workspace_id,repository_id));CREATE TABLE ticket_current_worker_assignments(workspace_id TEXT,ticket_id TEXT,assignment_id TEXT,runtime_id TEXT,worker_id TEXT,updated_at TEXT,PRIMARY KEY(workspace_id,ticket_id));CREATE TABLE typed_tickets(workspace_id TEXT,ticket_id TEXT,workflow_state TEXT,workflow_state_explicit INTEGER,updated_at TEXT,PRIMARY KEY(workspace_id,ticket_id));CREATE TABLE typed_ticket_events(workspace_id TEXT,ticket_id TEXT,event_index INTEGER,kind TEXT,author TEXT,at TEXT,from_state TEXT,to_state TEXT,heading TEXT,body TEXT,PRIMARY KEY(workspace_id,ticket_id,event_index));CREATE TABLE typed_ticket_event_attributes(workspace_id TEXT,ticket_id TEXT,event_index INTEGER,key TEXT,value TEXT,PRIMARY KEY(workspace_id,ticket_id,event_index,key));INSERT INTO workspaces VALUES('W');INSERT INTO repositories VALUES('W','R');INSERT INTO repositories VALUES('W','R2');INSERT INTO ticket_current_worker_assignments VALUES('W','T','A','runtime','coder','t');INSERT INTO typed_tickets VALUES('W','T','inprogress',1,'t');CREATE VIEW ticket_active_worker_assignments AS SELECT current.* FROM ticket_current_worker_assignments current JOIN typed_tickets ticket ON ticket.workspace_id=current.workspace_id AND ticket.ticket_id=current.ticket_id WHERE ticket.workflow_state NOT IN ('done','closed');").unwrap();
+    c.execute_batch("CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY);CREATE TABLE repositories(workspace_id TEXT,repository_id TEXT,PRIMARY KEY(workspace_id,repository_id));CREATE TABLE ticket_current_worker_assignments(workspace_id TEXT,ticket_id TEXT,assignment_id TEXT,runtime_id TEXT,worker_id TEXT,updated_at TEXT,PRIMARY KEY(workspace_id,ticket_id));CREATE TABLE typed_tickets(workspace_id TEXT,ticket_id TEXT,workflow_state TEXT,workflow_state_explicit INTEGER,updated_at TEXT,title TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(workspace_id,ticket_id));CREATE TABLE typed_ticket_targets(workspace_id TEXT,ticket_id TEXT,ordinal INTEGER,repository_key TEXT,ref_selector TEXT,access TEXT);CREATE TABLE typed_ticket_events(workspace_id TEXT,ticket_id TEXT,event_index INTEGER,kind TEXT,author TEXT,at TEXT,from_state TEXT,to_state TEXT,heading TEXT,body TEXT,PRIMARY KEY(workspace_id,ticket_id,event_index));CREATE TABLE typed_ticket_event_attributes(workspace_id TEXT,ticket_id TEXT,event_index INTEGER,key TEXT,value TEXT,PRIMARY KEY(workspace_id,ticket_id,event_index,key));INSERT INTO workspaces VALUES('W');INSERT INTO repositories VALUES('W','R');INSERT INTO repositories VALUES('W','R2');INSERT INTO ticket_current_worker_assignments VALUES('W','T','A','runtime','coder','t');INSERT INTO typed_tickets VALUES('W','T','inprogress',1,'t','Title','Requirements');CREATE VIEW ticket_active_worker_assignments AS SELECT current.* FROM ticket_current_worker_assignments current JOIN typed_tickets ticket ON ticket.workspace_id=current.workspace_id AND ticket.ticket_id=current.ticket_id WHERE ticket.workflow_state NOT IN ('done','closed');").unwrap();
     drop(c);
     let a = Assignments(Arc::new(Mutex::new(CurrentAssignment {
         assignment_id: "A".into(),
@@ -50,6 +63,221 @@ fn fixture() -> (tempfile::TempDir, MergeRequestStore) {
     let s = MergeRequestStore::open(&p, Arc::new(a), Arc::new(Repositories)).unwrap();
     (d, s)
 }
+/// Frozen v12 fixture: counters must never be promoted to content attestations.
+fn freeze_v12_review_payloads(connection: &Connection) {
+    let rows = {
+        let mut statement = connection.prepare(
+            "SELECT event_id,payload_json FROM merge_request_thread_events WHERE kind IN ('review_requested','review')",
+        ).unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    for (event_id, payload) in rows {
+        let mut value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("ticket_content_digest");
+        object.insert("ticket_item_revision".into(), serde_json::json!("T:0"));
+        connection
+            .execute(
+                "UPDATE merge_request_thread_events SET payload_json=?2 WHERE event_id=?1",
+                rusqlite::params![event_id, value.to_string()],
+            )
+            .unwrap();
+    }
+    connection
+        .execute("UPDATE merge_request_schema SET version=12", [])
+        .unwrap();
+}
+
+#[test]
+fn v12_migration_revokes_old_grants_preserves_integration_and_requires_fresh_content_review() {
+    let (dir, store) = fixture();
+    open(&store);
+    let approved = approve(&store, "source", "old-consumed");
+    let completion = CompleteMergeRequest {
+        merge_request_id: "MR".into(),
+        ticket_id: "T".into(),
+        operation_id: "integration".into(),
+        approval_event_id: approved.event_id.clone(),
+        current_subject_ref: "source".into(),
+        target_ref_before: "before".into(),
+        target_ref_after: "after".into(),
+        strategy: MergeStrategy::FastForward,
+        resolution: ConflictResolution::None,
+        auth: auth(),
+        now: at(5),
+    };
+    let merged = store.complete(completion.clone()).unwrap();
+    request(&store, "source", "old-issued");
+    let connection = Connection::open(dir.path().join("db")).unwrap();
+    freeze_v12_review_payloads(&connection);
+    let original_reviews = {
+        let mut statement = connection.prepare(
+            "SELECT event_id,payload_json FROM merge_request_thread_events WHERE kind IN ('review_requested','review') ORDER BY event_id",
+        ).unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    migrate(&connection).unwrap();
+    let archived_reviews = {
+        let mut statement = connection.prepare(
+            "SELECT event_id,payload_json FROM merge_request_legacy_review_archive ORDER BY event_id",
+        ).unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        archived_reviews, original_reviews,
+        "historical review bytes must survive conversion"
+    );
+    assert!(
+        connection
+            .execute_batch("UPDATE merge_request_legacy_review_archive SET payload_json='{}'")
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute_batch("DELETE FROM merge_request_legacy_review_archive")
+            .is_err()
+    );
+    let grants: Vec<(String, String, Option<String>)> = connection.prepare(
+        "SELECT capability_token,status,revoked_at FROM merge_request_review_grants ORDER BY capability_token",
+    ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!(grants[0].0, "old-consumed");
+    assert_eq!(grants[0].1, "consumed");
+    assert_eq!(grants[1].0, "old-issued");
+    assert_eq!(grants[1].1, "revoked");
+    assert!(grants[1].2.is_some());
+    let legacy_terms: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM merge_request_thread_events WHERE payload_json LIKE '%ticket_item_revision%'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(legacy_terms, 0);
+    let saved = store.get_by_id("W", "MR").unwrap();
+    assert_eq!(saved.merged_result().unwrap(), &merged);
+    let integration = saved.integration_approval().unwrap();
+    assert_eq!(integration.event_id, approved.event_id);
+    assert!(integration.ticket_content_digest.is_empty());
+    let snapshot = vec![MergeRequestReviewSubject {
+        merge_request_id: "MR".into(),
+        subject_ref: "source".into(),
+    }];
+    assert_eq!(
+        requirement_approval(
+            &[saved],
+            &content_digest("Title"),
+            &snapshot,
+            Some(&approved.event_id)
+        ),
+        Err(MergeRequestEvidenceError::TicketContentMismatch),
+    );
+    assert!(matches!(
+        store.authorize_review_submission("MR", "old-issued"),
+        Err(MergeRequestError::Unauthorized(_)),
+    ));
+    assert!(
+        store
+            .submit_review(SubmitMergeRequestReview {
+                merge_request_id: "MR".into(),
+                ticket_id: "T".into(),
+                current_subject_ref: "source".into(),
+                capability_token: "old-issued".into(),
+                decision: ReviewDecision::Approve,
+                body: "late old review".into(),
+                findings: vec![],
+                now: at(6),
+            })
+            .is_err()
+    );
+    assert_eq!(
+        store.complete(completion).unwrap(),
+        merged,
+        "recorded merge replay stays intact"
+    );
+    let fresh = approve(&store, "source", "fresh");
+    assert_eq!(fresh.ticket_content_digest, content_digest("Title"));
+    migrate(&connection).unwrap();
+    let requests = store.list_for_ticket("W", "T").unwrap();
+    assert_eq!(
+        requirement_approval(
+            &requests,
+            &content_digest("Title"),
+            &snapshot,
+            Some(&fresh.event_id)
+        )
+        .unwrap(),
+        &fresh,
+    );
+    assert_eq!(requests[0].merged_result().unwrap(), &merged);
+    assert_eq!(
+        connection
+            .query_row("SELECT version FROM merge_request_schema", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        13
+    );
+}
+
+#[test]
+fn v12_migration_rolls_back_payload_and_grant_changes_when_schema_update_fails() {
+    let (dir, store) = fixture();
+    open(&store);
+    request(&store, "source", "old-issued");
+    let connection = Connection::open(dir.path().join("db")).unwrap();
+    freeze_v12_review_payloads(&connection);
+    let before: String = connection
+        .query_row(
+            "SELECT payload_json FROM merge_request_thread_events WHERE kind='review_requested'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection.execute_batch(
+        "CREATE TRIGGER reject_schema_update BEFORE UPDATE ON merge_request_schema BEGIN SELECT RAISE(ABORT,'injected migration failure'); END;",
+    ).unwrap();
+    assert!(migrate(&connection).is_err());
+    assert!(
+        connection
+            .prepare("SELECT * FROM merge_request_legacy_review_archive")
+            .is_err(),
+        "failed conversion must roll back its archive too"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT version FROM merge_request_schema", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        12
+    );
+    assert_eq!(connection.query_row("SELECT payload_json FROM merge_request_thread_events WHERE kind='review_requested'", [], |row| row.get::<_, String>(0)).unwrap(), before);
+    assert_eq!(connection.query_row("SELECT status FROM merge_request_review_grants WHERE capability_token='old-issued'", [], |row| row.get::<_, String>(0)).unwrap(), "issued");
+    connection
+        .execute_batch("DROP TRIGGER reject_schema_update")
+        .unwrap();
+    migrate(&connection).unwrap();
+    assert!(
+        store
+            .authorize_review_submission("MR", "old-issued")
+            .is_err()
+    );
+}
+
 fn open_for(s: &MergeRequestStore, merge_request_id: &str, repository_id: &str) {
     s.open_merge_request(OpenMergeRequest {
         merge_request_id: merge_request_id.into(),
@@ -108,7 +336,7 @@ fn request_for(
         .collect();
     s.request_review(RequestMergeRequestReview {
         merge_request_id: merge_request_id.into(),
-        ticket_item_revision: "t".into(),
+        ticket_content_digest: content_digest("Title"),
         ticket_merge_request_subjects,
         ticket_id: "T".into(),
         subject_ref: subject.into(),
@@ -236,13 +464,13 @@ fn integration_preserves_selectors_ticket_state_and_assignment_and_replays_its_m
     assert!(active);
     let json = serde_json::to_string(&mr).unwrap();
     for banned in [
-        "revision_id",
+        "digest_id",
         "attempt_id",
         "base_commit",
         "head_commit",
         "source_commit",
         "result_commit",
-        "current_revision",
+        "current_digest",
     ] {
         assert!(!json.contains(banned), "{banned} in {json}")
     }
@@ -375,7 +603,7 @@ fn review_revocation_invalidates_readiness() {
 }
 
 #[test]
-fn fresh_schema_uses_version_12_and_reopens_as_current() {
+fn fresh_schema_uses_version_13_and_reopens_as_current() {
     let c = Connection::open_in_memory().unwrap();
     c.execute_batch(
         "CREATE TABLE repositories(workspace_id TEXT,repository_id TEXT,PRIMARY KEY(workspace_id,repository_id));CREATE TABLE typed_tickets(workspace_id TEXT,ticket_id TEXT,PRIMARY KEY(workspace_id,ticket_id));",
@@ -388,7 +616,7 @@ fn fresh_schema_uses_version_12_and_reopens_as_current() {
             r.get::<_, i64>(0)
         })
         .unwrap(),
-        12
+        13
     );
     merge_request::migrate(&c).unwrap();
 }
@@ -724,9 +952,8 @@ fn ticket_rescope_requires_fresh_review_before_merge_and_remains_recoverable() {
     let stale = approve(&store, "subject", "token-stale");
     let connection = Connection::open(dir.path().join("db")).unwrap();
     connection
-        .execute(
-            "INSERT INTO typed_ticket_events VALUES('W','T',1,'item_edit','user','t2',NULL,NULL,NULL,NULL)",
-            [],
+        .execute_batch(
+            "UPDATE typed_tickets SET title='Rescoped' WHERE workspace_id='W' AND ticket_id='T'; INSERT INTO typed_ticket_events VALUES('W','T',1,'item_edit','user','t2',NULL,NULL,NULL,NULL)",
         )
         .unwrap();
     connection
@@ -750,7 +977,7 @@ fn ticket_rescope_requires_fresh_review_before_merge_and_remains_recoverable() {
         readiness
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("Ticket revision"))
+            .any(|blocker| blocker.contains("Ticket digest"))
     );
 
     let stale_completion = CompleteMergeRequest {
@@ -789,7 +1016,7 @@ fn ticket_rescope_requires_fresh_review_before_merge_and_remains_recoverable() {
         .request_review(RequestMergeRequestReview {
             merge_request_id: "MR".into(),
             ticket_id: "T".into(),
-            ticket_item_revision: "T:1".into(),
+            ticket_content_digest: content_digest("Rescoped"),
             ticket_merge_request_subjects: vec![MergeRequestReviewSubject {
                 merge_request_id: "MR".into(),
                 subject_ref: "subject".into(),
@@ -852,9 +1079,8 @@ fn ticket_rescope_after_integration_accepts_fresh_requirement_attestation() {
         .unwrap();
     let connection = Connection::open(dir.path().join("db")).unwrap();
     connection
-        .execute(
-            "INSERT INTO typed_ticket_events VALUES('W','T',1,'item_edit','user','t2',NULL,NULL,NULL,NULL)",
-            [],
+        .execute_batch(
+            "UPDATE typed_tickets SET title='Rescoped' WHERE workspace_id='W' AND ticket_id='T'; INSERT INTO typed_ticket_events VALUES('W','T',1,'item_edit','user','t2',NULL,NULL,NULL,NULL)",
         )
         .unwrap();
     connection
@@ -873,11 +1099,11 @@ fn ticket_rescope_after_integration_accepts_fresh_requirement_attestation() {
     assert_eq!(
         requirement_approval(
             &before_refresh,
-            "T:1",
+            &content_digest("Rescoped"),
             &snapshot,
             Some(&integration_approval.event_id),
         ),
-        Err(MergeRequestEvidenceError::ItemRevisionMismatch)
+        Err(MergeRequestEvidenceError::TicketContentMismatch)
     );
     assert_eq!(before_refresh[0].merged_result().unwrap(), &merge);
     assert_eq!(
@@ -899,7 +1125,7 @@ fn ticket_rescope_after_integration_accepts_fresh_requirement_attestation() {
         .request_review(RequestMergeRequestReview {
             merge_request_id: "MR".into(),
             ticket_id: "T".into(),
-            ticket_item_revision: "T:1".into(),
+            ticket_content_digest: content_digest("Rescoped"),
             ticket_merge_request_subjects: vec![MergeRequestReviewSubject {
                 merge_request_id: "MR".into(),
                 subject_ref: "subject".into(),
@@ -927,7 +1153,7 @@ fn ticket_rescope_after_integration_accepts_fresh_requirement_attestation() {
     assert_eq!(
         requirement_approval(
             &refreshed,
-            "T:1",
+            &content_digest("Rescoped"),
             &snapshot,
             Some(&requirement_review.event_id),
         )
@@ -935,7 +1161,7 @@ fn ticket_rescope_after_integration_accepts_fresh_requirement_attestation() {
         &requirement_review
     );
     assert_eq!(
-        requirement_approval(&refreshed, "T:1", &snapshot, None).unwrap(),
+        requirement_approval(&refreshed, &content_digest("Rescoped"), &snapshot, None).unwrap(),
         &requirement_review
     );
     assert_eq!(refreshed[0].merged_result().unwrap(), &merge);
@@ -970,7 +1196,7 @@ fn review_request_rejects_a_snapshot_that_omits_a_linked_merge_request() {
     let result = store.request_review(RequestMergeRequestReview {
         merge_request_id: "MR".into(),
         ticket_id: "T".into(),
-        ticket_item_revision: "t".into(),
+        ticket_content_digest: content_digest("Title"),
         ticket_merge_request_subjects: vec![MergeRequestReviewSubject {
             merge_request_id: "MR".into(),
             subject_ref: "subject-one".into(),
@@ -1058,7 +1284,13 @@ fn partial_and_full_integration_retain_ticket_state_and_active_assignment() {
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        requirement_approval(&requests, "t", &snapshot, Some(&second.event_id)).unwrap(),
+        requirement_approval(
+            &requests,
+            &content_digest("Title"),
+            &snapshot,
+            Some(&second.event_id)
+        )
+        .unwrap(),
         &second
     );
     let first_request = requests
@@ -1217,9 +1449,7 @@ fn persisted_integration_evidence_rejects_missing_mismatched_revoked_or_late_app
                 match case {
                     "source-mismatch" => altered.subject_ref = "different-source".into(),
                     "not-approved" => altered.decision = ReviewDecision::RequestChanges,
-                    "request-mismatch" => {
-                        altered.ticket_item_revision = "different-revision".into()
-                    }
+                    "request-mismatch" => altered.ticket_content_digest = "different-digest".into(),
                     _ => unreachable!(),
                 }
                 connection.execute(

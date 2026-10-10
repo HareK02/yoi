@@ -170,13 +170,13 @@
         if (!file) throw new Error('Choose a file.');
         if (file.size > DRIVE_FILE_MAX_BYTES) throw new Error('Upload exceeds 16 MiB.');
         requestId = await controller.upload(file, selectedForm === 'replace' ? {
-          operation: 'update', id: current.entry, expected_revision: current.revision, content_type: file.type || 'application/octet-stream',
+          operation: 'update', id: current.entry, expected_mutation_id: current.last_mutation_id, content_type: file.type || 'application/octet-stream',
         } : {
           operation: 'create', parent: current.entry, name: file.name, content_type: file.type || 'application/octet-stream',
         });
       } else if (selectedForm === 'relocate') {
         if (!destination || destinationBusy || destinationError) throw new Error('Choose an available destination folder.');
-        requestId = await controller.mutate({ operation: 'relocate', id: current.entry, expected_revision: current.revision, parent: { workspace_id: workspaceId, node_id: parseDriveDecimal(parentId) }, name });
+        requestId = await controller.mutate({ operation: 'relocate', id: current.entry, expected_mutation_id: current.last_mutation_id, parent: { workspace_id: workspaceId, node_id: parseDriveDecimal(parentId) }, name });
       } else {
         requestId = await controller.mutate(selectedForm === 'folder' ? { operation: 'create_folder', parent: current.entry, name } : { operation: 'create_text', parent: current.entry, name, text: newText, content_type: 'text/markdown' });
       }
@@ -193,7 +193,7 @@
     if (!current || !canWrite || !current.parent) return;
     if (!confirm(`Delete “${current.name}”? This cannot be undone. Folders must be empty; contents are never recursively deleted.`)) return;
     await action(async () => {
-      await controller.mutate({ operation: 'delete', id: current.entry, expected_revision: current.revision });
+      await controller.mutate({ operation: 'delete', id: current.entry, expected_mutation_id: current.last_mutation_id });
       // Stay on this stable URL; a subsequent lookup correctly reports NotFound.
       if (controller.state.receipts.at(-1)?.state === 'committed') await controller.refresh();
     });
@@ -283,7 +283,7 @@
         <button class="primary" type="button" onclick={() => openForm('upload')}><DriveIcon name="upload" />Upload</button>
       {/if}
       {#if entry?.parent}
-        {#if entry.kind === 'file'}<a class="drive-button" href={driveDownloadUrl(workspaceId, entry.entry, entry.revision)} download={entry.name}><DriveIcon name="download" />Download</a>{/if}
+        {#if entry.kind === 'file'}<a class="drive-button" href={driveDownloadUrl(workspaceId, entry.entry, entry.last_mutation_id)} download={entry.name}><DriveIcon name="download" />Download</a>{/if}
         {#if canEdit}<button class="primary" type="button" onclick={() => editing = !editing}><DriveIcon name="edit" />{editing ? 'View' : 'Edit text'}</button>{/if}
         <details class="drive-menu" bind:open={actionsMenu}>
           <summary class="icon-button" aria-label="More actions" title="More actions"><DriveIcon name="more" /></summary>
@@ -352,17 +352,17 @@
     {:else if kind === 'markdown' || kind === 'text'}
       {#if $controller.truncated}<p class="drive-state" role="status">Preview truncated at 64 KiB. Download the full file; partial content cannot be saved.</p>{/if}
       {#if draft?.conflict}
-        <div class="drive-conflict" role="alert"><strong>Revision conflict — your draft is retained.</strong><p>Another writer changed this file. Refresh displays the latest content without changing your draft or its expected revision. Copy your draft before explicitly discarding it; it is never automatically retried.</p></div>
+        <div class="drive-conflict" role="alert"><strong>Content changed — your draft is retained.</strong><p>Another writer changed this file. Refresh displays the latest content without changing your draft or the saved content it was based on. Copy your draft before explicitly discarding it; it is never automatically retried.</p></div>
       {/if}
       <div class="drive-document" class:is-editing={editing && draft !== null}>
         {#if editing && draft}
           <div class="drive-editor">
-            <label>Draft (expected revision {draft.expectedRevision})
+            <label>Draft
               <textarea value={draft.text} oninput={(event) => controller.edit(event.currentTarget.value)} readonly={denied} spellcheck="false"></textarea>
             </label>
             <div class="drive-toolbar">
               {#if canWrite}<button class="primary" type="button" disabled={!dirty || draft.conflict || new TextEncoder().encode(draft.text).length > DRIVE_TEXT_MAX_BYTES} onclick={() => action(() => controller.save())}>Save</button>{/if}
-              <button type="button" disabled={unresolved} onclick={() => { if (confirm('Discard your draft and load the current Backend revision?')) void action(() => controller.discardDraft()); }}>Discard draft / load latest</button>
+              <button type="button" disabled={unresolved} onclick={() => { if (confirm('Discard your draft and load the latest saved content?')) void action(() => controller.discardDraft()); }}>Discard draft / load latest</button>
               <span class="drive-note" role="status">{dirty ? 'Unsaved draft' : 'Saved content'} · {formatBytes(new TextEncoder().encode(draft.text).length)} / 64 KiB</span>
             </div>
           </div>
@@ -383,11 +383,11 @@
         {/if}
       </div>
     {:else if kind === 'download'}
-      <div class="drive-empty drive-download-preview"><span class="drive-empty-icon"><DriveIcon name="download" /></span><h2>No preview available</h2><p class="drive-note">This file type is download-only. HTML, SVG and other active content are never rendered here.</p><a class="drive-button" href={driveDownloadUrl(workspaceId, entry.entry, entry.revision)} download={entry.name}>Download file</a></div>
+      <div class="drive-empty drive-download-preview"><span class="drive-empty-icon"><DriveIcon name="download" /></span><h2>No preview available</h2><p class="drive-note">This file type is download-only. HTML, SVG and other active content are never rendered here.</p><a class="drive-button" href={driveDownloadUrl(workspaceId, entry.entry, entry.last_mutation_id)} download={entry.name}>Download file</a></div>
     {/if}
     {#if entry.parent}
       <details class="drive-details"><summary><DriveIcon name="info" />Details</summary>
-        <dl><div><dt>Updated</dt><dd>{formatDate(entry.updated_at)}</dd></div><div><dt>By</dt><dd>{entry.updated_by}</dd></div><div><dt>Revision</dt><dd>{entry.revision}</dd></div><div><dt>Latest URL</dt><dd><a href={driveHref(entry.entry)}>{driveHref(entry.entry)}</a></dd></div></dl>
+        <dl><div><dt>Updated</dt><dd>{formatDate(entry.updated_at)}</dd></div><div><dt>By</dt><dd>{entry.updated_by}</dd></div><div><dt>Last change request</dt><dd>{entry.last_mutation_id}</dd></div><div><dt>Latest URL</dt><dd><a href={driveHref(entry.entry)}>{driveHref(entry.entry)}</a></dd></div></dl>
         <p class="drive-note">Saving replaces the current content. There is no version history.</p>
       </details>
     {/if}
@@ -426,7 +426,7 @@
         {/if}
         {#if form === 'text'}<label>Markdown<textarea bind:value={newText} disabled={pending} placeholder="Write your document…"></textarea></label>{/if}
       {/if}
-      {#if form === 'replace' || form === 'relocate'}<p class="drive-note">Expected revision {formEntry?.revision}. Changes by another writer will not be overwritten.</p>{/if}
+      {#if form === 'replace' || form === 'relocate'}<p class="drive-note">Changes by another writer will not be overwritten.</p>{/if}
       {#if form === 'replace'}<p class="drive-note">This replaces the current file. There is no version history.</p>{/if}
       <footer class="drive-dialog-actions">
         <button type="button" disabled={pending} onclick={closeForm}>Cancel form</button>

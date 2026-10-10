@@ -32,7 +32,7 @@ function plan() {
     workspace_id: "workspace-a",
     runtime_id: "runtime-a",
     generated_at: "2026-09-01T00:00:00Z",
-    revision: "revision-a",
+
     digest: "digest-a",
     workers: [{
       target_id: "worker-target",

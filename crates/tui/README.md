@@ -40,11 +40,12 @@ arguments; Backspace/Delete removes a chip atomically. Typed chips survive local
 history, draft restoration, transport retry, and rewind.
 
 Every completion and chip-re-edit query carries a fresh `request_id`. Replies
-must echo that nonce and match the active query context, composer edit/cursor
-revision, authority snapshot generation, and Worker target. Identical-prefix ABA
-edits, cancelled/reopened queries, permission snapshots, and Worker/view switches
-cannot reuse older replies or candidates. Uncorrelated replies are ignored, even
-for File queries where the wire field remains optional for legacy callers.
+must echo that ID and match the active query context and Worker target. The first
+input/cursor edit cancels the pending input watch; returning to identical text
+cannot revive it. Authority snapshots and Worker/view switches discard pending
+queries and visible candidates, rather than advancing another counter.
+Uncorrelated replies are ignored, even for File queries where the wire field
+remains optional for legacy callers.
 
 The declared attachment adapter stages a client-local file in place, replacing
 its staging chip with an `UploadedFile` reference when ready. Local file argument

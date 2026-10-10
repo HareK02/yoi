@@ -250,7 +250,6 @@ pub struct WorkingDirectoryRepository {
     pub id: String,
     pub provider: String,
     pub source: RepositorySource,
-    pub source_revision: u64,
     pub source_fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<RepositorySelector>,
@@ -291,9 +290,6 @@ pub struct BackendResourceHandle {
     pub operation: BackendResourceOperation,
     pub expires_at_unix_seconds: i64,
     pub nonce: String,
-    pub revision: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation: Option<u64>,
     pub max_bytes: u64,
     pub content_type: String,
     pub redaction: ResourceRedactionPolicy,
@@ -305,14 +301,14 @@ pub struct BackendResourceHandle {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RepositorySshCredentialCandidate {
     pub credential_id: String,
-    pub credential_revision: u64,
+    pub public_key_fingerprint: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RepositorySshMaterializationAccess {
     pub credential_candidates: Vec<RepositorySshCredentialCandidate>,
     pub host_trust_id: String,
-    pub host_trust_revision: u64,
+    pub host_key_fingerprint: String,
     pub access: RepositoryAccessMode,
     pub expires_at_epoch_seconds: u64,
     pub repository_id: String,
@@ -326,7 +322,6 @@ pub struct RepositoryMaterializationContext {
     pub workspace_id: String,
     pub runtime_id: String,
     pub operation_id: String,
-    pub config_revision: u64,
     pub config_projection_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<RepositorySshMaterializationAccess>,
@@ -427,7 +422,7 @@ pub struct BackendJobExecutionBinding {
     pub job_id: String,
     pub attempt_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_revision: Option<String>,
+    pub input_digest: Option<String>,
     #[serde(default)]
     pub subjektiv_consolidation: bool,
 }
@@ -689,13 +684,11 @@ pub struct WorkerRetentionExecutionRequest {
     pub workspace_id: String,
     pub source_runtime_id: String,
     pub worker_id: WorkerId,
-    pub expected_worker_revision: String,
     pub source_created_at: String,
     pub removed_at: String,
     pub effective_profile: Option<String>,
     pub retention_class: Option<String>,
     pub policy_id: String,
-    pub policy_revision: u64,
     pub session_disposition: SessionDisposition,
     pub diagnostics_disposition: DiagnosticsDisposition,
 }
@@ -718,7 +711,6 @@ pub struct WorkerSessionArchiveManifest {
     pub content_bytes: u64,
     pub content_file_count: u64,
     pub policy_id: String,
-    pub policy_revision: u64,
     pub operation_id: String,
     pub input_fingerprint: String,
 }
@@ -727,7 +719,6 @@ pub struct WorkerSessionArchiveManifest {
 pub struct WorkerRetentionExecutionResult {
     pub operation_id: String,
     pub input_fingerprint: String,
-    pub expected_worker_revision: String,
     pub worker_id: WorkerId,
     pub session_disposition: SessionDisposition,
     pub diagnostics_disposition: DiagnosticsDisposition,

@@ -161,7 +161,7 @@ fn decode<T: serde::de::DeserializeOwned>(
                 .find(|diagnostic| {
                     matches!(
                         diagnostic.code.as_str(),
-                        "revision_conflict"
+                        "change_conflict"
                             | "stale_cursor"
                             | "candidate_decision_conflict"
                             | "subject_scope_mismatch"
@@ -394,7 +394,7 @@ pub(crate) fn test_connection(client: Arc<dyn WorkspaceClient>) -> SubjektivHost
     config
         .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
             workspace_id: client.workspace_id().unwrap().to_string(),
-            settings_revision: 1,
+
             language: "English".into(),
         })
         .unwrap();
@@ -447,7 +447,6 @@ mod tests {
                     Ok(SubjektivMemoryBackendResponse::ResidentContext(
                         SubjektivResidentContextOutput {
                             behavior_md: "Explicit local subject behavior.".into(),
-                            behavior_revision: 1,
                             memory_surface: memory::backend::MemoryResidentSummaryOutput {
                                 availability:
                                     memory::backend::MemoryResidentSummaryAvailability::Ungenerated,

@@ -34,8 +34,8 @@ export type WorkspaceWorkersState = {
   workers: SidebarWorker[];
   /** Full catalog metadata; null until fetched. Never substitutes sidebar display state. */
   catalogWorkers: Worker[] | null;
-  /** Changes immediately when an observation invalidates dependent cleanup plans. */
-  observationVersion: number;
+  /** Actual catalog GET identity; changes before dependent cleanup plans can settle. */
+  catalogRequest: AbortSignal | null;
   catalogRefreshing: boolean;
 };
 
@@ -108,7 +108,7 @@ export function workspaceWorkersStore(
       loading: true,
       workers: [],
       catalogWorkers: null,
-      observationVersion: 0,
+      catalogRequest: null,
       catalogRefreshing: true,
     },
     (set) => {
@@ -117,7 +117,7 @@ export function workspaceWorkersStore(
           loading: false,
           workers: [],
           catalogWorkers: [],
-          observationVersion: 0,
+          catalogRequest: null,
           catalogRefreshing: false,
         });
         return;
@@ -130,9 +130,7 @@ export function workspaceWorkersStore(
       let loading = true;
       let disposed = false;
       let catalogWorkers: Worker[] | null = null;
-      let observationVersion = 0;
       let catalogRefreshing = true;
-      let refreshSequence = 0;
       let catalogAbort: AbortController | null = null;
       const publish = (): boolean => {
         if (disposed) return false;
@@ -144,7 +142,7 @@ export function workspaceWorkersStore(
             loading,
             workers,
             catalogWorkers,
-            observationVersion,
+            catalogRequest: catalogAbort?.signal ?? null,
             catalogRefreshing,
           });
           return true;
@@ -160,7 +158,7 @@ export function workspaceWorkersStore(
             loading: false,
             workers,
             catalogWorkers,
-            observationVersion,
+            catalogRequest: catalogAbort?.signal ?? null,
             catalogRefreshing,
           });
           return false;
@@ -168,8 +166,6 @@ export function workspaceWorkersStore(
       };
       const refreshCatalog = async () => {
         if (disposed) return;
-        const sequence = ++refreshSequence;
-        const version = ++observationVersion;
         catalogAbort?.abort();
         const abort = new AbortController();
         catalogAbort = abort;
@@ -183,8 +179,7 @@ export function workspaceWorkersStore(
           { diagnosticLabel: "Worker API", maxResponseBytes: 8 * 1024 * 1024 },
         );
         if (
-          disposed || sequence !== refreshSequence ||
-          version !== observationVersion
+          disposed || abort.signal.aborted || catalogAbort !== abort
         ) return;
         if (!result.data || result.data.workspace_id !== workspaceId) {
           reportWorkerFailure(

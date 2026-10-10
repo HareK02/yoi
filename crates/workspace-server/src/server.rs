@@ -397,7 +397,6 @@ impl ServerConfig {
                 provider: repository.provider.unwrap_or(repository.kind),
                 path: repository_local_path(&repository.source),
                 source: repository.source,
-                source_revision: repository.source_revision,
                 source_fingerprint: repository.source_fingerprint,
                 observed_status: repository.observed_status,
                 observed_at: repository.observed_at,
@@ -2557,7 +2556,6 @@ fn workspace_repository_record(record: RepositoryRecord) -> WorkspaceRepositoryR
         provider: record.provider,
         source: record.source,
         default_ref: record.default_ref,
-        source_revision: record.source_revision,
         source_fingerprint: record.source_fingerprint,
         observed_status: record.observed_status,
         observed_at: record.observed_at,
@@ -2572,7 +2570,6 @@ fn workspace_create_response(
     WorkspaceCreateResponse {
         workspace: workspace_summary(created.workspace),
         repository: created.repository.map(workspace_repository_record),
-        config_revision: created.config_revision,
         request_fingerprint: created.request_fingerprint,
         replayed: created.replayed,
     }
@@ -3313,11 +3310,14 @@ impl WorkspaceApi {
                     base_url: "in-process://embedded".to_owned(),
                     public_key: embedded_identity.public_key.clone(),
                     public_key_fingerprint: String::new(),
-                    binding_revision: 1,
+                    binding_id: "binding-test".to_string(),
                     state: StoredRuntimeBindingState::Verified,
                     authentication_mode: StoredRuntimeAuthenticationMode::LegacyServerIssuer,
                     workspace_key_id: None,
-                    workspace_key_generation: None,
+
+                    workspace_public_key_fingerprint: None,
+
+                    workspace_trust_id: None,
                     created_at: config.workspace_created_at.clone(),
                     updated_at: config.workspace_created_at.clone(),
                     revoked_at: None,
@@ -3761,7 +3761,7 @@ impl WorkspaceApi {
                     job_id: request.job_id.clone(),
                     attempt_id: reservation.attempt.attempt_id.clone(),
                     purpose: request.purpose.clone(),
-                    input_revision: request.input_revision.clone(),
+                    input_digest: request.input_digest()?,
                     subjektiv_consolidation: request.grants.subjektiv_consolidation.is_some(),
                 },
                 acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
@@ -4515,7 +4515,7 @@ impl WorkspaceApi {
                 attempt.state,
                 BackendJobAttemptState::Dispatched | BackendJobAttemptState::Completed
             ) || attempt.worker.as_ref() != Some(source_worker)
-                || attempt.input_revision != submission.input_revision
+                || attempt.input_digest != submission.input_digest
                 || job.current_attempt != attempt.attempt
             {
                 return Err(Error::InvalidInput(
@@ -4555,7 +4555,7 @@ impl WorkspaceApi {
                 .ok_or_else(|| Error::InvalidInput("unknown consolidation attempt".into()))?;
             if attempt.worker.as_ref() != Some(source_worker)
                 || job.current_attempt != attempt.attempt
-                || attempt.input_revision != submission.input_revision
+                || attempt.input_digest != submission.input_digest
                 || !matches!(
                     attempt.state,
                     BackendJobAttemptState::Dispatched | BackendJobAttemptState::Completed
@@ -4658,8 +4658,8 @@ impl WorkspaceApi {
                 Ok(ticket_item_checker::TicketItemCheckNotification::Stale) => {
                     let detail = format!(
                         "checked revision {} is no longer current ({})",
-                        checker_input.revision,
-                        ticket_item_checker::item_revision(&current_ticket)
+                        checker_input.content_digest,
+                        ticket_item_checker::content_digest(&current_ticket)
                     );
                     let _ = self.store.finish_backend_job_delivery(
                         &self.config.workspace_id,
@@ -6063,7 +6063,6 @@ fn import_configured_repositories(
             provider: Some(repository.provider.clone()),
             source: repository.source.clone(),
             default_ref: repository.default_selector.clone(),
-            source_revision: repository.source_revision,
             source_fingerprint: repository.source_fingerprint.clone(),
             observed_status: repository.observed_status,
             observed_at: repository.observed_at.clone(),
@@ -6094,7 +6093,6 @@ fn configured_repository_from_record(record: RepositoryRecord) -> Result<Configu
         provider,
         path,
         source: record.source,
-        source_revision: record.source_revision,
         source_fingerprint: record.source_fingerprint,
         observed_status: record.observed_status,
         observed_at: record.observed_at,
@@ -6361,7 +6359,7 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::workspace_config_tree_commit(
             service.clone(),
         ))
-        .merge(server_api::server_api_axum::workspace_config_revision(
+        .merge(server_api::server_api_axum::workspace_config_history(
             service.clone(),
         ))
         .merge(server_api::server_api_axum::workspace_config_entry(
@@ -6406,7 +6404,7 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::subjektiv_memory_detail(
             service.clone(),
         ))
-        .merge(server_api::server_api_axum::subjektiv_memory_revisions(
+        .merge(server_api::server_api_axum::subjektiv_memory_changes(
             service.clone(),
         ))
         .merge(server_api::server_api_axum::subjektiv_subject_retire(
@@ -7741,7 +7739,7 @@ impl server_api::ServerApi for ServerApiContractService {
         server_api::RepositorySshHostTrustMutationResponse,
         server_api::RepositoryApiError,
     > {
-        let created = request.expected_revision.is_none();
+        let created = request.expected_fingerprint.is_none();
         scoped_put_repository_ssh_host_trust(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
@@ -7842,22 +7840,16 @@ impl server_api::ServerApi for ServerApiContractService {
         .map_err(ApiError::into_repository_api_error)
     }
 
-    async fn workspace_config_revision(
+    async fn workspace_config_history(
         &self,
         workspace_id: String,
-        revision: String,
+        content_digest: String,
     ) -> std::result::Result<server_api::ConfigTreeSnapshot, server_api::RepositoryApiError> {
-        let revision = revision.parse::<u64>().map_err(|_| {
-            ApiError::from(Error::InvalidInput(
-                "config revision must be an unsigned integer".into(),
-            ))
-            .into_repository_api_error()
-        })?;
-        scoped_get_workspace_config_revision(
+        scoped_get_workspace_config_history(
             State(self.workspace_api()?.clone()),
-            AxumPath(WorkspaceConfigRevisionPath {
+            AxumPath(WorkspaceConfigHistoryPath {
                 workspace_id,
-                revision,
+                content_digest,
             }),
         )
         .await
@@ -8181,17 +8173,17 @@ impl server_api::ServerApi for ServerApiContractService {
         .map_err(ApiError::into_repository_api_error)
     }
 
-    async fn subjektiv_memory_revisions(
+    async fn subjektiv_memory_changes(
         &self,
         workspace_id: String,
         subject_id: String,
         memory_id: String,
-        query: server_api::SubjektivMemoryRevisionsQuery,
+        query: server_api::SubjektivMemoryChangesQuery,
     ) -> std::result::Result<
-        server_api::SubjektivMemoryListRevisionsResponse,
+        server_api::SubjektivMemoryListChangesResponse,
         server_api::RepositoryApiError,
     > {
-        scoped_list_subjektiv_memory_revisions(
+        scoped_list_subjektiv_memory_changes(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedSubjektivMemoryPath {
                 workspace_id,
@@ -9087,10 +9079,11 @@ impl server_api::ServerApi for ServerApiContractService {
                 "the embedded Runtime trust key is managed by the embedded Runtime authority",
             )));
         }
-        if request.expected_revision == 0 {
+        if request.expected_binding_id.trim().is_empty() || request.expected_binding_id.len() > 256
+        {
             return Err(map_error(settings_bad_request(
-                "invalid_runtime_binding_revision",
-                "expected_revision must be greater than zero",
+                "invalid_runtime_binding_id",
+                "expected_binding_id must contain between 1 and 256 bytes",
             )));
         }
         let now = Utc::now().to_rfc3339();
@@ -9099,15 +9092,15 @@ impl server_api::ServerApi for ServerApiContractService {
             .revoke_workspace_runtime_binding_key(
                 &workspace_id,
                 &runtime_id,
-                request.expected_revision,
+                &request.expected_binding_id,
                 &actor.account_id,
                 &now,
             )
             .await
         {
             let kind = match error {
-                Error::RuntimeBindingRevisionConflict { .. } => {
-                    Some(server_api::RuntimeTrustConflictKind::StaleRevision)
+                Error::RuntimeBindingIdConflict { .. } => {
+                    Some(server_api::RuntimeTrustConflictKind::StaleBinding)
                 }
                 Error::RuntimeBindingFingerprintConflict { .. } => {
                     Some(server_api::RuntimeTrustConflictKind::FingerprintInUse)
@@ -9124,14 +9117,14 @@ impl server_api::ServerApi for ServerApiContractService {
                     server_api::RuntimeTrustConflictResponse {
                         error: kind,
                         message: match kind {
-                            server_api::RuntimeTrustConflictKind::StaleRevision => {
+                            server_api::RuntimeTrustConflictKind::StaleBinding => {
                                 "the Runtime trust binding changed; reload before retrying".to_string()
                             }
                             server_api::RuntimeTrustConflictKind::FingerprintInUse => {
                                 "the public key is already bound to another Runtime in this Workspace".to_string()
                             }
                         },
-                        current_revision: current.as_ref().map(|binding| binding.binding_revision),
+                        current_binding_id: current.as_ref().map(|binding| binding.binding_id.clone()),
                         current_fingerprint: current
                             .as_ref()
                             .map(|binding| binding.public_key_fingerprint.clone()),
@@ -12146,7 +12139,6 @@ async fn scoped_resolve_flow_source(
                 selector: request.selector.clone(),
                 workspace_id: path.workspace_id,
                 flow_id: format!("builtin:{slug}"),
-                revision: builtin.revision,
                 content_digest: definition.content_digest.clone(),
                 definition,
             }
@@ -12156,22 +12148,25 @@ async fn scoped_resolve_flow_source(
                 .store
                 .get_flow_source_by_name(&path.workspace_id, FlowSourceKind::Workspace, slug)?
                 .ok_or_else(|| Error::InvalidRecordId(request.selector.to_string()))?;
-            let revision = api
+            let content = api
                 .store
-                .get_flow_source_revision(&path.workspace_id, &source.flow_id, source.revision)?
+                .get_flow_source_content(
+                    &path.workspace_id,
+                    &source.flow_id,
+                    &source.content_digest,
+                )?
                 .ok_or_else(|| {
                     Error::Store(format!(
-                        "resolved Flow revision {}@{} is missing",
-                        source.flow_id, source.revision
+                        "resolved Flow content {}@{} is missing",
+                        source.flow_id, source.content_digest
                     ))
                 })?;
             ResolvedFlowSource {
                 selector: request.selector.clone(),
                 workspace_id: path.workspace_id,
                 flow_id: source.flow_id,
-                revision: source.revision,
-                content_digest: revision.content_digest,
-                definition: revision.definition,
+                content_digest: content.content_digest,
+                definition: content.definition,
             }
         }
     };
@@ -12218,10 +12213,10 @@ async fn scoped_update_workspace_settings(
         .get_workspace(&path.workspace_id)
         .await?
         .ok_or_else(|| Error::InvalidRecordId(path.workspace_id.clone()))?;
-    if request.revision != current.updated_at {
+    if request.expected_updated_at != current.updated_at {
         return Err(Error::RuntimeOperationFailed {
             runtime_id: "workspace-backend".to_string(),
-            code: "workspace_metadata_revision_conflict".to_string(),
+            code: "workspace_metadata_updated_at_conflict".to_string(),
             message: "Workspace metadata changed before this update was applied".to_string(),
         }
         .into());
@@ -12232,7 +12227,7 @@ async fn scoped_update_workspace_settings(
         .await?
         .ok_or_else(|| Error::RuntimeOperationFailed {
             runtime_id: "workspace-backend".to_string(),
-            code: "workspace_metadata_revision_conflict".to_string(),
+            code: "workspace_metadata_updated_at_conflict".to_string(),
             message: "Workspace metadata changed before this update was applied".to_string(),
         })?;
     let workspace = crate::profile_settings::workspace_metadata_settings(&workspace);
@@ -12326,7 +12321,6 @@ fn project_workspace_signing_identity(
             algorithm: identity.algorithm.clone(),
             public_key,
             public_key_fingerprint,
-            revision: identity.revision,
         })
     } else {
         None
@@ -12338,7 +12332,6 @@ fn project_workspace_signing_identity(
             algorithm: identity.algorithm,
             public_key: identity.public_key,
             public_key_fingerprint: identity.public_key_fingerprint,
-            revision: identity.revision,
             state,
             created_at: identity.created_at,
             provisioned_at: identity.provisioned_at,
@@ -12348,20 +12341,20 @@ fn project_workspace_signing_identity(
 }
 
 #[derive(Debug, Deserialize)]
-struct WorkspaceConfigRevisionPath {
+struct WorkspaceConfigHistoryPath {
     workspace_id: String,
-    revision: u64,
+    content_digest: String,
 }
 
-async fn scoped_get_workspace_config_revision(
+async fn scoped_get_workspace_config_history(
     State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<WorkspaceConfigRevisionPath>,
+    AxumPath(path): AxumPath<WorkspaceConfigHistoryPath>,
 ) -> ApiResult<Json<server_api::ConfigTreeSnapshot>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let snapshot = api
         .config_store
-        .load_workspace_config_revision(&path.workspace_id, path.revision)?
-        .ok_or_else(|| ApiError::from(Error::InvalidRecordId(path.revision.to_string())))?;
+        .load_workspace_config_history(&path.workspace_id, &path.content_digest)?
+        .ok_or_else(|| ApiError::from(Error::InvalidRecordId(path.content_digest.clone())))?;
     Ok(Json(config_tree_snapshot_to_api(snapshot)))
 }
 
@@ -12401,7 +12394,6 @@ async fn scoped_get_workspace_memory_settings(
         .map_err(ApiError::from)?;
     Ok(Json(server_api::WorkspaceMemorySettings {
         workspace_id: settings.workspace_id,
-        settings_revision: settings.settings_revision,
         language: settings.language,
     }))
 }
@@ -12416,13 +12408,12 @@ async fn scoped_update_workspace_memory_settings(
         .config_store
         .update_workspace_memory_settings(
             &workspace_id,
-            request.expected_revision,
+            &request.expected_language,
             &request.language,
         )
         .map_err(ApiError::from)?;
     Ok(Json(server_api::WorkspaceMemorySettings {
         workspace_id: settings.workspace_id,
-        settings_revision: settings.settings_revision,
         language: settings.language,
     }))
 }
@@ -12641,7 +12632,7 @@ async fn scoped_put_repository_ssh_host_trust(
     Json(request): Json<PutRepositorySshHostTrustRequest>,
 ) -> ApiResult<(StatusCode, Json<RepositorySshHostTrust>)> {
     require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
-    let status = if request.expected_revision.is_some() {
+    let status = if request.expected_fingerprint.is_some() {
         StatusCode::OK
     } else {
         StatusCode::CREATED
@@ -12692,7 +12683,6 @@ fn config_tree_snapshot_to_api(
     snapshot: config_source::ConfigTreeSnapshot,
 ) -> server_api::ConfigTreeSnapshot {
     server_api::ConfigTreeSnapshot {
-        revision: snapshot.revision,
         digest: snapshot.digest,
         entries: snapshot
             .entries
@@ -12833,7 +12823,6 @@ fn config_commit_request_from_api(
         .map(config_virtual_path)
         .collect::<Result<Vec<_>>>()?;
     Ok(ConfigCommitRequest {
-        base_revision: request.base_revision,
         base_digest: request.base_digest,
         changes,
         entrypoints,
@@ -12846,14 +12835,12 @@ fn prompt_projection_to_api(
     let catalog = projection.catalog;
     server_api::WorkspacePromptProjection {
         workspace_id: projection.workspace_id,
-        config_revision: projection.config_revision,
         source_digest: projection.source_digest,
         projection_digest: projection.projection_digest,
         schema_fingerprint: projection.schema_fingerprint,
         toolchain_fingerprint: projection.toolchain_fingerprint,
         catalog: server_api::EffectivePromptCatalog {
             templates: catalog.templates,
-            config_revision: catalog.config_revision,
             source_digest: catalog.source_digest,
             schema_fingerprint: catalog.schema_fingerprint,
             toolchain_fingerprint: catalog.toolchain_fingerprint,
@@ -12874,7 +12861,6 @@ fn flow_source_record_to_api(source: FlowSourceRecord) -> server_api::FlowSource
         path: source.path,
         content: source.content,
         content_digest: source.content_digest,
-        revision: source.revision,
         created_at: source.created_at,
         updated_at: source.updated_at,
     }
@@ -12931,7 +12917,6 @@ fn resolved_flow_source_to_api(source: ResolvedFlowSource) -> server_api::Resolv
         selector: source.selector.to_string(),
         workspace_id: source.workspace_id,
         flow_id: source.flow_id,
-        revision: source.revision,
         content_digest: source.content_digest,
         definition: compiled_flow_definition_to_api(source.definition),
     }
@@ -13350,11 +13335,11 @@ async fn start_manual_ticket_worker_assignment(
     let recovery = api
         .config_store
         .get_ticket_claim_recovery(&api.config.workspace_id, operation_id)?;
-    let item_revision = match &recovery {
-        Some(saved) => saved.item_revision.clone(),
-        None => api.authority.ticket(&record.ticket_id)?.item_revision,
+    let content_digest = match &recovery {
+        Some(saved) => saved.content_digest.clone(),
+        None => api.authority.ticket(&record.ticket_id)?.content_digest,
     };
-    let binding_fingerprint = serde_json::to_string(&(&selected, &item_revision))
+    let binding_fingerprint = serde_json::to_string(&(&selected, &content_digest))
         .map_err(|error| Error::Store(error.to_string()))?;
     let fingerprint =
         crate::store::manual_ticket_assignment_fingerprint(record, Some(&binding_fingerprint))?;
@@ -13395,7 +13380,7 @@ async fn start_manual_ticket_worker_assignment(
                         record,
                         operation_id,
                         &binding_fingerprint,
-                        &item_revision,
+                        &content_digest,
                         &worker,
                         &binding,
                     )
@@ -13470,7 +13455,7 @@ async fn start_manual_ticket_worker_assignment(
         return Err(Error::TicketAssignmentConflict("manual Worker claim is already admitted; reread its durable result instead of redispatching".into()).into());
     }
     let saved = crate::store::TicketWorkerClaimRecovery {
-        item_revision: item_revision.clone(),
+        content_digest: content_digest.clone(),
         selected: selected.clone(),
         original_links: binding.original_links.clone(),
         effective_links: binding.effective_links.clone(),
@@ -13657,7 +13642,7 @@ async fn start_manual_ticket_worker_assignment(
         record,
         operation_id,
         &binding_fingerprint,
-        &item_revision,
+        &content_digest,
         &worker,
         &binding,
     )
@@ -13669,11 +13654,11 @@ async fn finalize_manual_ticket_worker_claim(
     record: &TicketRoleAssignmentRecord,
     operation_id: &str,
     binding_fingerprint: &str,
-    item_revision: &str,
+    content_digest: &str,
     worker: &RuntimeWorkerRef,
     binding: &ManualTicketWorkerWorkdirBinding,
 ) -> ApiResult<TicketRoleAssignmentRecord> {
-    if api.authority.ticket(&record.ticket_id)?.item_revision != item_revision {
+    if api.authority.ticket(&record.ticket_id)?.content_digest != content_digest {
         let diagnostics =
             compensate_manual_ticket_worker_binding(api, &worker, &binding, operation_id, true)
                 .await;
@@ -14370,7 +14355,7 @@ async fn scoped_transition_ticket_state(
         Json(ticket::TicketStateUpdate {
             state,
             operation_key: request.operation_key,
-            expected_item_revision: request.expected_item_revision,
+            expected_content_digest: request.expected_content_digest,
             expected_state: browser_ticket_workflow_state(request.expected_state),
             reason,
             references: Vec::new(),
@@ -14457,7 +14442,7 @@ async fn scoped_close_ticket(
         Json(ticket::TicketStateUpdate {
             state: TicketWorkflowState::Closed,
             operation_key: request.operation_key,
-            expected_item_revision: request.expected_item_revision,
+            expected_content_digest: request.expected_content_digest,
             expected_state: browser_ticket_workflow_state(request.expected_state),
             reason: request.resolution,
             references: Vec::new(),
@@ -14598,7 +14583,7 @@ fn schedule_ticket_item_check(
         Err(error) => {
             tracing::warn!(
                 ticket_id = %ticket.meta.id,
-                revision = %request.input_revision,
+                input_digest = ?request.input_digest(),
                 %error,
                 "Ticket item was saved but its asynchronous checker could not be reserved"
             );
@@ -14610,7 +14595,7 @@ fn schedule_ticket_item_check(
         if let Err(error) = api.dispatch_backend_job_reservation(reservation) {
             tracing::warn!(
                 job_id = %request.job_id,
-                ticket_revision = %request.input_revision,
+                ticket_input_digest = ?request.input_digest(),
                 %error,
                 "asynchronous Ticket item checker dispatch failed"
             );
@@ -14754,7 +14739,7 @@ async fn execute_ticket_rest_operation(
                     &before.meta.id,
                     ticket::TicketStateUpdate {
                         operation_key: new_id("tdecision"),
-                        expected_item_revision: ticket::ticket_item_revision(before),
+                        expected_content_digest: ticket::ticket_content_digest(before),
                         expected_state,
                         state,
                         reason,
@@ -15232,7 +15217,7 @@ impl TicketMergeRevisionSource for RuntimeTicketMergeRevisionSource {
             repository_id,
             selector,
         )
-        .map(|observation| observation.revision_ref)
+        .map(|observation| observation.resolved_ref)
         .map_err(merge_ref_diagnostic)
     }
 }
@@ -15388,7 +15373,7 @@ fn require_assigned_workdir_source(
     assignment: &crate::store::TicketWorkerAssignmentRecord,
     repository_id: &str,
     selector: &str,
-    revision_ref: &str,
+    resolved_ref: &str,
 ) -> ApiResult<()> {
     let worker = api
         .runtime
@@ -15417,7 +15402,7 @@ fn require_assigned_workdir_source(
         else {
             continue;
         };
-        match validate_assigned_workdir_source(&workdir, repository_id, selector, revision_ref) {
+        match validate_assigned_workdir_source(&workdir, repository_id, selector, resolved_ref) {
             Ok(()) => return Ok(()),
             Err(diagnostic) => last_diagnostic = Some(diagnostic),
         }
@@ -15440,7 +15425,7 @@ fn validate_assigned_workdir_source(
     workdir: &worker_runtime::catalog::WorkingDirectorySummary,
     repository_id: &str,
     selector: &str,
-    revision_ref: &str,
+    resolved_ref: &str,
 ) -> std::result::Result<(), worker_runtime::working_directory::WorkingDirectoryDiagnostic> {
     if workdir.repository_id != repository_id {
         return Err(
@@ -15469,7 +15454,7 @@ fn validate_assigned_workdir_source(
             crate::repositories::normalize_target_branch_selector(repository_id, selector)
                 .is_ok_and(|selector| selector == workdir_selector)
         });
-    if !workdir_selector_matches || workdir.current_ref.as_deref() != Some(revision_ref) {
+    if !workdir_selector_matches || workdir.current_ref.as_deref() != Some(resolved_ref) {
         return Err(
             worker_runtime::working_directory::WorkingDirectoryDiagnostic {
                 code: "source_ref_revision_mismatch".to_string(),
@@ -15666,7 +15651,7 @@ fn public_review_event(event: merge_request::ReviewEvent) -> server_api::ReviewE
         sequence: event.sequence,
         request_event_id: event.request_event_id,
         subject_ref: event.subject_ref,
-        ticket_item_revision: event.ticket_item_revision,
+        ticket_content_digest: event.ticket_content_digest,
         ticket_merge_request_subjects: event
             .ticket_merge_request_subjects
             .into_iter()
@@ -15764,7 +15749,7 @@ fn public_merge_request_thread_event(
                 event_id: event.event_id,
                 sequence: event.sequence,
                 subject_ref: event.subject_ref,
-                ticket_item_revision: event.ticket_item_revision,
+                ticket_content_digest: event.ticket_content_digest,
                 ticket_merge_request_subjects: event
                     .ticket_merge_request_subjects
                     .into_iter()
@@ -15906,7 +15891,7 @@ async fn scoped_list_merge_requests(
                                 &merge_request.repository_id,
                                 selector,
                             ) {
-                                Ok(observation) => (Some(observation.revision_ref), Vec::new()),
+                                Ok(observation) => (Some(observation.resolved_ref), Vec::new()),
                                 Err(error) => (None, vec![merge_ref_diagnostic(error)]),
                             },
                             None => (
@@ -15973,7 +15958,7 @@ fn merge_ref_diagnostic(error: ApiError) -> MergeRequestRefDiagnostic {
 fn unknown_merge_ref(code: &str, message: &str) -> server_api::MergeRequestRefResponse {
     server_api::MergeRequestRefResponse {
         status: "unknown".to_string(),
-        revision_ref: None,
+        resolved_ref: None,
         observed_at: Utc::now().to_rfc3339(),
         diagnostic: Some(MergeRequestRefDiagnostic {
             code: code.to_string(),
@@ -15985,7 +15970,7 @@ fn unknown_merge_ref(code: &str, message: &str) -> server_api::MergeRequestRefRe
 fn unknown_merge_ref_response(error: ApiError) -> server_api::MergeRequestRefResponse {
     server_api::MergeRequestRefResponse {
         status: "unknown".to_string(),
-        revision_ref: None,
+        resolved_ref: None,
         observed_at: Utc::now().to_rfc3339(),
         diagnostic: Some(merge_ref_diagnostic(error)),
     }
@@ -16000,7 +15985,7 @@ fn merge_ref_response(
             .to_rfc3339();
     server_api::MergeRequestRefResponse {
         status: "known".into(),
-        revision_ref: Some(observation.revision_ref),
+        resolved_ref: Some(observation.resolved_ref),
         observed_at,
         diagnostic: None,
     }
@@ -16031,7 +16016,7 @@ fn integrated_merge_refs(
             "unknown"
         }
         .into(),
-        revision_ref: result.map(|merge| merge.approved_source_ref.clone()),
+        resolved_ref: result.map(|merge| merge.approved_source_ref.clone()),
         observed_at: result.map_or_else(
             || mr.updated_at.to_rfc3339(),
             |merge| merge.created_at.to_rfc3339(),
@@ -16040,7 +16025,7 @@ fn integrated_merge_refs(
     };
     let target = server_api::MergeRequestRefResponse {
         status: if result.is_some() { "known" } else { "unknown" }.into(),
-        revision_ref: result.map(|merge| merge.target_ref_after.clone()),
+        resolved_ref: result.map(|merge| merge.target_ref_after.clone()),
         observed_at: source.observed_at.clone(),
         diagnostic: result.is_none().then(|| MergeRequestRefDiagnostic {
             code: "merge_result_missing".into(),
@@ -16096,7 +16081,7 @@ async fn scoped_show_merge_request(
             ),
             (None, _) => server_api::MergeRequestRefResponse {
                 status: "requires_repair".into(),
-                revision_ref: None,
+                resolved_ref: None,
                 observed_at: Utc::now().to_rfc3339(),
                 diagnostic: None,
             },
@@ -16170,7 +16155,7 @@ async fn scoped_merge_request_readiness(
                     &mr.repository_id,
                     selector,
                 ) {
-                    Ok(observation) => (Some(observation.revision_ref), None),
+                    Ok(observation) => (Some(observation.resolved_ref), None),
                     Err(error) => {
                         let diagnostic = merge_ref_diagnostic(error);
                         let blocker = source_ref_readiness_blocker(&diagnostic.code);
@@ -16249,7 +16234,7 @@ async fn scoped_open_merge_request(
         &assignment,
         &repository_id,
         &input.selector_from,
-        &source_observation.revision_ref,
+        &source_observation.resolved_ref,
     )?;
     observe_published_merge_ref(
         &api,
@@ -16332,7 +16317,7 @@ async fn scoped_repair_merge_request_selector(
         &mr.repository_id,
         &input.selector_from,
     )?
-    .revision_ref;
+    .resolved_ref;
     let repaired = store.repair_selector_from(merge_request::RepairSelectorFrom {
         workspace_id: workspace_id.clone(),
         merge_request_id,
@@ -16424,9 +16409,9 @@ async fn scoped_register_merge_request_review_capability(
                 &assignment,
                 &mr.repository_id,
                 selector,
-                &source_observation.revision_ref,
+                &source_observation.resolved_ref,
             )?;
-            source_observation.revision_ref
+            source_observation.resolved_ref
         }
         merge_request::MergeRequestState::Closed => {
             return Err(
@@ -16452,18 +16437,18 @@ async fn scoped_register_merge_request_review_capability(
                 &linked.repository_id,
                 linked_selector,
             )?
-            .revision_ref
+            .resolved_ref
         };
         ticket_merge_request_subjects.push(merge_request::MergeRequestReviewSubject {
             merge_request_id: linked.merge_request_id,
             subject_ref: linked_subject_ref,
         });
     }
-    let ticket_item_revision = api.authority.ticket(&ticket_id)?.item_revision;
+    let ticket_content_digest = api.authority.ticket(&ticket_id)?.content_digest;
     store.request_review(merge_request::RequestMergeRequestReview {
         merge_request_id,
         ticket_id,
-        ticket_item_revision,
+        ticket_content_digest,
         ticket_merge_request_subjects,
         subject_ref,
         child_session_id: input.child_session_id,
@@ -16521,7 +16506,7 @@ async fn scoped_submit_merge_request_review(
                 &mr.repository_id,
                 selector,
             )?
-            .revision_ref
+            .resolved_ref
         }
         merge_request::MergeRequestState::Closed => {
             return Err(
@@ -16650,7 +16635,7 @@ async fn scoped_complete_merge_request(
         &mr.repository_id,
         selector,
     )?
-    .revision_ref;
+    .resolved_ref;
     let observed_target = observe_published_merge_ref(
         &api,
         &workspace_id,
@@ -16659,7 +16644,7 @@ async fn scoped_complete_merge_request(
         &mr.selector_to,
     )?;
     require_completed_target_observation(
-        &observed_target.revision_ref,
+        &observed_target.resolved_ref,
         &input.target_ref_before,
         &input.target_ref_after,
     )?;
@@ -16702,7 +16687,7 @@ async fn scoped_complete_ticket(
         AxumPath((workspace_id, ticket_id)),
         Json(ticket::TicketStateUpdate {
             operation_key: input.operation_key,
-            expected_item_revision: input.expected_item_revision,
+            expected_content_digest: input.expected_content_digest,
             expected_state: input.expected_state,
             state: TicketWorkflowState::Done,
             reason: input.reason,
@@ -16785,7 +16770,7 @@ async fn scoped_close_ticket_record(
         Json(ticket::TicketStateUpdate {
             state: TicketWorkflowState::Closed,
             operation_key: request.operation_key,
-            expected_item_revision: request.expected_item_revision,
+            expected_content_digest: request.expected_content_digest,
             expected_state: request.expected_state,
             reason: request.reason,
             references: request.references,
@@ -17769,7 +17754,7 @@ async fn scoped_submit_backend_job_result(
         &BackendJobResultSubmission {
             job_id: binding.job_id,
             attempt_id: binding.attempt_id,
-            input_revision: attempt.input_revision,
+            input_digest: attempt.input_digest,
             result: request.result,
         },
     )?;
@@ -18032,7 +18017,7 @@ fn list_current_worker_workdir_catalog_for_worker(
         workspace_id: api.config.workspace_id.clone(),
         items,
         next_cursor: page.next_cursor,
-        revision: page.revision,
+        digest: page.revision,
     })
 }
 
@@ -18048,7 +18033,7 @@ fn list_current_worker_workdir_attachments(
             Error::InvalidInput("attachment page limit must be 1..=100".to_string()).into(),
         );
     }
-    let (mut links, revision) = api.store.list_worker_workdir_links_page_with_revision(
+    let (mut links, digest) = api.store.list_worker_workdir_links_page_with_revision(
         &api.config.workspace_id,
         worker,
         limit + 1,
@@ -18076,7 +18061,7 @@ fn list_current_worker_workdir_attachments(
             })
             .collect(),
         next_offset,
-        revision,
+        digest,
     })
 }
 
@@ -19143,7 +19128,10 @@ fn require_existing_subjektiv_session_attribution(
 fn subjektiv_subject_response(
     api: &WorkspaceApi,
     subject: crate::subjektiv::SubjectRecord,
-) -> server_api::SubjektivSubjectResponse {
+) -> ApiResult<server_api::SubjektivSubjectResponse> {
+    let memory_fingerprint = open_subjektiv_store(api)?
+        .memory_fingerprint(&subject.id)
+        .map_err(subjektiv_store_error)?;
     let current_worker = crate::subjektiv::subject_worker_singleton_key(&subject.id)
         .ok()
         .and_then(|key| {
@@ -19154,20 +19142,19 @@ fn subjektiv_subject_response(
         })
         .and_then(|lease| api.runtime.worker(&lease.worker).ok())
         .map(worker_launch_worker_summary);
-    server_api::SubjektivSubjectResponse {
+    Ok(server_api::SubjektivSubjectResponse {
         id: subject.id,
         role: subject.role.as_str().to_string(),
         behavior_md: subject.behavior_md,
-        behavior_revision: subject.behavior_revision,
+        memory_fingerprint,
         state: match subject.state {
             crate::subjektiv::SubjectState::Active => server_api::SubjektivSubjectState::Active,
             crate::subjektiv::SubjectState::Retired => server_api::SubjektivSubjectState::Retired,
         },
-        store_revision: subject.store_revision,
         created_at: subject.created_at,
         updated_at: subject.updated_at,
         current_worker,
-    }
+    })
 }
 
 async fn scoped_create_subjektiv_subject(
@@ -19185,7 +19172,7 @@ async fn scoped_create_subjektiv_subject(
         .map_err(subjektiv_store_error)?;
     Ok((
         StatusCode::CREATED,
-        Json(subjektiv_subject_response(&api, subject)),
+        Json(subjektiv_subject_response(&api, subject)?),
     ))
 }
 
@@ -19256,7 +19243,7 @@ async fn scoped_list_subjektiv_subjects(
             .items
             .into_iter()
             .map(|subject| subjektiv_subject_response(&api, subject))
-            .collect(),
+            .collect::<ApiResult<Vec<_>>>()?,
         next_cursor,
         has_more: page.has_more,
     }))
@@ -19271,7 +19258,7 @@ async fn scoped_get_subjektiv_subject(
         .subject(&path.subject_id)
         .map_err(|error| Error::Store(error.to_string()))?
         .ok_or_else(|| Error::SubjektivSubjectNotFound(path.subject_id.clone()))?;
-    Ok(Json(subjektiv_subject_response(&api, subject)))
+    Ok(Json(subjektiv_subject_response(&api, subject)?))
 }
 
 async fn scoped_update_subjektiv_subject_behavior(
@@ -19285,11 +19272,11 @@ async fn scoped_update_subjektiv_subject_behavior(
     let subject = open_subjektiv_store(&api)?
         .update_subject_behavior(
             &path.subject_id,
-            request.expected_behavior_revision,
+            &request.expected_behavior_md,
             request.behavior_md,
         )
         .map_err(subjektiv_store_error)?;
-    Ok(Json(subjektiv_subject_response(&api, subject)))
+    Ok(Json(subjektiv_subject_response(&api, subject)?))
 }
 
 fn require_subjektiv_subject(
@@ -19338,12 +19325,12 @@ async fn scoped_get_subjektiv_resident_surface(
             memory_refs: snapshot
                 .memory_refs
                 .into_iter()
-                .map(|reference| server_api::SubjektivMemoryRevisionRef {
+                .map(|reference| server_api::SubjektivMemoryChangeRef {
                     memory_id: reference.memory_id,
-                    revision: reference.revision,
+                    change_id: reference.change_id,
                 })
                 .collect(),
-            built_from_store_revision: snapshot.built_from_store_revision,
+            built_from_memory_fingerprint: snapshot.built_from_memory_fingerprint,
             created_at: snapshot.created_at,
         });
     Ok(Json(server_api::SubjektivResidentSurfaceResponse {
@@ -19381,7 +19368,7 @@ async fn scoped_get_subjektiv_memory(
         &path.subject_id,
         server_api::SubjektivMemoryReadRequest {
             memory_id: path.memory_id,
-            revision: query.revision,
+            change_id: query.change_id,
             offset: query.offset,
             byte_offset: query.byte_offset,
             limit: query.limit,
@@ -19390,18 +19377,18 @@ async fn scoped_get_subjektiv_memory(
     )?))
 }
 
-async fn scoped_list_subjektiv_memory_revisions(
+async fn scoped_list_subjektiv_memory_changes(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedSubjektivMemoryPath>,
-    Query(query): Query<server_api::SubjektivMemoryRevisionsQuery>,
-) -> ApiResult<Json<server_api::SubjektivMemoryListRevisionsResponse>> {
+    Query(query): Query<server_api::SubjektivMemoryChangesQuery>,
+) -> ApiResult<Json<server_api::SubjektivMemoryListChangesResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let store = open_subjektiv_store(&api)?;
     require_subjektiv_subject(&store, &path.subject_id)?;
-    Ok(Json(subjektiv_memory_list_revisions(
+    Ok(Json(subjektiv_memory_list_changes(
         &store,
         &path.subject_id,
-        server_api::SubjektivMemoryListRevisionsRequest {
+        server_api::SubjektivMemoryListChangesRequest {
             memory_id: path.memory_id,
             limit: query.limit,
             cursor: query.cursor,
@@ -19419,7 +19406,7 @@ async fn scoped_retire_subjektiv_subject(
         .map_err(subjektiv_store_error)?;
     // Retirement deliberately does not stop or remove the current Worker. The
     // Worker lease and subject lifecycle are independent authorities.
-    Ok(Json(subjektiv_subject_response(&api, subject)))
+    Ok(Json(subjektiv_subject_response(&api, subject)?))
 }
 
 async fn scoped_stage_subjektiv_candidate(
@@ -20693,7 +20680,6 @@ fn subjektiv_session_archive_manifest_matches(
                 && actual.content_checksum_sha256 == expected.checksum_sha256
                 && actual.content_bytes == expected.content_bytes
                 && actual.policy_id == expected.policy_id
-                && actual.policy_revision == expected.policy_revision
                 && actual.operation_id == expected.operation_id
         }
         _ => false,
@@ -20887,7 +20873,7 @@ async fn scoped_subjektiv_memory_backend(
             Some(SubjektivWorkerAuthority::Consolidation),
             "surface generation failure",
         ),
-        Op::Query(_) | Op::Read(_) | Op::ListRevisions(_) => (None, "recall"),
+        Op::Query(_) | Op::Read(_) | Op::ListChanges(_) => (None, "recall"),
     };
     if let Some(expected) = expected {
         require_subjektiv_worker_authority(authority, expected, label)?;
@@ -20951,10 +20937,10 @@ fn subjektiv_store_error(error: crate::subjektiv::SubjektivError) -> Error {
         crate::subjektiv::SubjektivError::SubjectScopeMismatch { .. } => {
             Error::WorkspacePermissionDenied(format!("subject_scope_mismatch: {error}"))
         }
-        crate::subjektiv::SubjektivError::RevisionConflict { .. }
+        crate::subjektiv::SubjektivError::MemoryChangeConflict { .. }
         | crate::subjektiv::SubjektivError::SubjectBehaviorConflict { .. }
         | crate::subjektiv::SubjektivError::SurfaceGenerationConflict(_) => {
-            Error::RepositoryConflict(format!("revision_conflict: {error}"))
+            Error::RepositoryConflict(format!("change_conflict: {error}"))
         }
         crate::subjektiv::SubjektivError::CandidateResolved(_)
         | crate::subjektiv::SubjektivError::DecisionRequestConflict(_) => {
@@ -21531,7 +21517,6 @@ async fn scoped_create_repository(
         source_fingerprint: repository_source_fingerprint(&source),
         source,
         default_ref,
-        source_revision: 1,
         observed_status: server_api::RepositoryObservedStatus::Unverified,
         observed_at: None,
         created_at: now.clone(),
@@ -21583,7 +21568,6 @@ fn repository_create_intent_matches(
         && existing.provider == requested.provider
         && existing.source == requested.source
         && existing.default_ref == requested.default_ref
-        && existing.source_revision == requested.source_revision
         && existing.source_fingerprint == requested.source_fingerprint
 }
 
@@ -21625,7 +21609,7 @@ async fn scoped_confirm_repository_ssh_host_trust(
                 "Selected SSH host key was not presented by the target Runtime",
             )
         })?;
-    if request.expected_host_trust_revision != probe.expected_host_trust_revision {
+    if request.expected_host_key_fingerprint != probe.expected_host_key_fingerprint {
         return Err(ApiError::from(Error::WorkspaceConfigConflict(
             "SSH host trust revision changed after the connection test".to_string(),
         )));
@@ -21638,7 +21622,7 @@ async fn scoped_confirm_repository_ssh_host_trust(
             hostname: probe.hostname,
             port: probe.port,
             host_key: candidate.host_key.clone(),
-            expected_revision: probe.expected_host_trust_revision,
+            expected_fingerprint: probe.expected_host_key_fingerprint,
         },
         &actor.account_id,
     )?;
@@ -21732,7 +21716,7 @@ fn probe_repository_ssh_connection(
             },
             |host_trust| host_trust.host_trust_id.clone(),
         ),
-        expected_host_trust_revision: existing.map(|host_trust| host_trust.current_revision),
+        expected_host_key_fingerprint: existing.map(|host_trust| host_trust.fingerprint.clone()),
         candidates,
     })
 }
@@ -21926,7 +21910,7 @@ fn worker_retention_error_response(
             "worker_not_found",
             "Worker was not found in this Workspace",
         ),
-        crate::retention::WorkerRetentionError::PolicyRevisionConflict { .. }
+        crate::retention::WorkerRetentionError::PolicyDigestConflict { .. }
         | crate::retention::WorkerRetentionError::StalePlan { .. }
         | crate::retention::WorkerRetentionError::OperationFingerprintConflict { .. } => {
             worker_remove_error_response(
@@ -24202,10 +24186,10 @@ async fn create_workspace_working_directory(
         )
         .into());
     }
-    if let Some(existing) = api
+    let existing = api
         .config_store
-        .load_workdir_create_operation(workspace_id, &operation_id)?
-    {
+        .load_workdir_create_operation(workspace_id, &operation_id)?;
+    if let Some(existing) = existing.as_ref() {
         working_directory_request.repository.selector =
             crate::workdir_create_operations::selector_for_retry(
                 request.selector.as_deref(),
@@ -24213,10 +24197,9 @@ async fn create_workspace_working_directory(
                 working_directory_request.repository.selector.as_deref(),
             )
             .map(RuntimeRepositorySelector::from);
-        if let (Some(kind), Some(uri), Some(revision), Some(fingerprint)) = (
+        if let (Some(kind), Some(uri), Some(fingerprint)) = (
             existing.source_kind.as_deref(),
             existing.source_uri.clone(),
-            existing.source_revision,
             existing.source_fingerprint.clone(),
         ) {
             let kind = match kind {
@@ -24234,7 +24217,6 @@ async fn create_workspace_working_directory(
             };
             working_directory_request.repository.source =
                 server_api::RepositorySource { kind, uri };
-            working_directory_request.repository.source_revision = revision;
             working_directory_request.repository.source_fingerprint = fingerprint;
         }
     }
@@ -24243,24 +24225,15 @@ async fn create_workspace_working_directory(
         .selector
         .as_ref()
         .map(|selector| selector.as_ref().to_string());
-    let request_fingerprint = crate::workdir_create_operations::request_fingerprint(
+    let request_fingerprint = crate::workdir_create_operations::request_fingerprint_for_replay(
         &request.repository_key,
         selector.as_deref(),
         requested_runtime_id.as_deref(),
         working_directory_request.display_name.as_deref(),
         &working_directory_request.repository.source_fingerprint,
-        working_directory_request.repository.source_revision,
-    );
-    let reserved = if let Some(existing) = api
-        .config_store
-        .load_workdir_create_operation(workspace_id, &operation_id)?
-    {
-        if existing.request_fingerprint != request_fingerprint {
-            return Err(Error::InvalidInput(format!(
-                "Workdir create operation `{operation_id}` was reused with different input"
-            ))
-            .into());
-        }
+        existing.as_ref().map(|r| r.request_fingerprint.as_str()),
+    )?;
+    let reserved = if let Some(existing) = existing {
         existing
     } else {
         let config_state = api
@@ -24301,7 +24274,6 @@ async fn create_workspace_working_directory(
                 selector,
                 requested_runtime_id,
                 resolved_runtime_id,
-                config_revision: runtime_projection.config_revision,
                 config_projection_digest: runtime_projection.projection_digest,
                 source_kind: Some(
                     working_directory_request
@@ -24312,7 +24284,6 @@ async fn create_workspace_working_directory(
                         .to_string(),
                 ),
                 source_uri: Some(working_directory_request.repository.source.uri.clone()),
-                source_revision: Some(working_directory_request.repository.source_revision),
                 source_fingerprint: Some(
                     working_directory_request
                         .repository
@@ -24320,9 +24291,9 @@ async fn create_workspace_working_directory(
                         .clone(),
                 ),
                 credential_id: None,
-                credential_revision: None,
+                credential_fingerprint: None,
                 host_trust_id: None,
-                host_trust_revision: None,
+                host_trust_fingerprint: None,
                 repository_access_mode: None,
                 credential_candidates: Vec::new(),
                 working_directory_id: next_backend_workdir_id(&request.repository_key),
@@ -24736,7 +24707,7 @@ fn current_workdir_removal_attempt_owner() -> Result<WorkdirRemovalAttemptOwner>
 
 fn workdir_removal_attempt_is_orphaned(operation: &WorkdirRemovalOperation) -> Result<bool> {
     let Some(owner) = operation.attempt_owner else {
-        return Ok(operation.attempt_count == 0);
+        return Ok(operation.attempt_id.is_none());
     };
     match observe_workdir_removal_owner(owner.process_id) {
         WorkdirRemovalOwnerObservation::Running {
@@ -24861,7 +24832,7 @@ fn execute_reserved_workdir_removal_with_provider(
                 &operation.request_fingerprint,
                 api.workdir_remove_attempt_owner,
                 operation.attempt_owner,
-                operation.attempt_count,
+                operation.attempt_id.as_deref(),
             )?
     } else {
         api.config_store.begin_workdir_removal_attempt(
@@ -25329,7 +25300,6 @@ fn build_runtime_cleanup_plan(
         workspace_id: api.config.workspace_id.clone(),
         runtime_id: runtime_id.to_string(),
         generated_at,
-        revision: digest.clone(),
         digest,
         workers: worker_candidates,
         workdirs: workdir_candidates,
@@ -25383,13 +25353,13 @@ async fn execute_runtime_cleanup_with_context(
 
     context.authorize_workspace(api).await?;
     let plan = build_runtime_cleanup_plan(api, runtime_id)?;
-    if request.expected_plan_revision != plan.revision
-        || request.expected_plan_digest != plan.digest
-    {
+    // Rebuild the actual candidate set immediately before executing. The digest
+    // binds targets, dependencies and blockers; per-target authority is checked again below.
+    if request.expected_plan_digest != plan.digest {
         return Err(cleanup_api_error(
             runtime_id,
             "workspace_cleanup_plan_stale",
-            "cleanup plan revision/digest is stale; refresh the preview before executing",
+            "cleanup candidates or blockers changed; refresh the preview before executing",
         ));
     }
     let worker_targets: HashSet<_> = request.worker_target_ids.iter().cloned().collect();
@@ -25704,7 +25674,12 @@ async fn scoped_test_runtime_connection(
             },
             display_name: Some(binding.display_name.clone()),
             endpoint: binding.base_url.clone(),
-            expected_revision: Some(binding.binding_revision),
+            workspace_trust_id: binding.workspace_trust_id.clone().ok_or_else(|| {
+                Error::RuntimeBindingConflict(
+                    "Runtime binding is missing its Workspace trust ID".to_string(),
+                )
+            })?,
+            expected_binding_id: Some(binding.binding_id.clone()),
         })
         .await?;
     }
@@ -27088,18 +27063,25 @@ async fn create_remote_runtime(
         base_url: endpoint.to_string().trim_end_matches('/').to_string(),
         public_key: request.public_bundle.public_key.trim().to_string(),
         public_key_fingerprint: String::new(),
-        binding_revision: request.expected_revision.unwrap_or(0),
+        binding_id: Uuid::now_v7().to_string(),
         state: StoredRuntimeBindingState::Configured,
         authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
         workspace_key_id: Some(identity.key_id.clone()),
-        workspace_key_generation: Some(identity.revision),
+
+        workspace_public_key_fingerprint: identity.public_key_fingerprint.clone(),
+
+        workspace_trust_id: Some(request.workspace_trust_id.clone()),
         created_at: now.clone(),
         updated_at: now,
         revoked_at: None,
     };
     let (mutation, binding) = api
         .store
-        .put_workspace_runtime_binding_key(record, request.expected_revision, &actor.account_id)
+        .put_workspace_runtime_binding_key(
+            record,
+            request.expected_binding_id.as_deref(),
+            &actor.account_id,
+        )
         .await?;
     api.runtime_binding_expectations
         .write()
@@ -27150,10 +27132,10 @@ fn runtime_removal_response(operation: RuntimeRemovalOperation) -> RuntimeRemova
 fn runtime_removal_fingerprint(
     workspace_id: &str,
     runtime_id: &str,
-    expected_binding_revision: u64,
+    expected_binding_id: &str,
 ) -> String {
     let digest = Sha256::digest(format!(
-        "runtime-removal-v1\0{workspace_id}\0{runtime_id}\0{expected_binding_revision}"
+        "runtime-removal-v2\0{workspace_id}\0{runtime_id}\0{expected_binding_id}"
     ));
     let digest = digest
         .iter()
@@ -27175,9 +27157,9 @@ fn runtime_removal_config_guard(
                 operation.workspace_id
             ))
         })?;
-    if config_state.snapshot.revision != operation.config_revision {
+    if config_state.snapshot.digest != operation.config_digest {
         return Err(Error::RuntimeBindingConflict(
-            "runtime_removal_config_revision_changed".to_string(),
+            "runtime_removal_config_digest_changed".to_string(),
         ));
     }
     let projection = crate::runtime_settings::project_runtime_from_workspace_config(
@@ -27365,13 +27347,13 @@ async fn remove_remote_runtime(
     let request_fingerprint = runtime_removal_fingerprint(
         &api.config.workspace_id,
         &runtime_id,
-        request.expected_binding_revision,
+        &request.expected_binding_id,
     );
     if let Some(existing) = api.store.get_runtime_removal(&request.operation_id).await? {
         if existing.workspace_id != api.config.workspace_id
             || existing.runtime_id != runtime_id
             || existing.request_fingerprint != request_fingerprint
-            || existing.expected_binding_revision != request.expected_binding_revision
+            || existing.expected_binding_id != request.expected_binding_id
         {
             return Err(Error::RuntimeBindingConflict(
                 "runtime_removal_operation_id_reused".to_string(),
@@ -27385,8 +27367,8 @@ async fn remove_remote_runtime(
                     &existing.runtime_id,
                     &existing.operation_id,
                     &existing.request_fingerprint,
-                    existing.expected_binding_revision,
-                    existing.config_revision,
+                    &existing.expected_binding_id,
+                    &existing.config_digest,
                 )
                 .await?
                 .operation
@@ -27423,8 +27405,8 @@ async fn remove_remote_runtime(
             &runtime_id,
             &request.operation_id,
             &request_fingerprint,
-            request.expected_binding_revision,
-            config_state.snapshot.revision,
+            &request.expected_binding_id,
+            &config_state.snapshot.digest,
         )
         .await?;
     let operation = execute_runtime_removal(&api, reservation.operation).await?;
@@ -27458,10 +27440,19 @@ async fn perform_workspace_runtime_verification(
         .workspace_key_id
         .as_deref()
         .ok_or_else(|| "Runtime binding is missing the Workspace key identity".to_string())?;
-    let workspace_trust_generation = binding
-        .workspace_key_generation
-        .ok_or_else(|| "Runtime binding is missing the Workspace trust generation".to_string())?;
-    if identity.key_id != workspace_key_id || identity.revision != workspace_trust_generation {
+    let workspace_trust_id = binding
+        .workspace_trust_id
+        .as_deref()
+        .ok_or_else(|| "Runtime binding is missing the Workspace trust ID".to_string())?;
+    let workspace_public_key_fingerprint = binding
+        .workspace_public_key_fingerprint
+        .as_deref()
+        .ok_or_else(|| {
+            "Runtime binding is missing the Workspace public key fingerprint".to_string()
+        })?;
+    if identity.key_id != workspace_key_id
+        || identity.public_key_fingerprint.as_deref() != Some(workspace_public_key_fingerprint)
+    {
         return Err(
             "Runtime binding no longer matches the active Workspace or Runtime identity"
                 .to_string(),
@@ -27474,12 +27465,11 @@ async fn perform_workspace_runtime_verification(
         challenge_id: Uuid::now_v7().to_string(),
         workspace_id: binding.workspace_id.clone(),
         runtime_id: binding.runtime_id.clone(),
-        binding_revision: binding.binding_revision,
+        binding_id: binding.binding_id.clone(),
         workspace_key_id: workspace_key_id.to_string(),
-        workspace_identity_revision: identity.revision,
-        workspace_trust_generation,
+        workspace_public_key_fingerprint: workspace_public_key_fingerprint.to_string(),
+        workspace_trust_id: workspace_trust_id.to_string(),
         runtime_public_key_fingerprint: binding.public_key_fingerprint.clone(),
-        runtime_identity_revision: 1,
         workspace_nonce: Uuid::now_v7().to_string(),
         expires_at,
     };
@@ -27487,12 +27477,11 @@ async fn perform_workspace_runtime_verification(
     let pending = crate::store::WorkspaceRuntimeVerificationEvidence {
         workspace_id: binding.workspace_id.clone(),
         runtime_id: binding.runtime_id.clone(),
-        binding_revision: binding.binding_revision,
+        binding_id: binding.binding_id.clone(),
         workspace_key_id: workspace_key_id.to_string(),
-        workspace_identity_revision: identity.revision,
-        workspace_trust_generation,
+        workspace_public_key_fingerprint: workspace_public_key_fingerprint.to_string(),
+        workspace_trust_id: workspace_trust_id.to_string(),
         runtime_public_key_fingerprint: binding.public_key_fingerprint.clone(),
-        runtime_identity_revision: 1,
         challenge_id: challenge.challenge_id.clone(),
         state: "pending".to_string(),
         last_outcome: "challenge_issued".to_string(),
@@ -27510,9 +27499,9 @@ async fn perform_workspace_runtime_verification(
             issuer: backend_url.to_string(),
             issuer_workspace_id: binding.workspace_id.clone(),
             issuer_key_id: identity.key_id.clone(),
-            issuer_identity_revision: identity.revision,
-            trust_generation: workspace_trust_generation,
-            binding_revision: binding.binding_revision,
+            issuer_public_key_fingerprint: workspace_public_key_fingerprint.to_string(),
+            trust_id: workspace_trust_id.to_string(),
+            binding_id: binding.binding_id.clone(),
             runtime_id: binding.runtime_id.clone(),
             worker_id: None,
             operation: WORKSPACE_VERIFICATION_OPERATION.to_string(),
@@ -27553,12 +27542,11 @@ async fn perform_workspace_runtime_verification(
             challenge_id: response.challenge_id.clone(),
             workspace_id: response.workspace_id.clone(),
             runtime_id: response.runtime_id.clone(),
-            binding_revision: response.binding_revision,
+            binding_id: response.binding_id.clone(),
             workspace_key_id: response.workspace_key_id.clone(),
-            workspace_identity_revision: response.workspace_identity_revision,
-            workspace_trust_generation: response.workspace_trust_generation,
+            workspace_public_key_fingerprint: response.workspace_public_key_fingerprint.clone(),
+            workspace_trust_id: response.workspace_trust_id.clone(),
             runtime_public_key_fingerprint: response.runtime_public_key_fingerprint.clone(),
-            runtime_identity_revision: response.runtime_identity_revision,
             workspace_nonce: response.workspace_nonce.clone(),
             runtime_nonce: response.runtime_nonce.clone(),
             response_digest: workspace_request_body_digest(&response_bytes),
@@ -27571,9 +27559,9 @@ async fn perform_workspace_runtime_verification(
             issuer: backend_url.to_string(),
             issuer_workspace_id: binding.workspace_id.clone(),
             issuer_key_id: identity.key_id.clone(),
-            issuer_identity_revision: identity.revision,
-            trust_generation: workspace_trust_generation,
-            binding_revision: binding.binding_revision,
+            issuer_public_key_fingerprint: workspace_public_key_fingerprint.to_string(),
+            trust_id: workspace_trust_id.to_string(),
+            binding_id: binding.binding_id.clone(),
             runtime_id: binding.runtime_id.clone(),
             worker_id: None,
             operation: WORKSPACE_VERIFICATION_OPERATION.to_string(),
@@ -27604,7 +27592,7 @@ async fn perform_workspace_runtime_verification(
         if receipt.challenge_id != challenge.challenge_id
             || receipt.workspace_id != binding.workspace_id
             || receipt.runtime_id != binding.runtime_id
-            || receipt.binding_revision != binding.binding_revision
+            || receipt.binding_id != binding.binding_id
         {
             return Err("Runtime verification acknowledgement receipt mismatched".to_string());
         }
@@ -27688,7 +27676,7 @@ async fn test_runtime_connection(
                         message,
                     ),
                 );
-                result.binding_revision = binding.binding_revision;
+                result.binding_id = binding.binding_id.clone();
                 result.connection_state = RuntimeConnectionDisplayState::Unavailable;
                 return Ok(Json(result));
             }
@@ -27735,7 +27723,7 @@ async fn test_runtime_connection(
     let summary = runtime_binding_summary(&current_binding, verification.as_ref());
     let mut result =
         runtime_connection_test_response(api.workspace_id(), &runtime_id, checked_at, ping);
-    result.binding_revision = current_binding.binding_revision;
+    result.binding_id = current_binding.binding_id.clone();
     result.connection_state = if result.status == RuntimeConnectionTestStatus::Compatible {
         summary.connection_state
     } else if summary.connection_state == RuntimeConnectionDisplayState::Revoked {
@@ -27762,7 +27750,6 @@ fn working_directory_request_from_repository(
             id: repository.id.clone(),
             provider: repository.provider.clone(),
             source: repository.source.clone(),
-            source_revision: repository.source_revision,
             source_fingerprint: repository.source_fingerprint.clone(),
             selector: selector
                 .map(|selector| RuntimeRepositorySelector::from(selector.to_string()))
@@ -28394,8 +28381,6 @@ fn backend_resource_request_from_api(
             },
             expires_at_unix_seconds: handle.expires_at_unix_seconds,
             nonce: handle.nonce,
-            revision: handle.revision,
-            generation: handle.generation,
             max_bytes: handle.max_bytes,
             content_type: handle.content_type,
             redaction: match handle.redaction {
@@ -30293,10 +30278,14 @@ fn runtime_binding_summary(
     verification: Option<&crate::store::WorkspaceRuntimeVerificationEvidence>,
 ) -> WorkspaceRuntimeBindingSummary {
     let current_verification = verification.filter(|verification| {
-        verification.binding_revision == binding.binding_revision
+        verification.binding_id == binding.binding_id
             && verification.runtime_public_key_fingerprint == binding.public_key_fingerprint
             && verification.workspace_key_id
                 == binding.workspace_key_id.as_deref().unwrap_or_default()
+            && Some(verification.workspace_public_key_fingerprint.as_str())
+                == binding.workspace_public_key_fingerprint.as_deref()
+            && Some(verification.workspace_trust_id.as_str())
+                == binding.workspace_trust_id.as_deref()
     });
     let valid_verification = current_verification.filter(|verification| {
         verification.state == "verified" && verification.last_outcome == "verified"
@@ -30324,9 +30313,9 @@ fn runtime_binding_summary(
             StoredRuntimeBindingState::Revoked => WorkspaceRuntimeBindingState::Revoked,
         },
         connection_state,
-        revision: binding.binding_revision,
+        binding_id: binding.binding_id.clone(),
         workspace_key_id: binding.workspace_key_id.clone(),
-        workspace_key_generation: binding.workspace_key_generation,
+        workspace_trust_id: binding.workspace_trust_id.clone(),
         verification: current_verification.and_then(runtime_verification_summary),
     }
 }
@@ -30345,12 +30334,11 @@ fn runtime_verification_summary(
         verified_at: verification.verified_at.clone(),
         last_checked_at: verification.checked_at.clone(),
         last_outcome,
-        binding_revision: verification.binding_revision,
+        binding_id: verification.binding_id.clone(),
         workspace_key_id: verification.workspace_key_id.clone(),
-        workspace_identity_revision: verification.workspace_identity_revision,
-        workspace_trust_generation: verification.workspace_trust_generation,
+        workspace_public_key_fingerprint: verification.workspace_public_key_fingerprint.clone(),
+        workspace_trust_id: verification.workspace_trust_id.clone(),
         runtime_public_key_fingerprint: verification.runtime_public_key_fingerprint.clone(),
-        runtime_identity_revision: verification.runtime_identity_revision,
     })
 }
 
@@ -30422,7 +30410,7 @@ async fn workspace_runtime_detail(
         RuntimeTrustKeyState {
             status: RuntimeTrustKeyStatus::Unconfigured,
             fingerprint: None,
-            revision: None,
+            binding_id: None,
             created_at: None,
             updated_at: None,
             revoked_at: None,
@@ -30434,7 +30422,7 @@ async fn workspace_runtime_detail(
                 RuntimeTrustKeyStatus::Active
             },
             fingerprint: Some(binding.public_key_fingerprint.clone()),
-            revision: Some(binding.binding_revision),
+            binding_id: Some(binding.binding_id.clone()),
             created_at: Some(binding.created_at.clone()),
             updated_at: Some(binding.updated_at.clone()),
             revoked_at: binding.revoked_at.clone(),
@@ -30475,7 +30463,7 @@ fn project_runtime_trust_audit(
         actor_account_id: record.actor_account_id,
         old_fingerprint: record.old_fingerprint,
         new_fingerprint: record.new_fingerprint,
-        revision: record.binding_revision,
+        binding_id: record.binding_id,
         at: record.at,
     })
 }
@@ -30488,6 +30476,28 @@ async fn validate_runtime_connection_request(
         return Err(settings_bad_request(
             "runtime_public_key_required",
             "Runtime public bundle must contain a public key",
+        ));
+    }
+    if request.workspace_trust_id.trim().is_empty()
+        || request.workspace_trust_id.len() > 256
+        || request
+            .workspace_trust_id
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return Err(settings_bad_request(
+            "invalid_workspace_trust_id",
+            "workspace_trust_id must be a bounded Runtime-issued trust identity",
+        ));
+    }
+    if request
+        .expected_binding_id
+        .as_deref()
+        .is_some_and(|id| id.trim().is_empty() || id.len() > 256)
+    {
+        return Err(settings_bad_request(
+            "invalid_runtime_binding_id",
+            "expected_binding_id must be a bounded binding identity",
         ));
     }
     validate_runtime_metadata(request.display_name.as_deref(), &request.endpoint).await
@@ -30650,7 +30660,7 @@ fn runtime_connection_test_response(
         Ok(ping) => RuntimeConnectionTestResponse {
             workspace_id: workspace_id.to_string(),
             runtime_id: runtime_id.to_string(),
-            binding_revision: 0,
+            binding_id: String::new(),
             connection_state: RuntimeConnectionDisplayState::Configured,
             verification: None,
             checked_at,
@@ -30702,7 +30712,7 @@ fn runtime_connection_test_failure(
     RuntimeConnectionTestResponse {
         workspace_id: workspace_id.to_string(),
         runtime_id: runtime_id.to_string(),
-        binding_revision: 0,
+        binding_id: String::new(),
         connection_state: RuntimeConnectionDisplayState::Unavailable,
         verification: None,
         checked_at,
@@ -31759,12 +31769,12 @@ fn repository_ssh_lease_candidates(
     }
     let workspace_default = api
         .repository_secrets
-        .lease_ssh_materialization_access_revision(
+        .lease_ssh_materialization_access_fingerprints(
             &api.config.workspace_id,
             crate::repository_access::WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID,
-            workspace_default.current_revision,
+            &workspace_default.public_key_fingerprint,
             &primary.host_trust_id,
-            primary.host_trust_revision,
+            &primary.host_trust_fingerprint,
         )?;
     Ok(vec![primary, workspace_default])
 }
@@ -31778,15 +31788,15 @@ fn authorize_repository_materialization_operation(
     let context = if request.repository.source.kind == server_api::RepositorySourceKind::Ssh {
         if let (
             Some(_credential_id),
-            Some(_credential_revision),
+            Some(_credential_fingerprint),
             Some(_host_trust_id),
-            Some(_host_trust_revision),
+            Some(_host_trust_fingerprint),
             Some(access_mode),
         ) = (
             operation.credential_id.as_deref(),
-            operation.credential_revision,
+            operation.credential_fingerprint.as_deref(),
             operation.host_trust_id.as_deref(),
-            operation.host_trust_revision,
+            operation.host_trust_fingerprint.as_deref(),
             operation.repository_access_mode.as_deref(),
         ) {
             let leases = repository_ssh_lease_candidates_from_operation(api, operation, request)?;
@@ -31797,7 +31807,7 @@ fn authorize_repository_materialization_operation(
                 )
             })?;
             let primary_host_trust_id = primary_lease.host_trust_id.clone();
-            let primary_host_trust_revision = primary_lease.host_trust_revision;
+            let primary_host_trust_fingerprint = primary_lease.host_trust_fingerprint.clone();
             let known_hosts_entry = primary_lease.known_hosts_entry.clone();
             let access = match access_mode {
                 "read_only" => server_api::RepositoryAccessMode::ReadOnly,
@@ -31816,18 +31826,6 @@ fn authorize_repository_materialization_operation(
                     &api.config.workspace_id,
                     &operation.resolved_runtime_id,
                     format!("repository-ssh-access:{}", operation.operation_id),
-                    format!(
-                        "credentials:{}:host-trust:{}",
-                        leases
-                            .iter()
-                            .map(|lease| format!(
-                                "{}:{}",
-                                lease.credential_id, lease.credential_revision
-                            ))
-                            .collect::<Vec<_>>()
-                            .join(","),
-                        primary_host_trust_revision
-                    ),
                     i64::try_from(expires_at_epoch_seconds).unwrap_or(i64::MAX),
                     worker_runtime::resource::RepositorySshAccessSecret {
                         credential_candidates: leases
@@ -31835,7 +31833,7 @@ fn authorize_repository_materialization_operation(
                             .map(|lease| {
                                 worker_runtime::resource::RepositorySshAccessSecretCandidate {
                                     credential_id: lease.credential_id.clone(),
-                                    credential_revision: lease.credential_revision,
+                                    public_key_fingerprint: lease.credential_fingerprint.clone(),
                                     private_key: lease.private_key.as_str().to_string(),
                                 }
                             })
@@ -31853,19 +31851,18 @@ fn authorize_repository_materialization_operation(
                 workspace_id: api.config.workspace_id.clone(),
                 runtime_id: operation.resolved_runtime_id.clone(),
                 operation_id: operation.operation_id.clone(),
-                config_revision: operation.config_revision,
                 config_projection_digest: operation.config_projection_digest.clone(),
                 ssh: Some(RepositorySshMaterializationAccess {
                     credential_candidates: leases
                         .into_iter()
                         .map(|lease| RepositorySshCredentialCandidate {
                             credential_id: lease.credential_id,
-                            credential_revision: lease.credential_revision,
+                            public_key_fingerprint: lease.credential_fingerprint.clone(),
                             private_key: SensitiveString::default(),
                         })
                         .collect(),
                     host_trust_id: primary_host_trust_id,
-                    host_trust_revision: primary_host_trust_revision,
+                    host_key_fingerprint: primary_host_trust_fingerprint,
                     access,
                     expires_at_epoch_seconds,
                     repository_id: request.repository.id.clone(),
@@ -31877,12 +31874,10 @@ fn authorize_repository_materialization_operation(
             }
         } else {
             let projection = active_repository_access_projection(api, &api.config.workspace_id)?;
-            if projection.config_revision != operation.config_revision
-                || projection.projection_digest != operation.config_projection_digest
-            {
+            if projection.projection_digest != operation.config_projection_digest {
                 return Err(settings_bad_request(
-                    "working_directory_repository_access_revision_changed",
-                    "Workspace Repository access revision changed before operation reservation was bound",
+                    "working_directory_repository_access_content_changed",
+                    "Workspace Repository access content changed before operation reservation was bound",
                 ));
             }
             authorize_repository_materialization(
@@ -31921,7 +31916,7 @@ fn authorize_repository_materialization_operation(
                         WorkdirCreateCredentialCandidateRole::WorkspaceDefaultFallback
                     },
                     credential_id: candidate.credential_id.clone(),
-                    credential_revision: candidate.credential_revision,
+                    credential_fingerprint: candidate.public_key_fingerprint.clone(),
                 })
                 .collect::<Vec<_>>();
             api.config_store.bind_workdir_create_repository_access(
@@ -31929,9 +31924,9 @@ fn authorize_repository_materialization_operation(
                 &operation.operation_id,
                 request_fingerprint,
                 &primary_credential.credential_id,
-                primary_credential.credential_revision,
+                &primary_credential.public_key_fingerprint,
                 &ssh.host_trust_id,
-                ssh.host_trust_revision,
+                &ssh.host_key_fingerprint,
                 match ssh.access {
                     server_api::RepositoryAccessMode::ReadOnly => "read_only",
                     server_api::RepositoryAccessMode::ReadWrite => "read_write",
@@ -31946,7 +31941,6 @@ fn authorize_repository_materialization_operation(
             workspace_id: api.config.workspace_id.clone(),
             runtime_id: operation.resolved_runtime_id.clone(),
             operation_id: operation.operation_id.clone(),
-            config_revision: operation.config_revision,
             config_projection_digest: operation.config_projection_digest.clone(),
             ssh: None,
         }
@@ -31981,7 +31975,6 @@ fn repository_ssh_lease_candidates_from_operation(
     if operation.repository_id != request.repository.id
         || operation.source_kind.as_deref() != Some(request.repository.source.kind.as_str())
         || operation.source_uri.as_deref() != Some(request.repository.source.uri.as_str())
-        || operation.source_revision != Some(request.repository.source_revision)
         || operation.source_fingerprint.as_deref()
             != Some(request.repository.source_fingerprint.as_str())
     {
@@ -31996,7 +31989,7 @@ fn repository_ssh_lease_candidates_from_operation(
             "persisted Workdir Repository access snapshot is incomplete",
         )
     })?;
-    let host_trust_revision = operation.host_trust_revision.ok_or_else(|| {
+    let host_trust_fingerprint = operation.host_trust_fingerprint.as_deref().ok_or_else(|| {
         settings_bad_request(
             "working_directory_repository_access_snapshot_missing",
             "persisted Workdir Repository access snapshot is incomplete",
@@ -32014,15 +32007,16 @@ fn repository_ssh_lease_candidates_from_operation(
             "persisted Workdir primary credential evidence is unavailable",
         )
     })?;
-    let primary_credential_revision = operation.credential_revision.ok_or_else(|| {
-        settings_bad_request(
-            "working_directory_repository_access_snapshot_missing",
-            "persisted Workdir primary credential evidence is unavailable",
-        )
-    })?;
+    let primary_credential_fingerprint =
+        operation.credential_fingerprint.as_deref().ok_or_else(|| {
+            settings_bad_request(
+                "working_directory_repository_access_snapshot_missing",
+                "persisted Workdir primary credential evidence is unavailable",
+            )
+        })?;
     crate::workdir_create_operations::validate_workdir_create_credential_candidates(
         primary_credential_id,
-        primary_credential_revision,
+        primary_credential_fingerprint,
         &operation.credential_candidates,
     )
     .map_err(|_error| {
@@ -32054,20 +32048,21 @@ fn repository_ssh_lease_candidates_from_operation(
     for candidate in &operation.credential_candidates {
         let lease = api
             .repository_secrets
-            .lease_ssh_materialization_access_revision(
+            .lease_ssh_materialization_access_fingerprints(
                 &api.config.workspace_id,
                 &candidate.credential_id,
-                candidate.credential_revision,
+                &candidate.credential_fingerprint,
                 host_trust_id,
-                host_trust_revision,
+                host_trust_fingerprint,
             )
             .map_err(|_| {
                 settings_bad_request(
                     "working_directory_repository_access_snapshot_unavailable",
-                    "persisted Workdir credential or host-trust revision is unavailable",
+                    "persisted Workdir credential or host-key identity is unavailable",
                 )
             })?;
-        if lease.host_trust_id != host_trust_id || lease.host_trust_revision != host_trust_revision
+        if lease.host_trust_id != host_trust_id
+            || lease.host_trust_fingerprint != host_trust_fingerprint
         {
             return Err(settings_bad_request(
                 "working_directory_repository_access_snapshot_mismatch",
@@ -32126,7 +32121,7 @@ fn authorize_repository_materialization(
             )
         })?;
         let primary_host_trust_id = primary_lease.host_trust_id.clone();
-        let primary_host_trust_revision = primary_lease.host_trust_revision;
+        let primary_host_trust_fingerprint = primary_lease.host_trust_fingerprint.clone();
         let known_hosts_entry = primary_lease.known_hosts_entry.clone();
         let expires_at_epoch_seconds = repository_access_expiry();
         let secret_resource = api
@@ -32135,18 +32130,6 @@ fn authorize_repository_materialization(
                 &api.config.workspace_id,
                 runtime_id,
                 format!("repository-ssh-access:{operation_id}"),
-                format!(
-                    "credentials:{}:host-trust:{}",
-                    leases
-                        .iter()
-                        .map(|lease| format!(
-                            "{}:{}",
-                            lease.credential_id, lease.credential_revision
-                        ))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    primary_host_trust_revision
-                ),
                 i64::try_from(expires_at_epoch_seconds).unwrap_or(i64::MAX),
                 worker_runtime::resource::RepositorySshAccessSecret {
                     credential_candidates: leases
@@ -32154,7 +32137,7 @@ fn authorize_repository_materialization(
                         .map(
                             |lease| worker_runtime::resource::RepositorySshAccessSecretCandidate {
                                 credential_id: lease.credential_id.clone(),
-                                credential_revision: lease.credential_revision,
+                                public_key_fingerprint: lease.credential_fingerprint.clone(),
                                 private_key: lease.private_key.as_str().to_string(),
                             },
                         )
@@ -32173,12 +32156,12 @@ fn authorize_repository_materialization(
                 .into_iter()
                 .map(|lease| RepositorySshCredentialCandidate {
                     credential_id: lease.credential_id,
-                    credential_revision: lease.credential_revision,
+                    public_key_fingerprint: lease.credential_fingerprint.clone(),
                     private_key: SensitiveString::default(),
                 })
                 .collect(),
             host_trust_id: primary_host_trust_id,
-            host_trust_revision: primary_host_trust_revision,
+            host_key_fingerprint: primary_host_trust_fingerprint,
             access: binding.access,
             expires_at_epoch_seconds,
             repository_id: request.repository.id.clone(),
@@ -32194,7 +32177,6 @@ fn authorize_repository_materialization(
         workspace_id: api.config.workspace_id.clone(),
         runtime_id: runtime_id.to_string(),
         operation_id: operation_id.to_string(),
-        config_revision: projection.config_revision,
         config_projection_digest: projection.projection_digest.clone(),
         ssh,
     });
@@ -32231,12 +32213,12 @@ fn complete_restore_repository_access(
         for candidate in &ssh.credential_candidates {
             leases.push(
                 api.repository_secrets
-                    .lease_ssh_materialization_access_revision(
+                    .lease_ssh_materialization_access_fingerprints(
                         api.workspace_id(),
                         &candidate.credential_id,
-                        candidate.credential_revision,
+                        &candidate.public_key_fingerprint,
                         &ssh.host_trust_id,
-                        ssh.host_trust_revision,
+                        &ssh.host_key_fingerprint,
                     )?,
             );
         }
@@ -32255,7 +32237,6 @@ fn complete_restore_repository_access(
                     "repository-ssh-access:{}",
                     access.materialization.operation_id
                 ),
-                ssh.secret_resource.revision.clone(),
                 i64::try_from(ssh.expires_at_epoch_seconds).unwrap_or(i64::MAX),
                 worker_runtime::resource::RepositorySshAccessSecret {
                     credential_candidates: leases
@@ -32263,7 +32244,7 @@ fn complete_restore_repository_access(
                         .map(
                             |lease| worker_runtime::resource::RepositorySshAccessSecretCandidate {
                                 credential_id: lease.credential_id,
-                                credential_revision: lease.credential_revision,
+                                public_key_fingerprint: lease.credential_fingerprint.clone(),
                                 private_key: lease.private_key.as_str().to_owned(),
                             },
                         )
@@ -32354,7 +32335,6 @@ fn working_directory_request_for_browser(
             id: repository.id.clone(),
             provider: "git".to_string(),
             source: repository.source.clone(),
-            source_revision: repository.source_revision,
             source_fingerprint: repository.source_fingerprint.clone(),
             selector: selector.map(RuntimeRepositorySelector),
         },
@@ -32764,7 +32744,7 @@ impl From<Error> for ApiError {
                     ticket::TicketError::Locked { .. } => "ticket_locked",
                     ticket::TicketError::Conflict(_)
                     | ticket::TicketError::StaleWorkflowState { .. }
-                    | ticket::TicketError::StaleItemRevision { .. }
+                    | ticket::TicketError::StaleContent { .. }
                     | ticket::TicketError::InvalidWorkflowTransition { .. }
                     | ticket::TicketError::BlockingRelations(_)
                     | ticket::TicketError::OperationFingerprintMismatch { .. } => "ticket_conflict",
@@ -32818,7 +32798,7 @@ impl From<Error> for ApiError {
 
 fn subjektiv_diagnostic_code(message: &str) -> Option<&'static str> {
     [
-        "revision_conflict",
+        "change_conflict",
         "stale_cursor",
         "candidate_decision_conflict",
         "subject_scope_mismatch",
@@ -32857,14 +32837,14 @@ fn api_error_status(error: &Error) -> StatusCode {
         | Error::WorkdirAttachmentConflict(_)
         | Error::WorkspaceConfigConflict(_)
         | Error::RuntimeBindingConflict(_)
-        | Error::RuntimeBindingRevisionConflict { .. }
+        | Error::RuntimeBindingIdConflict { .. }
         | Error::RuntimeBindingFingerprintConflict { .. }
         | Error::RepositoryConflict(_)
         | Error::RestoreObservationConflict => StatusCode::CONFLICT,
         Error::WorkerSourceIdentity(_) => StatusCode::BAD_REQUEST,
         Error::InvalidInput(message)
             if message.starts_with("memory_not_found:")
-                || message.starts_with("memory_revision_not_found:") =>
+                || message.starts_with("memory_change_not_found:") =>
         {
             StatusCode::NOT_FOUND
         }
@@ -32882,7 +32862,7 @@ fn api_error_status(error: &Error) -> StatusCode {
             ticket::TicketError::Ambiguous { .. }
             | ticket::TicketError::Locked { .. }
             | ticket::TicketError::Conflict(_)
-            | ticket::TicketError::StaleItemRevision { .. }
+            | ticket::TicketError::StaleContent { .. }
             | ticket::TicketError::StaleWorkflowState { .. }
             | ticket::TicketError::OperationFingerprintMismatch { .. },
         ) => StatusCode::CONFLICT,
@@ -32921,7 +32901,7 @@ fn api_error_status(error: &Error) -> StatusCode {
         Error::RuntimeOperationFailed { code, .. }
             if code == "profile_registry_revision_conflict"
                 || code == "profile_source_revision_conflict"
-                || code == "workspace_metadata_revision_conflict"
+                || code == "workspace_metadata_updated_at_conflict"
                 || code == "workspace_cleanup_plan_stale"
                 || code == "workspace_cleanup_worker_blocked"
                 || code == "workspace_cleanup_workdir_blocked"
@@ -33102,7 +33082,7 @@ mod tests {
                 subject_id: "subject-a".into(),
                 body_md: String::new(),
                 memory_refs: Vec::new(),
-                built_from_store_revision: 7,
+                built_from_memory_fingerprint: "memory-empty".into(),
                 created_at: "2026-10-02T00:00:00Z".into(),
             }),
         });
@@ -36485,11 +36465,14 @@ mod tests {
                     base_url: "https://runtime.test".to_owned(),
                     public_key: identity.public_key.clone(),
                     public_key_fingerprint: String::new(),
-                    binding_revision: 1,
+                    binding_id: "binding-test".to_string(),
                     state: StoredRuntimeBindingState::Verified,
                     authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
                     workspace_key_id: Some("WK-test".to_owned()),
-                    workspace_key_generation: Some(1),
+
+                    workspace_public_key_fingerprint: Some("sha256:workspace-test".to_string()),
+
+                    workspace_trust_id: Some("trust-test".to_string()),
                     created_at: "2026-01-01T00:00:00Z".to_owned(),
                     updated_at: "2026-01-01T00:00:00Z".to_owned(),
                     revoked_at: None,
@@ -36664,7 +36647,7 @@ mod tests {
     fn test_worker_memory_settings() -> manifest::WorkspaceMemorySettingsSnapshot {
         manifest::WorkspaceMemorySettingsSnapshot {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
-            settings_revision: 1,
+
             language: "English".to_string(),
         }
     }
@@ -37066,7 +37049,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resolved.flow_id, stored.flow_id);
-        assert_eq!(resolved.revision, stored.revision);
         assert_eq!(resolved.content_digest, stored.content_digest);
         assert_eq!(resolved.definition.name, "browser-flow");
 
@@ -37085,10 +37067,12 @@ mod tests {
         assert_eq!(builtin.selector.to_string(), "builtin:coder-review");
         assert_eq!(builtin.flow_id, "builtin:coder-review");
         assert_eq!(
-            builtin.revision,
+            builtin.content_digest,
             flow::builtin_flow_source(flow::CODER_REVIEW_FLOW_SLUG)
                 .unwrap()
-                .revision
+                .compile()
+                .unwrap()
+                .content_digest
         );
         assert_eq!(
             api.store
@@ -37197,7 +37181,7 @@ mod tests {
                     hostname: "example.test".to_string(),
                     port: 22,
                     host_key: host_public_key,
-                    expected_revision: None,
+                    expected_fingerprint: None,
                 },
                 "owner-account",
             )
@@ -37240,7 +37224,6 @@ mod tests {
                 id: "repository-a".to_string(),
                 provider: "git".to_string(),
                 source: source.clone(),
-                source_revision: 1,
                 source_fingerprint: source_fingerprint.clone(),
                 selector: None,
             },
@@ -37257,16 +37240,14 @@ mod tests {
             selector: None,
             requested_runtime_id: Some("runtime-1".to_string()),
             resolved_runtime_id: "runtime-1".to_string(),
-            config_revision: 1,
             config_projection_digest: "sha256:projection".to_string(),
             source_kind: Some(source.kind.as_str().to_string()),
             source_uri: Some(source.uri.clone()),
-            source_revision: Some(1),
             source_fingerprint: Some(source_fingerprint),
             credential_id: Some(candidates[0].credential_id.clone()),
-            credential_revision: Some(candidates[0].credential_revision),
+            credential_fingerprint: Some(candidates[0].credential_fingerprint.clone()),
             host_trust_id: Some(candidates[0].host_trust_id.clone()),
-            host_trust_revision: Some(candidates[0].host_trust_revision),
+            host_trust_fingerprint: Some(candidates[0].host_trust_fingerprint.clone()),
             repository_access_mode: Some("read_only".to_string()),
             credential_candidates: candidates
                 .iter()
@@ -37278,7 +37259,7 @@ mod tests {
                         WorkdirCreateCredentialCandidateRole::WorkspaceDefaultFallback
                     },
                     credential_id: candidate.credential_id.clone(),
-                    credential_revision: candidate.credential_revision,
+                    credential_fingerprint: candidate.credential_fingerprint.clone(),
                 })
                 .collect(),
             working_directory_id: "workdir-a".to_string(),
@@ -37295,7 +37276,7 @@ mod tests {
                 .iter()
                 .map(|candidate| (
                     candidate.credential_id.as_str(),
-                    candidate.credential_revision
+                    candidate.credential_fingerprint.as_str()
                 ))
                 .collect::<Vec<_>>(),
             operation
@@ -37303,7 +37284,7 @@ mod tests {
                 .iter()
                 .map(|candidate| (
                     candidate.credential_id.as_str(),
-                    candidate.credential_revision
+                    candidate.credential_fingerprint.as_str()
                 ))
                 .collect::<Vec<_>>()
         );
@@ -37352,7 +37333,6 @@ mod tests {
                     uri: dir.path().join("foreign").display().to_string(),
                 },
                 default_ref: Some("HEAD".to_string()),
-                source_revision: 1,
                 source_fingerprint: "sha256:test".to_string(),
                 observed_status: server_api::RepositoryObservedStatus::Unverified,
                 observed_at: None,
@@ -37438,13 +37418,12 @@ mod tests {
                 &api.config.workspace_id,
                 "runtime-1",
                 "repository-access-test",
-                "1",
                 i64::MAX,
                 worker_runtime::resource::RepositorySshAccessSecret {
                     credential_candidates: vec![
                         worker_runtime::resource::RepositorySshAccessSecretCandidate {
                             credential_id: "credential-1".to_string(),
-                            credential_revision: 1,
+                            public_key_fingerprint: "SHA256:credential-test".to_string(),
                             private_key: "private-key-bytes".to_string(),
                         },
                     ],
@@ -37463,19 +37442,18 @@ mod tests {
                 workspace_id: api.config.workspace_id.clone(),
                 runtime_id: "runtime-1".to_string(),
                 operation_id: "operation-1".to_string(),
-                config_revision: 1,
                 config_projection_digest: "sha256:projection".to_string(),
                 ssh: Some(
                     worker_runtime::catalog::RepositorySshMaterializationAccess {
                         credential_candidates: vec![
                             worker_runtime::catalog::RepositorySshCredentialCandidate {
                                 credential_id: "credential-1".to_string(),
-                                credential_revision: 1,
+                                public_key_fingerprint: "SHA256:credential-test".to_string(),
                                 private_key: worker_runtime::catalog::SensitiveString::default(),
                             },
                         ],
                         host_trust_id: "host-trust-1".to_string(),
-                        host_trust_revision: 1,
+                        host_key_fingerprint: "SHA256:host-test".to_string(),
                         access: server_api::RepositoryAccessMode::ReadOnly,
                         expires_at_epoch_seconds: u64::MAX,
                         repository_id: working_directory.repository.id.clone(),
@@ -39913,8 +39891,8 @@ mod tests {
                 .memory(&subject.id, &memory.id)
                 .unwrap()
                 .unwrap()
-                .revision,
-            1
+                .change_id,
+            memory.change_id
         );
 
         let Json(repeated) = scoped_reset_legacy_memory(
@@ -40025,14 +40003,17 @@ mod tests {
             created["behavior_md"],
             "Prefer explicit evidence.\nAsk when uncertain."
         );
-        assert_eq!(created["behavior_revision"], 0);
+        assert!(created.get("behavior_revision").is_none());
         assert_eq!(created["state"], "active");
-        assert_eq!(created["store_revision"], 0);
+        assert!(created.get("store_revision").is_none());
         assert!(created.get("current_worker").is_none());
         let created_id = created["id"].as_str().unwrap();
         let persisted = store.subject(created_id).unwrap().unwrap();
         assert_eq!(persisted.role.as_str(), "  Browser author  ");
-        assert_eq!(persisted.behavior_revision, 0);
+        assert_eq!(
+            persisted.behavior_md,
+            created["behavior_md"].as_str().unwrap()
+        );
         let behavior_uri =
             format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{created_id}/behavior");
         request_json(
@@ -40040,7 +40021,7 @@ mod tests {
             "PATCH",
             &behavior_uri,
             Some(serde_json::json!({
-                "expected_behavior_revision": 0,
+                "expected_behavior_md": "Prefer explicit evidence.\nAsk when uncertain.",
                 "behavior_md": "Updated without rewriting history."
             })),
             StatusCode::UNAUTHORIZED,
@@ -40051,7 +40032,7 @@ mod tests {
             "PATCH",
             &behavior_uri,
             Some(serde_json::json!({
-                "expected_behavior_revision": 0,
+                "expected_behavior_md": "Prefer explicit evidence.\nAsk when uncertain.",
                 "behavior_md": "Updated without rewriting history."
             })),
             &owner_token,
@@ -40059,13 +40040,13 @@ mod tests {
         )
         .await;
         assert_eq!(updated["behavior_md"], "Updated without rewriting history.");
-        assert_eq!(updated["behavior_revision"], 1);
+        assert!(updated.get("behavior_revision").is_none());
         request_json_authenticated(
             app.clone(),
             "PATCH",
             &behavior_uri,
             Some(serde_json::json!({
-                "expected_behavior_revision": 0,
+                "expected_behavior_md": "Prefer explicit evidence.\nAsk when uncertain.",
                 "behavior_md": "stale write"
             })),
             &owner_token,
@@ -40077,7 +40058,7 @@ mod tests {
             "PATCH",
             &behavior_uri,
             Some(serde_json::json!({
-                "expected_behavior_revision": 1,
+                "expected_behavior_md": "Updated without rewriting history.",
                 "behavior_md": ""
             })),
             &owner_token,
@@ -40085,7 +40066,7 @@ mod tests {
         )
         .await;
         assert_eq!(cleared["behavior_md"], "");
-        assert_eq!(cleared["behavior_revision"], 2);
+        assert!(cleared.get("behavior_revision").is_none());
         assert!(
             api.store
                 .current_worker_singleton_owner(
@@ -40127,7 +40108,7 @@ mod tests {
             format!("{subject_root}/surface"),
             format!("{subject_root}/memories?limit=1"),
             memory_root.clone(),
-            format!("{memory_root}/revisions?limit=1"),
+            format!("{memory_root}/changes?limit=1"),
         ] {
             request_json_authenticated(
                 app.clone(),
@@ -40181,8 +40162,8 @@ mod tests {
             store
                 .scoped_memory(&subject.id, &memory.id)
                 .unwrap()
-                .revision,
-            1
+                .change_id,
+            memory.change_id
         );
     }
 
@@ -40205,7 +40186,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(created.behavior_revision, 0);
+
         assert_eq!(created.behavior_md, "Prefer explicit evidence.");
 
         let Json(updated) = scoped_update_subjektiv_subject_behavior(
@@ -40215,13 +40196,13 @@ mod tests {
                 subject_id: created.id.clone(),
             }),
             Json(server_api::SubjektivSubjectBehaviorUpdateRequest {
-                expected_behavior_revision: 0,
+                expected_behavior_md: created.behavior_md.clone(),
                 behavior_md: "Ask when uncertain.".to_string(),
             }),
         )
         .await
         .unwrap();
-        assert_eq!(updated.behavior_revision, 1);
+
         assert_eq!(updated.behavior_md, "Ask when uncertain.");
 
         let conflict = scoped_update_subjektiv_subject_behavior(
@@ -40231,7 +40212,7 @@ mod tests {
                 subject_id: created.id.clone(),
             }),
             Json(server_api::SubjektivSubjectBehaviorUpdateRequest {
-                expected_behavior_revision: 0,
+                expected_behavior_md: created.behavior_md.clone(),
                 behavior_md: "Stale edit".to_string(),
             }),
         )
@@ -40246,13 +40227,13 @@ mod tests {
                 subject_id: created.id,
             }),
             Json(server_api::SubjektivSubjectBehaviorUpdateRequest {
-                expected_behavior_revision: 1,
+                expected_behavior_md: updated.behavior_md.clone(),
                 behavior_md: String::new(),
             }),
         )
         .await
         .unwrap();
-        assert_eq!(cleared.behavior_revision, 2);
+
         assert!(cleared.behavior_md.is_empty());
 
         let oversized = scoped_create_subjektiv_subject(
@@ -40271,7 +40252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subjektiv_browser_reads_are_bounded_scoped_and_revision_exact() {
+    async fn subjektiv_browser_reads_are_bounded_scoped_and_change_id_exact() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
@@ -40373,7 +40354,7 @@ mod tests {
                 &first_subject.id,
                 crate::subjektiv::MemoryDraft::active(
                     memory::extract::CandidateKind::Lesson,
-                    "Keep exact revisions",
+                    "Keep exact changes",
                     "first body",
                     "Supports historical reads",
                     "initial",
@@ -40384,10 +40365,10 @@ mod tests {
             .revise_memory(
                 &first_subject.id,
                 &memory.id,
-                1,
+                memory.change_id.clone(),
                 crate::subjektiv::MemoryDraft::active(
                     memory::extract::CandidateKind::Lesson,
-                    "Keep exact revisions",
+                    "Keep exact changes",
                     "second body",
                     "Supports historical reads",
                     "correction",
@@ -40425,7 +40406,7 @@ mod tests {
         .unwrap();
         assert_eq!(memories.items.len(), 1);
         assert_eq!(memories.items[0].id, memory.id);
-        assert_eq!(memories.items[0].revision, 2);
+        assert_eq!(memories.items[0].change_id, revised.change_id);
 
         let missing_memory = scoped_get_subjektiv_memory(
             State(api.clone()),
@@ -40443,7 +40424,7 @@ mod tests {
             StatusCode::NOT_FOUND
         );
 
-        let missing_revision = scoped_get_subjektiv_memory(
+        let missing_change_id = scoped_get_subjektiv_memory(
             State(api.clone()),
             AxumPath(ScopedSubjektivMemoryPath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
@@ -40451,15 +40432,34 @@ mod tests {
                 memory_id: memory.id.clone(),
             }),
             Query(server_api::SubjektivMemoryDetailQuery {
-                revision: Some(99),
+                change_id: Some("missing-change".into()),
                 ..Default::default()
             }),
         )
         .await
         .unwrap_err();
         assert_eq!(
-            missing_revision.into_response().status(),
+            missing_change_id.into_response().status(),
             StatusCode::NOT_FOUND
+        );
+
+        let invalid_change_id = scoped_get_subjektiv_memory(
+            State(api.clone()),
+            AxumPath(ScopedSubjektivMemoryPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                subject_id: first_subject.id.clone(),
+                memory_id: memory.id.clone(),
+            }),
+            Query(server_api::SubjektivMemoryDetailQuery {
+                change_id: Some(String::new()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            invalid_change_id.into_response().status(),
+            StatusCode::BAD_REQUEST
         );
 
         let cross_subject = scoped_get_subjektiv_memory(
@@ -40486,45 +40486,45 @@ mod tests {
                 memory_id: memory.id.clone(),
             }),
             Query(server_api::SubjektivMemoryDetailQuery {
-                revision: Some(1),
+                change_id: Some(memory.change_id.clone()),
                 ..Default::default()
             }),
         )
         .await
         .unwrap();
-        assert_eq!(historical.revision, 1);
-        assert_eq!(historical.current_revision, 2);
+        assert_eq!(historical.change_id, memory.change_id);
+        assert_eq!(historical.current_change_id, revised.change_id);
         assert_eq!(historical.body_md, "first body");
 
-        let Json(revisions) = scoped_list_subjektiv_memory_revisions(
+        let Json(changes) = scoped_list_subjektiv_memory_changes(
             State(api.clone()),
             AxumPath(ScopedSubjektivMemoryPath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 subject_id: first_subject.id.clone(),
                 memory_id: memory.id.clone(),
             }),
-            Query(server_api::SubjektivMemoryRevisionsQuery {
+            Query(server_api::SubjektivMemoryChangesQuery {
                 limit: Some(1),
                 cursor: None,
             }),
         )
         .await
         .unwrap();
-        assert_eq!(revisions.current_revision, 2);
-        assert_eq!(revisions.items[0].revision, 2);
-        assert!(revisions.has_more);
+        assert_eq!(changes.current_change_id, revised.change_id);
+        assert_eq!(changes.items[0].change_id, revised.change_id);
+        assert!(changes.has_more);
 
         let generation = store.prepare_surface_generation(&first_subject.id).unwrap();
-        let expected_ref = crate::subjektiv::MemoryRevisionRef {
+        let expected_ref = crate::subjektiv::MemoryChangeRef {
             memory_id: revised.id.clone(),
-            revision: revised.revision,
+            change_id: revised.change_id.clone(),
         };
         store
             .publish_surface_generation(
                 &first_subject.id,
                 &generation.id,
                 vec![crate::subjektiv::SurfacePoint {
-                    body_md: "- Keep exact revisions".to_string(),
+                    body_md: "- Keep exact changes".to_string(),
                     memory_refs: vec![expected_ref.clone()],
                 }],
             )
@@ -40545,7 +40545,7 @@ mod tests {
         let snapshot = surface.snapshot.unwrap();
         assert_eq!(snapshot.memory_refs.len(), 1);
         assert_eq!(snapshot.memory_refs[0].memory_id, expected_ref.memory_id);
-        assert_eq!(snapshot.memory_refs[0].revision, expected_ref.revision);
+        assert_eq!(snapshot.memory_refs[0].change_id, expected_ref.change_id);
     }
 
     #[tokio::test]
@@ -40833,7 +40833,6 @@ mod tests {
             server_api::SubjektivMemoryBackendResponse::ResidentContext(
                 server_api::SubjektivResidentContextOutput {
                     behavior_md,
-                    behavior_revision: 0,
                     memory_surface: memory::backend::MemoryResidentSummaryOutput {
                         availability: memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
                         content: None,
@@ -40917,7 +40916,7 @@ mod tests {
                     worker_id: None,
                     flow_selector: None,
                     flow_definition_id: None,
-                    flow_definition_revision: None,
+                    flow_definition_fingerprint: None,
                 }),
                 excerpt: Some("Keep subject scope host-derived".to_string()),
                 summary: Some("Scope decision".to_string()),
@@ -41091,7 +41090,7 @@ mod tests {
                 worker_id: None,
                 flow_selector: None,
                 flow_definition_id: None,
-                flow_definition_revision: None,
+                flow_definition_fingerprint: None,
             }),
             excerpt: Some("Correct the first rule".to_string()),
             summary: Some("Human correction".to_string()),
@@ -41152,10 +41151,10 @@ mod tests {
                             evidence_id: Some("E00000000".to_string()),
                             ..Default::default()
                         }],
-                        proposal: Some(server_api::SubjektivMemoryRevisionProposal {
+                        proposal: Some(server_api::SubjektivMemoryChangeProposal {
                             memory_id: target.id.clone(),
-                            expected_revision: 1,
-                            intent: server_api::SubjektivMemoryRevisionIntent::Revise,
+                            expected_change_id: target.change_id.clone(),
+                            intent: server_api::SubjektivMemoryChangeIntent::Revise,
                             change_reason: "The human corrected the rule".to_string(),
                         }),
                     },
@@ -41201,20 +41200,20 @@ mod tests {
             .staging_candidate(&subject.id, &staged.candidate_id)
             .unwrap()
             .unwrap();
-        assert_eq!(candidate.revision_proposal.unwrap().memory_id, target.id);
+        assert_eq!(candidate.change_proposal.unwrap().memory_id, target.id);
         assert_eq!(
             store
                 .memory(&subject.id, &target.id)
                 .unwrap()
                 .unwrap()
-                .revision,
-            1,
-            "staging a proposal must not create a confirmed revision"
+                .change_id,
+            target.change_id,
+            "staging a proposal must not create a confirmed change"
         );
     }
 
     #[tokio::test]
-    async fn subjektiv_memory_tools_filter_page_and_read_fixed_revisions() {
+    async fn subjektiv_memory_tools_filter_page_and_read_fixed_changes() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
@@ -41254,21 +41253,25 @@ mod tests {
             "resolved after verification",
         );
         resolved.state = crate::subjektiv::MemoryState::Resolved;
-        store
-            .revise_memory(&subject.id, &second.id, 1, resolved)
+        let revised_second = store
+            .revise_memory(&subject.id, &second.id, second.change_id.clone(), resolved)
             .unwrap();
-        let revision_conflict = subjektiv_memory_validate_proposal(
+        let change_id_conflict = subjektiv_memory_validate_proposal(
             &store,
             &subject.id,
             server_api::SubjektivMemoryValidateProposalRequest {
                 memory_id: second.id.clone(),
-                expected_revision: 1,
-                intent: server_api::SubjektivMemoryRevisionIntent::Revise,
+                expected_change_id: second.change_id.clone(),
+                intent: server_api::SubjektivMemoryChangeIntent::Revise,
             },
         )
         .unwrap_err();
-        let revision_api = ApiError::from(revision_conflict).into_repository_api_error();
-        assert_eq!(revision_api.diagnostics[0].code, "revision_conflict");
+        let change_id_api = ApiError::from(change_id_conflict).into_repository_api_error();
+        assert_eq!(
+            api_macros::HttpError::status_code(&change_id_api),
+            StatusCode::CONFLICT.as_u16()
+        );
+        assert_eq!(change_id_api.diagnostics[0].code, "change_conflict");
 
         let default_page = subjektiv_memory_query(
             &store,
@@ -41356,7 +41359,7 @@ mod tests {
             &subject.id,
             server_api::SubjektivMemoryReadRequest {
                 memory_id: first.id.clone(),
-                revision: None,
+                change_id: None,
                 offset: None,
                 byte_offset: None,
                 limit: Some(1),
@@ -41364,13 +41367,13 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(initial_read.revision, 1);
+        assert_eq!(initial_read.change_id, first.change_id);
         assert_eq!(initial_read.body_next_offset, Some(1));
-        store
+        let revised_first = store
             .revise_memory(
                 &subject.id,
                 &first.id,
-                1,
+                first.change_id.clone(),
                 crate::subjektiv::MemoryDraft::active(
                     memory::extract::CandidateKind::Decision,
                     "Choose stable cursors",
@@ -41385,7 +41388,7 @@ mod tests {
             &subject.id,
             server_api::SubjektivMemoryReadRequest {
                 memory_id: first.id.clone(),
-                revision: None,
+                change_id: None,
                 offset: initial_read.body_next_offset,
                 byte_offset: initial_read.body_next_byte_offset,
                 limit: Some(1),
@@ -41403,7 +41406,7 @@ mod tests {
             &subject.id,
             server_api::SubjektivMemoryReadRequest {
                 memory_id: first.id.clone(),
-                revision: Some(1),
+                change_id: Some(first.change_id.clone()),
                 offset: Some(1),
                 byte_offset: None,
                 limit: Some(1),
@@ -41414,8 +41417,8 @@ mod tests {
         assert_eq!(read.body_md, "line two\n");
         assert_eq!(read.body_next_offset, Some(2));
         assert!(read.body_truncated);
-        assert_eq!(read.revision, 1);
-        assert_eq!(read.current_revision, 2);
+        assert_eq!(read.change_id, first.change_id);
+        assert_eq!(read.current_change_id, revised_first.change_id);
 
         let oversized_body = "界".repeat(7_000);
         let oversized_memory = store
@@ -41435,7 +41438,7 @@ mod tests {
             &subject.id,
             server_api::SubjektivMemoryReadRequest {
                 memory_id: oversized_memory.id.clone(),
-                revision: None,
+                change_id: None,
                 offset: None,
                 byte_offset: None,
                 limit: Some(1),
@@ -41451,7 +41454,7 @@ mod tests {
             &subject.id,
             server_api::SubjektivMemoryReadRequest {
                 memory_id: oversized_memory.id,
-                revision: Some(oversized_first.revision),
+                change_id: Some(oversized_first.change_id),
                 offset: oversized_first.body_next_offset,
                 byte_offset: oversized_first.body_next_byte_offset,
                 limit: Some(1),
@@ -41482,7 +41485,7 @@ mod tests {
                     worker_id: Some(format!("worker-{index}-{}", "w".repeat(4_000))),
                     flow_selector: Some(format!("flow-{index}-{}", "f".repeat(4_000))),
                     flow_definition_id: Some(format!("definition-{index}-{}", "d".repeat(4_000))),
-                    flow_definition_revision: None,
+                    flow_definition_fingerprint: None,
                 }),
                 excerpt: Some(format!("evidence-{index}-{}", "x".repeat(4_000))),
                 summary: Some(format!("evidence-summary-{index}-{}", "q".repeat(4_000))),
@@ -41511,7 +41514,7 @@ mod tests {
                         "source-definition-{index}-{}",
                         "d".repeat(4_000)
                     )),
-                    flow_definition_revision: Some(index as u64),
+                    flow_definition_fingerprint: Some(format!("flow-content-{index}")),
                 }),
                 ..Default::default()
             })
@@ -41581,7 +41584,7 @@ mod tests {
             .apply_candidate(
                 &subject.id,
                 &nested_candidate.id,
-                crate::subjektiv::MemoryRevisionTarget::Create,
+                crate::subjektiv::MemoryChangeTarget::Create,
                 crate::subjektiv::MemoryDraft::active(
                     memory::extract::CandidateKind::Lesson,
                     "Keep nested provenance bounded",
@@ -41597,7 +41600,7 @@ mod tests {
             &subject.id,
             server_api::SubjektivMemoryReadRequest {
                 memory_id: nested_memory.id.clone(),
-                revision: Some(1),
+                change_id: Some(nested_memory.change_id.clone()),
                 offset: None,
                 byte_offset: None,
                 limit: None,
@@ -41667,7 +41670,7 @@ mod tests {
                 &subject.id,
                 server_api::SubjektivMemoryReadRequest {
                     memory_id: nested_memory.id.clone(),
-                    revision: Some(1),
+                    change_id: Some(nested_memory.change_id.clone()),
                     offset: None,
                     byte_offset: None,
                     limit: None,
@@ -41697,7 +41700,7 @@ mod tests {
                 &subject.id,
                 server_api::SubjektivMemoryReadRequest {
                     memory_id: nested_memory.id.clone(),
-                    revision: Some(1),
+                    change_id: Some(nested_memory.change_id.clone()),
                     offset: Some(offset),
                     byte_offset: next_byte,
                     limit: None,
@@ -41733,7 +41736,7 @@ mod tests {
                     worker_id: None,
                     flow_selector: None,
                     flow_definition_id: None,
-                    flow_definition_revision: None,
+                    flow_definition_fingerprint: None,
                 }),
                 excerpt: Some(format!("legacy excerpt {index}")),
                 summary: None,
@@ -41754,7 +41757,7 @@ mod tests {
                     worker_id: None,
                     flow_selector: None,
                     flow_definition_id: None,
-                    flow_definition_revision: None,
+                    flow_definition_fingerprint: None,
                 }),
                 ..Default::default()
             })
@@ -41792,7 +41795,7 @@ mod tests {
             .apply_candidate(
                 &subject.id,
                 &legacy_candidate.id,
-                crate::subjektiv::MemoryRevisionTarget::Create,
+                crate::subjektiv::MemoryChangeTarget::Create,
                 crate::subjektiv::MemoryDraft::active(
                     memory::extract::CandidateKind::Lesson,
                     "Preserve compatible historical provenance",
@@ -41812,7 +41815,7 @@ mod tests {
                 &subject.id,
                 server_api::SubjektivMemoryReadRequest {
                     memory_id: legacy_memory.id.clone(),
-                    revision: Some(1),
+                    change_id: Some(legacy_memory.change_id.clone()),
                     offset: None,
                     byte_offset: None,
                     limit: None,
@@ -41840,29 +41843,29 @@ mod tests {
             assert!(retrieved_sessions.contains(&format!("legacy-session-{index}")));
         }
 
-        let revisions = subjektiv_memory_list_revisions(
+        let changes = subjektiv_memory_list_changes(
             &store,
             &subject.id,
-            server_api::SubjektivMemoryListRevisionsRequest {
+            server_api::SubjektivMemoryListChangesRequest {
                 memory_id: second.id.clone(),
                 limit: Some(1),
                 cursor: None,
             },
         )
         .unwrap();
-        assert_eq!(revisions.items[0].revision, 2);
-        assert!(revisions.has_more);
-        let older = subjektiv_memory_list_revisions(
+        assert_eq!(changes.items[0].change_id, revised_second.change_id);
+        assert!(changes.has_more);
+        let older = subjektiv_memory_list_changes(
             &store,
             &subject.id,
-            server_api::SubjektivMemoryListRevisionsRequest {
+            server_api::SubjektivMemoryListChangesRequest {
                 memory_id: second.id,
                 limit: Some(1),
-                cursor: revisions.next_cursor,
+                cursor: changes.next_cursor,
             },
         )
         .unwrap();
-        assert_eq!(older.items[0].revision, 1);
+        assert_eq!(older.items[0].change_id, second.change_id);
         assert_eq!(older.items[0].claim, "Keep immutable history");
         assert!(!older.has_more);
     }
@@ -42566,11 +42569,14 @@ mod tests {
                     base_url: "https://8.8.8.8".to_string(),
                     public_key: runtime_identity.public_key,
                     public_key_fingerprint: String::new(),
-                    binding_revision: 1,
+                    binding_id: "binding-test".to_string(),
                     state: StoredRuntimeBindingState::Configured,
                     authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
                     workspace_key_id: Some(identity.key_id.clone()),
-                    workspace_key_generation: Some(identity.revision),
+
+                    workspace_public_key_fingerprint: identity.public_key_fingerprint.clone(),
+
+                    workspace_trust_id: Some("trust-test".to_string()),
                     created_at: "1".to_string(),
                     updated_at: "1".to_string(),
                     revoked_at: None,
@@ -42588,12 +42594,11 @@ mod tests {
         let evidence = crate::store::WorkspaceRuntimeVerificationEvidence {
             workspace_id: configured.workspace_id.clone(),
             runtime_id: configured.runtime_id.clone(),
-            binding_revision: configured.binding_revision,
+            binding_id: configured.binding_id.clone(),
             workspace_key_id: identity.key_id,
-            workspace_identity_revision: identity.revision,
-            workspace_trust_generation: identity.revision,
+            workspace_public_key_fingerprint: identity.public_key_fingerprint.clone().unwrap(),
+            workspace_trust_id: "trust-test".to_string(),
             runtime_public_key_fingerprint: configured.public_key_fingerprint.clone(),
-            runtime_identity_revision: 1,
             challenge_id: "restart-challenge".to_string(),
             state: "verified".to_string(),
             last_outcome: "verified".to_string(),
@@ -42635,12 +42640,12 @@ mod tests {
                     restored.config.workspace_id.clone(),
                     "restored-runtime".to_string(),
                 )),
-            "restored Runtime must retain its revision-fenced binding expectation"
+            "restored Runtime must retain its binding-ID-fenced expectation"
         );
     }
 
     #[tokio::test]
-    async fn verified_remote_runtime_metadata_update_preserves_public_key_and_verification() {
+    async fn remote_runtime_endpoint_update_preserves_public_key_but_requires_reverification() {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
         let actor = test_owner_actor();
@@ -42658,11 +42663,14 @@ mod tests {
                     base_url: "https://8.8.8.8".to_string(),
                     public_key: runtime_identity.public_key.clone(),
                     public_key_fingerprint: String::new(),
-                    binding_revision: 1,
+                    binding_id: "binding-test".to_string(),
                     state: StoredRuntimeBindingState::Configured,
                     authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
                     workspace_key_id: Some(workspace_identity.key_id.clone()),
-                    workspace_key_generation: Some(workspace_identity.revision),
+                    workspace_public_key_fingerprint: workspace_identity
+                        .public_key_fingerprint
+                        .clone(),
+                    workspace_trust_id: Some("trust-test".to_string()),
                     created_at: "1".to_string(),
                     updated_at: "1".to_string(),
                     revoked_at: None,
@@ -42680,12 +42688,14 @@ mod tests {
         let evidence = crate::store::WorkspaceRuntimeVerificationEvidence {
             workspace_id: configured.workspace_id.clone(),
             runtime_id: configured.runtime_id.clone(),
-            binding_revision: configured.binding_revision,
+            binding_id: configured.binding_id.clone(),
             workspace_key_id: workspace_identity.key_id,
-            workspace_identity_revision: workspace_identity.revision,
-            workspace_trust_generation: workspace_identity.revision,
+            workspace_public_key_fingerprint: workspace_identity
+                .public_key_fingerprint
+                .clone()
+                .unwrap(),
+            workspace_trust_id: "trust-test".to_string(),
             runtime_public_key_fingerprint: configured.public_key_fingerprint.clone(),
-            runtime_identity_revision: 1,
             challenge_id: "verified-metadata-update".to_string(),
             state: "verified".to_string(),
             last_outcome: "verified".to_string(),
@@ -42719,9 +42729,9 @@ mod tests {
         assert_eq!(updated.runtime.runtime.label, "New label");
         assert_eq!(updated.endpoint.as_deref(), Some("https://8.8.4.4"));
         let binding = updated.runtime.management.binding.unwrap();
-        assert_eq!(binding.state, WorkspaceRuntimeBindingState::Verified);
-        assert_eq!(binding.revision, 1);
-        assert_eq!(binding.verification.unwrap().binding_revision, 1);
+        assert_eq!(binding.state, WorkspaceRuntimeBindingState::Configured);
+        assert_ne!(binding.binding_id, configured.binding_id);
+        assert_eq!(binding.verification, None);
         assert_eq!(
             updated.trust_key.fingerprint.as_deref(),
             Some(configured.public_key_fingerprint.as_str())
@@ -42749,7 +42759,8 @@ mod tests {
                 },
                 display_name: Some("New label".to_string()),
                 endpoint: "https://8.8.4.4".to_string(),
-                expected_revision: Some(1),
+                workspace_trust_id: "trust-test".to_string(),
+                expected_binding_id: Some(configured.binding_id.clone()),
             }),
         )
         .await
@@ -42758,7 +42769,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_runtime_registration_is_workspace_scoped_revisioned_and_configured() {
+    async fn remote_runtime_registration_is_workspace_scoped_binding_fenced_and_configured() {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
         let actor = test_owner_actor();
@@ -42786,7 +42797,8 @@ mod tests {
             },
             display_name: Some("Configured Runtime".to_string()),
             endpoint: "https://8.8.8.8".to_string(),
-            expected_revision: None,
+            workspace_trust_id: "trust-test".to_string(),
+            expected_binding_id: None,
         };
         let mut non_owner = actor.clone();
         non_owner.user_id = "other-user".to_string();
@@ -42811,9 +42823,9 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED);
         let binding = created.management.binding.as_ref().unwrap();
         assert_eq!(binding.state, WorkspaceRuntimeBindingState::Configured);
-        assert_eq!(binding.revision, 1);
+        assert!(!binding.binding_id.is_empty());
         assert!(binding.workspace_key_id.is_some());
-        assert_eq!(binding.workspace_key_generation, Some(1));
+        assert_eq!(binding.workspace_trust_id.as_deref(), Some("trust-test"));
         assert!(!created.runtime.worker_creation_available);
         assert!(
             api.runtime
@@ -42831,7 +42843,7 @@ mod tests {
                     api.config.workspace_id.clone(),
                     "configured-runtime".to_string(),
                 )),
-            "configured binding must remain fenced by its current binding revision"
+            "configured binding must remain fenced by its current binding ID"
         );
         let Json(configured_test) = scoped_test_runtime_connection(
             State(api.clone()),
@@ -42857,7 +42869,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(replayed.management.binding.unwrap().revision, 1);
+        assert_eq!(
+            replayed.management.binding.unwrap().binding_id,
+            binding.binding_id
+        );
 
         let mut mismatched = request.clone();
         mismatched.display_name = Some("Different Runtime".to_string());
@@ -42870,13 +42885,16 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
 
-        mismatched.expected_revision = Some(1);
+        mismatched.expected_binding_id = Some(binding.binding_id.clone());
         let (status, Json(replaced)) =
             create_remote_runtime(State(api.clone()), Extension(actor), Json(mismatched))
                 .await
                 .unwrap();
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(replaced.management.binding.unwrap().revision, 2);
+        assert_ne!(
+            replaced.management.binding.unwrap().binding_id,
+            binding.binding_id
+        );
 
         let unknown_identity = RuntimeIdentityMaterial::generate("unknown-runtime").unwrap();
         let unknown_revision = create_remote_runtime(
@@ -42889,7 +42907,8 @@ mod tests {
                 },
                 display_name: None,
                 endpoint: "https://8.8.4.4".to_string(),
-                expected_revision: Some(9),
+                workspace_trust_id: "trust-test".to_string(),
+                expected_binding_id: Some("binding-missing".to_string()),
             }),
         )
         .await
@@ -42916,6 +42935,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_trust_reregistration_changes_binding_and_rejects_old_revoke_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        let actor = test_owner_actor();
+        api.signing_identities
+            .provision_existing(api.workspace_id(), &actor.account_id)
+            .unwrap();
+        let runtime_identity =
+            RuntimeIdentityMaterial::generate("trust-reaccepted-runtime").unwrap();
+        let request = CreateRemoteRuntimeRequest {
+            public_bundle: server_api::RuntimePublicIdentityBundle {
+                identity_id: "trust-reaccepted-runtime".to_string(),
+                public_key: runtime_identity.public_key,
+            },
+            display_name: None,
+            endpoint: "http://127.0.0.1:1".to_string(),
+            workspace_trust_id: "trust-first-acceptance".to_string(),
+            expected_binding_id: None,
+        };
+        let (_, Json(created)) = create_remote_runtime(
+            State(api.clone()),
+            Extension(actor.clone()),
+            Json(request.clone()),
+        )
+        .await
+        .unwrap();
+        let original = created.management.binding.unwrap();
+        let service = ServerApiContractService::Workspace(api.clone());
+        let revoked =
+            <ServerApiContractService as server_api::ServerApi>::runtime_trust_key_revoke(
+                &service,
+                actor.clone(),
+                api.workspace_id().to_string(),
+                "trust-reaccepted-runtime".to_string(),
+                server_api::RevokeRuntimeTrustKeyRequest {
+                    expected_binding_id: original.binding_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let revoked_id = revoked.trust_key.binding_id.unwrap();
+        assert_ne!(revoked_id, original.binding_id);
+        let mut reaccepted = request;
+        reaccepted.workspace_trust_id = "trust-second-acceptance".to_string();
+        reaccepted.expected_binding_id = Some(revoked_id);
+        let (_, Json(created)) = create_remote_runtime(
+            State(api.clone()),
+            Extension(actor.clone()),
+            Json(reaccepted),
+        )
+        .await
+        .unwrap();
+        let current = created.management.binding.unwrap();
+        assert_ne!(current.binding_id, original.binding_id);
+        assert_eq!(
+            current.workspace_trust_id.as_deref(),
+            Some("trust-second-acceptance")
+        );
+        assert_eq!(
+            current.connection_state,
+            RuntimeConnectionDisplayState::Configured
+        );
+        let stale = <ServerApiContractService as server_api::ServerApi>::runtime_trust_key_revoke(
+            &service,
+            actor,
+            api.workspace_id().to_string(),
+            "trust-reaccepted-runtime".to_string(),
+            server_api::RevokeRuntimeTrustKeyRequest {
+                expected_binding_id: original.binding_id,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(api_macros::HttpError::status_code(&stale), 409);
+        let body = serde_json::to_value(stale).unwrap();
+        assert_eq!(body["error"], "stale_binding");
+        assert_eq!(body["current_binding_id"], current.binding_id);
+        let stored = api
+            .store
+            .get_workspace_runtime_binding(api.workspace_id(), "trust-reaccepted-runtime")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.revoked_at.is_none());
+        assert_eq!(stored.binding_id, current.binding_id);
+    }
+
+    #[tokio::test]
     async fn runtime_connection_request_validation_bounds_browser_input() {
         let identity = RuntimeIdentityMaterial::generate("team-runtime_1").unwrap();
         let ok = CreateRemoteRuntimeRequest {
@@ -42925,7 +43032,8 @@ mod tests {
             },
             display_name: Some("Team Runtime".to_string()),
             endpoint: "https://8.8.8.8".to_string(),
-            expected_revision: None,
+            workspace_trust_id: "trust-test".to_string(),
+            expected_binding_id: None,
         };
         assert!(validate_runtime_connection_request(&ok).await.is_ok());
 
@@ -42950,6 +43058,59 @@ mod tests {
                     .await
                     .is_err(),
                 "{endpoint}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_registration_rejects_blank_and_malformed_workspace_trust_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        let actor = test_owner_actor();
+        let identity = RuntimeIdentityMaterial::generate("invalid-trust-runtime").unwrap();
+        for trust_id in [
+            String::new(),
+            " ".to_string(),
+            " trust-valid".to_string(),
+            "trust-valid ".to_string(),
+            "trust invalid".to_string(),
+            "trust\ninvalid".to_string(),
+            "x".repeat(257),
+        ] {
+            let error = create_remote_runtime(
+                State(api.clone()),
+                Extension(actor.clone()),
+                Json(CreateRemoteRuntimeRequest {
+                    public_bundle: server_api::RuntimePublicIdentityBundle {
+                        identity_id: identity.identity_id.clone(),
+                        public_key: identity.public_key.clone(),
+                    },
+                    display_name: None,
+                    endpoint: "http://127.0.0.1:1".to_string(),
+                    workspace_trust_id: trust_id.clone(),
+                    expected_binding_id: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{trust_id:?}");
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert!(
+                body["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("invalid_workspace_trust_id"),
+                "{body}"
+            );
+            assert!(
+                api.store
+                    .get_workspace_runtime_binding(api.workspace_id(), &identity.identity_id)
+                    .await
+                    .unwrap()
+                    .is_none()
             );
         }
     }
@@ -43594,7 +43755,6 @@ mod tests {
             source_fingerprint: crate::repository_source::repository_source_fingerprint(&source),
             source,
             default_ref: Some("main".to_string()),
-            source_revision: 1,
             observed_status: server_api::RepositoryObservedStatus::Unverified,
             observed_at: None,
             created_at: "1".to_string(),
@@ -43648,7 +43808,6 @@ mod tests {
             source_fingerprint: crate::repository_source::repository_source_fingerprint(&source),
             source,
             default_ref: Some("main".to_string()),
-            source_revision: 1,
             observed_status: server_api::RepositoryObservedStatus::Unverified,
             observed_at: None,
             created_at: "1".to_string(),
@@ -43683,7 +43842,6 @@ mod tests {
             provider: "git".to_string(),
             source_fingerprint: crate::repository_source::repository_source_fingerprint(&source),
             source,
-            source_revision: 1,
             observed_status: server_api::RepositoryObservedStatus::Unverified,
             observed_at: None,
             path: Some(workspace_root),
@@ -43757,6 +43915,43 @@ mod tests {
         headers
     }
 
+    fn ticket_check_jobs_for_snapshot(
+        api: &WorkspaceApi,
+        ticket: &ticket::Ticket,
+    ) -> Vec<crate::backend_job::BackendJobRecord> {
+        let digest = ticket_item_checker::content_digest(ticket);
+        let requests = api
+            .config_store
+            .with_conn(|conn| {
+                let mut query =
+                    conn.prepare("SELECT request_json FROM backend_jobs WHERE workspace_id = ?1")?;
+                let rows = query.query_map([TEST_WORKSPACE_ID], |row| row.get::<_, String>(0))?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(Error::from)
+            })
+            .unwrap();
+        requests
+            .into_iter()
+            .filter_map(|json| {
+                let request: crate::backend_job::BackendJobRequest =
+                    serde_json::from_str(&json).unwrap();
+                if request.purpose != ticket_item_checker::PURPOSE {
+                    return None;
+                }
+                let input = ticket_item_checker::parse_input(&request.input).unwrap();
+                if input.ticket_id != ticket.meta.id || input.content_digest != digest {
+                    return None;
+                }
+                Some(
+                    api.store
+                        .get_backend_job(TEST_WORKSPACE_ID, &request.job_id)
+                        .unwrap()
+                        .unwrap(),
+                )
+            })
+            .collect()
+    }
+
     fn ticket_check_job(
         api: &WorkspaceApi,
         ticket_id: &str,
@@ -43765,14 +43960,13 @@ mod tests {
             .unwrap()
             .show(ticket_id.to_string().into())
             .unwrap();
-        let revision = ticket_item_checker::item_revision(&ticket);
-        api.store
-            .get_backend_job(
-                TEST_WORKSPACE_ID,
-                &format!("ticket-item-check:{ticket_id}:{revision}"),
-            )
-            .unwrap()
-            .expect("Ticket item checker Job was reserved after save")
+        let mut jobs = ticket_check_jobs_for_snapshot(api, &ticket);
+        assert_eq!(
+            jobs.len(),
+            1,
+            "fixture must have exactly one checker intent for its current content"
+        );
+        jobs.pop().unwrap()
     }
 
     async fn wait_for_ticket_check_attempt(
@@ -43868,7 +44062,10 @@ mod tests {
             checker_input.body,
             "This turn only creates the Ticket; I will not implement it. Production deployment requires approval."
         );
-        assert_eq!(checker_input.revision, job.request.input_revision);
+        assert_eq!(
+            checker_input.content_digest,
+            api.authority.ticket(&ticket_ref.id).unwrap().content_digest
+        );
         assert_eq!(job.request.source_worker.as_ref(), Some(&source));
         assert_eq!(job.request.notification_target.as_ref(), Some(&source));
         assert_eq!(job.request.limits.max_attempts, 1);
@@ -43876,7 +44073,11 @@ mod tests {
         assert!(job.request.instruction.contains("Do not infer user intent"));
         let dispatched_inputs = execution.take_inputs();
         assert_eq!(dispatched_inputs.len(), 1);
-        assert!(dispatched_inputs[0].1.contains(&checker_input.revision));
+        assert!(
+            dispatched_inputs[0]
+                .1
+                .contains(&checker_input.content_digest)
+        );
 
         release_tx.send(()).unwrap();
         let attempt = wait_for_ticket_check_attempt(&api, &job).await;
@@ -43885,7 +44086,7 @@ mod tests {
         let submission = BackendJobResultSubmission {
             job_id: job.request.job_id.clone(),
             attempt_id: attempt.attempt_id.clone(),
-            input_revision: job.request.input_revision.clone(),
+            input_digest: job.request.input_digest().unwrap(),
             result: serde_json::json!({"findings": [{
                 "category": "writer_scope",
                 "quote": "I will not implement it",
@@ -43903,7 +44104,7 @@ mod tests {
                 .1
                 .contains("[Ticket item checker advisory]")
         );
-        assert!(notifications[0].1.contains(&checker_input.revision));
+        assert!(notifications[0].1.contains(&checker_input.content_digest));
         assert!(notifications[0].1.contains("I will not implement it"));
         assert!(notifications[0].1.contains("not a new user request"));
         assert!(
@@ -44027,7 +44228,7 @@ mod tests {
                 &BackendJobResultSubmission {
                     job_id: job.request.job_id.clone(),
                     attempt_id: attempt.attempt_id,
-                    input_revision: job.request.input_revision.clone(),
+                    input_digest: job.request.input_digest().unwrap(),
                     result: FakeTicketCheckerModel::respond(&job.request),
                 },
             )
@@ -44139,7 +44340,7 @@ mod tests {
                         &BackendJobResultSubmission {
                             job_id: job.request.job_id.clone(),
                             attempt_id: attempt.attempt_id,
-                            input_revision: job.request.input_revision.clone(),
+                            input_digest: job.request.input_digest().unwrap(),
                             result: serde_json::json!({"findings": []}),
                         },
                     )
@@ -44220,17 +44421,16 @@ mod tests {
         ];
         let mut checked_inputs = Vec::new();
         for (ticket, source, expected_body) in snapshots {
-            let revision = ticket_item_checker::item_revision(&ticket);
-            let job = api
-                .store
-                .get_backend_job(
-                    TEST_WORKSPACE_ID,
-                    &format!("ticket-item-check:{}:{revision}", ticket.meta.id),
-                )
-                .unwrap()
-                .expect("each successful edit has its own checker Job");
+            let revision = ticket_item_checker::content_digest(&ticket);
+            let mut jobs = ticket_check_jobs_for_snapshot(&api, &ticket);
+            assert_eq!(
+                jobs.len(),
+                1,
+                "each successful edit has its own checker Job"
+            );
+            let job = jobs.pop().unwrap();
             let input = ticket_item_checker::parse_input(&job.request.input).unwrap();
-            assert_eq!(input.revision, revision);
+            assert_eq!(input.content_digest, revision);
             assert_eq!(input.body, expected_body);
             assert_eq!(job.request.source_worker.as_ref(), Some(&source));
             assert_eq!(job.request.notification_target.as_ref(), Some(&source));
@@ -44250,7 +44450,7 @@ mod tests {
             .expect("one edit must atomically observe the initial preimage");
         let second = checked_inputs
             .iter()
-            .find(|input| input.revision != first.revision)
+            .find(|input| input.content_digest != first.content_digest)
             .unwrap();
         assert!(matches!(
             &second.edit,
@@ -44332,7 +44532,7 @@ mod tests {
             &BackendJobResultSubmission {
                 job_id: stale_job.request.job_id.clone(),
                 attempt_id: stale_attempt.attempt_id.clone(),
-                input_revision: stale_job.request.input_revision.clone(),
+                input_digest: stale_job.request.input_digest().unwrap(),
                 result: serde_json::json!({"findings": [{
                     "category": "writer_scope",
                     "quote": "I will not implement this Ticket",
@@ -44371,7 +44571,7 @@ mod tests {
             &BackendJobResultSubmission {
                 job_id: current_job.request.job_id.clone(),
                 attempt_id: current_attempt.attempt_id.clone(),
-                input_revision: current_job.request.input_revision.clone(),
+                input_digest: current_job.request.input_digest().unwrap(),
                 result: serde_json::json!({"findings": []}),
             },
         )
@@ -44415,7 +44615,7 @@ mod tests {
                 &BackendJobResultSubmission {
                     job_id: invalid_job.request.job_id.clone(),
                     attempt_id: invalid_attempt.attempt_id.clone(),
-                    input_revision: invalid_job.request.input_revision.clone(),
+                    input_digest: invalid_job.request.input_digest().unwrap(),
                     result: serde_json::json!({"findings": [{
                         "category": "internal_inconsistency",
                         "quote": "invented quote",
@@ -44476,15 +44676,8 @@ mod tests {
             .unwrap()
             .show(ticket_ref.id.clone().into())
             .unwrap();
-        let browser_revision = ticket_item_checker::item_revision(&browser_ticket);
         assert!(
-            api.store
-                .get_backend_job(
-                    TEST_WORKSPACE_ID,
-                    &format!("ticket-item-check:{}:{browser_revision}", ticket_ref.id),
-                )
-                .unwrap()
-                .is_none(),
+            ticket_check_jobs_for_snapshot(&api, &browser_ticket).is_empty(),
             "direct browser edits are explicitly outside the Worker advisory path"
         );
 
@@ -44515,7 +44708,6 @@ mod tests {
         let request = BackendJobRequest {
             job_id: "runner-check-1".to_string(),
             purpose: "runner_contract_check".to_string(),
-            input_revision: "revision-1".to_string(),
             input_ref: "test://runner/input/1".to_string(),
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
@@ -44602,7 +44794,7 @@ mod tests {
                 &BackendJobResultSubmission {
                     job_id: request.job_id.clone(),
                     attempt_id: dispatched.attempt.attempt_id,
-                    input_revision: request.input_revision,
+                    input_digest: request.input_digest().unwrap(),
                     result: serde_json::json!({"valid": true}),
                 },
             )
@@ -44618,7 +44810,6 @@ mod tests {
         let request = BackendJobRequest {
             job_id: "runner-cleanup-success-1".to_string(),
             purpose: "cleanup_contract_check".to_string(),
-            input_revision: "revision-1".to_string(),
             input_ref: "test://runner/cleanup/1".to_string(),
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
@@ -44639,7 +44830,7 @@ mod tests {
         let submission = BackendJobResultSubmission {
             job_id: request.job_id.clone(),
             attempt_id: dispatched.attempt.attempt_id.clone(),
-            input_revision: request.input_revision.clone(),
+            input_digest: request.input_digest().unwrap(),
             result: serde_json::json!({"valid": true}),
         };
 
@@ -44726,7 +44917,6 @@ mod tests {
         let request = BackendJobRequest {
             job_id: "runner-cleanup-retry-1".to_string(),
             purpose: "cleanup_retry_contract_check".to_string(),
-            input_revision: "revision-1".to_string(),
             input_ref: "test://runner/cleanup-retry/1".to_string(),
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
@@ -44801,7 +44991,7 @@ mod tests {
             &BackendJobResultSubmission {
                 job_id: request.job_id.clone(),
                 attempt_id: second.attempt.attempt_id.clone(),
-                input_revision: request.input_revision.clone(),
+                input_digest: request.input_digest().unwrap(),
                 result: serde_json::json!({"retried": true}),
             },
         )
@@ -44835,7 +45025,6 @@ mod tests {
         let request = BackendJobRequest {
             job_id: "runner-cleanup-pre-marker-restart-1".to_string(),
             purpose: "cleanup_pre_marker_restart_contract_check".to_string(),
-            input_revision: "revision-1".to_string(),
             input_ref: "test://runner/cleanup-pre-marker-restart/1".to_string(),
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
@@ -44960,7 +45149,7 @@ mod tests {
                 &BackendJobResultSubmission {
                     job_id: request.job_id.clone(),
                     attempt_id: reservation.attempt.attempt_id.clone(),
-                    input_revision: request.input_revision.clone(),
+                    input_digest: request.input_digest().unwrap(),
                     result: serde_json::json!({"persisted": true}),
                 },
                 &now,
@@ -45015,7 +45204,6 @@ mod tests {
         let request = BackendJobRequest {
             job_id: "r".repeat(256),
             purpose: "fast_result_contract_check".to_string(),
-            input_revision: "revision-1".to_string(),
             input_ref: "test://runner/fast-result/1".to_string(),
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
@@ -45041,7 +45229,7 @@ mod tests {
                     &BackendJobResultSubmission {
                         job_id: hook_request.job_id.clone(),
                         attempt_id: crate::backend_job::attempt_id(&hook_request.job_id, 1),
-                        input_revision: hook_request.input_revision.clone(),
+                        input_digest: hook_request.input_digest().unwrap(),
                         result: serde_json::json!({"valid": true}),
                     },
                 )
@@ -45079,7 +45267,6 @@ mod tests {
         let request = BackendJobRequest {
             job_id: "runner-result-response-fence-1".to_string(),
             purpose: "result_response_fence_check".to_string(),
-            input_revision: "revision-1".to_string(),
             input_ref: "test://runner/result-response-fence/1".to_string(),
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
@@ -45214,7 +45401,6 @@ mod tests {
         let request = BackendJobRequest {
             job_id: "n".repeat(256),
             purpose: "delivery_recovery_contract_check".to_string(),
-            input_revision: "revision-1".to_string(),
             input_ref: "test://runner/delivery-recovery/1".to_string(),
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
@@ -45238,7 +45424,7 @@ mod tests {
                 &BackendJobResultSubmission {
                     job_id: request.job_id.clone(),
                     attempt_id: dispatched.attempt.attempt_id.clone(),
-                    input_revision: request.input_revision.clone(),
+                    input_digest: request.input_digest().unwrap(),
                     result: serde_json::json!({"valid": true}),
                 },
                 &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
@@ -45298,7 +45484,6 @@ mod tests {
         let request = BackendJobRequest {
             job_id: "runner-spawn-error-1".to_string(),
             purpose: "spawn_error_contract_check".to_string(),
-            input_revision: "revision-1".to_string(),
             input_ref: "test://runner/spawn-error/1".to_string(),
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
@@ -45338,7 +45523,6 @@ mod tests {
         let request = BackendJobRequest {
             job_id: "runner-input-failure-1".to_string(),
             purpose: "failure_contract_check".to_string(),
-            input_revision: "revision-1".to_string(),
             input_ref: "test://runner/failure/1".to_string(),
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
@@ -45405,7 +45589,6 @@ mod tests {
             let request = BackendJobRequest {
                 job_id: format!("restart-page-{index:03}"),
                 purpose: "restart_page_contract_check".to_string(),
-                input_revision: "1".to_string(),
                 input_ref: format!("fixture://restart-page/{index}"),
                 input: serde_json::json!({"index": index}),
                 instruction: "Return a structured fixture result.".to_string(),
@@ -45452,7 +45635,6 @@ mod tests {
         let request = BackendJobRequest {
             job_id: "runner-restart-1".to_string(),
             purpose: "restart_contract_check".to_string(),
-            input_revision: "revision-1".to_string(),
             input_ref: "test://runner/restart/1".to_string(),
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
@@ -45497,7 +45679,6 @@ mod tests {
         let request = BackendJobRequest {
             job_id: "runner-unknown-1".to_string(),
             purpose: "unknown_contract_check".to_string(),
-            input_revision: "revision-1".to_string(),
             input_ref: "test://runner/unknown/1".to_string(),
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
@@ -45588,7 +45769,6 @@ mod tests {
         let request = BackendJobRequest {
             job_id: "runner-timeout-1".to_string(),
             purpose: "timeout_contract_check".to_string(),
-            input_revision: "revision-1".to_string(),
             input_ref: "test://runner/timeout/1".to_string(),
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Wait for a structured result.".to_string(),
@@ -45633,9 +45813,9 @@ mod tests {
             api.accept_backend_job_result(
                 &worker,
                 &BackendJobResultSubmission {
-                    job_id: request.job_id,
+                    job_id: request.job_id.clone(),
                     attempt_id: dispatched.attempt.attempt_id,
-                    input_revision: request.input_revision,
+                    input_digest: request.input_digest().unwrap(),
                     result: serde_json::json!({"late": true}),
                 },
             )
@@ -45714,7 +45894,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_binding_summary_omits_stale_verification_revision() {
+    fn runtime_binding_summary_omits_stale_verification_binding() {
         let binding = WorkspaceRuntimeBinding {
             workspace_id: "workspace-a".to_string(),
             runtime_id: "runtime-a".to_string(),
@@ -45722,12 +45902,15 @@ mod tests {
             base_url: "https://runtime.example.test".to_string(),
             public_key: "runtime-public-key".to_string(),
             public_key_fingerprint: "sha256:runtime".to_string(),
-            binding_revision: 2,
+            binding_id: "binding-test".to_string(),
             state: crate::store::WorkspaceRuntimeBindingState::Revoked,
             authentication_mode:
                 crate::store::WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity,
             workspace_key_id: Some("WK-a".to_string()),
-            workspace_key_generation: Some(1),
+
+            workspace_public_key_fingerprint: Some("sha256:workspace-test".to_string()),
+
+            workspace_trust_id: Some("trust-test".to_string()),
             created_at: "1".to_string(),
             updated_at: "2".to_string(),
             revoked_at: Some("2".to_string()),
@@ -45735,12 +45918,11 @@ mod tests {
         let stale = crate::store::WorkspaceRuntimeVerificationEvidence {
             workspace_id: "workspace-a".to_string(),
             runtime_id: "runtime-a".to_string(),
-            binding_revision: 1,
+            binding_id: "binding-retired".to_string(),
             workspace_key_id: "WK-a".to_string(),
-            workspace_identity_revision: 1,
-            workspace_trust_generation: 1,
+            workspace_public_key_fingerprint: "sha256:workspace-test".to_string(),
+            workspace_trust_id: "trust-test".to_string(),
             runtime_public_key_fingerprint: "sha256:runtime".to_string(),
-            runtime_identity_revision: 1,
             challenge_id: "challenge-a".to_string(),
             state: "failed".to_string(),
             last_outcome: "connectivity_failed".to_string(),
@@ -46137,7 +46319,7 @@ mod tests {
         .await;
         assert_eq!(preflight["can_delete"], true, "{preflight}");
         assert_eq!(preflight["resources"]["repositories"], 0);
-        let deletion_request = json!({"operation_id": "delete-second-empty", "expected_revision": preflight["expected_revision"], "confirmation": "Second Empty"});
+        let deletion_request = json!({"operation_id": "delete-second-empty", "expected_workspace_updated_at": preflight["expected_workspace_updated_at"], "confirmation": "Second Empty"});
         request_json_authenticated(
             app.clone(),
             "POST",
@@ -46989,7 +47171,7 @@ mod tests {
                 &workspace.workspace.workspace_id,
                 &server_api::WorkspaceDeletionRequest {
                     operation_id: "repository-conflict-test".to_owned(),
-                    expected_revision: preflight.expected_revision,
+                    expected_workspace_updated_at: preflight.expected_workspace_updated_at,
                     confirmation: preflight.display_name,
                 },
             )
@@ -48295,7 +48477,7 @@ mod tests {
         let before = backend.show(ticket.id.clone().into()).unwrap();
         let request = server_api::CompleteTicketRequest {
             operation_key: "forged".into(),
-            expected_item_revision: ticket::ticket_item_revision(&before),
+            expected_content_digest: ticket::ticket_content_digest(&before),
             expected_state: TicketWorkflowState::InProgress,
             reason: "Not my task".into(),
             references: Vec::new(),
@@ -48321,7 +48503,7 @@ mod tests {
                 state: server_api::BrowserTicketWorkflowState::Done,
                 expected_state: server_api::BrowserTicketWorkflowState::Inprogress,
                 operation_key: "browser-forged".into(),
-                expected_item_revision: ticket::ticket_item_revision(&before),
+                expected_content_digest: ticket::ticket_content_digest(&before),
                 reason: "Not human authority".into(),
                 body: None,
             }),
@@ -48345,7 +48527,7 @@ mod tests {
         let before = backend.show(reference.id.clone().into()).unwrap();
         let request = server_api::CompleteTicketRequest {
             operation_key: "research-done".into(),
-            expected_item_revision: ticket::ticket_item_revision(&before),
+            expected_content_digest: ticket::ticket_content_digest(&before),
             expected_state: TicketWorkflowState::InProgress,
             reason: "## 完了理由\n\n日本語の長い検証結果を省略せず記録する。\n<!-- 完了 -->\n"
                 .repeat(1024),
@@ -48381,7 +48563,7 @@ mod tests {
             let mut changed = request.clone();
             match field {
                 "reason" => changed.reason = "different judgment".into(),
-                "revision" => changed.expected_item_revision = "stale".into(),
+                "revision" => changed.expected_content_digest = "stale".into(),
                 "state" => changed.expected_state = TicketWorkflowState::Planning,
                 "references" => changed.references.push(ticket::TicketReference {
                     kind: "document".into(),
@@ -48445,7 +48627,7 @@ mod tests {
             HeaderMap::new(),
             Json(ticket::TicketCompletion {
                 operation_key: "normal-close".into(),
-                expected_item_revision: api.authority.ticket(&ticket.id).unwrap().item_revision,
+                expected_content_digest: api.authority.ticket(&ticket.id).unwrap().content_digest,
                 expected_state: TicketWorkflowState::InProgress,
                 reason: "Normal close ends implementation work".into(),
                 references: Vec::new(),
@@ -48991,7 +49173,6 @@ mod tests {
                                     .to_string(),
                             },
                             default_ref: Some("develop".to_string()),
-                            source_revision: 1,
                             source_fingerprint: "sha256:undeclared".to_string(),
                             observed_status: server_api::RepositoryObservedStatus::Unverified,
                             observed_at: None,
@@ -49773,7 +49954,7 @@ mod tests {
             let request = server_api::BrowserTransitionTicketStateRequest {
                 state: state.clone(),
                 operation_key: format!("decision-{index}"),
-                expected_item_revision: ticket::ticket_item_revision(&before),
+                expected_content_digest: ticket::ticket_content_digest(&before),
                 expected_state,
                 reason: "Human progress judgment".into(),
                 body: None,
@@ -49808,7 +49989,7 @@ mod tests {
             Json(server_api::BrowserTransitionTicketStateRequest {
                 state: server_api::BrowserTicketWorkflowState::Done,
                 operation_key: "stale".into(),
-                expected_item_revision: "stale-revision".into(),
+                expected_content_digest: "stale-revision".into(),
                 expected_state: server_api::BrowserTicketWorkflowState::Planning,
                 reason: "Stale decision".into(),
                 body: None,
@@ -51536,7 +51717,7 @@ mod tests {
             AxumPath(path()),
             Json(server_api::BrowserCloseTicketRequest {
                 operation_key: "browser-close".into(),
-                expected_item_revision: queued.item_revision.clone(),
+                expected_content_digest: queued.content_digest.clone(),
                 expected_state: server_api::BrowserTicketWorkflowState::Queued,
                 resolution: "Closed through the Browser API.".to_string(),
             }),
@@ -51608,7 +51789,7 @@ mod tests {
             skills::SKILL_DOCUMENT_SCHEMA_SOURCE
         );
         let request = crate::config_source::ConfigCommitRequest {
-            base_revision: current.snapshot.revision,
+
             base_digest: current.snapshot.digest.clone(),
             changes: vec![
                 config_source::ConfigTreeChange::Update {
@@ -51657,7 +51838,7 @@ mod tests {
             entry.provenance.virtual_path.as_deref(),
             Some("skills/triage-errors/SKILL.md")
         );
-        assert!(entry.provenance.revision.is_some());
+        assert!(entry.provenance.tree_digest.is_some());
         assert!(entry.provenance.source_digest.is_some());
         assert_ne!(entry.description, "stale filesystem authority");
         assert!(
@@ -51710,11 +51891,14 @@ mod tests {
                     base_url: "https://runtime.example".to_owned(),
                     public_key: identity.public_key,
                     public_key_fingerprint: String::new(),
-                    binding_revision: 1,
+                    binding_id: "binding-test".to_string(),
                     state: StoredRuntimeBindingState::Verified,
                     authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
                     workspace_key_id: Some("WK-test".to_owned()),
-                    workspace_key_generation: Some(1),
+
+                    workspace_public_key_fingerprint: Some("sha256:workspace-test".to_string()),
+
+                    workspace_trust_id: Some("trust-test".to_string()),
                     created_at: now.clone(),
                     updated_at: now,
                     revoked_at: None,
@@ -51748,6 +51932,13 @@ mod tests {
         .unwrap_err();
         assert_eq!(denied.into_response().status(), StatusCode::FORBIDDEN);
 
+        let original_binding_id = api
+            .store
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, "runtime-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .binding_id;
         let contract_service = ServerApiContractService::Workspace(api.clone());
         let denied = <ServerApiContractService as server_api::ServerApi>::runtime_trust_key_revoke(
             &contract_service,
@@ -51755,7 +51946,7 @@ mod tests {
             TEST_WORKSPACE_ID.to_owned(),
             "runtime-a".to_owned(),
             server_api::RevokeRuntimeTrustKeyRequest {
-                expected_revision: 1,
+                expected_binding_id: original_binding_id.clone(),
             },
         )
         .await
@@ -51767,7 +51958,7 @@ mod tests {
             TEST_WORKSPACE_ID.to_owned(),
             "runtime-a".to_owned(),
             server_api::RevokeRuntimeTrustKeyRequest {
-                expected_revision: 1,
+                expected_binding_id: original_binding_id.clone(),
             },
         )
         .await
@@ -51778,8 +51969,70 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(binding.binding_revision, 2);
+        assert_ne!(binding.binding_id, original_binding_id);
         assert!(binding.revoked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn ssh_rotation_http_fences_key_identity_and_replays_exact_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        let app = build_inner_router(api).layer(Extension(test_owner_actor()));
+        let base = format!("/api/w/{TEST_WORKSPACE_ID}/settings/repository-access/credentials");
+        let private_key = |seed| {
+            ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[seed; 32]))
+                .to_openssh(ssh_key::LineEnding::LF)
+                .unwrap()
+                .to_string()
+        };
+        let created = request_json(
+            app.clone(),
+            "POST",
+            &base,
+            Some(json!({
+                "operation_id": "http-key-create", "credential_id": "http-key", "name": "HTTP key",
+                "private_key": private_key(11),
+            })),
+            StatusCode::CREATED,
+        )
+        .await;
+        let original_fingerprint = created["public_key_fingerprint"].clone();
+        let rotate_path = format!("{base}/http-key/rotate");
+        let reseal = json!({"operation_id":"http-key-reseal", "expected_public_key_fingerprint":original_fingerprint, "private_key":private_key(11)});
+        let resealed = request_json(
+            app.clone(),
+            "POST",
+            &rotate_path,
+            Some(reseal.clone()),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(resealed["public_key_fingerprint"], original_fingerprint);
+        let replayed = request_json(
+            app.clone(),
+            "POST",
+            &rotate_path,
+            Some(reseal),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(replayed, resealed);
+        request_json(app.clone(), "POST", &rotate_path, Some(json!({
+            "operation_id":"http-key-reseal", "expected_public_key_fingerprint":original_fingerprint, "private_key":private_key(12),
+        })), StatusCode::CONFLICT).await;
+        let rotated = request_json(app.clone(), "POST", &rotate_path, Some(json!({
+            "operation_id":"http-key-rotate", "expected_public_key_fingerprint":original_fingerprint, "private_key":private_key(12),
+        })), StatusCode::OK).await;
+        assert_ne!(rotated["public_key_fingerprint"], original_fingerprint);
+        request_json(app.clone(), "POST", &rotate_path, Some(json!({
+            "operation_id":"http-key-stale", "expected_public_key_fingerprint":original_fingerprint, "private_key":private_key(13),
+        })), StatusCode::CONFLICT).await;
+        let current = get_json(app, &format!("{base}/http-key")).await;
+        assert_eq!(
+            current["public_key_fingerprint"],
+            rotated["public_key_fingerprint"]
+        );
+        assert!(current.get("private_key").is_none());
     }
 
     #[tokio::test]
@@ -51837,7 +52090,7 @@ mod tests {
             AxumPath(path),
             Json(UpdateWorkspaceMetadataRequest {
                 display_name: "  Renamed Workspace  ".to_string(),
-                revision: current.revision.clone(),
+                expected_updated_at: current.updated_at.clone(),
             }),
         )
         .await
@@ -51845,7 +52098,7 @@ mod tests {
         .0
         .workspace;
         assert_eq!(updated.display_name, "Renamed Workspace");
-        assert_ne!(updated.revision, current.revision);
+        assert_ne!(updated.updated_at, current.updated_at);
         assert_eq!(
             fs::read_to_string(&local_identity_path).unwrap(),
             "not valid toml = ["
@@ -51867,7 +52120,7 @@ mod tests {
             }),
             Json(UpdateWorkspaceMetadataRequest {
                 display_name: "Stale Workspace".to_string(),
-                revision: current.revision,
+                expected_updated_at: current.updated_at,
             }),
         )
         .await
@@ -51996,7 +52249,6 @@ mod tests {
             .unwrap();
         let main_path = config_source::VirtualPath::parse("main.dcdl").unwrap();
         let request = crate::config_source::ConfigCommitRequest {
-            base_revision: current.snapshot.revision,
             base_digest: current.snapshot.digest.clone(),
             changes: vec![config_source::ConfigTreeChange::Update {
                 path: main_path.clone(),
@@ -52020,7 +52272,10 @@ mod tests {
             .unwrap();
     }
 
-    async fn register_test_runtime(api: &WorkspaceApi, runtime_id: &str) {
+    async fn register_test_runtime(
+        api: &WorkspaceApi,
+        runtime_id: &str,
+    ) -> WorkspaceRuntimeBinding {
         let identity = RuntimeIdentityMaterial::generate(runtime_id).unwrap();
         let binding = WorkspaceRuntimeBinding {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
@@ -52029,11 +52284,14 @@ mod tests {
             base_url: "https://runtime.example.invalid".to_string(),
             public_key: identity.public_key,
             public_key_fingerprint: String::new(),
-            binding_revision: 1,
+            binding_id: "binding-test".to_string(),
             state: StoredRuntimeBindingState::Verified,
             authentication_mode: StoredRuntimeAuthenticationMode::LegacyServerIssuer,
             workspace_key_id: None,
-            workspace_key_generation: None,
+
+            workspace_public_key_fingerprint: None,
+
+            workspace_trust_id: None,
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
             revoked_at: None,
@@ -52041,6 +52299,12 @@ mod tests {
         api.store
             .upsert_workspace_runtime_binding_record(binding.clone(), false)
             .await
+            .unwrap();
+        let binding = api
+            .store
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, runtime_id)
+            .await
+            .unwrap()
             .unwrap();
         api.runtime.register_or_replace(
             RemoteWorkerRuntime::new(
@@ -52050,6 +52314,7 @@ mod tests {
             )
             .unwrap(),
         );
+        binding
     }
 
     fn assign_test_orchestrator(api: &WorkspaceApi, ticket_id: &str) {
@@ -52112,7 +52377,7 @@ mod tests {
                 State(api),
                 AxumPath("workspace-foreign".to_string()),
                 Json(server_api::UpdateWorkspaceMemorySettingsRequest {
-                    expected_revision: 1,
+                    expected_language: "English".to_string(),
                     language: "English".to_string(),
                 }),
             )
@@ -52636,11 +52901,14 @@ mod tests {
             base_url: "https://runtime.invalid".to_string(),
             public_key: identity.public_key.clone(),
             public_key_fingerprint: String::new(),
-            binding_revision: 1,
+            binding_id: "binding-test".to_string(),
             state: StoredRuntimeBindingState::Verified,
             authentication_mode: StoredRuntimeAuthenticationMode::LegacyServerIssuer,
             workspace_key_id: None,
-            workspace_key_generation: None,
+
+            workspace_public_key_fingerprint: None,
+
+            workspace_trust_id: None,
             created_at: "2026-08-11T00:00:00Z".to_string(),
             updated_at: "2026-08-11T00:00:00Z".to_string(),
             revoked_at: None,
@@ -53063,7 +53331,6 @@ mod tests {
                     uri: api.config.workspace_execution_root.display().to_string(),
                 },
                 default_ref: Some("HEAD".to_string()),
-                source_revision: 1,
                 source_fingerprint: "sha256:test".to_string(),
                 observed_status: server_api::RepositoryObservedStatus::Unverified,
                 observed_at: None,
@@ -53330,7 +53597,6 @@ mod tests {
                         id: "repo-test".to_string(),
                         provider: "git".to_string(),
                         source: repository_source.clone(),
-                        source_revision: 1,
                         source_fingerprint: source_fingerprint.clone(),
                         selector: Some(RuntimeRepositorySelector("HEAD".to_string())),
                     },
@@ -53369,11 +53635,14 @@ mod tests {
             base_url: provider_base_url.clone(),
             public_key: provider_identity.public_key,
             public_key_fingerprint: String::new(),
-            binding_revision: 1,
+            binding_id: "binding-test".to_string(),
             state: StoredRuntimeBindingState::Verified,
             authentication_mode: StoredRuntimeAuthenticationMode::LegacyServerIssuer,
             workspace_key_id: None,
-            workspace_key_generation: None,
+
+            workspace_public_key_fingerprint: None,
+
+            workspace_trust_id: None,
             created_at: now.clone(),
             updated_at: now,
             revoked_at: None,
@@ -53725,7 +53994,7 @@ mod tests {
             let page: server_api::CurrentWorkerWorkdirCatalogResponse =
                 serde_json::from_slice(&bytes).unwrap();
             assert!(page.items.len() <= 37);
-            assert_eq!(page.revision, empty.revision);
+            assert_eq!(page.digest, empty.digest);
             seen.extend(page.items.into_iter().map(|item| item.working_directory_id));
             pages += 1;
             if let Some(next) = page.next_cursor {
@@ -53802,7 +54071,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(before.items, changed.items);
-        assert_ne!(before.revision, changed.revision);
+        assert_ne!(before.digest, changed.digest);
         let template_link = api
             .store
             .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
@@ -53825,7 +54094,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(changed.items, occupied.items);
-        assert_ne!(changed.revision, occupied.revision);
+        assert_ne!(changed.digest, occupied.digest);
         api.store
             .detach_worker_workdir_connection(
                 TEST_WORKSPACE_ID,
@@ -53836,14 +54105,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            changed.revision,
+            changed.digest,
             list_current_worker_workdir_catalog(api, Default::default())
                 .unwrap()
-                .revision
+                .digest
         );
         let restarted = SqliteWorkspaceStore::open(&api.config.database_path).unwrap();
         assert_eq!(
-            changed.revision,
+            changed.digest,
             restarted
                 .workdir_catalog_page(TEST_WORKSPACE_ID, 100, None)
                 .unwrap()
@@ -54289,7 +54558,7 @@ mod tests {
         assert_eq!(page.items[0].connection_id, target.connection_id);
         assert_eq!(page.next_offset, None);
         assert_eq!(
-            page.revision, first.revision,
+            page.digest, first.digest,
             "lookup does not narrow the collection revision"
         );
 
@@ -54320,7 +54589,7 @@ mod tests {
                     .unwrap();
             assert!(page.items.is_empty());
             assert_eq!(page.next_offset, None);
-            assert_eq!(page.revision, first.revision);
+            assert_eq!(page.digest, first.digest);
         }
         let mut forged = request(&lookup_path);
         forged
@@ -54371,7 +54640,7 @@ mod tests {
         assert_eq!(reattached.items, first.items);
         assert_eq!(reattached.next_offset, first.next_offset);
         assert_ne!(
-            reattached.revision, first.revision,
+            reattached.digest, first.digest,
             "same alias and Workdir, new lifetime beyond page zero"
         );
         let downgraded = api
@@ -54386,7 +54655,7 @@ mod tests {
             list_current_worker_workdir_attachments(api, &fixture.worker, Default::default())
                 .unwrap();
         assert_eq!(capability_changed.items, reattached.items);
-        assert_ne!(capability_changed.revision, reattached.revision);
+        assert_ne!(capability_changed.digest, reattached.digest);
         let restarted = SqliteWorkspaceStore::open(&api.config.database_path).unwrap();
         let (restarted_page, restarted_revision) = restarted
             .list_worker_workdir_links_page_with_revision(
@@ -54398,7 +54667,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(restarted_page.len(), 51);
-        assert_eq!(restarted_revision, capability_changed.revision);
+        assert_eq!(restarted_revision, capability_changed.digest);
         // A SQLite backup restores the same authoritative content/revision, without a sync store.
         let source = rusqlite::Connection::open(&api.config.database_path).unwrap();
         let mut snapshot = rusqlite::Connection::open_in_memory().unwrap();
@@ -54450,7 +54719,7 @@ mod tests {
                 Some(&replacement.connection_id),
             )
             .unwrap();
-        assert_ne!(read_write_revision, capability_changed.revision);
+        assert_ne!(read_write_revision, capability_changed.digest);
         let reader = SqliteWorkspaceStore::open(&api.config.database_path).unwrap();
         let barrier = Arc::new(std::sync::Barrier::new(2));
         std::thread::scope(|scope| {
@@ -54490,7 +54759,7 @@ mod tests {
                         workdir::WorkdirSessionCapabilities::READ_WRITE
                     );
                 } else {
-                    assert_eq!(revision, capability_changed.revision);
+                    assert_eq!(revision, capability_changed.digest);
                     assert_eq!(
                         page[0].capabilities,
                         workdir::WorkdirSessionCapabilities::READ_ONLY
@@ -54829,6 +55098,7 @@ mod tests {
             ),
             confirmed_workdir_cleanup_result(),
         );
+        let dirty_attempt_id = dirty.attempt_id.clone();
         let removed_after_retry = execute_reserved_workdir_removal_with_provider(
             &api,
             dirty,
@@ -54840,7 +55110,7 @@ mod tests {
             removed_after_retry.disposition,
             Some(WorkdirRemovalDisposition::Removed)
         );
-        assert_eq!(removed_after_retry.attempt_count, 2);
+        assert_ne!(removed_after_retry.attempt_id, dirty_attempt_id);
         assert_eq!(clean_retry_provider.cleanup_calls(), 1);
 
         let (corrupted_operation, mut corrupted_summary) =
@@ -55057,7 +55327,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(removed.operation_id, occupied.operation_id);
-        assert_eq!(removed.attempt_count, 4);
+        assert_ne!(removed.attempt_id, occupied.attempt_id);
         assert_eq!(
             removed.disposition,
             Some(WorkdirRemovalDisposition::Removed)
@@ -55320,6 +55590,17 @@ mod tests {
                 .is_some()
         );
 
+        let first_attempt_id = api
+            .config_store
+            .find_workdir_removal_operation_by_intent(
+                &api.config.workspace_id,
+                "missing-clean-workdir",
+                "account:owner",
+                "remove stale clean Workdir",
+            )
+            .unwrap()
+            .unwrap()
+            .attempt_id;
         let retry = execute_workdir_removal(
             &api,
             "missing-clean-workdir",
@@ -55338,7 +55619,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(operation.attempt_count, 2);
+        assert_ne!(operation.attempt_id, first_attempt_id);
     }
 
     #[tokio::test]
@@ -55394,7 +55675,8 @@ mod tests {
             .config_store
             .reserve_workdir_removal_operation(&intent)
             .unwrap();
-        api.config_store
+        let started = api
+            .config_store
             .begin_workdir_removal_attempt(
                 &reserved.workspace_id,
                 &reserved.operation_id,
@@ -55411,7 +55693,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(operation.state, WorkdirRemovalOperationState::Pending);
-        assert_eq!(operation.attempt_count, 1);
+        assert_eq!(operation.attempt_id, started.attempt_id);
         assert_eq!(
             operation.attempt_owner,
             Some(api.workdir_remove_attempt_owner)
@@ -55447,7 +55729,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(interrupted_attempt.attempt_count, 1);
+        assert!(interrupted_attempt.attempt_id.is_some());
 
         recover_workdir_removals(&api).unwrap();
 
@@ -55457,7 +55739,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(operation.state, WorkdirRemovalOperationState::Failed);
-        assert_eq!(operation.attempt_count, 2);
+        assert_ne!(operation.attempt_id, interrupted_attempt.attempt_id);
         assert!(operation.retryable);
         assert_eq!(
             operation.failure_category.as_deref(),
@@ -55554,29 +55836,36 @@ mod tests {
             .unwrap()
             .target_id
             .clone();
+        // Change the candidate set after preview, without changing the requested target.
+        seed_cleanup_worker(&api, 2, "normal");
         let stale = ExecuteRuntimeCleanupRequest {
-            expected_plan_revision: "stale".to_string(),
             expected_plan_digest: plan.digest.clone(),
             worker_target_ids: vec![target.clone()],
             workdir_target_ids: Vec::new(),
             confirm_dirty_discard_target_ids: Vec::new(),
         };
+        let error = execute_runtime_cleanup(&api, "runtime-test", stale)
+            .await
+            .err()
+            .expect("changed candidates must reject the old preview");
         assert!(
-            execute_runtime_cleanup(&api, "runtime-test", stale)
-                .await
-                .is_err()
+            matches!(error.error, Error::RuntimeOperationFailed { code, .. } if code == "workspace_cleanup_plan_stale")
         );
+
+        let refreshed = build_runtime_cleanup_plan(&api, "runtime-test").unwrap();
+        assert_ne!(plan.digest, refreshed.digest);
         let pinned = ExecuteRuntimeCleanupRequest {
-            expected_plan_revision: plan.revision,
-            expected_plan_digest: plan.digest,
+            expected_plan_digest: refreshed.digest,
             worker_target_ids: vec![target],
             workdir_target_ids: Vec::new(),
             confirm_dirty_discard_target_ids: Vec::new(),
         };
+        let error = execute_runtime_cleanup(&api, "runtime-test", pinned)
+            .await
+            .err()
+            .expect("current preview must still enforce target protection");
         assert!(
-            execute_runtime_cleanup(&api, "runtime-test", pinned)
-                .await
-                .is_err()
+            matches!(error.error, Error::RuntimeOperationFailed { code, .. } if code == "workspace_cleanup_worker_blocked")
         );
     }
 
@@ -55768,7 +56057,6 @@ mod tests {
             .find(|candidate| candidate.worker_id == worker_id)
             .unwrap();
         let request = ExecuteRuntimeCleanupRequest {
-            expected_plan_revision: plan.revision,
             expected_plan_digest: plan.digest,
             worker_target_ids: vec![candidate.target_id.clone()],
             workdir_target_ids: Vec::new(),
@@ -55891,7 +56179,6 @@ mod tests {
             Some("worker has unfinished work for Ticket `ticket-assigned` (`worker`)")
         );
         let request = ExecuteRuntimeCleanupRequest {
-            expected_plan_revision: plan.revision.clone(),
             expected_plan_digest: plan.digest.clone(),
             worker_target_ids: vec![candidate.target_id.clone()],
             workdir_target_ids: Vec::new(),
@@ -56032,7 +56319,6 @@ mod tests {
             .target_id
             .clone();
         let missing_confirmation = ExecuteRuntimeCleanupRequest {
-            expected_plan_revision: plan.revision.clone(),
             expected_plan_digest: plan.digest.clone(),
             worker_target_ids: Vec::new(),
             workdir_target_ids: vec![dirty_target],
@@ -56049,7 +56335,6 @@ mod tests {
                 .is_some()
         );
         let delete_removed = ExecuteRuntimeCleanupRequest {
-            expected_plan_revision: plan.revision,
             expected_plan_digest: plan.digest,
             worker_target_ids: Vec::new(),
             workdir_target_ids: vec![removed_target],
@@ -56136,7 +56421,7 @@ mod tests {
         workspace_root: impl Into<PathBuf>,
         runtime_id: &str,
         endpoint: String,
-    ) -> Router {
+    ) -> (Router, WorkspaceRuntimeBinding) {
         let api = test_api(workspace_root).await;
         api.store
             .upsert_workspace_runtime_binding_record(
@@ -56149,11 +56434,14 @@ mod tests {
                         .unwrap()
                         .public_key,
                     public_key_fingerprint: String::new(),
-                    binding_revision: 1,
+                    binding_id: "binding-test".to_string(),
                     state: StoredRuntimeBindingState::Verified,
                     authentication_mode: StoredRuntimeAuthenticationMode::LegacyServerIssuer,
                     workspace_key_id: None,
-                    workspace_key_generation: None,
+
+                    workspace_public_key_fingerprint: None,
+
+                    workspace_trust_id: None,
                     created_at: "1".to_string(),
                     updated_at: "1".to_string(),
                     revoked_at: None,
@@ -56161,6 +56449,12 @@ mod tests {
                 false,
             )
             .await
+            .unwrap();
+        let binding = api
+            .store
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, runtime_id)
+            .await
+            .unwrap()
             .unwrap();
         api.runtime.register_or_replace(
             RemoteWorkerRuntime::new(
@@ -56183,7 +56477,7 @@ mod tests {
             )
             .unwrap(),
         );
-        build_inner_router(api)
+        (build_inner_router(api), binding)
     }
 
     async fn test_app(workspace_root: impl Into<PathBuf>) -> Router {
@@ -56225,8 +56519,6 @@ mod tests {
             operation: worker_runtime::resource::BackendResourceOperation::FetchArchive,
             expires_at_unix_seconds: 4_102_444_800,
             nonce: "missing-nonce".to_string(),
-            revision: "missing-revision".to_string(),
-            generation: None,
             max_bytes: worker_runtime::resource::DEFAULT_PROFILE_SOURCE_ARCHIVE_MAX_BYTES,
             content_type: worker_runtime::resource::PROFILE_SOURCE_ARCHIVE_CONTENT_TYPE.to_string(),
             redaction: worker_runtime::resource::ResourceRedactionPolicy::RuntimeInternalOnly,
@@ -56841,7 +57133,6 @@ mod tests {
             metadata: worker_runtime::config_bundle::ConfigBundleMetadata {
                 id: "server-test-bundle".to_string(),
                 digest: String::new(),
-                revision: "test".to_string(),
                 workspace_id: "test".to_string(),
                 created_at: "test".to_string(),
                 provenance: worker_runtime::config_bundle::ConfigBundleProvenance {
@@ -56964,7 +57255,6 @@ mod tests {
             Some(EMBEDDED_WORKER_RUNTIME_ID),
             None,
             &repository.source_fingerprint,
-            repository.source_revision,
         );
         api.config_store
             .reserve_workdir_create_operation(&WorkdirCreateOperationRecord {
@@ -56975,16 +57265,14 @@ mod tests {
                 selector: Some("HEAD".to_string()),
                 requested_runtime_id: Some(EMBEDDED_WORKER_RUNTIME_ID.to_string()),
                 resolved_runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                config_revision: 1,
                 config_projection_digest: "sha256:test".to_string(),
                 source_kind: Some("local_path".to_string()),
                 source_uri: Some("/tmp/repo".to_string()),
-                source_revision: Some(1),
                 source_fingerprint: Some("sha256:test".to_string()),
                 credential_id: None,
-                credential_revision: None,
+                credential_fingerprint: None,
                 host_trust_id: None,
-                host_trust_revision: None,
+                host_trust_fingerprint: None,
                 repository_access_mode: None,
                 credential_candidates: Vec::new(),
                 working_directory_id: "workdir-provider-rejection".to_string(),
@@ -57119,6 +57407,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_workdir_create_replays_migrated_identity_and_rejects_changed_input() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let token = seed_test_api_token(api.store.as_ref(), "migrated-workdir-create-replay");
+        let operation_id = "migrated-workdir-create";
+        // Schema-86 hash of (test-repository, frozen-selector, None,
+        // Original Name, sha256:frozen-source), followed by source ordinal 9.
+        // Migration retains this evidence; display_name was never stored.
+        let legacy_identity = "workdir-create-v86:9:sha256:3b675cec7c31a4ce75c1d56a0c2e3b3b975567d459e9930db6aad78feab63ce8";
+        let now = now_registry_timestamp();
+        api.config_store
+            .reserve_workdir_create_operation(&WorkdirCreateOperationRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                operation_id: operation_id.to_string(),
+                request_fingerprint: legacy_identity.to_string(),
+                repository_id: test_repository_id(&api),
+                selector: Some("frozen-selector".to_string()),
+                requested_runtime_id: None,
+                resolved_runtime_id: "frozen-missing-runtime".to_string(),
+                config_projection_digest: "sha256:frozen-projection".to_string(),
+                source_kind: Some("local_path".to_string()),
+                source_uri: Some("/frozen/repository/source".to_string()),
+                source_fingerprint: Some("sha256:frozen-source".to_string()),
+                credential_id: None,
+                credential_fingerprint: None,
+                host_trust_id: None,
+                host_trust_fingerprint: None,
+                repository_access_mode: None,
+                credential_candidates: Vec::new(),
+                working_directory_id: "workdir-migrated-replay".to_string(),
+                state: "failed".to_string(),
+                failure: Some("legacy_failure".to_string()),
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .unwrap();
+        set_test_default_runtime(&api, EMBEDDED_WORKER_RUNTIME_ID);
+        let app = build_router(api.clone());
+        let path = format!("/api/w/{TEST_WORKSPACE_ID}/working-directories");
+        let original = serde_json::json!({
+            "repository_key": "test-repository",
+            "operation_id": operation_id,
+            "display_name": "Original Name",
+        });
+        // The omitted selector and changed current source/default Runtime must
+        // resolve from the persisted operation before verifying its identity.
+        for _ in 0..2 {
+            let response = request_json_authenticated(
+                app.clone(),
+                "POST",
+                &path,
+                Some(original.clone()),
+                &token,
+                StatusCode::NOT_FOUND,
+            )
+            .await;
+            assert_eq!(response["diagnostics"][0]["code"], "runtime_unavailable");
+            let operation = api
+                .config_store
+                .load_workdir_create_operation(TEST_WORKSPACE_ID, operation_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(operation.request_fingerprint, legacy_identity);
+            assert_eq!(operation.state, "failed");
+            assert_eq!(operation.failure.as_deref(), Some("runtime_unavailable"));
+            assert_eq!(operation.resolved_runtime_id, "frozen-missing-runtime");
+            assert_eq!(operation.selector.as_deref(), Some("frozen-selector"));
+            assert_eq!(
+                operation.source_fingerprint.as_deref(),
+                Some("sha256:frozen-source")
+            );
+        }
+        let before = api
+            .config_store
+            .load_workdir_create_operation(TEST_WORKSPACE_ID, operation_id)
+            .unwrap()
+            .unwrap();
+        for (field, value) in [
+            ("display_name", serde_json::Value::Null),
+            ("display_name", serde_json::json!("Changed Name")),
+            ("selector", serde_json::json!("changed-selector")),
+            ("runtime_id", serde_json::json!(EMBEDDED_WORKER_RUNTIME_ID)),
+        ] {
+            let mut changed = original.clone();
+            changed[field] = value;
+            let response = request_json_authenticated(
+                app.clone(),
+                "POST",
+                &path,
+                Some(changed),
+                &token,
+                StatusCode::BAD_REQUEST,
+            )
+            .await;
+            assert!(
+                response["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("reused with different input"),
+                "{response}"
+            );
+            let after = api
+                .config_store
+                .load_workdir_create_operation(TEST_WORKSPACE_ID, operation_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.request_fingerprint, legacy_identity);
+            assert_eq!(after.state, before.state);
+            assert_eq!(after.failure, before.failure);
+            assert_eq!(after.updated_at, before.updated_at);
+        }
+        assert!(
+            api.store
+                .get_workdir_registry(TEST_WORKSPACE_ID, "workdir-migrated-replay")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn browser_workspace_workdir_create_rejects_stale_json_before_side_effects() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
@@ -57196,6 +57605,12 @@ mod tests {
         let api = test_api(dir.path()).await;
         let token = seed_test_api_token(api.store.as_ref(), "failed-default-resolution");
         set_test_default_runtime(&api, EMBEDDED_WORKER_RUNTIME_ID);
+        let original_projection_digest = api
+            .config_store
+            .load_workspace_config(TEST_WORKSPACE_ID)
+            .unwrap()
+            .unwrap()
+            .projection_digest;
         let app = build_router(api.clone());
         let operation_id = "workdir-create-default-runtime";
 
@@ -57243,7 +57658,18 @@ mod tests {
             operation.failure.as_deref(),
             Some("embedded_worker_workdir_unsupported")
         );
-        assert_eq!(operation.config_revision, 2);
+        assert_eq!(
+            operation.config_projection_digest,
+            original_projection_digest
+        );
+        assert_ne!(
+            operation.config_projection_digest,
+            api.config_store
+                .load_workspace_config(TEST_WORKSPACE_ID)
+                .unwrap()
+                .unwrap()
+                .projection_digest
+        );
         assert!(!operation.config_projection_digest.is_empty());
         assert!(
             api.store
@@ -57310,11 +57736,14 @@ mod tests {
             base_url: "https://runtime.example.invalid".to_string(),
             public_key: identity.public_key,
             public_key_fingerprint: String::new(),
-            binding_revision: 1,
+            binding_id: "binding-test".to_string(),
             state: StoredRuntimeBindingState::Verified,
             authentication_mode: StoredRuntimeAuthenticationMode::LegacyServerIssuer,
             workspace_key_id: None,
-            workspace_key_generation: None,
+
+            workspace_public_key_fingerprint: None,
+
+            workspace_trust_id: None,
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
             revoked_at: None,
@@ -57322,6 +57751,12 @@ mod tests {
         store
             .upsert_workspace_runtime_binding_record(binding.clone(), false)
             .await
+            .unwrap();
+        let binding = api
+            .store
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, "team-runtime")
+            .await
+            .unwrap()
             .unwrap();
         let remote = remote_runtime_config_from_binding(&binding).unwrap();
         api.runtime.register_or_replace(
@@ -57350,7 +57785,7 @@ mod tests {
             &format!("{runtimes_uri}/{EMBEDDED_WORKER_RUNTIME_ID}"),
             Some(serde_json::json!({
                 "operation_id": "remove-embedded",
-                "expected_binding_revision": 1
+                "expected_binding_id": "binding-test"
             })),
             StatusCode::BAD_REQUEST,
         )
@@ -57374,7 +57809,8 @@ mod tests {
                     "public_key": ""
                 },
                 "display_name": "Keyless Runtime",
-                "endpoint": "https://8.8.8.8"
+                "endpoint": "https://8.8.8.8",
+                "workspace_trust_id": "trust-keyless-test"
             })),
             StatusCode::BAD_REQUEST,
         )
@@ -57421,7 +57857,7 @@ mod tests {
 
         let removal_request = serde_json::json!({
             "operation_id": "remove-team-runtime",
-            "expected_binding_revision": 1
+            "expected_binding_id": binding.binding_id
         });
         let deleted = request_json(
             app.clone(),
@@ -57462,7 +57898,7 @@ mod tests {
     async fn runtime_removal_config_and_revision_guards_preserve_active_trust() {
         let root = tempfile::tempdir().unwrap();
         let api = test_api(root.path()).await;
-        register_test_runtime(&api, "guarded-runtime").await;
+        let original = register_test_runtime(&api, "guarded-runtime").await;
         let app = build_inner_router(api.clone()).layer(Extension(test_owner_actor()));
         let runtimes_uri = format!("/api/w/{TEST_WORKSPACE_ID}/runtimes");
 
@@ -57472,14 +57908,14 @@ mod tests {
             &format!("{runtimes_uri}/guarded-runtime"),
             Some(serde_json::json!({
                 "operation_id": "remove-guarded-stale",
-                "expected_binding_revision": 2
+                "expected_binding_id": "binding-stale"
             })),
             StatusCode::CONFLICT,
         )
         .await;
         assert!(
-            stale.to_string().contains("revision conflict"),
-            "unexpected stale-revision response: {stale}"
+            stale.to_string().contains("identity conflict"),
+            "unexpected stale-binding response: {stale}"
         );
         let binding = api
             .store
@@ -57487,7 +57923,7 @@ mod tests {
             .await
             .unwrap()
             .expect("stale removal must preserve binding");
-        assert_eq!(binding.binding_revision, 1);
+        assert_eq!(binding.binding_id, original.binding_id);
         assert!(binding.revoked_at.is_none());
 
         set_test_default_runtime(&api, "guarded-runtime");
@@ -57497,7 +57933,7 @@ mod tests {
             &format!("{runtimes_uri}/guarded-runtime"),
             Some(serde_json::json!({
                 "operation_id": "remove-guarded-referenced",
-                "expected_binding_revision": 1
+                "expected_binding_id": original.binding_id
             })),
             StatusCode::CONFLICT,
         )
@@ -57514,30 +57950,97 @@ mod tests {
             .await
             .unwrap()
             .expect("config-blocked removal must preserve binding");
-        assert_eq!(binding.binding_revision, 1);
+        assert_eq!(binding.binding_id, original.binding_id);
         assert!(binding.revoked_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_removal_rejects_source_changes_even_when_projection_is_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        register_test_runtime(&api, "source-fenced-runtime").await;
+        let state = api
+            .config_store
+            .load_workspace_config(TEST_WORKSPACE_ID)
+            .unwrap()
+            .unwrap();
+        let binding = api
+            .store
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, "source-fenced-runtime")
+            .await
+            .unwrap()
+            .unwrap();
+        let operation = api
+            .store
+            .reserve_runtime_removal(
+                TEST_WORKSPACE_ID,
+                "source-fenced-runtime",
+                "remove-source-fenced-runtime",
+                &runtime_removal_fingerprint(
+                    TEST_WORKSPACE_ID,
+                    "source-fenced-runtime",
+                    &binding.binding_id,
+                ),
+                &binding.binding_id,
+                &state.snapshot.digest,
+            )
+            .await
+            .unwrap()
+            .operation;
+        runtime_removal_config_guard(&api, &operation).unwrap();
+        let changed = commit_workspace_config_tree(
+            &api,
+            TEST_WORKSPACE_ID,
+            &crate::config_source::ConfigCommitRequest {
+                base_digest: state.snapshot.digest.clone(),
+                entrypoints: state.contract.entrypoints.clone(),
+                changes: vec![config_source::ConfigTreeChange::Create {
+                    path: config_source::VirtualPath::parse("notes/removal-fence.txt").unwrap(),
+                    content_type: config_source::ConfigContentType::Text,
+                    content: "new source content, same runtime projection".to_string(),
+                }],
+            },
+        )
+        .unwrap();
+        assert_ne!(changed.snapshot.digest, state.snapshot.digest);
+        assert_eq!(changed.projection_digest, state.projection_digest);
+        assert!(
+            matches!(runtime_removal_config_guard(&api, &operation), Err(Error::RuntimeBindingConflict(message)) if message == "runtime_removal_config_digest_changed")
+        );
+        let retained = api
+            .store
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, "source-fenced-runtime")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.binding_id, binding.binding_id);
+        assert!(retained.revoked_at.is_none());
     }
 
     #[tokio::test]
     async fn startup_recovers_runtime_removal_after_binding_checkpoint() {
         let root = tempfile::tempdir().unwrap();
         let api = test_api(root.path()).await;
-        register_test_runtime(&api, "recover-runtime").await;
-        let config_revision = api
+        let binding = register_test_runtime(&api, "recover-runtime").await;
+        let config_digest = api
             .config_store
             .load_workspace_config(TEST_WORKSPACE_ID)
             .unwrap()
             .unwrap()
             .snapshot
-            .revision;
+            .digest;
         api.store
             .reserve_runtime_removal(
                 TEST_WORKSPACE_ID,
                 "recover-runtime",
                 "remove-recover-runtime",
-                &runtime_removal_fingerprint(TEST_WORKSPACE_ID, "recover-runtime", 1),
-                1,
-                config_revision,
+                &runtime_removal_fingerprint(
+                    TEST_WORKSPACE_ID,
+                    "recover-runtime",
+                    &binding.binding_id,
+                ),
+                &binding.binding_id,
+                &config_digest,
             )
             .await
             .unwrap();
@@ -57599,11 +58102,14 @@ mod tests {
                 .unwrap()
                 .public_key,
             public_key_fingerprint: String::new(),
-            binding_revision: 1,
+            binding_id: "binding-test".to_string(),
             state: StoredRuntimeBindingState::Verified,
             authentication_mode: StoredRuntimeAuthenticationMode::LegacyServerIssuer,
             workspace_key_id: None,
-            workspace_key_generation: None,
+
+            workspace_public_key_fingerprint: None,
+
+            workspace_trust_id: None,
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
             revoked_at: None,
@@ -57611,6 +58117,12 @@ mod tests {
         api.store
             .upsert_workspace_runtime_binding_record(binding.clone(), false)
             .await
+            .unwrap();
+        let binding = api
+            .store
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, "busy-runtime")
+            .await
+            .unwrap()
             .unwrap();
         api.runtime.register_or_replace(
             RemoteWorkerRuntime::new(
@@ -57633,7 +58145,7 @@ mod tests {
             &format!("/api/w/{TEST_WORKSPACE_ID}/runtimes/busy-runtime"),
             Some(serde_json::json!({
                 "operation_id": "remove-busy-runtime",
-                "expected_binding_revision": 1
+                "expected_binding_id": binding.binding_id
             })),
             StatusCode::CONFLICT,
         )
@@ -57642,7 +58154,8 @@ mod tests {
             response["message"]
                 .as_str()
                 .unwrap()
-                .contains("runtime_removal_active_worker_blocked")
+                .contains("runtime_removal_active_worker_blocked"),
+            "unexpected active-worker removal response: {response}"
         );
         let persisted = api
             .store
@@ -57650,7 +58163,7 @@ mod tests {
             .await
             .unwrap()
             .expect("busy Runtime binding must remain after rejected removal");
-        assert_eq!(persisted.binding_revision, 1);
+        assert_eq!(persisted.binding_id, binding.binding_id);
         assert!(persisted.revoked_at.is_none());
     }
 
@@ -57660,15 +58173,17 @@ mod tests {
     ) -> serde_json::Value {
         let (endpoint, _server) = runtime_ping_stub(status, body).await;
         let dir = tempfile::tempdir().unwrap();
-        let app = test_app_with_remote_runtime(dir.path(), "probe-runtime", endpoint)
-            .await
-            .layer(Extension(test_owner_actor()));
-        post_json(
+        let (app, binding) =
+            test_app_with_remote_runtime(dir.path(), "probe-runtime", endpoint).await;
+        let app = app.layer(Extension(test_owner_actor()));
+        let response = post_json(
             app,
             &format!("/api/w/{TEST_WORKSPACE_ID}/runtimes/probe-runtime/connection-tests"),
             serde_json::json!({}),
         )
-        .await
+        .await;
+        assert_eq!(response["binding_id"], binding.binding_id);
+        response
     }
 
     #[tokio::test]
@@ -57702,7 +58217,6 @@ mod tests {
         .await;
 
         assert_eq!(response["status"], "compatible");
-        assert_eq!(response["binding_revision"], 1);
         assert_eq!(response["connection_state"], "verified");
         assert_eq!(response["verification"], serde_json::Value::Null);
         assert_eq!(response["failure_kind"], serde_json::Value::Null);
@@ -58248,7 +58762,6 @@ mod tests {
                 provider: Some(configured_repository.provider),
                 source: configured_repository.source,
                 default_ref: configured_repository.default_selector,
-                source_revision: configured_repository.source_revision,
                 source_fingerprint: configured_repository.source_fingerprint,
                 observed_status: configured_repository.observed_status,
                 observed_at: configured_repository.observed_at,
@@ -58452,10 +58965,7 @@ mod tests {
         .await;
         assert_eq!(scoped_objective["id"], "00000000001J3");
         assert_eq!(scoped_objective["record_source"], "workspace-sqlite");
-        assert_eq!(
-            scoped_objective["revision"].as_str().unwrap().is_empty(),
-            false
-        );
+        assert_eq!(scoped_objective["body"], "Objective body.\n");
         assert_eq!(
             scoped_objective["resources"][0]["path"],
             "memory-architecture-overview.md"
@@ -58485,7 +58995,7 @@ mod tests {
         )
         .await;
         assert!(shown_ticket["evidence"]["missing"].is_array());
-        assert!(shown_ticket["item_revision"].as_str().is_some());
+        assert!(shown_ticket["content_digest"].as_str().is_some());
         let queried_objectives = request_json(
             app.clone(),
             "POST",
@@ -59167,7 +59677,6 @@ mod tests {
                 kind: server_api::RepositorySourceKind::LocalPath,
                 uri: root.path().display().to_string(),
             },
-            source_revision: 1,
             source_fingerprint: "sha256:test".to_string(),
             observed_status: server_api::RepositoryObservedStatus::Unverified,
             observed_at: None,
@@ -60920,7 +61429,6 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
         let app = test_app(dir.path()).await;
         let source_tree_path = format!("/api/w/{TEST_WORKSPACE_ID}/config/source-tree");
         let initial = get_json(app.clone(), &source_tree_path).await;
-        let revision = initial["snapshot"]["revision"].as_u64().unwrap();
         let digest = initial["snapshot"]["digest"].as_str().unwrap();
 
         let committed = request_json(
@@ -60928,7 +61436,6 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
             "POST",
             &format!("{source_tree_path}/commit"),
             Some(json!({
-                "base_revision": revision,
                 "base_digest": digest,
                 "changes": [{
                     "kind": "create",
@@ -60941,14 +61448,14 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
             StatusCode::CREATED,
         )
         .await;
-        let committed_revision = committed["snapshot"]["revision"].as_u64().unwrap();
+        let committed_digest = committed["snapshot"]["digest"].as_str().unwrap();
 
         let revision_snapshot = get_json(
             app.clone(),
-            &format!("{source_tree_path}/revisions/{committed_revision}"),
+            &format!("{source_tree_path}/history/{committed_digest}"),
         )
         .await;
-        assert_eq!(revision_snapshot["revision"], committed_revision);
+        assert_eq!(revision_snapshot["digest"], committed_digest);
         assert_eq!(
             revision_snapshot["entries"]["notes/readme.txt"]["content"],
             "nested entry"
@@ -60977,7 +61484,7 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
         let path = format!("/api/w/{TEST_WORKSPACE_ID}/settings/profiles");
         let settings = get_json(app.clone(), &path).await;
         assert_eq!(settings["default_profile"], "builtin:companion");
-        assert_eq!(settings["config_revision"], 1);
+        assert!(settings.get("config_revision").is_none());
         assert!(settings["tree_digest"].as_str().is_some());
         assert!(settings["projection_digest"].as_str().is_some());
         assert!(
@@ -61250,6 +61757,20 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
     #[test]
     fn subjektiv_http_errors_emit_typed_retry_diagnostics() {
         for (error, code, status) in [
+            (
+                Error::from(subjektiv::api::OperationError::Conflict(
+                    "change_conflict: Memory change was superseded".to_string(),
+                )),
+                "change_conflict",
+                StatusCode::CONFLICT,
+            ),
+            (
+                subjektiv_store_error(crate::subjektiv::SubjektivError::SubjectBehaviorConflict {
+                    subject_id: "subject-test".to_string(),
+                }),
+                "change_conflict",
+                StatusCode::CONFLICT,
+            ),
             (
                 Error::RepositoryConflict(
                     "candidate_decision_conflict: candidate already resolved".to_string(),

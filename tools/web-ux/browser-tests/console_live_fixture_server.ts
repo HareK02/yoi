@@ -99,7 +99,7 @@ const entries = [
   },
 ];
 const session = {
-  pending_submissions: { revision: 0, notification_count: 0, head_id: null, submissions: [] },
+  pending_submissions: { notification_count: 0, head_id: null, submissions: [] },
   entries,
 };
 const state = { last_command_id: 0, state: { kind: "idle" } };
@@ -249,6 +249,9 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   }
   if (url.pathname === `/api/w/${workspaceId}/working-directories`) {
     return json({ workspace_id: workspaceId, items: [], diagnostics: [] });
+  }
+  if (url.pathname === `/api/w/${workspaceId}/workers`) {
+    return json({ workspace_id: workspaceId, limit: 200, items: [worker], source: "fixture", diagnostics: [] });
   }
   if (url.pathname === `/api/w/${workspaceId}/workers/W-901` || url.pathname === workerPath) {
     return json(worker);

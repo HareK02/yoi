@@ -64,13 +64,13 @@ No native operation is inferred for a Tool that the Feature did not register. En
 
 Backend 401/403 failures map to permission denial, 404 to missing objects, and deterministic 400/409/422 validation or workflow failures to invalid arguments when the typed operation fails before any successful mutation. Cancellation and interruption remain distinct. Post-mutation canonical-reference lookups are explicitly marked as unknown-outcome stages, so even a later deterministic HTTP status cannot misreport an already-committed write as a rejection. Transport, server, malformed response, and other post-dispatch failures retain unknown outcome, and mutating operations are not retried automatically.
 
-Successful reads observe the authoritative item revision. Successful mutations advance a local observation generation even when the first call uses an internal ID whose canonical alias has not yet been learned. Once a read or mutation reveals the canonical key, the canonical/internal alias groups are merged and invalidated together. Relation mutations also invalidate the reported target Ticket, while queue results invalidate every reported queued Ticket, because those objects' incoming relations or workflow states changed. A stale validator is rejected by the common WIP Host before another Backend dispatch; the caller must rediscover/reinspect and explicitly decide whether to call again.
+Successful reads observe the authoritative item `content_digest`. Successful mutations advance a local observation generation even when the first call uses an internal ID whose canonical alias has not yet been learned. Once a read or mutation reveals the canonical key, the canonical/internal alias groups are merged and invalidated together. Relation mutations also invalidate the reported target Ticket, while queue results invalidate every reported queued Ticket, because those objects' incoming relations or workflow states changed. A stale validator is rejected by the common WIP Host before another Backend dispatch; the caller must rediscover/reinspect and explicitly decide whether to call again.
 
 ## Preserved Ticket contracts
 
 The projection invokes the existing Tool and scoped Backend routes, so the following remain authoritative and are not reimplemented by WIP:
 
-- item revision and audited item/thread/state events;
+- item content digest and audited item/thread/state events;
 - title/body/targets input validation;
 - planning-to-ready target validation and write-target requirement;
 - queue dependency traversal, planning-dependency rejection and cycle detection;

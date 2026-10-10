@@ -28,7 +28,7 @@ DCDL source
 
 The Serde-compatible intermediate is private compiler infrastructure. Public APIs and persisted Flow runtime records use typed Flow domain values.
 
-`flow_sources` stores one current logical Workspace-authored source per Workspace/slug. Every changed source creates an immutable `flow_source_revisions` row containing the original content, content digest, and compiled definition. Built-ins remain read-only embedded resources with an explicit monotonic resource revision; resolving one compiles and returns that resource snapshot without writing it into Workspace DB. Runtime pins source identity, revision, digest, and compiled definition in Worker state, so editing a Workspace source or updating a built-in resource never changes an existing instance.
+`flow_sources` stores one current logical Workspace-authored source per Workspace/slug. Every changed source retains the original content, content digest, and compiled definition in immutable source history. Built-ins are read-only embedded resources: resolving one compiles and returns its exact source snapshot without writing it into Workspace DB or maintaining a manual change counter. Runtime pins source identity, content digest, and compiled definition in Worker state, so editing a Workspace source or updating a built-in resource never changes an existing instance.
 
 The compiler rejects unknown fields, unsupported schema versions, invalid/reserved identifiers, unknown transition targets, authored `$cancelled` state/targets, terminal states with outgoing transitions, non-terminal states without transitions, unreachable states, and reachable closed paths that cannot reach a user-declared terminal state. It injects the synthetic exceptional-cancellation transition and `$cancelled` terminal state after validation.
 
@@ -36,18 +36,27 @@ The compiler rejects unknown fields, unsupported schema versions, invalid/reserv
 
 Flow source authority and Flow execution authority are split at the immutable source snapshot boundary.
 
-The Workspace Backend stores only current Flow sources and immutable source revisions. Resolving a source-qualified selector returns the Workspace id, Flow id, revision, digest, and compiled definition. Resolution is read-only with respect to Flow execution: it never creates an instance, attempt, or event.
+The Workspace Backend stores only current Flow sources and immutable source history. Resolving a source-qualified selector returns the Workspace id, Flow id, content digest, and compiled definition. Resolution is read-only with respect to Flow execution: it never creates an instance, attempt, or event.
 
 One Runtime Worker durably owns:
 
 - the pinned source snapshot and compiled definition;
-- its active Flow instance, current state, revision, and lifecycle status;
+- its active Flow instance, current state, and lifecycle status;
 - its active transition attempt;
 - its ordered Flow events.
 
 The complete `FlowRuntimeState` is persisted as a typed `flow.runtime.v1` Worker session extension. Initial Flow state is committed in the same `UserInput` log record as the entered-state instructions and remaining Submit segments. Backend therefore cannot contain an active instance that Worker history has never observed.
 
 Transition mutations clone the current Runtime state, append ordered events, persist the new session extension, and only then replace the in-memory projection. A persisted verifying attempt survives Runtime restart and same-Worker restore; the next transition request recovers it instead of creating a competing attempt.
+
+The executable checks live in `FlowRuntimeState::begin_or_recover_transition` and `resolve_active_transition`, with private `begin_transition` / `resolve_transition` helpers:
+
+- Before starting, require an active instance, no other active attempt, and the same compiled content digest as the pinned source. Reject an attempt ID already present in `TransitionRequested` events, including cancelled/failed attempts.
+- Before consuming a result, require its exact instance and currently reserved attempt ID. Then compare the compiled and captured definition digests against the pinned digest.
+- Before applying a successful verdict, require the instance to remain active and its current state to equal the captured source state. Validate the complete outgoing-condition result set and accept exactly one met condition.
+- Completion or cancellation releases the active attempt. A delayed result cannot consume a newer attempt even if the graph returns to the same state. The persisted event log prevents reusing the old attempt ID after restore.
+
+There is no independent state counter or manually incremented built-in source counter. Event `sequence` remains only the append order of the actual event log, not a substitute for any of these conditions.
 
 Worker stop retains the Flow with the Worker session. Restoring the same Worker reconstructs the latest state from session extensions and the saved Profile still determines `feature.flow` eligibility. Worker deletion removes the owning Worker/session; Flow state is not implicitly handed to another Worker.
 

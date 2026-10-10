@@ -28,7 +28,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 84;
+const LATEST_SCHEMA_VERSION: i64 = 88;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -84,49 +84,6 @@ const WORKER_RESTORE_INTENTS_MIGRATION_NAME: &str =
     "durable internal Worker Restore request identity";
 const TICKET_SCHEMA_VERSION_WITH_TARGETS: i64 = 7;
 const TICKET_SCHEMA_BASELINE_NAME: &str = "ticket schema baseline";
-const WORKER_REGISTRY_PROJECTION_SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS worker_registry_observations (
-    workspace_id TEXT NOT NULL,
-    runtime_id TEXT NOT NULL,
-    worker_id TEXT NOT NULL,
-    availability TEXT NOT NULL CHECK (availability IN ('observed', 'unavailable')),
-    worker_json TEXT,
-    connection_generation INTEGER NOT NULL,
-    subject_revision INTEGER NOT NULL,
-    snapshot_revision INTEGER NOT NULL,
-    projection_revision INTEGER NOT NULL,
-    observed_at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, runtime_id, worker_id),
-    FOREIGN KEY (workspace_id, worker_id)
-        REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS worker_registry_projection_cursors (
-    workspace_id TEXT NOT NULL,
-    runtime_id TEXT NOT NULL,
-    connection_generation INTEGER NOT NULL,
-    snapshot_revision INTEGER NOT NULL,
-    PRIMARY KEY (workspace_id, runtime_id)
-);
-CREATE TABLE IF NOT EXISTS worker_registry_projection_revisions (
-    workspace_id TEXT PRIMARY KEY,
-    revision INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS worker_registry_projection_removals (
-    workspace_id TEXT NOT NULL,
-    runtime_id TEXT NOT NULL,
-    worker_id TEXT NOT NULL,
-    projection_revision INTEGER NOT NULL,
-    PRIMARY KEY (workspace_id, runtime_id, worker_id)
-);
-CREATE TABLE IF NOT EXISTS worker_registry_projection_diagnostics (
-    diagnostic_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    workspace_id TEXT NOT NULL,
-    runtime_id TEXT NOT NULL,
-    worker_id TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    observed_at TEXT NOT NULL
-);
-"#;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -299,6 +256,26 @@ const MIGRATIONS: &[Migration] = &[
         name: WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME,
         apply: migrate_workspace_drive_grants_v83_to_v84,
     },
+    Migration {
+        version: 85,
+        name: "content-addressed Flow sources",
+        apply: migrate_flow_content_v84_to_v85,
+    },
+    Migration {
+        version: 86,
+        name: "content-fenced config, Memory settings and Jobs",
+        apply: migrate_content_state_v85_to_v86,
+    },
+    Migration {
+        version: 87,
+        name: "Repository SSH key identities and encrypted operation objects",
+        apply: migrate_repository_keys_v86_to_v87,
+    },
+    Migration {
+        version: 88,
+        name: "Runtime binding identities and retention content contracts",
+        apply: migrate_runtime_bindings_v87_to_v88,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -342,7 +319,6 @@ pub struct WorkspaceRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceMemorySettingsRecord {
     pub workspace_id: String,
-    pub settings_revision: u64,
     pub language: String,
     pub created_at: String,
     pub updated_at: String,
@@ -376,7 +352,6 @@ pub struct RepositoryRecord {
     pub provider: Option<String>,
     pub source: RepositorySource,
     pub default_ref: Option<String>,
-    pub source_revision: u64,
     pub source_fingerprint: String,
     pub observed_status: RepositoryObservedStatus,
     pub observed_at: Option<String>,
@@ -402,7 +377,6 @@ pub struct WorkspaceBootstrapRecord {
 pub struct WorkspaceBootstrapResult {
     pub workspace: WorkspaceRecord,
     pub repository: Option<RepositoryRecord>,
-    pub config_revision: u64,
     pub replayed: bool,
 }
 
@@ -414,7 +388,6 @@ pub struct WorkspaceSigningIdentityRecord {
     pub public_key: Option<String>,
     pub public_key_fingerprint: Option<String>,
     pub private_material_ref: String,
-    pub revision: u64,
     pub state: String,
     pub created_at: String,
     pub provisioned_at: Option<String>,
@@ -431,7 +404,6 @@ impl std::fmt::Debug for WorkspaceSigningIdentityRecord {
             .field("public_key", &self.public_key)
             .field("public_key_fingerprint", &self.public_key_fingerprint)
             .field("private_material_ref", &"[REDACTED]")
-            .field("revision", &self.revision)
             .field("state", &self.state)
             .field("created_at", &self.created_at)
             .field("provisioned_at", &self.provisioned_at)
@@ -447,7 +419,6 @@ pub struct WorkspaceSigningIdentityActivation {
     pub public_key: String,
     pub public_key_fingerprint: String,
     pub private_material_ref: String,
-    pub revision: u64,
     pub provisioned_at: String,
 }
 
@@ -459,7 +430,6 @@ pub struct WorkspaceSigningIdentityProvisioningOperation {
     pub workspace_id: String,
     pub key_id: String,
     pub private_material_ref: String,
-    pub revision: u64,
     pub actor_account_id: String,
     pub state: String,
     pub created_at: String,
@@ -470,12 +440,11 @@ pub struct WorkspaceSigningIdentityProvisioningOperation {
 pub struct WorkspaceRuntimeVerificationEvidence {
     pub workspace_id: String,
     pub runtime_id: String,
-    pub binding_revision: u64,
+    pub binding_id: String,
     pub workspace_key_id: String,
-    pub workspace_identity_revision: u64,
-    pub workspace_trust_generation: u64,
+    pub workspace_public_key_fingerprint: String,
+    pub workspace_trust_id: String,
     pub runtime_public_key_fingerprint: String,
-    pub runtime_identity_revision: u64,
     pub challenge_id: String,
     pub state: String,
     pub last_outcome: String,
@@ -491,11 +460,12 @@ pub struct WorkspaceRuntimeBinding {
     pub base_url: String,
     pub public_key: String,
     pub public_key_fingerprint: String,
-    pub binding_revision: u64,
+    pub binding_id: String,
     pub state: WorkspaceRuntimeBindingState,
     pub authentication_mode: WorkspaceRuntimeAuthenticationMode,
     pub workspace_key_id: Option<String>,
-    pub workspace_key_generation: Option<u64>,
+    pub workspace_public_key_fingerprint: Option<String>,
+    pub workspace_trust_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub revoked_at: Option<String>,
@@ -507,8 +477,8 @@ pub struct RuntimeRemovalOperation {
     pub workspace_id: String,
     pub runtime_id: String,
     pub request_fingerprint: String,
-    pub expected_binding_revision: u64,
-    pub config_revision: u64,
+    pub expected_binding_id: String,
+    pub config_digest: String,
     pub state: RuntimeRemovalOperationState,
     pub failure_category: Option<String>,
     pub binding_removed: bool,
@@ -604,7 +574,7 @@ pub struct WorkspaceRuntimeBindingAuditRecord {
     pub action: String,
     pub old_fingerprint: Option<String>,
     pub new_fingerprint: Option<String>,
-    pub binding_revision: u64,
+    pub binding_id: String,
     pub at: String,
 }
 
@@ -899,7 +869,7 @@ impl WorkdirCreateCredentialCandidateRole {
 pub struct WorkdirCreateCredentialCandidate {
     pub role: WorkdirCreateCredentialCandidateRole,
     pub credential_id: String,
-    pub credential_revision: u64,
+    pub credential_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -911,16 +881,14 @@ pub struct WorkdirCreateOperationRecord {
     pub selector: Option<String>,
     pub requested_runtime_id: Option<String>,
     pub resolved_runtime_id: String,
-    pub config_revision: u64,
     pub config_projection_digest: String,
     pub source_kind: Option<String>,
     pub source_uri: Option<String>,
-    pub source_revision: Option<u64>,
     pub source_fingerprint: Option<String>,
     pub credential_id: Option<String>,
-    pub credential_revision: Option<u64>,
+    pub credential_fingerprint: Option<String>,
     pub host_trust_id: Option<String>,
-    pub host_trust_revision: Option<u64>,
+    pub host_trust_fingerprint: Option<String>,
     pub repository_access_mode: Option<String>,
     #[serde(default)]
     pub credential_candidates: Vec<WorkdirCreateCredentialCandidate>,
@@ -1121,16 +1089,14 @@ pub struct FlowSourceRecord {
     pub path: String,
     pub content: String,
     pub content_digest: String,
-    pub revision: u64,
     pub created_at: String,
     pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FlowSourceRevisionRecord {
+pub struct FlowSourceContentRecord {
     pub workspace_id: String,
     pub flow_id: String,
-    pub revision: u64,
     pub content: String,
     pub content_digest: String,
     pub definition: CompiledFlowDefinition,
@@ -1220,8 +1186,8 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     fn workspace_runtime_verification_matches(
         &self,
         binding: &WorkspaceRuntimeBinding,
-        workspace_identity_revision: u64,
-        workspace_trust_generation: u64,
+        workspace_public_key_fingerprint: &str,
+        workspace_trust_id: &str,
     ) -> Result<bool>;
     async fn get_workspace_runtime_verification(
         &self,
@@ -1269,8 +1235,8 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         runtime_id: &str,
         operation_id: &str,
         request_fingerprint: &str,
-        expected_binding_revision: u64,
-        config_revision: u64,
+        expected_binding_id: &str,
+        config_digest: &str,
     ) -> Result<RuntimeRemovalReservation>;
     async fn get_runtime_removal(
         &self,
@@ -1308,7 +1274,7 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     async fn put_workspace_runtime_binding_key(
         &self,
         record: WorkspaceRuntimeBinding,
-        expected_revision: Option<u64>,
+        expected_binding_id: Option<&str>,
         actor_account_id: &str,
     ) -> Result<(WorkspaceRuntimeBindingMutation, WorkspaceRuntimeBinding)>;
     async fn update_workspace_runtime_binding_metadata(
@@ -1323,7 +1289,7 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         &self,
         workspace_id: &str,
         runtime_id: &str,
-        expected_revision: u64,
+        expected_binding_id: &str,
         actor_account_id: &str,
         revoked_at: &str,
     ) -> Result<(WorkspaceRuntimeBindingMutation, WorkspaceRuntimeBinding)>;
@@ -1454,12 +1420,12 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         workspace_id: &str,
         flow_id: &str,
     ) -> Result<Option<FlowSourceRecord>>;
-    fn get_flow_source_revision(
+    fn get_flow_source_content(
         &self,
         workspace_id: &str,
         flow_id: &str,
-        revision: u64,
-    ) -> Result<Option<FlowSourceRevisionRecord>>;
+        content_digest: &str,
+    ) -> Result<Option<FlowSourceContentRecord>>;
 
     fn upsert_objective(&self, record: &ObjectiveRecord) -> Result<()>;
     fn list_objectives(&self, workspace_id: &str, limit: usize) -> Result<Vec<ObjectiveRecord>>;
@@ -2221,7 +2187,7 @@ impl SqliteWorkspaceStore {
             Duration::from_millis(1),
             None,
         )?;
-        prepare_connection(&candidate)?;
+        prepare_connection_with_secret_source(&candidate, Some(path))?;
         Ok(plan)
     }
 
@@ -2364,27 +2330,10 @@ impl SqliteWorkspaceStore {
         &self,
         workspace_id: &str,
     ) -> Result<WorkspaceMemorySettingsRecord> {
-        let record = self.with_conn(|conn| {
-            conn.query_row(
-                "SELECT workspace_id, settings_revision, language, created_at, updated_at \
-                 FROM workspace_memory_settings WHERE workspace_id = ?1",
-                params![workspace_id],
-                |row| {
-                    let revision = row.get::<_, i64>(1)?;
-                    Ok(WorkspaceMemorySettingsRecord {
-                        workspace_id: row.get(0)?,
-                        settings_revision: revision
-                            .try_into()
-                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, revision))?,
-                        language: row.get(2)?,
-                        created_at: row.get(3)?,
-                        updated_at: row.get(4)?,
-                    })
-                },
-            )
-            .optional()?
-            .ok_or_else(|| Error::Store("Workspace Memory settings are missing".to_string()))
-        })?;
+        let record = self.with_conn(|conn| conn.query_row(
+            "SELECT workspace_id, language, created_at, updated_at FROM workspace_memory_settings WHERE workspace_id=?1",
+            [workspace_id], read_workspace_memory_settings,
+        ).optional()?.ok_or_else(|| Error::Store("Workspace Memory settings are missing".into())))?;
         validate_workspace_memory_settings_record(&record, workspace_id)?;
         Ok(record)
     }
@@ -2392,70 +2341,23 @@ impl SqliteWorkspaceStore {
     pub(crate) fn update_workspace_memory_settings(
         &self,
         workspace_id: &str,
-        expected_revision: u64,
+        expected_language: &str,
         language: &str,
     ) -> Result<WorkspaceMemorySettingsRecord> {
         let language = normalize_workspace_memory_language(language)?;
         self.with_conn_mut(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let current = tx
-                .query_row(
-                    "SELECT workspace_id, settings_revision, language, created_at, updated_at \
-                     FROM workspace_memory_settings WHERE workspace_id = ?1",
-                    params![workspace_id],
-                    |row| {
-                        let revision = row.get::<_, i64>(1)?;
-                        Ok(WorkspaceMemorySettingsRecord {
-                            workspace_id: row.get(0)?,
-                            settings_revision: revision.try_into().map_err(|_| {
-                                rusqlite::Error::IntegralValueOutOfRange(1, revision)
-                            })?,
-                            language: row.get(2)?,
-                            created_at: row.get(3)?,
-                            updated_at: row.get(4)?,
-                        })
-                    },
-                )
-                .optional()?
-                .ok_or_else(|| Error::Store("Workspace Memory settings are missing".to_string()))?;
-            validate_workspace_memory_settings_record(&current, workspace_id)?;
-            let current_revision = current.settings_revision;
-            if current_revision != expected_revision {
-                return Err(Error::WorkspaceConfigConflict(format!(
-                    "Workspace Memory settings revision changed: expected {expected_revision}, current {current_revision}"
-                )));
+            let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current=tx.query_row("SELECT workspace_id,language,created_at,updated_at FROM workspace_memory_settings WHERE workspace_id=?1",[workspace_id],read_workspace_memory_settings)
+                .optional()?.ok_or_else(|| Error::Store("Workspace Memory settings are missing".into()))?;
+            validate_workspace_memory_settings_record(&current,workspace_id)?;
+            if current.language != expected_language {
+                return Err(Error::WorkspaceConfigConflict("Workspace Memory language changed".into()));
             }
-            if current.language == language {
-                tx.commit()?;
-                return Ok(current);
-            }
-            let next_revision = current_revision.checked_add(1).ok_or_else(|| {
-                Error::InvalidInput("Workspace Memory settings revision overflow".to_string())
-            })?;
-            let now = chrono::Utc::now().to_rfc3339();
-            tx.execute(
-                "UPDATE workspace_memory_settings \
-                 SET settings_revision = ?2, language = ?3, updated_at = ?4 \
-                 WHERE workspace_id = ?1",
-                params![workspace_id, next_revision as i64, language, now],
-            )?;
-            let record = tx.query_row(
-                "SELECT workspace_id, settings_revision, language, created_at, updated_at \
-                 FROM workspace_memory_settings WHERE workspace_id = ?1",
-                params![workspace_id],
-                |row| {
-                    let revision = row.get::<_, i64>(1)?;
-                    Ok(WorkspaceMemorySettingsRecord {
-                        workspace_id: row.get(0)?,
-                        settings_revision: revision as u64,
-                        language: row.get(2)?,
-                        created_at: row.get(3)?,
-                        updated_at: row.get(4)?,
-                    })
-                },
-            )?;
+            if current.language == language { tx.commit()?; return Ok(current); }
+            let now=chrono::Utc::now().to_rfc3339();
+            tx.execute("UPDATE workspace_memory_settings SET language=?2,updated_at=?3 WHERE workspace_id=?1",params![workspace_id,language,now])?;
             tx.commit()?;
-            Ok(record)
+            Ok(WorkspaceMemorySettingsRecord { language,updated_at:now,..current })
         })
     }
 
@@ -2482,7 +2384,7 @@ impl SqliteWorkspaceStore {
             let existing = tx
                 .query_row(
                     "SELECT worker_id, runtime_id, request_fingerprint, create_fingerprint, \
-                            memory_settings_revision, memory_language, state, singleton_key, \
+                            memory_language, state, singleton_key, \
                             singleton_generation \
                      FROM worker_create_reservations \
                      WHERE workspace_id = ?1 AND allocation_key = ?2",
@@ -2493,16 +2395,15 @@ impl SqliteWorkspaceStore {
                             row.get::<_, String>(1)?,
                             row.get::<_, Option<String>>(2)?,
                             row.get::<_, String>(3)?,
-                            row.get::<_, Option<i64>>(4)?,
-                            row.get::<_, Option<String>>(5)?,
-                            row.get::<_, String>(6)?,
-                            row.get::<_, Option<String>>(7)?,
-                            row.get::<_, Option<i64>>(8)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<i64>>(7)?,
                         ))
                     },
                 )
                 .optional()?;
-            if let Some((worker_id, reserved_runtime_id, stored_request_fingerprint, create_fingerprint, revision, language, state, stored_singleton_key, singleton_generation)) = existing {
+            if let Some((worker_id, reserved_runtime_id, stored_request_fingerprint, create_fingerprint, language, state, stored_singleton_key, singleton_generation)) = existing {
                 if state == "removed" {
                     return Err(Error::InvalidInput(format!(
                         "Worker create allocation {allocation_key} was terminally removed"
@@ -2516,11 +2417,6 @@ impl SqliteWorkspaceStore {
                         "Worker create allocation {allocation_key} was already used with different input"
                     )));
                 }
-                let revision = revision.ok_or_else(|| {
-                    Error::InvalidInput(format!(
-                        "Worker create allocation {allocation_key} has no persisted Memory settings snapshot"
-                    ))
-                })?;
                 let language = language.ok_or_else(|| {
                     Error::InvalidInput(format!(
                         "Worker create allocation {allocation_key} has no persisted Memory language"
@@ -2533,9 +2429,6 @@ impl SqliteWorkspaceStore {
                 })?;
                 let snapshot = manifest::WorkspaceMemorySettingsSnapshot {
                     workspace_id: workspace_id.to_string(),
-                    settings_revision: revision.try_into().map_err(|_| {
-                        rusqlite::Error::IntegralValueOutOfRange(4, revision)
-                    })?,
                     language,
                 };
                 validate_workspace_memory_settings_snapshot(&snapshot, workspace_id)?;
@@ -2577,7 +2470,7 @@ impl SqliteWorkspaceStore {
                 let stored = tx
                     .query_row(
                         "SELECT allocation_key, request_fingerprint, create_fingerprint, \
-                                memory_settings_revision, memory_language, singleton_key, \
+                                memory_language, singleton_key, \
                                 singleton_generation \
                          FROM worker_create_reservations \
                          WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
@@ -2591,15 +2484,14 @@ impl SqliteWorkspaceStore {
                                 row.get::<_, String>(0)?,
                                 row.get::<_, Option<String>>(1)?,
                                 row.get::<_, String>(2)?,
-                                row.get::<_, Option<i64>>(3)?,
+                                row.get::<_, Option<String>>(3)?,
                                 row.get::<_, Option<String>>(4)?,
-                                row.get::<_, Option<String>>(5)?,
-                                row.get::<_, Option<i64>>(6)?,
+                                row.get::<_, Option<i64>>(5)?,
                             ))
                         },
                     )
                     .optional()?;
-                if let Some((stored_allocation_key, stored_request_fingerprint, create_fingerprint, revision, language, stored_singleton_key, stored_generation)) = stored
+                if let Some((stored_allocation_key, stored_request_fingerprint, create_fingerprint, language, stored_singleton_key, stored_generation)) = stored
                     && allocation_key.starts_with("manual:")
                     && stored_allocation_key.starts_with("manual:")
                     && owner.worker.runtime_id == runtime_id
@@ -2608,13 +2500,7 @@ impl SqliteWorkspaceStore {
                     && stored_generation.and_then(|generation| u64::try_from(generation).ok())
                         == Some(owner.generation)
                 {
-                    let revision = revision.ok_or_else(|| {
-                        Error::InvalidInput(format!(
-                            "Worker singleton reservation {}:{} has no persisted Memory settings snapshot",
-                            owner.worker.runtime_id, owner.worker.worker_id
-                        ))
-                    })?;
-                    let language = language.ok_or_else(|| {
+                        let language = language.ok_or_else(|| {
                         Error::InvalidInput(format!(
                             "Worker singleton reservation {}:{} has no persisted Memory language",
                             owner.worker.runtime_id, owner.worker.worker_id
@@ -2628,10 +2514,7 @@ impl SqliteWorkspaceStore {
                     })?;
                     let snapshot = manifest::WorkspaceMemorySettingsSnapshot {
                         workspace_id: workspace_id.to_string(),
-                        settings_revision: revision.try_into().map_err(|_| {
-                            rusqlite::Error::IntegralValueOutOfRange(2, revision)
-                        })?,
-                        language,
+                            language,
                     };
                     validate_workspace_memory_settings_snapshot(&snapshot, workspace_id)?;
                     return Ok(WorkerCreateReservation {
@@ -2647,19 +2530,15 @@ impl SqliteWorkspaceStore {
                 )));
             }
 
-            let (authoritative_revision, authoritative_language) = tx
+            let authoritative_language = tx
                 .query_row(
-                    "SELECT settings_revision, language FROM workspace_memory_settings WHERE workspace_id = ?1",
+                    "SELECT language FROM workspace_memory_settings WHERE workspace_id = ?1",
                     params![workspace_id],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                    |row| row.get::<_, String>(0),
                 )
                 .optional()?
                 .ok_or_else(|| Error::Store("Workspace Memory settings are missing".to_string()))?;
-            let authoritative_revision: u64 = authoritative_revision.try_into().map_err(|_| {
-                rusqlite::Error::IntegralValueOutOfRange(0, authoritative_revision)
-            })?;
-            if authoritative_revision != current_memory_settings.settings_revision
-                || authoritative_language != current_memory_settings.language
+            if authoritative_language != current_memory_settings.language
             {
                 return Err(Error::WorkspaceConfigConflict(
                     "Workspace Memory settings changed while the Worker create reservation was being accepted"
@@ -2669,7 +2548,6 @@ impl SqliteWorkspaceStore {
 
             let snapshot = manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: workspace_id.to_string(),
-                settings_revision: authoritative_revision,
                 language: authoritative_language,
             };
             validate_workspace_memory_settings_snapshot(&snapshot, workspace_id)?;
@@ -2704,8 +2582,8 @@ impl SqliteWorkspaceStore {
                 "INSERT INTO worker_create_reservations(\
                     workspace_id, allocation_key, worker_id, runtime_id, create_fingerprint,\
                     state, created_at, updated_at, request_fingerprint,\
-                    memory_settings_revision, memory_language, singleton_key, singleton_generation\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    memory_language, singleton_key, singleton_generation\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     workspace_id,
                     allocation_key,
@@ -2714,7 +2592,6 @@ impl SqliteWorkspaceStore {
                     create_fingerprint,
                     now,
                     request_fingerprint,
-                    snapshot.settings_revision as i64,
                     snapshot.language,
                     singleton_key,
                     singleton_generation.map(|generation| generation as i64),
@@ -3046,15 +2923,15 @@ impl SqliteWorkspaceStore {
         self.with_conn(|conn| {
             let sql = if include_revoked {
                 r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                          public_key_fingerprint, binding_revision, state, authentication_mode,
-                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+                          public_key_fingerprint, binding_id, state, authentication_mode,
+                          workspace_key_id, workspace_trust_id, created_at, updated_at, revoked_at, workspace_public_key_fingerprint
                    FROM workspace_runtime_bindings
                    WHERE workspace_id = ?1
                    ORDER BY runtime_id ASC"#
             } else {
                 r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                          public_key_fingerprint, binding_revision, state, authentication_mode,
-                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+                          public_key_fingerprint, binding_id, state, authentication_mode,
+                          workspace_key_id, workspace_trust_id, created_at, updated_at, revoked_at, workspace_public_key_fingerprint
                    FROM workspace_runtime_bindings
                    WHERE workspace_id = ?1 AND revoked_at IS NULL
                    ORDER BY runtime_id ASC"#
@@ -3076,8 +2953,8 @@ impl SqliteWorkspaceStore {
         self.with_conn(|conn| {
             conn.query_row(
                 r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                          public_key_fingerprint, binding_revision, state, authentication_mode,
-                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+                          public_key_fingerprint, binding_id, state, authentication_mode,
+                          workspace_key_id, workspace_trust_id, created_at, updated_at, revoked_at, workspace_public_key_fingerprint
                    FROM workspace_runtime_bindings
                    WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                 params![workspace_id, runtime_id],
@@ -3176,13 +3053,15 @@ impl SqliteWorkspaceStore {
         runtime_id: &str,
         operation_id: &str,
         request_fingerprint: &str,
-        expected_binding_revision: u64,
-        config_revision: u64,
+        expected_binding_id: &str,
+        config_digest: &str,
     ) -> Result<RuntimeRemovalReservation> {
         validate_identifier("workspace_id", workspace_id)?;
         validate_identifier("runtime_id", runtime_id)?;
         validate_identifier("operation_id", operation_id)?;
         validate_non_empty("request_fingerprint", request_fingerprint)?;
+        validate_identifier("expected_binding_id", expected_binding_id)?;
+        validate_non_empty("config_digest", config_digest)?;
         if operation_id.len() > 128 || request_fingerprint.len() > 128 {
             return Err(Error::InvalidInput(
                 "Runtime removal operation identity is too long".to_string(),
@@ -3194,8 +3073,8 @@ impl SqliteWorkspaceStore {
                 if existing.workspace_id != workspace_id
                     || existing.runtime_id != runtime_id
                     || existing.request_fingerprint != request_fingerprint
-                    || existing.expected_binding_revision != expected_binding_revision
-                    || existing.config_revision != config_revision
+                    || existing.expected_binding_id != expected_binding_id
+                    || existing.config_digest != config_digest
                 {
                     return Err(Error::RuntimeBindingConflict(
                         "runtime_removal_operation_id_reused".to_string(),
@@ -3212,7 +3091,7 @@ impl SqliteWorkspaceStore {
                     &tx,
                     workspace_id,
                     runtime_id,
-                    expected_binding_revision,
+                    expected_binding_id,
                 )?;
                 let now = chrono::Utc::now().to_rfc3339();
                 tx.execute(
@@ -3249,13 +3128,13 @@ impl SqliteWorkspaceStore {
                 &tx,
                 workspace_id,
                 runtime_id,
-                expected_binding_revision,
+                expected_binding_id,
             )?;
             let now = chrono::Utc::now().to_rfc3339();
             tx.execute(
                 "INSERT INTO runtime_removal_operations(\
                      operation_id, workspace_id, runtime_id, request_fingerprint, \
-                     expected_binding_revision, config_revision, state, failure_category, \
+                     expected_binding_id, config_digest, state, failure_category, \
                      binding_removed, runtime_registration_removed, created_at, updated_at, completed_at\
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, 0, NULL, ?7, ?7, NULL)",
                 params![
@@ -3263,12 +3142,8 @@ impl SqliteWorkspaceStore {
                     workspace_id,
                     runtime_id,
                     request_fingerprint,
-                    i64::try_from(expected_binding_revision).map_err(|_| {
-                        Error::InvalidInput("binding revision is too large".to_string())
-                    })?,
-                    i64::try_from(config_revision).map_err(|_| {
-                        Error::InvalidInput("config revision is too large".to_string())
-                    })?,
+                    expected_binding_id,
+                    config_digest,
                     now,
                 ],
             )?;
@@ -3338,7 +3213,7 @@ impl SqliteWorkspaceStore {
                 &tx,
                 &operation.workspace_id,
                 &operation.runtime_id,
-                operation.expected_binding_revision,
+                &operation.expected_binding_id,
             )?;
             tx.execute(
                 "DELETE FROM worker_mutation_source_proof_jtis \
@@ -3352,18 +3227,16 @@ impl SqliteWorkspaceStore {
             )?;
             let removed = tx.execute(
                 "DELETE FROM workspace_runtime_bindings \
-                 WHERE workspace_id = ?1 AND runtime_id = ?2 AND binding_revision = ?3",
+                 WHERE workspace_id = ?1 AND runtime_id = ?2 AND binding_id = ?3",
                 params![
                     operation.workspace_id,
                     operation.runtime_id,
-                    i64::try_from(operation.expected_binding_revision).map_err(|_| {
-                        Error::InvalidInput("binding revision is too large".to_string())
-                    })?,
+                    &operation.expected_binding_id,
                 ],
             )?;
             if removed != 1 {
-                return Err(Error::RuntimeBindingRevisionConflict {
-                    expected: Some(operation.expected_binding_revision),
+                return Err(Error::RuntimeBindingIdConflict {
+                    expected: Some(operation.expected_binding_id.clone()),
                     actual: None,
                 });
             }
@@ -3434,8 +3307,8 @@ impl SqliteWorkspaceStore {
             let existing = tx
                 .query_row(
                     r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                              public_key_fingerprint, binding_revision, state, authentication_mode,
-                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+                              public_key_fingerprint, binding_id, state, authentication_mode,
+                          workspace_key_id, workspace_trust_id, created_at, updated_at, revoked_at, workspace_public_key_fingerprint
                        FROM workspace_runtime_bindings
                        WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                     params![record.workspace_id, record.runtime_id],
@@ -3452,7 +3325,8 @@ impl SqliteWorkspaceStore {
                     && existing.state == record.state
                     && existing.authentication_mode == record.authentication_mode
                     && existing.workspace_key_id == record.workspace_key_id
-                    && existing.workspace_key_generation == record.workspace_key_generation;
+                    && existing.workspace_public_key_fingerprint == record.workspace_public_key_fingerprint
+                    && existing.workspace_trust_id == record.workspace_trust_id;
                 if exact_active_match {
                     tx.commit()?;
                     return Ok(WorkspaceRuntimeBindingUpsert::Unchanged);
@@ -3466,10 +3340,10 @@ impl SqliteWorkspaceStore {
                 tx.execute(
                     r#"UPDATE workspace_runtime_bindings
                        SET display_name = ?3, base_url = ?4, public_key = ?5,
-                           public_key_fingerprint = ?6, binding_revision = binding_revision + 1,
+                           public_key_fingerprint = ?6, binding_id = ?13,
                            state = ?7, authentication_mode = ?8,
-                           workspace_key_id = ?9, workspace_key_generation = ?10,
-                           updated_at = ?11, revoked_at = ?12
+                           workspace_key_id = ?9, workspace_trust_id = ?10,
+                           updated_at = ?11, revoked_at = ?12, workspace_public_key_fingerprint = ?14
                        WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                     params![
                         record.workspace_id,
@@ -3481,10 +3355,11 @@ impl SqliteWorkspaceStore {
                         record.state.as_str(),
                         record.authentication_mode.as_str(),
                         record.workspace_key_id,
-                        record.workspace_key_generation,
+                        record.workspace_trust_id,
                         record.updated_at,
                         record.revoked_at,
-                    ],
+                        new_runtime_binding_id(),
+                        record.workspace_public_key_fingerprint,                    ],
                 )
                 .map_err(map_runtime_binding_write_error)?;
                 tx.execute(
@@ -3497,9 +3372,9 @@ impl SqliteWorkspaceStore {
             tx.execute(
                 r#"INSERT INTO workspace_runtime_bindings (
                        workspace_id, runtime_id, display_name, base_url, public_key,
-                       public_key_fingerprint, binding_revision, state, authentication_mode,
-                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
-                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+                       public_key_fingerprint, binding_id, state, authentication_mode,
+                          workspace_key_id, workspace_trust_id, created_at, updated_at, revoked_at, workspace_public_key_fingerprint
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?14, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?15)"#,
                 params![
                     record.workspace_id,
                     record.runtime_id,
@@ -3510,10 +3385,12 @@ impl SqliteWorkspaceStore {
                     record.state.as_str(),
                     record.authentication_mode.as_str(),
                     record.workspace_key_id,
-                    record.workspace_key_generation,
+                    record.workspace_trust_id,
                     record.created_at,
                     record.updated_at,
                     record.revoked_at,
+                    new_runtime_binding_id(),
+                    record.workspace_public_key_fingerprint,
                 ],
             )
             .map_err(map_runtime_binding_write_error)?;
@@ -3536,9 +3413,9 @@ impl SqliteWorkspaceStore {
             let changed = tx.execute(
                 r#"UPDATE workspace_runtime_bindings
                    SET state = 'revoked', revoked_at = ?3, updated_at = ?3,
-                       binding_revision = binding_revision + 1
+                       binding_id = ?4
                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND revoked_at IS NULL"#,
-                params![workspace_id, runtime_id, revoked_at],
+                params![workspace_id, runtime_id, revoked_at, new_runtime_binding_id()],
             )?;
             if changed > 0 {
                 tx.execute(
@@ -3554,7 +3431,7 @@ impl SqliteWorkspaceStore {
     pub fn put_workspace_runtime_binding_key(
         &self,
         mut record: WorkspaceRuntimeBinding,
-        expected_revision: Option<u64>,
+        expected_binding_id: Option<&str>,
         actor_account_id: &str,
     ) -> Result<(WorkspaceRuntimeBindingMutation, WorkspaceRuntimeBinding)> {
         validate_identifier("workspace_id", &record.workspace_id)?;
@@ -3569,8 +3446,8 @@ impl SqliteWorkspaceStore {
             let existing = tx
                 .query_row(
                     r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                              public_key_fingerprint, binding_revision, state, authentication_mode,
-                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+                              public_key_fingerprint, binding_id, state, authentication_mode,
+                          workspace_key_id, workspace_trust_id, created_at, updated_at, revoked_at, workspace_public_key_fingerprint
                        FROM workspace_runtime_bindings
                        WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                     params![record.workspace_id, record.runtime_id],
@@ -3579,6 +3456,12 @@ impl SqliteWorkspaceStore {
                 .optional()?;
 
             if let Some(existing) = existing {
+                if expected_binding_id.is_some_and(|id| id != existing.binding_id) {
+                    return Err(Error::RuntimeBindingIdConflict {
+                        expected: expected_binding_id.map(str::to_owned),
+                        actual: Some(existing.binding_id.clone()),
+                    });
+                }
                 if existing.revoked_at.is_none()
                     && existing.display_name == record.display_name
                     && existing.base_url == record.base_url
@@ -3587,15 +3470,16 @@ impl SqliteWorkspaceStore {
                     && existing.state == record.state
                     && existing.authentication_mode == record.authentication_mode
                     && existing.workspace_key_id == record.workspace_key_id
-                    && existing.workspace_key_generation == record.workspace_key_generation
+                    && existing.workspace_public_key_fingerprint == record.workspace_public_key_fingerprint
+                    && existing.workspace_trust_id == record.workspace_trust_id
                 {
                     tx.commit()?;
                     return Ok((WorkspaceRuntimeBindingMutation::Unchanged, existing));
                 }
-                if expected_revision != Some(existing.binding_revision) {
-                    return Err(Error::RuntimeBindingRevisionConflict {
-                        expected: expected_revision,
-                        actual: Some(existing.binding_revision),
+                if expected_binding_id != Some(existing.binding_id.as_str()) {
+                    return Err(Error::RuntimeBindingIdConflict {
+                        expected: expected_binding_id.map(str::to_owned),
+                        actual: Some(existing.binding_id.clone()),
                     });
                 }
                 let fingerprint_owner = tx
@@ -3626,16 +3510,14 @@ impl SqliteWorkspaceStore {
                     WorkspaceRuntimeBindingMutation::Replaced => "replaced",
                     _ => unreachable!("action is selected above"),
                 };
-                let next_revision = existing.binding_revision.checked_add(1).ok_or_else(|| {
-                    Error::Store("Runtime binding revision overflow".to_string())
-                })?;
+                let next_binding_id = new_runtime_binding_id();
                 tx.execute(
                     r#"UPDATE workspace_runtime_bindings
                        SET display_name = ?3, base_url = ?4,
                            public_key = ?5, public_key_fingerprint = ?6,
                            state = ?7, authentication_mode = ?8,
-                           workspace_key_id = ?9, workspace_key_generation = ?10,
-                           binding_revision = ?11, updated_at = ?12, revoked_at = NULL
+                           workspace_key_id = ?9, workspace_trust_id = ?10,
+                           binding_id = ?11, updated_at = ?12, revoked_at = NULL, workspace_public_key_fingerprint = ?13
                        WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                     params![
                         record.workspace_id,
@@ -3647,9 +3529,10 @@ impl SqliteWorkspaceStore {
                         record.state.as_str(),
                         record.authentication_mode.as_str(),
                         record.workspace_key_id,
-                        record.workspace_key_generation,
-                        next_revision,
+                        record.workspace_trust_id,
+                        &next_binding_id,
                         record.updated_at,
+                        record.workspace_public_key_fingerprint,
                     ],
                 )?;
                 tx.execute(
@@ -3664,13 +3547,13 @@ impl SqliteWorkspaceStore {
                     action_name,
                     Some(&existing.public_key_fingerprint),
                     Some(&record.public_key_fingerprint),
-                    next_revision,
+                    &next_binding_id,
                     &record.updated_at,
                 )?;
                 let updated = tx.query_row(
                     r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                              public_key_fingerprint, binding_revision, state, authentication_mode,
-                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+                              public_key_fingerprint, binding_id, state, authentication_mode,
+                          workspace_key_id, workspace_trust_id, created_at, updated_at, revoked_at, workspace_public_key_fingerprint
                        FROM workspace_runtime_bindings
                        WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                     params![record.workspace_id, record.runtime_id],
@@ -3680,9 +3563,9 @@ impl SqliteWorkspaceStore {
                 return Ok((action, updated));
             }
 
-            if expected_revision.is_some() {
-                return Err(Error::RuntimeBindingRevisionConflict {
-                    expected: expected_revision,
+            if expected_binding_id.is_some() {
+                return Err(Error::RuntimeBindingIdConflict {
+                    expected: expected_binding_id.map(str::to_owned),
                     actual: None,
                 });
             }
@@ -3699,14 +3582,14 @@ impl SqliteWorkspaceStore {
                     fingerprint: record.public_key_fingerprint,
                 });
             }
-            record.binding_revision = 1;
+            record.binding_id = new_runtime_binding_id();
             record.revoked_at = None;
             tx.execute(
                 r#"INSERT INTO workspace_runtime_bindings (
                        workspace_id, runtime_id, display_name, base_url, public_key,
-                       public_key_fingerprint, binding_revision, state, authentication_mode,
-                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
-                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9, ?10, ?11, ?12, NULL)"#,
+                       public_key_fingerprint, binding_id, state, authentication_mode,
+                          workspace_key_id, workspace_trust_id, created_at, updated_at, revoked_at, workspace_public_key_fingerprint
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?13, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?14)"#,
                 params![
                     record.workspace_id,
                     record.runtime_id,
@@ -3717,10 +3600,11 @@ impl SqliteWorkspaceStore {
                     record.state.as_str(),
                     record.authentication_mode.as_str(),
                     record.workspace_key_id,
-                    record.workspace_key_generation,
+                    record.workspace_trust_id,
                     record.created_at,
                     record.updated_at,
-                ],
+                    record.binding_id,
+                    record.workspace_public_key_fingerprint,                ],
             )?;
             insert_workspace_runtime_binding_audit(
                 &tx,
@@ -3730,7 +3614,7 @@ impl SqliteWorkspaceStore {
                 "created",
                 None,
                 Some(&record.public_key_fingerprint),
-                1,
+                &record.binding_id,
                 &record.updated_at,
             )?;
             tx.commit()?;
@@ -3756,8 +3640,8 @@ impl SqliteWorkspaceStore {
             let existing = tx
                 .query_row(
                     r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                              public_key_fingerprint, binding_revision, state, authentication_mode,
-                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+                              public_key_fingerprint, binding_id, state, authentication_mode,
+                          workspace_key_id, workspace_trust_id, created_at, updated_at, revoked_at, workspace_public_key_fingerprint
                        FROM workspace_runtime_bindings
                        WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                     params![workspace_id, runtime_id],
@@ -3773,14 +3657,22 @@ impl SqliteWorkspaceStore {
             }
             tx.execute(
                 r#"UPDATE workspace_runtime_bindings
-                   SET display_name = ?3, base_url = ?4, updated_at = ?5
+                   SET display_name = ?3, base_url = ?4, updated_at = ?5,
+                       binding_id = ?6,
+                       state = CASE WHEN base_url != ?4 AND state = 'verified'
+                                         AND authentication_mode = 'workspace_identity'
+                                    THEN 'configured' ELSE state END
                    WHERE workspace_id = ?1 AND runtime_id = ?2"#,
-                params![workspace_id, runtime_id, display_name, base_url, updated_at],
+                params![workspace_id, runtime_id, display_name, base_url, updated_at,
+                    if existing.base_url != base_url { new_runtime_binding_id() } else { existing.binding_id.clone() }],
             )?;
+            if existing.base_url != base_url {
+                tx.execute("DELETE FROM workspace_runtime_verifications WHERE workspace_id=?1 AND runtime_id=?2", params![workspace_id,runtime_id])?;
+            }
             let updated = tx.query_row(
                 r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                          public_key_fingerprint, binding_revision, state, authentication_mode,
-                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+                          public_key_fingerprint, binding_id, state, authentication_mode,
+                          workspace_key_id, workspace_trust_id, created_at, updated_at, revoked_at, workspace_public_key_fingerprint
                    FROM workspace_runtime_bindings
                    WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                 params![workspace_id, runtime_id],
@@ -3795,7 +3687,7 @@ impl SqliteWorkspaceStore {
         &self,
         workspace_id: &str,
         runtime_id: &str,
-        expected_revision: u64,
+        expected_binding_id: &str,
         actor_account_id: &str,
         revoked_at: &str,
     ) -> Result<(WorkspaceRuntimeBindingMutation, WorkspaceRuntimeBinding)> {
@@ -3808,8 +3700,8 @@ impl SqliteWorkspaceStore {
             let existing = tx
                 .query_row(
                     r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                              public_key_fingerprint, binding_revision, state, authentication_mode,
-                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+                              public_key_fingerprint, binding_id, state, authentication_mode,
+                          workspace_key_id, workspace_trust_id, created_at, updated_at, revoked_at, workspace_public_key_fingerprint
                        FROM workspace_runtime_bindings
                        WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                     params![workspace_id, runtime_id],
@@ -3819,25 +3711,22 @@ impl SqliteWorkspaceStore {
                 .ok_or_else(|| Error::RuntimeBindingNotFound {
                     runtime_id: runtime_id.to_string(),
                 })?;
+            if expected_binding_id != existing.binding_id {
+                return Err(Error::RuntimeBindingIdConflict {
+                    expected: Some(expected_binding_id.to_owned()),
+                    actual: Some(existing.binding_id.clone()),
+                });
+            }
             if existing.revoked_at.is_some() {
                 tx.commit()?;
                 return Ok((WorkspaceRuntimeBindingMutation::Unchanged, existing));
             }
-            if expected_revision != existing.binding_revision {
-                return Err(Error::RuntimeBindingRevisionConflict {
-                    expected: Some(expected_revision),
-                    actual: Some(existing.binding_revision),
-                });
-            }
-            let next_revision = existing
-                .binding_revision
-                .checked_add(1)
-                .ok_or_else(|| Error::Store("Runtime binding revision overflow".to_string()))?;
+            let next_binding_id = new_runtime_binding_id();
             tx.execute(
                 r#"UPDATE workspace_runtime_bindings
-                   SET state = 'revoked', revoked_at = ?3, updated_at = ?3, binding_revision = ?4
+                   SET state = 'revoked', revoked_at = ?3, updated_at = ?3, binding_id = ?4
                    WHERE workspace_id = ?1 AND runtime_id = ?2"#,
-                params![workspace_id, runtime_id, revoked_at, next_revision],
+                params![workspace_id, runtime_id, revoked_at, next_binding_id],
             )?;
             tx.execute(
                 "DELETE FROM workspace_runtime_verifications WHERE workspace_id = ?1 AND runtime_id = ?2",
@@ -3851,13 +3740,13 @@ impl SqliteWorkspaceStore {
                 "revoked",
                 Some(&existing.public_key_fingerprint),
                 None,
-                next_revision,
+                &next_binding_id,
                 revoked_at,
             )?;
             let updated = tx.query_row(
                 r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                          public_key_fingerprint, binding_revision, state, authentication_mode,
-                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+                          public_key_fingerprint, binding_id, state, authentication_mode,
+                          workspace_key_id, workspace_trust_id, created_at, updated_at, revoked_at, workspace_public_key_fingerprint
                    FROM workspace_runtime_bindings
                    WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                 params![workspace_id, runtime_id],
@@ -3871,8 +3760,8 @@ impl SqliteWorkspaceStore {
     pub fn workspace_runtime_verification_matches(
         &self,
         binding: &WorkspaceRuntimeBinding,
-        workspace_identity_revision: u64,
-        workspace_trust_generation: u64,
+        workspace_public_key_fingerprint: &str,
+        workspace_trust_id: &str,
     ) -> Result<bool> {
         let Some(evidence) =
             self.get_workspace_runtime_verification(&binding.workspace_id, &binding.runtime_id)?
@@ -3882,12 +3771,15 @@ impl SqliteWorkspaceStore {
         Ok(evidence.state == "verified"
             && evidence.last_outcome == "verified"
             && evidence.verified_at.is_some()
-            && evidence.binding_revision == binding.binding_revision
+            && evidence.binding_id == binding.binding_id
             && evidence.workspace_key_id == binding.workspace_key_id.as_deref().unwrap_or_default()
-            && evidence.workspace_identity_revision == workspace_identity_revision
-            && evidence.workspace_trust_generation == workspace_trust_generation
+            && evidence.workspace_public_key_fingerprint == workspace_public_key_fingerprint
+            && binding.workspace_public_key_fingerprint.as_deref()
+                == Some(workspace_public_key_fingerprint)
+            && evidence.workspace_trust_id == workspace_trust_id
             && evidence.runtime_public_key_fingerprint == binding.public_key_fingerprint
-            && evidence.runtime_identity_revision > 0)
+            && binding.revoked_at.is_none()
+            && binding.workspace_trust_id.as_deref() == Some(workspace_trust_id))
     }
 
     pub fn get_workspace_runtime_verification(
@@ -3900,9 +3792,9 @@ impl SqliteWorkspaceStore {
         self.with_conn(|conn| {
             let evidence = conn
                 .query_row(
-                    r#"SELECT workspace_id, runtime_id, binding_revision, workspace_key_id,
-                          workspace_identity_revision, workspace_trust_generation,
-                          runtime_public_key_fingerprint, runtime_identity_revision,
+                    r#"SELECT workspace_id, runtime_id, binding_id, workspace_key_id,
+                          workspace_public_key_fingerprint, workspace_trust_id,
+                          runtime_public_key_fingerprint,
                           challenge_id, state, last_outcome, verified_at, checked_at
                    FROM workspace_runtime_verifications
                    WHERE workspace_id = ?1 AND runtime_id = ?2"#,
@@ -3923,41 +3815,44 @@ impl SqliteWorkspaceStore {
     ) -> Result<()> {
         validate_workspace_runtime_verification(evidence)?;
         self.with_conn(|conn| {
-            conn.execute(
+            let changed = conn.execute(
                 r#"INSERT INTO workspace_runtime_verifications (
-                       workspace_id, runtime_id, binding_revision, workspace_key_id,
-                       workspace_identity_revision, workspace_trust_generation,
-                       runtime_public_key_fingerprint, runtime_identity_revision,
+                       workspace_id, runtime_id, binding_id, workspace_key_id,
+                       workspace_public_key_fingerprint, workspace_trust_id,
+                       runtime_public_key_fingerprint,
                        challenge_id, state, last_outcome, verified_at, checked_at
-                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                   ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+                   WHERE EXISTS(SELECT 1 FROM workspace_runtime_bindings binding
+                       WHERE binding.workspace_id=?1 AND binding.runtime_id=?2
+                         AND binding.binding_id=?3 AND binding.workspace_key_id=?4
+                         AND binding.workspace_public_key_fingerprint=?5
+                         AND binding.workspace_trust_id=?6 AND binding.public_key_fingerprint=?7
+                         AND binding.state IN ('configured','verified') AND binding.revoked_at IS NULL)
                    ON CONFLICT(workspace_id, runtime_id) DO UPDATE SET
-                       binding_revision = excluded.binding_revision,
+                       binding_id = excluded.binding_id,
                        workspace_key_id = excluded.workspace_key_id,
-                       workspace_identity_revision = excluded.workspace_identity_revision,
-                       workspace_trust_generation = excluded.workspace_trust_generation,
+                       workspace_public_key_fingerprint = excluded.workspace_public_key_fingerprint,
+                       workspace_trust_id = excluded.workspace_trust_id,
                        runtime_public_key_fingerprint = excluded.runtime_public_key_fingerprint,
-                       runtime_identity_revision = excluded.runtime_identity_revision,
                        challenge_id = excluded.challenge_id,
                        state = CASE
                            WHEN workspace_runtime_verifications.state = 'verified'
-                            AND workspace_runtime_verifications.binding_revision = excluded.binding_revision
+                            AND workspace_runtime_verifications.binding_id = excluded.binding_id
                             AND workspace_runtime_verifications.workspace_key_id = excluded.workspace_key_id
-                            AND workspace_runtime_verifications.workspace_identity_revision = excluded.workspace_identity_revision
-                            AND workspace_runtime_verifications.workspace_trust_generation = excluded.workspace_trust_generation
+                            AND workspace_runtime_verifications.workspace_public_key_fingerprint = excluded.workspace_public_key_fingerprint
+                            AND workspace_runtime_verifications.workspace_trust_id = excluded.workspace_trust_id
                             AND workspace_runtime_verifications.runtime_public_key_fingerprint = excluded.runtime_public_key_fingerprint
-                            AND workspace_runtime_verifications.runtime_identity_revision = excluded.runtime_identity_revision
                            THEN workspace_runtime_verifications.state
                            ELSE excluded.state
                        END,
                        last_outcome = excluded.last_outcome,
                        verified_at = CASE
                            WHEN workspace_runtime_verifications.state = 'verified'
-                            AND workspace_runtime_verifications.binding_revision = excluded.binding_revision
+                            AND workspace_runtime_verifications.binding_id = excluded.binding_id
                             AND workspace_runtime_verifications.workspace_key_id = excluded.workspace_key_id
-                            AND workspace_runtime_verifications.workspace_identity_revision = excluded.workspace_identity_revision
-                            AND workspace_runtime_verifications.workspace_trust_generation = excluded.workspace_trust_generation
+                            AND workspace_runtime_verifications.workspace_public_key_fingerprint = excluded.workspace_public_key_fingerprint
+                            AND workspace_runtime_verifications.workspace_trust_id = excluded.workspace_trust_id
                             AND workspace_runtime_verifications.runtime_public_key_fingerprint = excluded.runtime_public_key_fingerprint
-                            AND workspace_runtime_verifications.runtime_identity_revision = excluded.runtime_identity_revision
                            THEN workspace_runtime_verifications.verified_at
                            ELSE excluded.verified_at
                        END,
@@ -3965,12 +3860,12 @@ impl SqliteWorkspaceStore {
                 params![
                     evidence.workspace_id,
                     evidence.runtime_id,
-                    evidence.binding_revision,
+                    evidence.binding_id,
                     evidence.workspace_key_id,
-                    evidence.workspace_identity_revision,
-                    evidence.workspace_trust_generation,
+                    evidence.workspace_public_key_fingerprint,
+                    evidence.workspace_trust_id,
                     evidence.runtime_public_key_fingerprint,
-                    evidence.runtime_identity_revision,
+
                     evidence.challenge_id,
                     evidence.state,
                     evidence.last_outcome,
@@ -3978,6 +3873,9 @@ impl SqliteWorkspaceStore {
                     evidence.checked_at,
                 ],
             )?;
+            if changed != 1 {
+                return Err(Error::RuntimeBindingConflict("Runtime verification attempt no longer matches binding authority".into()));
+            }
             Ok(())
         })
     }
@@ -4011,26 +3909,24 @@ impl SqliteWorkspaceStore {
         self.with_conn(|conn| {
             let changed = conn.execute(
                 r#"UPDATE workspace_runtime_verifications
-                   SET state = CASE WHEN state = 'verified' THEN state ELSE ?10 END,
-                       last_outcome = ?11,
-                       checked_at = ?12
+                   SET state = CASE WHEN state = 'verified' THEN state ELSE ?9 END,
+                       last_outcome = ?10,
+                       checked_at = ?11
                    WHERE workspace_id = ?1 AND runtime_id = ?2
-                     AND binding_revision = ?3
+                     AND binding_id = ?3
                      AND workspace_key_id = ?4
-                     AND workspace_identity_revision = ?5
-                     AND workspace_trust_generation = ?6
+                     AND workspace_public_key_fingerprint = ?5
+                     AND workspace_trust_id = ?6
                      AND runtime_public_key_fingerprint = ?7
-                     AND runtime_identity_revision = ?8
-                     AND challenge_id = ?9"#,
+                     AND challenge_id = ?8"#,
                 params![
                     expected.workspace_id,
                     expected.runtime_id,
-                    expected.binding_revision,
+                    expected.binding_id,
                     expected.workspace_key_id,
-                    expected.workspace_identity_revision,
-                    expected.workspace_trust_generation,
+                    expected.workspace_public_key_fingerprint,
+                    expected.workspace_trust_id,
                     expected.runtime_public_key_fingerprint,
-                    expected.runtime_identity_revision,
                     expected.challenge_id,
                     state,
                     outcome,
@@ -4046,7 +3942,10 @@ impl SqliteWorkspaceStore {
         evidence: &WorkspaceRuntimeVerificationEvidence,
     ) -> Result<WorkspaceRuntimeBinding> {
         validate_workspace_runtime_verification(evidence)?;
-        if evidence.state != "verified" || evidence.verified_at.is_none() {
+        if evidence.state != "verified"
+            || evidence.last_outcome != "verified"
+            || evidence.verified_at.is_none()
+        {
             return Err(Error::Store(
                 "completed Runtime verification evidence must be verified".to_string(),
             ));
@@ -4057,23 +3956,22 @@ impl SqliteWorkspaceStore {
                 r#"SELECT EXISTS(
                        SELECT 1 FROM workspace_runtime_verifications
                        WHERE workspace_id = ?1 AND runtime_id = ?2
-                         AND binding_revision = ?3
+                         AND binding_id = ?3
                          AND workspace_key_id = ?4
-                         AND workspace_identity_revision = ?5
-                         AND workspace_trust_generation = ?6
+                         AND workspace_public_key_fingerprint = ?5
+                         AND workspace_trust_id = ?6
                          AND runtime_public_key_fingerprint = ?7
-                         AND runtime_identity_revision = ?8
-                         AND challenge_id = ?9
+                         AND challenge_id = ?8
                    )"#,
                 params![
                     evidence.workspace_id,
                     evidence.runtime_id,
-                    evidence.binding_revision,
+                    evidence.binding_id,
                     evidence.workspace_key_id,
-                    evidence.workspace_identity_revision,
-                    evidence.workspace_trust_generation,
+                    evidence.workspace_public_key_fingerprint,
+                    evidence.workspace_trust_id,
                     evidence.runtime_public_key_fingerprint,
-                    evidence.runtime_identity_revision,
+
                     evidence.challenge_id,
                 ],
                 |row| row.get::<_, bool>(0),
@@ -4087,21 +3985,26 @@ impl SqliteWorkspaceStore {
                 r#"UPDATE workspace_runtime_bindings
                    SET state = 'verified', updated_at = ?7
                    WHERE workspace_id = ?1 AND runtime_id = ?2
-                     AND binding_revision = ?3
+                     AND binding_id = ?3
                      AND state IN ('configured', 'verified')
                      AND authentication_mode = 'workspace_identity'
                      AND workspace_key_id = ?4
-                     AND workspace_key_generation = ?5
+                     AND workspace_trust_id = ?5
+                     AND workspace_public_key_fingerprint = ?8
                      AND public_key_fingerprint = ?6
-                     AND revoked_at IS NULL"#,
+                     AND revoked_at IS NULL
+                     AND EXISTS(SELECT 1 FROM workspace_signing_identities identity
+                         WHERE identity.workspace_id = ?1 AND identity.key_id = ?4
+                           AND identity.public_key_fingerprint = ?8 AND identity.state = 'active')"#,
                 params![
                     evidence.workspace_id,
                     evidence.runtime_id,
-                    evidence.binding_revision,
+                    evidence.binding_id,
                     evidence.workspace_key_id,
-                    evidence.workspace_trust_generation,
+                    evidence.workspace_trust_id,
                     evidence.runtime_public_key_fingerprint,
                     evidence.checked_at,
+                    evidence.workspace_public_key_fingerprint,
                 ],
             )?;
             if changed != 1 {
@@ -4112,18 +4015,17 @@ impl SqliteWorkspaceStore {
             }
             tx.execute(
                 r#"INSERT INTO workspace_runtime_verifications (
-                       workspace_id, runtime_id, binding_revision, workspace_key_id,
-                       workspace_identity_revision, workspace_trust_generation,
-                       runtime_public_key_fingerprint, runtime_identity_revision,
+                       workspace_id, runtime_id, binding_id, workspace_key_id,
+                       workspace_public_key_fingerprint, workspace_trust_id,
+                       runtime_public_key_fingerprint,
                        challenge_id, state, last_outcome, verified_at, checked_at
-                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                    ON CONFLICT(workspace_id, runtime_id) DO UPDATE SET
-                       binding_revision = excluded.binding_revision,
+                       binding_id = excluded.binding_id,
                        workspace_key_id = excluded.workspace_key_id,
-                       workspace_identity_revision = excluded.workspace_identity_revision,
-                       workspace_trust_generation = excluded.workspace_trust_generation,
+                       workspace_public_key_fingerprint = excluded.workspace_public_key_fingerprint,
+                       workspace_trust_id = excluded.workspace_trust_id,
                        runtime_public_key_fingerprint = excluded.runtime_public_key_fingerprint,
-                       runtime_identity_revision = excluded.runtime_identity_revision,
                        challenge_id = excluded.challenge_id,
                        state = excluded.state,
                        last_outcome = excluded.last_outcome,
@@ -4132,12 +4034,12 @@ impl SqliteWorkspaceStore {
                 params![
                     evidence.workspace_id,
                     evidence.runtime_id,
-                    evidence.binding_revision,
+                    evidence.binding_id,
                     evidence.workspace_key_id,
-                    evidence.workspace_identity_revision,
-                    evidence.workspace_trust_generation,
+                    evidence.workspace_public_key_fingerprint,
+                    evidence.workspace_trust_id,
                     evidence.runtime_public_key_fingerprint,
-                    evidence.runtime_identity_revision,
+
                     evidence.challenge_id,
                     evidence.state,
                     evidence.last_outcome,
@@ -4147,8 +4049,8 @@ impl SqliteWorkspaceStore {
             )?;
             let binding = tx.query_row(
                 r#"SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                          public_key_fingerprint, binding_revision, state, authentication_mode,
-                          workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
+                          public_key_fingerprint, binding_id, state, authentication_mode,
+                          workspace_key_id, workspace_trust_id, created_at, updated_at, revoked_at, workspace_public_key_fingerprint
                    FROM workspace_runtime_bindings
                    WHERE workspace_id = ?1 AND runtime_id = ?2"#,
                 params![evidence.workspace_id, evidence.runtime_id],
@@ -4171,10 +4073,10 @@ impl SqliteWorkspaceStore {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 r#"SELECT workspace_id, runtime_id, actor_account_id, action,
-                          old_fingerprint, new_fingerprint, binding_revision, at
+                          old_fingerprint, new_fingerprint, binding_id, at
                    FROM workspace_runtime_binding_audit
                    WHERE workspace_id = ?1 AND runtime_id = ?2
-                   ORDER BY binding_revision DESC
+                   ORDER BY at DESC, binding_id DESC
                    LIMIT ?3"#,
             )?;
             let rows = stmt.query_map(params![workspace_id, runtime_id, limit], |row| {
@@ -4185,7 +4087,7 @@ impl SqliteWorkspaceStore {
                     action: row.get(3)?,
                     old_fingerprint: row.get(4)?,
                     new_fingerprint: row.get(5)?,
-                    binding_revision: row.get(6)?,
+                    binding_id: row.get(6)?,
                     at: row.get(7)?,
                 })
             })?;
@@ -4203,13 +4105,13 @@ fn insert_workspace_runtime_binding_audit(
     action: &str,
     old_fingerprint: Option<&str>,
     new_fingerprint: Option<&str>,
-    binding_revision: u64,
+    binding_id: &str,
     at: &str,
 ) -> Result<()> {
     tx.execute(
         r#"INSERT INTO workspace_runtime_binding_audit (
                workspace_id, runtime_id, actor_account_id, action,
-               old_fingerprint, new_fingerprint, binding_revision, at
+               old_fingerprint, new_fingerprint, binding_id, at
            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
         params![
             workspace_id,
@@ -4218,7 +4120,7 @@ fn insert_workspace_runtime_binding_audit(
             action,
             old_fingerprint,
             new_fingerprint,
-            binding_revision,
+            binding_id,
             at,
         ],
     )?;
@@ -4422,17 +4324,17 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             tx.execute(
                 r#"INSERT OR IGNORE INTO workspace_memory_settings (
-                    workspace_id, settings_revision, language, created_at, updated_at
-                ) VALUES (?1, 1, 'English', ?2, ?3)"#,
+                    workspace_id, language, created_at, updated_at
+                ) VALUES (?1, 'English', ?2, ?3)"#,
                 params![record.workspace_id, record.created_at, record.updated_at],
             )?;
             tx.execute(
                 r#"INSERT OR IGNORE INTO workspace_signing_identities (
                     workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
-                    private_material_ref, revision, state, created_at, provisioned_at, updated_at
+                    private_material_ref, state, created_at, provisioned_at, updated_at
                 ) VALUES (
                     ?1, 'WK-' || lower(hex(randomblob(16))), 'ed25519', NULL, NULL,
-                    'workspace-signing/' || ?1 || '/ed25519-v1', 1,
+                    'workspace-signing/' || ?1 || '/ed25519-v1',
                     'pending_provisioning', ?2, NULL, ?3
                 )"#,
                 params![record.workspace_id, record.created_at, record.updated_at],
@@ -4572,7 +4474,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 )?;
                 let repository = if let Some(initial) = &record.repository { tx.query_row(
                     r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
-                              source_kind, source_uri, default_ref, source_revision,
+                              source_kind, source_uri, default_ref,
                               source_fingerprint, observed_status, observed_at, created_at, updated_at
                        FROM repositories WHERE workspace_id = ?1 AND repository_key = ?2"#,
                     params![workspace.workspace_id, initial.repository_key],
@@ -4580,7 +4482,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ).optional()? } else { None };
                 let persisted_identity = tx.query_row(
                     r#"SELECT workspace_id, key_id, algorithm, public_key,
-                              public_key_fingerprint, private_material_ref, revision, state,
+                              public_key_fingerprint, private_material_ref, state,
                               created_at, provisioned_at, updated_at
                        FROM workspace_signing_identities WHERE workspace_id = ?1"#,
                     params![workspace.workspace_id],
@@ -4594,7 +4496,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         != Some(signing_identity.public_key_fingerprint.as_str())
                     || persisted_identity.private_material_ref
                         != signing_identity.private_material_ref
-                    || persisted_identity.revision != signing_identity.revision
+
                     || persisted_identity.state != "active"
                 {
                     return Err(Error::Store(
@@ -4615,15 +4517,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                             .to_string(),
                     ));
                 }
-                let config_revision = crate::config_source::load_state(&tx, &workspace.workspace_id)?
-                    .ok_or_else(|| Error::Store("Workspace config is missing".to_string()))?
-                    .snapshot
-                    .revision;
+                crate::config_source::load_state(&tx, &workspace.workspace_id)?
+                    .ok_or_else(|| Error::Store("Workspace config is missing".to_string()))?;
                 tx.commit()?;
                 return Ok(WorkspaceBootstrapResult {
                     workspace,
                     repository,
-                    config_revision,
                     replayed: true,
                 });
             }
@@ -4656,8 +4555,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 )?;
                 tx.execute(
                     r#"INSERT INTO workspace_memory_settings (
-                        workspace_id, settings_revision, language, created_at, updated_at
-                    ) VALUES (?1, 1, 'English', ?2, ?3)"#,
+                        workspace_id, language, created_at, updated_at
+                    ) VALUES (?1, 'English', ?2, ?3)"#,
                     params![
                         record.workspace.workspace_id,
                         record.workspace.created_at,
@@ -4668,9 +4567,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 tx.execute(
                     r#"INSERT INTO repositories (
                         workspace_id, repository_id, repository_key, kind, provider, uri,
-                        source_kind, source_uri, default_ref, source_revision,
+                        source_kind, source_uri, default_ref,
                         source_fingerprint, observed_status, observed_at, created_at, updated_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#,
                     params![
                         repository.workspace_id,
                         repository.repository_id,
@@ -4681,7 +4580,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         repository.source.kind.as_str(),
                         repository.source.uri,
                         repository.default_ref,
-                        repository.source_revision,
                         repository.source_fingerprint,
                         repository.observed_status.as_str(),
                         repository.observed_at,
@@ -4708,39 +4606,37 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     params![record.workspace.workspace_id, resource_kind],
                 )?;
             }
-            let config_revision = crate::config_source::load_state(
+            crate::config_source::load_state(
                 &tx,
                 &record.workspace.workspace_id,
             )?
-            .ok_or_else(|| Error::Store("Workspace config is missing".to_string()))?
-            .snapshot
-            .revision;
+            .ok_or_else(|| Error::Store("Workspace config is missing".to_string()))?;
             tx.execute(
                 r#"INSERT INTO workspace_signing_identities (
                     workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
-                    private_material_ref, revision, state, created_at, provisioned_at, updated_at
-                ) VALUES (?1, ?2, 'ed25519', ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?8)"#,
+                    private_material_ref, state, created_at, provisioned_at, updated_at
+                ) VALUES (?1, ?2, 'ed25519', ?3, ?4, ?5, 'active', ?6, ?7, ?7)"#,
                 params![
                     signing_identity.workspace_id,
                     signing_identity.key_id,
                     signing_identity.public_key,
                     signing_identity.public_key_fingerprint,
                     signing_identity.private_material_ref,
-                    signing_identity.revision,
+
                     record.workspace.created_at,
                     signing_identity.provisioned_at,
                 ],
             )?;
             tx.execute(
                 r#"INSERT INTO workspace_signing_identity_audit (
-                    event_id, workspace_id, key_id, action, revision,
+                    event_id, workspace_id, key_id, action,
                     public_key_fingerprint, actor_account_id, created_at
-                ) VALUES (?1, ?2, ?3, 'provisioned', ?4, ?5, ?6, ?7)"#,
+                ) VALUES (?1, ?2, ?3, 'provisioned', ?4, ?5, ?6)"#,
                 params![
                     uuid::Uuid::now_v7().to_string(),
                     signing_identity.workspace_id,
                     signing_identity.key_id,
-                    signing_identity.revision,
+
                     signing_identity.public_key_fingerprint,
                     record.workspace.owner_account_id,
                     signing_identity.provisioned_at,
@@ -4751,14 +4647,14 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                    SET state = 'completed', completed_at = ?2
                    WHERE operation_key = ?1 AND state = 'pending'
                      AND workspace_id = ?3 AND key_id = ?4
-                     AND private_material_ref = ?5 AND revision = ?6"#,
+                     AND private_material_ref = ?5"#,
                 params![
                     identity_provisioning_operation_key,
                     signing_identity.provisioned_at,
                     signing_identity.workspace_id,
                     signing_identity.key_id,
                     signing_identity.private_material_ref,
-                    signing_identity.revision,
+
                 ],
             )?;
             if completed != 1 {
@@ -4782,7 +4678,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             Ok(WorkspaceBootstrapResult {
                 workspace: record.workspace.clone(),
                 repository: record.repository.clone(),
-                config_revision,
                 replayed: false,
             })
         })
@@ -4811,8 +4706,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         if !matches!(
             operation.operation_kind.as_str(),
             "workspace_create" | "existing_workspace"
-        ) || operation.revision == 0
-        {
+        ) {
             return Err(Error::Store(
                 "Workspace signing identity provisioning reservation is invalid".to_string(),
             ));
@@ -4822,7 +4716,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             if let Some(existing) = tx
                 .query_row(
                     r#"SELECT operation_key, request_fingerprint, operation_kind, workspace_id,
-                              key_id, private_material_ref, revision, actor_account_id, state,
+                              key_id, private_material_ref, actor_account_id, state,
                               created_at, completed_at
                        FROM workspace_signing_identity_provisioning_operations
                        WHERE operation_key = ?1"#,
@@ -4845,9 +4739,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             tx.execute(
                 r#"INSERT INTO workspace_signing_identity_provisioning_operations (
                     operation_key, request_fingerprint, operation_kind, workspace_id,
-                    key_id, private_material_ref, revision, actor_account_id, state,
+                    key_id, private_material_ref, actor_account_id, state,
                     created_at, completed_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, NULL)"#,
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, NULL)"#,
                 params![
                     operation.operation_key,
                     operation.request_fingerprint,
@@ -4855,7 +4749,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     operation.workspace_id,
                     operation.key_id,
                     operation.private_material_ref,
-                    operation.revision,
+
                     operation.actor_account_id,
                     operation.created_at,
                 ],
@@ -4883,7 +4777,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| {
             conn.query_row(
                 r#"SELECT workspace_id, key_id, algorithm, public_key,
-                          public_key_fingerprint, private_material_ref, revision, state,
+                          public_key_fingerprint, private_material_ref, state,
                           created_at, provisioned_at, updated_at
                    FROM workspace_signing_identities WHERE workspace_id = ?1"#,
                 params![workspace_id],
@@ -4911,7 +4805,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let operation = tx
                 .query_row(
                     r#"SELECT operation_key, request_fingerprint, operation_kind, workspace_id,
-                              key_id, private_material_ref, revision, actor_account_id, state,
+                              key_id, private_material_ref, actor_account_id, state,
                               created_at, completed_at
                        FROM workspace_signing_identity_provisioning_operations
                        WHERE operation_key = ?1"#,
@@ -4927,7 +4821,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             if operation.workspace_id != activation.workspace_id
                 || operation.key_id != activation.key_id
                 || operation.private_material_ref != activation.private_material_ref
-                || operation.revision != activation.revision
                 || operation.actor_account_id != actor_account_id
             {
                 return Err(Error::Store(
@@ -4936,7 +4829,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             let existing = tx.query_row(
                 r#"SELECT workspace_id, key_id, algorithm, public_key,
-                          public_key_fingerprint, private_material_ref, revision, state,
+                          public_key_fingerprint, private_material_ref, state,
                           created_at, provisioned_at, updated_at
                    FROM workspace_signing_identities WHERE workspace_id = ?1"#,
                 params![activation.workspace_id],
@@ -4944,7 +4837,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             if existing.key_id != activation.key_id
                 || existing.private_material_ref != activation.private_material_ref
-                || existing.revision != activation.revision
             {
                 return Err(Error::Store(
                     "Workspace signing identity activation does not match persisted metadata"
@@ -4992,14 +4884,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             tx.execute(
                 r#"INSERT INTO workspace_signing_identity_audit (
-                    event_id, workspace_id, key_id, action, revision,
+                    event_id, workspace_id, key_id, action,
                     public_key_fingerprint, actor_account_id, created_at
-                ) VALUES (?1, ?2, ?3, 'provisioned', ?4, ?5, ?6, ?7)"#,
+                ) VALUES (?1, ?2, ?3, 'provisioned', ?4, ?5, ?6)"#,
                 params![
                     uuid::Uuid::now_v7().to_string(),
                     activation.workspace_id,
                     activation.key_id,
-                    activation.revision,
                     activation.public_key_fingerprint,
                     actor_account_id,
                     activation.provisioned_at,
@@ -5016,7 +4907,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             let activated = tx.query_row(
                 r#"SELECT workspace_id, key_id, algorithm, public_key,
-                          public_key_fingerprint, private_material_ref, revision, state,
+                          public_key_fingerprint, private_material_ref, state,
                           created_at, provisioned_at, updated_at
                    FROM workspace_signing_identities WHERE workspace_id = ?1"#,
                 params![activation.workspace_id],
@@ -5042,14 +4933,14 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn workspace_runtime_verification_matches(
         &self,
         binding: &WorkspaceRuntimeBinding,
-        workspace_identity_revision: u64,
-        workspace_trust_generation: u64,
+        workspace_public_key_fingerprint: &str,
+        workspace_trust_id: &str,
     ) -> Result<bool> {
         SqliteWorkspaceStore::workspace_runtime_verification_matches(
             self,
             binding,
-            workspace_identity_revision,
-            workspace_trust_generation,
+            workspace_public_key_fingerprint,
+            workspace_trust_id,
         )
     }
 
@@ -5129,8 +5020,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         runtime_id: &str,
         operation_id: &str,
         request_fingerprint: &str,
-        expected_binding_revision: u64,
-        config_revision: u64,
+        expected_binding_id: &str,
+        config_digest: &str,
     ) -> Result<RuntimeRemovalReservation> {
         SqliteWorkspaceStore::reserve_runtime_removal(
             self,
@@ -5138,8 +5029,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             runtime_id,
             operation_id,
             request_fingerprint,
-            expected_binding_revision,
-            config_revision,
+            expected_binding_id,
+            config_digest,
         )
     }
 
@@ -5209,13 +5100,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     async fn put_workspace_runtime_binding_key(
         &self,
         record: WorkspaceRuntimeBinding,
-        expected_revision: Option<u64>,
+        expected_binding_id: Option<&str>,
         actor_account_id: &str,
     ) -> Result<(WorkspaceRuntimeBindingMutation, WorkspaceRuntimeBinding)> {
         SqliteWorkspaceStore::put_workspace_runtime_binding_key(
             self,
             record,
-            expected_revision,
+            expected_binding_id,
             actor_account_id,
         )
     }
@@ -5242,7 +5133,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         &self,
         workspace_id: &str,
         runtime_id: &str,
-        expected_revision: u64,
+        expected_binding_id: &str,
         actor_account_id: &str,
         revoked_at: &str,
     ) -> Result<(WorkspaceRuntimeBindingMutation, WorkspaceRuntimeBinding)> {
@@ -5250,7 +5141,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             self,
             workspace_id,
             runtime_id,
-            expected_revision,
+            expected_binding_id,
             actor_account_id,
             revoked_at,
         )
@@ -5410,7 +5301,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let existing = tx
                 .query_row(
                     r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
-                              source_kind, source_uri, default_ref, source_revision,
+                              source_kind, source_uri, default_ref,
                               source_fingerprint, observed_status, observed_at, created_at, updated_at
                        FROM repositories
                        WHERE workspace_id = ?1 AND repository_key = ?2"#,
@@ -5443,9 +5334,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 tx.execute(
                     r#"INSERT INTO repositories (
                         workspace_id, repository_id, repository_key, kind, provider, uri,
-                        source_kind, source_uri, default_ref, source_revision,
+                        source_kind, source_uri, default_ref,
                         source_fingerprint, observed_status, observed_at, created_at, updated_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#,
                     params![
                         record.workspace_id,
                         record.repository_id,
@@ -5456,7 +5347,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         record.source.kind.as_str(),
                         record.source.uri,
                         record.default_ref,
-                        record.source_revision,
                         record.source_fingerprint,
                         record.observed_status.as_str(),
                         record.observed_at,
@@ -5477,7 +5367,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let existing = transaction
                 .query_row(
                     r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
-                              source_kind, source_uri, default_ref, source_revision,
+                              source_kind, source_uri, default_ref,
                               source_fingerprint, observed_status, observed_at, created_at, updated_at
                        FROM repositories
                        WHERE workspace_id = ?1 AND repository_key = ?2"#,
@@ -5493,9 +5383,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             transaction.execute(
                 r#"INSERT INTO repositories (
                     workspace_id, repository_id, repository_key, kind, provider, uri,
-                    source_kind, source_uri, default_ref, source_revision,
+                    source_kind, source_uri, default_ref,
                     source_fingerprint, observed_status, observed_at, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#,
                 params![
                     record.workspace_id,
                     record.repository_id,
@@ -5506,7 +5396,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.source.kind.as_str(),
                     record.source.uri,
                     record.default_ref,
-                    record.source_revision,
                     record.source_fingerprint,
                     record.observed_status.as_str(),
                     record.observed_at,
@@ -5527,7 +5416,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| {
             conn.query_row(
                 r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
-                          source_kind, source_uri, default_ref, source_revision,
+                          source_kind, source_uri, default_ref,
                           source_fingerprint, observed_status, observed_at, created_at, updated_at
                    FROM repositories
                    WHERE workspace_id = ?1 AND repository_id = ?2"#,
@@ -5547,7 +5436,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| {
             conn.query_row(
                 r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
-                          source_kind, source_uri, default_ref, source_revision,
+                          source_kind, source_uri, default_ref,
                           source_fingerprint, observed_status, observed_at, created_at, updated_at
                    FROM repositories
                    WHERE workspace_id = ?1 AND repository_key = ?2"#,
@@ -5563,7 +5452,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
-                          source_kind, source_uri, default_ref, source_revision,
+                          source_kind, source_uri, default_ref,
                           source_fingerprint, observed_status, observed_at, created_at, updated_at
                    FROM repositories
                    WHERE workspace_id = ?1
@@ -5607,7 +5496,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let existing = tx
                 .query_row(
                     r#"SELECT workspace_id, flow_id, source_kind, name, path, content,
-                              content_digest, revision, created_at, updated_at
+                              content_digest, created_at, updated_at
                        FROM flow_sources
                        WHERE workspace_id = ?1 AND source_kind = ?2 AND name = ?3"#,
                     params![workspace_id, source_kind.as_str(), name],
@@ -5619,21 +5508,16 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     tx.commit()?;
                     return Ok(existing);
                 }
-                let revision = existing
-                    .revision
-                    .checked_add(1)
-                    .ok_or_else(|| Error::Store("Flow source revision overflowed".to_string()))?;
                 let definition_json = serde_json::to_string(&definition)
                     .map_err(|error| Error::Store(error.to_string()))?;
                 tx.execute(
-                    r#"INSERT INTO flow_source_revisions (
-                           workspace_id, flow_id, revision, content, content_digest,
+                    r#"INSERT OR IGNORE INTO flow_source_contents (
+                           workspace_id, flow_id, content, content_digest,
                            definition_json, created_at
-                       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+                       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
                     params![
                         workspace_id,
                         existing.flow_id,
-                        revision,
                         content,
                         definition.content_digest,
                         definition_json,
@@ -5643,7 +5527,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 tx.execute(
                     r#"UPDATE flow_sources
                        SET path = ?4, content = ?5, content_digest = ?6,
-                           revision = ?7, updated_at = ?8
+                           updated_at = ?7
                        WHERE workspace_id = ?1 AND source_kind = ?2 AND name = ?3"#,
                     params![
                         workspace_id,
@@ -5652,13 +5536,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         path,
                         content,
                         definition.content_digest,
-                        revision,
                         now
                     ],
                 )?;
                 tx.commit()?;
                 return Ok(FlowSourceRecord {
-                    revision,
                     path: path.to_string(),
                     content: content.to_string(),
                     content_digest: definition.content_digest,
@@ -5673,8 +5555,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             tx.execute(
                 r#"INSERT INTO flow_sources (
                        workspace_id, flow_id, source_kind, name, path, content,
-                       content_digest, revision, created_at, updated_at
-                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8)"#,
+                       content_digest, created_at, updated_at
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)"#,
                 params![
                     workspace_id,
                     flow_id,
@@ -5687,10 +5569,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ],
             )?;
             tx.execute(
-                r#"INSERT INTO flow_source_revisions (
-                       workspace_id, flow_id, revision, content, content_digest,
+                r#"INSERT OR IGNORE INTO flow_source_contents (
+                       workspace_id, flow_id, content, content_digest,
                        definition_json, created_at
-                   ) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6)"#,
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
                 params![
                     workspace_id,
                     flow_id,
@@ -5709,7 +5591,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 path: path.to_string(),
                 content: content.to_string(),
                 content_digest: definition.content_digest,
-                revision: 1,
                 created_at: now.to_string(),
                 updated_at: now.to_string(),
             })
@@ -5725,7 +5606,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| {
             conn.query_row(
                 r#"SELECT workspace_id, flow_id, source_kind, name, path, content,
-                          content_digest, revision, created_at, updated_at
+                          content_digest, created_at, updated_at
                    FROM flow_sources
                    WHERE workspace_id = ?1 AND source_kind = ?2 AND name = ?3"#,
                 params![workspace_id, source_kind.as_str(), name],
@@ -5740,7 +5621,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| {
             let mut statement = conn.prepare(
                 r#"SELECT workspace_id, flow_id, source_kind, name, path, content,
-                          content_digest, revision, created_at, updated_at
+                          content_digest, created_at, updated_at
                    FROM flow_sources WHERE workspace_id = ?1
                    ORDER BY source_kind ASC, name ASC"#,
             )?;
@@ -5758,7 +5639,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| {
             conn.query_row(
                 r#"SELECT workspace_id, flow_id, source_kind, name, path, content,
-                          content_digest, revision, created_at, updated_at
+                          content_digest, created_at, updated_at
                    FROM flow_sources WHERE workspace_id = ?1 AND flow_id = ?2"#,
                 params![workspace_id, flow_id],
                 read_flow_source_record,
@@ -5768,20 +5649,20 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
-    fn get_flow_source_revision(
+    fn get_flow_source_content(
         &self,
         workspace_id: &str,
         flow_id: &str,
-        revision: u64,
-    ) -> Result<Option<FlowSourceRevisionRecord>> {
+        content_digest: &str,
+    ) -> Result<Option<FlowSourceContentRecord>> {
         self.with_conn(|conn| {
             conn.query_row(
-                r#"SELECT workspace_id, flow_id, revision, content, content_digest,
+                r#"SELECT workspace_id, flow_id, content, content_digest,
                           definition_json, created_at
-                   FROM flow_source_revisions
-                   WHERE workspace_id = ?1 AND flow_id = ?2 AND revision = ?3"#,
-                params![workspace_id, flow_id, revision],
-                read_flow_source_revision_record,
+                   FROM flow_source_contents
+                   WHERE workspace_id = ?1 AND flow_id = ?2 AND content_digest = ?3"#,
+                params![workspace_id, flow_id, content_digest],
+                read_flow_source_content_record,
             )
             .optional()
             .map_err(Error::from)
@@ -6649,12 +6530,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let current_attempt = 1_u8;
             let attempt_id = attempt_id(&request.job_id, current_attempt);
             tx.execute(
-                "INSERT INTO backend_jobs (workspace_id, job_id, purpose, input_revision, input_ref, request_json, intent_fingerprint, state, current_attempt, created_at, updated_at, resource_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?9, ?10)",
-                params![workspace_id, request.job_id, request.purpose, request.input_revision, request.input_ref, request_json, fingerprint, current_attempt as i64, now, request.resource_key()],
+                "INSERT INTO backend_jobs (workspace_id, job_id, purpose, input_digest, input_ref, request_json, intent_fingerprint, state, current_attempt, created_at, updated_at, resource_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?9, ?10)",
+                params![workspace_id, request.job_id, request.purpose, request.input_digest()?, request.input_ref, request_json, fingerprint, current_attempt as i64, now, request.resource_key()],
             )?;
             tx.execute(
-                "INSERT INTO backend_job_attempts (workspace_id, job_id, attempt_id, attempt, input_revision, state, deadline_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?7, ?7)",
-                params![workspace_id, request.job_id, attempt_id, current_attempt as i64, request.input_revision, deadline, now],
+                "INSERT INTO backend_job_attempts (workspace_id, job_id, attempt_id, attempt, input_digest, state, deadline_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?7, ?7)",
+                params![workspace_id, request.job_id, attempt_id, current_attempt as i64, request.input_digest()?, deadline, now],
             )?;
             let job = read_backend_job(&tx, workspace_id, &request.job_id)?
                 .ok_or_else(|| Error::Store("reserved Backend Job is missing".to_string()))?;
@@ -6713,8 +6594,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 return Err(Error::Store("Backend Job retry compare-and-set failed".to_string()));
             }
             tx.execute(
-                "INSERT INTO backend_job_attempts (workspace_id, job_id, attempt_id, attempt, input_revision, state, deadline_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?7, ?7)",
-                params![workspace_id, job_id, next_id, next as i64, job.request.input_revision, deadline, now],
+                "INSERT INTO backend_job_attempts (workspace_id, job_id, attempt_id, attempt, input_digest, state, deadline_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?7, ?7)",
+                params![workspace_id, job_id, next_id, next as i64, job.request.input_digest()?, deadline, now],
             )?;
             job = read_backend_job(&tx, workspace_id, job_id)?
                 .ok_or_else(|| Error::Store("retried Backend Job is missing".to_string()))?;
@@ -6877,7 +6758,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{job_id}`")))?;
             let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{attempt_id}`")))?;
-            if attempt.attempt != job.current_attempt || attempt.input_revision != job.request.input_revision {
+            if attempt.attempt != job.current_attempt || attempt.input_digest != job.request.input_digest()? {
                 return Err(Error::InvalidInput(
                     "Backend Job attempt is stale for the current input revision".to_string(),
                 ));
@@ -6989,8 +6870,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let attempt = read_backend_job_attempt(&tx, workspace_id, &submission.job_id, &submission.attempt_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{}`", submission.attempt_id)))?;
             let (digest, result_json) = result_digest(&submission.result, job.request.limits.max_result_bytes)?;
-            if submission.input_revision != job.request.input_revision
-                || attempt.input_revision != submission.input_revision
+            if submission.input_digest != job.request.input_digest()?
+                || attempt.input_digest != submission.input_digest
                 || attempt.attempt != job.current_attempt
             {
                 return Err(Error::InvalidInput(
@@ -8680,8 +8561,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 }
             }
             if let Some(recovery)=read_ticket_claim_recovery(&tx,&record.workspace_id,operation_id)? {
-                let item_edit:i64=tx.query_row("SELECT COALESCE(MAX(event_index),0) FROM typed_ticket_events WHERE workspace_id=?1 AND ticket_id=?2 AND kind='item_edit'",params![record.workspace_id,record.ticket_id],|r|r.get(0))?;
-                if recovery.item_revision!=format!("{}:{item_edit}",record.ticket_id) {
+                let current_digest = ticket::sqlite_ticket_content_digest(&tx, &record.workspace_id, &record.ticket_id)
+                    .map_err(|error| Error::Store(error.to_string()))?;
+                if Some(&recovery.content_digest) != current_digest.as_ref() {
                     return Err(Error::TicketAssignmentConflict("Ticket changed during explicit Worker binding".into()));
                 }
                 for link in &recovery.effective_links {
@@ -10744,7 +10626,6 @@ fn read_flow_source_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<FlowSour
             ));
         }
     };
-    let revision = row.get::<_, i64>(7)?;
     Ok(FlowSourceRecord {
         workspace_id: row.get(0)?,
         flow_id: row.get(1)?,
@@ -10753,40 +10634,25 @@ fn read_flow_source_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<FlowSour
         path: row.get(4)?,
         content: row.get(5)?,
         content_digest: row.get(6)?,
-        revision: u64::try_from(revision).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                7,
-                rusqlite::types::Type::Integer,
-                Box::new(error),
-            )
-        })?,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
     })
 }
 
-fn read_flow_source_revision_record(
+fn read_flow_source_content_record(
     row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<FlowSourceRevisionRecord> {
-    let revision = row.get::<_, i64>(2)?;
-    let definition_json = row.get::<_, String>(5)?;
+) -> rusqlite::Result<FlowSourceContentRecord> {
+    let definition_json = row.get::<_, String>(4)?;
     let definition = serde_json::from_str(&definition_json).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error))
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error))
     })?;
-    Ok(FlowSourceRevisionRecord {
+    Ok(FlowSourceContentRecord {
         workspace_id: row.get(0)?,
         flow_id: row.get(1)?,
-        revision: u64::try_from(revision).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                2,
-                rusqlite::types::Type::Integer,
-                Box::new(error),
-            )
-        })?,
-        content: row.get(3)?,
-        content_digest: row.get(4)?,
+        content: row.get(2)?,
+        content_digest: row.get(3)?,
         definition,
-        created_at: row.get(6)?,
+        created_at: row.get(5)?,
     })
 }
 
@@ -10804,7 +10670,6 @@ fn read_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceR
 fn read_workspace_signing_identity(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<WorkspaceSigningIdentityRecord> {
-    let revision: i64 = row.get(6)?;
     Ok(WorkspaceSigningIdentityRecord {
         workspace_id: row.get(0)?,
         key_id: row.get(1)?,
@@ -10812,19 +10677,16 @@ fn read_workspace_signing_identity(
         public_key: row.get(3)?,
         public_key_fingerprint: row.get(4)?,
         private_material_ref: row.get(5)?,
-        revision: u64::try_from(revision)
-            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, revision))?,
-        state: row.get(7)?,
-        created_at: row.get(8)?,
-        provisioned_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        state: row.get(6)?,
+        created_at: row.get(7)?,
+        provisioned_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 
 fn read_workspace_signing_identity_provisioning_operation(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<WorkspaceSigningIdentityProvisioningOperation> {
-    let revision: i64 = row.get(6)?;
     Ok(WorkspaceSigningIdentityProvisioningOperation {
         operation_key: row.get(0)?,
         request_fingerprint: row.get(1)?,
@@ -10832,12 +10694,10 @@ fn read_workspace_signing_identity_provisioning_operation(
         workspace_id: row.get(3)?,
         key_id: row.get(4)?,
         private_material_ref: row.get(5)?,
-        revision: u64::try_from(revision)
-            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, revision))?,
-        actor_account_id: row.get(7)?,
-        state: row.get(8)?,
-        created_at: row.get(9)?,
-        completed_at: row.get(10)?,
+        actor_account_id: row.get(6)?,
+        state: row.get(7)?,
+        created_at: row.get(8)?,
+        completed_at: row.get(9)?,
     })
 }
 
@@ -10851,7 +10711,6 @@ fn repository_registration_intent_matches(
         && existing.provider == requested.provider
         && existing.source == requested.source
         && existing.default_ref == requested.default_ref
-        && existing.source_revision == requested.source_revision
         && existing.source_fingerprint == requested.source_fingerprint
 }
 
@@ -10865,18 +10724,15 @@ fn read_repository_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Repositor
     let source_kind_value = row.get::<_, String>(5)?;
     let source_kind = server_api::RepositorySourceKind::parse(&source_kind_value)
         .unwrap_or(server_api::RepositorySourceKind::Invalid);
-    let source_revision = row.get::<_, u64>(8)?;
-    let source_fingerprint = row.get::<_, String>(9)?;
+    let source_fingerprint = row.get::<_, String>(8)?;
     let mut source = RepositorySource {
         kind: source_kind,
         uri: row.get(6)?,
     };
-    let observed_status_value = row.get::<_, String>(10)?;
+    let observed_status_value = row.get::<_, String>(9)?;
     let mut observed_status = RepositoryObservedStatus::parse(&observed_status_value)
         .unwrap_or(RepositoryObservedStatus::Invalid);
-    if source_revision == 0
-        || crate::repository_source::repository_source_fingerprint(&source) != source_fingerprint
-    {
+    if crate::repository_source::repository_source_fingerprint(&source) != source_fingerprint {
         source.kind = server_api::RepositorySourceKind::Invalid;
         observed_status = RepositoryObservedStatus::Invalid;
     }
@@ -10888,12 +10744,11 @@ fn read_repository_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Repositor
         provider: row.get(4)?,
         source,
         default_ref: row.get(7)?,
-        source_revision,
         source_fingerprint,
         observed_status,
-        observed_at: row.get(11)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
+        observed_at: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
     })
 }
 
@@ -10909,17 +10764,16 @@ fn read_workspace_runtime_verification(
     Ok(WorkspaceRuntimeVerificationEvidence {
         workspace_id: row.get(0)?,
         runtime_id: row.get(1)?,
-        binding_revision: row.get(2)?,
+        binding_id: row.get(2)?,
         workspace_key_id: row.get(3)?,
-        workspace_identity_revision: row.get(4)?,
-        workspace_trust_generation: row.get(5)?,
+        workspace_public_key_fingerprint: row.get(4)?,
+        workspace_trust_id: row.get(5)?,
         runtime_public_key_fingerprint: row.get(6)?,
-        runtime_identity_revision: row.get(7)?,
-        challenge_id: row.get(8)?,
-        state: row.get(9)?,
-        last_outcome: row.get(10)?,
-        verified_at: row.get(11)?,
-        checked_at: row.get(12)?,
+        challenge_id: row.get(7)?,
+        state: row.get(8)?,
+        last_outcome: row.get(9)?,
+        verified_at: row.get(10)?,
+        checked_at: row.get(11)?,
     })
 }
 
@@ -10934,20 +10788,23 @@ fn validate_workspace_runtime_verification(
     ] {
         validate_identifier(field, value)?;
     }
-    if evidence.binding_revision == 0
-        || evidence.workspace_identity_revision == 0
-        || evidence.workspace_trust_generation == 0
-        || evidence.runtime_identity_revision == 0
-    {
-        return Err(Error::InvalidInput(
-            "Runtime verification revisions and generations must be positive".to_string(),
-        ));
-    }
+    validate_identifier("binding_id", &evidence.binding_id)?;
+    validate_identifier("workspace_trust_id", &evidence.workspace_trust_id)?;
+    validate_non_empty(
+        "workspace_public_key_fingerprint",
+        &evidence.workspace_public_key_fingerprint,
+    )?;
     validate_non_empty(
         "runtime_public_key_fingerprint",
         &evidence.runtime_public_key_fingerprint,
     )?;
-    validate_non_empty("verification state", &evidence.state)?;
+    if !matches!(evidence.state.as_str(), "pending" | "verified" | "failed")
+        || (evidence.state == "verified") != evidence.verified_at.is_some()
+    {
+        return Err(Error::InvalidInput(
+            "Runtime verification lifecycle evidence is invalid".into(),
+        ));
+    }
     if !matches!(
         evidence.last_outcome.as_str(),
         "verified" | "challenge_issued" | "verification_failed" | "connectivity_failed"
@@ -10971,27 +10828,15 @@ fn read_runtime_removal_operation(
             error.to_string().into(),
         )
     })?;
-    let expected_binding_revision = u64::try_from(row.get::<_, i64>(4)?).map_err(|_| {
-        rusqlite::Error::FromSqlConversionFailure(
-            4,
-            rusqlite::types::Type::Integer,
-            "invalid Runtime removal binding revision".into(),
-        )
-    })?;
-    let config_revision = u64::try_from(row.get::<_, i64>(5)?).map_err(|_| {
-        rusqlite::Error::FromSqlConversionFailure(
-            5,
-            rusqlite::types::Type::Integer,
-            "invalid Runtime removal config revision".into(),
-        )
-    })?;
+    let expected_binding_id = row.get(4)?;
+    let config_digest = row.get(5)?;
     Ok(RuntimeRemovalOperation {
         operation_id: row.get(0)?,
         workspace_id: row.get(1)?,
         runtime_id: row.get(2)?,
         request_fingerprint: row.get(3)?,
-        expected_binding_revision,
-        config_revision,
+        expected_binding_id,
+        config_digest,
         state,
         failure_category: row.get(7)?,
         binding_removed: row.get::<_, i64>(8)? != 0,
@@ -11003,7 +10848,7 @@ fn read_runtime_removal_operation(
 }
 
 const RUNTIME_REMOVAL_OPERATION_SELECT: &str = "SELECT operation_id, workspace_id, runtime_id, request_fingerprint, \
-            expected_binding_revision, config_revision, state, failure_category, \
+            expected_binding_id, config_digest, state, failure_category, \
             binding_removed, runtime_registration_removed, created_at, updated_at, completed_at \
      FROM runtime_removal_operations";
 
@@ -11024,27 +10869,25 @@ fn runtime_removal_preflight(
     conn: &Connection,
     workspace_id: &str,
     runtime_id: &str,
-    expected_binding_revision: u64,
+    expected_binding_id: &str,
 ) -> Result<()> {
-    let binding_revision = conn
+    let binding_id = conn
         .query_row(
-            "SELECT binding_revision FROM workspace_runtime_bindings \
+            "SELECT binding_id FROM workspace_runtime_bindings \
              WHERE workspace_id = ?1 AND runtime_id = ?2",
             params![workspace_id, runtime_id],
-            |row| row.get::<_, i64>(0),
+            |row| row.get::<_, String>(0),
         )
         .optional()?;
-    let Some(binding_revision) = binding_revision else {
+    let Some(binding_id) = binding_id else {
         return Err(Error::RuntimeBindingNotFound {
             runtime_id: runtime_id.to_string(),
         });
     };
-    let binding_revision = u64::try_from(binding_revision)
-        .map_err(|_| Error::Store("Runtime binding revision is invalid".to_string()))?;
-    if binding_revision != expected_binding_revision {
-        return Err(Error::RuntimeBindingRevisionConflict {
-            expected: Some(expected_binding_revision),
-            actual: Some(binding_revision),
+    if binding_id != expected_binding_id {
+        return Err(Error::RuntimeBindingIdConflict {
+            expected: Some(expected_binding_id.to_owned()),
+            actual: Some(binding_id),
         });
     }
 
@@ -11142,11 +10985,12 @@ fn read_workspace_runtime_binding(
         base_url: row.get(3)?,
         public_key: row.get(4)?,
         public_key_fingerprint: row.get(5)?,
-        binding_revision: row.get(6)?,
+        binding_id: row.get(6)?,
         state,
         authentication_mode,
         workspace_key_id: row.get(9)?,
-        workspace_key_generation: row.get(10)?,
+        workspace_public_key_fingerprint: row.get(14)?,
+        workspace_trust_id: row.get(10)?,
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
         revoked_at: row.get(13)?,
@@ -11207,7 +11051,10 @@ fn normalize_workspace_runtime_binding_key(record: &mut WorkspaceRuntimeBinding)
     record.public_key_fingerprint = fingerprint;
     match record.authentication_mode {
         WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer => {
-            if record.workspace_key_id.is_some() || record.workspace_key_generation.is_some() {
+            if record.workspace_key_id.is_some()
+                || record.workspace_trust_id.is_some()
+                || record.workspace_public_key_fingerprint.is_some()
+            {
                 return Err(Error::InvalidInput(
                     "legacy Runtime bindings must not carry Workspace key metadata".into(),
                 ));
@@ -11227,12 +11074,20 @@ fn normalize_workspace_runtime_binding_key(record: &mut WorkspaceRuntimeBinding)
                 )
             })?;
             validate_identifier("workspace_key_id", key_id)?;
+            validate_non_empty(
+                "workspace_public_key_fingerprint",
+                record
+                    .workspace_public_key_fingerprint
+                    .as_deref()
+                    .unwrap_or_default(),
+            )?;
             if record
-                .workspace_key_generation
-                .is_none_or(|generation| generation == 0)
+                .workspace_trust_id
+                .as_deref()
+                .is_none_or(str::is_empty)
             {
                 return Err(Error::InvalidInput(
-                    "Workspace identity Runtime bindings require a positive workspace_key_generation"
+                    "Workspace identity Runtime bindings require a non-empty workspace_trust_id"
                         .into(),
                 ));
             }
@@ -11630,7 +11485,7 @@ fn read_backend_job_attempt(
     attempt_id: &str,
 ) -> Result<Option<BackendJobAttemptRecord>> {
     let row = conn.query_row(
-        "SELECT attempt, input_revision, state, runtime_id, worker_id, runtime_run_id, dispatched_at, deadline_at, result_json, result_digest, failure_category, failure_detail, worker_cleanup_state, worker_cleanup_failure_category, worker_cleanup_failure_detail, worker_cleanup_updated_at, worker_cleanup_completed_at, created_at, updated_at, completed_at FROM backend_job_attempts WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3",
+        "SELECT attempt, input_digest, state, runtime_id, worker_id, runtime_run_id, dispatched_at, deadline_at, result_json, result_digest, failure_category, failure_detail, worker_cleanup_state, worker_cleanup_failure_category, worker_cleanup_failure_detail, worker_cleanup_updated_at, worker_cleanup_completed_at, created_at, updated_at, completed_at FROM backend_job_attempts WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3",
         params![workspace_id, job_id, attempt_id],
         |row| Ok((
             row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
@@ -11644,7 +11499,7 @@ fn read_backend_job_attempt(
     ).optional()?;
     let Some((
         attempt,
-        input_revision,
+        input_digest,
         state,
         runtime_id,
         worker_id,
@@ -11691,7 +11546,7 @@ fn read_backend_job_attempt(
         job_id: job_id.to_string(),
         attempt_id: attempt_id.to_string(),
         attempt,
-        input_revision,
+        input_digest,
         state: BackendJobAttemptState::parse(&state)?,
         worker,
         runtime_run_id,
@@ -12517,7 +12372,7 @@ pub struct TicketAssignmentOperationRecord {
 /// Immutable manual claim admission data used for recovery and compensation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct TicketWorkerClaimRecovery {
-    pub item_revision: String,
+    pub content_digest: String,
     pub selected: Vec<server_api::TicketWorkerAttachmentBinding>,
     pub original_links: Vec<WorkerWorkdirLinkRecord>,
     pub effective_links: Vec<WorkerWorkdirLinkRecord>,
@@ -12767,41 +12622,77 @@ fn read_workdir_registry_record(
     })
 }
 
-fn migrate_workspace_drive_grants_v83_to_v84(conn: &Connection) -> Result<()> {
-    if current_schema_version(conn)? != 83 {
-        return Err(Error::Store(
-            "Drive grants migration requires schema 83".into(),
-        ));
-    }
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    tx.execute_batch(include_str!("workspace_drive_grants.sql"))?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(?1,?2)",
-        params![84_i64, WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
+fn new_runtime_binding_id() -> String {
+    format!("RB-{}", Uuid::now_v7().simple())
 }
 
-fn migrate_worker_restore_intents_v79_to_v80(conn: &Connection) -> Result<()> {
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    tx.execute_batch("CREATE TABLE worker_restore_intents (
-        workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL, worker_id TEXT NOT NULL,
-        domain_key TEXT NOT NULL, request_id TEXT NOT NULL, expected_token TEXT NOT NULL,
-        settled INTEGER NOT NULL CHECK(settled IN (0,1)),
-        PRIMARY KEY(workspace_id,runtime_id,worker_id,request_id),
-        FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
-    );
-    CREATE UNIQUE INDEX worker_restore_intent_pending_domain ON worker_restore_intents(workspace_id,runtime_id,worker_id,domain_key) WHERE settled=0;")?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(?1,?2)",
-        params![80_i64, WORKER_RESTORE_INTENTS_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
+include!("frozen_legacy_migrations.rs");
+#[allow(dead_code)]
+#[derive(Clone)]
+struct FrozenWorkspaceRuntimeBinding {
+    workspace_id: String,
+    runtime_id: String,
+    display_name: String,
+    base_url: String,
+    public_key: String,
+    public_key_fingerprint: String,
+    binding_revision: u64,
+    state: WorkspaceRuntimeBindingState,
+    authentication_mode: WorkspaceRuntimeAuthenticationMode,
+    workspace_key_id: Option<String>,
+    workspace_key_generation: Option<u64>,
+    created_at: String,
+    updated_at: String,
+    revoked_at: Option<String>,
 }
+fn read_frozen_workspace_runtime_binding(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<FrozenWorkspaceRuntimeBinding> {
+    let state = match row.get::<_, String>(7)?.as_str() {
+        "configured" => WorkspaceRuntimeBindingState::Configured,
+        "verified" => WorkspaceRuntimeBindingState::Verified,
+        "revoked" => WorkspaceRuntimeBindingState::Revoked,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let authentication_mode = match row.get::<_, String>(8)?.as_str() {
+        "workspace_identity" => WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity,
+        "legacy_server_issuer" => WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    Ok(FrozenWorkspaceRuntimeBinding {
+        workspace_id: row.get(0)?,
+        runtime_id: row.get(1)?,
+        display_name: row.get(2)?,
+        base_url: row.get(3)?,
+        public_key: row.get(4)?,
+        public_key_fingerprint: row.get(5)?,
+        binding_revision: row.get(6)?,
+        state,
+        authentication_mode,
+        workspace_key_id: row.get(9)?,
+        workspace_key_generation: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+        revoked_at: row.get(13)?,
+    })
+}
+
+include!("frozen_flow_content_migration.rs");
+include!("frozen_content_state_migration.rs");
+include!("frozen_repository_key_migration.rs");
+include!("frozen_runtime_binding_migration.rs");
 
 fn prepare_connection(conn: &Connection) -> Result<()> {
+    prepare_connection_with_secret_source(
+        conn,
+        conn.path().filter(|path| !path.is_empty()).map(Path::new),
+    )
+}
+
+fn prepare_connection_with_secret_source(
+    conn: &Connection,
+    secret_source: Option<&Path>,
+) -> Result<()> {
     configure_sqlite(conn)?;
     let workspace_schema_version = current_schema_version(conn)?;
     if workspace_schema_version == 0 {
@@ -12810,13 +12701,13 @@ fn prepare_connection(conn: &Connection) -> Result<()> {
         merge_request::migrate(conn).map_err(|error| {
             Error::Store(format!("Merge Request schema verification failed: {error}"))
         })?;
-        apply_migrations(conn)
+        apply_migrations_with_secret_source(conn, secret_source)
             .map_err(|error| Error::Store(format!("workspace schema migration failed: {error}")))?;
     } else {
         // Workspace migrations own cross-domain table rebuilds. Apply them before
         // component verification so the Ticket crate sees its new canonical target
         // schema and migration marker rather than rejecting the legacy singular shape.
-        apply_migrations(conn)
+        apply_migrations_with_secret_source(conn, secret_source)
             .map_err(|error| Error::Store(format!("workspace schema migration failed: {error}")))?;
         ticket::migrate_sqlite_ticket_schema(conn)
             .map_err(|error| Error::Store(format!("Ticket schema verification failed: {error}")))?;
@@ -12858,702 +12749,10 @@ struct WorkspaceRuntimeBindingV51 {
     revoked_at: Option<String>,
 }
 
-fn migrate_workspace_runtime_bindings_v50_to_v51(conn: &Connection) -> Result<()> {
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    let legacy_columns = table_columns(&tx, "trusted_runtime_records")?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let expected_columns = [
-        "runtime_id",
-        "display_name",
-        "base_url",
-        "public_key",
-        "created_at",
-        "updated_at",
-        "revoked_at",
-        "workspace_id",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect::<BTreeSet<_>>();
-    if legacy_columns != expected_columns {
-        return Err(Error::Store(format!(
-            "schema-50 trusted_runtime_records columns are not canonical"
-        )));
-    }
-
-    let all_workspace_ids = {
-        let mut stmt = tx.prepare("SELECT workspace_id FROM workspaces ORDER BY workspace_id")?;
-        stmt.query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-
-    let mut bindings = Vec::new();
-    {
-        let mut stmt = tx.prepare(
-            r#"SELECT runtime_id, workspace_id, display_name, base_url, public_key,
-                      created_at, updated_at, revoked_at
-               FROM trusted_runtime_records ORDER BY runtime_id"#,
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
-            ))
-        })?;
-        for row in rows {
-            let (
-                runtime_id,
-                workspace_id,
-                display_name,
-                base_url,
-                public_key,
-                created_at,
-                updated_at,
-                revoked_at,
-            ) = row?;
-            let workspace_ids = if runtime_id == crate::hosts::EMBEDDED_RUNTIME_ID {
-                if all_workspace_ids.is_empty() {
-                    return Err(Error::Store(
-                        "embedded Runtime migration requires at least one registered Workspace"
-                            .to_string(),
-                    ));
-                }
-                all_workspace_ids.clone()
-            } else if let Some(workspace_id) = workspace_id.filter(|value| !value.trim().is_empty())
-            {
-                vec![workspace_id]
-            } else {
-                continue;
-            };
-            let (public_key, fingerprint) = normalize_runtime_public_key(&public_key)?;
-            for workspace_id in workspace_ids {
-                let workspace_exists = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id = ?1)",
-                    params![workspace_id],
-                    |row| row.get::<_, i64>(0),
-                )? != 0;
-                if !workspace_exists {
-                    return Err(Error::Store(format!(
-                        "Runtime `{runtime_id}` references unknown Workspace `{workspace_id}`"
-                    )));
-                }
-                bindings.push(WorkspaceRuntimeBindingV51 {
-                    workspace_id,
-                    runtime_id: runtime_id.clone(),
-                    display_name: display_name.clone(),
-                    base_url: base_url.clone(),
-                    public_key: Some(public_key.clone()),
-                    public_key_fingerprint: Some(fingerprint.clone()),
-                    created_at: created_at.clone(),
-                    updated_at: updated_at.clone(),
-                    revoked_at: revoked_at.clone(),
-                });
-            }
-        }
-    }
-
-    let mut binding_keys = HashSet::new();
-    let mut trust_keys = HashSet::new();
-    for binding in &bindings {
-        if !binding_keys.insert((binding.workspace_id.clone(), binding.runtime_id.clone())) {
-            return Err(Error::Store(format!(
-                "duplicate Runtime binding `{}/{}` in schema-50",
-                binding.workspace_id, binding.runtime_id
-            )));
-        }
-        let fingerprint = binding
-            .public_key_fingerprint
-            .clone()
-            .expect("normalized key");
-        if !trust_keys.insert((binding.workspace_id.clone(), fingerprint.clone())) {
-            return Err(Error::Store(format!(
-                "duplicate Runtime trust fingerprint `{fingerprint}` in Workspace `{}`",
-                binding.workspace_id
-            )));
-        }
-    }
-
-    let mut consumed_jtis = Vec::new();
-    {
-        let runtime_workspaces = bindings.iter().fold(
-            HashMap::<&str, Vec<&str>>::new(),
-            |mut workspaces, binding| {
-                workspaces
-                    .entry(binding.runtime_id.as_str())
-                    .or_default()
-                    .push(binding.workspace_id.as_str());
-                workspaces
-            },
-        );
-        let mut stmt = tx.prepare(
-            "SELECT runtime_id, jti, expires_at, consumed_at FROM worker_mutation_source_proof_jtis",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        for row in rows {
-            let (runtime_id, jti, expires_at, consumed_at) = row?;
-            let Some(workspace_ids) = runtime_workspaces.get(runtime_id.as_str()) else {
-                continue;
-            };
-            for workspace_id in workspace_ids {
-                consumed_jtis.push((
-                    (*workspace_id).to_string(),
-                    runtime_id.clone(),
-                    jti.clone(),
-                    expires_at,
-                    consumed_at.clone(),
-                ));
-            }
-        }
-    }
-
-    tx.execute_batch(
-        r#"
-        ALTER TABLE worker_mutation_source_proof_jtis
-            RENAME TO worker_mutation_source_proof_jtis_v50;
-        ALTER TABLE trusted_runtime_records
-            RENAME TO trusted_runtime_records_v50;
-
-        CREATE TABLE workspace_runtime_bindings (
-            workspace_id TEXT NOT NULL,
-            runtime_id TEXT NOT NULL,
-            display_name TEXT NOT NULL,
-            base_url TEXT NOT NULL,
-            public_key TEXT,
-            public_key_fingerprint TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            revoked_at TEXT,
-            PRIMARY KEY (workspace_id, runtime_id),
-            UNIQUE (workspace_id, public_key_fingerprint),
-            CHECK ((public_key IS NULL) = (public_key_fingerprint IS NULL)),
-            FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT
-        );
-        CREATE INDEX idx_workspace_runtime_bindings_workspace
-            ON workspace_runtime_bindings(workspace_id, revoked_at, runtime_id);
-        CREATE TABLE worker_mutation_source_proof_jtis (
-            workspace_id TEXT NOT NULL,
-            runtime_id TEXT NOT NULL,
-            jti TEXT NOT NULL,
-            expires_at INTEGER NOT NULL,
-            consumed_at TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, runtime_id, jti)
-        );
-        "#,
-    )?;
-    for binding in bindings {
-        tx.execute(
-            r#"INSERT INTO workspace_runtime_bindings (
-                   workspace_id, runtime_id, display_name, base_url, public_key,
-                   public_key_fingerprint, created_at, updated_at, revoked_at
-               ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
-            params![
-                binding.workspace_id,
-                binding.runtime_id,
-                binding.display_name,
-                binding.base_url,
-                binding.public_key,
-                binding.public_key_fingerprint,
-                binding.created_at,
-                binding.updated_at,
-                binding.revoked_at,
-            ],
-        )?;
-    }
-    for (workspace_id, runtime_id, jti, expires_at, consumed_at) in consumed_jtis {
-        tx.execute(
-            "INSERT INTO worker_mutation_source_proof_jtis (
-                workspace_id, runtime_id, jti, expires_at, consumed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![workspace_id, runtime_id, jti, expires_at, consumed_at],
-        )?;
-    }
-    tx.execute_batch(
-        "DROP TABLE worker_mutation_source_proof_jtis_v50;
-         DROP TABLE trusted_runtime_records_v50;",
-    )?;
-    let foreign_key_failures =
-        tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
-            row.get::<_, i64>(0)
-        })?;
-    if foreign_key_failures != 0 {
-        return Err(Error::Store(format!(
-            "schema-51 migration produced {foreign_key_failures} foreign-key violation(s)"
-        )));
-    }
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![51, WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_workspace_runtime_bindings_v51_to_v52(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 51 {
-        return Err(Error::Store(format!(
-            "expected schema version 51 before {RUNTIME_BINDING_AUDIT_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    tx.execute_batch(
-        r#"
-        ALTER TABLE workspace_runtime_bindings
-            ADD COLUMN binding_revision INTEGER NOT NULL DEFAULT 1 CHECK (binding_revision > 0);
-        CREATE TABLE workspace_runtime_binding_audit (
-            workspace_id TEXT NOT NULL,
-            runtime_id TEXT NOT NULL,
-            actor_account_id TEXT NOT NULL,
-            action TEXT NOT NULL CHECK (action IN ('created', 'replaced', 'reactivated', 'revoked')),
-            old_fingerprint TEXT,
-            new_fingerprint TEXT,
-            binding_revision INTEGER NOT NULL CHECK (binding_revision > 0),
-            at TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, runtime_id, binding_revision),
-            FOREIGN KEY(workspace_id, runtime_id)
-                REFERENCES workspace_runtime_bindings(workspace_id, runtime_id) ON DELETE RESTRICT,
-            FOREIGN KEY(actor_account_id) REFERENCES accounts(account_id) ON DELETE RESTRICT
-        );
-        CREATE INDEX idx_workspace_runtime_binding_audit_recent
-            ON workspace_runtime_binding_audit(workspace_id, runtime_id, binding_revision DESC);
-        "#,
-    )?;
-    verify_workspace_runtime_binding_schema(&tx)?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![52, RUNTIME_BINDING_AUDIT_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_workspace_deletion_v52_to_v53(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 52 {
-        return Err(Error::Store(format!(
-            "expected schema version 52 before {WORKSPACE_DELETION_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    tx.execute_batch(
-        r#"
-        CREATE TABLE worker_create_reservations_v53 (
-            workspace_id TEXT NOT NULL,
-            allocation_key TEXT NOT NULL,
-            worker_id TEXT NOT NULL,
-            runtime_id TEXT NOT NULL,
-            create_fingerprint TEXT NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('reserved', 'created', 'removed')),
-            request_fingerprint TEXT,
-            memory_settings_revision INTEGER,
-            memory_language TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, allocation_key),
-            UNIQUE (workspace_id, worker_id),
-            FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-            CHECK (
-                (request_fingerprint IS NULL AND memory_settings_revision IS NULL AND memory_language IS NULL)
-                OR
-                (request_fingerprint IS NOT NULL AND memory_settings_revision IS NOT NULL AND memory_settings_revision > 0 AND memory_language IS NOT NULL AND length(trim(memory_language)) > 0)
-            )
-        );
-        INSERT INTO worker_create_reservations_v53 (
-            workspace_id, allocation_key, worker_id, runtime_id, create_fingerprint,
-            state, request_fingerprint, memory_settings_revision, memory_language,
-            created_at, updated_at
-        )
-        SELECT workspace_id, allocation_key, worker_id, runtime_id, create_fingerprint,
-               state,
-               CASE WHEN request_fingerprint IS NOT NULL
-                          AND memory_settings_revision IS NOT NULL
-                          AND memory_settings_revision > 0
-                          AND memory_language IS NOT NULL
-                          AND length(trim(memory_language)) > 0
-                    THEN request_fingerprint ELSE NULL END,
-               CASE WHEN request_fingerprint IS NOT NULL
-                          AND memory_settings_revision IS NOT NULL
-                          AND memory_settings_revision > 0
-                          AND memory_language IS NOT NULL
-                          AND length(trim(memory_language)) > 0
-                    THEN memory_settings_revision ELSE NULL END,
-               CASE WHEN request_fingerprint IS NOT NULL
-                          AND memory_settings_revision IS NOT NULL
-                          AND memory_settings_revision > 0
-                          AND memory_language IS NOT NULL
-                          AND length(trim(memory_language)) > 0
-                    THEN memory_language ELSE NULL END,
-               created_at, updated_at
-        FROM worker_create_reservations;
-        DROP TABLE worker_create_reservations;
-        ALTER TABLE worker_create_reservations_v53 RENAME TO worker_create_reservations;
-
-        CREATE TABLE workspace_deletion_operations (
-            operation_id TEXT PRIMARY KEY,
-            request_fingerprint TEXT NOT NULL,
-            workspace_id TEXT NOT NULL,
-            workspace_display_name TEXT NOT NULL,
-            workspace_revision TEXT NOT NULL,
-            owner_account_id TEXT NOT NULL,
-            actor_account_id TEXT NOT NULL,
-            state TEXT NOT NULL CHECK(state IN ('queued', 'running', 'blocked', 'failed', 'succeeded')),
-            resource_counts_json TEXT NOT NULL,
-            child_operation_ids_json TEXT NOT NULL,
-            blockers_json TEXT NOT NULL,
-            failure_category TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            completed_at TEXT,
-            FOREIGN KEY(owner_account_id) REFERENCES accounts(account_id) ON DELETE RESTRICT,
-            FOREIGN KEY(actor_account_id) REFERENCES accounts(account_id) ON DELETE RESTRICT
-        );
-        CREATE INDEX workspace_deletion_operations_workspace_recent
-            ON workspace_deletion_operations(workspace_id, created_at DESC);
-        "#,
-    )?;
-    verify_workspace_deletion_schema(&tx)?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![53_i64, WORKSPACE_DELETION_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_workspace_signing_identity_v53_to_v54(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 53 {
-        return Err(Error::Store(format!(
-            "expected schema version 53 before {WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    tx.execute_batch(
-        r#"
-        CREATE TABLE workspace_signing_identities (
-            workspace_id TEXT PRIMARY KEY,
-            key_id TEXT NOT NULL UNIQUE,
-            algorithm TEXT NOT NULL CHECK (algorithm = 'ed25519'),
-            public_key TEXT,
-            public_key_fingerprint TEXT,
-            private_material_ref TEXT NOT NULL UNIQUE,
-            revision INTEGER NOT NULL CHECK (revision >= 1),
-            state TEXT NOT NULL CHECK (state IN ('pending_provisioning', 'active')),
-            created_at TEXT NOT NULL,
-            provisioned_at TEXT,
-            updated_at TEXT NOT NULL,
-            CHECK (
-                (state = 'pending_provisioning' AND public_key IS NULL AND public_key_fingerprint IS NULL AND provisioned_at IS NULL)
-                OR
-                (state = 'active' AND public_key IS NOT NULL AND public_key_fingerprint IS NOT NULL AND provisioned_at IS NOT NULL)
-            ),
-            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
-        );
-        CREATE TABLE workspace_signing_identity_provisioning_operations (
-            operation_key TEXT PRIMARY KEY,
-            request_fingerprint TEXT NOT NULL,
-            operation_kind TEXT NOT NULL CHECK (operation_kind IN ('workspace_create', 'existing_workspace')),
-            workspace_id TEXT NOT NULL UNIQUE,
-            key_id TEXT NOT NULL UNIQUE,
-            private_material_ref TEXT NOT NULL UNIQUE,
-            revision INTEGER NOT NULL CHECK (revision >= 1),
-            actor_account_id TEXT NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
-            created_at TEXT NOT NULL,
-            completed_at TEXT
-        );
-        CREATE TABLE workspace_signing_identity_audit (
-            event_id TEXT PRIMARY KEY,
-            workspace_id TEXT NOT NULL,
-            key_id TEXT NOT NULL,
-            action TEXT NOT NULL CHECK (action IN ('provisioned')),
-            revision INTEGER NOT NULL CHECK (revision >= 1),
-            public_key_fingerprint TEXT NOT NULL,
-            actor_account_id TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
-        );
-        CREATE INDEX workspace_signing_identity_audit_workspace_idx
-            ON workspace_signing_identity_audit(workspace_id, created_at DESC);
-        INSERT INTO workspace_signing_identities (
-            workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
-            private_material_ref, revision, state, created_at, provisioned_at, updated_at
-        )
-        SELECT workspace_id,
-               'WK-' || lower(hex(randomblob(16))),
-               'ed25519', NULL, NULL,
-               'workspace-signing/' || workspace_id || '/ed25519-v1',
-               1, 'pending_provisioning', created_at, NULL, updated_at
-        FROM workspaces;
-        "#,
-    )?;
-    verify_workspace_signing_identity_schema(&tx)?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![54_i64, WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_workspace_runtime_binding_state_v54_to_v55(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 54 {
-        return Err(Error::Store(format!(
-            "expected schema version 54 before {WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    let columns = table_columns(&tx, "workspace_runtime_bindings")?;
-    let lifecycle_columns = [
-        "state",
-        "authentication_mode",
-        "workspace_key_id",
-        "workspace_key_generation",
-    ];
-    let present = lifecycle_columns
-        .iter()
-        .filter(|column| columns.iter().any(|existing| existing == **column))
-        .count();
-    if present == 0 {
-        tx.execute_batch(
-            r#"
-            CREATE TABLE workspace_runtime_bindings_v55 (
-                workspace_id TEXT NOT NULL,
-                runtime_id TEXT NOT NULL,
-                display_name TEXT NOT NULL,
-                base_url TEXT NOT NULL,
-                public_key TEXT NOT NULL,
-                public_key_fingerprint TEXT NOT NULL,
-                binding_revision INTEGER NOT NULL DEFAULT 1 CHECK (binding_revision > 0),
-                state TEXT NOT NULL CHECK (state IN ('configured', 'verified', 'revoked')),
-                authentication_mode TEXT NOT NULL CHECK (authentication_mode IN ('legacy_server_issuer', 'workspace_identity')),
-                workspace_key_id TEXT,
-                workspace_key_generation INTEGER CHECK (workspace_key_generation > 0),
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                revoked_at TEXT,
-                PRIMARY KEY (workspace_id, runtime_id),
-                UNIQUE (workspace_id, public_key_fingerprint),
-                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
-                CHECK (
-                    (authentication_mode = 'legacy_server_issuer' AND workspace_key_id IS NULL AND workspace_key_generation IS NULL)
-                    OR
-                    (authentication_mode = 'workspace_identity' AND workspace_key_id IS NOT NULL AND workspace_key_generation IS NOT NULL)
-                ),
-                CHECK (
-                    (state = 'revoked' AND revoked_at IS NOT NULL)
-                    OR
-                    (state != 'revoked' AND revoked_at IS NULL)
-                )
-            );
-            INSERT INTO workspace_runtime_bindings_v55 (
-                workspace_id, runtime_id, display_name, base_url, public_key,
-                public_key_fingerprint, binding_revision, state, authentication_mode,
-                workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
-            )
-            SELECT workspace_id, runtime_id, display_name, base_url, public_key,
-                   public_key_fingerprint, binding_revision,
-                   CASE WHEN revoked_at IS NULL THEN 'verified' ELSE 'revoked' END,
-                   'legacy_server_issuer', NULL, NULL, created_at, updated_at, revoked_at
-            FROM workspace_runtime_bindings;
-            DROP TABLE workspace_runtime_bindings;
-            ALTER TABLE workspace_runtime_bindings_v55 RENAME TO workspace_runtime_bindings;
-            CREATE INDEX idx_workspace_runtime_bindings_workspace
-                ON workspace_runtime_bindings(workspace_id, revoked_at, runtime_id);
-            "#,
-        )?;
-    } else if present != lifecycle_columns.len() {
-        return Err(Error::Store(
-            "workspace_runtime_bindings has a partially applied lifecycle schema".to_string(),
-        ));
-    }
-    verify_workspace_runtime_binding_schema(&tx)?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![55_i64, WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_workspace_runtime_verification_v55_to_v56(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 55 {
-        return Err(Error::Store(format!(
-            "expected schema version 55 before {WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    tx.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS workspace_runtime_verifications (
-            workspace_id TEXT NOT NULL,
-            runtime_id TEXT NOT NULL,
-            binding_revision INTEGER NOT NULL CHECK(binding_revision > 0),
-            workspace_key_id TEXT NOT NULL,
-            workspace_identity_revision INTEGER NOT NULL CHECK(workspace_identity_revision > 0),
-            workspace_trust_generation INTEGER NOT NULL CHECK(workspace_trust_generation > 0),
-            runtime_public_key_fingerprint TEXT NOT NULL,
-            runtime_identity_revision INTEGER NOT NULL CHECK(runtime_identity_revision > 0),
-            challenge_id TEXT NOT NULL,
-            state TEXT NOT NULL CHECK(state IN ('pending', 'verified', 'failed')),
-            last_outcome TEXT NOT NULL,
-            verified_at TEXT,
-            checked_at TEXT NOT NULL,
-            PRIMARY KEY(workspace_id, runtime_id),
-            FOREIGN KEY(workspace_id, runtime_id)
-                REFERENCES workspace_runtime_bindings(workspace_id, runtime_id)
-                ON DELETE CASCADE,
-            CHECK((state = 'verified' AND verified_at IS NOT NULL)
-               OR (state != 'verified' AND verified_at IS NULL))
-        );
-        CREATE INDEX IF NOT EXISTS workspace_runtime_verifications_state_idx
-            ON workspace_runtime_verifications(workspace_id, state, checked_at DESC);
-        "#,
-    )?;
-    verify_workspace_runtime_verification_schema(&tx)?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![56_i64, WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_legacy_external_runtime_bindings_v56_to_v57(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 56 {
-        return Err(Error::Store(format!(
-            "expected schema version 56 before {LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    let missing_workspace_identity_count = tx.query_row(
-        "SELECT COUNT(*)
-         FROM workspace_runtime_bindings binding
-         LEFT JOIN workspace_signing_identities identity
-           ON identity.workspace_id = binding.workspace_id
-         WHERE binding.authentication_mode = 'legacy_server_issuer'
-           AND binding.runtime_id <> ?1
-           AND identity.workspace_id IS NULL",
-        params![crate::hosts::EMBEDDED_RUNTIME_ID],
-        |row| row.get::<_, i64>(0),
-    )?;
-    if missing_workspace_identity_count != 0 {
-        return Err(Error::Store(
-            "legacy external Runtime binding migration requires Workspace signing identity metadata"
-                .to_string(),
-        ));
-    }
-    tx.execute(
-        "DELETE FROM workspace_runtime_verifications
-         WHERE EXISTS (
-             SELECT 1 FROM workspace_runtime_bindings binding
-             WHERE binding.workspace_id = workspace_runtime_verifications.workspace_id
-               AND binding.runtime_id = workspace_runtime_verifications.runtime_id
-               AND binding.authentication_mode = 'legacy_server_issuer'
-               AND binding.runtime_id <> ?1
-         )",
-        params![crate::hosts::EMBEDDED_RUNTIME_ID],
-    )?;
-    tx.execute(
-        "UPDATE workspace_runtime_bindings
-         SET state = CASE WHEN state = 'verified' THEN 'configured' ELSE state END,
-             authentication_mode = 'workspace_identity',
-             workspace_key_id = (
-                 SELECT identity.key_id FROM workspace_signing_identities identity
-                 WHERE identity.workspace_id = workspace_runtime_bindings.workspace_id
-             ),
-             workspace_key_generation = (
-                 SELECT identity.revision FROM workspace_signing_identities identity
-                 WHERE identity.workspace_id = workspace_runtime_bindings.workspace_id
-             )
-         WHERE authentication_mode = 'legacy_server_issuer'
-           AND runtime_id <> ?1",
-        params![crate::hosts::EMBEDDED_RUNTIME_ID],
-    )?;
-    let remaining_external_legacy_bindings = tx.query_row(
-        "SELECT COUNT(*) FROM workspace_runtime_bindings
-         WHERE authentication_mode = 'legacy_server_issuer'
-           AND runtime_id <> ?1",
-        params![crate::hosts::EMBEDDED_RUNTIME_ID],
-        |row| row.get::<_, i64>(0),
-    )?;
-    if remaining_external_legacy_bindings != 0 {
-        return Err(Error::Store(
-            "legacy Server-issued external Runtime bindings remain after schema-57 migration"
-                .to_string(),
-        ));
-    }
-    verify_workspace_runtime_binding_schema(&tx)?;
-    verify_workspace_runtime_verification_schema(&tx)?;
-    let foreign_key_violations =
-        tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
-            row.get::<_, i64>(0)
-        })?;
-    if foreign_key_violations != 0 {
-        return Err(Error::Store(format!(
-            "schema-57 Runtime binding migration left {foreign_key_violations} foreign-key violation(s)"
-        )));
-    }
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![
-            57_i64,
-            LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME
-        ],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_workdir_cache_generation_v57_to_v58(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 57 {
-        return Err(Error::Store(format!(
-            "expected schema version 57 before {REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    if table_columns(&tx, "workdir_create_operations")?.contains(&"cache_generation".to_string()) {
-        tx.execute(
-            "ALTER TABLE workdir_create_operations DROP COLUMN cache_generation",
-            [],
-        )?;
-    }
-    if table_columns(&tx, "workdir_create_operations")?.contains(&"cache_generation".to_string()) {
-        return Err(Error::Store(
-            "obsolete Workdir cache generation remains after schema-58 migration".to_string(),
-        ));
-    }
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![58_i64, REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
 fn verify_workspace_runtime_verification_schema(conn: &Connection) -> Result<()> {
+    if column_exists(conn, "workspace_runtime_verifications", "binding_id")? {
+        return verify_runtime_binding_content_schema(conn);
+    }
     let actual = table_columns(conn, "workspace_runtime_verifications")?
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -13584,6 +12783,9 @@ fn verify_workspace_runtime_verification_schema(conn: &Connection) -> Result<()>
 }
 
 fn verify_workspace_signing_identity_schema(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "workspace_signing_identities", "revision")? {
+        return verify_runtime_binding_content_schema(conn);
+    }
     for (table, expected) in [
         (
             "workspace_signing_identities",
@@ -13667,7 +12869,15 @@ fn verify_workspace_deletion_schema(conn: &Connection) -> Result<()> {
         "request_fingerprint",
         "workspace_id",
         "workspace_display_name",
-        "workspace_revision",
+        if column_exists(
+            conn,
+            "workspace_deletion_operations",
+            "workspace_updated_at",
+        )? {
+            "workspace_updated_at"
+        } else {
+            "workspace_revision"
+        },
         "owner_account_id",
         "actor_account_id",
         "state",
@@ -13701,6 +12911,9 @@ fn verify_workspace_deletion_schema(conn: &Connection) -> Result<()> {
 }
 
 fn verify_workspace_runtime_binding_schema(conn: &Connection) -> Result<()> {
+    if column_exists(conn, "workspace_runtime_bindings", "binding_id")? {
+        return verify_runtime_binding_content_schema(conn);
+    }
     let columns = table_columns(conn, "workspace_runtime_bindings")?
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -13841,7 +13054,7 @@ fn verify_workspace_runtime_binding_schema(conn: &Connection) -> Result<()> {
                       workspace_key_id, workspace_key_generation, created_at, updated_at, revoked_at
                FROM workspace_runtime_bindings"#,
         )?;
-        let rows = stmt.query_map([], read_workspace_runtime_binding)?;
+        let rows = stmt.query_map([], read_frozen_workspace_runtime_binding)?;
         for row in rows {
             verify_canonical_workspace_runtime_binding(row?)?;
         }
@@ -13852,7 +13065,7 @@ fn verify_workspace_runtime_binding_schema(conn: &Connection) -> Result<()> {
                FROM workspace_runtime_bindings"#,
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok(WorkspaceRuntimeBinding {
+            Ok(FrozenWorkspaceRuntimeBinding {
                 workspace_id: row.get(0)?,
                 runtime_id: row.get(1)?,
                 display_name: row.get(2)?,
@@ -13880,7 +13093,9 @@ fn verify_workspace_runtime_binding_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn verify_canonical_workspace_runtime_binding(binding: WorkspaceRuntimeBinding) -> Result<()> {
+fn verify_canonical_workspace_runtime_binding(
+    binding: FrozenWorkspaceRuntimeBinding,
+) -> Result<()> {
     if binding.authentication_mode == WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer {
         if binding.workspace_key_id.is_some() || binding.workspace_key_generation.is_some() {
             return Err(Error::Store(format!(
@@ -13897,10 +13112,14 @@ fn verify_canonical_workspace_runtime_binding(binding: WorkspaceRuntimeBinding) 
         }
         return Ok(());
     }
-    let mut normalized = binding.clone();
-    normalize_workspace_runtime_binding_key(&mut normalized)?;
-    if normalized.public_key != binding.public_key
-        || normalized.public_key_fingerprint != binding.public_key_fingerprint
+    let (canonical, fingerprint) = normalize_runtime_public_key(&binding.public_key)?;
+    if binding
+        .workspace_key_id
+        .as_deref()
+        .is_none_or(str::is_empty)
+        || binding.workspace_key_generation.is_none_or(|v| v == 0)
+        || canonical != binding.public_key
+        || fingerprint != binding.public_key_fingerprint
     {
         return Err(Error::Store(format!(
             "Runtime binding `{}/{}` has non-canonical trust content",
@@ -13908,364 +13127,6 @@ fn verify_canonical_workspace_runtime_binding(binding: WorkspaceRuntimeBinding) 
         )));
     }
     Ok(())
-}
-
-fn migrate_runtime_removal_operations_v59_to_v60(conn: &Connection) -> Result<()> {
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    tx.execute_batch(
-        r#"CREATE TABLE runtime_removal_operations (
-             operation_id TEXT PRIMARY KEY,
-             workspace_id TEXT NOT NULL,
-             runtime_id TEXT NOT NULL,
-             request_fingerprint TEXT NOT NULL,
-             expected_binding_revision INTEGER NOT NULL,
-             config_revision INTEGER NOT NULL,
-             state TEXT NOT NULL CHECK (state IN ('pending', 'cleanup_pending', 'succeeded', 'failed')),
-             failure_category TEXT,
-             binding_removed INTEGER NOT NULL CHECK (binding_removed IN (0, 1)),
-             runtime_registration_removed INTEGER CHECK (runtime_registration_removed IS NULL OR runtime_registration_removed IN (0, 1)),
-             created_at TEXT NOT NULL,
-             updated_at TEXT NOT NULL,
-             completed_at TEXT,
-             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
-         );
-         CREATE UNIQUE INDEX runtime_removal_operations_one_active_runtime
-         ON runtime_removal_operations(runtime_id)
-         WHERE state IN ('pending', 'cleanup_pending');
-         CREATE INDEX runtime_removal_operations_workspace_state
-         ON runtime_removal_operations(workspace_id, state, updated_at);
-         CREATE TRIGGER runtime_binding_insert_blocked_by_removal
-         BEFORE INSERT ON workspace_runtime_bindings
-         FOR EACH ROW
-         WHEN EXISTS (
-             SELECT 1 FROM runtime_removal_operations operation
-             WHERE operation.runtime_id = NEW.runtime_id
-               AND operation.state IN ('pending', 'cleanup_pending')
-         )
-         BEGIN
-             SELECT RAISE(ABORT, 'runtime_removal_in_progress');
-         END;
-         CREATE TRIGGER runtime_binding_update_blocked_by_removal
-         BEFORE UPDATE ON workspace_runtime_bindings
-         FOR EACH ROW
-         WHEN EXISTS (
-             SELECT 1 FROM runtime_removal_operations operation
-             WHERE operation.runtime_id = NEW.runtime_id
-               AND operation.state IN ('pending', 'cleanup_pending')
-         )
-         BEGIN
-             SELECT RAISE(ABORT, 'runtime_removal_in_progress');
-         END;"#,
-    )?;
-    tx.execute_batch(
-        r#"
-        CREATE TRIGGER worker_registry_insert_blocked_by_runtime_removal
-        BEFORE INSERT ON worker_registry FOR EACH ROW
-        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
-        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-        CREATE TRIGGER worker_registry_update_blocked_by_runtime_removal
-        BEFORE UPDATE ON worker_registry FOR EACH ROW
-        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
-        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-        CREATE TRIGGER workdir_registry_insert_blocked_by_runtime_removal
-        BEFORE INSERT ON workdir_registry FOR EACH ROW
-        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
-        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-        CREATE TRIGGER workdir_registry_update_blocked_by_runtime_removal
-        BEFORE UPDATE ON workdir_registry FOR EACH ROW
-        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
-        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-        CREATE TRIGGER worker_assignment_insert_blocked_by_runtime_removal
-        BEFORE INSERT ON ticket_current_worker_assignments FOR EACH ROW
-        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
-        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-        CREATE TRIGGER worker_assignment_update_blocked_by_runtime_removal
-        BEFORE UPDATE ON ticket_current_worker_assignments FOR EACH ROW
-        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
-        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-        CREATE TRIGGER workdir_attachment_insert_blocked_by_runtime_removal
-        BEFORE INSERT ON worker_workdir_links FOR EACH ROW
-        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
-        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-        CREATE TRIGGER workdir_attachment_update_blocked_by_runtime_removal
-        BEFORE UPDATE ON worker_workdir_links FOR EACH ROW
-        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
-        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-        CREATE TRIGGER worker_create_insert_blocked_by_runtime_removal
-        BEFORE INSERT ON worker_create_reservations FOR EACH ROW
-        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
-        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-        CREATE TRIGGER worker_create_update_blocked_by_runtime_removal
-        BEFORE UPDATE ON worker_create_reservations FOR EACH ROW
-        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
-        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-        CREATE TRIGGER workdir_create_insert_blocked_by_runtime_removal
-        BEFORE INSERT ON workdir_create_operations FOR EACH ROW
-        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.resolved_runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
-        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-        CREATE TRIGGER workdir_create_update_blocked_by_runtime_removal
-        BEFORE UPDATE ON workdir_create_operations FOR EACH ROW
-        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.resolved_runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
-        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-        CREATE TRIGGER worker_removal_insert_blocked_by_runtime_removal
-        BEFORE INSERT ON worker_removal_operations FOR EACH ROW
-        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
-        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-        CREATE TRIGGER worker_removal_update_blocked_by_runtime_removal
-        BEFORE UPDATE ON worker_removal_operations FOR EACH ROW
-        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
-        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-        CREATE TRIGGER workdir_removal_insert_blocked_by_runtime_removal
-        BEFORE INSERT ON workdir_removal_operations FOR EACH ROW
-        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
-        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-        CREATE TRIGGER workdir_removal_update_blocked_by_runtime_removal
-        BEFORE UPDATE ON workdir_removal_operations FOR EACH ROW
-        WHEN EXISTS (SELECT 1 FROM runtime_removal_operations operation WHERE operation.runtime_id = NEW.runtime_id AND operation.state IN ('pending', 'cleanup_pending'))
-        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-        "#,
-    )?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![60, RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_worker_run_generation_v60_to_v61(conn: &Connection) -> Result<()> {
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    tx.execute_batch("ALTER TABLE worker_removal_operations DROP COLUMN run_generation;")?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![61, REMOVE_WORKER_RUN_GENERATION_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_worker_registry_projection_v61_to_v62(conn: &Connection) -> Result<()> {
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    tx.execute_batch(WORKER_REGISTRY_PROJECTION_SCHEMA)?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![62, WORKER_REGISTRY_PROJECTION_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_multi_workdir_attachments_v62_to_v63(conn: &Connection) -> Result<()> {
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    if !column_exists(&tx, "workdir_registry", "display_name")? {
-        tx.execute_batch("ALTER TABLE workdir_registry ADD COLUMN display_name TEXT;")?;
-    }
-    if column_exists(&tx, "worker_workdir_links", "role")?
-        && !column_exists(&tx, "worker_workdir_links", "alias")?
-    {
-        tx.execute_batch("ALTER TABLE worker_workdir_links RENAME COLUMN role TO alias;")?;
-    }
-    tx.execute_batch(
-        "DROP INDEX IF EXISTS worker_workdir_links_active_worker_unique;
-         CREATE UNIQUE INDEX IF NOT EXISTS worker_workdir_links_active_alias_unique
-             ON worker_workdir_links(workspace_id, worker_id, alias)
-             WHERE unlinked_at IS NULL;",
-    )?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![63, MULTI_WORKDIR_ATTACHMENTS_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_external_workdir_grants_v63_to_v64(conn: &Connection) -> Result<()> {
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    // Migration-chain tests and repaired databases may carry the canonical v64
-    // shape while the durable history still stops at v63. In that case only
-    // advance the marker; rebuilding would discard External grant rows and
-    // collide with the already-created table.
-    if column_exists(&tx, "workdir_registry", "source_kind")?
-        && table_exists(&tx, "external_workdir_grants")?
-    {
-        tx.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-            params![64, EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME],
-        )?;
-        tx.commit()?;
-        return Ok(());
-    }
-    tx.execute_batch(
-        r#"
-        PRAGMA defer_foreign_keys = ON;
-        DROP TRIGGER IF EXISTS workdir_registry_insert_blocked_by_runtime_removal;
-        DROP TRIGGER IF EXISTS workdir_registry_update_blocked_by_runtime_removal;
-        CREATE TEMP TABLE worker_workdir_attachment_reservations_v64 AS
-            SELECT workspace_id, workdir_id, reservation_id, reserved_at
-            FROM worker_workdir_attachment_reservations;
-        CREATE TEMP TABLE worker_workdir_links_v64 AS
-            SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at
-            FROM worker_workdir_links;
-        DROP TABLE worker_workdir_attachment_reservations;
-        DROP TABLE worker_workdir_links;
-        CREATE TABLE external_workdir_grants (
-            grant_id TEXT NOT NULL,
-            workspace_id TEXT NOT NULL,
-            workdir_id TEXT NOT NULL,
-            provider_instance_id TEXT NOT NULL,
-            display_name TEXT NOT NULL,
-            permissions TEXT NOT NULL CHECK (permissions = 'read_only'),
-            created_by TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
-            generation INTEGER NOT NULL CHECK (generation > 0),
-            status TEXT NOT NULL CHECK (status IN ('pending', 'online', 'offline', 'revoked', 'expired')),
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, grant_id),
-            UNIQUE (workspace_id, workdir_id),
-            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-            FOREIGN KEY (workspace_id, workdir_id) REFERENCES workdir_registry_v64(workspace_id, workdir_id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
-        );
-        CREATE TABLE workdir_registry_v64 (
-            workspace_id TEXT NOT NULL,
-            workdir_id TEXT NOT NULL,
-            display_name TEXT,
-            source_kind TEXT NOT NULL CHECK (source_kind IN ('repository', 'external_grant')),
-            runtime_id TEXT,
-            repository_id TEXT,
-            external_grant_id TEXT,
-            creation_selector TEXT,
-            creation_ref TEXT,
-            creation_tree TEXT,
-            current_selector TEXT,
-            current_ref TEXT,
-            current_tree TEXT,
-            observed_at_epoch_seconds INTEGER,
-            materialization_status TEXT NOT NULL CHECK (materialization_status IN ('pending', 'present', 'not_found', 'corrupted', 'unknown', 'failed')),
-            cleanliness TEXT NOT NULL CHECK (cleanliness IN ('clean', 'dirty', 'unknown')),
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, workdir_id),
-            CHECK (
-                (source_kind = 'repository' AND runtime_id IS NOT NULL AND repository_id IS NOT NULL AND external_grant_id IS NULL)
-                OR (source_kind = 'external_grant' AND runtime_id IS NULL AND repository_id IS NULL AND external_grant_id IS NOT NULL)
-            ),
-            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-            FOREIGN KEY (workspace_id, repository_id) REFERENCES repositories(workspace_id, repository_id),
-            FOREIGN KEY (workspace_id, external_grant_id) REFERENCES external_workdir_grants(workspace_id, grant_id) DEFERRABLE INITIALLY DEFERRED
-        );
-        INSERT INTO workdir_registry_v64 (
-            workspace_id, workdir_id, display_name, source_kind, runtime_id, repository_id,
-            external_grant_id, creation_selector, creation_ref, creation_tree, current_selector,
-            current_ref, current_tree, observed_at_epoch_seconds, materialization_status,
-            cleanliness, created_at, updated_at
-        ) SELECT workspace_id, workdir_id, display_name, 'repository', runtime_id, repository_id,
-                 NULL, creation_selector, creation_ref, creation_tree, current_selector,
-                 current_ref, current_tree, observed_at_epoch_seconds, materialization_status,
-                 cleanliness, created_at, updated_at
-          FROM workdir_registry;
-        DROP TABLE workdir_registry;
-        ALTER TABLE workdir_registry_v64 RENAME TO workdir_registry;
-        CREATE TABLE worker_workdir_attachment_reservations (
-            workspace_id TEXT NOT NULL,
-            workdir_id TEXT NOT NULL,
-            reservation_id TEXT NOT NULL,
-            reserved_at TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, workdir_id),
-            FOREIGN KEY (workspace_id, workdir_id)
-                REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
-        );
-        INSERT INTO worker_workdir_attachment_reservations
-            (workspace_id, workdir_id, reservation_id, reserved_at)
-            SELECT workspace_id, workdir_id, reservation_id, reserved_at
-            FROM worker_workdir_attachment_reservations_v64;
-        CREATE TABLE worker_workdir_links (
-            workspace_id TEXT NOT NULL,
-            runtime_id TEXT NOT NULL,
-            worker_id TEXT NOT NULL,
-            workdir_id TEXT NOT NULL,
-            alias TEXT NOT NULL,
-            linked_at TEXT NOT NULL,
-            unlinked_at TEXT,
-            PRIMARY KEY (workspace_id, worker_id, workdir_id, alias),
-            FOREIGN KEY (workspace_id, worker_id)
-                REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE,
-            FOREIGN KEY (workspace_id, workdir_id)
-                REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
-        );
-        INSERT INTO worker_workdir_links
-            (workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at)
-            SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at
-            FROM worker_workdir_links_v64;
-        DROP TABLE worker_workdir_attachment_reservations_v64;
-        DROP TABLE worker_workdir_links_v64;
-        CREATE UNIQUE INDEX worker_workdir_links_active_workdir_unique
-            ON worker_workdir_links(workspace_id, workdir_id) WHERE unlinked_at IS NULL;
-        CREATE UNIQUE INDEX worker_workdir_links_active_alias_unique
-            ON worker_workdir_links(workspace_id, worker_id, alias) WHERE unlinked_at IS NULL;
-        CREATE INDEX worker_workdir_links_workdir
-            ON worker_workdir_links(workspace_id, workdir_id);
-        CREATE INDEX idx_workdir_registry_workspace_updated
-            ON workdir_registry(workspace_id, updated_at DESC);
-        CREATE INDEX idx_external_workdir_grants_status_expiry
-            ON external_workdir_grants(workspace_id, status, expires_at);
-        CREATE TRIGGER workdir_registry_insert_blocked_by_runtime_removal
-        BEFORE INSERT ON workdir_registry FOR EACH ROW
-        WHEN NEW.runtime_id IS NOT NULL AND EXISTS (
-            SELECT 1 FROM runtime_removal_operations operation
-            WHERE operation.runtime_id = NEW.runtime_id
-              AND operation.state IN ('pending', 'cleanup_pending')
-        )
-        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-        CREATE TRIGGER workdir_registry_update_blocked_by_runtime_removal
-        BEFORE UPDATE ON workdir_registry FOR EACH ROW
-        WHEN NEW.runtime_id IS NOT NULL AND EXISTS (
-            SELECT 1 FROM runtime_removal_operations operation
-            WHERE operation.runtime_id = NEW.runtime_id
-              AND operation.state IN ('pending', 'cleanup_pending')
-        )
-        BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-        "#,
-    )?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![64, EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_external_workdir_cleanup_v64_to_v65(conn: &Connection) -> Result<()> {
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    if !column_exists(&tx, "external_workdir_grants", "cleanup_state")? {
-        tx.execute_batch(
-            "ALTER TABLE external_workdir_grants ADD COLUMN cleanup_state TEXT NOT NULL DEFAULT 'not_required' CHECK (cleanup_state IN ('not_required', 'pending', 'retry_required', 'completed'));\
-             ALTER TABLE external_workdir_grants ADD COLUMN cleanup_error TEXT;\
-             ALTER TABLE external_workdir_grants ADD COLUMN cleanup_updated_at TEXT;",
-        )?;
-        tx.execute(
-            "UPDATE external_workdir_grants
-             SET cleanup_state = 'pending', cleanup_updated_at = updated_at
-             WHERE status IN ('revoked', 'expired')",
-            [],
-        )?;
-    }
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![65, EXTERNAL_WORKDIR_CLEANUP_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_ticket_targets_and_workdir_capabilities_v65_to_v66(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 65 {
-        return Err(Error::Store(format!(
-            "expected schema version 65 before {TICKET_TARGETS_AND_WORKDIR_CAPABILITIES_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-    apply_ticket_targets_and_workdir_capabilities_schema(conn)
 }
 
 fn apply_ticket_targets_and_workdir_capabilities_schema(conn: &Connection) -> Result<()> {
@@ -14686,1318 +13547,6 @@ fn apply_ticket_targets_and_workdir_capabilities_schema(conn: &Connection) -> Re
     }
 }
 
-fn migrate_external_workdir_access_and_optional_expiry_v66_to_v67(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 66 {
-        return Err(Error::Store(format!(
-            "expected schema version 66 before {EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-    let foreign_keys_enabled =
-        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))? != 0;
-    if foreign_keys_enabled {
-        conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-    }
-    let result = (|| {
-        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-        tx.execute_batch(
-            r#"
-            CREATE TABLE external_workdir_grants_v67 (
-                grant_id TEXT NOT NULL,
-                workspace_id TEXT NOT NULL,
-                workdir_id TEXT NOT NULL,
-                provider_instance_id TEXT NOT NULL,
-                display_name TEXT NOT NULL,
-                permissions TEXT NOT NULL CHECK (permissions IN ('read_only', 'read_write')),
-                created_by TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                expires_at TEXT,
-                generation INTEGER NOT NULL CHECK (generation > 0),
-                status TEXT NOT NULL CHECK (status IN ('pending', 'online', 'offline', 'revoked', 'expired')),
-                updated_at TEXT NOT NULL,
-                cleanup_state TEXT NOT NULL DEFAULT 'not_required' CHECK (cleanup_state IN ('not_required', 'pending', 'retry_required', 'completed')),
-                cleanup_error TEXT,
-                cleanup_updated_at TEXT,
-                PRIMARY KEY (workspace_id, grant_id),
-                UNIQUE (workspace_id, workdir_id),
-                FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-                FOREIGN KEY (workspace_id, workdir_id)
-                    REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
-            );
-            INSERT INTO external_workdir_grants_v67 (
-                grant_id, workspace_id, workdir_id, provider_instance_id, display_name,
-                permissions, created_by, created_at, expires_at, generation, status, updated_at,
-                cleanup_state, cleanup_error, cleanup_updated_at
-            ) SELECT grant_id, workspace_id, workdir_id, provider_instance_id, display_name,
-                     permissions, created_by, created_at, expires_at, generation, status, updated_at,
-                     cleanup_state, cleanup_error, cleanup_updated_at
-                FROM external_workdir_grants;
-            DROP TABLE external_workdir_grants;
-            ALTER TABLE external_workdir_grants_v67 RENAME TO external_workdir_grants;
-            CREATE INDEX idx_external_workdir_grants_status_expiry
-                ON external_workdir_grants(workspace_id, status, expires_at);
-            CREATE TABLE worker_workdir_links_v67 (
-                workspace_id TEXT NOT NULL,
-                runtime_id TEXT NOT NULL,
-                worker_id TEXT NOT NULL,
-                workdir_id TEXT NOT NULL,
-                alias TEXT NOT NULL,
-                capabilities TEXT NOT NULL CHECK (capabilities IN ('all', 'read_only', 'read_write')),
-                linked_at TEXT NOT NULL,
-                unlinked_at TEXT,
-                PRIMARY KEY (workspace_id, worker_id, workdir_id, alias),
-                FOREIGN KEY (workspace_id, worker_id)
-                    REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE,
-                FOREIGN KEY (workspace_id, workdir_id)
-                    REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
-            );
-            INSERT INTO worker_workdir_links_v67 (
-                workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities,
-                linked_at, unlinked_at
-            ) SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities,
-                     linked_at, unlinked_at
-                FROM worker_workdir_links;
-            DROP TABLE worker_workdir_links;
-            ALTER TABLE worker_workdir_links_v67 RENAME TO worker_workdir_links;
-            CREATE UNIQUE INDEX worker_workdir_links_active_workdir_unique
-                ON worker_workdir_links(workspace_id, workdir_id) WHERE unlinked_at IS NULL;
-            CREATE UNIQUE INDEX worker_workdir_links_active_alias_unique
-                ON worker_workdir_links(workspace_id, worker_id, alias) WHERE unlinked_at IS NULL;
-            CREATE INDEX worker_workdir_links_workdir
-                ON worker_workdir_links(workspace_id, workdir_id);
-            CREATE TRIGGER workdir_attachment_insert_blocked_by_runtime_removal
-            BEFORE INSERT ON worker_workdir_links FOR EACH ROW
-            WHEN EXISTS (
-                SELECT 1 FROM runtime_removal_operations operation
-                WHERE operation.runtime_id = NEW.runtime_id
-                  AND operation.state IN ('pending', 'cleanup_pending')
-            )
-            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-            CREATE TRIGGER workdir_attachment_update_blocked_by_runtime_removal
-            BEFORE UPDATE ON worker_workdir_links FOR EACH ROW
-            WHEN EXISTS (
-                SELECT 1 FROM runtime_removal_operations operation
-                WHERE operation.runtime_id = NEW.runtime_id
-                  AND operation.state IN ('pending', 'cleanup_pending')
-            )
-            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-            "#,
-        )?;
-        let violations =
-            tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
-                row.get::<_, i64>(0)
-            })?;
-        if violations != 0 {
-            return Err(Error::Store(format!(
-                "schema-67 migration left {violations} foreign-key violation(s)"
-            )));
-        }
-        tx.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-            params![
-                67_i64,
-                EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME
-            ],
-        )?;
-        tx.commit()?;
-        Ok(())
-    })();
-    let restore = if foreign_keys_enabled {
-        conn.execute_batch("PRAGMA foreign_keys = ON;")
-            .map_err(Error::from)
-    } else {
-        Ok(())
-    };
-    match (result, restore) {
-        (Err(error), _) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
-    }
-}
-
-fn migrate_external_workdir_command_permission_v67_to_v68(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 67 {
-        return Err(Error::Store(format!(
-            "expected schema version 67 before {EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-    let foreign_keys_enabled =
-        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))? != 0;
-    if foreign_keys_enabled {
-        conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-    }
-    let result = (|| {
-        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-        tx.execute_batch(
-            r#"
-            CREATE TABLE external_workdir_grants_v68 (
-                grant_id TEXT NOT NULL,
-                workspace_id TEXT NOT NULL,
-                workdir_id TEXT NOT NULL,
-                provider_instance_id TEXT NOT NULL,
-                display_name TEXT NOT NULL,
-                permissions TEXT NOT NULL CHECK (permissions IN (
-                    'read_only', 'read_write', 'command_only',
-                    'read_command', 'read_write_command'
-                )),
-                created_by TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                expires_at TEXT,
-                generation INTEGER NOT NULL CHECK (generation > 0),
-                status TEXT NOT NULL CHECK (status IN ('pending', 'online', 'offline', 'revoked', 'expired')),
-                updated_at TEXT NOT NULL,
-                cleanup_state TEXT NOT NULL DEFAULT 'not_required' CHECK (cleanup_state IN ('not_required', 'pending', 'retry_required', 'completed')),
-                cleanup_error TEXT,
-                cleanup_updated_at TEXT,
-                PRIMARY KEY (workspace_id, grant_id),
-                UNIQUE (workspace_id, workdir_id),
-                FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-                FOREIGN KEY (workspace_id, workdir_id)
-                    REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
-            );
-            INSERT INTO external_workdir_grants_v68 (
-                grant_id, workspace_id, workdir_id, provider_instance_id, display_name,
-                permissions, created_by, created_at, expires_at, generation, status, updated_at,
-                cleanup_state, cleanup_error, cleanup_updated_at
-            ) SELECT grant_id, workspace_id, workdir_id, provider_instance_id, display_name,
-                     permissions, created_by, created_at, expires_at, generation, status, updated_at,
-                     cleanup_state, cleanup_error, cleanup_updated_at
-                FROM external_workdir_grants;
-            DROP TABLE external_workdir_grants;
-            ALTER TABLE external_workdir_grants_v68 RENAME TO external_workdir_grants;
-            CREATE INDEX idx_external_workdir_grants_status_expiry
-                ON external_workdir_grants(workspace_id, status, expires_at);
-            "#,
-        )?;
-        let violations =
-            tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
-                row.get::<_, i64>(0)
-            })?;
-        if violations != 0 {
-            return Err(Error::Store(format!(
-                "schema-68 migration left {violations} foreign-key violation(s)"
-            )));
-        }
-        tx.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-            params![68_i64, EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME],
-        )?;
-        tx.commit()?;
-        Ok(())
-    })();
-    let restore = if foreign_keys_enabled {
-        conn.execute_batch("PRAGMA foreign_keys = ON;")
-            .map_err(Error::from)
-    } else {
-        Ok(())
-    };
-    match (result, restore) {
-        (Err(error), _) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
-    }
-}
-
-fn migrate_workdir_command_attachment_capabilities_v68_to_v69(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 68 {
-        return Err(Error::Store(format!(
-            "expected schema version 68 before {WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-    let foreign_keys_enabled =
-        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))? != 0;
-    if foreign_keys_enabled {
-        conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-    }
-    let result = (|| {
-        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-        tx.execute_batch(
-            r#"
-            CREATE TABLE worker_workdir_links_v69 (
-                workspace_id TEXT NOT NULL,
-                runtime_id TEXT NOT NULL,
-                worker_id TEXT NOT NULL,
-                workdir_id TEXT NOT NULL,
-                alias TEXT NOT NULL,
-                capabilities TEXT NOT NULL CHECK (capabilities IN (
-                    'all', 'read_only', 'read_write', 'command_only', 'read_command'
-                )),
-                linked_at TEXT NOT NULL,
-                unlinked_at TEXT,
-                PRIMARY KEY (workspace_id, worker_id, workdir_id, alias),
-                FOREIGN KEY (workspace_id, worker_id)
-                    REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE,
-                FOREIGN KEY (workspace_id, workdir_id)
-                    REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
-            );
-            INSERT INTO worker_workdir_links_v69 (
-                workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities,
-                linked_at, unlinked_at
-            ) SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities,
-                     linked_at, unlinked_at
-                FROM worker_workdir_links;
-            DROP TABLE worker_workdir_links;
-            ALTER TABLE worker_workdir_links_v69 RENAME TO worker_workdir_links;
-            CREATE UNIQUE INDEX worker_workdir_links_active_workdir_unique
-                ON worker_workdir_links(workspace_id, workdir_id) WHERE unlinked_at IS NULL;
-            CREATE UNIQUE INDEX worker_workdir_links_active_alias_unique
-                ON worker_workdir_links(workspace_id, worker_id, alias) WHERE unlinked_at IS NULL;
-            CREATE INDEX worker_workdir_links_workdir
-                ON worker_workdir_links(workspace_id, workdir_id);
-            CREATE TRIGGER workdir_attachment_insert_blocked_by_runtime_removal
-            BEFORE INSERT ON worker_workdir_links FOR EACH ROW
-            WHEN EXISTS (
-                SELECT 1 FROM runtime_removal_operations operation
-                WHERE operation.runtime_id = NEW.runtime_id
-                  AND operation.state IN ('pending', 'cleanup_pending')
-            )
-            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-            CREATE TRIGGER workdir_attachment_update_blocked_by_runtime_removal
-            BEFORE UPDATE ON worker_workdir_links FOR EACH ROW
-            WHEN EXISTS (
-                SELECT 1 FROM runtime_removal_operations operation
-                WHERE operation.runtime_id = NEW.runtime_id
-                  AND operation.state IN ('pending', 'cleanup_pending')
-            )
-            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-            "#,
-        )?;
-        let violations =
-            tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
-                row.get::<_, i64>(0)
-            })?;
-        if violations != 0 {
-            return Err(Error::Store(format!(
-                "schema-69 migration left {violations} foreign-key violation(s)"
-            )));
-        }
-        tx.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-            params![
-                69_i64,
-                WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME
-            ],
-        )?;
-        tx.commit()?;
-        Ok(())
-    })();
-    let restore = if foreign_keys_enabled {
-        conn.execute_batch("PRAGMA foreign_keys = ON;")
-            .map_err(Error::from)
-    } else {
-        Ok(())
-    };
-    match (result, restore) {
-        (Err(error), _) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
-    }
-}
-
-fn migrate_backend_job_runner_v69_to_v70(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 69 {
-        return Err(Error::Store(format!(
-            "expected schema version 69 before {BACKEND_JOB_RUNNER_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    tx.execute_batch(
-        r#"
-        CREATE TABLE backend_jobs (
-            workspace_id TEXT NOT NULL,
-            job_id TEXT NOT NULL,
-            purpose TEXT NOT NULL,
-            input_revision TEXT NOT NULL,
-            input_ref TEXT NOT NULL,
-            request_json TEXT NOT NULL,
-            intent_fingerprint TEXT NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed', 'unknown')),
-            current_attempt INTEGER NOT NULL CHECK (current_attempt > 0 AND current_attempt <= 3),
-            result_json TEXT,
-            result_digest TEXT,
-            failure_category TEXT,
-            failure_detail TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            completed_at TEXT,
-            PRIMARY KEY (workspace_id, job_id),
-            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-            CHECK ((result_json IS NULL) = (result_digest IS NULL)),
-            CHECK ((state = 'completed') = (result_json IS NOT NULL))
-        );
-        CREATE INDEX backend_jobs_active
-            ON backend_jobs(workspace_id, state, updated_at);
-        CREATE TABLE backend_job_attempts (
-            workspace_id TEXT NOT NULL,
-            job_id TEXT NOT NULL,
-            attempt_id TEXT NOT NULL,
-            attempt INTEGER NOT NULL CHECK (attempt > 0 AND attempt <= 3),
-            input_revision TEXT NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('reserved', 'dispatched', 'completed', 'failed', 'unknown')),
-            runtime_id TEXT,
-            worker_id TEXT,
-            runtime_run_id TEXT,
-            dispatched_at TEXT,
-            deadline_at TEXT NOT NULL,
-            result_json TEXT,
-            result_digest TEXT,
-            failure_category TEXT,
-            failure_detail TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            completed_at TEXT,
-            PRIMARY KEY (workspace_id, job_id, attempt_id),
-            UNIQUE (workspace_id, job_id, attempt),
-            UNIQUE (workspace_id, runtime_id, worker_id),
-            FOREIGN KEY (workspace_id, job_id)
-                REFERENCES backend_jobs(workspace_id, job_id) ON DELETE CASCADE,
-            CHECK ((runtime_id IS NULL) = (worker_id IS NULL)),
-            CHECK ((result_json IS NULL) = (result_digest IS NULL)),
-            CHECK ((state = 'completed') = (result_json IS NOT NULL))
-        );
-        CREATE INDEX backend_job_attempts_recovery
-            ON backend_job_attempts(workspace_id, state, deadline_at);
-        CREATE TABLE backend_job_deliveries (
-            workspace_id TEXT NOT NULL,
-            delivery_id TEXT NOT NULL,
-            job_id TEXT NOT NULL,
-            attempt_id TEXT NOT NULL,
-            target_runtime_id TEXT NOT NULL,
-            target_worker_id TEXT NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed')),
-            failure_category TEXT,
-            failure_detail TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            delivered_at TEXT,
-            PRIMARY KEY (workspace_id, delivery_id),
-            FOREIGN KEY (workspace_id, job_id, attempt_id)
-                REFERENCES backend_job_attempts(workspace_id, job_id, attempt_id) ON DELETE CASCADE
-        );
-        CREATE INDEX backend_job_deliveries_pending
-            ON backend_job_deliveries(workspace_id, state, updated_at);
-        "#,
-    )?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![70_i64, BACKEND_JOB_RUNNER_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_backend_job_delivery_claims_v70_to_v71(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 70 {
-        return Err(Error::Store(format!(
-            "expected schema version 70 before {BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    tx.execute_batch(
-        r#"
-        DROP INDEX backend_job_deliveries_pending;
-        ALTER TABLE backend_job_deliveries RENAME TO backend_job_deliveries_v70;
-        CREATE TABLE backend_job_deliveries (
-            workspace_id TEXT NOT NULL,
-            delivery_id TEXT NOT NULL,
-            job_id TEXT NOT NULL,
-            attempt_id TEXT NOT NULL,
-            target_runtime_id TEXT NOT NULL,
-            target_worker_id TEXT NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'completed', 'failed', 'unknown')),
-            failure_category TEXT,
-            failure_detail TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            delivered_at TEXT,
-            PRIMARY KEY (workspace_id, delivery_id),
-            FOREIGN KEY (workspace_id, job_id, attempt_id)
-                REFERENCES backend_job_attempts(workspace_id, job_id, attempt_id) ON DELETE CASCADE
-        );
-        INSERT INTO backend_job_deliveries (
-            workspace_id, delivery_id, job_id, attempt_id, target_runtime_id,
-            target_worker_id, state, failure_category, failure_detail,
-            created_at, updated_at, delivered_at
-        )
-        SELECT workspace_id, delivery_id, job_id, attempt_id, target_runtime_id,
-               target_worker_id, state, failure_category, failure_detail,
-               created_at, updated_at, delivered_at
-        FROM backend_job_deliveries_v70;
-        DROP TABLE backend_job_deliveries_v70;
-        CREATE INDEX backend_job_deliveries_pending
-            ON backend_job_deliveries(workspace_id, state, updated_at);
-        "#,
-    )?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![71_i64, BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_backend_job_dispatch_queue_v71_to_v72(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 71 {
-        return Err(Error::Store(format!(
-            "expected schema version 71 before {BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    tx.execute_batch(
-        r#"
-        DROP INDEX backend_job_deliveries_pending;
-        DROP INDEX backend_job_attempts_recovery;
-        ALTER TABLE backend_job_deliveries RENAME TO backend_job_deliveries_v71;
-        ALTER TABLE backend_job_attempts RENAME TO backend_job_attempts_v71;
-        CREATE TABLE backend_job_attempts (
-            workspace_id TEXT NOT NULL,
-            job_id TEXT NOT NULL,
-            attempt_id TEXT NOT NULL,
-            attempt INTEGER NOT NULL CHECK (attempt > 0 AND attempt <= 3),
-            input_revision TEXT NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('reserved', 'dispatching', 'dispatched', 'completed', 'failed', 'unknown')),
-            runtime_id TEXT,
-            worker_id TEXT,
-            runtime_run_id TEXT,
-            dispatched_at TEXT,
-            deadline_at TEXT NOT NULL,
-            result_json TEXT,
-            result_digest TEXT,
-            failure_category TEXT,
-            failure_detail TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            completed_at TEXT,
-            PRIMARY KEY (workspace_id, job_id, attempt_id),
-            UNIQUE (workspace_id, job_id, attempt),
-            UNIQUE (workspace_id, runtime_id, worker_id),
-            FOREIGN KEY (workspace_id, job_id)
-                REFERENCES backend_jobs(workspace_id, job_id) ON DELETE CASCADE,
-            CHECK ((runtime_id IS NULL) = (worker_id IS NULL)),
-            CHECK ((result_json IS NULL) = (result_digest IS NULL)),
-            CHECK ((state = 'completed') = (result_json IS NOT NULL))
-        );
-        INSERT INTO backend_job_attempts SELECT * FROM backend_job_attempts_v71;
-        CREATE INDEX backend_job_attempts_recovery
-            ON backend_job_attempts(workspace_id, state, deadline_at);
-        CREATE TABLE backend_job_deliveries (
-            workspace_id TEXT NOT NULL,
-            delivery_id TEXT NOT NULL,
-            job_id TEXT NOT NULL,
-            attempt_id TEXT NOT NULL,
-            target_runtime_id TEXT NOT NULL,
-            target_worker_id TEXT NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'completed', 'failed', 'unknown')),
-            failure_category TEXT,
-            failure_detail TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            delivered_at TEXT,
-            PRIMARY KEY (workspace_id, delivery_id),
-            FOREIGN KEY (workspace_id, job_id, attempt_id)
-                REFERENCES backend_job_attempts(workspace_id, job_id, attempt_id) ON DELETE CASCADE
-        );
-        INSERT INTO backend_job_deliveries SELECT * FROM backend_job_deliveries_v71;
-        CREATE INDEX backend_job_deliveries_pending
-            ON backend_job_deliveries(workspace_id, state, updated_at);
-        DROP TABLE backend_job_deliveries_v71;
-        DROP TABLE backend_job_attempts_v71;
-        "#,
-    )?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![72_i64, BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_worker_singleton_ownership_v72_to_v73(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 72 {
-        return Err(Error::Store(format!(
-            "expected schema version 72 before {WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    if !column_exists(&tx, "worker_create_reservations", "singleton_key")? {
-        tx.execute(
-            "ALTER TABLE worker_create_reservations ADD COLUMN singleton_key TEXT",
-            [],
-        )?;
-    }
-    if !column_exists(&tx, "worker_create_reservations", "singleton_generation")? {
-        tx.execute(
-            "ALTER TABLE worker_create_reservations ADD COLUMN singleton_generation INTEGER \
-             CHECK (singleton_generation IS NULL OR singleton_generation > 0)",
-            [],
-        )?;
-    }
-    tx.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS worker_singleton_owners (
-            workspace_id TEXT NOT NULL,
-            singleton_key TEXT NOT NULL,
-            runtime_id TEXT NOT NULL,
-            worker_id TEXT NOT NULL,
-            generation INTEGER NOT NULL CHECK (generation > 0),
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, singleton_key),
-            UNIQUE (workspace_id, worker_id),
-            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
-        );
-        CREATE TRIGGER IF NOT EXISTS worker_create_reservation_singleton_lease_insert
-        BEFORE INSERT ON worker_create_reservations
-        WHEN (NEW.singleton_key IS NULL AND NEW.singleton_generation IS NOT NULL)
-          OR (NEW.singleton_key IS NOT NULL AND NEW.singleton_generation IS NULL)
-        BEGIN
-            SELECT RAISE(ABORT, 'worker_singleton_lease_incomplete');
-        END;
-        CREATE TRIGGER IF NOT EXISTS worker_create_reservation_singleton_lease_update
-        BEFORE UPDATE OF singleton_key, singleton_generation ON worker_create_reservations
-        WHEN (NEW.singleton_key IS NULL AND NEW.singleton_generation IS NOT NULL)
-          OR (NEW.singleton_key IS NOT NULL AND NEW.singleton_generation IS NULL)
-        BEGIN
-            SELECT RAISE(ABORT, 'worker_singleton_lease_incomplete');
-        END;
-
-        -- Preserve the two historical singleton conventions as Backend ownership. If an old
-        -- database contains duplicates, deterministically fence every Worker except the oldest.
-        INSERT INTO worker_singleton_owners (
-            workspace_id, singleton_key, runtime_id, worker_id, generation, created_at, updated_at
-        )
-        SELECT worker.workspace_id, 'workspace-orchestrator', worker.runtime_id, worker.worker_id,
-               1, worker.created_at, worker.updated_at
-        FROM worker_registry worker
-        WHERE worker.profile IN ('orchestrator', 'builtin:orchestrator')
-          AND worker.display_name = 'Workspace Orchestrator'
-          AND NOT EXISTS (
-              SELECT 1 FROM worker_registry older
-              WHERE older.workspace_id = worker.workspace_id
-                AND older.profile IN ('orchestrator', 'builtin:orchestrator')
-                AND older.display_name = 'Workspace Orchestrator'
-                AND (older.created_at < worker.created_at
-                     OR (older.created_at = worker.created_at AND older.worker_id < worker.worker_id))
-          );
-        INSERT INTO worker_singleton_owners (
-            workspace_id, singleton_key, runtime_id, worker_id, generation, created_at, updated_at
-        )
-        SELECT worker.workspace_id, 'workspace-memory-consolidation', worker.runtime_id,
-               worker.worker_id, 1, worker.created_at, worker.updated_at
-        FROM worker_registry worker
-        WHERE worker.profile IN ('memory-consolidation', 'builtin:memory-consolidation')
-          AND NOT EXISTS (
-              SELECT 1 FROM worker_registry older
-              WHERE older.workspace_id = worker.workspace_id
-                AND older.profile IN ('memory-consolidation', 'builtin:memory-consolidation')
-                AND (older.created_at < worker.created_at
-                     OR (older.created_at = worker.created_at AND older.worker_id < worker.worker_id))
-          );
-        INSERT INTO worker_create_reservations (
-            workspace_id, allocation_key, worker_id, runtime_id, create_fingerprint,
-            state, created_at, updated_at, request_fingerprint,
-            memory_settings_revision, memory_language, singleton_key, singleton_generation
-        )
-        SELECT worker.workspace_id, 'migration-v73-singleton:' || worker.worker_id,
-               worker.worker_id, worker.runtime_id,
-               'migration-v73:' || CASE
-                   WHEN worker.profile IN ('orchestrator', 'builtin:orchestrator')
-                        AND worker.display_name = 'Workspace Orchestrator'
-                       THEN 'workspace-orchestrator'
-                   ELSE 'workspace-memory-consolidation'
-               END,
-               'created', worker.created_at, worker.updated_at, NULL, NULL, NULL,
-               CASE
-                   WHEN worker.profile IN ('orchestrator', 'builtin:orchestrator')
-                        AND worker.display_name = 'Workspace Orchestrator'
-                       THEN 'workspace-orchestrator'
-                   ELSE 'workspace-memory-consolidation'
-               END,
-               1
-        FROM worker_registry worker
-        WHERE (
-                (
-                    worker.profile IN ('orchestrator', 'builtin:orchestrator')
-                    AND worker.display_name = 'Workspace Orchestrator'
-                )
-                OR worker.profile IN ('memory-consolidation', 'builtin:memory-consolidation')
-              )
-          AND NOT EXISTS (
-              SELECT 1 FROM worker_create_reservations reservation
-              WHERE reservation.workspace_id = worker.workspace_id
-                AND reservation.worker_id = worker.worker_id
-          );
-        UPDATE worker_create_reservations
-        SET singleton_key = (
-                SELECT CASE
-                    WHEN worker.profile IN ('orchestrator', 'builtin:orchestrator')
-                         AND worker.display_name = 'Workspace Orchestrator'
-                        THEN 'workspace-orchestrator'
-                    ELSE 'workspace-memory-consolidation'
-                END
-                FROM worker_registry worker
-                WHERE worker.workspace_id = worker_create_reservations.workspace_id
-                  AND worker.worker_id = worker_create_reservations.worker_id
-                  AND (
-                        (worker.profile IN ('orchestrator', 'builtin:orchestrator')
-                         AND worker.display_name = 'Workspace Orchestrator')
-                        OR worker.profile IN ('memory-consolidation', 'builtin:memory-consolidation')
-                      )
-            ),
-            singleton_generation = 1
-        WHERE EXISTS (
-            SELECT 1 FROM worker_registry worker
-            WHERE worker.workspace_id = worker_create_reservations.workspace_id
-              AND worker.worker_id = worker_create_reservations.worker_id
-              AND (
-                    (worker.profile IN ('orchestrator', 'builtin:orchestrator')
-                     AND worker.display_name = 'Workspace Orchestrator')
-                    OR worker.profile IN ('memory-consolidation', 'builtin:memory-consolidation')
-                  )
-        );
-        "#,
-    )?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![73_i64, WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_ordered_worker_projection_v73_to_v74(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 73 {
-        return Err(Error::Store(format!(
-            "expected schema version 73 before {ORDERED_WORKER_PROJECTION_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    tx.execute_batch(
-        r#"
-        ALTER TABLE worker_registry_observations RENAME TO worker_registry_observations_v73;
-        CREATE TABLE worker_registry_observations (
-            workspace_id TEXT NOT NULL,
-            runtime_id TEXT NOT NULL,
-            worker_id TEXT NOT NULL,
-            availability TEXT NOT NULL CHECK (availability IN ('observed', 'unavailable')),
-            worker_json TEXT,
-            observed_at TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, runtime_id, worker_id),
-            FOREIGN KEY (workspace_id, worker_id)
-                REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE
-        );
-        INSERT INTO worker_registry_observations (
-            workspace_id, runtime_id, worker_id, availability, worker_json, observed_at
-        )
-        SELECT workspace_id, runtime_id, worker_id, availability, worker_json, observed_at
-        FROM worker_registry_observations_v73;
-        DROP TABLE worker_registry_observations_v73;
-
-        DROP TABLE IF EXISTS worker_registry_projection_cursors;
-        DROP TABLE IF EXISTS worker_registry_projection_revisions;
-
-        ALTER TABLE worker_registry_projection_removals
-            RENAME TO worker_registry_projection_removals_v73;
-        CREATE TABLE worker_registry_projection_removals (
-            workspace_id TEXT NOT NULL,
-            runtime_id TEXT NOT NULL,
-            worker_id TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, runtime_id, worker_id)
-        );
-        INSERT INTO worker_registry_projection_removals (workspace_id, runtime_id, worker_id)
-        SELECT workspace_id, runtime_id, worker_id
-        FROM worker_registry_projection_removals_v73;
-        DROP TABLE worker_registry_projection_removals_v73;
-        "#,
-    )?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![74_i64, ORDERED_WORKER_PROJECTION_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_runtime_scoped_worker_identity_v74_to_v75(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 74 {
-        return Err(Error::Store(format!(
-            "expected schema version 74 before {RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-    let foreign_keys_enabled =
-        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))? != 0;
-    let legacy_alter_table_enabled =
-        conn.query_row("PRAGMA legacy_alter_table", [], |row| row.get::<_, i64>(0))? != 0;
-    if foreign_keys_enabled {
-        conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-    }
-    if !legacy_alter_table_enabled {
-        conn.execute_batch("PRAGMA legacy_alter_table = ON;")?;
-    }
-    let result = (|| {
-        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-        tx.execute_batch(
-            r#"
-            DROP INDEX worker_control_grants_controller;
-            DROP INDEX worker_control_grants_subject;
-            DROP INDEX worker_workdir_links_active_workdir_unique;
-            DROP INDEX worker_workdir_links_active_alias_unique;
-            DROP INDEX worker_workdir_links_workdir;
-            DROP INDEX idx_worker_registry_workspace_runtime_worker;
-            DROP INDEX worker_registry_runtime;
-
-            ALTER TABLE worker_registry_observations RENAME TO worker_registry_observations_v74;
-            ALTER TABLE worker_control_grants RENAME TO worker_control_grants_v74;
-            ALTER TABLE worker_workdir_links RENAME TO worker_workdir_links_v74;
-            ALTER TABLE worker_registry RENAME TO worker_registry_v74;
-
-            CREATE TABLE worker_registry (
-                workspace_id TEXT NOT NULL,
-                worker_id TEXT NOT NULL,
-                runtime_id TEXT NOT NULL,
-                display_name TEXT NOT NULL,
-                profile TEXT,
-                retention_state TEXT NOT NULL CHECK (retention_state IN ('normal', 'pinned')),
-                transcript_ref TEXT,
-                session_ref TEXT,
-                summary_ref TEXT,
-                diagnostics_ref TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (workspace_id, runtime_id, worker_id),
-                FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
-            );
-            INSERT INTO worker_registry
-            SELECT * FROM worker_registry_v74;
-
-            UPDATE workspace_resource_keys AS resource
-            SET resource_id = COALESCE(
-                (
-                    SELECT hex(worker.runtime_id) || ':' || hex(worker.worker_id)
-                    FROM worker_registry AS worker
-                    WHERE worker.workspace_id = resource.workspace_id
-                      AND worker.worker_id = resource.resource_id
-                    LIMIT 1
-                ),
-                (
-                    SELECT hex(reservation.runtime_id) || ':' || hex(reservation.worker_id)
-                    FROM worker_create_reservations AS reservation
-                    WHERE reservation.workspace_id = resource.workspace_id
-                      AND reservation.worker_id = resource.resource_id
-                    LIMIT 1
-                )
-            )
-            WHERE resource.resource_kind = 'worker'
-              AND (
-                    EXISTS (
-                        SELECT 1 FROM worker_registry AS worker
-                        WHERE worker.workspace_id = resource.workspace_id
-                          AND worker.worker_id = resource.resource_id
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM worker_create_reservations AS reservation
-                        WHERE reservation.workspace_id = resource.workspace_id
-                          AND reservation.worker_id = resource.resource_id
-                    )
-                  );
-
-            CREATE TABLE worker_registry_observations (
-                workspace_id TEXT NOT NULL,
-                runtime_id TEXT NOT NULL,
-                worker_id TEXT NOT NULL,
-                availability TEXT NOT NULL CHECK (availability IN ('observed', 'unavailable')),
-                worker_json TEXT,
-                observed_at TEXT NOT NULL,
-                PRIMARY KEY (workspace_id, runtime_id, worker_id),
-                FOREIGN KEY (workspace_id, runtime_id, worker_id)
-                    REFERENCES worker_registry(workspace_id, runtime_id, worker_id) ON DELETE CASCADE
-            );
-            INSERT INTO worker_registry_observations
-            SELECT * FROM worker_registry_observations_v74;
-
-            CREATE TABLE worker_control_grants (
-                grant_id TEXT NOT NULL,
-                workspace_id TEXT NOT NULL,
-                controller_runtime_id TEXT NOT NULL,
-                controller_worker_id TEXT NOT NULL,
-                subject_runtime_id TEXT NOT NULL,
-                subject_worker_id TEXT NOT NULL,
-                relation TEXT NOT NULL,
-                origin TEXT NOT NULL,
-                permissions_json TEXT NOT NULL,
-                operation_id TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                revoked_at TEXT,
-                PRIMARY KEY (workspace_id, grant_id),
-                UNIQUE (workspace_id, controller_runtime_id, controller_worker_id, operation_id),
-                FOREIGN KEY (workspace_id, controller_runtime_id, controller_worker_id)
-                    REFERENCES worker_registry(workspace_id, runtime_id, worker_id) ON DELETE CASCADE,
-                FOREIGN KEY (workspace_id, subject_runtime_id, subject_worker_id)
-                    REFERENCES worker_registry(workspace_id, runtime_id, worker_id) ON DELETE CASCADE
-            );
-            INSERT INTO worker_control_grants
-            SELECT * FROM worker_control_grants_v74;
-
-            CREATE TABLE worker_workdir_links (
-                workspace_id TEXT NOT NULL,
-                runtime_id TEXT NOT NULL,
-                worker_id TEXT NOT NULL,
-                workdir_id TEXT NOT NULL,
-                alias TEXT NOT NULL,
-                linked_at TEXT NOT NULL,
-                unlinked_at TEXT,
-                capabilities TEXT NOT NULL CHECK (capabilities IN (
-                    'all', 'read_only', 'read_write', 'command_only', 'read_command'
-                )),
-                PRIMARY KEY (workspace_id, runtime_id, worker_id, workdir_id, alias),
-                FOREIGN KEY (workspace_id, runtime_id, worker_id)
-                    REFERENCES worker_registry(workspace_id, runtime_id, worker_id) ON DELETE CASCADE,
-                FOREIGN KEY (workspace_id, workdir_id)
-                    REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
-            );
-            INSERT INTO worker_workdir_links (
-                workspace_id, runtime_id, worker_id, workdir_id, alias,
-                linked_at, unlinked_at, capabilities
-            )
-            SELECT workspace_id, runtime_id, worker_id, workdir_id, alias,
-                   linked_at, unlinked_at, capabilities
-            FROM worker_workdir_links_v74;
-
-            DROP TABLE worker_registry_observations_v74;
-            DROP TABLE worker_control_grants_v74;
-            DROP TABLE worker_workdir_links_v74;
-            DROP TABLE worker_registry_v74;
-
-            CREATE INDEX worker_control_grants_controller ON worker_control_grants(
-                workspace_id, controller_runtime_id, controller_worker_id, revoked_at
-            );
-            CREATE INDEX worker_control_grants_subject ON worker_control_grants(
-                workspace_id, subject_runtime_id, subject_worker_id, revoked_at
-            );
-            CREATE UNIQUE INDEX worker_workdir_links_active_workdir_unique
-                ON worker_workdir_links(workspace_id, workdir_id) WHERE unlinked_at IS NULL;
-            CREATE UNIQUE INDEX worker_workdir_links_active_alias_unique
-                ON worker_workdir_links(workspace_id, runtime_id, worker_id, alias)
-                WHERE unlinked_at IS NULL;
-            CREATE INDEX worker_workdir_links_workdir
-                ON worker_workdir_links(workspace_id, workdir_id);
-            CREATE INDEX worker_registry_runtime
-                ON worker_registry(workspace_id, runtime_id, worker_id);
-
-            CREATE TRIGGER worker_registry_insert_blocked_by_runtime_removal
-            BEFORE INSERT ON worker_registry FOR EACH ROW
-            WHEN EXISTS (
-                SELECT 1 FROM runtime_removal_operations operation
-                WHERE operation.runtime_id = NEW.runtime_id
-                  AND operation.state IN ('pending', 'cleanup_pending')
-            )
-            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-
-            CREATE TRIGGER worker_registry_update_blocked_by_runtime_removal
-            BEFORE UPDATE ON worker_registry FOR EACH ROW
-            WHEN EXISTS (
-                SELECT 1 FROM runtime_removal_operations operation
-                WHERE operation.runtime_id = NEW.runtime_id
-                  AND operation.state IN ('pending', 'cleanup_pending')
-            )
-            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-
-            CREATE TRIGGER workdir_attachment_insert_blocked_by_runtime_removal
-            BEFORE INSERT ON worker_workdir_links FOR EACH ROW
-            WHEN EXISTS (
-                SELECT 1 FROM runtime_removal_operations operation
-                WHERE operation.runtime_id = NEW.runtime_id
-                  AND operation.state IN ('pending', 'cleanup_pending')
-            )
-            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-
-            CREATE TRIGGER workdir_attachment_update_blocked_by_runtime_removal
-            BEFORE UPDATE ON worker_workdir_links FOR EACH ROW
-            WHEN EXISTS (
-                SELECT 1 FROM runtime_removal_operations operation
-                WHERE operation.runtime_id = NEW.runtime_id
-                  AND operation.state IN ('pending', 'cleanup_pending')
-            )
-            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
-
-            CREATE TRIGGER ticket_assignment_worker_parent_tombstone_delete
-            BEFORE DELETE ON worker_registry
-            WHEN EXISTS (
-                SELECT 1 FROM ticket_worker_assignments AS assignment
-                WHERE assignment.workspace_id = OLD.workspace_id
-                  AND assignment.principal_kind = 'worker'
-                  AND assignment.runtime_id = OLD.runtime_id
-                  AND assignment.worker_id = OLD.worker_id
-            )
-            BEGIN
-                INSERT OR IGNORE INTO ticket_assignment_worker_tombstones (
-                    workspace_id, runtime_id, worker_id, deleted_at
-                ) VALUES (OLD.workspace_id, OLD.runtime_id, OLD.worker_id, CURRENT_TIMESTAMP);
-            END;
-
-            CREATE TRIGGER ticket_assignment_worker_parent_tombstone_move
-            BEFORE UPDATE OF runtime_id ON worker_registry
-            WHEN OLD.runtime_id != NEW.runtime_id
-             AND EXISTS (
-                SELECT 1 FROM ticket_worker_assignments AS assignment
-                WHERE assignment.workspace_id = OLD.workspace_id
-                  AND assignment.principal_kind = 'worker'
-                  AND assignment.runtime_id = OLD.runtime_id
-                  AND assignment.worker_id = OLD.worker_id
-            )
-            BEGIN
-                INSERT OR IGNORE INTO ticket_assignment_worker_tombstones (
-                    workspace_id, runtime_id, worker_id, deleted_at
-                ) VALUES (OLD.workspace_id, OLD.runtime_id, OLD.worker_id, CURRENT_TIMESTAMP);
-            END;
-            "#,
-        )?;
-        tx.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-            params![75_i64, RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME],
-        )?;
-        tx.commit()?;
-        Ok(())
-    })();
-    let restore_result = match (legacy_alter_table_enabled, foreign_keys_enabled) {
-        (false, true) => {
-            conn.execute_batch("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;")
-        }
-        (false, false) => conn.execute_batch("PRAGMA legacy_alter_table = OFF;"),
-        (true, true) => conn.execute_batch("PRAGMA foreign_keys = ON;"),
-        (true, false) => Ok(()),
-    }
-    .map_err(Error::from);
-    match (result, restore_result) {
-        (Err(error), _) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => {
-            let violations = conn
-                .prepare("PRAGMA foreign_key_check")?
-                .query_map([], |_| Ok(()))?
-                .count();
-            if violations != 0 {
-                return Err(Error::Store(format!(
-                    "Runtime-scoped Worker identity migration left {violations} foreign key violation(s)"
-                )));
-            }
-            Ok(())
-        }
-    }
-}
-
-fn migrate_archive_observe_grants_v75_to_v76(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 75 {
-        return Err(Error::Store(format!(
-            "expected schema version 75 before {ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    tx.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS worker_session_archive_observe_grants (
-            workspace_id TEXT NOT NULL,
-            archive_id TEXT NOT NULL,
-            controller_runtime_id TEXT NOT NULL,
-            controller_worker_id TEXT NOT NULL,
-            subject_runtime_id TEXT NOT NULL,
-            subject_worker_id TEXT NOT NULL,
-            source_grant_id TEXT NOT NULL,
-            granted_at TEXT NOT NULL,
-            revoked_at TEXT,
-            PRIMARY KEY (
-                workspace_id, archive_id,
-                controller_runtime_id, controller_worker_id,
-                source_grant_id
-            ),
-            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-            FOREIGN KEY (archive_id) REFERENCES worker_session_archives(archive_id) ON DELETE CASCADE
-        );
-        CREATE INDEX IF NOT EXISTS worker_session_archive_observe_grants_controller
-            ON worker_session_archive_observe_grants(
-                workspace_id, controller_runtime_id, controller_worker_id, archive_id
-            );
-        "#,
-    )?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![76_i64, ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_assignment_work_v81_to_v82(conn: &Connection) -> Result<()> {
-    if current_schema_version(conn)? != 81 {
-        return Err(Error::Store(
-            "Ticket work separation requires schema 81".into(),
-        ));
-    }
-    let foreign_keys =
-        conn.pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))?;
-    let legacy =
-        conn.pragma_query_value(None, "legacy_alter_table", |row| row.get::<_, bool>(0))?;
-    conn.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;")?;
-    let result = (|| {
-        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-        let dependents = {
-            let mut stmt = tx.prepare("SELECT sql FROM sqlite_schema WHERE tbl_name='ticket_current_worker_assignments' AND type IN ('index','trigger') AND sql IS NOT NULL AND name != 'ticket_current_worker_role_idx'")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        // The retained v82 migration keeps its original coder role contract.
-        let schema = include_str!("latest_schema.sql")
-            .replace(
-                "role TEXT NOT NULL DEFAULT 'worker'",
-                "role TEXT NOT NULL DEFAULT 'coder'",
-            )
-            .replace(
-                "role IN ('orchestrator', 'worker'",
-                "role IN ('orchestrator', 'coder'",
-            );
-        let start = schema
-            .find("CREATE TABLE ticket_current_worker_assignments (")
-            .ok_or_else(|| Error::Store("Missing assignment schema".into()))?;
-        let end = schema[start..]
-            .find("CREATE TABLE ticket_worker_assignment_events")
-            .ok_or_else(|| Error::Store("Missing assignment schema end".into()))?
-            + start;
-        tx.execute_batch(&schema[start..end].replace(
-            "CREATE TABLE ticket_current_worker_assignments",
-            "CREATE TABLE ticket_current_worker_assignments_v82",
-        ))?;
-        tx.execute_batch("INSERT INTO ticket_current_worker_assignments_v82 SELECT * FROM ticket_current_worker_assignments;
-            DROP TABLE ticket_current_worker_assignments;
-            ALTER TABLE ticket_current_worker_assignments_v82 RENAME TO ticket_current_worker_assignments;")?;
-        for sql in dependents {
-            tx.execute_batch(&sql)?;
-        }
-        tx.execute_batch(include_str!("assignment_work.sql"))?;
-        // Existing done/closed + current-assignment data is preserved, and a
-        // durable release prevents a later reopen from resurrecting old work.
-        tx.execute_batch("INSERT OR IGNORE INTO ticket_assignment_work_releases
-            SELECT current.workspace_id, current.assignment_id, COALESCE(ticket.updated_at, current.updated_at)
-            FROM ticket_current_worker_assignments current JOIN typed_tickets ticket
-              ON ticket.workspace_id=current.workspace_id AND ticket.ticket_id=current.ticket_id
-            WHERE ticket.workflow_state IN ('done','closed');")?;
-        let legacy_plans = {
-            let mut statement =
-                tx.prepare("SELECT operation_id, blockers_json FROM worker_removal_operations")?;
-            let rows = statement.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (operation_id, encoded) in legacy_plans {
-            let mut blockers: Vec<serde_json::Value> = serde_json::from_str(&encoded)
-                .map_err(|error| Error::Store(format!("invalid removal blockers: {error}")))?;
-            let mut changed = false;
-            for blocker in &mut blockers {
-                if blocker.get("kind").and_then(serde_json::Value::as_str)
-                    == Some("current_assignment")
-                {
-                    blocker["kind"] = serde_json::Value::String("unfinished_work".into());
-                    changed = true;
-                }
-            }
-            if changed {
-                let encoded = serde_json::to_string(&blockers)
-                    .map_err(|error| Error::Store(error.to_string()))?;
-                // Historical blocked plans stay blocked; issued fingerprints
-                // and identities are immutable. Fresh planning rereads active work.
-                tx.execute(
-                    "UPDATE worker_removal_operations SET blockers_json=?2 WHERE operation_id=?1",
-                    params![operation_id, encoded],
-                )?;
-            }
-        }
-        let broken: i64 =
-            tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
-                row.get(0)
-            })?;
-        if broken != 0 {
-            return Err(Error::Store(
-                "Ticket work migration foreign-key verification failed".into(),
-            ));
-        }
-        tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES (82,'Ticket responsibility and unfinished work separation')", [])?;
-        tx.commit()?;
-        Ok(())
-    })();
-    conn.pragma_update(None, "legacy_alter_table", legacy)?;
-    conn.pragma_update(None, "foreign_keys", foreign_keys)?;
-    result
-}
-
-fn migrate_ticket_worker_v82_to_v83(conn: &Connection) -> Result<()> {
-    if current_schema_version(conn)? != 82 {
-        return Err(Error::Store(
-            "Ticket Worker migration requires schema 82".into(),
-        ));
-    }
-    let foreign_keys =
-        conn.pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))?;
-    let legacy =
-        conn.pragma_query_value(None, "legacy_alter_table", |row| row.get::<_, bool>(0))?;
-    conn.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;")?;
-    let result = (|| {
-        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-        // Rebuild all role-bearing assignment tables together: merely renaming
-        // the current role would break its historical composite foreign key.
-        let schema = include_str!("latest_schema.sql");
-        let mut dependents = Vec::new();
-        for table in [
-            "ticket_assignment_operations",
-            "ticket_worker_assignments",
-            "ticket_current_worker_assignments",
-            "ticket_worker_assignment_events",
-        ] {
-            let mut stmt = tx.prepare("SELECT sql FROM sqlite_schema WHERE tbl_name=?1 AND type IN ('index','trigger') AND sql IS NOT NULL AND name != 'ticket_current_worker_role_idx'")?;
-            let rows = stmt.query_map([table], |row| row.get::<_, String>(0))?;
-            dependents.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
-            drop(stmt);
-            let declaration = format!("CREATE TABLE {table} (");
-            let start = schema
-                .find(&declaration)
-                .ok_or_else(|| Error::Store(format!("Missing assignment schema for {table}")))?;
-            let end = schema[start..].find(';').ok_or_else(|| {
-                Error::Store(format!("Missing assignment schema end for {table}"))
-            })? + start
-                + 1;
-            let replacement = format!("{table}_v83");
-            tx.execute_batch(&schema[start..end].replacen(
-                &format!("CREATE TABLE {table}"),
-                &format!("CREATE TABLE {replacement}"),
-                1,
-            ))?;
-            let columns = table_columns(&tx, table)?;
-            let values = columns
-                .iter()
-                .map(|column| {
-                    if column == "role" {
-                        "CASE role WHEN 'coder' THEN 'worker' ELSE role END".to_string()
-                    } else {
-                        format!("\"{column}\"")
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let column_names = columns
-                .iter()
-                .map(|column| format!("\"{column}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            // Only role-bearing historical columns are copied. New receipts
-            // classify legacy unfinished assign operations conservatively.
-            tx.execute_batch(&format!(
-                "INSERT INTO {replacement} ({column_names}) SELECT {values} FROM {table};
-                 DROP TABLE {table}; ALTER TABLE {replacement} RENAME TO {table};"
-            ))?;
-            if table == "ticket_assignment_operations"
-                && !columns.iter().any(|c| c == "claim_state")
-            {
-                tx.execute(
-                    "UPDATE ticket_assignment_operations SET claim_state='pending'
-                    WHERE action IN ('assign','reassign') AND assignment_id IS NULL",
-                    [],
-                )?;
-            }
-        }
-        for sql in dependents {
-            tx.execute_batch(&sql.replace("'coder'", "'worker'"))?;
-        }
-        tx.execute(
-            "UPDATE typed_ticket_event_attributes SET value='worker'
-            WHERE key='assignment_role' AND value='coder'",
-            [],
-        )?;
-        let broken: i64 =
-            tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
-                row.get(0)
-            })?;
-        if broken != 0 {
-            return Err(Error::Store(
-                "Ticket work migration foreign-key verification failed".into(),
-            ));
-        }
-        tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES (83,'Generic Ticket Worker roles and durable claims')", [])?;
-        tx.commit()?;
-        Ok(())
-    })();
-    conn.pragma_update(None, "legacy_alter_table", legacy)?;
-    conn.pragma_update(None, "foreign_keys", foreign_keys)?;
-    result
-}
-
-fn migrate_backend_job_resources_v80_to_v81(conn: &Connection) -> Result<()> {
-    if current_schema_version(conn)? != 80 {
-        return Err(Error::Store(
-            "Backend Job resource migration requires schema 80".into(),
-        ));
-    }
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    tx.execute_batch(
-        "ALTER TABLE backend_jobs ADD COLUMN resource_key TEXT;
-         CREATE INDEX backend_jobs_resource ON backend_jobs(workspace_id, resource_key, created_at);",
-    )?;
-    // Pre-grant requests had no resource lock. Preserve their exact stored JSON
-    // and fingerprint; serde defaults read them as empty grants / no key.
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations(version, name) VALUES (81, 'Backend Job immutable resource serialization')",
-        [],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_backend_job_worker_cleanup_v76_to_v77(conn: &Connection) -> Result<()> {
-    let current = current_schema_version(conn)?;
-    if current != 76 {
-        return Err(Error::Store(format!(
-            "expected schema version 76 before {BACKEND_JOB_WORKER_CLEANUP_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    tx.execute_batch(
-        r#"
-        ALTER TABLE backend_job_attempts ADD COLUMN worker_cleanup_state TEXT
-            CHECK (worker_cleanup_state IN ('pending', 'executing', 'completed', 'failed'));
-        ALTER TABLE backend_job_attempts ADD COLUMN worker_cleanup_failure_category TEXT;
-        ALTER TABLE backend_job_attempts ADD COLUMN worker_cleanup_failure_detail TEXT;
-        ALTER TABLE backend_job_attempts ADD COLUMN worker_cleanup_updated_at TEXT;
-        ALTER TABLE backend_job_attempts ADD COLUMN worker_cleanup_completed_at TEXT;
-        UPDATE backend_job_attempts
-        SET worker_cleanup_state = CASE
-                WHEN runtime_id IS NULL THEN 'completed'
-                ELSE 'pending'
-            END,
-            worker_cleanup_updated_at = updated_at,
-            worker_cleanup_completed_at = CASE
-                WHEN runtime_id IS NULL THEN updated_at
-                ELSE NULL
-            END
-        WHERE state IN ('completed', 'failed', 'unknown');
-        CREATE INDEX backend_job_attempts_worker_cleanup
-            ON backend_job_attempts(workspace_id, worker_cleanup_state, updated_at);
-        "#,
-    )?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![77_i64, BACKEND_JOB_WORKER_CLEANUP_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
 fn read_workspace_config_grant(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<server_api::WorkspaceConfigGrantResponse> {
@@ -16021,87 +13570,6 @@ fn read_workspace_config_grant(
         },
         revoked: row.get(6)?,
     })
-}
-
-fn migrate_workspace_config_v78_to_v79(conn: &Connection) -> Result<()> {
-    if current_schema_version(conn)? != 78 {
-        return Err(Error::Store(
-            "Workspace config migration requires schema 78".into(),
-        ));
-    }
-    let foreign_keys =
-        conn.pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))?;
-    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-    let result = (|| {
-        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-        let dependents = {
-            let mut stmt = tx.prepare("SELECT sql FROM sqlite_schema WHERE tbl_name='workdir_registry' AND type IN ('index','trigger') AND sql IS NOT NULL")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let schema = include_str!("latest_schema.sql");
-        let start = schema
-            .find("CREATE TABLE \"workdir_registry\"")
-            .ok_or_else(|| Error::Store("Missing Workdir schema".into()))?;
-        let end = schema[start..]
-            .find("CREATE TABLE external_workdir_grants")
-            .ok_or_else(|| Error::Store("Missing Workdir schema end".into()))?
-            + start;
-        if column_exists(&tx, "workdir_registry", "workspace_config_grant_id")?
-            && table_exists(&tx, "workspace_config_grants")?
-        {
-            tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES (79,'Workspace config grants and logical Workdirs')", [])?;
-            tx.commit()?;
-            return Ok(());
-        }
-        tx.execute_batch(include_str!("workspace_config_grants.sql"))?;
-        tx.execute_batch(&schema[start..end].replace(
-            "CREATE TABLE \"workdir_registry\"",
-            "CREATE TABLE workdir_registry_v79",
-        ))?;
-        tx.execute_batch("INSERT INTO workdir_registry_v79 (workspace_id,workdir_id,display_name,source_kind,runtime_id,repository_id,external_grant_id,creation_selector,creation_ref,creation_tree,current_selector,current_ref,current_tree,observed_at_epoch_seconds,materialization_status,cleanliness,created_at,updated_at) SELECT workspace_id,workdir_id,display_name,source_kind,runtime_id,repository_id,external_grant_id,creation_selector,creation_ref,creation_tree,current_selector,current_ref,current_tree,observed_at_epoch_seconds,materialization_status,cleanliness,created_at,updated_at FROM workdir_registry; DROP TABLE workdir_registry; ALTER TABLE workdir_registry_v79 RENAME TO workdir_registry;")?;
-        for sql in dependents {
-            tx.execute_batch(&sql)?;
-        }
-        let broken: bool = {
-            let mut stmt = tx.prepare("PRAGMA foreign_key_check")?;
-            let mut rows = stmt.query([])?;
-            rows.next()?.is_some()
-        };
-        if broken {
-            return Err(Error::Store(
-                "Workspace config migration foreign-key verification failed".into(),
-            ));
-        }
-        tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES (79,'Workspace config grants and logical Workdirs')", [])?;
-        tx.commit()?;
-        Ok(())
-    })();
-    if foreign_keys {
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-    }
-    result
-}
-
-fn migrate_workdir_connection_id_v77_to_v78(conn: &Connection) -> Result<()> {
-    use rusqlite::TransactionBehavior;
-    let current = current_schema_version(conn)?;
-    if current != 77 {
-        return Err(Error::Store(format!(
-            "expected schema version 77 before {WORKDIR_CONNECTION_ID_MIGRATION_NAME} migration, found {current}"
-        )));
-    }
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    tx.execute_batch(
-        "ALTER TABLE worker_workdir_links ADD COLUMN connection_id TEXT NOT NULL DEFAULT '';
-         UPDATE worker_workdir_links SET connection_id = lower(hex(randomblob(16)));",
-    )?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![78_i64, WORKDIR_CONNECTION_ID_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
 }
 
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
@@ -16553,12 +14021,22 @@ fn collect_reference_diagnostics(
     Ok(())
 }
 
+fn read_workspace_memory_settings(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkspaceMemorySettingsRecord> {
+    Ok(WorkspaceMemorySettingsRecord {
+        workspace_id: row.get(0)?,
+        language: row.get(1)?,
+        created_at: row.get(2)?,
+        updated_at: row.get(3)?,
+    })
+}
+
 fn validate_workspace_memory_settings_snapshot(
     snapshot: &manifest::WorkspaceMemorySettingsSnapshot,
     expected_workspace_id: &str,
 ) -> Result<()> {
     if snapshot.workspace_id != expected_workspace_id
-        || snapshot.settings_revision == 0
         || !manifest::is_normalized_workspace_memory_language(&snapshot.language)
     {
         return Err(Error::Store(
@@ -16575,7 +14053,6 @@ fn validate_workspace_memory_settings_record(
     validate_workspace_memory_settings_snapshot(
         &manifest::WorkspaceMemorySettingsSnapshot {
             workspace_id: record.workspace_id.clone(),
-            settings_revision: record.settings_revision,
             language: record.language.clone(),
         },
         expected_workspace_id,
@@ -16682,12 +14159,10 @@ fn bound_worker_create_fingerprint(
     snapshot: &manifest::WorkspaceMemorySettingsSnapshot,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"workspace-worker-create-v2\0");
+    digest.update(b"workspace-worker-create-v3\0");
     digest.update(request_fingerprint.as_bytes());
     digest.update(b"\0");
     digest.update(snapshot.workspace_id.as_bytes());
-    digest.update(b"\0");
-    digest.update(snapshot.settings_revision.to_be_bytes());
     digest.update(b"\0");
     digest.update(snapshot.language.as_bytes());
     let encoded = digest
@@ -16870,8 +14345,36 @@ fn workspace_schema_migration_plan(conn: &Connection) -> Result<WorkspaceSchemaM
     })
 }
 
+#[cfg(test)]
 fn apply_migrations(conn: &Connection) -> Result<()> {
+    apply_migrations_with_secret_source(
+        conn,
+        conn.path().filter(|path| !path.is_empty()).map(Path::new),
+    )
+}
+
+fn apply_migrations_with_secret_source(
+    conn: &Connection,
+    secret_source: Option<&Path>,
+) -> Result<()> {
     let plan = workspace_schema_migration_plan(conn)?;
+    // Check recovery blockers before any retained migration commits. Waiting until
+    // schema 87 would strand a schema-84 operator without a runnable old binary.
+    if plan.current_schema_version > 0
+        && plan.current_schema_version < 88
+        && table_exists(conn, "worker_removal_operations")?
+    {
+        let unresolved: Option<String> = conn.query_row(
+            "SELECT operation_id FROM worker_removal_operations WHERE state IN ('executing','failed') ORDER BY operation_id LIMIT 1",
+            [], |row| row.get(0),
+        ).optional()?;
+        if let Some(operation) = unresolved {
+            return Err(Error::Store(format!(
+                "Worker removal {operation} requires receipt reconciliation on the existing Server before schema migration; database remains at schema {}",
+                plan.current_schema_version
+            )));
+        }
+    }
     if plan.current_schema_version == 0 {
         let foreign_keys_enabled =
             conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))? != 0;
@@ -16918,7 +14421,11 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                         step.version
                     ))
                 })?;
-            (migration.apply)(conn)?;
+            if migration.version == 87 {
+                migrate_repository_keys_v86_to_v87_with_secret_source(conn, secret_source)?;
+            } else {
+                (migration.apply)(conn)?;
+            }
         }
     }
 
@@ -16951,56 +14458,6 @@ fn table_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>> {
         .map_err(Error::from)
 }
 
-fn migrate_workdir_credential_candidate_snapshots_v58_to_v59(conn: &Connection) -> Result<()> {
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-    tx.execute_batch(
-        r#"
-        CREATE TABLE workdir_create_credential_candidates (
-            workspace_id TEXT NOT NULL,
-            operation_id TEXT NOT NULL,
-            ordinal INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal < 2),
-            role TEXT NOT NULL CHECK (role IN ('primary', 'workspace_default_fallback')),
-            credential_id TEXT NOT NULL CHECK (length(credential_id) BETWEEN 1 AND 128),
-            credential_revision INTEGER NOT NULL CHECK (credential_revision > 0),
-            PRIMARY KEY (workspace_id, operation_id, ordinal),
-            UNIQUE (workspace_id, operation_id, role),
-            UNIQUE (workspace_id, operation_id, credential_id),
-            FOREIGN KEY (workspace_id, operation_id)
-                REFERENCES workdir_create_operations(workspace_id, operation_id)
-                ON DELETE CASCADE
-        );
-        CREATE INDEX idx_workdir_create_credential_candidates_revision
-            ON workdir_create_credential_candidates(
-                workspace_id, credential_id, credential_revision
-            );
-        CREATE TABLE workdir_create_credential_revision_retentions (
-            workspace_id TEXT NOT NULL,
-            operation_id TEXT NOT NULL,
-            ordinal INTEGER NOT NULL,
-            credential_id TEXT NOT NULL,
-            credential_revision INTEGER NOT NULL,
-            PRIMARY KEY (workspace_id, operation_id, ordinal),
-            FOREIGN KEY (workspace_id, operation_id, ordinal)
-                REFERENCES workdir_create_credential_candidates(
-                    workspace_id, operation_id, ordinal
-                )
-                ON DELETE CASCADE,
-            FOREIGN KEY (workspace_id, credential_id, credential_revision)
-                REFERENCES repository_ssh_credential_revisions(
-                    workspace_id, credential_id, revision
-                )
-                ON DELETE RESTRICT
-        );
-        "#,
-    )?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-        params![59_i64, WORKDIR_CREDENTIAL_CANDIDATE_SNAPSHOT_MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     include!("store_workspace_config_tests.rs");
@@ -17010,7 +14467,7 @@ mod tests {
             c.execute_batch("INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at) VALUES('drive-owner','user','drive-owner','Owner','1','1');
                 INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at) VALUES('drive-ws','drive-owner','Workspace','active','1','1'),('drive-other','drive-owner','Other','active','1','1');")?;
             for workspace in ["drive-ws", "drive-other"] {
-                c.execute("INSERT INTO workspace_signing_identities(workspace_id,key_id,algorithm,private_material_ref,revision,state,created_at,updated_at) VALUES(?1,?1,'ed25519',?1,1,'pending_provisioning','1','1')", [workspace])?;
+                c.execute("INSERT INTO workspace_signing_identities(workspace_id,key_id,algorithm,private_material_ref,state,created_at,updated_at) VALUES(?1,?1,'ed25519',?1,'pending_provisioning','1','1')", [workspace])?;
                 c.execute("INSERT INTO worker_registry(workspace_id,runtime_id,worker_id,display_name,retention_state,created_at,updated_at) VALUES(?1,?2,'worker','Worker','normal','1','1')", params![workspace, crate::hosts::EMBEDDED_RUNTIME_ID])?;
             }
             Ok(())
@@ -17033,20 +14490,16 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let path = t.path().join("server.db");
         let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let legacy = Connection::open_in_memory().unwrap();
+        configure_sqlite(&legacy).unwrap();
+        legacy.execute_batch("CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY);
+            CREATE TABLE accounts(account_id TEXT PRIMARY KEY);
+            CREATE TABLE worker_registry(workspace_id TEXT,runtime_id TEXT,worker_id TEXT,PRIMARY KEY(workspace_id,runtime_id,worker_id));
+            INSERT INTO __yoi_schema_migrations(version,name) VALUES(83,'workspace schema baseline');").unwrap();
+        migrate_workspace_drive_grants_v83_to_v84(&legacy).unwrap();
+        assert_eq!(current_schema_version(&legacy).unwrap(), 84);
+        assert!(table_exists(&legacy, "workspace_drive_grants").unwrap());
         let mut proposed = drive_grant_fixture(&store);
-        store.with_conn(|c| {
-            c.execute_batch("DROP TRIGGER workspace_drive_grants_worker_deleted; DROP TABLE workspace_drive_grants; UPDATE __yoi_schema_migrations SET version=83 WHERE version=84;")?;
-            assert_eq!(current_schema_version(c)?, 83);
-            Ok(())
-        }).unwrap();
-        drop(store);
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
-        store
-            .with_conn(|c| {
-                assert_eq!(current_schema_version(c)?, 84);
-                Ok(())
-            })
-            .unwrap();
         let first = store.create_workspace_drive_grant(&proposed).unwrap();
         assert_eq!(first.grant_id, "1");
         assert_eq!(first.created_by, "drive-owner");
@@ -17165,7 +14618,7 @@ mod tests {
         let proposed = drive_grant_fixture(&store);
         let first = store.create_workspace_drive_grant(&proposed).unwrap();
         store.with_conn(|c| {
-            assert_eq!(current_schema_version(c)?, 84);
+            assert_eq!(current_schema_version(c)?, LATEST_SCHEMA_VERSION);
             assert!(c.execute("INSERT INTO workspace_drive_grants(workspace_id,runtime_id,worker_id,access,created_by,created_at) VALUES('drive-ws',?1,'worker','read_write','drive-owner','now')", [crate::hosts::EMBEDDED_RUNTIME_ID]).is_err());
             assert!(c.execute("INSERT INTO workspace_drive_grants(workspace_id,runtime_id,worker_id,access,created_by,created_at) VALUES('drive-ws','r','w','command','drive-owner','now')", []).is_err());
             assert!(c.execute("UPDATE workspace_drive_grants SET revoked=1 WHERE grant_id=?1", [&first.grant_id]).is_err());
@@ -17901,15 +15354,18 @@ mod tests {
                      VALUES ('workspace-a', 'owner', 'Workspace A', 'active', '1', '1'); \
                      INSERT INTO workspace_runtime_bindings(\
                          workspace_id, runtime_id, display_name, base_url, public_key, \
-                         public_key_fingerprint, binding_revision, state, authentication_mode, \
+                         public_key_fingerprint, binding_id, state, authentication_mode, \
                          created_at, updated_at\
                      ) VALUES (\
                          'workspace-a', 'runtime-a', 'Runtime A', 'https://runtime.invalid', \
-                         'key-a', 'fingerprint-a', 3, 'verified', 'legacy_server_issuer', '1', '1'\
+                         'key-a', 'fingerprint-a', 'binding-live', 'verified', 'legacy_server_issuer', '1', '1'\
                      );",
                 )?;
                 Ok(())
             })
+            .unwrap();
+        store
+            .materialize_workspace_config("workspace-a", "1")
             .unwrap();
         (temp, store)
     }
@@ -17919,14 +15375,14 @@ mod tests {
             .get_workspace_runtime_binding("workspace-a", "runtime-a")
             .unwrap()
             .expect("Runtime binding must remain");
-        assert_eq!(binding.binding_revision, 3);
+        assert_eq!(binding.binding_id, "binding-live");
         assert_eq!(binding.state, WorkspaceRuntimeBindingState::Verified);
         assert!(binding.revoked_at.is_none());
     }
 
     #[test]
-    fn runtime_removal_preflight_rejects_stale_revision_and_active_resources_without_revoking_trust()
-     {
+    fn runtime_removal_preflight_rejects_stale_binding_and_active_resources_without_revoking_trust()
+    {
         let (_temp, store) = runtime_removal_test_store();
         let stale = store
             .reserve_runtime_removal(
@@ -17934,14 +15390,16 @@ mod tests {
                 "runtime-a",
                 "remove-stale",
                 "fingerprint-stale",
-                2,
-                1,
+                "binding-stale",
+                &store
+                    .load_workspace_config("workspace-a")
+                    .unwrap()
+                    .unwrap()
+                    .snapshot
+                    .digest,
             )
             .unwrap_err();
-        assert!(matches!(
-            stale,
-            Error::RuntimeBindingRevisionConflict { .. }
-        ));
+        assert!(matches!(stale, Error::RuntimeBindingIdConflict { .. }));
         assert_runtime_removal_binding_unchanged(&store);
 
         store
@@ -17961,8 +15419,13 @@ mod tests {
                 "runtime-a",
                 "remove-worker",
                 "fingerprint-worker",
-                3,
-                1,
+                "binding-live",
+                &store
+                    .load_workspace_config("workspace-a")
+                    .unwrap()
+                    .unwrap()
+                    .snapshot
+                    .digest,
             )
             .unwrap_err();
         assert!(
@@ -17981,10 +15444,10 @@ mod tests {
                 conn.execute_batch(
                     "INSERT INTO repositories(\
                          workspace_id, repository_id, repository_key, kind, uri, created_at, updated_at, \
-                         source_kind, source_uri, source_revision, source_fingerprint, observed_status\
+                         source_kind, source_uri, source_fingerprint, observed_status\
                      ) VALUES (\
                          'workspace-a', 'repository-a', 'repository-a', 'git', '/repo', '1', '1', \
-                         'local', '/repo', 1, 'source-a', 'unverified'\
+                         'local', '/repo', 'source-a', 'unverified'\
                      ); \
                      INSERT INTO workdir_registry(\
                          workspace_id, workdir_id, source_kind, runtime_id, repository_id, materialization_status, \
@@ -18003,8 +15466,13 @@ mod tests {
                 "runtime-a",
                 "remove-workdir",
                 "fingerprint-workdir",
-                3,
-                1,
+                "binding-live",
+                &store
+                    .load_workspace_config("workspace-a")
+                    .unwrap()
+                    .unwrap()
+                    .snapshot
+                    .digest,
             )
             .unwrap_err();
         assert!(
@@ -18020,11 +15488,11 @@ mod tests {
                 conn.execute(
                     "INSERT INTO workdir_create_operations(\
                          workspace_id, operation_id, request_fingerprint, repository_id, \
-                         resolved_runtime_id, config_revision, config_projection_digest, \
+                         resolved_runtime_id, config_projection_digest, \
                          working_directory_id, state, created_at, updated_at\
                      ) VALUES (\
                          'workspace-a', 'create-workdir', 'request-a', 'repository-a', \
-                         'runtime-a', 1, 'projection-a', 'workdir-b', 'pending', '1', '1'\
+                         'runtime-a', 'projection-a', 'workdir-b', 'pending', '1', '1'\
                      )",
                     [],
                 )?;
@@ -18037,8 +15505,13 @@ mod tests {
                 "runtime-a",
                 "remove-pending",
                 "fingerprint-pending",
-                3,
-                1,
+                "binding-live",
+                &store
+                    .load_workspace_config("workspace-a")
+                    .unwrap()
+                    .unwrap()
+                    .snapshot
+                    .digest,
             )
             .unwrap_err();
         assert!(
@@ -18061,11 +15534,11 @@ mod tests {
                      VALUES ('workspace-b', 'owner-b', 'Workspace B', 'active', '1', '1'); \
                      INSERT INTO workspace_runtime_bindings(\
                          workspace_id, runtime_id, display_name, base_url, public_key, \
-                         public_key_fingerprint, binding_revision, state, authentication_mode, \
+                         public_key_fingerprint, binding_id, state, authentication_mode, \
                          created_at, updated_at\
                      ) VALUES (\
                          'workspace-b', 'runtime-a', 'Runtime A', 'https://runtime.invalid', \
-                         'key-a', 'fingerprint-b', 1, 'verified', 'legacy_server_issuer', '1', '1'\
+                         'key-a', 'fingerprint-b', 'binding-other', 'verified', 'legacy_server_issuer', '1', '1'\
                      );",
                 )?;
                 Ok(())
@@ -18077,8 +15550,13 @@ mod tests {
                 "runtime-a",
                 "remove-shared",
                 "fingerprint-shared",
-                3,
-                1,
+                "binding-live",
+                &store
+                    .load_workspace_config("workspace-a")
+                    .unwrap()
+                    .unwrap()
+                    .snapshot
+                    .digest,
             )
             .unwrap_err();
         assert!(
@@ -18109,8 +15587,13 @@ mod tests {
                 "runtime-a",
                 "remove-fenced",
                 "fingerprint-fenced",
-                3,
-                1,
+                "binding-live",
+                &store
+                    .load_workspace_config("workspace-a")
+                    .unwrap()
+                    .unwrap()
+                    .snapshot
+                    .digest,
             )
             .unwrap();
         let competing_conn = Connection::open(temp.path().join("server.db")).unwrap();
@@ -18120,11 +15603,11 @@ mod tests {
         let blocked_insert = competing_conn.execute(
             "INSERT INTO workspace_runtime_bindings(\
                  workspace_id, runtime_id, display_name, base_url, public_key, \
-                 public_key_fingerprint, binding_revision, state, authentication_mode, \
+                 public_key_fingerprint, binding_id, state, authentication_mode, \
                  created_at, updated_at\
              ) VALUES (\
                  'workspace-b', 'runtime-a', 'Runtime A', 'https://runtime.invalid', \
-                 'key-a', 'fingerprint-b', 1, 'verified', 'legacy_server_issuer', '1', '1'\
+                 'key-a', 'fingerprint-b', 'binding-other', 'verified', 'legacy_server_issuer', '1', '1'\
              )",
             [],
         );
@@ -18144,10 +15627,10 @@ mod tests {
              ) VALUES ('workspace-a', 'racing-allocation', 'racing-worker', 'runtime-a', 'racing-create', 'reserved', '2', '2')",
             "INSERT INTO workdir_create_operations(\
                  workspace_id, operation_id, request_fingerprint, repository_id, resolved_runtime_id, \
-                 config_revision, config_projection_digest, working_directory_id, state, created_at, updated_at\
+                 config_projection_digest, working_directory_id, state, created_at, updated_at\
              ) VALUES (\
                  'workspace-a', 'racing-workdir-create', 'racing-request', 'repository-a', 'runtime-a', \
-                 1, 'racing-projection', 'racing-workdir', 'pending', '2', '2'\
+                 'racing-projection', 'racing-workdir', 'pending', '2', '2'\
              )",
         ] {
             let error = competing_conn.execute(competing_mutation, []).unwrap_err();
@@ -18168,8 +15651,13 @@ mod tests {
                 "runtime-a",
                 "remove-runtime-a",
                 "fingerprint-a",
-                3,
-                7,
+                "binding-live",
+                &store
+                    .load_workspace_config("workspace-a")
+                    .unwrap()
+                    .unwrap()
+                    .snapshot
+                    .digest,
             )
             .unwrap();
         assert!(!reserved.replay);
@@ -18184,8 +15672,13 @@ mod tests {
                 "runtime-a",
                 "remove-runtime-a",
                 "fingerprint-a",
-                3,
-                7,
+                "binding-live",
+                &store
+                    .load_workspace_config("workspace-a")
+                    .unwrap()
+                    .unwrap()
+                    .snapshot
+                    .digest,
             )
             .unwrap();
         assert!(retried.replay);
@@ -18233,43 +15726,7 @@ mod tests {
     fn schema_v59_upgrade_adds_runtime_removal_authority_atomically() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
-        store
-            .with_conn(|conn| {
-                conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")?;
-                downgrade_assignment_work_schema(conn);
-                conn.execute_batch("PRAGMA legacy_alter_table=OFF; PRAGMA foreign_keys=ON;")?;
-                downgrade_schema_66_ticket_and_workdir_authority(conn)?;
-                conn.execute_batch(
-                    "DROP TRIGGER runtime_binding_insert_blocked_by_removal; \
-                     DROP TRIGGER runtime_binding_update_blocked_by_removal; \
-                     DROP TRIGGER worker_registry_insert_blocked_by_runtime_removal; \
-                     DROP TRIGGER worker_registry_update_blocked_by_runtime_removal; \
-                     DROP TRIGGER workdir_registry_insert_blocked_by_runtime_removal; \
-                     DROP TRIGGER workdir_registry_update_blocked_by_runtime_removal; \
-                     DROP TRIGGER worker_assignment_insert_blocked_by_runtime_removal; \
-                     DROP TRIGGER worker_assignment_update_blocked_by_runtime_removal; \
-                     DROP TRIGGER workdir_attachment_insert_blocked_by_runtime_removal; \
-                     DROP TRIGGER workdir_attachment_update_blocked_by_runtime_removal; \
-                     DROP TRIGGER worker_create_insert_blocked_by_runtime_removal; \
-                     DROP TRIGGER worker_create_update_blocked_by_runtime_removal; \
-                     DROP TRIGGER workdir_create_insert_blocked_by_runtime_removal; \
-                     DROP TRIGGER workdir_create_update_blocked_by_runtime_removal; \
-                     DROP TRIGGER worker_removal_insert_blocked_by_runtime_removal; \
-                     DROP TRIGGER worker_removal_update_blocked_by_runtime_removal; \
-                     DROP TRIGGER workdir_removal_insert_blocked_by_runtime_removal; \
-                     DROP TRIGGER workdir_removal_update_blocked_by_runtime_removal; \
-                     DROP TABLE runtime_removal_operations; \
-                     ALTER TABLE worker_removal_operations \
-                     ADD COLUMN run_generation INTEGER NOT NULL DEFAULT 0; \
-                     DELETE FROM __yoi_schema_migrations; \
-                     INSERT INTO __yoi_schema_migrations(version, name) \
-                     VALUES (59, 'workspace schema baseline');",
-                )?;
-                Ok(())
-            })
-            .unwrap();
-        drop(store);
+        prepare_retained_schema(&path, 59);
 
         let migrated = SqliteWorkspaceStore::open(&path).unwrap();
         migrated
@@ -18305,24 +15762,7 @@ mod tests {
     fn schema_v60_upgrade_removes_worker_run_generation_column() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
-        drop(SqliteWorkspaceStore::open(&path).unwrap());
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")
-                .unwrap();
-            downgrade_assignment_work_schema(&conn);
-            conn.execute_batch("PRAGMA legacy_alter_table=OFF; PRAGMA foreign_keys=ON;")
-                .unwrap();
-            downgrade_schema_66_ticket_and_workdir_authority(&conn).unwrap();
-            conn.execute_batch(
-                "ALTER TABLE worker_removal_operations \
-                 ADD COLUMN run_generation INTEGER NOT NULL DEFAULT 0; \
-                 DELETE FROM __yoi_schema_migrations; \
-                 INSERT INTO __yoi_schema_migrations(version,name) \
-                 VALUES (60,'workspace schema baseline');",
-            )
-            .unwrap();
-        }
+        prepare_retained_schema(&path, 60);
 
         drop(SqliteWorkspaceStore::open(&path).unwrap());
         let conn = Connection::open(&path).unwrap();
@@ -18400,54 +15840,13 @@ mod tests {
     fn schema_v65_migrates_ticket_targets_and_workdir_capabilities() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
-        drop(SqliteWorkspaceStore::open(&path).unwrap());
+        prepare_retained_schema(&path, 65);
         let conn = Connection::open(&path).unwrap();
         configure_sqlite(&conn).unwrap();
         conn.execute_batch(
             r#"
-            PRAGMA foreign_keys = OFF;
-            DROP TABLE typed_ticket_targets;
-            ALTER TABLE typed_tickets ADD COLUMN repository_id TEXT;
-            ALTER TABLE typed_tickets ADD COLUMN ref_selector TEXT;
-            CREATE UNIQUE INDEX worker_registry_v74_workspace_worker
-                ON worker_registry(workspace_id, worker_id);
-            DROP INDEX worker_workdir_links_active_workdir_unique;
-            DROP INDEX worker_workdir_links_active_alias_unique;
-            DROP INDEX worker_workdir_links_workdir;
-            CREATE TABLE worker_workdir_links_v65 (
-                workspace_id TEXT NOT NULL,
-                runtime_id TEXT NOT NULL,
-                worker_id TEXT NOT NULL,
-                workdir_id TEXT NOT NULL,
-                alias TEXT NOT NULL,
-                linked_at TEXT NOT NULL,
-                unlinked_at TEXT,
-                PRIMARY KEY (workspace_id, worker_id, workdir_id, alias),
-                FOREIGN KEY (workspace_id, worker_id)
-                    REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE,
-                FOREIGN KEY (workspace_id, workdir_id)
-                    REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
-            );
-            INSERT INTO worker_workdir_links_v65 (
-                workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at
-            )
-            SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at
-              FROM worker_workdir_links;
-            DROP TABLE worker_workdir_links;
-            ALTER TABLE worker_workdir_links_v65 RENAME TO worker_workdir_links;
-            CREATE UNIQUE INDEX worker_workdir_links_active_workdir_unique
-                ON worker_workdir_links(workspace_id, workdir_id) WHERE unlinked_at IS NULL;
-            CREATE UNIQUE INDEX worker_workdir_links_active_alias_unique
-                ON worker_workdir_links(workspace_id, worker_id, alias) WHERE unlinked_at IS NULL;
-            CREATE INDEX worker_workdir_links_workdir
-                ON worker_workdir_links(workspace_id, workdir_id);
-            DELETE FROM __yoi_schema_migrations;
-            INSERT INTO __yoi_schema_migrations(version, name)
-                VALUES (65, 'workspace schema baseline');
-            DELETE FROM ticket_schema_migrations;
-            INSERT INTO ticket_schema_migrations(version, name, applied_at)
-                VALUES (6, 'ticket schema baseline', '1');
-
+            BEGIN;
+            PRAGMA defer_foreign_keys = ON;
             INSERT INTO accounts(account_id, kind, handle, display_name, created_at, updated_at)
                 VALUES ('owner', 'user', 'owner', 'Owner', '1', '1');
             INSERT INTO workspaces(
@@ -18521,7 +15920,7 @@ mod tests {
                  'checkout', '1', NULL),
                 ('workspace-a', 'runtime-a', 'worker-external', 'workdir-external',
                  'external', '1', NULL);
-            PRAGMA foreign_keys = ON;
+            COMMIT;
             "#,
         )
         .unwrap();
@@ -18805,7 +16204,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .iter()
                 .map(|s| s.version)
                 .collect::<Vec<_>>(),
-            vec![83, 84]
+            (83..=LATEST_SCHEMA_VERSION).collect::<Vec<_>>()
         );
         let store = SqliteWorkspaceStore::open(&path).unwrap();
         let assignment = store
@@ -18838,6 +16237,108 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         }).unwrap();
     }
 
+    // Legacy fixtures compose frozen counter-bearing SQL, never current-schema downgrades.
+    fn create_frozen_schema_v85(conn: &Connection) -> Result<()> {
+        conn.execute_batch("CREATE TABLE worker_restore_intents (
+        workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL, worker_id TEXT NOT NULL,
+        domain_key TEXT NOT NULL, request_id TEXT NOT NULL, expected_token TEXT NOT NULL,
+        settled INTEGER NOT NULL CHECK(settled IN (0,1)),
+        PRIMARY KEY(workspace_id,runtime_id,worker_id,request_id),
+        FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX worker_restore_intent_pending_domain ON worker_restore_intents(workspace_id,runtime_id,worker_id,domain_key) WHERE settled=0;")?;
+
+        conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_targets;")?;
+        conn.execute_batch(include_str!("frozen_schema_v85.sql"))?;
+        conn.execute_batch(
+            r#"
+        ALTER TABLE typed_tickets RENAME TO typed_tickets_legacy_v66;
+        CREATE TABLE typed_tickets (
+            workspace_id TEXT NOT NULL,
+            ticket_id TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            priority TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT,
+            updated_at TEXT,
+            assignee TEXT,
+            readiness TEXT,
+            workflow_state TEXT NOT NULL,
+            workflow_state_explicit INTEGER NOT NULL,
+            queued_by TEXT,
+            queued_at TEXT,
+            resolution TEXT,
+            PRIMARY KEY (workspace_id, ticket_id),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+        DROP TABLE typed_tickets_legacy_v66;
+        CREATE INDEX idx_typed_tickets_workspace_state_updated
+            ON typed_tickets(workspace_id, workflow_state, updated_at DESC, ticket_id);
+        CREATE INDEX idx_typed_tickets_workspace_updated
+            ON typed_tickets(workspace_id, updated_at DESC, ticket_id);
+        CREATE TRIGGER ticket_assignment_ticket_parent_tombstone
+            BEFORE DELETE ON typed_tickets
+            WHEN EXISTS (
+                SELECT 1 FROM ticket_worker_assignments AS assignment
+                WHERE assignment.workspace_id = OLD.workspace_id
+                  AND assignment.ticket_id = OLD.ticket_id
+            )
+            BEGIN
+                INSERT OR IGNORE INTO ticket_assignment_ticket_tombstones (
+                    workspace_id, ticket_id, deleted_at
+                ) VALUES (OLD.workspace_id, OLD.ticket_id, CURRENT_TIMESTAMP);
+            END;
+        CREATE TABLE typed_ticket_targets (
+            workspace_id TEXT NOT NULL,
+            ticket_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            repository_key TEXT NOT NULL,
+            ref_selector TEXT,
+            access TEXT NOT NULL CHECK (access IN ('read_only', 'read_write')),
+            PRIMARY KEY (workspace_id, ticket_id, ordinal),
+            UNIQUE (workspace_id, ticket_id, repository_key),
+            FOREIGN KEY (workspace_id, ticket_id)
+                REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE,
+            FOREIGN KEY (workspace_id, repository_key)
+                REFERENCES repositories(workspace_id, repository_key) ON DELETE RESTRICT
+        );
+        CREATE INDEX typed_ticket_targets_workspace_repository
+            ON typed_ticket_targets(workspace_id, repository_key, ticket_id);
+        ALTER TABLE worker_workdir_links ADD COLUMN connection_id TEXT NOT NULL DEFAULT '';
+        ALTER TABLE worker_workdir_links
+            ADD COLUMN capabilities TEXT NOT NULL
+            CHECK (capabilities IN (
+                'all', 'read_only', 'read_write', 'command_only', 'read_command'
+            ));
+        "#,
+        )?;
+        conn.execute_batch(include_str!("assignment_work.sql"))?;
+        ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
+            Error::Store(format!(
+                "fresh Workspace Ticket schema verification failed: {error}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    include!("schema_equivalence_tests.rs");
+    include!("migration_entrypoint_tests.rs");
+
+    fn prepare_retained_schema(path: &Path, version: i64) {
+        prepare_schema_v52(path);
+        let conn = Connection::open(path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > 52 && migration.version <= version)
+        {
+            (migration.apply)(&conn).unwrap();
+        }
+    }
+
     fn prepare_schema_v52(path: &Path) {
         let conn = Connection::open(path).unwrap();
         configure_sqlite(&conn).unwrap();
@@ -18845,7 +16346,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         merge_request::migrate(&conn).unwrap();
         conn.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;")
             .unwrap();
-        create_latest_workspace_schema(&conn).unwrap();
+        create_frozen_schema_v85(&conn).unwrap();
         downgrade_assignment_work_schema(&conn);
         downgrade_schema_66_ticket_and_workdir_authority(&conn).unwrap();
         conn.execute_batch("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;")
@@ -19120,6 +16621,23 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     version: 84,
                     name: WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME.to_string()
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 85,
+                    name: "content-addressed Flow sources".to_string()
+                },
+                WorkspaceSchemaMigrationStep {
+                    version: 86,
+                    name: "content-fenced config, Memory settings and Jobs".to_string()
+                },
+                WorkspaceSchemaMigrationStep {
+                    version: 87,
+                    name: "Repository SSH key identities and encrypted operation objects"
+                        .to_string()
+                },
+                WorkspaceSchemaMigrationStep {
+                    version: 88,
+                    name: "Runtime binding identities and retention content contracts".to_string()
+                },
             ]
         );
 
@@ -19214,6 +16732,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                         (82, "Ticket responsibility and unfinished work separation".to_string()),
                         (83, "Generic Ticket Worker roles and durable claims".to_string()),
                         (84, WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME.to_string()),
+(85, "content-addressed Flow sources".to_string()),
+(86, "content-fenced config, Memory settings and Jobs".to_string()),
+(87, "Repository SSH key identities and encrypted operation objects".to_string()),
+(88, "Runtime binding identities and retention content contracts".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -19240,7 +16762,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                         "SELECT COUNT(*) FROM workspace_runtime_bindings
                          WHERE workspace_id='workspace-a' AND runtime_id='shared'
                            AND workspace_key_id IS NOT NULL
-                           AND workspace_key_generation IS NOT NULL",
+                           AND length(binding_id) > 0
+                           AND workspace_trust_id IS NULL",
                         [],
                         |row| row.get::<_, i64>(0),
                     )?,
@@ -19563,10 +17086,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![
-                52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
-                73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84
-            ]
+            (52..=LATEST_SCHEMA_VERSION).collect::<Vec<_>>()
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
@@ -19574,7 +17094,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 35);
+        assert_eq!(
+            workspace_schema_migration_history(&conn).unwrap().len(),
+            (LATEST_SCHEMA_VERSION - 50 + 1) as usize
+        );
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());
@@ -19869,29 +17392,27 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 )?;
                 assert_eq!(reservation_state, "created");
                 let reservation_memory = conn.query_row(
-                    "SELECT request_fingerprint, memory_settings_revision, memory_language
+                    "SELECT request_fingerprint, memory_language
                      FROM worker_create_reservations
                      WHERE workspace_id='workspace-a' AND allocation_key='allocation'",
                     [],
                     |row| {
                         Ok((
                             row.get::<_, Option<String>>(0)?,
-                            row.get::<_, Option<i64>>(1)?,
-                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(1)?,
                         ))
                     },
                 )?;
-                assert_eq!(reservation_memory, (None, None, None));
+                assert_eq!(reservation_memory, (None, None));
                 let complete_memory = conn.query_row(
-                    "SELECT request_fingerprint, memory_settings_revision, memory_language
+                    "SELECT request_fingerprint, memory_language
                      FROM worker_create_reservations
                      WHERE workspace_id='workspace-a' AND allocation_key='allocation-complete'",
                     [],
                     |row| {
                         Ok((
                             row.get::<_, Option<String>>(0)?,
-                            row.get::<_, Option<i64>>(1)?,
-                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(1)?,
                         ))
                     },
                 )?;
@@ -19899,7 +17420,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     complete_memory,
                     (
                         Some("request-complete".to_string()),
-                        Some(7),
                         Some("ja".to_string())
                     )
                 );
@@ -19999,10 +17519,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                         ('workspace-b', 'owner', 'Workspace B', 'active', '1', '1');
                     INSERT INTO workspace_signing_identities(
                         workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
-                        private_material_ref, revision, state, created_at, provisioned_at, updated_at
+                        private_material_ref, state, created_at, provisioned_at, updated_at
                     ) VALUES
-                        ('workspace-a', 'WK-a', 'ed25519', NULL, NULL, 'workspace-signing/workspace-a/ed25519-v1', 1, 'pending_provisioning', '1', NULL, '1'),
-                        ('workspace-b', 'WK-b', 'ed25519', NULL, NULL, 'workspace-signing/workspace-b/ed25519-v1', 1, 'pending_provisioning', '1', NULL, '1');
+                        ('workspace-a', 'WK-a', 'ed25519', NULL, NULL, 'workspace-signing/workspace-a/ed25519-v1', 'pending_provisioning', '1', NULL, '1'),
+                        ('workspace-b', 'WK-b', 'ed25519', NULL, NULL, 'workspace-signing/workspace-b/ed25519-v1', 'pending_provisioning', '1', NULL, '1');
                     "#,
                 )?;
                 Ok(())
@@ -20016,11 +17536,12 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             base_url: format!("https://{workspace_id}.runtime.test"),
             public_key: identity.public_key.clone(),
             public_key_fingerprint: String::new(),
-            binding_revision: 1,
+            binding_id: String::new(),
             state: WorkspaceRuntimeBindingState::Verified,
             authentication_mode: WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity,
             workspace_key_id: Some(format!("WK-{}", &workspace_id["workspace-".len()..])),
-            workspace_key_generation: Some(1),
+            workspace_trust_id: Some("trust-fixture".into()),
+            workspace_public_key_fingerprint: Some("sha256:key".into()),
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
             revoked_at: None,
@@ -20152,9 +17673,9 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     VALUES ('workspace-a', 'owner', 'Workspace A', 'active', '1', '1');
                     INSERT INTO workspace_signing_identities(
                         workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
-                        private_material_ref, revision, state, created_at, provisioned_at, updated_at
+                        private_material_ref, state, created_at, provisioned_at, updated_at
                     ) VALUES ('workspace-a', 'WK-a', 'ed25519', 'key', 'sha256:key',
-                              'workspace-signing/workspace-a/ed25519-v1', 1, 'active', '1', '1', '1');
+                              'workspace-signing/workspace-a/ed25519-v1', 'active', '1', '1', '1');
                     "#,
                 )?;
                 Ok(())
@@ -20171,11 +17692,12 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     base_url: "https://runtime.test".to_string(),
                     public_key: runtime_identity.public_key,
                     public_key_fingerprint: String::new(),
-                    binding_revision: 1,
+                    binding_id: String::new(),
                     state: WorkspaceRuntimeBindingState::Configured,
                     authentication_mode: WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity,
                     workspace_key_id: Some("WK-a".to_string()),
-                    workspace_key_generation: Some(1),
+                    workspace_trust_id: Some("trust-fixture".into()),
+                    workspace_public_key_fingerprint: Some("sha256:key".into()),
                     created_at: "1".to_string(),
                     updated_at: "1".to_string(),
                     revoked_at: None,
@@ -20190,12 +17712,12 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         let evidence = WorkspaceRuntimeVerificationEvidence {
             workspace_id: "workspace-a".to_string(),
             runtime_id: "runtime-a".to_string(),
-            binding_revision: persisted.binding_revision,
+            binding_id: persisted.binding_id.clone(),
             workspace_key_id: "WK-a".to_string(),
-            workspace_identity_revision: 1,
-            workspace_trust_generation: 1,
+            workspace_public_key_fingerprint: "sha256:key".into(),
+            workspace_trust_id: "trust-fixture".into(),
             runtime_public_key_fingerprint: persisted.public_key_fingerprint.clone(),
-            runtime_identity_revision: 1,
+
             challenge_id: "challenge-a".to_string(),
             state: "verified".to_string(),
             last_outcome: "verified".to_string(),
@@ -20228,7 +17750,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         assert_eq!(retained.last_outcome, "challenge_issued");
         assert!(
             !store
-                .workspace_runtime_verification_matches(&verified, 1, 1)
+                .workspace_runtime_verification_matches(&verified, "sha256:key", "trust-fixture")
                 .unwrap()
         );
         store
@@ -20565,11 +18087,12 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             base_url: "https://runtime.test".to_string(),
             public_key,
             public_key_fingerprint: String::new(),
-            binding_revision: 1,
+            binding_id: String::new(),
             state: WorkspaceRuntimeBindingState::Configured,
             authentication_mode: WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity,
             workspace_key_id: Some("WK-a".to_string()),
-            workspace_key_generation: Some(1),
+            workspace_trust_id: Some("trust-fixture".into()),
+            workspace_public_key_fingerprint: Some("sha256:key".into()),
             created_at: at.to_string(),
             updated_at: at.to_string(),
             revoked_at: None,
@@ -20583,7 +18106,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             )
             .unwrap();
         assert_eq!(created, WorkspaceRuntimeBindingMutation::Created);
-        assert_eq!(created_binding.binding_revision, 1);
+        assert!(!created_binding.binding_id.is_empty());
         assert_eq!(
             created_binding.state,
             WorkspaceRuntimeBindingState::Configured
@@ -20593,55 +18116,58 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity
         );
         assert_eq!(created_binding.workspace_key_id.as_deref(), Some("WK-a"));
-        assert_eq!(created_binding.workspace_key_generation, Some(1));
+        assert_eq!(
+            created_binding.workspace_trust_id.as_deref(),
+            Some("trust-fixture")
+        );
         let (replayed, replayed_binding) = store
             .put_workspace_runtime_binding_key(binding(first.public_key, "2"), None, "owner")
             .unwrap();
         assert_eq!(replayed, WorkspaceRuntimeBindingMutation::Unchanged);
-        assert_eq!(replayed_binding.binding_revision, 1);
+        assert_eq!(replayed_binding.binding_id, created_binding.binding_id);
         let mut mismatched_replay = binding(replayed_binding.public_key.clone(), "2");
         mismatched_replay.base_url = "https://different.runtime.test".to_string();
         assert!(matches!(
             store.put_workspace_runtime_binding_key(mismatched_replay, None, "owner"),
-            Err(Error::RuntimeBindingRevisionConflict {
+            Err(Error::RuntimeBindingIdConflict {
                 expected: None,
-                actual: Some(1)
+                actual: Some(_)
             })
         ));
 
         let stale = store
             .put_workspace_runtime_binding_key(
                 binding(second.public_key.clone(), "3"),
-                Some(0),
+                Some("binding-stale"),
                 "owner",
             )
             .unwrap_err();
         assert!(matches!(
             stale,
-            Error::RuntimeBindingRevisionConflict {
-                expected: Some(0),
-                actual: Some(1)
+            Error::RuntimeBindingIdConflict {
+                expected: Some(_),
+                actual: Some(_)
             }
         ));
         let (replaced, replaced_binding) = store
             .put_workspace_runtime_binding_key(
                 binding(second.public_key.clone(), "3"),
-                Some(1),
+                Some(&created_binding.binding_id),
                 "owner",
             )
             .unwrap();
         assert_eq!(replaced, WorkspaceRuntimeBindingMutation::Replaced);
-        assert_eq!(replaced_binding.binding_revision, 2);
+        assert_ne!(replaced_binding.binding_id, created_binding.binding_id);
         store
             .record_workspace_runtime_verification_attempt(&WorkspaceRuntimeVerificationEvidence {
                 workspace_id: "workspace-a".to_string(),
                 runtime_id: "runtime-a".to_string(),
-                binding_revision: 2,
+                binding_id: replaced_binding.binding_id.clone(),
                 workspace_key_id: "WK-a".to_string(),
-                workspace_identity_revision: 1,
-                workspace_trust_generation: 1,
+                workspace_public_key_fingerprint: "sha256:key".into(),
+                workspace_trust_id: "trust-fixture".into(),
                 runtime_public_key_fingerprint: replaced_binding.public_key_fingerprint.clone(),
-                runtime_identity_revision: 1,
+
                 challenge_id: "challenge-a".to_string(),
                 state: "failed".to_string(),
                 last_outcome: "connectivity_failed".to_string(),
@@ -20656,10 +18182,16 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .is_some()
         );
         let (revoked, revoked_binding) = store
-            .revoke_workspace_runtime_binding_key("workspace-a", "runtime-a", 2, "owner", "4")
+            .revoke_workspace_runtime_binding_key(
+                "workspace-a",
+                "runtime-a",
+                &replaced_binding.binding_id,
+                "owner",
+                "4",
+            )
             .unwrap();
         assert_eq!(revoked, WorkspaceRuntimeBindingMutation::Revoked);
-        assert_eq!(revoked_binding.binding_revision, 3);
+        assert_ne!(revoked_binding.binding_id, replaced_binding.binding_id);
         assert_eq!(revoked_binding.revoked_at.as_deref(), Some("4"));
         assert_eq!(revoked_binding.state, WorkspaceRuntimeBindingState::Revoked);
         assert_eq!(
@@ -20671,12 +18203,12 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         let (reactivated, reactivated_binding) = store
             .put_workspace_runtime_binding_key(
                 binding(second.public_key.clone(), "5"),
-                Some(3),
+                Some(&revoked_binding.binding_id),
                 "owner",
             )
             .unwrap();
         assert_eq!(reactivated, WorkspaceRuntimeBindingMutation::Reactivated);
-        assert_eq!(reactivated_binding.binding_revision, 4);
+        assert_ne!(reactivated_binding.binding_id, revoked_binding.binding_id);
         assert_eq!(
             reactivated_binding.state,
             WorkspaceRuntimeBindingState::Configured
@@ -20697,7 +18229,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             .unwrap();
         assert_eq!(audit.len(), 4);
         assert_eq!(audit[0].action, "reactivated");
-        assert_eq!(audit[0].binding_revision, 4);
+        assert_eq!(audit[0].binding_id, reactivated_binding.binding_id);
         assert_eq!(audit[1].action, "revoked");
         assert_eq!(audit[2].action, "replaced");
         assert_eq!(audit[3].action, "created");
@@ -20730,11 +18262,12 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             base_url: "in-process://embedded".to_string(),
             public_key,
             public_key_fingerprint: String::new(),
-            binding_revision: 1,
+            binding_id: String::new(),
             state: WorkspaceRuntimeBindingState::Verified,
             authentication_mode: WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer,
             workspace_key_id: None,
-            workspace_key_generation: None,
+            workspace_trust_id: None,
+            workspace_public_key_fingerprint: None,
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
             revoked_at: None,
@@ -20846,7 +18379,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     uri: "/repo-a".to_string(),
                 },
                 default_ref: Some("HEAD".to_string()),
-                source_revision: 1,
+
                 source_fingerprint: "sha256:test".to_string(),
                 observed_status: RepositoryObservedStatus::Unverified,
                 observed_at: None,
@@ -21027,7 +18560,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             .unwrap();
 
         let memory_settings = store.get_workspace_memory_settings("workspace-a").unwrap();
-        assert_eq!(memory_settings.settings_revision, 1);
         assert_eq!(memory_settings.language, "English");
         let reserved = store
             .reserve_worker_create(
@@ -21043,7 +18575,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             reserved.worker_id.as_uuid().get_version(),
             Some(uuid::Version::SortRand)
         );
-        assert_eq!(reserved.memory_settings.settings_revision, 1);
         assert_eq!(reserved.memory_settings.language, "English");
         let reserved_worker = RuntimeWorkerRef::new("arcadia", reserved.worker_id.to_string());
         assert!(
@@ -21052,14 +18583,24 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .unwrap()
         );
         let unchanged_memory_settings = store
-            .update_workspace_memory_settings("workspace-a", 1, " English ")
+            .update_workspace_memory_settings("workspace-a", "English", " English ")
             .unwrap();
         assert_eq!(unchanged_memory_settings, memory_settings);
         let updated_memory_settings = store
-            .update_workspace_memory_settings("workspace-a", 1, " Français ")
+            .update_workspace_memory_settings("workspace-a", "English", " Français ")
             .unwrap();
-        assert_eq!(updated_memory_settings.settings_revision, 2);
         assert_eq!(updated_memory_settings.language, "Français");
+        assert!(matches!(
+            store.update_workspace_memory_settings("workspace-a", "English", "Japanese"),
+            Err(Error::WorkspaceConfigConflict(_))
+        ));
+        assert_eq!(
+            store
+                .get_workspace_memory_settings("workspace-a")
+                .unwrap()
+                .language,
+            "Français"
+        );
         assert_eq!(
             store
                 .reserve_worker_create(
@@ -21108,7 +18649,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 &updated_memory_settings,
             )
             .unwrap();
-        assert_eq!(second.memory_settings.settings_revision, 2);
         assert_eq!(
             store
                 .worker_resource_key(
@@ -21276,7 +18816,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         assert!(store.get_workspace_memory_settings("workspace-a").is_err());
         assert!(
             store
-                .update_workspace_memory_settings("workspace-a", 2, "Spanish")
+                .update_workspace_memory_settings("workspace-a", "Français", "Spanish")
                 .is_err()
         );
         let mut corrupt = updated_memory_settings.clone();
@@ -21594,7 +19134,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     }
 
     #[tokio::test]
-    async fn workspace_flow_sources_keep_revisions_and_builtins_stay_resources() {
+    async fn workspace_flow_sources_pin_content_and_builtins_stay_resources() {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteWorkspaceStore::open(dir.path().join("server.db")).unwrap();
         store
@@ -21614,7 +19154,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             initial = "work";
             states = {
                 work = {
-                    instructions = "Workspace revision one.";
+                    instructions = "Workspace initial content.";
                     transitions = { done = { target = "done"; condition = "Done."; }; };
                 };
                 done = { instructions = ""; terminal = true; };
@@ -21647,25 +19187,61 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             vec![workspace.clone()]
         );
 
-        let revision_two =
-            workspace_source.replace("Workspace revision one.", "Workspace revision two.");
+        let changed_content =
+            workspace_source.replace("Workspace initial content.", "Workspace changed content.");
         let updated = store
             .put_flow_source_for_kind(
                 "workspace-a",
                 FlowSourceKind::Workspace,
                 "flows/coder-review.dcdl",
-                &revision_two,
+                &changed_content,
                 "2026-08-06T00:00:03Z",
             )
             .unwrap();
         assert_eq!(updated.flow_id, workspace.flow_id);
-        assert_eq!(updated.revision, 2);
+        assert_ne!(updated.content_digest, workspace.content_digest);
         let pinned = store
-            .get_flow_source_revision("workspace-a", &workspace.flow_id, 1)
+            .get_flow_source_content("workspace-a", &workspace.flow_id, &workspace.content_digest)
             .unwrap()
             .unwrap();
         assert_eq!(pinned.content, workspace_source);
         assert_eq!(pinned.definition.name, "coder-review");
+        let restored = store
+            .put_flow_source_for_kind(
+                "workspace-a",
+                FlowSourceKind::Workspace,
+                "flows/coder-review.dcdl",
+                workspace_source,
+                "2026-08-06T00:00:04Z",
+            )
+            .unwrap();
+        assert_eq!(restored.content_digest, workspace.content_digest);
+        let count: i64 = store
+            .with_conn(|conn| {
+                Ok(conn.query_row(
+            "SELECT COUNT(*) FROM flow_source_contents WHERE workspace_id=?1 AND flow_id=?2",
+            params!["workspace-a", workspace.flow_id], |row| row.get(0),
+        )?)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "returning to earlier content must reuse the immutable content"
+        );
+        drop(store);
+        let reopened = SqliteWorkspaceStore::open(dir.path().join("server.db")).unwrap();
+        assert_eq!(
+            reopened
+                .get_flow_source_content(
+                    "workspace-a",
+                    &workspace.flow_id,
+                    &workspace.content_digest
+                )
+                .unwrap()
+                .unwrap()
+                .content,
+            workspace_source
+        );
     }
 
     // Equivalent to the reported closed T-12 + retained Coder data. The
@@ -21773,7 +19349,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
         assert_eq!(
             (plan.as_str(), fingerprint.as_str(), state.as_str()),
-            ("old-plan", "immutable-fingerprint", "blocked")
+            ("old-plan", "immutable-fingerprint", "stale")
         );
         let blockers: Vec<crate::retention::WorkerRemovalBlocker> =
             serde_json::from_str(&encoded).unwrap();
@@ -22221,7 +19797,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             )
             .unwrap();
         let recovery = TicketWorkerClaimRecovery {
-            item_revision: "first:0".into(),
+            content_digest: "first:0".into(),
             selected: vec![],
             original_links: vec![],
             effective_links: vec![],
@@ -22233,7 +19809,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             .retain_ticket_claim_recovery("w", "claim", &fingerprint, &recovery)
             .unwrap();
         let mut changed = recovery.clone();
-        changed.item_revision = "first:1".into();
+        changed.content_digest = "first:1".into();
         assert!(
             store
                 .retain_ticket_claim_recovery("w", "claim", &fingerprint, &changed)
@@ -22948,7 +20524,7 @@ INSERT INTO worker_registry (
                     uri: "file:///tmp/main".to_string(),
                 },
                 default_ref: Some("develop".to_string()),
-                source_revision: 1,
+
                 source_fingerprint: "sha256:test".to_string(),
                 observed_status: RepositoryObservedStatus::Unverified,
                 observed_at: None,
@@ -23252,10 +20828,10 @@ INSERT INTO workspaces (workspace_id, owner_account_id, display_name, state, cre
 VALUES ('workspace-a', 'owner-account', 'A', 'active', '2026-01-01', '2026-01-01');
 INSERT INTO workspace_signing_identities (
     workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
-    private_material_ref, revision, state, created_at, provisioned_at, updated_at
+    private_material_ref, state, created_at, provisioned_at, updated_at
 ) VALUES (
     'workspace-a', 'WK-a', 'ed25519', NULL, NULL,
-    'workspace-signing/workspace-a/ed25519-v1', 1, 'pending_provisioning',
+    'workspace-signing/workspace-a/ed25519-v1', 'pending_provisioning',
     '2026-01-01', NULL, '2026-01-01'
 );
 INSERT INTO typed_tickets (
@@ -23282,10 +20858,10 @@ INSERT INTO workspaces (workspace_id, owner_account_id, display_name, state, cre
 VALUES ('workspace-b', 'owner-account', 'B', 'active', '2026-01-01', '2026-01-01');
 INSERT INTO workspace_signing_identities (
     workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
-    private_material_ref, revision, state, created_at, provisioned_at, updated_at
+    private_material_ref, state, created_at, provisioned_at, updated_at
 ) VALUES (
     'workspace-b', 'WK-b', 'ed25519', NULL, NULL,
-    'workspace-signing/workspace-b/ed25519-v1', 1, 'pending_provisioning',
+    'workspace-signing/workspace-b/ed25519-v1', 'pending_provisioning',
     '2026-01-01', NULL, '2026-01-01'
 );
 INSERT INTO typed_tickets (
@@ -23363,7 +20939,7 @@ INSERT INTO worker_registry (
                 uri: "/repo".to_string(),
             },
             default_ref: Some("develop".to_string()),
-            source_revision: 1,
+
             source_fingerprint: "sha256:test".to_string(),
             observed_status: RepositoryObservedStatus::Unverified,
             observed_at: None,
@@ -23377,7 +20953,7 @@ INSERT INTO worker_registry (
             public_key: "test-public-key".to_string(),
             public_key_fingerprint: "sha256:test-public-key".to_string(),
             private_material_ref: "workspace-signing/store-test/ed25519-v1".to_string(),
-            revision: 1,
+
             provisioned_at: "1".to_string(),
         };
         let error = store
@@ -23414,7 +20990,7 @@ INSERT INTO worker_registry (
                 uri: "/repo".to_string(),
             },
             default_ref: Some("develop".to_string()),
-            source_revision: 1,
+
             source_fingerprint: "sha256:test".to_string(),
             observed_status: RepositoryObservedStatus::Unverified,
             observed_at: None,
@@ -23436,7 +21012,7 @@ INSERT INTO worker_registry (
                     workspace_id: first.workspace.workspace_id.clone(),
                     key_id: signing_identity.key_id.clone(),
                     private_material_ref: signing_identity.private_material_ref.clone(),
-                    revision: signing_identity.revision,
+
                     actor_account_id: first.workspace.owner_account_id.clone(),
                     state: "pending".to_string(),
                     created_at: "1".to_string(),
@@ -23488,7 +21064,7 @@ INSERT INTO worker_registry (
                 uri: "/repo".to_string(),
             },
             default_ref: Some("HEAD".to_string()),
-            source_revision: 1,
+
             source_fingerprint: crate::repository_source::repository_source_fingerprint(
                 &RepositorySource {
                     kind: server_api::RepositorySourceKind::LocalPath,
@@ -23810,7 +21386,7 @@ INSERT INTO worker_registry (
                     uri: "/repo".to_string(),
                 },
                 default_ref: Some("HEAD".to_string()),
-                source_revision: 1,
+
                 source_fingerprint: "sha256:test".to_string(),
                 observed_status: RepositoryObservedStatus::Unverified,
                 observed_at: None,
@@ -24998,7 +22574,6 @@ INSERT INTO worker_registry (
         BackendJobRequest {
             job_id: id.into(),
             purpose: "subjektiv_consolidation".into(),
-            input_revision: candidate.into(),
             input_ref: format!("subject://{subject}/{candidate}"),
             input: serde_json::json!({"candidate": candidate}),
             instruction: "Consolidate this immutable candidate snapshot.".into(),
@@ -25507,8 +23082,8 @@ INSERT INTO worker_registry (
         let second_id = attempt_id(&request.job_id, 2);
         store.with_conn(|conn| {
             conn.execute("UPDATE backend_jobs SET state = 'pending', current_attempt = 2, completed_at = NULL WHERE workspace_id = 'resource-workspace' AND job_id = ?1", params![request.job_id])?;
-            conn.execute("INSERT INTO backend_job_attempts (workspace_id, job_id, attempt_id, attempt, input_revision, state, deadline_at, created_at, updated_at) VALUES ('resource-workspace', ?1, ?2, 2, ?3, 'reserved', ?4, ?4, ?4)",
-                params![request.job_id, second_id, request.input_revision, RESOURCE_JOB_NOW])?;
+            conn.execute("INSERT INTO backend_job_attempts (workspace_id, job_id, attempt_id, attempt, input_digest, state, deadline_at, created_at, updated_at) VALUES ('resource-workspace', ?1, ?2, 2, ?3, 'reserved', ?4, ?4, ?4)",
+                params![request.job_id, second_id, request.input_digest().unwrap(), RESOURCE_JOB_NOW])?;
             Ok(())
         }).unwrap();
         let second = store
@@ -25565,7 +23140,7 @@ INSERT INTO worker_registry (
         let submission = BackendJobResultSubmission {
             job_id: request.job_id.clone(),
             attempt_id: third.attempt.attempt_id.clone(),
-            input_revision: request.input_revision.clone(),
+            input_digest: request.input_digest().unwrap(),
             result: serde_json::json!({"converged": true}),
         };
         store
@@ -25694,7 +23269,7 @@ INSERT INTO worker_registry (
                     &BackendJobResultSubmission {
                         job_id: refresh.job_id.clone(),
                         attempt_id: first.attempt.attempt_id.clone(),
-                        input_revision: refresh.input_revision.clone(),
+                        input_digest: refresh.input_digest().unwrap(),
                         result: serde_json::json!({"surface": {"availability": "available"}}),
                     },
                     RESOURCE_JOB_NOW,
@@ -25740,7 +23315,7 @@ INSERT INTO worker_registry (
                 &BackendJobResultSubmission {
                     job_id: request.job_id.clone(),
                     attempt_id: first.attempt.attempt_id.clone(),
-                    input_revision: request.input_revision.clone(),
+                    input_digest: request.input_digest().unwrap(),
                     result: serde_json::json!({"done": true}),
                 },
                 RESOURCE_JOB_NOW,
@@ -25860,7 +23435,6 @@ INSERT INTO worker_registry (
         let request = BackendJobRequest {
             job_id: "check:T-1:r1".to_string(),
             purpose: "ticket_item_check".to_string(),
-            input_revision: "1".to_string(),
             input_ref: "ticket://T-1/revisions/1".to_string(),
             input: serde_json::json!({"title": "check"}),
             instruction: "Check the immutable input.".to_string(),
@@ -25896,7 +23470,7 @@ INSERT INTO worker_registry (
                     &BackendJobResultSubmission {
                         job_id: request.job_id.clone(),
                         attempt_id: attempt_id(&request.job_id, 1),
-                        input_revision: request.input_revision.clone(),
+                        input_digest: request.input_digest().unwrap(),
                         result: serde_json::json!({"cross_workspace": true}),
                     },
                     "2026-09-01T00:00:00Z",
@@ -25935,7 +23509,7 @@ INSERT INTO worker_registry (
         let submission = BackendJobResultSubmission {
             job_id: request.job_id.clone(),
             attempt_id: first.attempt.attempt_id.clone(),
-            input_revision: request.input_revision.clone(),
+            input_digest: request.input_digest().unwrap(),
             result: serde_json::json!({"valid": true}),
         };
         assert!(
@@ -26280,7 +23854,7 @@ INSERT INTO worker_registry (
                     &BackendJobResultSubmission {
                         job_id: retry_request.job_id.clone(),
                         attempt_id: failed.attempt.attempt_id.clone(),
-                        input_revision: retry_request.input_revision.clone(),
+                        input_digest: retry_request.input_digest().unwrap(),
                         result: serde_json::json!({"late": true}),
                     },
                     "2026-09-01T00:01:03Z",
@@ -26342,3 +23916,19 @@ INSERT INTO worker_registry (
         );
     }
 }
+
+#[cfg(test)]
+#[path = "frozen_flow_content_tests.rs"]
+mod flow_content_migration_tests;
+
+#[cfg(test)]
+#[path = "frozen_content_state_tests.rs"]
+mod content_state_migration_tests;
+
+#[cfg(test)]
+#[path = "frozen_repository_key_tests.rs"]
+mod repository_key_migration_tests;
+
+#[cfg(test)]
+#[path = "frozen_runtime_binding_tests.rs"]
+mod frozen_runtime_binding_tests;

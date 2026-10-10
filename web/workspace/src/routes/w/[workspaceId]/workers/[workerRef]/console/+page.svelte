@@ -186,7 +186,7 @@
     });
     let protocolSubscription: WorkspaceMultiplexerSubscription | null = null;
     let pendingSubmissions = $state<PendingSubmissionsSnapshot>({
-        revision: 0,
+
         notification_count: 0,
         head_id: null,
         submissions: [],
@@ -2095,7 +2095,6 @@
                                         method: "cancel_pending_submission",
                                         params: {
                                             submission_id: submission.submission_id,
-                                            expected_revision: pendingSubmissions.revision,
                                         },
                                     }, "Pending submission cancellation")}
                                 >

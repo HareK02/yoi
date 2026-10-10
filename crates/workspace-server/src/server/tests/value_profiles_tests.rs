@@ -31,7 +31,6 @@ fn request(
     }];
     changes.extend(extra);
     ConfigCommitRequest {
-        base_revision: state.snapshot.revision,
         base_digest: state.snapshot.digest,
         entrypoints: state.contract.entrypoints,
         changes,
@@ -75,10 +74,7 @@ async fn value_profiles_builtin_http_config_tree_is_read_only_and_never_falls_ba
         StatusCode::CREATED,
     )
     .await;
-    assert_eq!(
-        saved["snapshot"]["revision"].as_u64().unwrap(),
-        initial["snapshot"]["revision"].as_u64().unwrap() + 1
-    );
+    assert_ne!(saved["snapshot"]["digest"], initial["snapshot"]["digest"]);
     let listed = get_json_authenticated(app.clone(), &tree, &token).await;
     assert_eq!(listed, saved);
     let entries = listed["snapshot"]["entries"].as_object().unwrap();
@@ -108,7 +104,6 @@ async fn value_profiles_builtin_http_config_tree_is_read_only_and_never_falls_ba
         .unwrap();
     let main_digest = entries["main.dcdl"]["content_digest"].as_str().unwrap();
     let base = json!({
-        "base_revision": listed["snapshot"]["revision"],
         "base_digest": listed["snapshot"]["digest"],
         "entrypoints": listed["contract"]["entrypoints"],
     });
@@ -326,7 +321,7 @@ async fn value_profiles_builtin_companion_composition_seals_observed_sources() {
 }
 
 #[tokio::test]
-async fn value_profiles_save_project_and_runtime_consume_the_same_revision() {
+async fn value_profiles_save_project_and_runtime_consume_the_same_content() {
     let dir = tempfile::tempdir().unwrap();
     let api = test_api(dir.path()).await;
     let forms = [
@@ -390,8 +385,8 @@ async fn value_profiles_save_project_and_runtime_consume_the_same_revision() {
             Some("project:alpha")
         );
         assert_eq!(
-            projection.settings.config_revision,
-            Some(state.snapshot.revision)
+            projection.settings.tree_digest.as_deref(),
+            Some(state.snapshot.digest.as_str())
         );
         let selected = projection
             .settings
@@ -413,10 +408,7 @@ async fn value_profiles_save_project_and_runtime_consume_the_same_revision() {
         .unwrap()
         .unwrap();
         assert_eq!(bundle.metadata.digest, bundle.computed_digest());
-        assert_eq!(
-            bundle.metadata.revision,
-            state.snapshot.revision.to_string()
-        );
+
         let archive = bundle.profile_source_archive.as_ref().unwrap();
         let verified = archive.verify().unwrap();
         // This is the Runtime's archive consumer. It needs neither the Workspace tree nor imports.
@@ -454,7 +446,7 @@ async fn value_profiles_save_project_and_runtime_consume_the_same_revision() {
         }
         if index == 2 {
             let mut other_state = state.clone();
-            other_state.snapshot.revision += 1;
+            other_state.snapshot.digest = "sha256:different-tree".to_string();
             assert!(
                 build_virtual_profile_config_bundle(
                     &projection,

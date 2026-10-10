@@ -18,7 +18,7 @@ The package validator may reject legacy core-Wasm artifacts and require Componen
 A future Server Plugin platform may execute Wasmtime Component Model packages only after the architecture is implemented as a coherent authority boundary:
 
 1. an operator installs an immutable package into Server-owned artifact authority;
-2. a Workspace owner selects an installed package through an immutable Addon revision;
+2. a Workspace owner selects an installed package through an immutable Addon configuration snapshot bound to exact package/content digests;
 3. Backend authors a per-Worker execution plan containing exact identities, digests, configuration, and bounded grants;
 4. Runtime fetches only Server-authorized digests and verifies package bytes and execution-plan identity;
 5. Runtime instantiates a fresh bounded Wasmtime Store with no ambient WASI authority; and

@@ -136,10 +136,10 @@ pub enum Error {
     WorkspaceConfigConflict(String),
     #[error("Runtime binding conflict: {0}")]
     RuntimeBindingConflict(String),
-    #[error("Runtime binding revision conflict: expected {expected:?}, current {actual:?}")]
-    RuntimeBindingRevisionConflict {
-        expected: Option<u64>,
-        actual: Option<u64>,
+    #[error("Runtime binding identity conflict: expected {expected:?}, current {actual:?}")]
+    RuntimeBindingIdConflict {
+        expected: Option<String>,
+        actual: Option<String>,
     },
     #[error("Runtime public key fingerprint is already bound in this Workspace: {fingerprint}")]
     RuntimeBindingFingerprintConflict { fingerprint: String },

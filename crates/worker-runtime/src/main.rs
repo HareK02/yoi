@@ -905,12 +905,11 @@ fn print_workspace_trust_mutation(
         WorkspaceIssuerTrustMutation::Unchanged => "unchanged",
     };
     println!(
-        "Workspace issuer trust {action}: workspace={} key={} fingerprint={} identity_revision={} trust_generation={} state={:?}",
+        "Workspace issuer trust {action}: workspace={} key={} fingerprint={} trust_id={} state={:?}",
         record.workspace_id,
         record.key_id,
         record.public_key_fingerprint,
-        record.identity_revision,
-        record.trust_generation,
+        record.trust_id,
         record.state,
     );
 }
@@ -936,10 +935,38 @@ fn read_runtime_auth_file(path: &Path) -> Result<RuntimeAuthFile, ProcessError> 
     }
     let contents = String::from_utf8(contents)
         .map_err(|_| ProcessError::auth("runtime auth store is corrupt"))?;
-    let auth: RuntimeAuthFile = toml::from_str(&contents)
+    let mut document: toml::Value = toml::from_str(&contents)
+        .map_err(|_| ProcessError::auth("runtime auth store is corrupt"))?;
+    let mut migrated = false;
+    if let Some(records) = document
+        .get_mut("workspace_issuers")
+        .and_then(toml::Value::as_array_mut)
+    {
+        for value in records {
+            if value.get("identity_revision").is_some() || value.get("trust_generation").is_some() {
+                let legacy = serde_json::to_value(&*value)
+                    .map_err(|_| ProcessError::auth("runtime auth store is corrupt"))?;
+                let record =
+                    worker_runtime::workspace_issuer::migrate_legacy_workspace_issuer_trust_record(
+                        legacy,
+                    )
+                    .map_err(|_| ProcessError::auth("runtime legacy trust store is corrupt"))?;
+                *value = toml::Value::try_from(record).map_err(|_| {
+                    ProcessError::auth("runtime auth migration serialization failed")
+                })?;
+                migrated = true;
+            }
+        }
+    }
+    let auth: RuntimeAuthFile = document
+        .try_into()
         .map_err(|_| ProcessError::auth("runtime auth store is corrupt"))?;
     validate_workspace_issuer_trust_records(&auth.workspace_issuers)
         .map_err(|_| ProcessError::auth("runtime Workspace issuer trust store is corrupt"))?;
+    if migrated {
+        // Commit the revoked migration before exposing any issuer authority.
+        write_runtime_auth_file(path, &auth)?;
+    }
     Ok(auth)
 }
 
@@ -1398,7 +1425,6 @@ mod tests {
                 algorithm: "ed25519".to_string(),
                 public_key: identity.public_key,
                 public_key_fingerprint: fingerprint,
-                revision: 1,
             })
             .unwrap(),
         )
@@ -1419,7 +1445,38 @@ mod tests {
         let path = runtime_auth_path(&config);
         let first = read_runtime_auth_file(&path).unwrap();
         assert_eq!(first.workspace_issuers.len(), 1);
-        assert_eq!(first.workspace_issuers[0].trust_generation, 1);
+        assert!(!first.workspace_issuers[0].trust_id.is_empty());
+        // `trust-workspace show` serializes this persisted record. Owner
+        // registration must forward that exact enrollment ID, not derive one
+        // from the key fingerprint or an initial counter.
+        let shown = serde_json::to_value(&first.workspace_issuers[0]).unwrap();
+        let runtime_identity = RuntimeIdentityMaterial::generate("remote-runtime").unwrap();
+        let mut registration_wire = serde_json::json!({
+            "public_bundle": {
+                "identity_id": runtime_identity.identity_id,
+                "public_key": runtime_identity.public_key,
+            },
+            "endpoint": "https://runtime.example.test",
+            "workspace_trust_id": shown["trust_id"],
+        });
+        let registration: server_api::CreateRemoteRuntimeRequest =
+            serde_json::from_value(registration_wire.clone()).unwrap();
+        assert_eq!(
+            registration.workspace_trust_id,
+            first.workspace_issuers[0].trust_id
+        );
+        assert_ne!(
+            registration.workspace_trust_id,
+            first.workspace_issuers[0].public_key_fingerprint
+        );
+        registration_wire
+            .as_object_mut()
+            .unwrap()
+            .remove("workspace_trust_id");
+        assert!(
+            serde_json::from_value::<server_api::CreateRemoteRuntimeRequest>(registration_wire)
+                .is_err()
+        );
 
         run_trust_workspace_command(VecDeque::from([
             "add".to_string(),
@@ -1430,7 +1487,10 @@ mod tests {
         ]))
         .unwrap();
         let replay = read_runtime_auth_file(&path).unwrap();
-        assert_eq!(replay.workspace_issuers[0].trust_generation, 1);
+        assert_eq!(
+            replay.workspace_issuers[0].trust_id,
+            first.workspace_issuers[0].trust_id
+        );
 
         let replacement = RuntimeIdentityMaterial::generate("WK-2").unwrap();
         let public_key = decode_public_key(&replacement.public_key).unwrap();
@@ -1451,7 +1511,6 @@ mod tests {
                 algorithm: "ed25519".to_string(),
                 public_key: replacement.public_key,
                 public_key_fingerprint: fingerprint,
-                revision: 2,
             })
             .unwrap(),
         )
@@ -1483,7 +1542,10 @@ mod tests {
         ]))
         .unwrap();
         let revoked = read_runtime_auth_file(&path).unwrap();
-        assert_eq!(revoked.workspace_issuers[0].trust_generation, 3);
+        assert_ne!(
+            revoked.workspace_issuers[0].trust_id,
+            first.workspace_issuers[0].trust_id
+        );
         assert_eq!(
             revoked.workspace_issuers[0].state,
             worker_runtime::workspace_issuer::WorkspaceIssuerTrustState::Revoked

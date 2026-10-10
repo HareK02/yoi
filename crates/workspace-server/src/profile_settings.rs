@@ -145,7 +145,7 @@ pub(crate) fn project_profiles_from_evaluation(
         resolve_profile_artifact_value(
             entry.profile.clone(),
             ProfileSource::Archive {
-                archive_id: format!("workspace-config-r{}", state.snapshot.revision),
+                archive_id: format!("workspace-config:{}", state.snapshot.digest),
                 source: entry.selector.clone(),
             },
             Path::new("/"),
@@ -172,7 +172,6 @@ pub(crate) fn project_profiles_from_evaluation(
             content_digest: config_source::digest_bytes(&value_bytes),
             provenance: WorkspaceProfileSourceProvenance::ProjectProfileSourceTree,
             editable: false,
-            revision: state.snapshot.revision.to_string(),
             size_bytes: value_bytes.len() as u64,
             diagnostics: Vec::new(),
         });
@@ -190,8 +189,6 @@ pub(crate) fn project_profiles_from_evaluation(
     Ok(ProfileConfigProjection {
         settings: ProfileSettingsResponse {
             workspace_id: workspace_id.to_string(),
-            registry_revision: format!("config:{}", state.snapshot.revision),
-            config_revision: Some(state.snapshot.revision),
             tree_digest: Some(state.snapshot.digest.clone()),
             projection_digest: Some(evaluation.projection_digest.clone()),
             default_profile: Some(config.profile.default_profile),
@@ -260,10 +257,6 @@ fn validate_prompt_projection_matches_state(
             "projection digest",
         ),
         (
-            prompt_catalog.config_revision != state.snapshot.revision,
-            "config revision",
-        ),
-        (
             prompt_catalog.schema_fingerprint != state.contract.schema_bundle.fingerprint,
             "schema fingerprint",
         ),
@@ -296,8 +289,6 @@ fn virtual_profile_bundle_id(
     hasher.update(b"workspace-profile-launch-v1\0");
     hasher.update(workspace_id.as_bytes());
     hasher.update(b"\0");
-    hasher.update(state.snapshot.revision.to_le_bytes());
-    hasher.update(b"\0");
     hasher.update(state.snapshot.digest.as_bytes());
     hasher.update(b"\0");
     hasher.update(state.projection_digest.as_bytes());
@@ -320,10 +311,7 @@ fn virtual_profile_bundle_id(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    Ok(format!(
-        "workspace-config-profile-r{}-{identity}",
-        state.snapshot.revision
-    ))
+    Ok(format!("workspace-config-profile-{identity}"))
 }
 
 pub fn build_virtual_profile_config_bundle(
@@ -386,7 +374,6 @@ pub fn build_virtual_profile_config_bundle_with_prompt_projection(
     prompt_projection: &worker::WorkspacePromptProjection,
 ) -> Result<Option<ConfigBundle>> {
     if projection.settings.workspace_id != workspace_id
-        || projection.settings.config_revision != Some(state.snapshot.revision)
         || projection.settings.tree_digest.as_deref() != Some(state.snapshot.digest.as_str())
         || projection.settings.projection_digest.as_deref()
             != Some(state.projection_digest.as_str())
@@ -418,14 +405,13 @@ pub fn build_virtual_profile_config_bundle_with_prompt_projection(
         metadata: ConfigBundleMetadata {
             id: bundle_id,
             digest: String::new(),
-            revision: state.snapshot.revision.to_string(),
             workspace_id: workspace_id.to_string(),
             created_at: workspace_created_at.to_string(),
             provenance: ConfigBundleProvenance {
                 source: "workspace_config".to_string(),
                 detail: Some(format!(
-                    "revision={} tree={} projection={}",
-                    state.snapshot.revision, state.snapshot.digest, state.projection_digest
+                    "content={} projection={}",
+                    state.snapshot.digest, state.projection_digest
                 )),
             },
         },
@@ -474,7 +460,7 @@ fn build_virtual_profile_archive(
             )
         })?;
     ProfileSourceArchive::build_evaluated_profile_with_builtin_sources(
-        format!("workspace-config-profile-r{}", state.snapshot.revision),
+        format!("workspace-config-profile:{}", state.snapshot.digest),
         selector.to_string(),
         entry.profile.clone(),
         builtin_sources,
@@ -489,7 +475,7 @@ pub fn workspace_metadata_settings(
         workspace_id: workspace.workspace_id.clone(),
         display_name: workspace.display_name.clone(),
         created_at: workspace.created_at.clone(),
-        revision: workspace.updated_at.clone(),
+        updated_at: workspace.updated_at.clone(),
         source: "server_db".to_string(),
         diagnostics: Vec::new(),
     }
@@ -586,7 +572,7 @@ mod tests {
         assert_eq!(settings.workspace_id, workspace.workspace_id);
         assert_eq!(settings.display_name, workspace.display_name);
         assert_eq!(settings.created_at, workspace.created_at);
-        assert_eq!(settings.revision, workspace.updated_at);
+        assert_eq!(settings.updated_at, workspace.updated_at);
         assert_eq!(settings.source, "server_db");
         assert!(settings.diagnostics.is_empty());
     }
@@ -606,7 +592,7 @@ mod tests {
     }
 
     fn virtual_state(entries: Vec<config_source::ConfigEntry>) -> WorkspaceConfigState {
-        let snapshot = config_source::ConfigTreeSnapshot::from_entries(7, entries).unwrap();
+        let snapshot = config_source::ConfigTreeSnapshot::from_entries(entries).unwrap();
         let schema_bundle = config_source::WorkspaceConfigSchemaBundle::compose([
             ProfileConfigSchemaProvider.contribution().unwrap(),
             crate::prompt_settings::PromptConfigSchemaProvider
@@ -632,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_config_projection_builds_archive_from_active_revision() {
+    fn virtual_config_projection_builds_archive_from_active_content() {
         let state = virtual_state(vec![
             config_source::ConfigEntry::new(
                 VirtualPath::parse("main.dcdl").unwrap(),
@@ -657,9 +643,12 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(projection.settings.config_revision, Some(7));
+        assert_eq!(
+            projection.settings.tree_digest.as_deref(),
+            Some(state.snapshot.digest.as_str())
+        );
         let prompt_catalog = bundle.prompt_catalog.as_ref().unwrap();
-        assert_eq!(prompt_catalog.config_revision, 7);
+        assert_eq!(prompt_catalog.source_digest, state.snapshot.digest);
         assert!(!prompt_catalog.templates.is_empty());
         assert!(
             bundle
@@ -667,7 +656,7 @@ mod tests {
                 .provenance
                 .detail
                 .unwrap()
-                .contains("revision=7")
+                .contains(&format!("content={}", state.snapshot.digest))
         );
         let archive = bundle.profile_source_archive.unwrap();
         assert_eq!(
@@ -767,18 +756,13 @@ mod tests {
             companion
                 .metadata
                 .id
-                .starts_with("workspace-config-profile-r7-")
+                .starts_with("workspace-config-profile-")
         );
-        assert!(
-            coder
-                .metadata
-                .id
-                .starts_with("workspace-config-profile-r7-")
-        );
+        assert!(coder.metadata.id.starts_with("workspace-config-profile-"));
     }
 
     #[test]
-    fn virtual_config_launch_bundle_rejects_prompt_projection_from_other_revision() {
+    fn virtual_config_launch_bundle_rejects_prompt_projection_from_other_content() {
         let state = virtual_state(vec![
             config_source::ConfigEntry::new(
                 VirtualPath::parse("main.dcdl").unwrap(),
@@ -792,7 +776,14 @@ mod tests {
             crate::prompt_settings::project_workspace_prompt_projection("workspace-test", &state)
                 .unwrap();
         let mut mismatched_state = state.clone();
-        mismatched_state.snapshot.revision += 1;
+        mismatched_state.snapshot = state
+            .snapshot
+            .apply(&[config_source::ConfigTreeChange::Create {
+                path: VirtualPath::parse("changed.txt").unwrap(),
+                content_type: ConfigContentType::Text,
+                content: "different source tree".into(),
+            }])
+            .unwrap();
 
         let error = build_virtual_profile_config_bundle_with_prompt_projection(
             &projection,
@@ -866,7 +857,7 @@ mod tests {
                 .contribution()
                 .unwrap()])
             .unwrap();
-        let snapshot = config_source::ConfigTreeSnapshot::from_entries(1, [config_source::ConfigEntry::new(
+        let snapshot = config_source::ConfigTreeSnapshot::from_entries([config_source::ConfigEntry::new(
             VirtualPath::parse("main.dcdl").unwrap(), ConfigContentType::Decodal,
             r#"{ profile = { entries = [{ selector = "project:alpha"; profile = {}; }]; }; } as WorkspaceConfigSchema"#,
         ).unwrap()]).unwrap();

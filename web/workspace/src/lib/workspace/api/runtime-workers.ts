@@ -406,7 +406,6 @@ export function parseRuntimeCleanupPlan(
       "workspace_id",
       "runtime_id",
       "generated_at",
-      "revision",
       "digest",
       "workers",
       "workdirs",
@@ -428,7 +427,6 @@ export function parseRuntimeCleanupPlan(
       item.generated_at,
       "Runtime cleanup plan.generated_at",
     ),
-    revision: boundedString(item.revision, "Runtime cleanup plan.revision"),
     digest: boundedString(item.digest, "Runtime cleanup plan.digest"),
     workers: array(item.workers, "Runtime cleanup plan.workers", MAX_CANDIDATES)
       .map(

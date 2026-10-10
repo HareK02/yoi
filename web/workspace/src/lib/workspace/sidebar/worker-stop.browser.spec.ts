@@ -369,7 +369,7 @@ test("sidebar Delete cannot proceed to execution when its cleanup plan arrives a
     workspace_id: "stop-test",
     runtime_id: "runtime-a",
     generated_at: "2026-10-06T00:00:00Z",
-    revision: "old-plan",
+
     digest: "old-digest",
     workdirs: [],
     diagnostics: [],

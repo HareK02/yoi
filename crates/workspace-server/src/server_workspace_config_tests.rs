@@ -68,7 +68,6 @@ mod workspace_config_integration {
             connection_id: connection.into(),
             validator: snapshot.validator.clone(),
             request: server_api::ConfigCommitRequest {
-                base_revision: snapshot.revision,
                 base_digest: snapshot.digest.clone(),
                 changes,
                 entrypoints: snapshot.entrypoints.clone(),
@@ -128,96 +127,334 @@ mod workspace_config_integration {
     }
 
     #[tokio::test]
+    async fn workspace_config_schema_refresh_invalidates_read_and_commit_validators_without_source_change()
+     {
+        struct AddedSchema;
+        impl crate::config_source::WorkspaceConfigSchemaProvider for AddedSchema {
+            fn contribution(&self) -> Result<config_source::ConfigSchemaContribution> {
+                Ok(config_source::ConfigSchemaContribution::new(
+                    "builtin:validator-test",
+                    "validator_test",
+                    "1",
+                    "{ validator_test = Bool default true; }",
+                )
+                .unwrap())
+            }
+        }
+        let mut fixture = manual_worker_assignment_fixture().await;
+        grant(&fixture.api, &fixture.worker, Access::ReadWrite).await;
+        let attached = attach(&fixture.api, &fixture.worker).await;
+        let prior = observe(
+            &fixture.api,
+            &fixture.worker,
+            &attached.connection_id,
+            &[""],
+            1,
+        )
+        .await;
+        let file = prior
+            .nodes
+            .iter()
+            .find(|node| node.path == "main.dcdl")
+            .unwrap();
+        // Also bind the schema that will be applied, even before canonical refresh.
+        fixture.api.config_schema_registry = fixture
+            .api
+            .config_schema_registry
+            .clone()
+            .with_provider(Arc::new(AddedSchema));
+        let applied = observe(
+            &fixture.api,
+            &fixture.worker,
+            &attached.connection_id,
+            &[""],
+            1,
+        )
+        .await;
+        assert_eq!(applied.digest, prior.digest);
+        assert_ne!(applied.validator, prior.validator);
+        fixture
+            .api
+            .config_store
+            .ensure_workspace_config_materialized_with_schema(
+                TEST_WORKSPACE_ID,
+                "2026-08-14T00:00:00Z",
+                fixture.api.config_schema_registry.compose().unwrap(),
+            )
+            .unwrap();
+        let refreshed = observe(
+            &fixture.api,
+            &fixture.worker,
+            &attached.connection_id,
+            &[""],
+            1,
+        )
+        .await;
+        assert_eq!(refreshed.digest, prior.digest);
+        assert_ne!(refreshed.validator, applied.validator);
+        let rejected = workspace_config::read(
+            &fixture.api,
+            &fixture.worker,
+            Read {
+                connection_id: attached.connection_id.clone(),
+                path: file.path.clone(),
+                validator: file.validator.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            (rejected.status, rejected.code.as_str()),
+            (409, "stale_validator")
+        );
+        let rejected = workspace_config::commit(
+            &fixture.api,
+            &fixture.worker,
+            commit_request(
+                &attached.connection_id,
+                &prior,
+                vec![create("stale.txt", "must not commit")],
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            (rejected.status, rejected.code.as_str()),
+            (409, "stale_validator")
+        );
+        assert_eq!(rejected.classification, Classification::NotCommitted);
+        assert!(
+            !fixture
+                .api
+                .config_store
+                .load_workspace_config(TEST_WORKSPACE_ID)
+                .unwrap()
+                .unwrap()
+                .snapshot
+                .entries
+                .contains_key(&config_source::VirtualPath::parse("stale.txt").unwrap())
+        );
+    }
+
+    #[tokio::test]
     async fn workspace_config_signed_editor_routes_cannot_bypass_wip_authority() {
         let mut fixture = manual_worker_assignment_fixture().await;
         let identity = RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id).unwrap();
         configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
         let api = &fixture.api;
-        let initial = api.config_store.load_workspace_config(TEST_WORKSPACE_ID).unwrap().unwrap();
+        let initial = api
+            .config_store
+            .load_workspace_config(TEST_WORKSPACE_ID)
+            .unwrap()
+            .unwrap();
         let tree = format!("/api/w/{TEST_WORKSPACE_ID}/config/source-tree");
         let change = server_api::ConfigCommitRequest {
-            base_revision: initial.snapshot.revision,
             base_digest: initial.snapshot.digest.clone(),
-            changes: vec![create("notes/editor-only.txt", "must not persist from Worker")],
+            changes: vec![create(
+                "notes/editor-only.txt",
+                "must not persist from Worker",
+            )],
             entrypoints: vec!["main.dcdl".into()],
         };
         let routes = [
             ("GET", tree.clone()),
             ("GET", format!("{tree}/entries/main.dcdl")),
-            ("GET", format!("{tree}/revisions/{}", initial.snapshot.revision)),
+            ("GET", format!("{tree}/history/{}", initial.snapshot.digest)),
             ("POST", format!("{tree}/commit")),
-            ("GET", format!("/api/w/{TEST_WORKSPACE_ID}/settings/profiles")),
+            (
+                "GET",
+                format!("/api/w/{TEST_WORKSPACE_ID}/settings/profiles"),
+            ),
         ];
-        for state in ["ungranted", "read_only", "revoked", "detached", "read_write"] {
+        for state in [
+            "ungranted",
+            "read_only",
+            "revoked",
+            "detached",
+            "read_write",
+        ] {
             match state {
                 "read_only" => {
                     grant(api, &fixture.worker, Access::ReadOnly).await;
                     attach(api, &fixture.worker).await;
                 }
                 "revoked" => {
-                    let current = api.store.current_workspace_config_grant(TEST_WORKSPACE_ID, &fixture.worker).unwrap().unwrap();
-                    workspace_config::revoke_grant(api, &test_owner_actor(), TEST_WORKSPACE_ID,
-                        &current.grant_id).await.unwrap();
+                    let current = api
+                        .store
+                        .current_workspace_config_grant(TEST_WORKSPACE_ID, &fixture.worker)
+                        .unwrap()
+                        .unwrap();
+                    workspace_config::revoke_grant(
+                        api,
+                        &test_owner_actor(),
+                        TEST_WORKSPACE_ID,
+                        &current.grant_id,
+                    )
+                    .await
+                    .unwrap();
                 }
                 "detached" => {
                     grant(api, &fixture.worker, Access::ReadWrite).await;
                     let attached = attach(api, &fixture.worker).await;
-                    detach_current_worker_workdir(api, &fixture.worker, "workspace-config",
-                        Some(&attached.connection_id)).await.unwrap();
+                    detach_current_worker_workdir(
+                        api,
+                        &fixture.worker,
+                        "workspace-config",
+                        Some(&attached.connection_id),
+                    )
+                    .await
+                    .unwrap();
                 }
-                "read_write" => { attach(api, &fixture.worker).await; }
+                "read_write" => {
+                    attach(api, &fixture.worker).await;
+                }
                 _ => {}
             }
             for (method, path) in &routes {
-                let body = if *method == "POST" { serde_json::to_vec(&change).unwrap() } else { vec![] };
+                let body = if *method == "POST" {
+                    serde_json::to_vec(&change).unwrap()
+                } else {
+                    vec![]
+                };
                 for scoped in [false, true] {
                     let app = if scoped {
-                        workspace_server_router(WorkspaceServerApi::new(api.config.clone(), api.store.clone()))
+                        workspace_server_router(WorkspaceServerApi::new(
+                            api.config.clone(),
+                            api.store.clone(),
+                        ))
                     } else {
                         build_router(api.clone())
                     };
-                    let response = app.oneshot(runtime_source_request(&identity,
-                        Some(&fixture.worker.worker_id), method, path, body.clone())).await.unwrap();
-                    assert_eq!(response.status(), StatusCode::FORBIDDEN,
-                        "{state}: {method} {path}, scoped={scoped}");
+                    let response = app
+                        .oneshot(runtime_source_request(
+                            &identity,
+                            Some(&fixture.worker.worker_id),
+                            method,
+                            path,
+                            body.clone(),
+                        ))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::FORBIDDEN,
+                        "{state}: {method} {path}, scoped={scoped}"
+                    );
                     let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
                     assert!(!String::from_utf8_lossy(&bytes).contains("must not persist"));
                 }
             }
-            let after = api.config_store.load_workspace_config(TEST_WORKSPACE_ID).unwrap().unwrap();
-            assert_eq!(after.snapshot, initial.snapshot, "{state}: editor rejection must have no effect");
+            let after = api
+                .config_store
+                .load_workspace_config(TEST_WORKSPACE_ID)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                after.snapshot, initial.snapshot,
+                "{state}: editor rejection must have no effect"
+            );
         }
         // A Runtime-only proof is not a user editor identity either.
-        assert_eq!(signed_call(api, &identity, None, "GET", &tree, Value::Null).await.0,
-            StatusCode::FORBIDDEN);
+        assert_eq!(
+            signed_call(api, &identity, None, "GET", &tree, Value::Null)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
         let attached = attach(api, &fixture.worker).await;
-        let observed = observe(api, &fixture.worker, &attached.connection_id, &["main.dcdl"], 0).await;
-        let node = observed.nodes.iter().find(|n| n.path == "main.dcdl").unwrap();
-        assert!(workspace_config::read(api, &fixture.worker, Read {
-            connection_id: attached.connection_id,
-            path: "main.dcdl".into(), validator: node.validator.clone(),
-        }).await.is_ok(), "the granted WIP path remains available");
+        let observed = observe(
+            api,
+            &fixture.worker,
+            &attached.connection_id,
+            &["main.dcdl"],
+            0,
+        )
+        .await;
+        let node = observed
+            .nodes
+            .iter()
+            .find(|n| n.path == "main.dcdl")
+            .unwrap();
+        assert!(
+            workspace_config::read(
+                api,
+                &fixture.worker,
+                Read {
+                    connection_id: attached.connection_id,
+                    path: "main.dcdl".into(),
+                    validator: node.validator.clone(),
+                }
+            )
+            .await
+            .is_ok(),
+            "the granted WIP path remains available"
+        );
 
         // Real API-token authentication still permits the normal UI editor.
         let token = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
         for (method, path) in &routes {
             if *method == "GET" {
-                request_json_authenticated(build_router(api.clone()), method, path, None,
-                    &token, StatusCode::OK).await;
+                request_json_authenticated(
+                    build_router(api.clone()),
+                    method,
+                    path,
+                    None,
+                    &token,
+                    StatusCode::OK,
+                )
+                .await;
             }
         }
-        request_json_authenticated(build_router(api.clone()), "POST", &format!("{tree}/commit"),
-            Some(serde_json::to_value(change).unwrap()), &token, StatusCode::CREATED).await;
-        let saved = api.config_store.load_workspace_config(TEST_WORKSPACE_ID).unwrap().unwrap();
-        assert_eq!(saved.snapshot.revision, initial.snapshot.revision + 1);
-        assert!(saved.snapshot.entries.keys().any(|p| p.as_str() == "notes/editor-only.txt"));
+        request_json_authenticated(
+            build_router(api.clone()),
+            "POST",
+            &format!("{tree}/commit"),
+            Some(serde_json::to_value(change).unwrap()),
+            &token,
+            StatusCode::CREATED,
+        )
+        .await;
+        let saved = api
+            .config_store
+            .load_workspace_config(TEST_WORKSPACE_ID)
+            .unwrap()
+            .unwrap();
+        assert_ne!(saved.snapshot.digest, initial.snapshot.digest);
+        assert!(
+            saved
+                .snapshot
+                .entries
+                .keys()
+                .any(|p| p.as_str() == "notes/editor-only.txt")
+        );
         // Prompt and Skill runtime consumption are separate read-only projections,
         // not authored-tree editor APIs; bootstrap must remain usable.
-        assert_eq!(signed_call(api, &identity, Some(&fixture.worker.worker_id), "GET",
-            &format!("/api/w/{TEST_WORKSPACE_ID}/config/projections/prompts"), Value::Null).await.0,
-            StatusCode::OK);
-        assert_eq!(signed_call(api, &identity, Some(&fixture.worker.worker_id), "GET",
-            &format!("/api/w/{TEST_WORKSPACE_ID}/skills"), Value::Null).await.0, StatusCode::OK);
+        assert_eq!(
+            signed_call(
+                api,
+                &identity,
+                Some(&fixture.worker.worker_id),
+                "GET",
+                &format!("/api/w/{TEST_WORKSPACE_ID}/config/projections/prompts"),
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            signed_call(
+                api,
+                &identity,
+                Some(&fixture.worker.worker_id),
+                "GET",
+                &format!("/api/w/{TEST_WORKSPACE_ID}/skills"),
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
@@ -836,7 +1073,6 @@ mod workspace_config_integration {
         let b = attach(api, &second).await;
         let first = observe(api, &fixture.worker, &a.connection_id, &[""], 0).await;
         let other = observe(api, &second, &b.connection_id, &[""], 0).await;
-        assert_eq!(first.revision, other.revision);
         assert_eq!(first.digest, other.digest);
         assert_ne!(first.validator, other.validator);
         workspace_config::commit(
@@ -871,7 +1107,6 @@ mod workspace_config_integration {
             validator: file.validator.clone(),
         };
         let canonical = config_commit_request_from_api(server_api::ConfigCommitRequest {
-            base_revision: fresh.revision,
             base_digest: fresh.digest.clone(),
             entrypoints: fresh.entrypoints.clone(),
             changes: vec![server_api::ConfigTreeChange::Update {
@@ -881,34 +1116,12 @@ mod workspace_config_integration {
             }],
         })
         .unwrap();
-        // Same bytes, new virtual identity/revision via the ORIGINAL UI commit boundary.
+        // Identical bytes retain content identity through the original UI commit boundary.
         commit_workspace_config_tree(api, TEST_WORKSPACE_ID, &canonical).unwrap();
         let after = observe(api, &second, &b.connection_id, &["notes/concurrent.md"], 0).await;
         assert_eq!(after.digest, fresh.digest);
-        assert!(after.revision > fresh.revision);
-        assert_ne!(after.validator, fresh.validator);
-        assert_eq!(
-            workspace_config::read(api, &second, old_read)
-                .await
-                .unwrap_err()
-                .code,
-            "stale_validator"
-        );
-        assert_eq!(
-            workspace_config::commit(
-                api,
-                &second,
-                commit_request(
-                    &b.connection_id,
-                    &fresh,
-                    vec![create("notes/stale.md", "stale")]
-                )
-            )
-            .await
-            .unwrap_err()
-            .code,
-            "stale_validator"
-        );
+        assert_eq!(after.validator, fresh.validator);
+        assert!(workspace_config::read(api, &second, old_read).await.is_ok());
         let delete = vec![server_api::ConfigTreeChange::Delete {
             path: file.path.clone(),
             expected_digest: file.digest.clone().unwrap(),

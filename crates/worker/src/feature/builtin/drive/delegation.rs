@@ -144,9 +144,8 @@ impl WorkspaceClient for InternalChildWorkspaceClient {
 
     fn current_prompt_projection(
         &self,
-        minimum_revision: Option<u64>,
     ) -> Result<Option<WorkspacePromptCatalogResolution>, WorkspaceClientError> {
-        self.inner.current_prompt_projection(minimum_revision)
+        self.inner.current_prompt_projection()
     }
 
     fn list_workspace_workers(
@@ -181,7 +180,7 @@ mod tests {
     enum Call {
         Json(WorkspaceRequest, Option<Duration>),
         Binary(WorkspaceBinaryRequest, Option<Duration>),
-        Projection(Option<u64>),
+        Projection,
         Discovery(WorkspaceWorkerDiscoveryRequest),
         Remove(String, String, String),
         Server,
@@ -250,9 +249,8 @@ mod tests {
         }
         fn current_prompt_projection(
             &self,
-            revision: Option<u64>,
         ) -> Result<Option<WorkspacePromptCatalogResolution>, WorkspaceClientError> {
-            self.calls.lock().unwrap().push(Call::Projection(revision));
+            self.calls.lock().unwrap().push(Call::Projection);
             Err(WorkspaceClientError::Request("projection marker".into()))
         }
         fn list_workspace_workers(
@@ -390,7 +388,7 @@ mod tests {
             expected_bytes
         );
         assert!(
-            matches!(client.current_prompt_projection(Some(42)), Err(WorkspaceClientError::Request(message)) if message == "projection marker")
+            matches!(client.current_prompt_projection(), Err(WorkspaceClientError::Request(message)) if message == "projection marker")
         );
         let discovery = WorkspaceWorkerDiscoveryRequest {
             cursor: Some("next".into()),
@@ -422,7 +420,7 @@ mod tests {
                 Call::Json(request, Some(timeout)),
                 Call::Binary(bytes.clone(), None),
                 Call::Binary(bytes, Some(timeout)),
-                Call::Projection(Some(42)),
+                Call::Projection,
                 Call::Discovery(discovery),
                 Call::Remove("runtime".into(), "worker".into(), "reason".into()),
                 Call::Server,

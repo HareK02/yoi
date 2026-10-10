@@ -111,7 +111,6 @@ mod tests {
             let body = serde_json::json!({
                 "authority": "workspace-config-skills-v1",
                 "projection": {
-                    "config_revision": 7,
                     "tree_digest": "tree-digest"
                 },
                 "entries": [{
@@ -123,7 +122,6 @@ mod tests {
                         "kind": "workspace",
                         "id": "workspace:triage-errors",
                         "virtual_path": "skills/triage-errors/SKILL.md",
-                        "revision": 7,
                         "source_digest": "source-digest",
                         "tree_digest": "tree-digest"
                     },

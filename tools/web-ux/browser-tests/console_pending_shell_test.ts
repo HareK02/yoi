@@ -54,15 +54,33 @@ Deno.test("Console pending scopes are independent and match Tasks row typography
           try {
             const page = await context.newPage();
             const errors: string[] = [];
+            const supersededCatalogReads: string[] = [];
             page.on("pageerror", (error) => errors.push(String(error)));
             page.on("console", (message) => {
               if (message.type() === "error") errors.push(message.text());
             });
-            page.on("requestfailed", (request) => errors.push(request.url()));
+            page.on("requestfailed", (request) => {
+              // The subscription snapshot supersedes the bootstrap catalog GET.
+              // Keep this intentional AbortController cancellation separate from
+              // transport failures; each mode still awaits a completed catalog GET.
+              if (
+                request.url() === `${url}/api/w/console-history-review/workers` &&
+                request.method() === "GET" &&
+                request.failure()?.errorText === "net::ERR_ABORTED"
+              ) supersededCatalogReads.push(request.url());
+              else errors.push(`${request.url()}: ${request.failure()?.errorText}`);
+            });
             for (const mode of ["both", "queue", "notifications", "legacy", "empty"]) {
+              const catalogFinished = page.waitForEvent("requestfinished", {
+                predicate: (request) =>
+                  request.url() === `${url}/api/w/console-history-review/workers` &&
+                  request.method() === "GET",
+                timeout: 10_000,
+              });
               await page.goto(
                 `${url}/w/console-history-review/workers/W-900-console-fixture/console?pending=${mode}`,
               );
+              await catalogFinished;
               await page.locator(".task-mini-row").waitFor();
               const metadata = page.getByLabel("Worker model and context", { exact: true });
               const statusGeometry = await metadata.evaluate((status) => {
@@ -257,7 +275,12 @@ Deno.test("Console pending scopes are independent and match Tasks row typography
                 await page.getByText("2 pending · Preview unavailable", { exact: true }).waitFor();
               }
             }
+            assertEquals(await page.locator(".workspace-alert").count(), 0);
             assertEquals(errors, []);
+            console.log(JSON.stringify({
+              colorScheme, width, supersededCatalogReads,
+              unexpectedErrors: errors,
+            }));
           } finally {
             await context.close();
           }

@@ -133,7 +133,7 @@ export type ReviewContext = {
   schemaVersion: 1;
   runId: string;
   scenario: { id: string; title: string; sourcePath: string | null };
-  source: { revision: string | null; dirty: boolean | null };
+  source: { commitSha: string | null; dirty: boolean | null };
   baseUrl: string;
   browser: { name: "chromium"; version: string };
   createdAt: string;

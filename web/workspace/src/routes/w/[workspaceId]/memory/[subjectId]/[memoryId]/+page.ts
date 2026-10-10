@@ -1,7 +1,7 @@
 import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 import {
   MEMORY_API_LOAD_POLICY,
-  parseSubjektivMemoryListRevisionsResponse,
+  parseSubjektivMemoryListChangesResponse,
   parseSubjektivMemoryReadResponse,
   parseSubjektivSubjectResponse,
 } from "#lib/workspace/memory/api.ts";
@@ -40,7 +40,6 @@ export const load: PageLoad = async ({ fetch, params, url }) => {
   const detailQuery = new URLSearchParams({ limit: "1000" });
   for (
     const [key, positive] of [
-      ["revision", true],
       ["offset", false],
       ["byte_offset", false],
     ] as const
@@ -48,16 +47,18 @@ export const load: PageLoad = async ({ fetch, params, url }) => {
     const value = safeIntegerQuery(url.searchParams, key, positive);
     if (value !== null) detailQuery.set(key, value);
   }
+  const changeId = boundedCursor(url.searchParams.get("change_id"), 512);
+  if (changeId) detailQuery.set("change_id", changeId);
   const evidenceCursor = boundedCursor(
     url.searchParams.get("evidence_cursor"),
     512,
   );
   if (evidenceCursor) detailQuery.set("evidence_cursor", evidenceCursor);
-  const revisionCursor = boundedCursor(url.searchParams.get("revision_cursor"));
-  const revisionQuery = new URLSearchParams({ limit: "100" });
-  if (revisionCursor) revisionQuery.set("cursor", revisionCursor);
+  const changeCursor = boundedCursor(url.searchParams.get("change_cursor"));
+  const changeQuery = new URLSearchParams({ limit: "100" });
+  if (changeCursor) changeQuery.set("cursor", changeCursor);
 
-  const [subject, memory, revisions] = await Promise.all([
+  const [subject, memory, changes] = await Promise.all([
     loadJson(
       fetch,
       workspaceApiPath(params.workspaceId, subjectPath),
@@ -75,10 +76,10 @@ export const load: PageLoad = async ({ fetch, params, url }) => {
     loadJson(
       fetch,
       `${
-        workspaceApiPath(params.workspaceId, `${memoryPath}/revisions`)
-      }?${revisionQuery}`,
+        workspaceApiPath(params.workspaceId, `${memoryPath}/changes`)
+      }?${changeQuery}`,
       undefined,
-      (value) => parseSubjektivMemoryListRevisionsResponse(value, memoryId),
+      (value) => parseSubjektivMemoryListChangesResponse(value, memoryId),
       MEMORY_API_LOAD_POLICY,
     ),
   ]);
@@ -87,9 +88,9 @@ export const load: PageLoad = async ({ fetch, params, url }) => {
     workspaceId: params.workspaceId,
     subjectId,
     memoryId,
-    revisionCursor,
+    changeCursor,
     subject,
     memory,
-    revisions,
+    changes,
   };
 };

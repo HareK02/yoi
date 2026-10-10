@@ -3,11 +3,11 @@ use server_api::{
     CreateWorkspaceWorkerRequest, ListResponse, MemoryDocumentResponse, MemoryStagingListResponse,
     ObjectiveCreateRequest, ObjectiveDetail, ObjectiveEditRequest, ObjectiveLinkTicketRequest,
     ObjectiveStateRequest, ObjectiveSummary, RevokeRuntimeTrustKeyRequest,
-    RuntimeTrustKeyRevealResponse, SubjektivMemoryDetailQuery, SubjektivMemoryListQuery,
-    SubjektivMemoryListRevisionsResponse, SubjektivMemoryQueryResponse,
-    SubjektivMemoryReadResponse, SubjektivMemoryRevisionsQuery, SubjektivResidentSurfaceResponse,
-    SubjektivSubjectListQuery, SubjektivSubjectListResponse, SubjektivSubjectResponse,
-    WorkerLaunchOptionsResponse, WorkspaceRuntimeDetail, WorkspaceRuntimeResource,
+    RuntimeTrustKeyRevealResponse, SubjektivMemoryChangesQuery, SubjektivMemoryDetailQuery,
+    SubjektivMemoryListChangesResponse, SubjektivMemoryListQuery, SubjektivMemoryQueryResponse,
+    SubjektivMemoryReadResponse, SubjektivResidentSurfaceResponse, SubjektivSubjectListQuery,
+    SubjektivSubjectListResponse, SubjektivSubjectResponse, WorkerLaunchOptionsResponse,
+    WorkspaceRuntimeDetail, WorkspaceRuntimeResource,
 };
 use ticket::{
     MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent, NewTicketRelation,
@@ -168,7 +168,7 @@ impl BackendWorkspaceProductClient {
         };
         Ok(ticket::TicketStateUpdate {
             operation_key: uuid::Uuid::now_v7().to_string(),
-            expected_item_revision: ticket::ticket_item_revision(&current),
+            expected_content_digest: ticket::ticket_content_digest(&current),
             expected_state: parse(&change.from)?,
             state: parse(&change.to)?,
             reason: if change.body.as_str().is_empty() {
@@ -208,7 +208,7 @@ impl BackendWorkspaceProductClient {
         let current = self.show_ticket(id)?;
         let request = ticket::TicketCompletion {
             operation_key: uuid::Uuid::now_v7().to_string(),
-            expected_item_revision: ticket::ticket_item_revision(&current),
+            expected_content_digest: ticket::ticket_content_digest(&current),
             expected_state: current.meta.workflow_state,
             reason: resolution.as_str().to_string(),
             references: Vec::new(),
@@ -521,19 +521,19 @@ impl BackendWorkspaceProductClient {
         })
     }
 
-    pub fn list_subjektiv_memory_revisions(
+    pub fn list_subjektiv_memory_changes(
         &self,
         subject_id: &str,
         memory_id: &str,
-        query: &SubjektivMemoryRevisionsQuery,
-    ) -> Result<SubjektivMemoryListRevisionsResponse, BackendWorkspaceClientError> {
+        query: &SubjektivMemoryChangesQuery,
+    ) -> Result<SubjektivMemoryListChangesResponse, BackendWorkspaceClientError> {
         let workspace_id = self.workspace_id.clone();
         let subject_id = subject_id.to_string();
         let memory_id = memory_id.to_string();
         let query = query.clone();
         self.generated(move |client| async move {
             client
-                .subjektiv_memory_revisions(workspace_id, subject_id, memory_id, query)
+                .subjektiv_memory_changes(workspace_id, subject_id, memory_id, query)
                 .await
         })
     }
@@ -997,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_state_adapter_uses_snapshot_revision_without_overriding_stale_expected_state() {
+    fn legacy_state_adapter_uses_snapshot_content_without_overriding_stale_expected_state() {
         let temp = tempfile::tempdir().unwrap();
         let backend =
             ticket::SqliteTicketBackend::open(temp.path().join("fixture.db"), "workspace-a")
@@ -1021,8 +1021,8 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(
-            body["expected_item_revision"],
-            ticket::ticket_item_revision(&snapshot)
+            body["expected_content_digest"],
+            ticket::ticket_content_digest(&snapshot)
         );
         assert_eq!(body["expected_state"], "ready");
         assert_eq!(body["state"], "done");
@@ -1057,8 +1057,8 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(
-            body["expected_item_revision"],
-            ticket::ticket_item_revision(&snapshot)
+            body["expected_content_digest"],
+            ticket::ticket_content_digest(&snapshot)
         );
         assert_eq!(body["expected_state"], "planning");
         assert_eq!(body["reason"], "The request was withdrawn");
@@ -1070,7 +1070,7 @@ mod tests {
     fn ticket_backend_completion_forwards_cas_judgment_and_backend_conflicts() {
         let (base_url, request, handle) = one_response_server(
             "409 Conflict",
-            r#"{"error":"ticket_conflict","message":"stale revision","diagnostics":[]}"#,
+            r#"{"error":"ticket_conflict","message":"stale content","diagnostics":[]}"#,
         );
         let client = BackendWorkspaceProductClient::new_with_access_token(
             base_url,
@@ -1083,7 +1083,7 @@ mod tests {
             "T-718",
             ticket::TicketCompletion {
                 operation_key: "research-done".into(),
-                expected_item_revision: "ticket:1".into(),
+                expected_content_digest: "ticket:1".into(),
                 expected_state: ticket::TicketWorkflowState::Planning,
                 reason: "Research findings recorded".into(),
                 references: Vec::new(),
@@ -1100,7 +1100,7 @@ mod tests {
             serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body["state"], "done");
         assert_eq!(body["operation_key"], "research-done");
-        assert_eq!(body["expected_item_revision"], "ticket:1");
+        assert_eq!(body["expected_content_digest"], "ticket:1");
         assert_eq!(body["expected_state"], "planning");
         assert_eq!(body["reason"], "Research findings recorded");
         assert!(body.get("merge_request_ids").is_none());

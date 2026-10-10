@@ -110,12 +110,12 @@ Deno.test("Drive A to B to A selection rejects the first A response and late rea
   equal(c.state.text, "fresh");
   equal(c.state.error, null);
 });
-Deno.test("Drive drafts survive workspace and node switches without revision rebasing", async () => {
-  let revision = "9007199254740993";
+Deno.test("Drive drafts survive workspace and node switches without last_mutation_id rebasing", async () => {
+  let last_mutation_id = "9007199254740993";
   const c = controller({
     readText: (ws, target) =>
       Promise.resolve({
-        entry: entry(target.node_id, ws, revision),
+        entry: entry(target.node_id, ws, last_mutation_id),
         text: "server",
         truncated: false,
       }),
@@ -124,22 +124,22 @@ Deno.test("Drive drafts survive workspace and node switches without revision reb
   c.edit("local alpha");
   await c.select("beta", ref("2", "beta"));
   c.edit("local beta");
-  revision = "9007199254740999";
+  last_mutation_id = "9007199254740999";
   await c.select("alpha", ref("3"));
   await c.select("alpha", ref());
   equal(c.state.draft?.text, "local alpha");
-  equal(c.state.draft?.expectedRevision, "9007199254740993");
-  equal(c.state.entry?.revision, "9007199254740999");
+  equal(c.state.draft?.expectedMutationId, "9007199254740993");
+  equal(c.state.entry?.last_mutation_id, "9007199254740999");
   await c.select("beta", ref("2", "beta"));
   equal(c.state.draft?.text, "local beta");
 });
-Deno.test("Drive conflict keeps local text and old CAS revision across switching without retry", async () => {
+Deno.test("Drive conflict keeps local text and old CAS last_mutation_id across switching without retry", async () => {
   let mutations = 0;
   const c = controller({
     mutate: (_, __, mutation) => {
       ++mutations;
-      assert("expected_revision" in mutation);
-      equal(mutation.expected_revision, "9007199254740993");
+      assert("expected_mutation_id" in mutation);
+      equal(mutation.expected_mutation_id, "9007199254740993");
       return Promise.reject(new DriveRequestError("conflict", "not_committed"));
     },
   });
@@ -151,7 +151,7 @@ Deno.test("Drive conflict keeps local text and old CAS revision across switching
   await c.select("alpha", ref("3"));
   await c.select("alpha", ref());
   equal(c.state.draft?.conflict, true);
-  equal(c.state.draft?.expectedRevision, "9007199254740993");
+  equal(c.state.draft?.expectedMutationId, "9007199254740993");
   equal(mutations, 1);
 });
 Deno.test("Drive acknowledged save preserves edits made while the request was in flight", async () => {
@@ -168,7 +168,7 @@ Deno.test("Drive acknowledged save preserves edits made while the request was in
   await saving;
   equal(c.state.draft?.text, "new edit");
   equal(c.state.draft?.baseText, "sent");
-  equal(c.state.draft?.expectedRevision, "9007199254740994");
+  equal(c.state.draft?.expectedMutationId, "9007199254740994");
 });
 Deno.test("Drive late mutation and upload success cannot affect a newly selected identity", async () => {
   for (const operation of ["mutation", "upload"] as const) {
@@ -184,7 +184,7 @@ Deno.test("Drive late mutation and upload success cannot affect a newly selected
       : c.upload(new Blob(["abc"]), {
         operation: "update",
         id: ref(),
-        expected_revision: "9007199254740993",
+        expected_mutation_id: "9007199254740993",
         content_type: "text/plain",
       });
     await c.select("beta", ref("2", "beta"));
@@ -195,11 +195,11 @@ Deno.test("Drive late mutation and upload success cannot affect a newly selected
     await sending;
     equal(c.state.workspaceId, "beta");
     equal(c.state.receipts, []);
-    equal(c.state.draft?.expectedRevision, "9007199254740993");
+    equal(c.state.draft?.expectedMutationId, "9007199254740993");
     await c.select("alpha", ref());
     equal(c.state.receipts[0].state, "unknown");
     equal(c.state.draft?.text, "sent");
-    equal(c.state.draft?.expectedRevision, "9007199254740993");
+    equal(c.state.draft?.expectedMutationId, "9007199254740993");
   }
 });
 Deno.test("Drive unknown upload reconciles by request id and never blindly retransmits", async () => {
@@ -234,7 +234,7 @@ Deno.test("Drive unknown upload reconciles by request id and never blindly retra
   const target = {
     operation: "update" as const,
     id: ref(),
-    expected_revision: "9007199254740993",
+    expected_mutation_id: "9007199254740993",
     content_type: "application/octet-stream",
   };
   const id = await c.upload(new Blob(["abc"]), target);
@@ -273,7 +273,7 @@ Deno.test("Drive late status response is fenced even when the original node is r
   });
   await checking;
   equal(c.state.receipts[0].state, "unknown");
-  equal(c.state.draft?.expectedRevision, "9007199254740993");
+  equal(c.state.draft?.expectedMutationId, "9007199254740993");
   equal(c.state.draft?.text, "local");
 });
 Deno.test("Drive truncated text has no editable draft and disposal rejects late publication", async () => {
@@ -460,7 +460,7 @@ Deno.test("Drive cancelled writes retain draft and receipt and ignore late compl
       : c.upload(new Blob(["abc"]), {
         operation: "update",
         id: ref(),
-        expected_revision: "9007199254740993",
+        expected_mutation_id: "9007199254740993",
         content_type: "text/plain",
       });
     equal(c.state.receipts[0].state, "pending");
@@ -470,7 +470,7 @@ Deno.test("Drive cancelled writes retain draft and receipt and ignore late compl
     equal(c.state.receipts[0].requestId, id);
     equal(c.state.receipts[0].state, "unknown");
     equal(c.state.draft?.text, "sent draft");
-    equal(c.state.draft?.expectedRevision, "9007199254740993");
+    equal(c.state.draft?.expectedMutationId, "9007199254740993");
     await rejects(() => c.save());
     await c.reconcile(id);
     assert(
@@ -495,7 +495,7 @@ Deno.test("Drive cancelled writes retain draft and receipt and ignore late compl
     equal(await sending, id);
     assert(c.state === snapshot);
     equal(sends, 1);
-    equal(c.state.entry?.revision, "9007199254740994");
+    equal(c.state.entry?.last_mutation_id, "9007199254740994");
   }
 });
 Deno.test("Drive cancellation does not abort or fence active search reads", async () => {
@@ -555,14 +555,14 @@ Deno.test("Drive concurrent writes are blocked before transmission and receipt c
     c.mutate({
       operation: "delete",
       id: ref(),
-      expected_revision: "9007199254740993",
+      expected_mutation_id: "9007199254740993",
     })
   );
   await rejects(() =>
     c.upload(new Blob(["abc"]), {
       operation: "update",
       id: ref(),
-      expected_revision: "9007199254740993",
+      expected_mutation_id: "9007199254740993",
       content_type: "text/plain",
     })
   );
@@ -574,13 +574,13 @@ Deno.test("Drive concurrent writes are blocked before transmission and receipt c
   });
   await saving;
 });
-Deno.test("Drive clean draft refresh adopts latest revision unless a request remains unresolved", async () => {
-  let revision = "9007199254740993";
+Deno.test("Drive clean draft refresh adopts latest last_mutation_id unless a request remains unresolved", async () => {
+  let last_mutation_id = "9007199254740993";
   let text = "abc";
   const c = controller({
     readText: () =>
       Promise.resolve({
-        entry: entry("2", "alpha", revision),
+        entry: entry("2", "alpha", last_mutation_id),
         text,
         truncated: false,
       }),
@@ -588,19 +588,19 @@ Deno.test("Drive clean draft refresh adopts latest revision unless a request rem
       Promise.reject(new DriveRequestError("outcome_unknown", "unknown")),
   });
   await c.select("alpha", ref());
-  revision = "9007199254740994";
+  last_mutation_id = "9007199254740994";
   text = "new";
   await c.refresh();
   equal(c.state.draft?.text, "new");
   equal(c.state.draft?.baseText, "new");
-  equal(c.state.draft?.expectedRevision, revision);
+  equal(c.state.draft?.expectedMutationId, last_mutation_id);
   await c.save();
-  revision = "9007199254740995";
+  last_mutation_id = "9007199254740995";
   text = "unknown change";
   await c.refresh();
   equal(c.state.text, "unknown change");
   equal(c.state.draft?.text, "new");
-  equal(c.state.draft?.expectedRevision, "9007199254740994");
+  equal(c.state.draft?.expectedMutationId, "9007199254740994");
   equal(c.state.receipts[0].state, "unknown");
   await rejects(() => c.save());
 });
@@ -688,13 +688,13 @@ Deno.test("Drive cancelled late success stays unknown until explicit committed s
   });
   const id = await saving;
   equal(c.state.receipts[0].state, "unknown");
-  equal(c.state.draft?.expectedRevision, "9007199254740993");
+  equal(c.state.draft?.expectedMutationId, "9007199254740993");
   equal(c.state.draft?.text, "local");
   equal(statusCalls, 0);
   await rejects(() => c.save());
   await c.reconcile(id);
   equal(c.state.receipts[0].state, "committed");
-  equal(c.state.draft?.expectedRevision, "9007199254740994");
+  equal(c.state.draft?.expectedMutationId, "9007199254740994");
   equal(c.state.draft?.baseText, "local");
 });
 Deno.test("Drive archived dirty draft cannot enable editing after MIME changes to active bytes", async () => {
@@ -723,14 +723,14 @@ Deno.test("Drive archived dirty draft cannot enable editing after MIME changes t
   contentType = "text/plain";
   await c.refresh();
   equal(c.state.draft?.text, "retain me");
-  equal(c.state.draft?.expectedRevision, "9007199254740993");
+  equal(c.state.draft?.expectedMutationId, "9007199254740993");
 });
 Deno.test("Drive conflicted clean draft stays fixed while clean truncated reread removes editor", async () => {
-  let revision = "9007199254740993";
+  let last_mutation_id = "9007199254740993";
   let truncated = false;
   const readText = () =>
     Promise.resolve({
-      entry: entry("2", "alpha", revision),
+      entry: entry("2", "alpha", last_mutation_id),
       text: "abc",
       truncated,
     });
@@ -741,12 +741,12 @@ Deno.test("Drive conflicted clean draft stays fixed while clean truncated reread
   });
   await conflict.select("alpha", ref());
   await conflict.save();
-  revision = "9007199254740994";
+  last_mutation_id = "9007199254740994";
   await conflict.refresh();
   equal(conflict.state.draft?.text, "abc");
   equal(conflict.state.draft?.baseText, "abc");
   equal(conflict.state.draft?.conflict, true);
-  equal(conflict.state.draft?.expectedRevision, "9007199254740993");
+  equal(conflict.state.draft?.expectedMutationId, "9007199254740993");
   const clean = controller({ readText });
   await clean.select("alpha", ref());
   assert(clean.state.draft);

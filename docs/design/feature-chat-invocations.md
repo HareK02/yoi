@@ -50,7 +50,7 @@ Clients may parse this spelling only for input assistance. A call becomes execut
 
 TUI and Web composers retain selected invocations as atomic typed chips containing identity and structured arguments. Backspace/Delete and range deletion remove an unsent chip; removal is not an undo for an already executed operation. Draft history, transport retry, queueing, Session history, snapshot/live projections, and rewind restoration preserve the typed segment rather than flattening and reparsing it.
 
-Completion requests carry a kind, fresh `request_id`, and source-qualified argument context. Host and Runtime echo the request ID unchanged. Clients correlate replies with that nonce plus their current draft revision, cursor, target Worker, authority snapshot, and connection generation; even identical-prefix/context ABA replies are discarded. Old uncorrelated replies cannot establish a selected invocation. Client-file arguments use a declared `InvocationClientAdapter`; they do not ask the Worker to resolve a client-local path.
+Completion requests carry a kind, fresh `request_id`, and source-qualified argument context. Host and Runtime echo the request ID unchanged. Clients correlate replies with that nonce plus their current draft identity/content and edit invalidation state, cursor, target Worker, authority snapshot, and connection generation; even identical-prefix/context ABA replies are discarded. Old uncorrelated replies cannot establish a selected invocation. Client-file arguments use a declared `InvocationClientAdapter`; they do not ask the Worker to resolve a client-local path.
 
 ## Attachment adapter
 

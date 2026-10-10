@@ -22,8 +22,7 @@ use crate::store::{
 use crate::{Error, Result};
 
 pub const WORKSPACE_SIGNING_ALGORITHM: &str = "ed25519";
-pub const WORKSPACE_SIGNING_IDENTITY_REVISION: u64 = 1;
-const MATERIAL_SCHEMA_VERSION: u32 = 1;
+const MATERIAL_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,7 +30,6 @@ pub struct WorkspaceSigningPrivateMaterial {
     version: u32,
     workspace_id: String,
     key_id: String,
-    revision: u64,
     private_key: String,
 }
 
@@ -42,7 +40,6 @@ impl fmt::Debug for WorkspaceSigningPrivateMaterial {
             .field("version", &self.version)
             .field("workspace_id", &self.workspace_id)
             .field("key_id", &self.key_id)
-            .field("revision", &self.revision)
             .field("private_key", &"[REDACTED]")
             .finish()
     }
@@ -66,7 +63,6 @@ impl WorkspaceSigningPrivateMaterial {
             version: MATERIAL_SCHEMA_VERSION,
             workspace_id: workspace_id.to_string(),
             key_id: key_id.to_string(),
-            revision: WORKSPACE_SIGNING_IDENTITY_REVISION,
             private_key: material.private_key,
         })
     }
@@ -75,12 +71,10 @@ impl WorkspaceSigningPrivateMaterial {
         &self,
         expected_workspace_id: &str,
         expected_key_id: &str,
-        expected_revision: u64,
     ) -> Result<ring::signature::Ed25519KeyPair> {
         if self.version != MATERIAL_SCHEMA_VERSION
             || self.workspace_id != expected_workspace_id
             || self.key_id != expected_key_id
-            || self.revision != expected_revision
         {
             return Err(identity_error(
                 "workspace_signing_identity_material_mismatch",
@@ -105,10 +99,8 @@ impl WorkspaceSigningPrivateMaterial {
         &self,
         expected_workspace_id: &str,
         expected_key_id: &str,
-        expected_revision: u64,
     ) -> Result<String> {
-        let signing_key =
-            self.signing_key(expected_workspace_id, expected_key_id, expected_revision)?;
+        let signing_key = self.signing_key(expected_workspace_id, expected_key_id)?;
         Ok(encode_public_key(signing_key.public_key().as_ref()))
     }
 }
@@ -146,7 +138,8 @@ impl WorkspaceSigningIdentityService {
     ) -> Result<(WorkspaceSigningIdentityActivation, String)> {
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let proposed_key_id = format!("WK-{}", uuid::Uuid::now_v7().simple());
-        let proposed_material_ref = format!("workspace-signing/{proposed_workspace_id}/ed25519-v1");
+        let proposed_material_ref =
+            format!("workspace-signing/{proposed_workspace_id}/{proposed_key_id}");
         let operation_key = format!("workspace-create:{workspace_create_operation_key}");
         let operation = self.store.reserve_workspace_signing_identity_provisioning(
             &WorkspaceSigningIdentityProvisioningOperation {
@@ -156,7 +149,6 @@ impl WorkspaceSigningIdentityService {
                 workspace_id: proposed_workspace_id.to_string(),
                 key_id: proposed_key_id,
                 private_material_ref: proposed_material_ref,
-                revision: WORKSPACE_SIGNING_IDENTITY_REVISION,
                 actor_account_id: actor_account_id.to_string(),
                 state: "pending".to_string(),
                 created_at: now,
@@ -191,12 +183,12 @@ impl WorkspaceSigningIdentityService {
                 "Workspace signing identity state is invalid",
             ));
         }
-        let operation_key = format!(
-            "existing-workspace:{workspace_id}:revision-{}",
-            identity.revision
+        let operation_key = format!("existing-workspace:{workspace_id}:key-{}", identity.key_id);
+        let request_fingerprint = provisioning_fingerprint(
+            workspace_id,
+            &identity.key_id,
+            &identity.private_material_ref,
         );
-        let request_fingerprint =
-            provisioning_fingerprint(workspace_id, &identity.key_id, identity.revision);
         let operation = self.store.reserve_workspace_signing_identity_provisioning(
             &WorkspaceSigningIdentityProvisioningOperation {
                 operation_key: operation_key.clone(),
@@ -205,7 +197,6 @@ impl WorkspaceSigningIdentityService {
                 workspace_id: workspace_id.to_string(),
                 key_id: identity.key_id.clone(),
                 private_material_ref: identity.private_material_ref.clone(),
-                revision: identity.revision,
                 actor_account_id: actor_account_id.to_string(),
                 state: "pending".to_string(),
                 created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -253,8 +244,20 @@ impl WorkspaceSigningIdentityService {
                     "Workspace signing private material is missing",
                 )
             })?;
-        let signing_key =
-            material.signing_key(workspace_id, &identity.key_id, identity.revision)?;
+        let fingerprint = identity.public_key_fingerprint.as_deref().ok_or_else(|| {
+            identity_error(
+                "workspace_signing_identity_material_mismatch",
+                "Workspace signing public key fingerprint is missing",
+            )
+        })?;
+        let signing_key = material.signing_key(workspace_id, &identity.key_id)?;
+        let public_key = encode_public_key(signing_key.public_key().as_ref());
+        if public_key_fingerprint(&public_key)? != fingerprint {
+            return Err(identity_error(
+                "workspace_signing_identity_material_mismatch",
+                "Workspace signing private material does not match public metadata",
+            ));
+        }
         Ok(signing_key.sign(payload).as_ref().to_vec())
     }
 
@@ -290,11 +293,8 @@ impl WorkspaceSigningIdentityService {
                     .put_if_absent(&operation.private_material_ref, &generated)?
             }
         };
-        let public_key = material.validate_and_public_key(
-            &operation.workspace_id,
-            &operation.key_id,
-            operation.revision,
-        )?;
+        let public_key =
+            material.validate_and_public_key(&operation.workspace_id, &operation.key_id)?;
         let public_key_fingerprint = public_key_fingerprint(&public_key)?;
         Ok(WorkspaceSigningIdentityActivation {
             workspace_id: operation.workspace_id.clone(),
@@ -302,7 +302,6 @@ impl WorkspaceSigningIdentityService {
             public_key,
             public_key_fingerprint,
             private_material_ref: operation.private_material_ref.clone(),
-            revision: operation.revision,
             provisioned_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         })
     }
@@ -317,11 +316,8 @@ impl WorkspaceSigningIdentityService {
                     "Workspace signing private material is missing",
                 )
             })?;
-        let public_key = material.validate_and_public_key(
-            &identity.workspace_id,
-            &identity.key_id,
-            identity.revision,
-        )?;
+        let public_key =
+            material.validate_and_public_key(&identity.workspace_id, &identity.key_id)?;
         let fingerprint = public_key_fingerprint(&public_key)?;
         if identity.public_key.as_deref() != Some(public_key.as_str())
             || identity.public_key_fingerprint.as_deref() != Some(fingerprint.as_str())
@@ -335,15 +331,114 @@ impl WorkspaceSigningIdentityService {
     }
 }
 
-fn provisioning_fingerprint(workspace_id: &str, key_id: &str, revision: u64) -> String {
+pub(crate) fn provisioning_fingerprint(
+    workspace_id: &str,
+    key_id: &str,
+    material_ref: &str,
+) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
+    hasher.update(b"workspace-signing-provisioning\0");
     hasher.update(workspace_id.as_bytes());
     hasher.update([0]);
     hasher.update(key_id.as_bytes());
     hasher.update([0]);
-    hasher.update(revision.to_be_bytes());
+    hasher.update(material_ref.as_bytes());
     format!("sha256:{}", hex_lower(&hasher.finalize()))
+}
+
+// Frozen v1 private-material decoder. New writes never include the old counter.
+mod frozen_material_v1 {
+    use super::*;
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Material {
+        version: u32,
+        workspace_id: String,
+        key_id: String,
+        revision: u64,
+        private_key: String,
+    }
+
+    impl Drop for Material {
+        fn drop(&mut self) {
+            self.private_key.zeroize();
+        }
+    }
+
+    pub(super) fn decode(bytes: &[u8]) -> Option<WorkspaceSigningPrivateMaterial> {
+        let old: Material = serde_json::from_slice(bytes).ok()?;
+        if old.version != 1 || old.revision != 1 {
+            return None;
+        }
+        Some(WorkspaceSigningPrivateMaterial {
+            version: MATERIAL_SCHEMA_VERSION,
+            workspace_id: old.workspace_id.clone(),
+            key_id: old.key_id.clone(),
+            private_key: old.private_key.clone(),
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn frozen_file_load_preserves_key_and_new_writes_use_current_shape() {
+            let material = WorkspaceSigningPrivateMaterial::generate("ws-1", "WK-1").unwrap();
+            let public_key = material.validate_and_public_key("ws-1", "WK-1").unwrap();
+            let mut old = serde_json::to_value(&material).unwrap();
+            old["version"] = 1.into();
+            old["revision"] = 1.into();
+            let temp = tempfile::tempdir().unwrap();
+            let store = FsWorkspaceSigningMaterialStore::new(temp.path().join("identities"));
+            store.put_if_absent("ws-1/ed25519-v1", &material).unwrap();
+            fs::write(
+                store.material_path("ws-1/ed25519-v1").unwrap(),
+                serde_json::to_vec(&old).unwrap(),
+            )
+            .unwrap();
+            let migrated = store.load("ws-1/ed25519-v1").unwrap().unwrap();
+            assert_eq!(
+                migrated.validate_and_public_key("ws-1", "WK-1").unwrap(),
+                public_key
+            );
+            let current = serde_json::to_value(&migrated).unwrap();
+            assert_eq!(current["version"], MATERIAL_SCHEMA_VERSION);
+            assert!(current.get("revision").is_none());
+            assert_eq!(current, serde_json::to_value(material).unwrap());
+        }
+
+        #[test]
+        fn frozen_decoder_rejects_unsupported_or_mixed_metadata() {
+            let material = WorkspaceSigningPrivateMaterial::generate("ws-1", "WK-1").unwrap();
+            let mut old = serde_json::to_value(material).unwrap();
+            old["version"] = 1.into();
+            for revision in [0, 2, u64::MAX] {
+                old["revision"] = revision.into();
+                assert!(decode_private_material(&serde_json::to_vec(&old).unwrap()).is_err());
+            }
+            old["revision"] = 1.into();
+            old["version"] = MATERIAL_SCHEMA_VERSION.into();
+            assert!(decode_private_material(&serde_json::to_vec(&old).unwrap()).is_err());
+            old["version"] = 1.into();
+            old["unexpected"] = true.into();
+            assert!(decode_private_material(&serde_json::to_vec(&old).unwrap()).is_err());
+        }
+    }
+}
+
+fn decode_private_material(
+    bytes: &[u8],
+) -> std::result::Result<WorkspaceSigningPrivateMaterial, ()> {
+    if let Ok(material) = serde_json::from_slice::<WorkspaceSigningPrivateMaterial>(bytes) {
+        if material.version == MATERIAL_SCHEMA_VERSION {
+            return Ok(material);
+        }
+        return Err(());
+    }
+    frozen_material_v1::decode(bytes).ok_or(())
 }
 
 #[derive(Default)]
@@ -418,7 +513,7 @@ impl WorkspaceSigningMaterialStore for FsWorkspaceSigningMaterialStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(material_io_error("read", error)),
         };
-        serde_json::from_slice(&bytes).map(Some).map_err(|_| {
+        decode_private_material(&bytes).map(Some).map_err(|_| {
             identity_error(
                 "workspace_signing_identity_material_corrupt",
                 "Workspace signing private material is corrupt",
@@ -606,6 +701,34 @@ mod tests {
 
     use super::*;
 
+    struct ReplaceMaterialAfterValidation {
+        inner: Arc<InMemoryWorkspaceSigningMaterialStore>,
+        replacement: WorkspaceSigningPrivateMaterial,
+        loads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl WorkspaceSigningMaterialStore for ReplaceMaterialAfterValidation {
+        fn load(&self, material_ref: &str) -> Result<Option<WorkspaceSigningPrivateMaterial>> {
+            if self.loads.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.inner.load(material_ref)
+            } else {
+                Ok(Some(self.replacement.clone()))
+            }
+        }
+
+        fn put_if_absent(
+            &self,
+            material_ref: &str,
+            material: &WorkspaceSigningPrivateMaterial,
+        ) -> Result<WorkspaceSigningPrivateMaterial> {
+            self.inner.put_if_absent(material_ref, material)
+        }
+
+        fn delete(&self, material_ref: &str) -> Result<()> {
+            self.inner.delete(material_ref)
+        }
+    }
+
     struct FailFirstMaterialWrite {
         inner: Arc<InMemoryWorkspaceSigningMaterialStore>,
         fail: AtomicBool,
@@ -709,6 +832,21 @@ mod tests {
         ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public_key)
             .verify(payload, &signature)
             .unwrap();
+        let replacement =
+            WorkspaceSigningPrivateMaterial::generate("workspace-1", &provisioned.key_id).unwrap();
+        let swapping_service = WorkspaceSigningIdentityService::new(
+            store.clone(),
+            Arc::new(ReplaceMaterialAfterValidation {
+                inner: materials.clone(),
+                replacement,
+                loads: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        );
+        assert!(matches!(
+            swapping_service.sign("workspace-1", payload),
+            Err(Error::WorkspaceSigningIdentity { ref code, .. })
+                if code == "workspace_signing_identity_material_mismatch"
+        ));
         assert_eq!(
             service
                 .provision_existing("workspace-1", "account-1")
@@ -747,17 +885,16 @@ mod tests {
         let operation = store
             .reserve_workspace_signing_identity_provisioning(
                 &WorkspaceSigningIdentityProvisioningOperation {
-                    operation_key: "existing-workspace:workspace-2:revision-1".to_string(),
+                    operation_key: format!("existing-workspace:workspace-2:key-{}", pending.key_id),
                     request_fingerprint: provisioning_fingerprint(
                         "workspace-2",
                         &pending.key_id,
-                        pending.revision,
+                        &pending.private_material_ref,
                     ),
                     operation_kind: "existing_workspace".to_string(),
                     workspace_id: "workspace-2".to_string(),
                     key_id: pending.key_id.clone(),
                     private_material_ref: pending.private_material_ref.clone(),
-                    revision: pending.revision,
                     actor_account_id: "account-1".to_string(),
                     state: "pending".to_string(),
                     created_at: "1".to_string(),
@@ -826,7 +963,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = FsWorkspaceSigningMaterialStore::new(temp.path().join("identities"));
         let first = WorkspaceSigningPrivateMaterial::generate("ws-1", "WK-1").unwrap();
-        let first_public = first.validate_and_public_key("ws-1", "WK-1", 1).unwrap();
+        let first_public = first.validate_and_public_key("ws-1", "WK-1").unwrap();
         let persisted = store.put_if_absent("ws-1/ed25519-v1", &first).unwrap();
         #[cfg(unix)]
         {
@@ -849,18 +986,14 @@ mod tests {
             );
         }
         assert_eq!(
-            persisted
-                .validate_and_public_key("ws-1", "WK-1", 1)
-                .unwrap(),
+            persisted.validate_and_public_key("ws-1", "WK-1").unwrap(),
             first_public
         );
 
         let second = WorkspaceSigningPrivateMaterial::generate("ws-1", "WK-1").unwrap();
         let persisted = store.put_if_absent("ws-1/ed25519-v1", &second).unwrap();
         assert_eq!(
-            persisted
-                .validate_and_public_key("ws-1", "WK-1", 1)
-                .unwrap(),
+            persisted.validate_and_public_key("ws-1", "WK-1").unwrap(),
             first_public
         );
     }
@@ -872,7 +1005,7 @@ mod tests {
         let material = WorkspaceSigningPrivateMaterial::generate("ws-1", "WK-1").unwrap();
         store.put_if_absent("ws-1/ed25519-v1", &material).unwrap();
         let loaded = store.load("ws-1/ed25519-v1").unwrap().unwrap();
-        assert!(loaded.validate_and_public_key("ws-2", "WK-1", 1).is_err());
+        assert!(loaded.validate_and_public_key("ws-2", "WK-1").is_err());
 
         fs::write(store.material_path("ws-1/ed25519-v1").unwrap(), b"not json").unwrap();
         assert!(store.load("ws-1/ed25519-v1").is_err());

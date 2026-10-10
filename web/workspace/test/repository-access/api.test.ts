@@ -37,7 +37,6 @@ const credential = {
   name: "Deploy key",
   public_key_algorithm: "ssh-ed25519",
   public_key_fingerprint: "SHA256:credential",
-  current_revision: 2,
   status: "active",
   created_at: "2026-09-01T00:00:00Z",
   rotated_at: null,
@@ -52,7 +51,6 @@ const hostTrust = {
   key_algorithm: "ssh-ed25519",
   host_key: "ssh-ed25519 AAAA",
   fingerprint: "SHA256:host",
-  current_revision: 3,
   created_at: "2026-09-01T00:00:00Z",
   updated_at: "2026-09-02T00:00:00Z",
   referenced_repositories: ["main"],
@@ -63,14 +61,12 @@ Deno.test("Repository Access parsers accept generated response contracts", () =>
   assertEquals(
     parseRepositorySshPublicKey({
       credential_id: "deploy-key",
-      current_revision: 2,
       public_key_algorithm: "ssh-ed25519",
       public_key_fingerprint: "SHA256:credential",
       public_key: "ssh-ed25519 AAAA",
     }),
     {
       credential_id: "deploy-key",
-      current_revision: 2,
       public_key_algorithm: "ssh-ed25519",
       public_key_fingerprint: "SHA256:credential",
       public_key: "ssh-ed25519 AAAA",
@@ -80,7 +76,6 @@ Deno.test("Repository Access parsers accept generated response contracts", () =>
   assertEquals(
     parseRepositoryAccessProjection({
       workspace_id: "workspace-1",
-      config_revision: 4,
       projection_digest: "sha256:projection",
       bindings: [{
         repository_key: "main",
@@ -91,7 +86,6 @@ Deno.test("Repository Access parsers accept generated response contracts", () =>
     }),
     {
       workspace_id: "workspace-1",
-      config_revision: 4,
       projection_digest: "sha256:projection",
       bindings: [{
         repository_key: "main",
@@ -115,10 +109,11 @@ Deno.test("Repository Access parsers reject malformed list responses", () => {
 });
 
 Deno.test("Repository Access parsers reject missing and wrong-typed fields", () => {
-  const { current_revision: _revision, ...missingRevision } = credential;
+  const { public_key_fingerprint: _fingerprint, ...missingFingerprint } =
+    credential;
   assertSchemaError(
-    () => parseRepositorySshCredentials([missingRevision]),
-    "credentials[0].current_revision",
+    () => parseRepositorySshCredentials([missingFingerprint]),
+    "credentials[0].public_key_fingerprint",
   );
   assertSchemaError(
     () => parseRepositorySshHostTrusts([{ ...hostTrust, port: "22" }]),
@@ -128,7 +123,6 @@ Deno.test("Repository Access parsers reject missing and wrong-typed fields", () 
     () =>
       parseRepositoryAccessProjection({
         workspace_id: "workspace-1",
-        config_revision: 4,
         projection_digest: "sha256:projection",
         bindings: [{
           repository_key: "main",

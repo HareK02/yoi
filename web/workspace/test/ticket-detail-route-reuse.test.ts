@@ -16,7 +16,7 @@ Deno.test("ticket detail synchronizes reused route data", () => {
     const token of [
       "data.ticketId",
       "data.ticket.data",
-      "incomingTicket.item_revision",
+      "JSON.stringify([data.workspaceId, incomingTicketId, incomingTicket])",
       "routeGeneration += 1",
       "resetTicketView(incomingTicket)",
     ]

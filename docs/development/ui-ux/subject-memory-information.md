@@ -1,5 +1,7 @@
 # Subject / Memory information audit (T-692)
 
+This document records T-692's UI decisions and validation at the commits cited below. Its counter labels and fixture values describe that historical implementation, not the current API. Current Memory uses opaque `change_id` references, `memory_fingerprint` and `built_from_memory_fingerprint`; see [the current store contract](../../design/subjektiv-store.md). Historical observations and test results below are retained unchanged.
+
 ## Decision and scope
 
 The previous Subjects index exposed `Store revision` alongside identity, state and

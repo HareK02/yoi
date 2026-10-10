@@ -18,12 +18,12 @@ import type {
   MemoryStagingRecord,
   SubjektivMemoryEvidence,
   SubjektivMemoryEvidenceCandidate,
-  SubjektivMemoryListRevisionsResponse,
+  SubjektivMemoryListChangesResponse,
   SubjektivMemoryQueryItem,
   SubjektivMemoryQueryResponse,
   SubjektivMemoryReadResponse,
-  SubjektivMemoryRevisionItem,
-  SubjektivMemoryRevisionRef,
+  SubjektivMemoryChangeItem,
+  SubjektivMemoryChangeRef,
   SubjektivMemorySourceEvidenceRef,
   SubjektivMemoryState,
   SubjektivResidentSurfaceAvailability,
@@ -79,7 +79,7 @@ const memoryStates = new Set<SubjektivMemoryState>([
 ]);
 const MAX_SUBJECTS = 100;
 const MAX_CURRENT_MEMORIES = 100;
-const MAX_REVISIONS = 100;
+const MAX_CHANGES = 100;
 const MAX_MEMORY_REFS = MEMORY_API_LIMITS.maxCollectionItems;
 
 export const MEMORY_API_LOAD_POLICY = {
@@ -221,15 +221,7 @@ export async function updateSubjektivSubjectBehavior(
   request: SubjektivSubjectBehaviorUpdateRequest,
 ): Promise<SubjektivSubjectResponse> {
   validateSubjectBehavior(request.behavior_md);
-  if (
-    !Number.isSafeInteger(request.expected_behavior_revision) ||
-    request.expected_behavior_revision < 0
-  ) {
-    throw new SubjektivSubjectCreateError(
-      "validation",
-      "Subject behavior revision is invalid.",
-    );
-  }
+  validateSubjectBehavior(request.expected_behavior_md);
   let response: Response;
   try {
     response = await fetchFn(
@@ -494,7 +486,6 @@ function parseEvidenceOrigin(value: unknown): MemoryEvidenceOrigin {
     "worker_id",
     "flow_selector",
     "flow_definition_id",
-    "flow_definition_revision",
   ] as const;
   const record = strictRecord(
     value,
@@ -528,14 +519,6 @@ function parseEvidenceOrigin(value: unknown): MemoryEvidenceOrigin {
       result[key] = text;
     }
   }
-  if ("flow_definition_revision" in record) {
-    result.flow_definition_revision = record.flow_definition_revision === null
-      ? null
-      : nonNegativeInteger(
-        record.flow_definition_revision,
-        "flow_definition_revision",
-      );
-  }
   return result;
 }
 
@@ -549,9 +532,8 @@ export function parseSubjektivSubjectResponse(
       "id",
       "role",
       "behavior_md",
-      "behavior_revision",
       "state",
-      "store_revision",
+      "memory_fingerprint",
       "created_at",
       "updated_at",
       "current_worker",
@@ -573,9 +555,8 @@ export function parseSubjektivSubjectResponse(
       "behavior_md",
       MAX_SUBJECT_BEHAVIOR_BYTES,
     ),
-    behavior_revision: requiredNonNegativeInteger(record, "behavior_revision"),
     state,
-    store_revision: requiredNonNegativeInteger(record, "store_revision"),
+    memory_fingerprint: requiredIdentifier(record, "memory_fingerprint"),
     created_at: requiredString(record, "created_at"),
     updated_at: requiredString(record, "updated_at"),
   };
@@ -665,7 +646,7 @@ function parseResidentSurfaceSnapshot(
       "snapshot_id",
       "body_md",
       "memory_refs",
-      "built_from_store_revision",
+      "built_from_memory_fingerprint",
       "created_at",
     ],
     "Resident surface snapshot",
@@ -681,10 +662,10 @@ function parseResidentSurfaceSnapshot(
       record.memory_refs,
       MAX_MEMORY_REFS,
       "memory_refs",
-    ).map(parseMemoryRevisionRef),
-    built_from_store_revision: requiredNonNegativeInteger(
+    ).map(parseMemoryChangeRef),
+    built_from_memory_fingerprint: requiredIdentifier(
       record,
-      "built_from_store_revision",
+      "built_from_memory_fingerprint",
     ),
     created_at: requiredString(record, "created_at"),
   };
@@ -716,12 +697,12 @@ export function parseSubjektivMemoryQueryResponse(
 function parseMemoryQueryItem(value: unknown): SubjektivMemoryQueryItem {
   const record = strictRecord(
     value,
-    ["id", "revision", "kind", "state", "claim", "excerpt", "updated_at"],
+    ["id", "change_id", "kind", "state", "claim", "excerpt", "updated_at"],
     "Current Memory item",
   );
   return {
     id: requiredIdentifier(record, "id"),
-    revision: requiredPositiveInteger(record, "revision"),
+    change_id: requiredIdentifier(record, "change_id"),
     kind: parseCandidateKind(record.kind),
     state: parseMemoryState(record.state),
     claim: requiredString(record, "claim"),
@@ -738,8 +719,8 @@ export function parseSubjektivMemoryReadResponse(
     value,
     [
       "memory_id",
-      "revision",
-      "current_revision",
+      "change_id",
+      "current_change_id",
       "kind",
       "state",
       "claim",
@@ -772,9 +753,8 @@ export function parseSubjektivMemoryReadResponse(
   if (expectedMemoryId !== undefined && memoryId !== expectedMemoryId) {
     invalid("Memory detail identity does not match the requested Memory");
   }
-  const revision = requiredPositiveInteger(record, "revision");
-  const currentRevision = requiredPositiveInteger(record, "current_revision");
-  if (revision > currentRevision) invalid("revision exceeds current_revision");
+  const changeId = requiredIdentifier(record, "change_id");
+  const currentChangeId = requiredIdentifier(record, "current_change_id");
   const bodyTruncated = requiredBoolean(record, "body_truncated");
   const bodyNextOffset = optionalNonNegativeInteger(record, "body_next_offset");
   const bodyNextByteOffset = optionalNonNegativeInteger(
@@ -814,8 +794,8 @@ export function parseSubjektivMemoryReadResponse(
   assertCursorInvariant(evidenceHasMore, evidenceNextCursor, "Memory evidence");
   const result: SubjektivMemoryReadResponse = {
     memory_id: memoryId,
-    revision,
-    current_revision: currentRevision,
+    change_id: changeId,
+    current_change_id: currentChangeId,
     kind: parseCandidateKind(record.kind),
     state: parseMemoryState(record.state),
     claim: requiredString(record, "claim"),
@@ -837,7 +817,7 @@ export function parseSubjektivMemoryReadResponse(
       record.derived_from,
       MAX_MEMORY_REFS,
       "derived_from",
-    ).map(parseMemoryRevisionRef),
+    ).map(parseMemoryChangeRef),
     evidence_has_more: evidenceHasMore,
   };
   if ("staleness" in record) {
@@ -984,37 +964,34 @@ function parseMemorySourceEvidenceRef(
   return result;
 }
 
-export function parseSubjektivMemoryListRevisionsResponse(
+export function parseSubjektivMemoryListChangesResponse(
   value: unknown,
   expectedMemoryId?: string,
-): SubjektivMemoryListRevisionsResponse {
+): SubjektivMemoryListChangesResponse {
   const record = strictRecord(
     value,
-    ["memory_id", "current_revision", "items", "next_cursor", "has_more"],
-    "Memory revisions response",
+    ["memory_id", "current_change_id", "items", "next_cursor", "has_more"],
+    "Memory changes response",
     ["next_cursor"],
   );
   const memoryId = requiredIdentifier(record, "memory_id");
   if (expectedMemoryId !== undefined && memoryId !== expectedMemoryId) {
-    invalid("Memory revisions identity does not match the requested Memory");
+    invalid("Memory changes identity does not match the requested Memory");
   }
-  const currentRevision = requiredPositiveInteger(record, "current_revision");
-  const items = boundedArray(record.items, MAX_REVISIONS, "items").map(
-    parseMemoryRevisionItem,
+  const currentChangeId = requiredIdentifier(record, "current_change_id");
+  const items = boundedArray(record.items, MAX_CHANGES, "items").map(
+    parseMemoryChangeItem,
   );
-  if (items.some((item) => item.revision > currentRevision)) {
-    invalid("revision history contains a future revision");
-  }
   assertUnique(
-    items.map((item) => String(item.revision)),
-    "Memory revisions",
+    items.map((item) => item.change_id),
+    "Memory changes",
   );
   const hasMore = requiredBoolean(record, "has_more");
   const nextCursor = optionalNullableString(record, "next_cursor");
-  assertCursorInvariant(hasMore, nextCursor, "Memory revisions");
-  const result: SubjektivMemoryListRevisionsResponse = {
+  assertCursorInvariant(hasMore, nextCursor, "Memory changes");
+  const result: SubjektivMemoryListChangesResponse = {
     memory_id: memoryId,
-    current_revision: currentRevision,
+    current_change_id: currentChangeId,
     items,
     has_more: hasMore,
   };
@@ -1022,14 +999,14 @@ export function parseSubjektivMemoryListRevisionsResponse(
   return result;
 }
 
-function parseMemoryRevisionItem(value: unknown): SubjektivMemoryRevisionItem {
+function parseMemoryChangeItem(value: unknown): SubjektivMemoryChangeItem {
   const record = strictRecord(
     value,
-    ["revision", "kind", "state", "claim", "change_reason", "updated_at"],
-    "Memory revision item",
+    ["change_id", "kind", "state", "claim", "change_reason", "updated_at"],
+    "Memory change item",
   );
   return {
-    revision: requiredPositiveInteger(record, "revision"),
+    change_id: requiredIdentifier(record, "change_id"),
     kind: parseCandidateKind(record.kind),
     state: parseMemoryState(record.state),
     claim: requiredString(record, "claim"),
@@ -1038,15 +1015,15 @@ function parseMemoryRevisionItem(value: unknown): SubjektivMemoryRevisionItem {
   };
 }
 
-function parseMemoryRevisionRef(value: unknown): SubjektivMemoryRevisionRef {
+function parseMemoryChangeRef(value: unknown): SubjektivMemoryChangeRef {
   const record = strictRecord(
     value,
-    ["memory_id", "revision"],
-    "Memory revision ref",
+    ["memory_id", "change_id"],
+    "Memory change ref",
   );
   return {
     memory_id: requiredIdentifier(record, "memory_id"),
-    revision: requiredPositiveInteger(record, "revision"),
+    change_id: requiredIdentifier(record, "change_id"),
   };
 }
 
@@ -1196,13 +1173,6 @@ function requiredNonNegativeInteger(
   key: string,
 ): number {
   return nonNegativeInteger(record[key], key);
-}
-
-function requiredPositiveInteger(
-  record: Record<string, unknown>,
-  key: string,
-): number {
-  return positiveInteger(record[key], key);
 }
 
 function positiveInteger(value: unknown, label: string): number {

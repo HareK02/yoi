@@ -3,9 +3,9 @@
 ## Authority and source mapping
 
 Workspace configuration is not the Backend host's configuration directory. The
-canonical authored source is already a SQLite-backed, revisioned virtual tree:
+canonical authored source is already a SQLite-backed, content-addressed virtual tree:
 `workspace_config_trees`, `workspace_config_entries`, and append-only
-`workspace_config_tree_revisions`. `WorkspaceConfigState` combines its
+`workspace_config_tree_history`. `WorkspaceConfigState` combines its
 `ConfigTreeSnapshot`, toolchain/schema contract and projection digest. The
 `main.dcdl` entrypoint and its imports are authored files; evaluated profiles,
 prompts and other projections are not replacement source files.
@@ -23,12 +23,15 @@ configuration subject; it is not a Bash cwd or a host filesystem grant.
 
 ## Existing save and activation contract
 
-The browser source-tree editor uses `ConfigCommitRequest`: a base revision and
-tree digest, changes with expected entry digests, and the `main.dcdl`
+The browser source-tree editor uses `ConfigCommitRequest`: a `base_digest` of the complete source tree, changes with expected entry digests, and the `main.dcdl`
 entrypoint. Candidate evaluation applies changes, formats/normalizes Decodal,
-and evaluates the composed schema. Commit rechecks revision **and** digest in
-an SQLite Immediate transaction before replacing active entries and appending
-the revision manifest. Worker operations must share that conflict domain with
+and evaluates the composed schema. Commit rechecks both the tree digest and the
+base toolchain/projection identity in an SQLite Immediate transaction before
+replacing active entries. Source content remains immutable and digest-addressed;
+evaluation provenance is retained by source, toolchain and projection identity,
+so reevaluating unchanged source does not erase earlier schema/compiler evidence.
+A candidate prepared before a schema-only refresh cannot reactivate its old
+contract. Worker operations must share that conflict domain with
 UI and other Worker edits; a per-Worker mutex alone would not prevent lost
 updates.
 
@@ -36,7 +39,7 @@ The Backend commit orchestration validates the prompt projection and
 repository-access references, then commits and best-effort publishes the prompt
 projection to the embedded Runtime. Saving establishes new authoritative
 Workspace configuration, **not universal live application to existing Workers**.
-New Worker configuration bundles are revision-bound. In-flight consumers can
+New Worker configuration bundles are digest-bound. In-flight consumers can
 retain immutable projections. Skill availability and activation are separate
 contracts. A transport failure after dispatch is not proof of rollback and is
 not authorization to retry a mutation automatically.
@@ -102,7 +105,7 @@ authored writes converge on source-tree commit. Existing runtime consumption of
 Prompt projections, Skill catalog/activation and resolved config bundles remains
 a separate read-only/activation contract needed for Worker startup and normal
 operation. Those evaluated projections are not authored source-tree bodies,
-revision history or a second editor. Do not fence all `/config` routes as one
+content history or a second editor. Do not fence all `/config` routes as one
 capability: that would break the existing Prompt reader's runtime contract.
 
 The existing connection ledger remains authoritative. Each granted Worker has
@@ -152,10 +155,13 @@ Worker operations use identity-bound routes under
 | Read | POST `read` | Connection + path validator; canonical body/type/digest |
 | Save | POST `commit` | Connection + root validator + canonical config changes/CAS |
 
-Observe returns root revision/digest and path validators from the same snapshot.
+Observe returns root digest and path validators from the same snapshot.
 Opaque validators bind Workspace, Worker, grant, connection lifetime, logical
-path and whole-tree revision/digest. Even replacing a file with identical bytes
-in a later revision invalidates older observations. Whole-tree CAS is
+path, whole-tree digest and active/applied evaluation contract. Identical source
+paths, content types and bytes retain the same digest; saving them again under
+the same contract does not create an edit counter or invalidate a content
+observation by itself. A schema/toolchain refresh invalidates observations even
+when source bytes are unchanged. Whole-tree CAS is
 intentionally conservative: an unrelated UI edit can require fresh observation.
 The Client holds validators; the LLM must not manage or fabricate them.
 
@@ -190,7 +196,7 @@ operations, not a generic POSIX filesystem or an OS mount.
 
 Content type is `decodal` (default for creation) or `text`. File operation
 targets come from the resolved WIP route. The root change batch uses canonical
-relative source paths; it does **not** accept `expected_digest`, revision,
+relative source paths; it does **not** accept `expected_digest`, tree digest,
 validator, Workspace, grant or connection overrides as model arguments. The
 adapter captures metadata and fills those preconditions automatically, requiring
 all paths in a batch to match one observed tree state. Unsupported/invalid
@@ -233,7 +239,7 @@ post-save-response cases complement that sequence.
 Web tests exercise the production generic composer component's declaration
 completion, selection and typed submission, plus removal/literal-text behavior.
 Logical-source parsers and launch/sidebar/TUI tests ensure that a settings
-attachment is not treated as a repository revision or process cwd. The two
+attachment is not treated as a repository commit or process cwd. The two
 layers are complementary; the Rust fixture uses a recording LLM client and
 in-process transport, not a live browser-to-provider deployment. No live
 Backend/Runtime/LLM browser or physical power-loss result is claimed. Bounds

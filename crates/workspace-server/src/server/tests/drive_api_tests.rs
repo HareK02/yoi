@@ -106,7 +106,7 @@ async fn drive_http_receipts_cas_stable_url_and_workspace_refs_follow_storage_au
     let create = json!({"operation":"create_text","parent":reference(&root),"name":"日本語.md","text":"# Shared\n","content_type":"text/markdown"});
     let first = mutate(&api, &token, "create", create.clone(), StatusCode::OK).await;
     let id = first["entry"]["entry"]["node_id"].as_str().unwrap();
-    let rev = first["entry"]["revision"].as_str().unwrap();
+    let rev = first["entry"]["last_mutation_id"].as_str().unwrap();
     assert_eq!(
         first,
         mutate(&api, &token, "create", create.clone(), StatusCode::OK).await,
@@ -137,7 +137,7 @@ async fn drive_http_receipts_cas_stable_url_and_workspace_refs_follow_storage_au
     )
     .await;
     assert_eq!(text["text"], "# Shared\n");
-    let wrong=mutate(&api,&token,"foreign",json!({"operation":"delete","id":{"workspace_id":"foreign","node_id":id},"expected_revision":rev}),StatusCode::FORBIDDEN).await;
+    let wrong=mutate(&api,&token,"foreign",json!({"operation":"delete","id":{"workspace_id":"foreign","node_id":id},"expected_mutation_id":rev}),StatusCode::FORBIDDEN).await;
     assert_eq!(wrong["code"], "denied");
     user_call(
         &api,
@@ -156,19 +156,19 @@ async fn drive_http_receipts_cas_stable_url_and_workspace_refs_follow_storage_au
         StatusCode::BAD_REQUEST,
     )
     .await;
-    let updated=mutate(&api,&token,"update",json!({"operation":"update_text","id":reference(id),"expected_revision":rev,"text":"new","content_type":"text/plain"}),StatusCode::OK).await;
+    let updated=mutate(&api,&token,"update",json!({"operation":"update_text","id":reference(id),"expected_mutation_id":rev,"text":"new","content_type":"text/plain"}),StatusCode::OK).await;
     for operation in [
-        json!({"operation":"update_text","id":reference(id),"expected_revision":rev,"text":"lost","content_type":"text/plain"}),
-        json!({"operation":"delete","id":reference(id),"expected_revision":rev}),
-        json!({"operation":"relocate","id":reference(id),"expected_revision":rev,"parent":reference(&root),"name":"lost"}),
+        json!({"operation":"update_text","id":reference(id),"expected_mutation_id":rev,"text":"lost","content_type":"text/plain"}),
+        json!({"operation":"delete","id":reference(id),"expected_mutation_id":rev}),
+        json!({"operation":"relocate","id":reference(id),"expected_mutation_id":rev,"parent":reference(&root),"name":"lost"}),
     ] {
         mutate(&api, &token, "stale", operation, StatusCode::CONFLICT).await;
     }
-    user_call(&api,&token,"GET",&format!("{}/read-chunk?entry_workspace_id={TEST_WORKSPACE_ID}&id={id}&expected_revision={rev}&offset=0&length=1",base()),None,StatusCode::CONFLICT).await;
-    let renamed=mutate(&api,&token,"rename",json!({"operation":"relocate","id":reference(id),"expected_revision":updated["entry"]["revision"],"parent":reference(&root),"name":"renamed.md"}),StatusCode::OK).await;
+    user_call(&api,&token,"GET",&format!("{}/read-chunk?entry_workspace_id={TEST_WORKSPACE_ID}&id={id}&expected_mutation_id={rev}&offset=0&length=1",base()),None,StatusCode::CONFLICT).await;
+    let renamed=mutate(&api,&token,"rename",json!({"operation":"relocate","id":reference(id),"expected_mutation_id":updated["entry"]["last_mutation_id"],"parent":reference(&root),"name":"renamed.md"}),StatusCode::OK).await;
     // URL is independent of name/parent; metadata lookup still resolves the same ID.
     assert_eq!(renamed["entry"]["entry"], first["entry"]["entry"]);
-    let deleted=mutate(&api,&token,"delete",json!({"operation":"delete","id":reference(id),"expected_revision":renamed["entry"]["revision"]}),StatusCode::OK).await;
+    let deleted=mutate(&api,&token,"delete",json!({"operation":"delete","id":reference(id),"expected_mutation_id":renamed["entry"]["last_mutation_id"]}),StatusCode::OK).await;
     assert!(deleted["entry"].is_null());
     user_call(
         &api,
@@ -536,7 +536,7 @@ async fn drive_generated_client_roundtrips_binary_and_declared_headers_over_real
                     parent_id: Some(root.entry.node_id.clone()),
                     name: Some(request.into()),
                     id: None,
-                    expected_revision: None,
+                    expected_mutation_id: None,
                     content_type: media.into(),
                     size: bytes.len() as u32,
                     sha256: digest(bytes),
@@ -552,7 +552,7 @@ async fn drive_generated_client_roundtrips_binary_and_declared_headers_over_real
                 DriveDownloadQuery {
                     entry_workspace_id: workspace.clone(),
                     id: saved.entry.node_id.clone(),
-                    expected_revision: Some(saved.revision.clone()),
+                    expected_mutation_id: Some(saved.last_mutation_id.clone()),
                 },
             )
             .await
@@ -574,7 +574,7 @@ async fn drive_generated_client_roundtrips_binary_and_declared_headers_over_real
                 DriveReadChunkQuery {
                     entry_workspace_id: workspace.clone(),
                     id: saved.entry.node_id,
-                    expected_revision: saved.revision,
+                    expected_mutation_id: saved.last_mutation_id,
                     offset: 0,
                     length: 65536,
                 },
@@ -770,7 +770,7 @@ async fn drive_read_entrypoints_use_current_grants_and_cannot_fallback_to_browse
     let root = root_id(&api, &owner).await;
     let saved=mutate(&api,&owner,"matrix-file",json!({"operation":"create_text","parent":reference(&root),"name":"matrix","text":"bytes","content_type":"text/plain"}),StatusCode::OK).await;
     let id = saved["entry"]["entry"]["node_id"].as_str().unwrap();
-    let rev = saved["entry"]["revision"].as_str().unwrap();
+    let rev = saved["entry"]["last_mutation_id"].as_str().unwrap();
     let (_runtime, workers) = workers(&api).await;
     let identity = RuntimeIdentityMaterial::generate(&workers[0].runtime_id).unwrap();
     configure_runtime_request_auth(&mut api, &identity, &workers[0].runtime_id);
@@ -790,7 +790,7 @@ async fn drive_read_entrypoints_use_current_grants_and_cannot_fallback_to_browse
             base()
         ),
         format!(
-            "{}/read-chunk?entry_workspace_id={TEST_WORKSPACE_ID}&id={id}&expected_revision={rev}&offset=0&length=4",
+            "{}/read-chunk?entry_workspace_id={TEST_WORKSPACE_ID}&id={id}&expected_mutation_id={rev}&offset=0&length=4",
             base()
         ),
         format!(
@@ -885,9 +885,9 @@ async fn drive_concurrent_http_cas_has_one_winner_and_name_search_pages_are_scop
     let root = root_id(&api, &token).await;
     let saved=mutate(&api,&token,"concurrent-file",json!({"operation":"create_text","parent":reference(&root),"name":"candidate","text":"find me","content_type":"text/plain"}),StatusCode::OK).await;
     let id = &saved["entry"]["entry"]["node_id"];
-    let rev = &saved["entry"]["revision"];
+    let rev = &saved["entry"]["last_mutation_id"];
     let request = |identity: &str, text: &str| {
-        Request::builder().method("POST").uri(format!("{}/mutate",base())).header("authorization",format!("Bearer {token}")).header(CONTENT_TYPE,"application/json").body(Body::from(json!({"request_id":identity,"mutation":{"operation":"update_text","id":reference(id.as_str().unwrap()),"expected_revision":rev,"text":text,"content_type":"text/plain"}}).to_string())).unwrap()
+        Request::builder().method("POST").uri(format!("{}/mutate",base())).header("authorization",format!("Bearer {token}")).header(CONTENT_TYPE,"application/json").body(Body::from(json!({"request_id":identity,"mutation":{"operation":"update_text","id":reference(id.as_str().unwrap()),"expected_mutation_id":rev,"text":text,"content_type":"text/plain"}}).to_string())).unwrap()
     };
     let app = build_router(api.clone());
     let (a, b) = tokio::join!(
@@ -955,7 +955,7 @@ async fn drive_concurrent_http_cas_has_one_winner_and_name_search_pages_are_scop
 }
 
 #[tokio::test]
-async fn drive_download_stream_expires_instead_of_mixing_revisions() {
+async fn drive_download_stream_expires_instead_of_mixing_last_mutation_ids() {
     let temp = tempfile::tempdir().unwrap();
     let api = test_api(temp.path()).await;
     let token = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
@@ -981,7 +981,7 @@ async fn drive_download_stream_expires_instead_of_mixing_revisions() {
         .unwrap();
     let saved = response_json(response, StatusCode::OK).await;
     let id = saved["entry"]["entry"]["node_id"].as_str().unwrap();
-    let rev = saved["entry"]["revision"].as_str().unwrap();
+    let rev = saved["entry"]["last_mutation_id"].as_str().unwrap();
     let response = build_router(api.clone())
         .oneshot(
             Request::builder()
@@ -996,7 +996,7 @@ async fn drive_download_stream_expires_instead_of_mixing_revisions() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    mutate(&api,&token,"stream-update",json!({"operation":"update_text","id":reference(id),"expected_revision":rev,"text":"generation b","content_type":"text/plain"}),StatusCode::OK).await;
+    mutate(&api,&token,"stream-update",json!({"operation":"update_text","id":reference(id),"expected_mutation_id":rev,"text":"generation b","content_type":"text/plain"}),StatusCode::OK).await;
     let mut stream = response.into_body().into_data_stream();
     let first = stream.next().await.unwrap().unwrap();
     assert_eq!(first.as_ref(), vec![b'a'; 64 * 1024]);

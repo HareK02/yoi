@@ -184,8 +184,6 @@ impl OperationCounts {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MemorySettingsAudit {
     pub workspace_id: String,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub settings_revision: u64,
     pub language: String,
 }
 

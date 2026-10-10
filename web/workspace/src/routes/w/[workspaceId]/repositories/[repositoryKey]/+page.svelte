@@ -101,7 +101,7 @@
         operation_id: `repository-ssh-confirm-${crypto.randomUUID()}`,
         runtime_id: operation.runtimeId,
         host_key: selectedHostKey,
-        expected_host_trust_revision: probe.expected_host_trust_revision
+        expected_host_key_fingerprint: probe.expected_host_key_fingerprint
       };
       parseRepositorySshHostTrust(await requestConnectionTest('PUT', body));
       if (!probeFence.isCurrent(operation, selectedRuntimeId)) return;
@@ -147,8 +147,8 @@
         <dd><a href={`/w/${encodeURIComponent(data.workspace.workspace_id)}/settings/repository-access`}>Manage SSH credentials and pinned host keys</a></dd>
       </div>
       <div>
-        <dt>Source revision</dt>
-        <dd>{data.repository.item.source_revision} · {data.repository.item.source_fingerprint}</dd>
+        <dt>Source fingerprint</dt>
+        <dd>{data.repository.item.source_fingerprint}</dd>
       </div>
       <div>
         <dt>Observed</dt>

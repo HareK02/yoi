@@ -11,7 +11,7 @@ It is not a dumping ground for external research, old plans, API inventories, or
 3. [`design/context-history.md`](design/context-history.md) — the highest-risk invariant: inputs that affect the model must be committed to history before they enter context.
 4. [`design/worker-session-state.md`](design/worker-session-state.md) — Worker identity, replayable session logs, current metadata, and live process hints.
 5. [`design/session-observation.md`](design/session-observation.md) — common session captures, `SessionEntryRef`, Memory evidence, and host-authorized Worker observation.
-6. [`design/flow-state-graph.md`](design/flow-state-graph.md) — Workspace Flow sources, immutable revisions, transition attempts, and bounded internal verification.
+6. [`design/flow-state-graph.md`](design/flow-state-graph.md) — Workspace Flow sources, frozen content-addressed definitions, transition attempts, and bounded internal verification.
 7. [`design/profiles-manifests-prompts.md`](design/profiles-manifests-prompts.md) — reusable Profiles, resolved Manifests, and prompt resources.
 8. [`design/tool-permissions-scope.md`](design/tool-permissions-scope.md) — tool policy and filesystem scope.
 9. [`design/plugin-packages.md`](design/plugin-packages.md) — the retained offline package format and the prohibition on ambient Plugin authority.
@@ -30,7 +30,7 @@ It is not a dumping ground for external research, old plans, API inventories, or
 22. [`development/workspace-schema-migrations.md`](development/workspace-schema-migrations.md) — how to preflight, apply, verify, and roll back control-plane SQLite schema changes.
 23. [`design/standalone-agent-host.md`](design/standalone-agent-host.md) — in-process standalone Worker host の依存方向、authority、lifecycle、非目標。
 24. [`design/server-feature-storage.md`](design/server-feature-storage.md) — Server管理のWorkspace/Feature専用SQLite、migration、transaction、backup/restore、削除・shutdown境界。
-25. [`design/subjektiv-store.md`](design/subjektiv-store.md) — subject-scoped Memoryのownership、authorization、Session attribution、revision、candidate consolidation境界。
+25. [`design/subjektiv-store.md`](design/subjektiv-store.md) — subject-scoped Memoryのownership、authorization、Session attribution、変更履歴、candidate consolidation境界。
 26. [`design/subjektiv-surface.md`](design/subjektiv-surface.md) — confirmed Memoryから生成するresident surface、availability、append-only restore injection。
 27. [`development/subjektiv-product-cutover.md`](development/subjektiv-product-cutover.md) — legacy Workspace Memoryからsubjektivへのoperator cutover、explicit reset、backup／rollback runbook。
 28. [`design/worker-wip-mode.md`](design/worker-wip-mode.md) — explicit-opt-in Worker WIP mode, Worldspace projection, authority, cache, and retry contracts.

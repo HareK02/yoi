@@ -166,7 +166,7 @@ Deno.test("Ticket progress, comment results and reopen work without Git while re
                 state: "planning",
                 reason: "Fixture reset",
                 expected_state: detail.state,
-                expected_item_revision: detail.item_revision,
+                expected_content_digest: detail.content_digest,
               },
             });
           }

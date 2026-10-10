@@ -52,17 +52,16 @@ function worker(overrides: Partial<Worker> = {}): Worker {
     ...overrides,
   };
 }
-function plan(revision = "plan-1"): RuntimeCleanupPlanResponse {
+function plan(scenario = "plan-1"): RuntimeCleanupPlanResponse {
   return {
     workspace_id: "page-test",
     generated_at: "2026-10-06T00:00:00Z",
     runtime_id: "runtime-a",
-    revision,
-    digest: `digest-${revision}`,
+    digest: `digest-${scenario}`,
     diagnostics: [],
     workdirs: [],
     workers: [{
-      target_id: `target-${revision}`,
+      target_id: `target-${scenario}`,
       action: "worker_delete",
       worker_id: "W-1",
       runtime_worker_id: "worker-a",
@@ -80,7 +79,7 @@ function catalog(id = "page-test") {
     loading: true,
     workers: [],
     catalogWorkers: null,
-    observationVersion: 0,
+    catalogRequest: null,
     catalogRefreshing: true,
   });
   shared.stores.set(id, state);
@@ -107,7 +106,7 @@ function publish(store: ReturnType<typeof catalog>, items: Worker[]) {
     loading: false,
     workers: [],
     catalogWorkers: items,
-    observationVersion: previous.observationVersion + 1,
+    catalogRequest: new AbortController().signal,
     catalogRefreshing: false,
   }));
 }
@@ -199,7 +198,7 @@ test("refresh start invalidates an installed Delete candidate without requesting
     .toBeTruthy();
   expect(request).toHaveBeenCalledTimes(1);
 
-  // The flag itself invalidates plans, independently of the observation version.
+  // The flag itself invalidates plans, independently of the catalog request identity.
   store.update((previous) => ({ ...previous, catalogRefreshing: true }));
   await waitFor(() =>
     expect(screen.queryByRole("button", { name: "Delete Catalog worker" }))
@@ -211,7 +210,7 @@ test("refresh start invalidates an installed Delete candidate without requesting
   expect(screen.queryByRole("button", { name: "Delete Catalog worker" }))
     .toBeNull();
 
-  // No catalog or version change on completion: the transition still reloads.
+  // No catalog or request change on completion: the transition still reloads.
   store.update((previous) => ({ ...previous, catalogRefreshing: false }));
   expect(await screen.findByRole("button", { name: "Delete Catalog worker" }))
     .toBeTruthy();
@@ -234,7 +233,7 @@ test.each(["during refresh", "after completion"] as const)(
     store.update((previous) => ({
       ...previous,
       catalogRefreshing: true,
-      observationVersion: previous.observationVersion + 1,
+      catalogRequest: new AbortController().signal,
       catalogWorkers: [
         worker({ pinned: false, display_name: "Overlay worker" }),
       ],
@@ -250,7 +249,7 @@ test.each(["during refresh", "after completion"] as const)(
         .toBeNull();
     }
 
-    // Successful catalog GET retains exactly the same catalog and observationVersion.
+    // Successful catalog GET retains exactly the same catalog and catalog request identity.
     store.update((previous) => ({ ...previous, catalogRefreshing: false }));
     await waitFor(() => expect(request).toHaveBeenCalledTimes(2));
     if (settlement === "after completion") {
@@ -288,7 +287,7 @@ test("restore follow-up cannot request cleanup while the authoritative catalog r
     store.update((previous) => ({
       ...previous,
       catalogRefreshing: true,
-      observationVersion: previous.observationVersion + 1,
+      catalogRequest: new AbortController().signal,
     }));
   });
   await fireEvent.click(

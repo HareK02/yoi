@@ -113,7 +113,7 @@ Deno.test("ordinary removal refreshes failed and successful inventory, supports 
           assertEquals(await page.locator("thead th").allTextContents(), [
             "Workdir",
             "Repository",
-            "Revision",
+            "Checkout",
             "Status",
             "Cleanliness",
             "Occupied by",
