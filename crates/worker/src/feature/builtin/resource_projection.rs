@@ -13,7 +13,10 @@ pub(super) struct ModelTicketQueryResponse {
 struct ModelTicketQueryItem {
     ticket: String,
     title: String,
-    state: String,
+    state: ticket::TicketState,
+    closure_operation_key: Option<String>,
+    current_closure: Option<ticket::TicketClosureJudgment>,
+    legacy_handoff: Option<ticket::TicketLegacyWorkflowSnapshot>,
     readiness: Option<String>,
     priority: Option<String>,
     created_at: Option<String>,
@@ -38,11 +41,15 @@ pub(super) struct ModelTicketDetail {
     content_digest: String,
     title: String,
     body: String,
-    state: String,
+    state: ticket::TicketState,
+    closure_operation_key: Option<String>,
+    current_closure: Option<ticket::TicketClosureJudgment>,
+    legacy_handoff: Option<ticket::TicketLegacyWorkflowSnapshot>,
     readiness: Option<String>,
     priority: Option<String>,
     created_at: Option<String>,
     updated_at: Option<String>,
+    closure_history: Vec<ticket::TicketCaseHistoryEntry>,
     thread: Vec<ModelTicketEvent>,
     relations: ModelTicketRelations,
     linked_objectives: Vec<ModelObjectiveSummary>,
@@ -216,6 +223,16 @@ struct ModelObjectiveEventPage {
     has_more: bool,
 }
 
+fn typed_field<T: serde::de::DeserializeOwned>(
+    root: &Map<String, Value>,
+    key: &str,
+) -> Result<T, String> {
+    let value = root
+        .get(key)
+        .ok_or_else(|| format!("Ticket projection requires {key}"))?;
+    serde_json::from_value(value.clone()).map_err(|error| format!("Invalid Ticket {key}: {error}"))
+}
+
 pub(super) fn project_ticket_query(value: Value) -> Result<ModelTicketQueryResponse, String> {
     let root = object(&value, "Ticket query response")?;
     let page = object_field(root, "page")?;
@@ -235,7 +252,10 @@ fn project_ticket_query_item(value: &Value) -> Result<ModelTicketQueryItem, Stri
     Ok(ModelTicketQueryItem {
         ticket: resource_ref(item, "resource_key", "T-")?,
         title: string_field(item, "title")?,
-        state: string_field(item, "state")?,
+        state: typed_field(item, "state")?,
+        closure_operation_key: typed_field(item, "closure_operation_key")?,
+        current_closure: typed_field(item, "current_closure")?,
+        legacy_handoff: typed_field(item, "legacy_handoff")?,
         readiness: optional_string(item, "readiness")?,
         priority: optional_string(item, "priority")?,
         created_at: optional_string(item, "created_at")?,
@@ -286,7 +306,11 @@ pub(super) fn project_ticket_detail(value: Value) -> Result<ModelTicketDetail, S
         content_digest: string_field(root, "content_digest")?,
         title: string_field(root, "title")?,
         body: string_field(root, "body")?,
-        state: string_field(root, "state")?,
+        state: typed_field(root, "state")?,
+        closure_operation_key: typed_field(root, "closure_operation_key")?,
+        current_closure: typed_field(root, "current_closure")?,
+        legacy_handoff: typed_field(root, "legacy_handoff")?,
+        closure_history: typed_field(root, "closure_history")?,
         readiness: optional_string(root, "readiness")?,
         priority: optional_string(root, "priority")?,
         created_at: optional_string(root, "created_at")?,
@@ -694,16 +718,10 @@ mod tests {
 
     #[test]
     fn mrless_evidence_is_inapplicable_not_missing_or_vacuously_approved() {
-        for state in [
-            "planning",
-            "ready",
-            "queued",
-            "inprogress",
-            "done",
-            "closed",
-        ] {
+        for state in ["open", "closed"] {
             let projected = project_ticket_detail(json!({
                 "resource_key": "T-718", "content_digest": "rev-1", "title": "No Git required", "body": "Decision",
+                "closure_operation_key": null, "current_closure": null, "closure_history": [], "legacy_handoff": null,
                 "state": state, "events": [{"sequence": 1, "kind": "completed", "body": "No Git needed"}],
                 "linked_objectives": [], "assignments": [], "implementation_reports": [],
                 "merge_requests": [], "merge_request": null,
@@ -722,6 +740,54 @@ mod tests {
             assert_eq!(projected["evidence"]["complete_for_integration"], false);
             assert_eq!(projected["evidence"]["missing"], json!([]));
         }
+    }
+
+    #[test]
+    fn reopened_ticket_projection_preserves_closure_observation_history_and_legacy_handoff() {
+        let history = json!([
+            {
+                "operation_key": "close-1", "previous_closure_operation_key": null,
+                "action": {"action": "close", "reason": "not_planned"},
+                "explanation": "Not proceeding", "references": [{"kind": "ticket", "target": "T-12"}],
+                "author": "workspace-user:alice", "at": "2026-01-01T00:00:00Z"
+            },
+            {
+                "operation_key": "reopen-1", "previous_closure_operation_key": "close-1",
+                "action": {"action": "reopen"}, "explanation": "New information",
+                "references": [], "author": "workspace-user:bob", "at": "2026-01-02T00:00:00Z"
+            }
+        ]);
+        let legacy = json!({
+            "workflow_state": "queued", "workflow_state_explicit": true, "status": "open",
+            "queued_by": "workspace-user:alice", "queued_at": "2025-12-31T00:00:00Z", "resolution": null
+        });
+        let response = json!({
+            "resource_key": "T-739", "content_digest": "content-digest", "title": "Case", "body": "Requirements",
+            "state": "open", "closure_operation_key": "close-1", "current_closure": null,
+            "closure_history": history, "legacy_handoff": legacy,
+            "events": [], "linked_objectives": [], "assignments": [], "implementation_reports": [],
+            "merge_requests": [], "merge_request": null
+        });
+        let projected =
+            serde_json::to_value(project_ticket_detail(response.clone()).unwrap()).unwrap();
+        assert_eq!(projected["state"], "open");
+        assert_eq!(projected["closure_operation_key"], "close-1");
+        assert_eq!(projected["current_closure"], Value::Null);
+        assert_eq!(projected["closure_history"], history);
+        assert_eq!(projected["legacy_handoff"], legacy);
+
+        // Missing observations must not silently become null: the model must be
+        // able to distinguish an observed never-closed case from unknown data.
+        let mut missing = response;
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("closure_operation_key");
+        assert!(
+            project_ticket_detail(missing)
+                .unwrap_err()
+                .contains("closure_operation_key")
+        );
     }
 
     #[test]
@@ -771,7 +837,8 @@ mod tests {
                 "id": "00001TICKETINTERNAL",
                 "resource_key": "T-543",
                 "title": "Ticket",
-                "state": "inprogress",
+                "state": "open",
+                "closure_operation_key": null, "current_closure": null, "legacy_handoff": null,
                 "readiness": null,
                 "priority": "high",
                 "created_at": null,
@@ -842,9 +909,10 @@ mod tests {
             "id": "internal-ticket",
             "resource_key": "T-588",
             "content_digest": "ticket-content-digest",
+                "closure_operation_key": null, "current_closure": null, "closure_history": [], "legacy_handoff": null,
             "title": "Queued Submit",
             "body": "Body",
-            "state": "planning",
+            "state": "open",
             "readiness": null,
             "priority": "P2",
             "created_at": "2026-09-03T00:00:00Z",
@@ -945,9 +1013,10 @@ mod tests {
             let projected = project_ticket_detail(json!({
                 "resource_key": "T-716",
                 "content_digest": "current-ticket-content-digest",
+                "closure_operation_key": null, "current_closure": null, "closure_history": [], "legacy_handoff": null,
                 "title": "Source evidence",
                 "body": "Body",
-                "state": if merged { "done" } else { "inprogress" },
+                "state": "open",
                 "events": [],
                 "linked_objectives": [],
                 "assignments": [],

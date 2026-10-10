@@ -1329,7 +1329,7 @@ mod tests {
 
         assert_eq!(manifest.engine.instruction, "role.ticket_worker");
         // enabled supplies ShowTicket; thread supplies TicketComment,
-        // TicketWorkflowState and CompleteTicket without broad workflow access.
+        // TicketCaseUpdate without broad workflow access.
         let feature = &manifest.feature;
         assert!(feature.ticket.enabled);
         assert!(feature.ticket.thread);

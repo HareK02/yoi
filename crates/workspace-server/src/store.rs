@@ -28,7 +28,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 89;
+const LATEST_SCHEMA_VERSION: i64 = 90;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -280,6 +280,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 89,
         name: "descriptive legacy evidence columns",
         apply: migrate_evidence_column_names_v88_to_v89,
+    },
+    Migration {
+        version: 90,
+        name: "Ticket open/closed cases and retained routing evidence",
+        apply: migrate_ticket_cases_v89_to_v90,
     },
 ];
 
@@ -7935,10 +7940,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| {
             let operation_id: Option<String> = conn
                 .query_row(
-                    "SELECT operation_id FROM ticket_assignment_operations
-                 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3
-                   AND claim_state='pending' AND action IN ('assign','reassign')
-                   AND assignment_id IS NULL ORDER BY created_at, operation_id LIMIT 1",
+                    "SELECT claim.operation_id FROM ticket_assignment_operations AS claim
+                 JOIN typed_tickets AS ticket ON ticket.workspace_id=claim.workspace_id
+                  AND ticket.ticket_id=claim.ticket_id
+                 WHERE claim.workspace_id=?1 AND claim.runtime_id=?2 AND claim.worker_id=?3
+                   AND ticket.workflow_state='open'
+                   AND claim.claim_state='pending' AND claim.action IN ('assign','reassign')
+                   AND claim.assignment_id IS NULL ORDER BY claim.created_at, claim.operation_id LIMIT 1",
                     params![workspace_id, worker.runtime_id, worker.worker_id],
                     |row| row.get(0),
                 )
@@ -8036,10 +8044,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 params![workspace_id, ticket_id],
                 |row| row.get(0),
             )?;
-            if !matches!(
-                state.as_str(),
-                "planning" | "ready" | "queued" | "inprogress"
-            ) {
+            if state != "open" {
                 return Err(Error::TicketAssignmentConflict(format!(
                     "Ticket `{ticket_id}` cannot claim work in state `{state}`"
                 )));
@@ -8094,6 +8099,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 || receipt.worker.as_ref().is_some_and(|w| w.worker_id != worker_id) {
                 return Err(Error::TicketAssignmentConflict(format!("assignment operation {operation_id} cannot bind Worker {worker_id}")));
             }
+            let open: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM typed_tickets WHERE workspace_id=?1 AND ticket_id=?2 AND workflow_state='open')",
+                params![workspace_id, receipt.ticket_id], |row| row.get(0),
+            )?;
+            if !open { return Err(Error::TicketAssignmentConflict("closed Ticket cannot bind pending work".into())); }
             let runtime_id = receipt.runtime_id.as_deref().ok_or_else(|| Error::TicketAssignmentConflict("pending Worker claim has no Runtime".into()))?;
             let worker = RuntimeWorkerRef::new(runtime_id, worker_id);
             ensure_no_competing_ticket_claim(&tx, workspace_id, &receipt.ticket_id, Some(&worker), operation_id)?;
@@ -8589,9 +8599,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 params![record.workspace_id, record.ticket_id],
                 |row| row.get(0),
             )?;
-            if !matches!(state.as_str(), "planning" | "ready" | "queued" | "inprogress") {
+            if state != "open" {
                 return Err(Error::TicketAssignmentConflict(format!(
-                    "manual Worker assignment requires planning, ready, queued, or inprogress Ticket; current state is `{state}`"
+                    "manual Worker assignment requires an open Ticket; current state is `{state}`"
                 )));
             }
             let unresolved_blockers: i64 = tx.query_row(
@@ -8608,7 +8618,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         (relation.ticket_id = ?2 AND relation.kind = 'depends_on')
                         OR (relation.target = ?2 AND relation.kind = 'blocks')
                     )
-                    AND related.workflow_state NOT IN ('done', 'closed')",
+                    AND related.workflow_state = 'open'",
                 params![record.workspace_id, record.ticket_id],
                 |row| row.get(0),
             )?;
@@ -8692,10 +8702,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 "INSERT INTO typed_ticket_events (
                      workspace_id, ticket_id, event_index, kind, author, at,
                      from_state, to_state, reason, state_field, heading, body
-                 ) VALUES (?1, ?2, ?3, 'state_changed', ?4, ?5, ?6, 'inprogress',
-                           'manual Worker assignment accepted', 'state', 'State changed', '')",
+                 ) VALUES (?1, ?2, ?3, 'assignment', ?4, ?5, NULL, NULL,
+                           'manual Worker assignment accepted', NULL, 'Worker assigned', '')",
                 params![record.workspace_id, record.ticket_id, event_index,
-                    record.assigned_by, record.assigned_at, state],
+                    record.assigned_by, record.assigned_at],
             )?;
             for (key, value) in [
                 ("event_id", event_id),
@@ -8711,17 +8721,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     params![record.workspace_id, record.ticket_id, event_index, key, value],
                 )?;
             }
-            let updated = tx.execute(
-                "UPDATE typed_tickets SET workflow_state = 'inprogress',
-                         workflow_state_explicit = 1, updated_at = ?3
-                  WHERE workspace_id = ?1 AND ticket_id = ?2 AND workflow_state = ?4",
-                params![record.workspace_id, record.ticket_id, record.assigned_at, state],
-            )?;
-            if updated != 1 {
-                return Err(Error::TicketAssignmentConflict(
-                    "Ticket state changed during manual Worker assignment".to_string(),
-                ));
-            }
+            // Assignment claims do not change the Ticket case state.
             tx.commit()?;
             Ok(record.clone())
         })
@@ -8773,17 +8773,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<bool> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let state: String = tx.query_row(
-                "SELECT workflow_state FROM typed_tickets
-                  WHERE workspace_id = ?1 AND ticket_id = ?2",
-                params![workspace_id, ticket_id],
-                |row| row.get(0),
-            )?;
-            if !matches!(state.as_str(), "inprogress" | "ready") {
-                return Err(Error::TicketAssignmentConflict(format!(
-                    "implementation cancellation requires an inprogress Ticket; current state is `{state}`"
-                )));
-            }
             let cleared = clear_current_ticket_role_assignment_in_tx(
                 &tx,
                 workspace_id,
@@ -8800,49 +8789,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             if !cleared {
                 return Ok(false);
             }
-            if state == "inprogress" {
-                let event_index: i64 = tx.query_row(
-                    "SELECT COALESCE(MAX(event_index), -1) + 1 FROM typed_ticket_events
-                      WHERE workspace_id = ?1 AND ticket_id = ?2",
-                    params![workspace_id, ticket_id],
-                    |row| row.get(0),
-                )?;
-                tx.execute(
-                    "INSERT INTO typed_ticket_events (
-                         workspace_id, ticket_id, event_index, kind, author, at,
-                         from_state, to_state, reason, state_field, heading, body
-                     ) VALUES (?1, ?2, ?3, 'state_changed', ?4, ?5,
-                               'inprogress', 'ready', ?6, 'state',
-                               'Implementation cancelled', '')",
-                    params![workspace_id, ticket_id, event_index, actor, occurred_at, reason],
-                )?;
-                for (key, value) in [
-                    ("event_id", state_event_id),
-                    ("assignment_id", assignment_id),
-                    ("assignment_role", "worker"),
-                    ("operation_id", operation_id),
-                ] {
-                    tx.execute(
-                        "INSERT INTO typed_ticket_event_attributes (
-                             workspace_id, ticket_id, event_index, key, value
-                         ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![workspace_id, ticket_id, event_index, key, value],
-                    )?;
-                }
-                let updated = tx.execute(
-                    "UPDATE typed_tickets SET workflow_state = 'ready',
-                             workflow_state_explicit = 1,
-                             queued_by = NULL, queued_at = NULL, updated_at = ?3
-                      WHERE workspace_id = ?1 AND ticket_id = ?2
-                        AND workflow_state = 'inprogress'",
-                    params![workspace_id, ticket_id, occurred_at],
-                )?;
-                if updated != 1 {
-                    return Err(Error::TicketAssignmentConflict(
-                        "Ticket state changed during implementation cancellation".to_string(),
-                    ));
-                }
-            }
+            // Ending work never reopens or rolls back a case judgment.
+            let _ = state_event_id; // Compatibility slot for the old authority caller.
+            tx.execute(
+                "UPDATE typed_tickets SET queued_by = NULL, queued_at = NULL
+                  WHERE workspace_id = ?1 AND ticket_id = ?2",
+                params![workspace_id, ticket_id],
+            )?;
             tx.commit()?;
             Ok(true)
         })
@@ -13512,11 +13465,8 @@ fn apply_ticket_targets_and_workdir_capabilities_schema(conn: &Connection) -> Re
                 TICKET_SCHEMA_BASELINE_NAME
             ],
         )?;
-        ticket::verify_sqlite_ticket_schema(db).map_err(|error| {
-            Error::Store(format!(
-                "schema-66 Ticket schema verification failed: {error}"
-            ))
-        })?;
+        // This retained step composes the historical Ticket schema 7.
+        // Current-domain verification follows the shared case migration at schema 90.
 
         let foreign_key_violations =
             db.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
@@ -13579,7 +13529,72 @@ fn read_workspace_config_grant(
     })
 }
 
+fn install_ticket_case_assignment_work_schema(conn: &Connection) -> Result<()> {
+    let (_, sql) = include_str!("latest_schema.sql")
+        .split_once("-- Ticket case assignment work constraints (schema 90).")
+        .ok_or_else(|| Error::Store("case assignment schema resource is missing".into()))?;
+    conn.execute_batch(sql)?;
+    Ok(())
+}
+
+fn migrate_ticket_cases_v89_to_v90(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 89 {
+        return Err(Error::Store(
+            "Ticket case migration requires schema 89".into(),
+        ));
+    }
+    // The shared Ticket migration owns the six-state snapshot, unknown legacy
+    // closure reasons and immutable case history. It opens its own transaction.
+    // Leave the Workspace marker at 89 until our composed constraints commit;
+    // a failed second phase is resumable through the idempotent domain migrator.
+    ticket::migrate_sqlite_ticket_schema(conn)
+        .map_err(|error| Error::Store(format!("Ticket case migration failed: {error}")))?;
+    let invalid: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM typed_tickets WHERE workflow_state NOT IN ('open', 'closed')",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid != 0 {
+        return Err(Error::Store(
+            "shared Ticket migration did not install the open/closed case contract".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    install_ticket_case_assignment_work_schema(&tx)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO ticket_assignment_work_releases
+         SELECT current.workspace_id, current.assignment_id, current.updated_at
+         FROM ticket_current_worker_assignments AS current
+         JOIN typed_tickets AS ticket ON ticket.workspace_id = current.workspace_id
+          AND ticket.ticket_id = current.ticket_id
+         WHERE ticket.workflow_state = 'closed'",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version, name) VALUES (90, 'Ticket open/closed cases and retained routing evidence')", [],
+    )?;
+    verify_workspace_resource_constraints(&tx)?;
+    let violations: i64 =
+        tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if violations != 0 {
+        return Err(Error::Store(format!(
+            "Ticket case migration left {violations} foreign-key violations"
+        )));
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
+    // The composed Workspace parent FK rebuild must not discard domain-owned
+    // case guards. Retain their SQL from the shared fresh Ticket schema.
+    let ticket_parent_triggers = conn
+        .prepare("SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = 'typed_tickets' ORDER BY name")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
     conn.execute_batch("CREATE TABLE worker_restore_intents (
         workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL, worker_id TEXT NOT NULL,
         domain_key TEXT NOT NULL, request_id TEXT NOT NULL, expected_token TEXT NOT NULL,
@@ -13656,7 +13671,10 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
             ));
         "#,
     )?;
-    conn.execute_batch(include_str!("assignment_work.sql"))?;
+    install_ticket_case_assignment_work_schema(conn)?;
+    for sql in ticket_parent_triggers {
+        conn.execute_batch(&sql)?;
+    }
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
         Error::Store(format!(
             "fresh Workspace Ticket schema verification failed: {error}"
@@ -13711,6 +13729,45 @@ fn verify_workspace_resource_constraints(conn: &Connection) -> Result<()> {
             if !exists {
                 return Err(Error::Store(format!(
                     "unfinished Ticket work constraint {name} is missing"
+                )));
+            }
+        }
+    }
+    if current_schema_version(conn)? >= 90 {
+        for (name, predicate) in [
+            (
+                "ticket_active_worker_assignments",
+                "ticket.workflow_state = 'open'",
+            ),
+            (
+                "ticket_terminal_releases_work",
+                "NEW.workflow_state = 'closed'",
+            ),
+            (
+                "ticket_terminal_assignment_releases_work_insert",
+                "workflow_state = 'closed'",
+            ),
+            (
+                "ticket_terminal_assignment_releases_work_update",
+                "workflow_state = 'closed'",
+            ),
+            (
+                "ticket_active_worker_role_insert",
+                "workflow_state = 'open'",
+            ),
+            (
+                "ticket_active_worker_role_update",
+                "workflow_state = 'open'",
+            ),
+        ] {
+            let sql: String = conn.query_row(
+                "SELECT sql FROM sqlite_schema WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )?;
+            if !sql.contains(predicate) || sql.contains("'done'") {
+                return Err(Error::Store(format!(
+                    "Ticket case constraint {name} does not match schema 90"
                 )));
             }
         }
@@ -15935,7 +15992,7 @@ mod tests {
         migrate_ticket_targets_and_workdir_capabilities_v65_to_v66(&conn).unwrap();
 
         assert_eq!(current_schema_version(&conn).unwrap(), 66);
-        ticket::verify_sqlite_ticket_schema(&conn).unwrap();
+        // The retained step is Ticket-7; current verification runs after schema 90.
         assert!(!column_exists(&conn, "typed_tickets", "repository_id").unwrap());
         assert!(!column_exists(&conn, "typed_tickets", "ref_selector").unwrap());
         assert_eq!(
@@ -16246,6 +16303,16 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 
     // Legacy fixtures compose frozen counter-bearing SQL, never current-schema downgrades.
     fn create_frozen_schema_v85(conn: &Connection) -> Result<()> {
+        // Compose the frozen Ticket-7 baseline, not current Ticket case tables.
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS typed_ticket_case_metadata;
+            DROP TABLE IF EXISTS typed_ticket_case_history;
+            DROP TABLE IF EXISTS typed_ticket_legacy_workflow_snapshot;
+            DELETE FROM ticket_schema_migrations;
+            INSERT INTO ticket_schema_migrations(version, name, applied_at)
+                VALUES(7, 'ticket schema baseline', 'fixture');",
+        )?;
+
         conn.execute_batch("CREATE TABLE worker_restore_intents (
         workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL, worker_id TEXT NOT NULL,
         domain_key TEXT NOT NULL, request_id TEXT NOT NULL, expected_token TEXT NOT NULL,
@@ -16323,11 +16390,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         "#,
         )?;
         conn.execute_batch(include_str!("assignment_work.sql"))?;
-        ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
-            Error::Store(format!(
-                "fresh Workspace Ticket schema verification failed: {error}"
-            ))
-        })?;
+        // Verification uses current schema 9 only after the real retained chain.
         Ok(())
     }
 
@@ -16650,6 +16713,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     version: 89,
                     name: "descriptive legacy evidence columns".to_string()
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 90,
+                    name: "Ticket open/closed cases and retained routing evidence".to_string()
+                },
             ]
         );
 
@@ -16749,6 +16816,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (87, "Repository SSH key identities and encrypted operation objects".to_string()),
 (88, "Runtime binding identities and retention content contracts".to_string()),
 (89, "descriptive legacy evidence columns".to_string()),
+(90, "Ticket open/closed cases and retained routing evidence".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -19257,6 +19325,436 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         );
     }
 
+    // SQLite boundary: a genuine retained Workspace-89 / Ticket-7 fixture,
+    // not a new database with a lower version marker.
+    fn legacy_case_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cases.db");
+        prepare_retained_schema(&path, 89);
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        conn.execute_batch("INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at)
+            VALUES('case-owner','user','case-owner','Owner','1','1');
+            INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at)
+            VALUES('case-workspace','case-owner','Cases','active','1','1');
+            INSERT INTO repositories(workspace_id,repository_id,repository_key,kind,provider,uri,default_ref,created_at,updated_at,source_kind,source_uri,source_fingerprint,observed_status)
+            VALUES('case-workspace','case-repo','main','git','git','/fixture','develop','1','1','local_path','/fixture','sha256:fixture','unverified');").unwrap();
+        (dir, path)
+    }
+
+    fn stored_fixture_rows(conn: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut stmt = conn
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .unwrap();
+        let columns = stmt.column_count();
+        stmt.query_map([], |row| (0..columns).map(|i| row.get(i)).collect())
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn schema_v89_cases_preserve_all_six_states_evidence_and_responsibility_without_starting_workers()
+     {
+        use ticket::TicketBackend;
+        let (_dir, path) = legacy_case_workspace();
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        for state in [
+            "planning",
+            "ready",
+            "queued",
+            "inprogress",
+            "done",
+            "closed",
+        ] {
+            for has_mr in [false, true] {
+                let id = format!("{state}-{has_mr}");
+                conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit,queued_by,queued_at,resolution,readiness,assignee,created_at,updated_at)
+                    VALUES('case-workspace',?1,?1,?1,?2,'task','P2','Original requirements',?3,1,?4,?5,'Original closure text','legacy-readiness','legacy-assignee','1','2')",
+                    params![id, if matches!(state,"done"|"closed") { "closed" } else { "open" }, state,
+                        (state=="queued").then_some("queue-author"), (state=="queued").then_some("queue-time")]).unwrap();
+                conn.execute("INSERT INTO worker_registry(workspace_id,runtime_id,worker_id,display_name,retention_state,created_at,updated_at)
+                    VALUES('case-workspace','case-runtime',?1,?1,'normal','1','1')", [&id]).unwrap();
+                conn.execute("INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,runtime_id,worker_id,assigned_by,assigned_at)
+                    VALUES('case-workspace',?1,?1,'worker','worker','case-runtime',?1,'original-actor','1')", [&id]).unwrap();
+                conn.execute("INSERT INTO ticket_current_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,runtime_id,worker_id,updated_at)
+                    VALUES('case-workspace',?1,?1,'worker','worker','case-runtime',?1,'1')", [&id]).unwrap();
+                conn.execute("INSERT INTO ticket_worker_assignment_events(workspace_id,ticket_id,event_id,assignment_id,role,action,actor,created_at,operation_id)
+                    VALUES('case-workspace',?1,?1,?1,'worker','assigned','original-actor','1',?1)", [&id]).unwrap();
+                conn.execute("INSERT INTO ticket_assignment_operations(workspace_id,operation_id,action,ticket_id,role,runtime_id,worker_id,assignment_id,created_at,request_fingerprint,claim_state)
+                    VALUES('case-workspace',?1,'assign',?1,'worker','case-runtime',?1,?1,'1','original-claim','committed')", [&id]).unwrap();
+                conn.execute("INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,kind,author,at,from_state,to_state,reason,state_field,heading,body)
+                    VALUES('case-workspace',?1,0,'state_changed','original-author','1','planning',?2,'Original decision','state','Original heading','Original thread')", params![id,state]).unwrap();
+                conn.execute("INSERT INTO typed_ticket_event_attributes(workspace_id,ticket_id,event_index,key,value)
+                    VALUES('case-workspace',?1,0,'operation_key','original-operation')", [&id]).unwrap();
+                conn.execute("INSERT INTO typed_ticket_event_references(workspace_id,ticket_id,event_index,ordinal,kind,target)
+                    VALUES('case-workspace',?1,0,0,'commit','original-ref')", [&id]).unwrap();
+                conn.execute("INSERT INTO typed_ticket_artifacts(workspace_id,ticket_id,relative_path,content)
+                    VALUES('case-workspace',?1,'original.txt',?2)", params![id,b"original artifact".as_slice()]).unwrap();
+                if has_mr {
+                    conn.execute("INSERT INTO typed_ticket_targets(workspace_id,ticket_id,ordinal,repository_key,ref_selector,access)
+                        VALUES('case-workspace',?1,0,'main','develop','read_write')", [&id]).unwrap();
+                    conn.execute("INSERT INTO merge_requests(workspace_id,merge_request_id,repository_id,state,selector_from,selector_to,created_at,updated_at)
+                        VALUES('case-workspace',?1,'case-repo','merged','work/original','develop','1','2')", [&id]).unwrap();
+                    conn.execute("INSERT INTO merge_request_ticket_relations(workspace_id,merge_request_id,ticket_id,relation_kind,created_at)
+                        VALUES('case-workspace',?1,?1,'implements','1')", [&id]).unwrap();
+                    let evidence = merge_request::MergeEvent {
+                        event_id: id.clone(),
+                        sequence: 1,
+                        operation_id: id.clone(),
+                        approval_event_id: "original-approval".into(),
+                        approved_source_ref: "original-source".into(),
+                        target_ref_before: "original-target".into(),
+                        target_ref_after: "original-result".into(),
+                        strategy: merge_request::MergeStrategy::FastForward,
+                        resolution: merge_request::ConflictResolution::None,
+                        merged_by: merge_request::WorkerIdentity {
+                            runtime_id: "original-runtime".into(),
+                            worker_id: "original-orchestrator".into(),
+                        },
+                        created_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                            .unwrap()
+                            .with_timezone(&chrono::Utc),
+                    };
+                    conn.execute("INSERT INTO merge_request_thread_events(workspace_id,merge_request_id,event_id,sequence,kind,payload_json,operation_id,created_at)
+                        VALUES('case-workspace',?1,?1,1,'merge',?2,?1,'2')", params![id,serde_json::to_string(&evidence).unwrap()]).unwrap();
+                }
+            }
+        }
+        conn.execute_batch("INSERT INTO worker_control_grants(workspace_id,grant_id,controller_runtime_id,controller_worker_id,subject_runtime_id,subject_worker_id,relation,origin,permissions_json,operation_id,created_at)
+            VALUES('case-workspace','original-control','case-runtime','planning-false','case-runtime','closed-true','ticket','user','[\"stop\",\"observe\"]','original-grant','1');
+            INSERT INTO worker_restore_intents(workspace_id,runtime_id,worker_id,domain_key,request_id,expected_token,settled)
+            VALUES('case-workspace','case-runtime','closed-true','original-domain','original-restore','original-token',0);
+            INSERT INTO workdir_registry(workspace_id,workdir_id,source_kind,runtime_id,repository_id,creation_selector,creation_ref,materialization_status,cleanliness,created_at,updated_at)
+            VALUES('case-workspace','original-workdir','repository','case-runtime','case-repo','develop','original-ref','present','clean','1','1');
+            INSERT INTO worker_workdir_links(workspace_id,runtime_id,worker_id,workdir_id,alias,capabilities,connection_id,linked_at)
+            VALUES('case-workspace','case-runtime','closed-true','original-workdir','checkout','all','original-connection','1');").unwrap();
+        // Queued intent with and without a pending claim must survive, but no
+        // assignment, Worker create/restore or grant is synthesized by migration.
+        for id in ["pending-queue", "only-queue"] {
+            conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit,queued_by,queued_at)
+                VALUES('case-workspace',?1,?1,?1,'open','task','P2','','queued',1,'queue-author','queue-time')", [id]).unwrap();
+        }
+        conn.execute("INSERT INTO worker_registry(workspace_id,runtime_id,worker_id,display_name,retention_state,created_at,updated_at)
+            VALUES('case-workspace','case-runtime','pending-worker','Pending','normal','1','1')", []).unwrap();
+        conn.execute("INSERT INTO ticket_assignment_operations(workspace_id,operation_id,action,ticket_id,role,runtime_id,worker_id,created_at,request_fingerprint,claim_state)
+            VALUES('case-workspace','pending-claim','assign','pending-queue','worker','case-runtime','pending-worker','1','pending-fingerprint','pending')", []).unwrap();
+        let unchanged = [
+            "typed_ticket_events",
+            "typed_ticket_event_attributes",
+            "typed_ticket_event_references",
+            "typed_ticket_artifacts",
+            "typed_ticket_targets",
+            "ticket_worker_assignments",
+            "ticket_current_worker_assignments",
+            "ticket_worker_assignment_events",
+            "ticket_assignment_operations",
+            "worker_registry",
+            "worker_create_reservations",
+            "worker_restore_intents",
+            "workdir_registry",
+            "worker_workdir_links",
+            "worker_control_grants",
+            "merge_requests",
+            "merge_request_ticket_relations",
+            "merge_request_thread_events",
+        ];
+        let before = unchanged.map(|table| stored_fixture_rows(&conn, table));
+        drop(conn);
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let backend = ticket::SqliteTicketBackend::open_verified(&path, "case-workspace").unwrap();
+        store
+            .with_conn(|conn| {
+                assert_eq!(current_schema_version(conn)?, 90);
+                for (table, rows) in unchanged.iter().zip(before.iter()) {
+                    assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
+                }
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM ticket_assignment_work_releases",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )?,
+                    4
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM ticket_active_worker_assignments",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )?,
+                    8
+                );
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+        for state in [
+            "planning",
+            "ready",
+            "queued",
+            "inprogress",
+            "done",
+            "closed",
+        ] {
+            for has_mr in [false, true] {
+                let id = format!("{state}-{has_mr}");
+                let ticket = backend.show(id.clone().into()).unwrap();
+                assert_eq!(ticket.document.body.as_str(), "Original requirements");
+                let snapshot = ticket.legacy_workflow_snapshot.as_ref().unwrap();
+                assert_eq!(snapshot.workflow_state, state);
+                assert_eq!(
+                    snapshot.resolution.as_deref(),
+                    Some("Original closure text")
+                );
+                assert_eq!(ticket.meta.assignee.as_deref(), Some("legacy-assignee"));
+                if matches!(state, "done" | "closed") {
+                    assert_eq!(ticket.meta.workflow_state, ticket::TicketState::Closed);
+                    assert_eq!(
+                        ticket.current_closure.as_ref().unwrap().reason,
+                        ticket::TicketClosureReason::Unknown,
+                        "MR evidence does not infer fulfillment"
+                    );
+                    assert_eq!(ticket.case_history.len(), 1);
+                    let reopened = update_test_case(
+                        &backend,
+                        &id,
+                        &format!("reopen-{id}"),
+                        ticket::TicketCaseAction::Reopen,
+                    );
+                    assert_eq!(reopened.meta.workflow_state, ticket::TicketState::Open);
+                    assert_eq!(reopened.case_history.len(), 2);
+                    assert_eq!(reopened.case_history[0], ticket.case_history[0]);
+                    assert!(
+                        store
+                            .get_active_ticket_worker_assignment("case-workspace", &id)
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(
+                        store
+                            .get_current_ticket_worker_assignment("case-workspace", &id)
+                            .unwrap()
+                            .unwrap()
+                            .assignment_id,
+                        id
+                    );
+                    assert!(
+                        store
+                            .delete_worker_registry(
+                                "case-workspace",
+                                &RuntimeWorkerRef::new("case-runtime", &id)
+                            )
+                            .is_ok()
+                    );
+                } else {
+                    assert_eq!(ticket.meta.workflow_state, ticket::TicketState::Open);
+                    assert!(ticket.case_history.is_empty());
+                    assert!(
+                        store
+                            .delete_worker_registry(
+                                "case-workspace",
+                                &RuntimeWorkerRef::new("case-runtime", &id)
+                            )
+                            .is_err()
+                    );
+                }
+            }
+        }
+        assert!(
+            store
+                .get_current_ticket_worker_assignment("case-workspace", "only-queue")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_active_ticket_worker_assignment("case-workspace", "pending-queue")
+                .unwrap()
+                .is_none()
+        );
+        let pending = store
+            .get_ticket_assignment_operation("case-workspace", "pending-claim")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.claim_state, "pending");
+        assert_eq!(
+            pending.request_fingerprint.as_deref(),
+            Some("pending-fingerprint")
+        );
+        drop(store);
+        let reopened = SqliteWorkspaceStore::open(&path).unwrap();
+        assert!(
+            reopened
+                .get_active_ticket_worker_assignment("case-workspace", "done-true")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            reopened
+                .get_ticket_assignment_operation("case-workspace", "pending-claim")
+                .unwrap()
+                .unwrap(),
+            pending
+        );
+    }
+
+    #[test]
+    fn schema_v90_resumes_after_shared_ticket_migration_without_duplicating_judgments() {
+        use ticket::TicketBackend;
+        let (_dir, path) = legacy_case_workspace();
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        conn.execute_batch("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit)
+            VALUES('case-workspace','terminal','terminal','Terminal','closed','task','P2','','done',1);
+            DROP VIEW ticket_active_worker_assignments;
+            CREATE TABLE ticket_active_worker_assignments(collision TEXT);").unwrap();
+        let error = migrate_ticket_cases_v89_to_v90(&conn).unwrap_err();
+        assert!(error.to_string().contains("DROP TABLE"));
+        assert_eq!(current_schema_version(&conn).unwrap(), 89);
+        // The shared transaction completed, but Workspace did not advertise a
+        // composed schema. Its immutable evidence remains the retry authority.
+        let before = stored_fixture_rows(&conn, "typed_ticket_case_history");
+        assert_eq!(before.len(), 1);
+        conn.execute_batch("DROP TABLE ticket_active_worker_assignments;")
+            .unwrap();
+        migrate_ticket_cases_v89_to_v90(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 90);
+        assert_eq!(
+            stored_fixture_rows(&conn, "typed_ticket_case_history"),
+            before
+        );
+        drop(conn);
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let backend = ticket::SqliteTicketBackend::open_verified(&path, "case-workspace").unwrap();
+        assert_eq!(
+            backend
+                .show("terminal".into())
+                .unwrap()
+                .current_closure
+                .unwrap()
+                .reason,
+            ticket::TicketClosureReason::Unknown
+        );
+        assert!(
+            store
+                .get_active_ticket_worker_assignment("case-workspace", "terminal")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn claims_and_compensation_do_not_change_case_state_or_resume_closed_work() {
+        let (dir, store) = manual_worker_start_store().await;
+        seed_manual_start_ticket(&store, "ticket", "open");
+        let record = manual_worker_assignment("ticket", "assignment");
+        let fingerprint = manual_ticket_assignment_fingerprint(&record, None).unwrap();
+        store
+            .reserve_ticket_assignment_operation(
+                "w",
+                "claim",
+                "ticket",
+                "r",
+                Some("worker"),
+                &fingerprint,
+                "1",
+            )
+            .unwrap();
+        let backend =
+            ticket::SqliteTicketBackend::open_verified(dir.path().join("workspace.db"), "w")
+                .unwrap();
+        use ticket::TicketBackend;
+        assert_eq!(
+            backend.show("ticket".into()).unwrap().meta.workflow_state,
+            ticket::TicketState::Open
+        );
+        let closed = update_test_case(
+            &backend,
+            "ticket",
+            "close",
+            ticket::TicketCaseAction::Close {
+                reason: ticket::TicketClosureReason::NotPlanned,
+            },
+        );
+        assert!(
+            store
+                .get_pending_ticket_assignment_operation_for_worker(
+                    "w",
+                    &RuntimeWorkerRef::new("r", "worker")
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .bind_ticket_assignment_operation_worker("w", "claim", "worker")
+                .is_err()
+        );
+        assert!(
+            store
+                .start_ticket_with_worker_assignment(&record, "event", "claim", None)
+                .is_err()
+        );
+        store
+            .rollback_ticket_assignment_operation("w", "claim")
+            .unwrap();
+        assert_eq!(
+            backend.show("ticket".into()).unwrap().meta.workflow_state,
+            ticket::TicketState::Closed
+        );
+        assert_eq!(
+            backend.show("ticket".into()).unwrap().case_history,
+            closed.case_history
+        );
+        assert_eq!(
+            store
+                .get_ticket_assignment_operation("w", "claim")
+                .unwrap()
+                .unwrap()
+                .claim_state,
+            "failed"
+        );
+        assert!(
+            store
+                .get_current_ticket_worker_assignment("w", "ticket")
+                .unwrap()
+                .is_none()
+        );
+        // Explicit reopening also leaves the failed claim receipt inert.
+        update_test_case(
+            &backend,
+            "ticket",
+            "reopen",
+            ticket::TicketCaseAction::Reopen,
+        );
+        assert!(
+            store
+                .start_ticket_with_worker_assignment(&record, "event", "claim", None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn schema_v90_case_constraint_verification_rejects_legacy_view_predicates() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        store.with_conn(|conn| {
+            conn.execute_batch("DROP VIEW ticket_active_worker_assignments;
+                CREATE VIEW ticket_active_worker_assignments AS
+                SELECT current.* FROM ticket_current_worker_assignments AS current
+                JOIN typed_tickets AS ticket ON ticket.workspace_id=current.workspace_id AND ticket.ticket_id=current.ticket_id
+                WHERE ticket.workflow_state NOT IN ('done','closed');")?;
+            assert!(verify_workspace_resource_constraints(conn).unwrap_err().to_string().contains("schema 90"));
+            Ok(())
+        }).unwrap();
+    }
+
     // Equivalent to the reported closed T-12 + retained Coder data. The
     // migration fixture is a real pre-cutover schema, not the live Workspace.
     #[test]
@@ -19370,7 +19868,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             matches!(&blockers[..], [crate::retention::WorkerRemovalBlocker::Hold,crate::retention::WorkerRemovalBlocker::UnfinishedWork { assignment_id,ticket_id }] if assignment_id=="current_assignment" && ticket_id=="closed-ticket")
         );
         conn.execute_batch(
-            "UPDATE typed_tickets SET workflow_state='planning' WHERE ticket_id='closed-ticket';
+            "UPDATE typed_tickets SET workflow_state='open' WHERE ticket_id='closed-ticket';
             DELETE FROM worker_registry WHERE worker_id='old-coder';",
         )
         .unwrap();
@@ -19428,6 +19926,31 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         (dir, store)
     }
 
+    fn update_test_case(
+        backend: &ticket::SqliteTicketBackend,
+        id: &str,
+        operation: &str,
+        action: ticket::TicketCaseAction,
+    ) -> ticket::Ticket {
+        use ticket::TicketBackend;
+        let current = backend.show(id.into()).unwrap();
+        backend
+            .update_case(
+                id,
+                ticket::TicketCaseUpdate {
+                    expected_content_digest: ticket::ticket_content_digest(&current),
+                    expected_state: current.meta.workflow_state,
+                    expected_closure_operation_key: current.closure_operation_key,
+                    operation_key: operation.into(),
+                    action,
+                    explanation: "Store fixture case judgment".into(),
+                    references: vec![],
+                    author: Some("store-fixture-author".into()),
+                },
+            )
+            .unwrap()
+    }
+
     fn seed_manual_start_ticket(store: &SqliteWorkspaceStore, id: &str, state: &str) {
         store.with_conn(|conn| {
             conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit,updated_at)
@@ -19458,8 +19981,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     async fn pending_claims_serialize_competing_ticket_and_known_worker_reservations() {
         for (same_ticket, same_operation) in [(true, false), (false, false), (true, true)] {
             let (dir, store) = manual_worker_start_store().await;
-            seed_manual_start_ticket(&store, "first", "planning");
-            seed_manual_start_ticket(&store, "second", "ready");
+            seed_manual_start_ticket(&store, "first", "open");
+            seed_manual_start_ticket(&store, "second", "open");
             store.with_conn(|conn| {
                 conn.execute_batch("INSERT INTO worker_registry(workspace_id,runtime_id,worker_id,display_name,retention_state,created_at,updated_at)
                     VALUES('w','r','other','Other','normal','1','1');")?;
@@ -19530,8 +20053,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     #[tokio::test]
     async fn pending_claims_fence_all_assignment_writers_and_worker_binding_until_owner_commits() {
         let (_dir, store) = manual_worker_start_store().await;
-        seed_manual_start_ticket(&store, "first", "planning");
-        seed_manual_start_ticket(&store, "second", "ready");
+        seed_manual_start_ticket(&store, "first", "open");
+        seed_manual_start_ticket(&store, "second", "open");
         let first = manual_worker_assignment("first", "first-assignment");
         let orchestrator = TicketRoleAssignmentRecord {
             role: TicketAssignmentRole::Orchestrator,
@@ -19702,7 +20225,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     #[tokio::test]
     async fn manual_claim_consumes_matching_binding_fingerprint_and_replays_committed_receipt() {
         let (_dir, store) = manual_worker_start_store().await;
-        seed_manual_start_ticket(&store, "first", "planning");
+        seed_manual_start_ticket(&store, "first", "open");
         let record = manual_worker_assignment("first", "assignment");
         let fingerprint =
             manual_ticket_assignment_fingerprint(&record, Some("bindings-a")).unwrap();
@@ -19795,7 +20318,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     #[tokio::test]
     async fn manual_claim_recovery_survives_reopen_and_fences_stale_item_finalization() {
         let (dir, store) = manual_worker_start_store().await;
-        seed_manual_start_ticket(&store, "first", "planning");
+        seed_manual_start_ticket(&store, "first", "open");
         let record = manual_worker_assignment("first", "assignment");
         let fingerprint = manual_ticket_assignment_fingerprint(&record, Some("bindings")).unwrap();
         store
@@ -19810,7 +20333,13 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             )
             .unwrap();
         let recovery = TicketWorkerClaimRecovery {
-            content_digest: "first:0".into(),
+            content_digest: store
+                .with_conn(|conn| {
+                    ticket::sqlite_ticket_content_digest(conn, "w", "first")
+                        .map_err(|error| Error::Store(error.to_string()))
+                })
+                .unwrap()
+                .unwrap(),
             selected: vec![],
             original_links: vec![],
             effective_links: vec![],
@@ -19834,7 +20363,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             Some(recovery)
         );
         reopened.with_conn(|conn| {
-            conn.execute("INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,kind,body) VALUES('w','first',1,'item_edit','Ticket targets changed')",[])?; Ok(())
+            conn.execute_batch("UPDATE typed_tickets SET title='Changed requirements' WHERE workspace_id='w' AND ticket_id='first';
+                INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,kind,body) VALUES('w','first',1,'item_edit','Ticket requirements changed');")?; Ok(())
         }).unwrap();
         assert!(
             reopened
@@ -19862,7 +20392,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     #[tokio::test]
     async fn manual_claim_failed_receipt_survives_reopen_and_rollback_without_restarting() {
         let (dir, store) = manual_worker_start_store().await;
-        seed_manual_start_ticket(&store, "first", "planning");
+        seed_manual_start_ticket(&store, "first", "open");
         let record = manual_worker_assignment("first", "assignment");
         let fingerprint = manual_ticket_assignment_fingerprint(&record, Some("bindings")).unwrap();
         store
@@ -19937,15 +20467,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     }
 
     #[tokio::test]
-    async fn manual_worker_start_accepts_nonterminal_states_with_idempotent_assignment_and_audit() {
-        for state in [
-            "planning",
-            "ready",
-            "queued",
-            "inprogress",
-            "done",
-            "closed",
-        ] {
+    async fn manual_worker_start_is_case_neutral_with_idempotent_assignment_and_audit() {
+        for state in ["open", "closed"] {
             for user_principal in [false, true] {
                 let (_dir, store) = manual_worker_start_store().await;
                 seed_manual_start_ticket(&store, "ticket", state);
@@ -19957,7 +20480,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 }
                 let result =
                     store.start_ticket_with_worker_assignment(&record, "event", "operation", None);
-                if matches!(state, "done" | "closed") {
+                if state == "closed" {
                     assert!(result.is_err(), "{state}");
                 } else {
                     assert_eq!(result.unwrap(), record, "{state}");
@@ -19994,12 +20517,12 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (SELECT COUNT(*) FROM ticket_worker_assignments), (SELECT COUNT(*) FROM ticket_assignment_operations)
                          FROM typed_tickets WHERE ticket_id='ticket'", [],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
-                    if matches!(state, "done" | "closed") {
+                    if state == "closed" {
                         assert_eq!((persisted.as_str(), events, assignments, operations), (state,0,0,0));
                     } else {
-                        assert_eq!((persisted.as_str(), events, assignments, operations), ("inprogress",1,1,1));
-                        let transition: (String,String) = conn.query_row("SELECT from_state,to_state FROM typed_ticket_events", [], |row| Ok((row.get(0)?,row.get(1)?)))?;
-                        assert_eq!(transition, (state.into(), "inprogress".into()));
+                        assert_eq!((persisted.as_str(), events, assignments, operations), ("open",1,1,1));
+                        let transition: (Option<String>,Option<String>,String) = conn.query_row("SELECT from_state,to_state,kind FROM typed_ticket_events", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+                        assert_eq!(transition, (None, None, "assignment".into()));
                         assert_eq!(conn.query_row("SELECT value FROM typed_ticket_event_attributes WHERE key='assignment_role'", [], |row| row.get::<_,String>(0))?, "worker");
                     }
                     Ok(())
@@ -20012,8 +20535,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     async fn manual_worker_start_rejects_busy_worker_without_mutation_and_requires_new_reopen_identity()
      {
         let (_dir, store) = manual_worker_start_store().await;
-        seed_manual_start_ticket(&store, "first", "planning");
-        seed_manual_start_ticket(&store, "second", "queued");
+        seed_manual_start_ticket(&store, "first", "open");
+        seed_manual_start_ticket(&store, "second", "open");
         let first = manual_worker_assignment("first", "first-assignment");
         let second = manual_worker_assignment("second", "second-assignment");
         store
@@ -20037,7 +20560,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                         [],
                         |row| row.get::<_, String>(0)
                     )?,
-                    "queued"
+                    "open"
                 );
                 assert_eq!(
                     conn.query_row(
@@ -20049,7 +20572,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 );
                 conn.execute_batch(
                     "UPDATE typed_tickets SET workflow_state='closed' WHERE ticket_id='first';
-                UPDATE typed_tickets SET workflow_state='planning' WHERE ticket_id='first';",
+                UPDATE typed_tickets SET workflow_state='open' WHERE ticket_id='first';",
                 )?;
                 Ok(())
             })
@@ -20152,12 +20675,14 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .set_current_ticket_worker_assignment(&next, None, "e2", "op2", false)
                 .is_err()
         );
-        backend
-            .close(
-                first.id.clone().into(),
-                ticket::MarkdownText::new("Closed without integration proof"),
-            )
-            .unwrap();
+        update_test_case(
+            &backend,
+            &first.id,
+            "close-first",
+            ticket::TicketCaseAction::Close {
+                reason: ticket::TicketClosureReason::Unknown,
+            },
+        );
         assert_eq!(
             store
                 .get_current_ticket_worker_assignment("w", &first.id)
@@ -20173,9 +20698,12 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         store
             .set_current_ticket_worker_assignment(&next, None, "e2", "op2", false)
             .unwrap();
-        // Generic Ticket tools do not expose terminal -> planning. Seed the
-        // authority state boundary to prove future/reconciled reopen is inert.
-        store.with_conn(|conn| { conn.execute("UPDATE typed_tickets SET workflow_state='planning' WHERE workspace_id='w' AND ticket_id=?1", [&first.id])?; Ok(()) }).unwrap();
+        update_test_case(
+            &backend,
+            &first.id,
+            "reopen-first",
+            ticket::TicketCaseAction::Reopen,
+        );
         assert!(
             store
                 .get_active_ticket_worker_assignment("w", &first.id)
@@ -20202,9 +20730,14 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .is_err(),
             "another Ticket still occupies the Worker"
         );
-        backend
-            .close(second.id.clone().into(), ticket::MarkdownText::new("Ended"))
-            .unwrap();
+        update_test_case(
+            &backend,
+            &second.id,
+            "close-second",
+            ticket::TicketCaseAction::Close {
+                reason: ticket::TicketClosureReason::Unknown,
+            },
+        );
         store
             .set_current_ticket_worker_assignment(&restarted, None, "e3", "op3", false)
             .unwrap();
@@ -20250,9 +20783,9 @@ INSERT INTO typed_tickets (
     workspace_id, ticket_id, slug, title, status, kind, priority, body,
     workflow_state, workflow_state_explicit
 ) VALUES
-    ('workspace-a', 'ticket-1', 'ticket-1', 'Ticket 1', 'open', 'task', 'normal', '', 'planning', 1),
-    ('workspace-a', 'ticket-2', 'ticket-2', 'Ticket 2', 'open', 'task', 'normal', '', 'planning', 1),
-    ('workspace-a', 'ticket-3', 'ticket-3', 'Ticket 3', 'open', 'task', 'normal', '', 'planning', 1);
+    ('workspace-a', 'ticket-1', 'ticket-1', 'Ticket 1', 'open', 'task', 'normal', '', 'open', 1),
+    ('workspace-a', 'ticket-2', 'ticket-2', 'Ticket 2', 'open', 'task', 'normal', '', 'open', 1),
+    ('workspace-a', 'ticket-3', 'ticket-3', 'Ticket 3', 'open', 'task', 'normal', '', 'open', 1);
 INSERT INTO worker_registry (
     workspace_id, runtime_id, worker_id, display_name, retention_state, created_at, updated_at
 ) VALUES
@@ -20563,7 +21096,7 @@ INSERT INTO worker_registry (
             ticket::SqliteTicketBackend::open_verified(&db_path, "workspace-role").unwrap();
         let mut input = ticket::NewTicket::new("Role assignment");
         input.body = ticket::MarkdownText::new("test");
-        input.workflow_state = Some(ticket::TicketWorkflowState::Ready);
+        input.workflow_state = Some(ticket::TicketState::Open);
         input.targets = vec![ticket::TicketTarget {
             repository_key: "main".to_string(),
             ref_selector: Some("develop".to_string()),
@@ -20636,7 +21169,7 @@ INSERT INTO worker_registry (
                 .unwrap()
                 .meta
                 .workflow_state,
-            ticket::TicketWorkflowState::Ready
+            ticket::TicketState::Open
         );
         assert!(
             store
@@ -20672,10 +21205,7 @@ INSERT INTO worker_registry (
             .unwrap();
         assert_eq!(replayed, coder);
         let ticket = ticket::TicketBackend::show(&backend, ticket.id.clone().into()).unwrap();
-        assert_eq!(
-            ticket.meta.workflow_state,
-            ticket::TicketWorkflowState::InProgress
-        );
+        assert_eq!(ticket.meta.workflow_state, ticket::TicketState::Open);
         assert_eq!(
             ticket
                 .events
@@ -20735,7 +21265,7 @@ INSERT INTO worker_registry (
             ticket::TicketBackend::show(&backend, ticket.meta.id.clone().into()).unwrap();
         assert_eq!(
             cancelled_ticket.meta.workflow_state,
-            ticket::TicketWorkflowState::Ready
+            ticket::TicketState::Open
         );
         assert_eq!(
             cancelled_ticket
@@ -20850,7 +21380,7 @@ INSERT INTO workspace_signing_identities (
 INSERT INTO typed_tickets (
     workspace_id, ticket_id, slug, title, status, kind, priority, body,
     workflow_state, workflow_state_explicit
-) VALUES ('workspace-a', 'ticket-a', 'ticket-a', 'A', 'open', 'task', 'normal', '', 'planning', 1);
+) VALUES ('workspace-a', 'ticket-a', 'ticket-a', 'A', 'open', 'task', 'normal', '', 'open', 1);
 INSERT INTO worker_registry (
     workspace_id, runtime_id, worker_id, display_name, retention_state, created_at, updated_at
 ) VALUES (
@@ -20880,7 +21410,7 @@ INSERT INTO workspace_signing_identities (
 INSERT INTO typed_tickets (
     workspace_id, ticket_id, slug, title, status, kind, priority, body,
     workflow_state, workflow_state_explicit
-) VALUES ('workspace-b', 'ticket-a', 'ticket-a-b', 'B', 'open', 'task', 'normal', '', 'planning', 1);
+) VALUES ('workspace-b', 'ticket-a', 'ticket-a-b', 'B', 'open', 'task', 'normal', '', 'open', 1);
 INSERT INTO worker_registry (
     workspace_id, runtime_id, worker_id, display_name, retention_state, created_at, updated_at
 ) VALUES (

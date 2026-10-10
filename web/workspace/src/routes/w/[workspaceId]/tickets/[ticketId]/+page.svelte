@@ -12,16 +12,18 @@
     parseTicketQueueOutcome,
     parseTicketRoleAssignmentMutationResponse,
   } from "#lib/workspace/api/ticket-browser.ts";
+  import { ticketCaseRequest, updateTicketCase } from "#lib/workspace/api/ticket-case.ts";
   import { mergeRequestPagePath } from "#lib/workspace/api/merge-requests.ts";
   import { currentRequirementApprovalStatus, summarySourceReviewStatus } from "#lib/workspace/merge-request-status.ts";
   import {
     relationLabel,
-    TICKET_STATES,
     ticketWorkerLaunchHref,
     type WorkspaceOrchestratorStatus,
   } from "#lib/workspace/tickets/ticket-panel.ts";
   import type { ApiResult } from "#lib/workspace/api/http.ts";
   import type {
+    TicketCaseAction,
+    TicketClosureReason,
     TicketTarget,
     TicketTargetAccess,
   } from "#lib/generated/ticket-api.ts";
@@ -37,7 +39,6 @@
     access: TicketTargetAccess;
   };
 
-  const MUTABLE_TICKET_STATES = TICKET_STATES;
 
   function editableTargets(targets: TicketTarget[]): EditableTicketTarget[] {
     return targets.map((target) => ({
@@ -78,12 +79,11 @@
   let targetDrafts = $state<EditableTicketTarget[]>(
     editableTargets(loadedTicket.targets),
   );
-  let nextState = $state(loadedTicket.state);
   let transitionReason = $state("");
-  let progressBody = $state("");
+  let closureReason = $state("unknown");
+  let otherClosureReason = $state("");
   let threadRole = $state("comment");
   let threadBody = $state("");
-  let resolution = $state("");
   let busy = $state<string | null>(null);
   let errorMessage = $state<string | null>(null);
   let queueMessage = $state<string | null>(null);
@@ -139,17 +139,16 @@
     editTitle = updatedTicket.title;
     editBody = updatedTicket.body;
     targetDrafts = editableTargets(updatedTicket.targets);
-    nextState = updatedTicket.state;
   }
 
   function resetTicketView(updatedTicket: TicketDetail): void {
     applyTicket(updatedTicket);
     editing = false;
     transitionReason = "";
-    progressBody = "";
+    closureReason = "unknown";
+    otherClosureReason = "";
     threadRole = "comment";
     threadBody = "";
-    resolution = "";
     busy = null;
     errorMessage = null;
     queueMessage = null;
@@ -363,7 +362,7 @@
   }
 
   async function markReady() {
-    if (ticket.state !== "planning" || busy) return;
+    if (ticket.state !== "open" || busy) return;
     readyOperationKey ??= crypto.randomUUID();
     if (
       await mutate("ready", "/ready", {
@@ -376,18 +375,33 @@
     }
   }
 
-  async function transition(event: SubmitEvent) {
-    event.preventDefault();
-    if (
-      await mutate("state", "/state", {
-        state: nextState,
-        operation_key: crypto.randomUUID(),
-        expected_content_digest: ticket.content_digest,
-        expected_state: ticket.state,
-        reason: transitionReason.trim(),
-        body: progressBody.trim() || null,
-      })
-    ) { transitionReason = ""; progressBody = ""; }
+  function selectedClosureReason(): TicketClosureReason {
+    return closureReason === "other" ? { other: otherClosureReason.trim() } : closureReason as TicketClosureReason;
+  }
+
+  async function caseDecision(action: TicketCaseAction): Promise<void> {
+    if (busy || !transitionReason.trim()) return;
+    const generation = routeGeneration;
+    const path = ticketPath;
+    const request = ticketCaseRequest(ticket, action, transitionReason, crypto.randomUUID());
+    busy = action.action;
+    errorMessage = null;
+    try {
+      await updateTicketCase(data.workspaceId, data.ticketId, request);
+      if (generation !== routeGeneration) return;
+      const updated = await workspaceApiJson(path, parseTicketDetail, TICKET_BROWSER_API_MAX_RESPONSE_BYTES);
+      if (generation !== routeGeneration) return;
+      applyTicket(updated);
+      transitionReason = "";
+    } catch (error) {
+      if (generation === routeGeneration) errorMessage = ticketMutationError(error);
+    } finally {
+      if (generation === routeGeneration) busy = null;
+    }
+  }
+
+  function closureReasonLabel(reason: TicketClosureReason): string {
+    return typeof reason === "string" ? relationLabel(reason) : reason.other;
   }
 
   async function appendThread(event: SubmitEvent) {
@@ -399,19 +413,6 @@
         body: threadBody.trim(),
       })
     ) threadBody = "";
-  }
-
-  async function closeTicket(event: SubmitEvent) {
-    event.preventDefault();
-    if (!resolution.trim()) return;
-    if (
-      await mutate("close", "/close", {
-        resolution: resolution.trim(),
-        operation_key: crypto.randomUUID(),
-        expected_content_digest: ticket.content_digest,
-        expected_state: ticket.state,
-      })
-    ) resolution = "";
   }
 
   function eventTitle(kind: string): string {
@@ -550,22 +551,29 @@
 
     <aside class="ticket-control-rail">
       <section class="ticket-control-card">
-        <header><h2>Progress decision</h2></header>
-        <p class="workspace-empty-copy">State records progress only. It does not start or stop a Worker, grant access, approve review, or merge code. Reopening does not resume an old Worker.</p>
-        <form class="ticket-control-form" onsubmit={transition}>
-          <label>State
-            <select bind:value={nextState}>
-              {#each MUTABLE_TICKET_STATES as state}<option value={state}>{state}</option>{/each}
+        <header><h2>Case decision</h2></header>
+        <p class="workspace-empty-copy">Open means the case remains under consideration; closed does not necessarily mean completed. Case decisions do not start or stop Workers, grant access, approve review, merge code, or change tags. Reopening does not resume an old Worker.</p>
+        <form class="ticket-control-form" onsubmit={(event) => { event.preventDefault(); void caseDecision(ticket.state === "open" ? { action: "close", reason: selectedClosureReason() } : { action: "reopen" }); }}>
+          <label>Explanation<textarea bind:value={transitionReason} rows="3" required></textarea></label>
+          <label>Closure reason
+            <select bind:value={closureReason}>
+              <option value="completed">Completed</option>
+              <option value="not_planned">Not planned</option>
+              <option value="duplicate">Duplicate</option>
+              <option value="unknown">Unknown</option>
+              <option value="other">Other</option>
             </select>
           </label>
-          <label>Reason<input bind:value={transitionReason} placeholder="Completion, start, or reopening decision" required /></label>
-          <label>Result, references, and remaining work (optional)<textarea bind:value={progressBody} rows="3" placeholder="A comment can be the result. Add links and remaining questions here."></textarea></label>
-          <button class="workspace-secondary-button" type="submit" disabled={busy !== null || nextState === ticket.state || !transitionReason.trim()}>
-            {nextState === "done" ? "Complete Ticket" : ticket.state === "done" || ticket.state === "closed" ? "Reopen / apply state" : "Apply state"}
+          {#if closureReason === "other"}<label>Other reason<input bind:value={otherClosureReason} required={ticket.state === "open"} /></label>{/if}
+          <button class="workspace-secondary-button" type="submit" disabled={busy !== null || !transitionReason.trim() || (ticket.state === "open" && closureReason === "other" && !otherClosureReason.trim())}>
+            {ticket.state === "open" ? "Close ticket" : "Reopen ticket"}
           </button>
+          {#if ticket.state === "closed" && ticket.current_closure}
+            <button class="workspace-secondary-button" type="button" disabled={busy !== null || !transitionReason.trim() || (closureReason === "other" && !otherClosureReason.trim())} onclick={() => void caseDecision({ action: "correct_closure", reason: selectedClosureReason() })}>Correct closure</button>
+          {/if}
         </form>
-        {#if ticket.state === "planning"}
-          <button class="workspace-secondary-button ticket-queue-button" type="button" disabled={busy !== null} onclick={markReady}>{busy === "ready" ? "Marking ready…" : "Mark ready"}</button>
+        {#if ticket.state === "open"}
+          <button class="workspace-secondary-button ticket-queue-button" type="button" disabled={busy !== null} onclick={markReady}>{busy === "ready" ? "Recording readiness…" : "Record routing readiness"}</button>
         {/if}
         <button class="workspace-secondary-button ticket-queue-button" type="button" disabled={busy !== null || !ticket.action_eligibility.can_queue} onclick={() => void queueTicket()}>{busy === "queue" ? "Queueing…" : "Request Orchestrator (queue)"}</button>
         <p class="workspace-empty-copy">Queue requests only this Ticket. Dependencies remain diagnostic information and are not automatically queued.</p>
@@ -631,12 +639,12 @@
             </button>
           </form></details>
         {/if}
-        {#if ticket.state === "inprogress" && workerAssignment}
+        {#if workerAssignment}
           <details class="ticket-cancel-implementation">
             <summary>Cancel implementation</summary>
             <form class="ticket-control-form" onsubmit={cancelImplementation}>
               <p class="workspace-empty-copy">
-                Cancel the assigned Worker’s unfinished work and return this Ticket to ready. Responsibility is retained. This does not delete the Worker or Workdir.
+                Cancel the assigned Worker’s unfinished work without changing the case state. Responsibility is retained. This does not delete the Worker or Workdir.
               </p>
               <label>Reason<textarea bind:value={cancellationReason} rows="3" required></textarea></label>
               <button
@@ -644,7 +652,7 @@
                 type="submit"
                 disabled={busy !== null || !cancellationReason.trim()}
               >
-                {busy === "cancel-implementation" ? "Cancelling…" : "Cancel and return to ready"}
+                {busy === "cancel-implementation" ? "Cancelling…" : "Cancel unfinished work"}
               </button>
             </form>
           </details>
@@ -724,16 +732,16 @@
             {#each ticket.evidence.missing as missing}<li>{missing}</li>{/each}
           </ul>
         {/if}
-        <p class="workspace-empty-copy">This evaluates linked MR requirements, separately from Ticket progress and persisted integration approval.</p>
-        {#if ticket.state === "done"}
-          <p class="workspace-empty-copy">This Ticket remains done. Incomplete current requirement evidence does not cancel recorded completion.</p>
+        <p class="workspace-empty-copy">This evaluates linked MR requirements, separately from the Ticket case judgment and persisted integration approval.</p>
+        {#if ticket.state === "closed"}
+          <p class="workspace-empty-copy">This case remains closed. Incomplete MR evidence does not alter the recorded case judgment.</p>
         {/if}
       </section>
 
       {/if}
       <section class="ticket-control-card">
         <header><h2>Merge Requests</h2></header>
-        <p class="workspace-empty-copy">Ticket completion is not MR approval or integration.</p>
+        <p class="workspace-empty-copy">Ticket closure is not MR approval or integration.</p>
         {#if mergeRequests.length > 0}
           {#each mergeRequests as mergeRequest (mergeRequest.merge_request_id)}
             <article class="ticket-control-card">
@@ -759,20 +767,33 @@
             </article>
           {/each}
         {:else}
-          <p class="workspace-empty-copy">No Merge Requests linked. A Ticket can be completed with a comment or document result.</p>
+          <p class="workspace-empty-copy">No Merge Requests linked. A Ticket can be closed with a comment or document result.</p>
         {/if}
       </section>
 
-      {#if ticket.state !== "closed"}
-        <details class="ticket-control-card ticket-close-card">
-          <summary>Close ticket</summary>
-          <form class="ticket-control-form" onsubmit={closeTicket}>
-            <label>Resolution<textarea bind:value={resolution} rows="5" required></textarea></label>
-            <button class="workspace-danger-button" type="submit" disabled={busy !== null || !resolution.trim()}>Close ticket</button>
-          </form>
+      {#if ticket.current_closure}
+        <section class="ticket-control-card"><header><h2>Current closure</h2></header>
+          <p>{closureReasonLabel(ticket.current_closure.reason)} · {ticket.current_closure.author} · {prettyDate(ticket.current_closure.at)}</p>
+          <RichMarkdown text={ticket.current_closure.explanation} />
+          {#each ticket.current_closure.references as reference}<p>{reference.kind}: {reference.target}</p>{/each}
+        </section>
+      {/if}
+      {#if ticket.closure_history.length > 0}
+        <details class="ticket-control-card"><summary>Case history ({ticket.closure_history.length})</summary>
+          {#each ticket.closure_history as judgment (judgment.operation_key)}
+            <article>
+              <p>{relationLabel(judgment.action.action)}{judgment.action.action !== "reopen" ? `: ${closureReasonLabel(judgment.action.reason)}` : ""} · {judgment.author} · {prettyDate(judgment.at)}</p>
+              <RichMarkdown text={judgment.explanation} />
+              {#each judgment.references as reference}<p>{reference.kind}: {reference.target}</p>{/each}
+            </article>
+          {/each}
         </details>
-      {:else if ticket.resolution}
-        <section class="ticket-control-card"><header><h2>Resolution</h2></header><RichMarkdown text={ticket.resolution} /></section>
+      {/if}
+      {#if ticket.legacy_handoff}
+        <details class="ticket-control-card"><summary>Legacy routing handoff</summary>
+          <p>Historical state: {ticket.legacy_handoff.workflow_state}</p>
+          {#if ticket.legacy_handoff.resolution}<RichMarkdown text={ticket.legacy_handoff.resolution} />{/if}
+        </details>
       {/if}
     </aside>
   </div>

@@ -247,13 +247,13 @@ fn validate_relative_cwd(value: String) -> Result<String, ToolError> {
 mod tests {
     use std::sync::Mutex;
 
-    use ticket::{TicketError, TicketWorkflowState};
+    use ticket::{TicketError, TicketState};
 
     use super::*;
     use crate::feature::builtin::ticket::TicketHandoff;
     use crate::worker::{WorkspaceClientError, WorkspaceResponse};
 
-    struct FixedTicketService(TicketWorkflowState);
+    struct FixedTicketService(TicketState);
 
     impl TicketService for FixedTicketService {
         fn ticket_handoff(&self, ticket_ref: &str) -> Result<TicketHandoff, TicketError> {
@@ -295,7 +295,7 @@ mod tests {
         })
     }
 
-    fn tool(service: Arc<RecordingService>, state: TicketWorkflowState) -> SpawnTicketWorkerTool {
+    fn tool(service: Arc<RecordingService>, state: TicketState) -> SpawnTicketWorkerTool {
         SpawnTicketWorkerTool {
             ticket_service: Arc::new(FixedTicketService(state)),
             worker_service: service,
@@ -315,7 +315,7 @@ mod tests {
             },
             {"alias": "docs", "working_directory_id": "workdir-2"}
         ]);
-        let output = tool(service.clone(), TicketWorkflowState::Queued)
+        let output = tool(service.clone(), TicketState::Open)
             .execute(
                 &input.to_string(),
                 ToolExecutionContext::new("call-7", "batch-1", 0),
@@ -372,7 +372,7 @@ mod tests {
                 input["workdir_attachments"] = serde_json::json!([]);
                 input["flow"] = serde_json::Value::Null;
             }
-            tool(service.clone(), TicketWorkflowState::Queued)
+            tool(service.clone(), TicketState::Open)
                 .execute(
                     &input.to_string(),
                     ToolExecutionContext::new("call-empty", "batch-1", 0),
@@ -395,7 +395,7 @@ mod tests {
     async fn spawn_ticket_worker_omitted_profile_uses_general_worker_without_flow_or_repository() {
         let service = Arc::new(RecordingService::default());
         let definition = definition(
-            Arc::new(FixedTicketService(TicketWorkflowState::Ready)),
+            Arc::new(FixedTicketService(TicketState::Open)),
             service.clone(),
         );
         let (meta, tool) = definition();
@@ -434,33 +434,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_ticket_worker_defers_claim_eligibility_to_backend() {
-        let service = Arc::new(RecordingService {
-            response: Some(WorkspaceResponse {
-                status: 409,
-                body: "Backend rejected Ticket claim".into(),
-            }),
-            ..Default::default()
-        });
-        let error = tool(service.clone(), TicketWorkflowState::Planning)
-            .execute(
-                &input().to_string(),
-                ToolExecutionContext::new("call-claim", "batch-1", 0),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(service.requests.lock().unwrap().len(), 1);
-        assert!(
-            error
-                .to_string()
-                .contains("HTTP 409: Backend rejected Ticket claim")
-        );
+    async fn spawn_ticket_worker_defers_claim_eligibility_to_backend_not_case_state() {
+        for state in [TicketState::Open, TicketState::Closed] {
+            let service = Arc::new(RecordingService {
+                response: Some(WorkspaceResponse {
+                    status: 409,
+                    body: "Backend rejected Ticket claim".into(),
+                }),
+                ..Default::default()
+            });
+            let error = tool(service.clone(), state)
+                .execute(
+                    &input().to_string(),
+                    ToolExecutionContext::new("call-claim", "batch-1", 0),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(service.requests.lock().unwrap().len(), 1);
+            assert!(
+                error
+                    .to_string()
+                    .contains("HTTP 409: Backend rejected Ticket claim")
+            );
+        }
     }
 
     #[tokio::test]
     async fn spawn_ticket_worker_rejects_invalid_input_before_worker_side_effect() {
         let service = Arc::new(RecordingService::default());
-        let tool = tool(service.clone(), TicketWorkflowState::Queued);
+        let tool = tool(service.clone(), TicketState::Open);
         let cases = [
             (
                 "profile",
@@ -603,7 +605,7 @@ mod tests {
     #[test]
     fn spawn_ticket_worker_schema_exposes_configuration_not_claim_or_review_grants() {
         let definition = definition(
-            Arc::new(FixedTicketService(TicketWorkflowState::Queued)),
+            Arc::new(FixedTicketService(TicketState::Open)),
             Arc::new(RecordingService::default()),
         );
         let (meta, _) = definition();

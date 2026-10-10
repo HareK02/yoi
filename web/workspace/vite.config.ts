@@ -40,6 +40,11 @@ export default defineConfig({
     },
 
     proxy: {
+      // Case judgments use the canonical authenticated Workspace API route.
+      "/workspaces": {
+        target: "http://127.0.0.1:8787",
+        changeOrigin: true,
+      },
       "/api": {
         target: "http://127.0.0.1:8787",
         changeOrigin: true,

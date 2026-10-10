@@ -306,14 +306,11 @@ impl_openapi_schema!(
     SkillDetailResponse,
     SkillActivationResponse,
     BrowserAppendTicketEventRequest,
-    BrowserCloseTicketRequest,
     BrowserEditTicketRequest,
     BrowserQueueTicketRequest,
-    BrowserTransitionTicketStateRequest,
     CancelTicketImplementationRequest,
     ClearTicketRoleAssignmentQuery,
     CompleteMergeRequestRequest,
-    CompleteTicketRequest,
     CreateTicketOrchestrationPlanRequest,
     CreateTicketRecordRequest,
     CreateTicketRelationRequest,
@@ -347,9 +344,10 @@ impl_openapi_schema!(
     SetTicketRoleAssignmentRequest,
     SubmitMergeRequestReviewRequest,
     TextResponse,
-    TicketCloseRecordRequest,
     TicketDependencyCheckResponse,
     TicketDetail,
+    TicketCaseUpdateRequest,
+    TicketSummary,
     TicketDoctorResponse,
     TicketIntakeSummaryRequest,
     TicketListHttpQuery,
@@ -372,8 +370,6 @@ impl_openapi_schema!(
     TicketRoleAssignmentMutationResponse,
     TicketRoleAssignmentsResponse,
     TicketShowRequest,
-    TicketStateChangeRequest,
-    TicketStateUpdateRequest,
     TicketSummarySearchQuery,
     TicketThreadEventRequest,
     RuntimeManagementApiError,
@@ -3051,14 +3047,6 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: TicketThreadEventRequest,
     ) -> Result<(), RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/state-changes", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_state_change_add(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-        #[body] request: TicketStateChangeRequest,
-    ) -> Result<(), RepositoryApiError>;
     #[post("/api/w/{workspace_id}/tickets/{id}/intake-summaries", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_intake_summary_add(
         &self,
@@ -3067,31 +3055,6 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: TicketIntakeSummaryRequest,
     ) -> Result<(), RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/state-fields/{field}", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_state_field_set(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-        #[path] field: String,
-        #[body] request: TicketStateChangeRequest,
-    ) -> Result<(), RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/workflow-state", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_workflow_state_set(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-        #[body] request: TicketStateChangeRequest,
-    ) -> Result<(), RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/state-update", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_state_update(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-        #[body] request: TicketStateUpdateRequest,
-    ) -> Result<TicketRecord, RepositoryApiError>;
     #[post("/api/w/{workspace_id}/tickets/{id}/workflow/mark-ready", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_mark_ready_record(
         &self,
@@ -3189,22 +3152,14 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: CompleteMergeRequestRequest,
     ) -> Result<MergeEvent, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/complete", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_complete(
+    #[post("/workspaces/{workspace_id}/tickets/{ticket_id}/case", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_case_update(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
-        #[path] id: String,
-        #[body] request: CompleteTicketRequest,
-    ) -> Result<TicketRecord, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/workflow/close", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_close_record(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-        #[body] request: TicketCloseRecordRequest,
-    ) -> Result<(), RepositoryApiError>;
+        #[path] ticket_id: String,
+        #[body] request: TicketCaseUpdateRequest,
+    ) -> Result<TicketSummary, RepositoryApiError>;
     #[get("/api/w/{workspace_id}/tickets/{id}/relation-view", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_relation_view(
         &self,
@@ -3292,15 +3247,6 @@ pub trait ServerApi {
         #[body] request: CancelTicketImplementationRequest,
     ) -> Result<TicketDetail, RepositoryApiError>;
 
-    #[post("/api/w/{workspace_id}/tickets/{id}/state", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_state_transition(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-        #[body] request: BrowserTransitionTicketStateRequest,
-    ) -> Result<TicketDetail, RepositoryApiError>;
-
     #[post("/api/w/{workspace_id}/tickets/{id}/ready", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_ready(
         &self,
@@ -3327,14 +3273,6 @@ pub trait ServerApi {
         #[body] request: BrowserQueueTicketRequest,
     ) -> Result<TicketQueueResponse, RepositoryApiError>;
 
-    #[post("/api/w/{workspace_id}/tickets/{id}/close", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_close(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-        #[body] request: BrowserCloseTicketRequest,
-    ) -> Result<TicketDetail, RepositoryApiError>;
     #[get("/api/objectives", status = 200, error_status = 400, additional_error_statuses = [500], bearer_auth = true, browser_auth = true)]
     async fn objective_list_alias(
         &self,
@@ -7263,13 +7201,23 @@ pub struct TicketListItemSummary {
     pub id: String,
     pub resource_key: String,
     pub title: String,
-    pub state: String,
+    pub state: BrowserTicketState,
     pub priority: String,
     pub updated_at: Option<String>,
     pub queued_by: Option<String>,
     pub queued_at: Option<String>,
     pub workspace_action_priority: String,
     pub record_source: String,
+    /// Last closure/correction key, retained across reopening for ABA-safe CAS.
+    pub closure_operation_key: Option<String>,
+    #[cfg_attr(feature = "typescript", ts(type = "TicketClosureJudgment | null"))]
+    pub current_closure: Option<ticket::TicketClosureJudgment>,
+    /// Original migration handoff; not another current state authority.
+    #[cfg_attr(
+        feature = "typescript",
+        ts(type = "TicketLegacyWorkflowSnapshot | null")
+    )]
+    pub legacy_handoff: Option<ticket::TicketLegacyWorkflowSnapshot>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -7553,20 +7501,49 @@ pub struct TicketEvidenceSummary {
     pub missing: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum TicketAttention {
+    UnresolvedReview,
+    MissingCommit,
+    Blocked,
+    Unblocked,
+    AwaitingReview,
+    UnresolvedChanges,
+    StaleAfterRescope,
+    MissingEvidence,
+}
+
+impl TicketAttention {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::UnresolvedReview => "unresolved_review",
+            Self::MissingCommit => "missing_commit",
+            Self::Blocked => "blocked",
+            Self::Unblocked => "unblocked",
+            Self::AwaitingReview => "awaiting_review",
+            Self::UnresolvedChanges => "unresolved_changes",
+            Self::StaleAfterRescope => "stale_after_rescope",
+            Self::MissingEvidence => "missing_evidence",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct TicketQueryRequest {
     pub query: Option<String>,
     #[serde(default)]
-    pub states: Vec<String>,
+    pub states: Vec<BrowserTicketState>,
     #[serde(default)]
     pub event_kinds: Vec<String>,
     #[serde(default)]
     pub evidence: Vec<String>,
     pub review_status: Option<String>,
     #[serde(default)]
-    pub attention: Vec<String>,
+    pub attention: Vec<TicketAttention>,
     pub related_ticket_id: Option<String>,
     pub relation_kind: Option<String>,
     pub linked_objective_id: Option<String>,
@@ -7585,7 +7562,7 @@ pub struct TicketQueryItem {
     pub id: String,
     pub resource_key: String,
     pub title: String,
-    pub state: String,
+    pub state: BrowserTicketState,
     pub readiness: Option<String>,
     pub priority: String,
     pub created_at: Option<String>,
@@ -7613,6 +7590,16 @@ pub struct TicketQueryItem {
     pub merge_requests: Vec<TicketMergeRequestSummary>,
     pub merge_request: Option<TicketMergeRequestSummary>,
     pub current_worker: Option<TicketAssignmentSummary>,
+    /// Last closure/correction key, retained across reopening for ABA-safe CAS.
+    pub closure_operation_key: Option<String>,
+    #[cfg_attr(feature = "typescript", ts(type = "TicketClosureJudgment | null"))]
+    pub current_closure: Option<ticket::TicketClosureJudgment>,
+    /// Original migration handoff; not another current state authority.
+    #[cfg_attr(
+        feature = "typescript",
+        ts(type = "TicketLegacyWorkflowSnapshot | null")
+    )]
+    pub legacy_handoff: Option<ticket::TicketLegacyWorkflowSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -7640,7 +7627,7 @@ pub struct TicketDetail {
     pub id: String,
     pub resource_key: String,
     pub title: String,
-    pub state: String,
+    pub state: BrowserTicketState,
     pub readiness: Option<String>,
     pub priority: String,
     pub created_at: Option<String>,
@@ -7674,6 +7661,18 @@ pub struct TicketDetail {
     pub evidence: TicketEvidenceSummary,
     pub resolution: Option<String>,
     pub record_source: String,
+    /// Last closure/correction key, retained across reopening for ABA-safe CAS.
+    pub closure_operation_key: Option<String>,
+    #[cfg_attr(feature = "typescript", ts(type = "TicketClosureJudgment | null"))]
+    pub current_closure: Option<ticket::TicketClosureJudgment>,
+    /// Original migration handoff; not another current state authority.
+    #[cfg_attr(
+        feature = "typescript",
+        ts(type = "TicketLegacyWorkflowSnapshot | null")
+    )]
+    pub legacy_handoff: Option<ticket::TicketLegacyWorkflowSnapshot>,
+    #[cfg_attr(feature = "typescript", ts(type = "Array<TicketCaseHistoryEntry>"))]
+    pub closure_history: Vec<ticket::TicketCaseHistoryEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -7703,6 +7702,34 @@ macro_rules! transparent_ticket_dto {
 }
 
 transparent_ticket_dto!(TicketRecord, ticket::Ticket);
+transparent_ticket_dto!(TicketSummary, ticket::TicketSummary);
+
+/// Authorized case judgment. Author comes from authenticated Workspace authority,
+/// never from the request. All three actions share content/state/closure-key CAS.
+fn deserialize_case_closure_observation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer)
+}
+
+fn case_closure_observation_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    generator.subschema_for::<Option<String>>()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketCaseUpdateRequest {
+    pub expected_content_digest: String,
+    pub expected_state: ticket::TicketState,
+    #[serde(deserialize_with = "deserialize_case_closure_observation")]
+    #[schemars(required, schema_with = "case_closure_observation_schema")]
+    pub expected_closure_operation_key: Option<String>,
+    pub operation_key: String,
+    pub action: ticket::TicketCaseAction,
+    pub explanation: String,
+    #[serde(default)]
+    pub references: Vec<ticket::TicketReference>,
+}
 transparent_ticket_dto!(TicketRecordRef, ticket::TicketRef);
 transparent_ticket_dto!(TicketRecordSummaryList, Vec<ticket::TicketSummary>);
 transparent_ticket_dto!(TicketDependencyCheckResponse, ticket::TicketDependencyCheck);
@@ -7722,10 +7749,7 @@ transparent_ticket_dto!(
 transparent_ticket_dto!(CreateTicketRecordRequest, ticket::NewTicket);
 transparent_ticket_dto!(EditTicketRecordItemRequest, ticket::TicketItemEdit);
 transparent_ticket_dto!(TicketThreadEventRequest, ticket::NewTicketEvent);
-transparent_ticket_dto!(TicketStateChangeRequest, ticket::TicketStateUpdate);
-transparent_ticket_dto!(TicketStateUpdateRequest, ticket::TicketStateUpdate);
 transparent_ticket_dto!(TicketIntakeSummaryRequest, ticket::TicketIntakeSummary);
-transparent_ticket_dto!(TicketCloseRecordRequest, ticket::TicketCompletion);
 transparent_ticket_dto!(CreateTicketRelationRequest, ticket::NewTicketRelation);
 transparent_ticket_dto!(
     CreateTicketOrchestrationPlanRequest,
@@ -7837,13 +7861,27 @@ pub enum BrowserTicketTargetEdit {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
-pub enum BrowserTicketWorkflowState {
-    Planning,
-    Ready,
-    Queued,
-    Inprogress,
-    Done,
+pub enum BrowserTicketState {
+    Open,
     Closed,
+}
+
+impl BrowserTicketState {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+impl From<ticket::TicketState> for BrowserTicketState {
+    fn from(state: ticket::TicketState) -> Self {
+        match state {
+            ticket::TicketState::Open => Self::Open,
+            ticket::TicketState::Closed => Self::Closed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -7858,18 +7896,6 @@ pub struct BrowserEditTicketRequest {
     pub replace_all: bool,
     pub target: Option<BrowserTicketTargetEdit>,
     pub author: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct BrowserTransitionTicketStateRequest {
-    pub state: BrowserTicketWorkflowState,
-    pub operation_key: String,
-    pub expected_content_digest: String,
-    pub expected_state: BrowserTicketWorkflowState,
-    pub reason: String,
-    pub body: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -7895,16 +7921,6 @@ pub struct BrowserAppendTicketEventRequest {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct BrowserQueueTicketRequest {}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct BrowserCloseTicketRequest {
-    pub operation_key: String,
-    pub expected_content_digest: String,
-    pub expected_state: BrowserTicketWorkflowState,
-    pub resolution: String,
-}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -8276,17 +8292,6 @@ pub struct CompleteMergeRequestRequest {
     pub target_ref_after: String,
     pub strategy: MergeStrategy,
     pub resolution: ConflictResolution,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CompleteTicketRequest {
-    pub operation_key: String,
-    pub expected_content_digest: String,
-    pub expected_state: ticket::TicketWorkflowState,
-    pub reason: String,
-    #[serde(default)]
-    pub references: Vec<ticket::TicketReference>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -11550,14 +11555,9 @@ mod tests {
         );
         for (operation_id, method, path) in [
             (
-                "ticket_state_update",
+                "ticket_case_update",
                 HttpMethod::Post,
-                "/api/w/{workspace_id}/tickets/{id}/state-update",
-            ),
-            (
-                "ticket_complete",
-                HttpMethod::Post,
-                "/api/w/{workspace_id}/tickets/{id}/complete",
+                "/workspaces/{workspace_id}/tickets/{ticket_id}/case",
             ),
             (
                 "ticket_relation_query",
@@ -12747,31 +12747,134 @@ mod tests {
     }
 
     #[test]
-    fn ticket_completion_wire_requires_cas_and_judgment_not_merge_evidence() {
+    fn ticket_case_wire_requires_cas_and_judgment_without_client_author() {
         let request = serde_json::json!({
-            "operation_key": "investigation-done",
+            "operation_key": "question-answered",
             "expected_content_digest": "ticket:1",
-            "expected_state": "planning",
-            "reason": "Question answered in the thread"
+            "expected_state": "open",
+            "expected_closure_operation_key": null,
+            "action": {"action": "close", "reason": "completed"},
+            "explanation": "Question answered in the thread"
         });
-        let parsed: CompleteTicketRequest = serde_json::from_value(request.clone()).unwrap();
+        let parsed: TicketCaseUpdateRequest = serde_json::from_value(request.clone()).unwrap();
         assert!(parsed.references.is_empty());
+        assert_eq!(parsed.expected_state, ticket::TicketState::Open);
         for field in [
             "operation_key",
             "expected_content_digest",
             "expected_state",
-            "reason",
+            "expected_closure_operation_key",
+            "action",
+            "explanation",
         ] {
             let mut missing = request.clone();
             missing.as_object_mut().unwrap().remove(field);
             assert!(
-                serde_json::from_value::<CompleteTicketRequest>(missing).is_err(),
+                serde_json::from_value::<TicketCaseUpdateRequest>(missing).is_err(),
                 "{field}"
             );
         }
-        let mut old = request;
-        old["requirement_approval_event_id"] = serde_json::json!("not-a-judgment");
-        assert!(serde_json::from_value::<CompleteTicketRequest>(old).is_err());
+        for (field, value) in [
+            ("author", serde_json::json!("untrusted-author")),
+            (
+                "requirement_approval_event_id",
+                serde_json::json!("not-a-judgment"),
+            ),
+            ("expected_state", serde_json::json!("done")),
+        ] {
+            let mut rejected = request.clone();
+            rejected[field] = value;
+            assert!(
+                serde_json::from_value::<TicketCaseUpdateRequest>(rejected).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn ticket_case_wire_preserves_actions_and_externally_tagged_other_reason() {
+        for action in [
+            serde_json::json!({"action": "close", "reason": "not_planned"}),
+            serde_json::json!({"action": "reopen"}),
+            serde_json::json!({"action": "correct_closure", "reason": {"other": "Deferred by user"}}),
+        ] {
+            let request = serde_json::json!({
+                "operation_key": "case-decision",
+                "expected_content_digest": "ticket:2",
+                "expected_state": "closed",
+                "expected_closure_operation_key": "previous-close",
+                "action": action,
+                "explanation": "Explicit user decision",
+                "references": [{"kind": "ticket", "target": "T-2"}]
+            });
+            let parsed: TicketCaseUpdateRequest = serde_json::from_value(request.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+        }
+    }
+
+    #[test]
+    fn ticket_query_accepts_only_case_states_and_current_attention_filters() {
+        let parsed: TicketQueryRequest = serde_json::from_value(serde_json::json!({
+            "states": ["open", "closed"], "attention": ["blocked", "missing_evidence"]
+        }))
+        .unwrap();
+        assert_eq!(parsed.states[0], BrowserTicketState::Open);
+        for state in [
+            "planning",
+            "ready",
+            "queued",
+            "inprogress",
+            "in_progress",
+            "done",
+        ] {
+            assert!(
+                serde_json::from_value::<TicketQueryRequest>(
+                    serde_json::json!({"states": [state]})
+                )
+                .is_err(),
+                "{state}"
+            );
+        }
+        for attention in ["done_not_closed", "ready"] {
+            assert!(
+                serde_json::from_value::<TicketQueryRequest>(
+                    serde_json::json!({"attention": [attention]})
+                )
+                .is_err(),
+                "{attention}"
+            );
+        }
+    }
+
+    #[test]
+    fn ticket_case_route_replaces_all_legacy_case_judgment_bypasses() {
+        let operations = ServerApiMetadata::OPERATIONS;
+        for removed in [
+            "ticket_complete",
+            "ticket_close",
+            "ticket_close_record",
+            "ticket_state_update",
+            "ticket_state_transition",
+            "ticket_state_change_add",
+            "ticket_state_field_set",
+            "ticket_workflow_state_set",
+        ] {
+            assert!(
+                !operations
+                    .iter()
+                    .any(|operation| operation.operation_id == removed),
+                "{removed}"
+            );
+        }
+        let operation = operations
+            .iter()
+            .find(|operation| operation.operation_id == "ticket_case_update")
+            .unwrap();
+        assert_eq!(operation.method, HttpMethod::Post);
+        assert_eq!(
+            operation.path,
+            "/workspaces/{workspace_id}/tickets/{ticket_id}/case"
+        );
     }
 
     #[cfg(feature = "typescript")]

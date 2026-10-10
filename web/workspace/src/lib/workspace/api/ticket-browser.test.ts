@@ -48,7 +48,7 @@ Deno.test("Ticket Browser parser accepts the generated Ticket list shape", () =>
       id: "ticket-id",
       resource_key: "T-1",
       title: "Ticket",
-      state: "ready",
+      state: "open",
       priority: "P2",
       updated_at: null,
       queued_by: null,
@@ -105,16 +105,23 @@ Deno.test("Ticket Browser accepts generic Worker eligibility and assignments", (
     assigned_at: "2026-10-06T00:00:00Z",
     assigned_by: "user-1",
     assignment_id: "assignment-1",
-    principal: { kind: "worker", runtime_id: "runtime-1", worker_id: "worker-1" },
+    principal: {
+      kind: "worker",
+      runtime_id: "runtime-1",
+      worker_id: "worker-1",
+    },
     role: "worker",
     ticket_id: "ticket-id",
     workspace_id: "workspace-a",
   };
-  assertEquals(parseTicketRoleAssignmentMutationResponse({
+  assertEquals(
+    parseTicketRoleAssignmentMutationResponse({
+      assignment,
+      ticket_id: "ticket-id",
+      workspace_id: "workspace-a",
+    }).assignment,
     assignment,
-    ticket_id: "ticket-id",
-    workspace_id: "workspace-a",
-  }).assignment, assignment);
+  );
 });
 
 function ticketDetailFixture() {
@@ -131,6 +138,10 @@ function ticketDetailFixture() {
     artifacts: [],
     assignment_diagnostics: [],
     assignments: [],
+    closure_history: [],
+    closure_operation_key: null,
+    current_closure: null,
+    legacy_handoff: null,
     body: "Body",
     body_truncated: false,
     current_worker: null,
@@ -164,7 +175,7 @@ function ticketDetailFixture() {
     resolution: null,
     resource_key: "T-1",
     risk_flags: [],
-    state: "planning",
+    state: "open",
     targets: [
       {
         repository_key: "docs",
@@ -342,11 +353,11 @@ Deno.test("Merge Request summaries require a nullable bounded integration eviden
   }
 });
 
-Deno.test("done Ticket state is preserved when current requirement evidence is incomplete", () => {
+Deno.test("closed Ticket state is preserved when current requirement evidence is incomplete", () => {
   const fixture = ticketDetailFixture();
   const parsed = parseTicketDetail({
     ...fixture,
-    state: "done",
+    state: "closed",
     evidence: { ...fixture.evidence, missing: ["review_after_rescope"] },
     merge_requests: [{
       ...mergeRequestSummary,
@@ -354,7 +365,7 @@ Deno.test("done Ticket state is preserved when current requirement evidence is i
       source_ref_observation: { status: "not_required" },
     }],
   });
-  assertEquals(parsed.state, "done");
+  assertEquals(parsed.state, "closed");
   assertEquals(parsed.evidence.complete_for_integration, false);
   assertEquals(parsed.merge_requests[0]?.review_status, "approved");
 });
@@ -438,5 +449,137 @@ Deno.test("Ticket Browser parser validates the canonical Merge Request thread", 
         thread: [{ ...parsed.thread[0], unexpected: true }],
       }),
     "unknown field unexpected",
+  );
+});
+
+const closure = {
+  operation_key: "close-1",
+  reason: "not_planned",
+  explanation: "Not planned for this scope.",
+  references: [{ kind: "document", target: "result.md" }],
+  author: "user:alice",
+  at: "2026-10-10T00:00:00Z",
+};
+const closureHistory = [
+  {
+    ...closure,
+    reason: undefined,
+    previous_closure_operation_key: null,
+    action: { action: "close", reason: "not_planned" },
+  },
+  {
+    ...closure,
+    reason: undefined,
+    operation_key: "correct-1",
+    previous_closure_operation_key: "close-1",
+    action: { action: "correct_closure", reason: { other: "Deferred" } },
+  },
+  {
+    ...closure,
+    reason: undefined,
+    operation_key: "reopen-1",
+    previous_closure_operation_key: "correct-1",
+    action: { action: "reopen" },
+  },
+].map(({ reason: _, ...entry }) => ({
+  operation_key: entry.operation_key,
+  previous_closure_operation_key: entry.previous_closure_operation_key,
+  action: entry.action,
+  explanation: entry.explanation,
+  references: entry.references,
+  author: entry.author,
+  at: entry.at,
+}));
+const legacyHandoff = {
+  workflow_state: "done",
+  workflow_state_explicit: true,
+  status: "Closed",
+  queued_by: "workspace-web",
+  queued_at: "2026-10-09T00:00:00Z",
+  resolution: "Historical result, not a current case state",
+};
+
+Deno.test("case projections retain reasons, actors, references and migration history after reopening", () => {
+  const fixture = {
+    ...ticketDetailFixture(),
+    state: "open",
+    closure_operation_key: "correct-1",
+    current_closure: null,
+    closure_history: closureHistory,
+    legacy_handoff: legacyHandoff,
+  };
+  const parsed = parseTicketDetail(fixture);
+  assertEquals(parsed.state, "open");
+  assertEquals(parsed.closure_operation_key, "correct-1");
+  assertEquals(parsed.closure_history, closureHistory);
+  assertEquals(parsed.legacy_handoff, legacyHandoff);
+  assertEquals(
+    parseTicketDetail({ ...fixture, state: "closed", current_closure: closure })
+      .current_closure,
+    closure,
+  );
+  const list = parseTicketListResponse({
+    workspace_id: "workspace-a",
+    limit: 30,
+    page,
+    invalid_records: [],
+    record_authority: "sqlite",
+    items: [{
+      id: "ticket-id",
+      resource_key: "T-1",
+      title: "Ticket",
+      state: "closed",
+      priority: "P2",
+      record_source: "sqlite",
+      workspace_action_priority: "background",
+      closure_operation_key: "close-1",
+      current_closure: closure,
+      legacy_handoff: legacyHandoff,
+    }],
+  });
+  assertEquals(list.items[0].current_closure, closure);
+  assertEquals(list.items[0].legacy_handoff, legacyHandoff);
+});
+
+Deno.test("case decoders reject legacy current states and malformed closure judgments", () => {
+  const fixture = ticketDetailFixture();
+  for (const state of ["planning", "ready", "queued", "inprogress", "done"]) {
+    assertThrows(
+      () => parseTicketDetail({ ...fixture, state }),
+      "state is invalid",
+    );
+  }
+  for (const reason of ["done", { other: 1 }, { other: "ok", extra: true }]) {
+    assertThrows(
+      () =>
+        parseTicketDetail({
+          ...fixture,
+          current_closure: { ...closure, reason },
+        }),
+      "Ticket detail.current_closure.reason",
+    );
+  }
+  for (
+    const action of ["reopen", { action: "close" }, {
+      action: "reopen",
+      reason: "completed",
+    }, { action: "complete", reason: "completed" }]
+  ) {
+    assertThrows(
+      () =>
+        parseTicketDetail({
+          ...fixture,
+          closure_history: [{ ...closureHistory[0], action }],
+        }),
+      "Ticket detail.closure_history[0].action",
+    );
+  }
+  assertThrows(
+    () => parseTicketDetail({ ...fixture, closure_history: {} }),
+    "closure_history must be an array",
+  );
+  assertThrows(
+    () => parseTicketDetail({ ...fixture, closure_operation_key: 1 }),
+    "closure_operation_key must be a string",
   );
 });

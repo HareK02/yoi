@@ -466,11 +466,11 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketDetail")],
         },
         OperationContract {
-            path: "/api/w/{workspace_id}/tickets/{id}/state",
+            path: "/workspaces/{workspace_id}/tickets/{ticket_id}/case",
             method: "post",
-            operation_id: "ticket_state_transition",
-            request: Some("BrowserTransitionTicketStateRequest"),
-            successes: &[("200", "TicketDetail")],
+            operation_id: "ticket_case_update",
+            request: Some("TicketCaseUpdateRequest"),
+            successes: &[("200", "TicketSummary")],
         },
         OperationContract {
             path: "/api/w/{workspace_id}/tickets/{id}/ready",
@@ -492,13 +492,6 @@ fn validate_ticket_browser_operations(
             operation_id: "ticket_queue",
             request: Some("BrowserQueueTicketRequest"),
             successes: &[("200", "TicketQueueOutcome")],
-        },
-        OperationContract {
-            path: "/api/w/{workspace_id}/tickets/{id}/close",
-            method: "post",
-            operation_id: "ticket_close",
-            request: Some("BrowserCloseTicketRequest"),
-            successes: &[("200", "TicketDetail")],
         },
         OperationContract {
             path: "/api/w/{workspace_id}/objectives",
@@ -1889,6 +1882,54 @@ mod tests {
         assert!(!detail.contains("repository_key"));
         assert!(!detail.contains("ref_selector"));
         assert!(!detail.contains(" target:"));
+    }
+
+    #[test]
+    fn ticket_browser_generator_exposes_case_judgment_and_closure_projections() {
+        let openapi = crate::canonical_openapi_document()
+            .unwrap()
+            .to_json()
+            .unwrap();
+        let output = generate_ticket_browser_typescript(&openapi).unwrap();
+        assert!(output.contains("export type BrowserTicketState = \"open\" | \"closed\";"));
+        let request = output
+            .lines()
+            .find(|line| line.starts_with("export type TicketCaseUpdateRequest ="))
+            .unwrap();
+        for field in [
+            "expected_content_digest: string",
+            "expected_state: TicketState",
+            "expected_closure_operation_key: string | null",
+            "operation_key: string",
+            "action: TicketCaseAction",
+            "explanation: string",
+        ] {
+            assert!(request.contains(field), "missing {field}: {request}");
+        }
+        assert!(!request.contains("author"));
+        assert!(output.contains("export type TicketClosureReason = \"completed\" | \"not_planned\" | \"duplicate\" | \"unknown\" | { other: string; };"));
+        let detail = output
+            .lines()
+            .find(|line| line.starts_with("export type TicketDetail ="))
+            .unwrap();
+        for field in [
+            "state: BrowserTicketState",
+            "closure_operation_key?: string | null",
+            "current_closure?: TicketClosureJudgment | null",
+            "closure_history: Array<TicketCaseHistoryEntry>",
+            "legacy_handoff?: TicketLegacyWorkflowSnapshot | null",
+        ] {
+            assert!(detail.contains(field), "missing {field}: {detail}");
+        }
+        for removed in [
+            "BrowserTransitionTicketStateRequest",
+            "BrowserCloseTicketRequest",
+            "CompleteTicketRequest",
+            "BrowserTicketWorkflowState",
+            "done_not_closed",
+        ] {
+            assert!(!output.contains(removed), "{removed}");
+        }
     }
 
     #[test]

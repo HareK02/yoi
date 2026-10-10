@@ -30,6 +30,7 @@ Deno.test("ticket detail fences stale mutation responses", () => {
     const operation of [
       "async function mutate(",
       "async function queueTicket(",
+      "async function caseDecision(",
       "async function mutateAssignment(",
     ]
   ) {

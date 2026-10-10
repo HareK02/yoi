@@ -10,29 +10,35 @@ export const fixturePage = (returned: number, more = false) => ({
 });
 const updated = (hour: number) =>
   `2026-09-28T${String(hour).padStart(2, "0")}:00:00Z`;
-export function fixtureTicket(key: string, state: string, hour = 10) {
+export function fixtureTicket(
+  key: string,
+  state: "open" | "closed",
+  hour = 10,
+) {
   return {
     id: `internal-${key}`,
     resource_key: key,
     title: key === "T-101"
       ? "Restore queued Worker submissions"
       : `${state} ticket ${key}`,
+    closure_operation_key: null,
+    current_closure: null,
+    legacy_handoff: null,
     state,
     priority: "normal",
     queued_at: null,
     queued_by: null,
     updated_at: updated(hour),
     record_source: "fixture",
-    workspace_action_priority: state === "inprogress" || state === "queued"
-      ? "active_work"
-      : "background",
+    workspace_action_priority: state === "open" ? "active_work" : "background",
   };
 }
 export function fixtureDetail(key = "T-101") {
-  const summary = fixtureTicket(key, key === "T-101" ? "inprogress" : "queued");
+  const summary = fixtureTicket(key, "open");
   const { workspace_action_priority: _, ...ticket } = summary;
   return {
     ...ticket,
+    closure_history: [],
     content_digest: "a".repeat(64),
     created_at: updated(1),
     readiness: null,
@@ -87,7 +93,7 @@ export function fixtureDetail(key = "T-101") {
       blockers: key === "T-101"
         ? [{
           blocking_resource_key: "T-99",
-          blocking_state: "ready",
+          blocking_state: "open",
           blocking_ticket: "internal-T-99",
           note: null,
           reason_kind: "dependency",
@@ -108,11 +114,13 @@ export function dashboardFixture(
     const state = search.get("states")!;
     const items = empty
       ? []
-      : state === "inprogress,queued"
-      ? [fixtureTicket("T-101", "inprogress"), fixtureTicket("T-102", "queued")]
-      : state === "done"
-      ? [fixtureTicket("T-103", "done", 12), fixtureTicket("T-104", "done", 7)]
-      : [fixtureTicket("T-105", "closed", 14)];
+      : state === "open"
+      ? [fixtureTicket("T-101", "open"), fixtureTicket("T-102", "open")]
+      : [
+        fixtureTicket("T-105", "closed", 14),
+        fixtureTicket("T-103", "closed", 12),
+        fixtureTicket("T-104", "closed", 7),
+      ];
     if (long && items[0]) {
       items[0].title = "長いTicket名 — ".repeat(8) +
         "preserve-the-full-title-without-horizontal-overflow";

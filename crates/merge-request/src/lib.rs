@@ -1159,18 +1159,9 @@ impl MergeRequestStore {
                 "approval predates the current Ticket digest; fresh review is required".into(),
             ));
         }
-        let state: Option<String> = connection
-            .query_row(
-                "SELECT workflow_state FROM typed_tickets WHERE workspace_id=?1 AND ticket_id=?2",
-                params![mr.workspace_id, i.ticket_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if state.as_deref() != Some("inprogress") {
-            return Err(MergeRequestError::Conflict(
-                "Ticket must be inprogress".into(),
-            ));
-        }
+        // Case openness is not an integration phase. Exact source approval,
+        // current Ticket content and active assignment fencing above remain
+        // the independent MR integration guards.
         Ok(())
     }
 
@@ -1239,18 +1230,9 @@ impl MergeRequestStore {
                 "approval predates the current Ticket digest; fresh review is required".into(),
             ));
         }
-        let state: Option<String> = transaction
-            .query_row(
-                "SELECT workflow_state FROM typed_tickets WHERE workspace_id=?1 AND ticket_id=?2",
-                params![mr.workspace_id, i.ticket_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if state.as_deref() != Some("inprogress") {
-            return Err(MergeRequestError::Conflict(
-                "Ticket must be inprogress".into(),
-            ));
-        }
+        // Case openness is not an integration phase. Exact source approval,
+        // current Ticket content and active assignment fencing above remain
+        // the independent MR integration guards.
         let issued_grants = {
             let mut statement = transaction.prepare(
                 "SELECT request_event_id,subject_ref,capability_token

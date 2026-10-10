@@ -7,7 +7,7 @@ use crate::{Result, TicketError, sqlite_err};
 
 const MIGRATION_TABLE: &str = "ticket_schema_migrations";
 const MAX_SCHEMA_DIAGNOSTICS: usize = 32;
-const LATEST_SQLITE_TICKET_SCHEMA_VERSION: i64 = 7;
+const LATEST_SQLITE_TICKET_SCHEMA_VERSION: i64 = 9;
 const PREVIOUS_SQLITE_TICKET_SCHEMA_VERSION: i64 = 6;
 const BASELINE_MIGRATION_NAME: &str = "ticket schema baseline";
 
@@ -52,6 +52,9 @@ const OWNED_TABLES: &[&str] = &[
     "typed_ticket_relations",
     "typed_ticket_orchestration_plans",
     "typed_ticket_artifacts",
+    "typed_ticket_case_metadata",
+    "typed_ticket_case_history",
+    "typed_ticket_legacy_workflow_snapshot",
     "workspace_resource_keys",
 ];
 
@@ -290,6 +293,7 @@ pub fn migrate_sqlite_ticket_schema(connection: &Connection) -> Result<()> {
             )])
         {
             migrate_v6_to_v7(connection)?;
+            migrate_v7_to_v9(connection)?;
             connection
                 .execute(
                     "DELETE FROM ticket_schema_migrations WHERE version = ?1",
@@ -307,7 +311,11 @@ pub fn migrate_sqlite_ticket_schema(connection: &Connection) -> Result<()> {
                     ],
                 )
                 .map_err(sqlite_err)?;
+        } else if applied == BTreeMap::from([(7, BASELINE_MIGRATION_NAME.to_string())]) {
+            migrate_v7_to_v9(connection)?;
+            connection.execute("UPDATE ticket_schema_migrations SET version = 9, applied_at = ?1 WHERE version = 7", params![chrono::Utc::now().to_rfc3339()]).map_err(sqlite_err)?;
         } else {
+            // Version 8 belongs to T-740; compose its tag migration explicitly at integration.
             validate_applied_migrations(&applied)?;
         }
 
@@ -448,6 +456,63 @@ pub fn verify_sqlite_ticket_schema(connection: &Connection) -> Result<()> {
         collect_absent_table_diagnostic(connection, legacy_table, &mut diagnostics);
     }
 
+    for (table, columns) in [
+        (
+            "typed_ticket_case_metadata",
+            vec![
+                column("workspace_id", "TEXT", true, 1),
+                column("ticket_id", "TEXT", true, 2),
+                column("closure_operation_key", "TEXT", false, 0),
+            ],
+        ),
+        (
+            "typed_ticket_case_history",
+            vec![
+                column("workspace_id", "TEXT", true, 1),
+                column("ticket_id", "TEXT", true, 2),
+                column("ordinal", "INTEGER", true, 0),
+                column("operation_key", "TEXT", true, 3),
+                column("request_fingerprint", "TEXT", true, 0),
+                column("judgment_json", "TEXT", true, 0),
+            ],
+        ),
+        (
+            "typed_ticket_legacy_workflow_snapshot",
+            vec![
+                column("workspace_id", "TEXT", true, 1),
+                column("ticket_id", "TEXT", true, 2),
+                column("snapshot_json", "TEXT", true, 0),
+            ],
+        ),
+    ] {
+        if let Err(error) = verify_table(connection, table, &columns, CHILD_FOREIGN_KEYS, false) {
+            push_diagnostic(&mut diagnostics, error.to_string());
+        }
+    }
+    for name in [
+        "typed_ticket_case_history_no_update",
+        "typed_ticket_case_history_no_delete",
+        "typed_ticket_legacy_workflow_no_update",
+        "typed_ticket_legacy_workflow_no_delete",
+        "typed_ticket_case_state_insert",
+        "typed_ticket_case_state_update",
+    ] {
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                params![name],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(sqlite_err)?
+            .is_some();
+        if !exists {
+            push_diagnostic(
+                &mut diagnostics,
+                format!("missing Ticket case trigger {name}"),
+            );
+        }
+    }
     for table in OWNED_TABLES {
         collect_foreign_key_check_diagnostics(connection, table, &mut diagnostics);
     }
@@ -472,6 +537,85 @@ fn create_latest_ticket_schema(connection: &Connection) -> Result<()> {
     connection
         .execute_batch(include_str!("latest_schema.sql"))
         .map_err(sqlite_err)
+}
+
+/// Independent 7→9 case migration. Does not rewrite historical events or
+/// create/resume worker identities. Version 8 tag composition is deliberately separate.
+fn migrate_v7_to_v9(connection: &Connection) -> Result<()> {
+    let snapshots = {
+        let mut stmt = connection.prepare("SELECT workspace_id, ticket_id, workflow_state, workflow_state_explicit, status, queued_by, queued_at, resolution FROM typed_tickets").map_err(sqlite_err)?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                crate::TicketLegacyWorkflowSnapshot {
+                    workflow_state: row.get(2)?,
+                    workflow_state_explicit: row.get::<_, i64>(3)? != 0,
+                    status: row.get(4)?,
+                    queued_by: row.get(5)?,
+                    queued_at: row.get(6)?,
+                    resolution: row.get(7)?,
+                },
+            ))
+        })
+        .map_err(sqlite_err)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(sqlite_err)?
+    };
+    // Validate old authority before any writes; unknown states are not silently repaired.
+    for (_, _, snapshot) in &snapshots {
+        if !matches!(
+            snapshot.workflow_state.as_str(),
+            "planning" | "ready" | "queued" | "inprogress" | "done" | "closed"
+        ) {
+            return Err(TicketError::Sqlite(format!(
+                "unsupported legacy Ticket workflow state {:?}",
+                snapshot.workflow_state
+            )));
+        }
+    }
+    // State guards are installed only after all six-state rows have been converted.
+    for (workspace_id, ticket_id, snapshot) in &snapshots {
+        let state = if matches!(snapshot.workflow_state.as_str(), "done" | "closed") {
+            "closed"
+        } else {
+            "open"
+        };
+        connection.execute("UPDATE typed_tickets SET workflow_state = ?3, status = ?3 WHERE workspace_id = ?1 AND ticket_id = ?2", params![workspace_id, ticket_id, state]).map_err(sqlite_err)?;
+    }
+    connection
+        .execute_batch(include_str!("case_schema.sql"))
+        .map_err(sqlite_err)?;
+    for (workspace_id, ticket_id, snapshot) in snapshots {
+        connection.execute("INSERT INTO typed_ticket_legacy_workflow_snapshot (workspace_id, ticket_id, snapshot_json) VALUES (?1, ?2, ?3)", params![workspace_id, ticket_id, serde_json::to_string(&snapshot).map_err(sqlite_err)?]).map_err(sqlite_err)?;
+        if matches!(snapshot.workflow_state.as_str(), "done" | "closed") {
+            let key = format!("migration-v9:{ticket_id}");
+            let judgment = crate::TicketCaseHistoryEntry {
+                operation_key: key.clone(),
+                previous_closure_operation_key: None,
+                // No typed evidence in schema7 establishes Completed. `done` is not success.
+                action: crate::TicketCaseAction::Close {
+                    reason: crate::TicketClosureReason::Unknown,
+                },
+                explanation: snapshot
+                    .resolution
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "Migrated legacy {} state; closure reason is unknown.",
+                            snapshot.workflow_state
+                        )
+                    }),
+                references: Vec::new(),
+                author: "ticket-schema-migration-v9".into(),
+                at: chrono::Utc::now().to_rfc3339(),
+            };
+            connection.execute("INSERT INTO typed_ticket_case_history (workspace_id, ticket_id, ordinal, operation_key, request_fingerprint, judgment_json) VALUES (?1, ?2, 0, ?3, 'migration-v9', ?4)", params![workspace_id, ticket_id, key, serde_json::to_string(&judgment).map_err(sqlite_err)?]).map_err(sqlite_err)?;
+            connection.execute("INSERT INTO typed_ticket_case_metadata (workspace_id, ticket_id, closure_operation_key) VALUES (?1, ?2, ?3)", params![workspace_id, ticket_id, key]).map_err(sqlite_err)?;
+        }
+    }
+    Ok(())
 }
 
 fn migrate_v6_to_v7(connection: &Connection) -> Result<()> {
@@ -1026,7 +1170,9 @@ mod tests {
     #[test]
     fn migrates_single_target_rows_to_ordered_read_write_targets() {
         let connection = Connection::open_in_memory().unwrap();
-        create_latest_ticket_schema(&connection).unwrap();
+        connection
+            .execute_batch(include_str!("../tests/fixtures/schema7.sql"))
+            .unwrap();
         connection
             .execute_batch(
                 "DROP TABLE typed_ticket_targets;
@@ -1137,7 +1283,7 @@ mod tests {
         assert!(!migrated_attributes.contains_key("ref_selector"));
         assert_eq!(
             load_applied_migrations(&connection).unwrap(),
-            BTreeMap::from([(7, BASELINE_MIGRATION_NAME.to_owned())])
+            BTreeMap::from([(9, BASELINE_MIGRATION_NAME.to_owned())])
         );
     }
 
@@ -1155,7 +1301,7 @@ mod tests {
 
         let error = migrate_sqlite_ticket_schema(&connection).unwrap_err();
         assert!(error.to_string().contains(
-            "migration history must contain only the canonical version 7 baseline marker"
+            "migration history must contain only the canonical version 9 baseline marker"
         ));
         assert_eq!(load_applied_migrations(&connection).unwrap().len(), 2);
     }
@@ -1177,7 +1323,7 @@ mod tests {
 
         let error = migrate_sqlite_ticket_schema(&connection).unwrap_err();
         assert!(error.to_string().contains(
-            "migration history must contain only the canonical version 7 baseline marker"
+            "migration history must contain only the canonical version 9 baseline marker"
         ));
         assert!(!table_exists(&connection, "typed_tickets").unwrap());
     }

@@ -23,56 +23,26 @@ function assertEquals<T>(actual: T, expected: T): void {
   }
 }
 
-Deno.test("ticketLanes combines workflow states and sorts by state then update time", () => {
+Deno.test("ticketLanes separates open and closed cases and orders updates deterministically", () => {
   const tickets = [
     {
-      id: "planning",
-      state: "planning",
-      title: "Planning",
-      updated_at: "2026-07-30T12:00:00Z",
-    },
-    {
-      id: "ready-old",
-      state: "ready",
-      title: "Ready old",
+      id: "old",
+      state: "open",
+      title: "Open old",
       updated_at: "2026-07-29T12:00:00Z",
     },
     {
-      id: "ready-new",
-      state: "ready",
-      title: "Ready new",
+      id: "new",
+      state: "open",
+      title: "Open new",
       updated_at: "2026-07-30T12:00:00Z",
     },
-    { id: "queued", state: "queued", title: "Queued", updated_at: null },
-    {
-      id: "inprogress",
-      state: "inprogress",
-      title: "In progress",
-      updated_at: null,
-    },
     { id: "closed", state: "closed", title: "Closed", updated_at: null },
-    { id: "done", state: "done", title: "Done", updated_at: null },
   ] as TicketSummary[];
-
   const lanes = ticketLanes(tickets);
-  assertEquals(lanes.map((lane) => lane.id), [
-    "ready-planning",
-    "inprogress-queued",
-    "done-closed",
-  ]);
-  assertEquals(lanes[0].tickets.map((ticket) => ticket.id), [
-    "ready-new",
-    "ready-old",
-    "planning",
-  ]);
-  assertEquals(lanes[1].tickets.map((ticket) => ticket.id), [
-    "inprogress",
-    "queued",
-  ]);
-  assertEquals(lanes[2].tickets.map((ticket) => ticket.id), [
-    "done",
-    "closed",
-  ]);
+  assertEquals(lanes.map((lane) => lane.id), ["open", "closed"]);
+  assertEquals(lanes[0].tickets.map((ticket) => ticket.id), ["new", "old"]);
+  assertEquals(lanes[1].tickets.map((ticket) => ticket.id), ["closed"]);
 });
 
 Deno.test("ticket lane visibility advances in bounded pages of 30", () => {

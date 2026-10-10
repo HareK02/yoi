@@ -559,9 +559,9 @@
     ]
   },
   {
-    "path": "crates/ticket/src/lib.rs",
+    "path": "crates/ticket/tests/migration.rs",
     "kind": "saved_data",
-    "reason": "frozen_counter_receipts_remain_immutable_and_cannot_be_reinterpreted_as_content_requestsの旧completion receipt属性fixture。保存済み旧fingerprintを新content requestの証拠に昇格せず、移行後も履歴を不変に保つ保証。keyを任意語に変えると実在したreceipt形式での回帰検出を失う。",
+    "reason": "旧Ticket完了receiptの実在したcounter入力keyを新schema7→9移行fixtureへ移設した。過去のfingerprintと全attributeを不変保持し、同じoperation keyを現行content/state/closure-key判断へ再解釈できないことを検証する。旧lib.rsの削除されたfixture例外を同じ1行へ移したもので、現行writer/APIには導入しない。",
     "lines": [
       {
         "sha256": "060994ddcd0e463815b01cd11b19723fd3652bd4c741fccdb33628e97691f092",

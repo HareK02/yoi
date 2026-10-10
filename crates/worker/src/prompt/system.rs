@@ -384,12 +384,12 @@ mod tests {
         assert!(!tools.iter().any(|meta| meta.name == "ReviewMergeRequest"));
         let complete = tools
             .iter()
-            .find(|meta| meta.name == "CompleteTicket")
+            .find(|meta| meta.name == "TicketCaseUpdate")
             .unwrap();
         assert!(
             complete
                 .description
-                .contains("Merge Requests and approvals are not prerequisites")
+                .contains("Repository, Merge Request and approval evidence are not prerequisites")
         );
         assert!(complete.description.contains("not real judgment"));
         assert!(
@@ -461,12 +461,12 @@ mod tests {
             );
             let complete = tools
                 .iter()
-                .find(|meta| meta.name == "CompleteTicket")
+                .find(|meta| meta.name == "TicketCaseUpdate")
                 .unwrap();
             assert!(
                 complete
                     .description
-                    .contains("return without conclusion need not call this tool")
+                    .contains("Return without conclusion need not call this tool")
             );
         }
     }

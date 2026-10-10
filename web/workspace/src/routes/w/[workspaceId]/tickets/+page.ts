@@ -9,11 +9,7 @@ import type { TicketListResponse } from "#lib/generated/ticket-api.ts";
 import type { WorkspaceOrchestratorStatus } from "#lib/workspace/tickets/ticket-panel.ts";
 import type { PageLoad } from "./$types";
 
-const LANE_STATES = {
-  "ready-planning": ["ready", "planning"],
-  "inprogress-queued": ["inprogress", "queued"],
-  "done-closed": ["done", "closed"],
-} as const;
+const LANE_STATES = { open: ["open"], closed: ["closed"] } as const;
 
 export type TicketLaneId = keyof typeof LANE_STATES;
 
@@ -48,15 +44,13 @@ async function loadLane(
 export const load: PageLoad = async ({ fetch, params }) => {
   const workspaceId = params.workspaceId;
   const [
-    readyPlanning,
-    inprogressQueued,
-    doneClosed,
+    open,
+    closed,
     orchestrator,
     repositories,
   ] = await Promise.all([
-    loadLane(fetch, workspaceId, "ready-planning"),
-    loadLane(fetch, workspaceId, "inprogress-queued"),
-    loadLane(fetch, workspaceId, "done-closed"),
+    loadLane(fetch, workspaceId, "open"),
+    loadLane(fetch, workspaceId, "closed"),
     loadJson<WorkspaceOrchestratorStatus>(
       fetch,
       workspaceApiPath(workspaceId, "/orchestrator"),
@@ -69,9 +63,8 @@ export const load: PageLoad = async ({ fetch, params }) => {
   return {
     workspaceId,
     ticketLanes: {
-      "ready-planning": readyPlanning,
-      "inprogress-queued": inprogressQueued,
-      "done-closed": doneClosed,
+      open,
+      closed,
     },
     orchestrator,
     repositories,

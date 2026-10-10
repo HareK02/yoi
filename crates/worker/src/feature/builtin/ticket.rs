@@ -14,11 +14,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ticket::{
-    MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent, NewTicketRelation,
+    NewOrchestrationPlanRecord, NewTicket, NewTicketEvent, NewTicketRelation,
     OrchestrationPlanKind, OrchestrationPlanRecord, Result as TicketResult, Ticket, TicketBackend,
     TicketBackendOperation, TicketBackendOperationResult, TicketDoctorReport, TicketError,
     TicketIdOrSlug, TicketIntakeSummary, TicketListQuery, TicketRef, TicketRelation,
-    TicketRelationKind, TicketRelationView, TicketStateChange, TicketSummary, TicketWorkflowState,
+    TicketRelationKind, TicketRelationView, TicketState, TicketStateChange, TicketSummary,
     tool::{TICKET_TOOL_NAMES, TicketToolBackend, ticket_tool_description, ticket_tools},
 };
 use wip_protocol::{
@@ -81,11 +81,7 @@ impl WorkspaceTicketReadKind {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum WorkspaceTicketStateFilter {
-    Planning,
-    Ready,
-    Queued,
-    Inprogress,
-    Done,
+    Open,
     Closed,
 }
 
@@ -111,12 +107,10 @@ enum WorkspaceTicketReviewFilter {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum WorkspaceTicketAttentionFilter {
-    DoneNotClosed,
     UnresolvedReview,
     MissingCommit,
     Blocked,
     Unblocked,
-    Ready,
     AwaitingReview,
     UnresolvedChanges,
     StaleAfterRescope,
@@ -147,7 +141,7 @@ enum WorkspaceTicketSort {
 struct WorkspaceQueryTicketInput {
     /// Full-text match over Ticket title, item body, and bounded thread excerpts.
     query: Option<String>,
-    /// Exact workflow states. Empty means every state.
+    /// Exact case states (open or closed). Empty means every state.
     #[serde(default)]
     states: Vec<WorkspaceTicketStateFilter>,
     /// Exact typed event kinds that must occur in the bounded thread window.
@@ -159,8 +153,8 @@ struct WorkspaceQueryTicketInput {
     /// Current authoritative Merge Request review status: none, pending, approved,
     /// request_changes, or unresolved_changes.
     review_status: Option<WorkspaceTicketReviewFilter>,
-    /// Attention filters include done_not_closed, unresolved_review, missing_commit,
-    /// blocked, unblocked, ready, awaiting_review, unresolved_changes,
+    /// Attention filters include unresolved_review, missing_commit,
+    /// blocked, unblocked, awaiting_review, unresolved_changes,
     /// stale_after_rescope, and missing_evidence.
     #[serde(default)]
     attention: Vec<WorkspaceTicketAttentionFilter>,
@@ -287,88 +281,58 @@ fn workspace_ticket_read_definition(
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct WorkspaceCompleteTicketInput {
-    /// Ticket reference. Prefer `T-*`.
+struct WorkspaceTicketCaseUpdateInput {
+    /// Ticket reference. Prefer T-*; WIP binds this from the item route.
     ticket: String,
-    /// Stable key for exact replay of this completion decision.
+    /// Stable key for exact replay of this case judgment.
     operation_key: String,
     /// SHA-256 of the current editable Ticket content from ShowTicket.
     expected_content_digest: String,
-    expected_state: TicketWorkflowState,
-    /// Required explanation of the completion decision; MR approval is not a prerequisite.
-    reason: String,
-    /// Optional typed supporting Ticket references, independent of MR integration evidence.
+    expected_state: ticket::TicketState,
+    /// Explicitly observed null for never closed, or current closure operation key.
+    #[serde(deserialize_with = "deserialize_observed_closure_key")]
+    expected_closure_operation_key: Option<String>,
+    action: ticket::TicketCaseAction,
+    /// Required explanation of the judgment, independent of Repository/MR evidence.
+    explanation: String,
     #[serde(default)]
     references: Vec<ticket::TicketReference>,
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct WorkspaceTicketStateUpdateInput {
-    /// Ticket reference. Prefer `T-*`.
-    ticket: String,
-    operation_key: String,
-    /// SHA-256 of the current editable Ticket content from ShowTicket.
-    expected_content_digest: String,
-    expected_state: TicketWorkflowState,
-    /// Progress-display state only: this does not start Workers or integrate Merge Requests.
-    state: TicketWorkflowState,
-    /// Required explanation for the state decision.
-    reason: String,
-    #[serde(default)]
-    references: Vec<ticket::TicketReference>,
+fn deserialize_observed_closure_key<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer)
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct WorkspaceTicketCloseInput {
-    /// Ticket reference. Prefer `T-*`; WIP binds this from the item route.
-    ticket: String,
-    /// Stable key for exact replay of this close decision.
-    operation_key: String,
-    /// SHA-256 of the current editable Ticket content from ShowTicket.
-    expected_content_digest: String,
-    expected_state: TicketWorkflowState,
-    /// Required explanation for closing this Ticket.
-    resolution: String,
-    #[serde(default)]
-    references: Vec<ticket::TicketReference>,
-}
-
-const TICKET_CLOSE_DESCRIPTION: &str = "Record an authorized Ticket closure decision with resolution, item/state CAS, and replay key when the requested return path calls for closure. No Merge Request or enforced state sequence is required. Backend checks actor authority, not natural-language satisfaction; this does not integrate MRs, stop/remove Workers, clean attachments, or expand Workdir grants.";
-const COMPLETE_TICKET_DESCRIPTION: &str = "Record an authorized Ticket completion decision with reason, item/state CAS, and replay key when user intent calls for completion; return without conclusion need not call this tool. Merge Requests and approvals are not prerequisites. Backend checks assigned Worker/Workspace Orchestrator authority, not real judgment of natural-language satisfaction; model-supplied roles never grant authority. Conclusion ends unfinished work while retaining terminal responsibility for display; it does not grant review/merge authority or stop/remove Workers and attachments.";
-const TICKET_STATE_UPDATE_DESCRIPTION: &str = "Update a Ticket progress-display state with reason, item/state CAS, and replay key. States need not follow an enforced sequence. Backend checks actor authority, not natural-language satisfaction. This does not start/stop Workers, queue dependencies, integrate Merge Requests, clean attachments, or enlarge live Workdir grants.";
+const TICKET_CASE_UPDATE_DESCRIPTION: &str = "Record an authorized Ticket close, reopen, or closure-correction judgment with an explicit observed closure key, item/state CAS, and replay key. Open means the case remains to be handled, not ready/queued/inprogress; Closed does not imply success. Repository, Merge Request and approval evidence are not prerequisites. Return without conclusion need not call this tool. Backend checks actor authority, not real judgment of natural-language satisfaction; actor identity is injected by the server. This does not start/stop Workers, restore execution rights, change assignments, grant resources, approve or integrate Merge Requests.";
 
 #[derive(Clone, Copy)]
 enum WorkspaceTicketDecisionKind {
-    Complete,
-    UpdateState,
-    Close,
+    CaseUpdate,
 }
 
 impl WorkspaceTicketDecisionKind {
     fn name(self) -> &'static str {
-        match self {
-            Self::Complete => "CompleteTicket",
-            Self::UpdateState => "TicketWorkflowState",
-            Self::Close => "TicketClose",
-        }
+        "TicketCaseUpdate"
     }
-
     fn description(self) -> &'static str {
-        match self {
-            Self::Complete => COMPLETE_TICKET_DESCRIPTION,
-            Self::UpdateState => TICKET_STATE_UPDATE_DESCRIPTION,
-            Self::Close => TICKET_CLOSE_DESCRIPTION,
-        }
+        TICKET_CASE_UPDATE_DESCRIPTION
     }
-
     fn schema(self) -> Value {
-        match self {
-            Self::Complete => json!(schemars::schema_for!(WorkspaceCompleteTicketInput)),
-            Self::UpdateState => json!(schemars::schema_for!(WorkspaceTicketStateUpdateInput)),
-            Self::Close => json!(schemars::schema_for!(WorkspaceTicketCloseInput)),
+        let mut schema = json!(schemars::schema_for!(WorkspaceTicketCaseUpdateInput));
+        // Observation must be present even when it is explicitly null. Keep the
+        // Option's nullable wire schema instead of treating it as a String.
+        let required = schema["required"]
+            .as_array_mut()
+            .expect("object schema required fields");
+        if !required
+            .iter()
+            .any(|field| field == "expected_closure_operation_key")
+        {
+            required.push(json!("expected_closure_operation_key"));
         }
+        schema
     }
 }
 
@@ -378,97 +342,62 @@ struct WorkspaceTicketDecisionTool {
     kind: WorkspaceTicketDecisionKind,
 }
 
-fn validate_ticket_decision(
-    ticket: &str,
-    operation_key: &str,
-    content_digest: &str,
-    reason: &str,
-) -> Result<(), ToolError> {
-    for (name, value) in [
-        ("ticket", ticket),
-        ("operation_key", operation_key),
-        ("expected_content_digest", content_digest),
-        ("reason", reason),
-    ] {
-        if value.trim().is_empty() {
-            return Err(ToolError::InvalidArgument(format!(
-                "{name} must not be empty"
-            )));
-        }
-    }
-    Ok(())
-}
-
 #[async_trait]
 impl Tool for WorkspaceTicketDecisionTool {
     async fn execute(&self, input: &str, _: ToolExecutionContext) -> Result<ToolOutput, ToolError> {
-        let workspace_id = self.client.workspace_id().ok_or_else(|| {
+        self.client.workspace_id().ok_or_else(|| {
             ToolError::InvalidArgument("Ticket decisions require Workspace identity".into())
         })?;
-        let (ticket, endpoint, body) = match self.kind {
-            WorkspaceTicketDecisionKind::Complete => {
-                let value: WorkspaceCompleteTicketInput = serde_json::from_str(input)
-                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
-                validate_ticket_decision(
-                    &value.ticket,
-                    &value.operation_key,
-                    &value.expected_content_digest,
-                    &value.reason,
-                )?;
-                let mut body = serde_json::to_value(&value)
-                    .map_err(|error| ToolError::Internal(error.to_string()))?;
-                body.as_object_mut()
-                    .expect("typed Ticket input is an object")
-                    .remove("ticket");
-                (value.ticket, "complete", body)
-            }
-            WorkspaceTicketDecisionKind::Close => {
-                let value: WorkspaceTicketCloseInput = serde_json::from_str(input)
-                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
-                validate_ticket_decision(
-                    &value.ticket,
-                    &value.operation_key,
-                    &value.expected_content_digest,
-                    &value.resolution,
-                )?;
-                let body = json!({
-                    "operation_key": value.operation_key,
-                    "expected_content_digest": value.expected_content_digest,
-                    "expected_state": value.expected_state,
-                    "state": TicketWorkflowState::Closed,
-                    "reason": value.resolution,
-                    "references": value.references,
-                });
-                (value.ticket, "state-update", body)
-            }
-            WorkspaceTicketDecisionKind::UpdateState => {
-                let value: WorkspaceTicketStateUpdateInput = serde_json::from_str(input)
-                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
-                validate_ticket_decision(
-                    &value.ticket,
-                    &value.operation_key,
-                    &value.expected_content_digest,
-                    &value.reason,
-                )?;
-                let mut body = serde_json::to_value(&value)
-                    .map_err(|error| ToolError::Internal(error.to_string()))?;
-                body.as_object_mut()
-                    .expect("typed Ticket input is an object")
-                    .remove("ticket");
-                // Actor identity is transport-bound, never a model-visible author/role input.
-                (value.ticket, "state-update", body)
-            }
-        };
-        let ticket: Ticket = WorkspaceHttpTicketBackend::request(
-            self.client.clone(),
-            WorkspaceRequestMethod::Post,
-            format!(
-                "/api/w/{workspace_id}/tickets/{}/{endpoint}",
-                WorkspaceHttpTicketBackend::ticket_path(&TicketIdOrSlug::from(ticket.as_str()))
+        let value: WorkspaceTicketCaseUpdateInput = serde_json::from_str(input)
+            .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
+        for (name, value) in [
+            ("ticket", value.ticket.as_str()),
+            ("operation_key", value.operation_key.as_str()),
+            (
+                "expected_content_digest",
+                value.expected_content_digest.as_str(),
             ),
-            Some(body),
-        )
-        .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+            ("explanation", value.explanation.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ToolError::InvalidArgument(format!(
+                    "{name} must not be empty"
+                )));
+            }
+        }
+        if value
+            .expected_closure_operation_key
+            .as_deref()
+            .is_some_and(|key| key.trim().is_empty())
+        {
+            return Err(ToolError::InvalidArgument(
+                "expected_closure_operation_key must be null or nonempty".into(),
+            ));
+        }
+        match &value.action {
+            ticket::TicketCaseAction::Close { reason }
+            | ticket::TicketCaseAction::CorrectClosure { reason }
+                if matches!(reason, ticket::TicketClosureReason::Other(text) if text.trim().is_empty()) =>
+            {
+                return Err(ToolError::InvalidArgument(
+                    "other closure reason must not be empty".into(),
+                ));
+            }
+            _ => {}
+        }
+        let mut body =
+            serde_json::to_value(&value).map_err(|error| ToolError::Internal(error.to_string()))?;
+        body.as_object_mut()
+            .expect("typed Ticket input is an object")
+            .remove("ticket");
+        // Actor identity is transport-bound, never a model-visible author/role input.
+        let ticket = WorkspaceHttpTicketBackend::new(self.client.clone())
+            .update_case(
+                &value.ticket,
+                serde_json::from_value(body)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
+            )
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
         Ok(ToolOutput {
             summary: self.kind.name().into(),
             content: Some(
@@ -499,9 +428,7 @@ fn workspace_ticket_decision_definition(
 
 fn workspace_ticket_tool_description(name: &str) -> String {
     match name {
-        "CompleteTicket" => COMPLETE_TICKET_DESCRIPTION.into(),
-        "TicketWorkflowState" => TICKET_STATE_UPDATE_DESCRIPTION.into(),
-        "TicketClose" => TICKET_CLOSE_DESCRIPTION.into(),
+        "TicketCaseUpdate" => TICKET_CASE_UPDATE_DESCRIPTION.into(),
         _ => ticket_tool_description(name, None),
     }
 }
@@ -522,7 +449,7 @@ pub trait TicketService: Send + Sync {
 pub struct TicketHandoff {
     pub id: String,
     pub resource_key: String,
-    pub workflow_state: TicketWorkflowState,
+    pub workflow_state: TicketState,
 }
 
 fn is_canonical_ticket_resource_key(resource_key: &str) -> bool {
@@ -631,7 +558,6 @@ impl TicketFeatureAccess {
             .iter()
             .copied()
             .filter(|name| self.allows_tool(name))
-            .chain((self.authoring || self.workflow || self.thread).then_some("CompleteTicket"))
             .collect()
     }
 
@@ -640,7 +566,7 @@ impl TicketFeatureAccess {
         // Workspace transport lets the Backend validate the current assignment
         // or author/orchestrator permission on every decision, in both modes.
         READ_ONLY_TOOL_NAMES.contains(&name)
-            || (name == "TicketWorkflowState" && (self.authoring || self.thread || self.workflow))
+            || (name == "TicketCaseUpdate" && (self.authoring || self.thread || self.workflow))
             || (self.authoring && AUTHORING_TOOL_NAMES.contains(&name))
             || (self.thread && THREAD_TOOL_NAMES.contains(&name))
             || (self.intake && INTAKE_TOOL_NAMES.contains(&name))
@@ -655,7 +581,7 @@ const AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketEditItem",
     "TicketMarkReady",
     "TicketQueue",
-    "TicketClose",
+    "TicketCaseUpdate",
     "TicketRelationRecord",
     "TicketRelationRemove",
 ];
@@ -673,11 +599,9 @@ const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketComment",
     "TicketMarkReady",
     "TicketQueue",
-    "TicketWorkflowState",
-    "TicketClose",
+    "TicketCaseUpdate",
     "TicketRelationRecord",
     "TicketRelationRemove",
-    "CompleteTicket",
 ];
 
 #[cfg(test)]
@@ -685,19 +609,16 @@ const WORKFLOW_TOOL_NAMES: &[&str] = &[
     "QueryTicket",
     "ShowTicket",
     "TicketComment",
-    "TicketWorkflowState",
-    "TicketClose",
+    "TicketCaseUpdate",
     "TicketDependencyCheck",
     "TicketRelationRecord",
     "TicketRelationRemove",
     "TicketOrchestrationPlanRecord",
     "TicketOrchestrationPlanQuery",
-    "CompleteTicket",
 ];
 
 const WORKFLOW_ADDITIONAL_TOOL_NAMES: &[&str] = &[
-    "TicketWorkflowState",
-    "TicketClose",
+    "TicketCaseUpdate",
     "TicketDependencyCheck",
     "TicketRelationRecord",
     "TicketRelationRemove",
@@ -972,49 +893,6 @@ impl WorkspaceHttpTicketBackend {
         Ok(TicketBackendOperationResult::Unit)
     }
 
-    fn legacy_state_request(
-        client: Arc<dyn WorkspaceClient>,
-        base: &str,
-        id: &TicketIdOrSlug,
-        change: TicketStateChange,
-    ) -> TicketResult<Value> {
-        // Preserve the caller's original `from`: refreshing it from the snapshot
-        // would turn a stale transition into a successful write.
-        let expected_state = TicketWorkflowState::parse(&change.from).ok_or_else(|| {
-            TicketError::Conflict(format!("invalid Ticket from state: {}", change.from))
-        })?;
-        let state = TicketWorkflowState::parse(&change.to).ok_or_else(|| {
-            TicketError::Conflict(format!("invalid Ticket to state: {}", change.to))
-        })?;
-        let reason = [change.reason.as_str(), change.body.as_str()]
-            .into_iter()
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        if reason.is_empty() {
-            return Err(TicketError::Conflict(
-                "Ticket state decision requires a reason".into(),
-            ));
-        }
-        let snapshot: Ticket = Self::request_unprojected(
-            client,
-            WorkspaceRequestMethod::Get,
-            format!("{base}/{}/record", Self::ticket_path(id)),
-            None,
-        )?;
-        serde_json::to_value(ticket::TicketStateUpdate {
-            operation_key: uuid::Uuid::now_v7().to_string(),
-            expected_content_digest: ticket::ticket_content_digest(&snapshot),
-            expected_state,
-            state,
-            reason: reason.into(),
-            references: change.references,
-            author: change.author,
-        })
-        .map_err(|error| TicketError::Conflict(format!("serialize Ticket state decision: {error}")))
-    }
-
     fn invoke_client(
         client: Arc<dyn WorkspaceClient>,
         workspace_id: String,
@@ -1069,6 +947,11 @@ impl WorkspaceHttpTicketBackend {
                 Ok(TicketBackendOperationResult::Ticket(ticket))
             }
             TicketBackendOperation::Create { input } => {
+                if input.workflow_state == Some(TicketState::Closed) {
+                    return Err(TicketError::Conflict(
+                        "Tickets must be created open; closing requires a case judgment".into(),
+                    ));
+                }
                 let ticket = Self::request(
                     client,
                     WorkspaceRequestMethod::Post,
@@ -1107,15 +990,9 @@ impl WorkspaceHttpTicketBackend {
                     TicketError::Conflict(format!("serialize Ticket event: {error}"))
                 })?),
             ),
-            TicketBackendOperation::AddStateChanged { id, change } => {
-                let body = Self::legacy_state_request(client.clone(), &base, &id, change)?;
-                Self::request_unit(
-                    client,
-                    WorkspaceRequestMethod::Post,
-                    format!("{base}/{}/state-changes", Self::ticket_path(&id)),
-                    Some(body),
-                )
-            }
+            TicketBackendOperation::AddStateChanged { .. } => Err(TicketError::Conflict(
+                "Case changes require an explicit TicketCaseUpdate judgment".into(),
+            )),
             TicketBackendOperation::AddIntakeSummary { id, summary } => Self::request_unit(
                 client,
                 WorkspaceRequestMethod::Post,
@@ -1124,57 +1001,31 @@ impl WorkspaceHttpTicketBackend {
                     TicketError::Conflict(format!("serialize Ticket intake summary: {error}"))
                 })?),
             ),
-            TicketBackendOperation::SetStateField { id, field, change } => {
-                if field != "workflow_state" && field != "state" {
-                    return Err(TicketError::Conflict(format!(
-                        "unsupported Ticket state field: {field}"
-                    )));
-                }
-                let body = Self::legacy_state_request(client.clone(), &base, &id, change)?;
-                Self::request_unit(
-                    client,
+            TicketBackendOperation::UpdateCase { ticket, request } => {
+                let mut body = serde_json::to_value(request).map_err(|error| {
+                    TicketError::Conflict(format!("serialize Ticket case judgment: {error}"))
+                })?;
+                // Domain callers cannot supply HTTP actor authority either.
+                body.as_object_mut()
+                    .expect("typed case update is an object")
+                    .remove("author");
+                let encoded_ticket = Self::ticket_path(&TicketIdOrSlug::from(ticket.as_str()));
+                let _: ticket::TicketSummary = Self::request(
+                    client.clone(),
                     WorkspaceRequestMethod::Post,
-                    format!(
-                        "{base}/{}/state-fields/{}",
-                        Self::ticket_path(&id),
-                        Self::ticket_path(&TicketIdOrSlug::Query(field))
-                    ),
+                    format!("/workspaces/{workspace_id}/tickets/{encoded_ticket}/case"),
                     Some(body),
-                )
-            }
-            TicketBackendOperation::SetWorkflowState { id, change } => {
-                let body = Self::legacy_state_request(client.clone(), &base, &id, change)?;
-                Self::request_unit(
+                )?;
+                // The mutation receipt returns a bounded summary. Read the full
+                // current authority; never fabricate history from that summary.
+                Self::request(
                     client,
-                    WorkspaceRequestMethod::Post,
-                    format!("{base}/{}/workflow-state", Self::ticket_path(&id)),
-                    Some(body),
+                    WorkspaceRequestMethod::Get,
+                    format!("{base}/{encoded_ticket}/record"),
+                    None,
                 )
+                .map(TicketBackendOperationResult::Ticket)
             }
-            TicketBackendOperation::UpdateState { ticket, request } => Self::request(
-                client,
-                WorkspaceRequestMethod::Post,
-                format!(
-                    "{base}/{}/state-update",
-                    Self::ticket_path(&TicketIdOrSlug::from(ticket.as_str()))
-                ),
-                Some(serde_json::to_value(request).map_err(|error| {
-                    TicketError::Conflict(format!("serialize Ticket state update: {error}"))
-                })?),
-            )
-            .map(TicketBackendOperationResult::Ticket),
-            TicketBackendOperation::Complete { ticket, request } => Self::request(
-                client,
-                WorkspaceRequestMethod::Post,
-                format!(
-                    "{base}/{}/complete",
-                    Self::ticket_path(&TicketIdOrSlug::from(ticket.as_str()))
-                ),
-                Some(serde_json::to_value(request).map_err(|error| {
-                    TicketError::Conflict(format!("serialize Ticket completion: {error}"))
-                })?),
-            )
-            .map(TicketBackendOperationResult::Ticket),
             TicketBackendOperation::MarkReady { id, request } => Self::request(
                 client,
                 WorkspaceRequestMethod::Post,
@@ -1191,36 +1042,6 @@ impl WorkspaceHttpTicketBackend {
                 None,
             )
             .map(TicketBackendOperationResult::QueueOutcome),
-            TicketBackendOperation::Close { id, resolution } => {
-                if resolution.as_str().trim().is_empty() {
-                    return Err(TicketError::Conflict(
-                        "Ticket close requires a resolution".into(),
-                    ));
-                }
-                let snapshot: Ticket = Self::request_unprojected(
-                    client.clone(),
-                    WorkspaceRequestMethod::Get,
-                    format!("{base}/{}/record", Self::ticket_path(&id)),
-                    None,
-                )?;
-                let body = serde_json::to_value(ticket::TicketCompletion {
-                    operation_key: uuid::Uuid::now_v7().to_string(),
-                    expected_content_digest: ticket::ticket_content_digest(&snapshot),
-                    expected_state: snapshot.meta.workflow_state,
-                    reason: resolution.as_str().to_owned(),
-                    references: Vec::new(),
-                    author: None,
-                })
-                .map_err(|error| {
-                    TicketError::Conflict(format!("serialize Ticket close: {error}"))
-                })?;
-                Self::request_unit(
-                    client,
-                    WorkspaceRequestMethod::Post,
-                    format!("{base}/{}/workflow/close", Self::ticket_path(&id)),
-                    Some(body),
-                )
-            }
             TicketBackendOperation::AddTicketRelation { id, relation } => {
                 let source_resource_key =
                     Self::resolve_ticket_resource_key(client.clone(), &base, &id)?;
@@ -1408,44 +1229,9 @@ impl TicketBackend for WorkspaceHttpTicketBackend {
         }
     }
 
-    fn set_state_field(
-        &self,
-        id: TicketIdOrSlug,
-        field: &str,
-        change: TicketStateChange,
-    ) -> TicketResult<()> {
-        match self.invoke(TicketBackendOperation::SetStateField {
-            id,
-            field: field.to_string(),
-            change,
-        })? {
-            TicketBackendOperationResult::Unit => Ok(()),
-            other => Err(TicketError::Conflict(format!(
-                "unexpected ticket backend response: {other:?}"
-            ))),
-        }
-    }
-
-    fn set_workflow_state(
-        &self,
-        id: TicketIdOrSlug,
-        change: TicketStateChange,
-    ) -> TicketResult<()> {
-        match self.invoke(TicketBackendOperation::SetWorkflowState { id, change })? {
-            TicketBackendOperationResult::Unit => Ok(()),
-            other => Err(TicketError::Conflict(format!(
-                "unexpected ticket backend response: {other:?}"
-            ))),
-        }
-    }
-
-    fn update_state(
-        &self,
-        ticket: &str,
-        request: ticket::TicketStateUpdate,
-    ) -> TicketResult<Ticket> {
+    fn update_case(&self, ticket: &str, request: ticket::TicketCaseUpdate) -> TicketResult<Ticket> {
         expect_ticket_result!(
-            self.invoke(TicketBackendOperation::UpdateState {
+            self.invoke(TicketBackendOperation::UpdateCase {
                 ticket: ticket.to_string(),
                 request
             }),
@@ -1476,15 +1262,6 @@ impl TicketBackend for WorkspaceHttpTicketBackend {
             }),
             TicketBackendOperationResult::QueueOutcome
         )
-    }
-
-    fn close(&self, id: TicketIdOrSlug, resolution: MarkdownText) -> TicketResult<()> {
-        match self.invoke(TicketBackendOperation::Close { id, resolution })? {
-            TicketBackendOperationResult::Unit => Ok(()),
-            other => Err(TicketError::Conflict(format!(
-                "unexpected ticket backend response: {other:?}"
-            ))),
-        }
     }
 
     fn add_ticket_relation(
@@ -1625,20 +1402,8 @@ fn native_ticket_operation(tool_name: &str) -> Option<NativeTicketOperation> {
             identity_field: Some("ticket"),
             mutating: true,
         },
-        "TicketWorkflowState" => NativeTicketOperation {
-            operation: "transition",
-            surface: NativeTicketSurface::Item,
-            identity_field: Some("ticket"),
-            mutating: true,
-        },
-        "CompleteTicket" => NativeTicketOperation {
-            operation: "complete",
-            surface: NativeTicketSurface::Item,
-            identity_field: Some("ticket"),
-            mutating: true,
-        },
-        "TicketClose" => NativeTicketOperation {
-            operation: "close",
+        "TicketCaseUpdate" => NativeTicketOperation {
+            operation: "case_update",
             surface: NativeTicketSurface::Item,
             identity_field: Some("ticket"),
             mutating: true,
@@ -1693,7 +1458,7 @@ pub(crate) fn enabled_ticket_definitions(
 ) -> Vec<ToolDefinition> {
     let backend = TicketToolBackend::new(WorkspaceHttpTicketBackend::new(client.clone()));
     let allowed = access.tool_names();
-    let mut definitions: Vec<ToolDefinition> = ticket_tools(backend)
+    ticket_tools(backend)
         .into_iter()
         .filter_map(|definition| {
             let (meta, _) = definition();
@@ -1707,25 +1472,14 @@ pub(crate) fn enabled_ticket_definitions(
                 "ShowTicket" => {
                     workspace_ticket_read_definition(client.clone(), WorkspaceTicketReadKind::Show)
                 }
-                "TicketClose" => workspace_ticket_decision_definition(
+                "TicketCaseUpdate" => workspace_ticket_decision_definition(
                     client.clone(),
-                    WorkspaceTicketDecisionKind::Close,
-                ),
-                "TicketWorkflowState" => workspace_ticket_decision_definition(
-                    client.clone(),
-                    WorkspaceTicketDecisionKind::UpdateState,
+                    WorkspaceTicketDecisionKind::CaseUpdate,
                 ),
                 _ => definition,
             })
         })
-        .collect();
-    if allowed.contains(&"CompleteTicket") {
-        definitions.push(workspace_ticket_decision_definition(
-            client,
-            WorkspaceTicketDecisionKind::Complete,
-        ));
-    }
-    definitions
+        .collect()
 }
 
 fn native_ticket_tools(
@@ -2387,13 +2141,16 @@ mod tests {
             // inject mutation rejection independently of that successful read.
             if request.method == WorkspaceRequestMethod::Get {
                 response.status = 200;
+            } else if response.status == 200 && request.path.ends_with("/case") {
+                let record: Value = serde_json::from_str(&response.body).unwrap();
+                response.body = record["meta"].to_string();
             }
             self.requests.lock().unwrap().push(request);
             Ok(response)
         }
     }
 
-    fn decision_client(status: u16, state: TicketWorkflowState) -> Arc<DecisionClient> {
+    fn decision_client(status: u16, state: TicketState) -> Arc<DecisionClient> {
         let temp = tempfile::tempdir().unwrap();
         let db =
             ticket::SqliteTicketBackend::open(temp.path().join("tickets.db"), "workspace").unwrap();
@@ -2412,511 +2169,248 @@ mod tests {
 
     fn decision_input() -> Value {
         json!({
-            "ticket": "T-718", "operation_key": "decision-1",
-            "expected_content_digest": "content_digest-1", "expected_state": "planning",
-            "reason": "No repository changes are needed"
+            "ticket": "T-739", "operation_key": "case-1",
+            "expected_content_digest": "digest-1", "expected_state": "open",
+            "expected_closure_operation_key": null,
+            "action": {"action": "close", "reason": "not_planned"},
+            "explanation": "No repository changes are needed"
         })
     }
 
-    fn close_input() -> Value {
+    #[test]
+    fn case_backend_sends_explicit_judgment_without_domain_author_claim() {
+        let client = decision_client(200, TicketState::Closed);
+        let backend = WorkspaceHttpTicketBackend::new(client.clone());
         let mut input = decision_input();
-        let reason = input.as_object_mut().unwrap().remove("reason").unwrap();
-        input["resolution"] = reason;
-        input
-    }
-
-    fn legacy_change() -> TicketStateChange {
-        serde_json::from_value(json!({
-            "from": "planning", "to": "closed", "reason": "Decision",
-            "body": "Supporting explanation", "references": [], "author": "caller"
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn legacy_ticket_state_adapters_send_strong_cas_without_refreshing_stale_from() {
-        for endpoint in [
-            "state-changes",
-            "workflow-state",
-            "state-fields/workflow_state",
-            "state-fields/state",
-        ] {
-            // The observed state is ready, deliberately different from change.from.
-            let client = decision_client(200, TicketWorkflowState::Ready);
-            let snapshot: Ticket = serde_json::from_str(&client.response.body).unwrap();
-            let backend = WorkspaceHttpTicketBackend::new(client.clone());
-            let id = TicketIdOrSlug::from("T-718");
-            match endpoint {
-                "state-changes" => backend.add_state_changed(id, legacy_change()),
-                "workflow-state" => backend.set_workflow_state(id, legacy_change()),
-                "state-fields/workflow_state" => {
-                    backend.set_state_field(id, "workflow_state", legacy_change())
-                }
-                _ => backend.set_state_field(id, "state", legacy_change()),
-            }
-            .unwrap();
-            let requests = client.requests.lock().unwrap();
-            assert_eq!(requests.len(), 2);
-            assert_eq!(requests[0].method, WorkspaceRequestMethod::Get);
-            assert_eq!(requests[0].path, "/api/w/workspace/tickets/T-718/record");
-            assert_eq!(requests[1].method, WorkspaceRequestMethod::Post);
-            assert_eq!(
-                requests[1].path,
-                format!("/api/w/workspace/tickets/T-718/{endpoint}")
-            );
-            let body: Value = serde_json::from_str(requests[1].body.as_deref().unwrap()).unwrap();
-            let request: ticket::TicketStateUpdate = serde_json::from_value(body.clone()).unwrap();
-            assert!(uuid::Uuid::parse_str(&request.operation_key).is_ok());
-            assert_eq!(
-                request.expected_content_digest,
-                ticket::ticket_content_digest(&snapshot)
-            );
-            assert_eq!(request.expected_state, TicketWorkflowState::Planning);
-            assert_eq!(request.state, TicketWorkflowState::Closed);
-            assert_eq!(request.reason, "Decision\n\nSupporting explanation");
-            assert_eq!(body["author"], "caller");
-            assert_eq!(body["references"], json!([]));
-            assert!(body.get("from").is_none());
-            assert!(body.get("to").is_none());
-        }
-    }
-
-    #[test]
-    fn legacy_ticket_state_adapter_parses_each_original_display_state() {
-        let client = decision_client(200, TicketWorkflowState::Closed);
-        let backend = WorkspaceHttpTicketBackend::new(client.clone());
-        for state in [
-            TicketWorkflowState::Planning,
-            TicketWorkflowState::Ready,
-            TicketWorkflowState::Queued,
-            TicketWorkflowState::InProgress,
-            TicketWorkflowState::Done,
-            TicketWorkflowState::Closed,
-        ] {
-            let mut change = legacy_change();
-            change.from = state.as_str().into();
-            change.to = state.as_str().into();
-            backend
-                .set_workflow_state(TicketIdOrSlug::from("T-718"), change)
-                .unwrap();
-            let requests = client.requests.lock().unwrap();
-            let request: ticket::TicketStateUpdate =
-                serde_json::from_str(requests.last().unwrap().body.as_deref().unwrap()).unwrap();
-            assert_eq!(request.expected_state, state);
-            assert_eq!(request.state, state);
-        }
-    }
-
-    #[test]
-    fn legacy_ticket_adapters_reject_invalid_fields_states_and_empty_reasons_before_dispatch() {
-        let client = decision_client(200, TicketWorkflowState::Planning);
-        let backend = WorkspaceHttpTicketBackend::new(client.clone());
-        assert!(
-            backend
-                .set_state_field(
-                    TicketIdOrSlug::from("T-718"),
-                    "approval_state",
-                    legacy_change()
-                )
-                .is_err()
-        );
-        for field in ["from", "to"] {
-            let mut change = legacy_change();
-            if field == "from" {
-                change.from = "approved".into();
-            } else {
-                change.to = "approved".into();
-            }
-            assert!(
-                backend
-                    .set_workflow_state(TicketIdOrSlug::from("T-718"), change)
-                    .is_err()
-            );
-        }
-        let mut change = legacy_change();
-        change.reason = " ".into();
-        change.body = " \n ".into();
-        assert!(
-            backend
-                .add_state_changed(TicketIdOrSlug::from("T-718"), change)
-                .is_err()
-        );
-        assert!(
-            backend
-                .close(TicketIdOrSlug::from("T-718"), " ".into())
-                .is_err()
-        );
-        assert!(client.requests.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn legacy_ticket_close_snapshots_cas_and_generates_distinct_completion_keys() {
-        let client = decision_client(200, TicketWorkflowState::Ready);
-        let snapshot: Ticket = serde_json::from_str(&client.response.body).unwrap();
-        let backend = WorkspaceHttpTicketBackend::new(client.clone());
-        for _ in 0..2 {
-            backend
-                .close(
-                    TicketIdOrSlug::from("T-718"),
-                    "Resolved without repository changes".into(),
-                )
-                .unwrap();
-        }
-        let requests = client.requests.lock().unwrap();
-        assert_eq!(requests.len(), 4);
-        let mut keys = BTreeSet::new();
-        for pair in requests.chunks_exact(2) {
-            assert_eq!(pair[0].method, WorkspaceRequestMethod::Get);
-            assert_eq!(pair[0].path, "/api/w/workspace/tickets/T-718/record");
-            assert_eq!(pair[1].method, WorkspaceRequestMethod::Post);
-            assert_eq!(
-                pair[1].path,
-                "/api/w/workspace/tickets/T-718/workflow/close"
-            );
-            let request: ticket::TicketCompletion =
-                serde_json::from_str(pair[1].body.as_deref().unwrap()).unwrap();
-            assert!(uuid::Uuid::parse_str(&request.operation_key).is_ok());
-            assert!(keys.insert(request.operation_key));
-            assert_eq!(
-                request.expected_content_digest,
-                ticket::ticket_content_digest(&snapshot)
-            );
-            assert_eq!(request.expected_state, TicketWorkflowState::Ready);
-            assert_eq!(request.reason, "Resolved without repository changes");
-            assert!(request.references.is_empty());
-            assert!(request.author.is_none());
-        }
-    }
-
-    #[test]
-    fn legacy_ticket_adapters_surface_backend_authority_and_stale_state_rejections() {
-        for status in [403, 409] {
-            for close in [false, true] {
-                let client = decision_client(status, TicketWorkflowState::Ready);
-                let backend = WorkspaceHttpTicketBackend::new(client.clone());
-                let result = if close {
-                    backend.close(TicketIdOrSlug::from("T-718"), "Resolved".into())
-                } else {
-                    backend.set_workflow_state(TicketIdOrSlug::from("T-718"), legacy_change())
-                };
-                assert!(
-                    result
-                        .unwrap_err()
-                        .to_string()
-                        .contains(&format!("HTTP status {status}"))
-                );
-                assert_eq!(client.requests.lock().unwrap().len(), 2);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn native_ticket_close_binds_subject_and_forwards_strong_closed_state_decision() {
-        let client = decision_client(200, TicketWorkflowState::Closed);
-        let tools = native_ticket_tools(client.clone(), TicketFeatureAccess::workspace_authoring())
-            .unwrap();
-        let descriptor = ticket_descriptor(&tools, "Ticket", "bound").unwrap();
-        let close = descriptor
-            .operations
-            .iter()
-            .find(|op| op.name == "close")
-            .unwrap();
-        assert!(
-            !close
-                .parameters
-                .iter()
-                .any(|p| p.name == "ticket" || p.name == "author" || p.name == "role")
-        );
-        for field in [
-            "operation_key",
-            "expected_content_digest",
-            "expected_state",
-            "resolution",
-        ] {
-            assert!(
-                close
-                    .parameters
-                    .iter()
-                    .any(|p| p.name == field && p.required)
-            );
-        }
-        assert!(
-            close
-                .parameters
-                .iter()
-                .any(|p| p.name == "references" && !p.required)
-        );
-        let observations = Arc::new(Mutex::new(TicketObservationState::default()));
-        let resolver = TicketItemResolver {
-            tools: operation_map(tools),
-            permissions: None,
-            collection_route: "/tickets".into(),
-            observations,
-        };
-        record_ticket_observation(
-            &resolver.observations,
-            Some("T-718"),
-            &json!({"ticket": "T-718", "body": "observed requirements"}),
-            false,
-        );
-        let bound = resolver.resolve("T-718").unwrap();
-        let before = bound.object.validator;
-        let other = resolver.resolve("T-719").unwrap().object.validator;
-        let mut input = close_input();
         input.as_object_mut().unwrap().remove("ticket");
-        let arguments = input
-            .as_object()
-            .unwrap()
-            .iter()
-            .map(|(key, value)| (key.clone(), json_to_wip(value).unwrap()))
-            .collect();
-        bound
-            .handler
-            .call(
-                "close",
-                &arguments,
-                WipCallContext {
-                    execution: ToolExecutionContext::direct(),
-                    security_context: "author".into(),
-                },
-            )
-            .await
-            .unwrap_or_else(|_| panic!("bound close should succeed"));
-        assert_ne!(before, resolver.resolve("T-718").unwrap().object.validator);
-        assert_eq!(other, resolver.resolve("T-719").unwrap().object.validator);
+        input["author"] = json!("self-reported-orchestrator");
+        backend
+            .update_case("T-739", serde_json::from_value(input.clone()).unwrap())
+            .unwrap();
         let requests = client.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0].path,
-            "/api/w/workspace/tickets/T-718/state-update"
-        );
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].path, "/api/w/workspace/tickets/T-739/record");
+        assert_eq!(requests[0].path, "/workspaces/workspace/tickets/T-739/case");
         let body: Value = serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            body,
-            json!({
-                "operation_key": "decision-1", "expected_content_digest": "content_digest-1",
-                "expected_state": "planning", "state": "closed",
-                "reason": "No repository changes are needed", "references": []
-            })
-        );
+        input.as_object_mut().unwrap().remove("author");
+        input["references"] = json!([]);
+        assert_eq!(body, input);
     }
 
-    #[tokio::test]
-    async fn native_ticket_close_preserves_backend_rejections_and_wip_permission_gate() {
-        for (status, code) in [
-            (403, ProtocolErrorCode::PermissionDenied),
-            (409, ProtocolErrorCode::InvalidArguments),
-        ] {
-            let client = decision_client(status, TicketWorkflowState::Planning);
-            let tools =
-                native_ticket_tools(client.clone(), TicketFeatureAccess::workflow()).unwrap();
-            let tool = tools
-                .iter()
-                .find(|tool| tool.name == "TicketClose")
-                .unwrap();
-            let error = execute_native_ticket_tool(
-                tool,
-                &None,
-                close_input(),
-                WipCallContext {
-                    execution: ToolExecutionContext::direct(),
-                    security_context: "self-reported-author".into(),
-                },
-            )
-            .await
-            .expect_err("Backend rejection must be preserved");
-            assert!(
-                matches!(error, WipOperationError::Protocol(ProtocolError { code: actual, .. }) if actual == code)
-            );
-            assert_eq!(client.requests.lock().unwrap().len(), 1);
-        }
-        let client = decision_client(200, TicketWorkflowState::Closed);
-        let tools = native_ticket_tools(client.clone(), TicketFeatureAccess::workflow()).unwrap();
-        let tool = tools
-            .iter()
-            .find(|tool| tool.name == "TicketClose")
-            .unwrap();
-        let permissions = Some(ToolPermissionConfig {
-            default_action: ToolPermissionAction::Deny,
-            rules: Vec::new(),
-        });
-        let error = execute_native_ticket_tool(
-            tool,
-            &permissions,
-            close_input(),
-            WipCallContext {
-                execution: ToolExecutionContext::direct(),
-                security_context: "author".into(),
-            },
-        )
-        .await
-        .expect_err("WIP permission denial must prevent dispatch");
-        assert!(matches!(
-            error,
-            WipOperationError::Protocol(ProtocolError {
-                code: ProtocolErrorCode::PermissionDenied,
-                ..
-            })
-        ));
+    #[test]
+    fn case_backend_rejects_creation_closed_and_untyped_state_change_without_dispatch() {
+        let client = decision_client(200, TicketState::Open);
+        let backend = WorkspaceHttpTicketBackend::new(client.clone());
+        let mut input = NewTicket::new("No bypass");
+        input.workflow_state = Some(TicketState::Closed);
+        assert!(
+            backend
+                .create(input)
+                .unwrap_err()
+                .to_string()
+                .contains("created open")
+        );
+        let change = TicketStateChange::new("open", "closed", "Decision", "Explanation");
+        assert!(
+            backend
+                .add_state_changed(TicketIdOrSlug::from("T-739"), change)
+                .is_err()
+        );
         assert!(client.requests.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn completion_accepts_mrless_decisions_and_forwards_cas_without_actor_claims() {
-        let client = decision_client(200, TicketWorkflowState::Done);
-        let (_, tool) = workspace_ticket_decision_definition(
-            client.clone(),
-            WorkspaceTicketDecisionKind::Complete,
-        )();
-        let output = tool
-            .execute(
-                &decision_input().to_string(),
-                ToolExecutionContext::direct(),
-            )
-            .await
-            .unwrap();
-        let projected: Value = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
-        assert_eq!(projected["meta"]["id"], "T-718");
-        assert_eq!(projected["meta"]["workflow_state"], "done");
-        let requests = client.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].path, "/api/w/workspace/tickets/T-718/complete");
-        assert_eq!(requests[0].method, WorkspaceRequestMethod::Post);
-        let body: Value = serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            body,
-            json!({
-                "operation_key": "decision-1", "expected_content_digest": "content_digest-1",
-                "expected_state": "planning", "reason": "No repository changes are needed", "references": []
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn state_updates_forward_each_display_state_without_other_control_operations() {
+    #[test]
+    fn query_schema_allows_only_open_and_closed_case_states() {
+        let client = decision_client(200, TicketState::Open);
+        let (meta, _) = workspace_ticket_read_definition(client, WorkspaceTicketReadKind::Query)();
+        let validator = jsonschema::validator_for(&meta.input_schema).unwrap();
+        assert!(validator.is_valid(&json!({"states":["open", "closed"]})));
         for state in [
             "planning",
             "ready",
             "queued",
+            "inprogress",
             "in_progress",
             "done",
-            "closed",
         ] {
-            let client = decision_client(200, TicketWorkflowState::Planning);
-            let (_, tool) = workspace_ticket_decision_definition(
-                client.clone(),
-                WorkspaceTicketDecisionKind::UpdateState,
-            )();
-            let mut input = decision_input();
-            input["state"] = json!(state);
-            tool.execute(&input.to_string(), ToolExecutionContext::direct())
-                .await
-                .unwrap();
-            let requests = client.requests.lock().unwrap();
-            assert_eq!(requests.len(), 1);
-            assert_eq!(
-                requests[0].path,
-                "/api/w/workspace/tickets/T-718/state-update"
+            assert!(!validator.is_valid(&json!({"states":[state]})));
+            assert!(
+                serde_json::from_value::<WorkspaceQueryTicketInput>(json!({"states":[state]}))
+                    .is_err()
             );
-            let mut expected = input.as_object().unwrap().clone();
-            expected.remove("ticket");
-            expected.insert("references".into(), json!([]));
-            let body: Value = serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
-            assert_eq!(body, Value::Object(expected));
         }
     }
 
     #[tokio::test]
-    async fn decision_inputs_require_reason_cas_and_reject_self_reported_authority_before_dispatch()
-    {
-        for kind in [
-            WorkspaceTicketDecisionKind::Complete,
-            WorkspaceTicketDecisionKind::UpdateState,
-            WorkspaceTicketDecisionKind::Close,
+    async fn case_update_forwards_all_judgments_and_replays_without_actor_or_repo_requirements() {
+        for (action, state, closure_key) in [
+            (
+                json!({"action":"close", "reason":"completed"}),
+                "open",
+                Value::Null,
+            ),
+            (
+                json!({"action":"close", "reason":"not_planned"}),
+                "open",
+                Value::Null,
+            ),
+            (
+                json!({"action":"close", "reason":"duplicate"}),
+                "open",
+                Value::Null,
+            ),
+            (
+                json!({"action":"close", "reason":"unknown"}),
+                "open",
+                Value::Null,
+            ),
+            (json!({"action":"reopen"}), "closed", json!("closed-1")),
+            (
+                json!({"action":"correct_closure", "reason":{"other":"Changed judgment"}}),
+                "closed",
+                json!("closed-1"),
+            ),
         ] {
-            let client = decision_client(200, TicketWorkflowState::Done);
-            let (meta, tool) = workspace_ticket_decision_definition(client.clone(), kind)();
-            let mut valid = decision_input();
-            if matches!(kind, WorkspaceTicketDecisionKind::UpdateState) {
-                valid["state"] = json!("ready");
+            let client = decision_client(200, TicketState::Closed);
+            let (meta, tool) = workspace_ticket_decision_definition(
+                client.clone(),
+                WorkspaceTicketDecisionKind::CaseUpdate,
+            )();
+            assert_eq!(meta.name, "TicketCaseUpdate");
+            let mut input = decision_input();
+            input["action"] = action;
+            input["expected_state"] = json!(state);
+            input["expected_closure_operation_key"] = closure_key;
+            input["references"] = json!([{"kind":"result", "target":"notes"}]);
+            assert!(
+                jsonschema::validator_for(&meta.input_schema)
+                    .unwrap()
+                    .is_valid(&input)
+            );
+            for _ in 0..2 {
+                let output = tool
+                    .execute(&input.to_string(), ToolExecutionContext::direct())
+                    .await
+                    .unwrap();
+                let projected: Value =
+                    serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+                assert_eq!(projected["meta"]["workflow_state"], "closed");
             }
-            let reason_field = if matches!(kind, WorkspaceTicketDecisionKind::Close) {
-                let reason = valid.as_object_mut().unwrap().remove("reason").unwrap();
-                valid["resolution"] = reason;
-                "resolution"
-            } else {
-                "reason"
-            };
-            let validator = jsonschema::validator_for(&meta.input_schema).unwrap();
-            assert!(validator.is_valid(&valid));
-            for field in [
-                "operation_key",
-                "expected_content_digest",
-                "expected_state",
-                reason_field,
-            ] {
-                let mut invalid = valid.clone();
-                invalid.as_object_mut().unwrap().remove(field);
-                assert!(!validator.is_valid(&invalid));
-                assert!(
-                    tool.execute(&invalid.to_string(), ToolExecutionContext::direct())
-                        .await
-                        .is_err()
-                );
+            let mut expected = input.as_object().unwrap().clone();
+            expected.remove("ticket");
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(requests.len(), 4);
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r.method == WorkspaceRequestMethod::Get)
+                    .count(),
+                2
+            );
+            for request in requests
+                .iter()
+                .filter(|r| r.method == WorkspaceRequestMethod::Post)
+            {
+                assert_eq!(request.path, "/workspaces/workspace/tickets/T-739/case");
+                assert_eq!(request.method, WorkspaceRequestMethod::Post);
+                let body: Value = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                assert_eq!(body, Value::Object(expected.clone()));
             }
-            for field in [
-                reason_field,
-                "operation_key",
-                "expected_content_digest",
-                "ticket",
-            ] {
-                let mut invalid = valid.clone();
-                invalid[field] = json!("  ");
-                assert!(
-                    tool.execute(&invalid.to_string(), ToolExecutionContext::direct())
-                        .await
-                        .is_err()
-                );
-            }
-            for field in [
-                "role",
-                "author",
-                "merge_request_ids",
-                "requirement_approval_event_id",
-            ] {
-                let mut invalid = valid.clone();
-                invalid[field] = json!("coder");
-                assert!(!validator.is_valid(&invalid));
-                assert!(
-                    tool.execute(&invalid.to_string(), ToolExecutionContext::direct())
-                        .await
-                        .is_err()
-                );
-            }
+        }
+    }
+
+    #[tokio::test]
+    async fn case_update_requires_observed_nullable_closure_cas_and_rejects_malformed_or_actor_claims()
+     {
+        let client = decision_client(200, TicketState::Closed);
+        let (meta, tool) = workspace_ticket_decision_definition(
+            client.clone(),
+            WorkspaceTicketDecisionKind::CaseUpdate,
+        )();
+        let validator = jsonschema::validator_for(&meta.input_schema).unwrap();
+        let valid = decision_input();
+        assert!(validator.is_valid(&valid));
+        for field in [
+            "ticket",
+            "operation_key",
+            "expected_content_digest",
+            "expected_state",
+            "expected_closure_operation_key",
+            "action",
+            "explanation",
+        ] {
             let mut invalid = valid.clone();
-            invalid["expected_state"] = json!("approved");
-            assert!(!validator.is_valid(&invalid));
+            invalid.as_object_mut().unwrap().remove(field);
+            assert!(
+                !validator.is_valid(&invalid),
+                "required schema field {field}"
+            );
+            assert!(
+                tool.execute(&invalid.to_string(), ToolExecutionContext::direct())
+                    .await
+                    .is_err(),
+                "required decode field {field}"
+            );
+        }
+        for (field, value) in [
+            ("expected_state", json!("done")),
+            ("expected_state", json!("queued")),
+            ("expected_closure_operation_key", json!(42)),
+            ("action", json!({"action":"close"})),
+            ("action", json!({"action":"close", "reason":"success"})),
+            ("action", json!({"action":"reopen", "reason":"completed"})),
+            ("actor", json!("orchestrator")),
+            ("author", json!("coder")),
+            ("role", json!("coder")),
+            ("merge_request_ids", json!([])),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert!(!validator.is_valid(&invalid), "schema accepts {invalid}");
+            assert!(
+                tool.execute(&invalid.to_string(), ToolExecutionContext::direct())
+                    .await
+                    .is_err(),
+                "decoder accepts {invalid}"
+            );
+        }
+        for field in [
+            "ticket",
+            "operation_key",
+            "expected_content_digest",
+            "explanation",
+            "expected_closure_operation_key",
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = json!("  ");
             assert!(
                 tool.execute(&invalid.to_string(), ToolExecutionContext::direct())
                     .await
                     .is_err()
             );
-            assert!(client.requests.lock().unwrap().is_empty());
         }
+        let mut invalid = valid;
+        invalid["action"] = json!({"action":"close", "reason":{"other":" "}});
+        assert!(
+            tool.execute(&invalid.to_string(), ToolExecutionContext::direct())
+                .await
+                .is_err()
+        );
+        assert!(client.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn decision_tools_preserve_backend_assignment_and_cas_rejections() {
+    async fn case_update_preserves_backend_cas_authority_rejections_and_wip_permission_gate() {
         for (status, code) in [
             (403, ProtocolErrorCode::PermissionDenied),
             (409, ProtocolErrorCode::InvalidArguments),
         ] {
-            let client = decision_client(status, TicketWorkflowState::Planning);
+            let client = decision_client(status, TicketState::Open);
             let tools =
                 native_ticket_tools(client.clone(), TicketFeatureAccess::work_report()).unwrap();
             let tool = tools
                 .iter()
-                .find(|tool| tool.name == "CompleteTicket")
+                .find(|tool| tool.name == "TicketCaseUpdate")
                 .unwrap();
             let error = execute_native_ticket_tool(
                 tool,
@@ -2934,70 +2428,89 @@ mod tests {
             );
             assert_eq!(client.requests.lock().unwrap().len(), 1);
         }
-    }
-
-    #[test]
-    fn native_ticket_decision_descriptions_preserve_intent_and_independent_lifecycle() {
-        let tools = native_ticket_tools(
-            decision_client(200, TicketWorkflowState::Ready),
-            TicketFeatureAccess::work_report(),
-        )
-        .unwrap();
-        let descriptor = ticket_descriptor(&tools, "Ticket", "bound").unwrap();
-        let complete = descriptor
-            .operations
+        let client = decision_client(200, TicketState::Closed);
+        let tools = native_ticket_tools(client.clone(), TicketFeatureAccess::workflow()).unwrap();
+        let tool = tools
             .iter()
-            .find(|op| op.name == "complete")
+            .find(|tool| tool.name == "TicketCaseUpdate")
             .unwrap();
-        let summary = &complete.documentation.as_ref().unwrap().summary;
-        assert!(summary.contains("Merge Requests and approvals are not prerequisites"));
-        assert!(summary.contains("return without conclusion need not call this tool"));
-        assert!(summary.contains("not real judgment"));
-        assert!(summary.contains("retaining terminal responsibility"));
-        assert!(summary.contains("does not grant review/merge authority or stop/remove Workers"));
+        let permissions = Some(ToolPermissionConfig {
+            default_action: ToolPermissionAction::Deny,
+            rules: Vec::new(),
+        });
+        let error = execute_native_ticket_tool(
+            tool,
+            &permissions,
+            decision_input(),
+            WipCallContext {
+                execution: ToolExecutionContext::direct(),
+                security_context: "author".into(),
+            },
+        )
+        .await
+        .expect_err("WIP denial prevents dispatch");
+        assert!(matches!(
+            error,
+            WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::PermissionDenied,
+                ..
+            })
+        ));
+        assert!(client.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn native_ticket_completion_binds_subject_and_stales_only_its_ticket_not_mrs() {
-        let client = decision_client(200, TicketWorkflowState::Done);
-        let observations = Arc::new(Mutex::new(TicketObservationState::default()));
+    async fn native_case_update_binds_subject_requires_closure_observation_and_stales_only_its_ticket()
+     {
+        let client = decision_client(200, TicketState::Closed);
         let tools =
             native_ticket_tools(client.clone(), TicketFeatureAccess::work_report()).unwrap();
         let descriptor = ticket_descriptor(&tools, "Ticket", "bound").unwrap();
-        let complete = descriptor
+        let case_update = descriptor
             .operations
             .iter()
-            .find(|op| op.name == "complete")
+            .find(|op| op.name == "case_update")
             .unwrap();
-        assert!(!complete.parameters.iter().any(|p| p.name == "ticket"));
+        assert!(
+            !case_update
+                .parameters
+                .iter()
+                .any(|p| p.name == "ticket" || p.name == "actor" || p.name == "author")
+        );
         for field in [
             "operation_key",
             "expected_content_digest",
             "expected_state",
-            "reason",
+            "expected_closure_operation_key",
+            "action",
+            "explanation",
         ] {
             assert!(
-                complete
+                case_update
                     .parameters
                     .iter()
                     .any(|p| p.name == field && p.required)
             );
         }
+        let summary = &case_update.documentation.as_ref().unwrap().summary;
+        assert!(summary.contains("Closed does not imply success"));
+        assert!(summary.contains("not real judgment"));
+        assert!(summary.contains("Return without conclusion need not call this tool"));
         let resolver = TicketItemResolver {
             tools: operation_map(tools),
             permissions: None,
             collection_route: "/tickets".into(),
-            observations: observations.clone(),
+            observations: Arc::new(Mutex::new(TicketObservationState::default())),
         };
         record_ticket_observation(
             &resolver.observations,
-            Some("T-718"),
-            &json!({"ticket": "T-718", "body": "observed requirements"}),
+            Some("T-739"),
+            &json!({"ticket":"T-739", "body":"observed requirements"}),
             false,
         );
-        let bound = resolver.resolve("T-718").unwrap();
+        let bound = resolver.resolve("T-739").unwrap();
         let before = bound.object.validator;
-        let other = resolver.resolve("T-719").unwrap().object.validator;
+        let other = resolver.resolve("T-740").unwrap().object.validator;
         let mut input = decision_input();
         input.as_object_mut().unwrap().remove("ticket");
         let arguments = input
@@ -3009,7 +2522,7 @@ mod tests {
         bound
             .handler
             .call(
-                "complete",
+                "case_update",
                 &arguments,
                 WipCallContext {
                     execution: ToolExecutionContext::direct(),
@@ -3017,13 +2530,32 @@ mod tests {
                 },
             )
             .await
-            .unwrap_or_else(|_| panic!("bound completion should succeed"));
-        assert_ne!(before, resolver.resolve("T-718").unwrap().object.validator);
-        assert_eq!(other, resolver.resolve("T-719").unwrap().object.validator);
-        assert_eq!(
-            client.requests.lock().unwrap()[0].path,
-            "/api/w/workspace/tickets/T-718/complete"
-        );
+            .unwrap_or_else(|_| panic!("WIP case update rejected"));
+        assert_ne!(before, resolver.resolve("T-739").unwrap().object.validator);
+        assert_eq!(other, resolver.resolve("T-740").unwrap().object.validator);
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].path, "/workspaces/workspace/tickets/T-739/case");
+        assert_eq!(requests[1].path, "/api/w/workspace/tickets/T-739/record");
+        let body: Value = serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        let mut expected = input;
+        expected["references"] = json!([]);
+        assert_eq!(body, expected);
+    }
+
+    #[tokio::test]
+    async fn case_update_never_falls_back_without_workspace_authority() {
+        let client = crate::worker::unavailable_workspace_client(None, "no Workspace configured");
+        let (_, tool) =
+            workspace_ticket_decision_definition(client, WorkspaceTicketDecisionKind::CaseUpdate)();
+        let error = tool
+            .execute(
+                &decision_input().to_string(),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Workspace identity"));
     }
 
     #[test]
@@ -3048,11 +2580,9 @@ mod tests {
                 "comment",
                 "mark_ready",
                 "queue",
-                "transition",
-                "close",
+                "case_update",
                 "record_relation",
                 "remove_relation",
-                "complete",
             ]
         );
         let item = ticket_descriptor(
@@ -3094,14 +2624,12 @@ mod tests {
                 "query",
                 "read",
                 "comment",
-                "transition",
-                "close",
+                "case_update",
                 "dependency_check",
                 "record_relation",
                 "remove_relation",
                 "record_orchestration_plan",
                 "query_orchestration_plans",
-                "complete",
             ]
         );
         assert_eq!(
@@ -3253,7 +2781,7 @@ mod tests {
             collection_route: "/tickets".into(),
             observations: Arc::clone(&observations),
         };
-        let response = json!({"ticket": "T-42", "body": "actual content", "state": "planning"});
+        let response = json!({"ticket": "T-42", "body": "actual content", "state": "open"});
         assert!(resolver.resolve("T-42").unwrap().object.validator.is_none());
         record_ticket_observation(&observations, Some("T-42"), &response, false);
         let observed = resolver.resolve("T-42").unwrap().object.validator;
@@ -3332,7 +2860,7 @@ mod tests {
         ));
         assert!(matches!(
             map_ticket_tool_error(ToolError::Internal(
-                "TicketClose outcome unknown after mutation: HTTP status 404".into()
+                "TicketCaseUpdate outcome unknown after mutation: HTTP status 404".into()
             )),
             WipOperationError::OutcomeUnknown(_)
         ));
@@ -3393,7 +2921,7 @@ mod tests {
         assert!(query.input_schema["properties"]["attention"].is_object());
         assert!(query.input_schema["properties"]["cursor"].is_object());
         let query_schema = serde_json::to_string(&query.input_schema).unwrap();
-        assert!(query_schema.contains("done_not_closed"));
+        assert!(!query_schema.contains("done_not_closed"));
         assert!(query_schema.contains("request_changes"));
         assert!(query_schema.contains("created_desc"));
         assert!(
@@ -3404,13 +2932,13 @@ mod tests {
         assert_eq!(show.name, "ShowTicket");
         assert!(show.input_schema["properties"]["event_limit"].is_object());
         let tool_names = TicketFeatureAccess::workspace_authoring().tool_names();
-        assert_eq!(tool_names.len(), 12);
+        assert_eq!(tool_names, WORKSPACE_AUTHORING_TOOL_NAMES);
         assert!(
             tool_names.len() < 13,
             "authoring catalog must stay below the prior broad catalog"
         );
         let workflow_names = TicketFeatureAccess::workflow().tool_names();
-        assert_eq!(workflow_names.len(), 11);
+        assert_eq!(workflow_names, WORKFLOW_TOOL_NAMES);
         assert!(
             workflow_names.len() < 12,
             "workflow catalog must stay below the prior broad catalog"
@@ -3482,7 +3010,7 @@ mod tests {
         assert!(workspace_tools.contains(&"TicketCreate"));
         assert!(workspace_tools.contains(&"TicketEditItem"));
         assert!(workspace_tools.contains(&"TicketQueue"));
-        assert!(workspace_tools.contains(&"TicketWorkflowState"));
+        assert!(workspace_tools.contains(&"TicketCaseUpdate"));
 
         let orchestration = workspace_feature(TicketFeatureAccess::workflow());
         let orchestration_descriptor = orchestration.descriptor();
@@ -3491,7 +3019,7 @@ mod tests {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
-        assert!(orchestration_tools.contains(&"TicketWorkflowState"));
+        assert!(orchestration_tools.contains(&"TicketCaseUpdate"));
         assert!(orchestration_tools.contains(&"TicketDependencyCheck"));
         assert!(orchestration_tools.contains(&"TicketRelationRecord"));
         assert!(orchestration_tools.contains(&"TicketOrchestrationPlanRecord"));
@@ -3506,8 +3034,7 @@ mod tests {
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
         assert!(work_report_tools.contains(&"TicketComment"));
-        assert!(work_report_tools.contains(&"CompleteTicket"));
-        assert!(work_report_tools.contains(&"TicketWorkflowState"));
+        assert!(work_report_tools.contains(&"TicketCaseUpdate"));
 
         let review = workspace_feature(TicketFeatureAccess::review());
         let review_descriptor = review.descriptor();
@@ -3516,8 +3043,7 @@ mod tests {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
-        assert!(!review_tools.contains(&"TicketWorkflowState"));
-        assert!(!review_tools.contains(&"CompleteTicket"));
+        assert!(!review_tools.contains(&"TicketCaseUpdate"));
     }
 
     #[test]
@@ -3566,7 +3092,7 @@ mod tests {
         assert!(installed.iter().any(|tool| *tool == "TicketQueue"));
         assert!(installed.iter().any(|tool| *tool == "TicketMarkReady"));
         assert!(!installed.iter().any(|tool| *tool == "TicketIntakeReady"));
-        assert!(installed.iter().any(|tool| *tool == "TicketWorkflowState"));
+        assert!(installed.iter().any(|tool| *tool == "TicketCaseUpdate"));
         assert!(
             !installed
                 .iter()
@@ -3623,7 +3149,7 @@ mod tests {
 
         let error = backend
             .invoke(TicketBackendOperation::DefaultIntakeReadyStateChangeBody {
-                from: "planning".to_string(),
+                from: "open".to_string(),
             })
             .unwrap_err();
 
@@ -3813,7 +3339,7 @@ mod tests {
         let created = sqlite.create(NewTicket::new("Ticket handoff")).unwrap();
         let mut ticket = sqlite.show(TicketIdOrSlug::Id(created.id.clone())).unwrap();
         ticket.meta.resource_key = Some("T-548".to_string());
-        ticket.meta.workflow_state = TicketWorkflowState::Queued;
+        ticket.meta.workflow_state = TicketState::Open;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -3843,7 +3369,7 @@ mod tests {
         server.join().unwrap();
         assert_eq!(handoff.id, created.id);
         assert_eq!(handoff.resource_key, "T-548");
-        assert_eq!(handoff.workflow_state, TicketWorkflowState::Queued);
+        assert_eq!(handoff.workflow_state, TicketState::Open);
     }
 
     #[test]

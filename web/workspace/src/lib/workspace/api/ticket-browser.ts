@@ -1,4 +1,5 @@
 import type {
+  BrowserTicketState,
   InvalidProjectRecord,
   MergeRequestDetailResponse,
   MergeRequestLinkedTicketResponse,
@@ -20,6 +21,10 @@ import type {
   TicketActionEligibility,
   TicketAssignmentPrincipal,
   TicketAssignmentSummary,
+  TicketCaseAction,
+  TicketCaseHistoryEntry,
+  TicketClosureJudgment,
+  TicketClosureReason,
   TicketDetail,
   TicketDetailDerivedRelation,
   TicketDetailRelation,
@@ -29,14 +34,17 @@ import type {
   TicketEventDetail,
   TicketEvidenceEvent,
   TicketEvidenceSummary,
+  TicketLegacyWorkflowSnapshot,
   TicketListItemSummary,
   TicketListResponse,
   TicketMergeRequestSummary,
   TicketQueueOutcome,
   TicketRef,
+  TicketReference,
   TicketRoleAssignmentMutationResponse,
   TicketRoleAssignmentRecord,
   TicketRoleAssignmentSummary,
+  TicketSummary,
   TicketTarget,
 } from "#lib/generated/ticket-api.ts";
 
@@ -183,12 +191,208 @@ function parseInvalidProjectRecord(
   };
 }
 
+function parseTicketState(value: unknown, label: string): BrowserTicketState {
+  if (value !== "open" && value !== "closed") {
+    throw new Error(`${label} is invalid`);
+  }
+  return value;
+}
+
+function parseClosureReason(
+  value: unknown,
+  label: string,
+): TicketClosureReason {
+  if (
+    typeof value === "string" &&
+    ["completed", "not_planned", "duplicate", "unknown"].includes(value)
+  ) {
+    return value as TicketClosureReason;
+  }
+  const item = object(value, label);
+  exact(item, ["other"], label);
+  return { other: string(item.other, `${label}.other`) };
+}
+
+function parseCaseAction(value: unknown, label: string): TicketCaseAction {
+  const item = object(value, label);
+  if (item.action === "reopen") {
+    exact(item, ["action"], label);
+    return { action: "reopen" };
+  }
+  if (item.action !== "close" && item.action !== "correct_closure") {
+    throw new Error(`${label}.action is invalid`);
+  }
+  exact(item, ["action", "reason"], label);
+  return {
+    action: item.action,
+    reason: parseClosureReason(item.reason, `${label}.reason`),
+  };
+}
+
+function parseReference(value: unknown, label: string): TicketReference {
+  const item = object(value, label);
+  exact(item, ["kind", "target"], label);
+  return {
+    kind: string(item.kind, `${label}.kind`),
+    target: string(item.target, `${label}.target`),
+  };
+}
+
+function parseClosure(value: unknown, label: string): TicketClosureJudgment {
+  const item = object(value, label);
+  exact(item, [
+    "operation_key",
+    "reason",
+    "explanation",
+    "references",
+    "author",
+    "at",
+  ], label);
+  return {
+    operation_key: string(item.operation_key, `${label}.operation_key`),
+    reason: parseClosureReason(item.reason, `${label}.reason`),
+    explanation: string(item.explanation, `${label}.explanation`),
+    references: array(item.references, `${label}.references`, parseReference),
+    author: string(item.author, `${label}.author`),
+    at: string(item.at, `${label}.at`),
+  };
+}
+
+function parseCaseHistory(
+  value: unknown,
+  label: string,
+): TicketCaseHistoryEntry {
+  const item = object(value, label);
+  exact(item, [
+    "operation_key",
+    "previous_closure_operation_key",
+    "action",
+    "explanation",
+    "references",
+    "author",
+    "at",
+  ], label);
+  return {
+    operation_key: string(item.operation_key, `${label}.operation_key`),
+    previous_closure_operation_key: optionalNullableString(
+      item.previous_closure_operation_key,
+      `${label}.previous_closure_operation_key`,
+    ),
+    action: parseCaseAction(item.action, `${label}.action`),
+    explanation: string(item.explanation, `${label}.explanation`),
+    references: array(item.references, `${label}.references`, parseReference),
+    author: string(item.author, `${label}.author`),
+    at: string(item.at, `${label}.at`),
+  };
+}
+
+function parseLegacyHandoff(
+  value: unknown,
+  label: string,
+): TicketLegacyWorkflowSnapshot {
+  const item = object(value, label);
+  exact(item, [
+    "workflow_state",
+    "workflow_state_explicit",
+    "status",
+    "queued_by",
+    "queued_at",
+    "resolution",
+  ], label);
+  return {
+    workflow_state: string(item.workflow_state, `${label}.workflow_state`),
+    workflow_state_explicit: boolean(
+      item.workflow_state_explicit,
+      `${label}.workflow_state_explicit`,
+    ),
+    status: string(item.status, `${label}.status`),
+    queued_by: optionalNullableString(item.queued_by, `${label}.queued_by`),
+    queued_at: optionalNullableString(item.queued_at, `${label}.queued_at`),
+    resolution: optionalNullableString(item.resolution, `${label}.resolution`),
+  };
+}
+
+function caseProjection(item: Record<string, unknown>, label: string) {
+  return {
+    closure_operation_key: optionalNullableString(
+      item.closure_operation_key,
+      `${label}.closure_operation_key`,
+    ),
+    current_closure: item.current_closure === undefined
+      ? undefined
+      : item.current_closure === null
+      ? null
+      : parseClosure(item.current_closure, `${label}.current_closure`),
+    legacy_handoff: item.legacy_handoff === undefined
+      ? undefined
+      : item.legacy_handoff === null
+      ? null
+      : parseLegacyHandoff(item.legacy_handoff, `${label}.legacy_handoff`),
+  };
+}
+
+export function parseTicketSummary(value: unknown): TicketSummary {
+  const label = "Ticket summary";
+  const item = object(value, label);
+  exact(item, [
+    "id",
+    "kind",
+    "labels",
+    "priority",
+    "queued_at",
+    "queued_by",
+    "readiness",
+    "resource_key",
+    "slug",
+    "status",
+    "title",
+    "updated_at",
+    "workflow_state",
+    "workflow_state_explicit",
+  ], label);
+  let status: TicketSummary["status"];
+  if (item.status === "Open" || item.status === "Closed") status = item.status;
+  else {
+    const other = object(item.status, `${label}.status`);
+    exact(other, ["Other"], `${label}.status`);
+    status = { Other: string(other.Other, `${label}.status.Other`) };
+  }
+  return {
+    id: string(item.id, `${label}.id`),
+    kind: string(item.kind, `${label}.kind`),
+    labels: strings(item.labels, `${label}.labels`),
+    priority: string(item.priority, `${label}.priority`),
+    queued_at: optionalNullableString(item.queued_at, `${label}.queued_at`),
+    queued_by: optionalNullableString(item.queued_by, `${label}.queued_by`),
+    readiness: optionalNullableString(item.readiness, `${label}.readiness`),
+    resource_key: optionalNullableString(
+      item.resource_key,
+      `${label}.resource_key`,
+    ),
+    slug: string(item.slug, `${label}.slug`),
+    status,
+    title: string(item.title, `${label}.title`),
+    updated_at: optionalNullableString(item.updated_at, `${label}.updated_at`),
+    workflow_state: parseTicketState(
+      item.workflow_state,
+      `${label}.workflow_state`,
+    ),
+    workflow_state_explicit: boolean(
+      item.workflow_state_explicit,
+      `${label}.workflow_state_explicit`,
+    ),
+  };
+}
+
 function parseTicketListItem(
   value: unknown,
   label: string,
 ): TicketListItemSummary {
   const item = object(value, label);
   exact(item, [
+    "closure_operation_key",
+    "current_closure",
+    "legacy_handoff",
     "id",
     "priority",
     "queued_at",
@@ -201,13 +405,14 @@ function parseTicketListItem(
     "workspace_action_priority",
   ], label);
   return {
+    ...caseProjection(item, label),
     id: string(item.id, `${label}.id`),
     priority: string(item.priority, `${label}.priority`),
     queued_at: optionalNullableString(item.queued_at, `${label}.queued_at`),
     queued_by: optionalNullableString(item.queued_by, `${label}.queued_by`),
     record_source: string(item.record_source, `${label}.record_source`),
     resource_key: string(item.resource_key, `${label}.resource_key`),
-    state: string(item.state, `${label}.state`),
+    state: parseTicketState(item.state, `${label}.state`),
     title: string(item.title, `${label}.title`),
     updated_at: optionalNullableString(item.updated_at, `${label}.updated_at`),
     workspace_action_priority: string(
@@ -727,6 +932,7 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     "artifacts",
     "assignment_diagnostics",
     "assignments",
+    "closure_history",
     "body",
     "body_truncated",
     "created_at",
@@ -735,6 +941,9 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     "event_page",
     "events",
     "evidence",
+    "closure_operation_key",
+    "current_closure",
+    "legacy_handoff",
     "id",
     "implementation_reports",
     "content_digest",
@@ -756,6 +965,12 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     "updated_at",
   ], label);
   return {
+    ...caseProjection(item, label),
+    closure_history: array(
+      item.closure_history,
+      `${label}.closure_history`,
+      parseCaseHistory,
+    ),
     action_eligibility: parseActionEligibility(
       item.action_eligibility,
       `${label}.action_eligibility`,
@@ -820,7 +1035,7 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     resolution: optionalNullableString(item.resolution, `${label}.resolution`),
     resource_key: string(item.resource_key, `${label}.resource_key`),
     risk_flags: strings(item.risk_flags, `${label}.risk_flags`),
-    state: string(item.state, `${label}.state`),
+    state: parseTicketState(item.state, `${label}.state`),
     targets: array(item.targets, `${label}.targets`, parseTicketTarget),
     title: string(item.title, `${label}.title`),
     updated_at: optionalNullableString(item.updated_at, `${label}.updated_at`),

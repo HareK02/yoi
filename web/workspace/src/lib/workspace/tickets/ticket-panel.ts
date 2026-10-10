@@ -4,35 +4,12 @@ import type {
   TicketListItemSummary,
 } from "#lib/generated/ticket-api.ts";
 
-export const TICKET_STATES = [
-  "planning",
-  "ready",
-  "queued",
-  "inprogress",
-  "done",
-  "closed",
-] as const;
-
+export const TICKET_STATES = ["open", "closed"] as const;
 export type TicketState = (typeof TICKET_STATES)[number];
-
 export type WorkspaceOrchestratorStatus = BrowserWorkspaceOrchestratorResponse;
-
 const LANE_DEFINITIONS = [
-  {
-    id: "ready-planning",
-    label: "Ready + Planning",
-    states: ["ready", "planning"],
-  },
-  {
-    id: "inprogress-queued",
-    label: "In progress + Queued",
-    states: ["inprogress", "queued"],
-  },
-  {
-    id: "done-closed",
-    label: "Done + Closed",
-    states: ["done", "closed"],
-  },
+  { id: "open", label: "Open", states: ["open"] },
+  { id: "closed", label: "Closed", states: ["closed"] },
 ] as const;
 
 export const TICKET_LANE_PAGE_SIZE = 30;
@@ -43,15 +20,6 @@ export type TicketCardSummary = Pick<
   TicketListItemSummary,
   "id" | "resource_key" | "title" | "state" | "priority" | "updated_at"
 >;
-
-const STATE_SORT_ORDER = new Map<string, number>([
-  ["ready", 0],
-  ["planning", 1],
-  ["inprogress", 0],
-  ["queued", 1],
-  ["done", 0],
-  ["closed", 1],
-]);
 
 export type TicketLane = {
   id: TicketLaneId;
@@ -77,9 +45,6 @@ export function sortTickets(
   tickets: TicketCardSummary[],
 ): TicketCardSummary[] {
   return [...tickets].sort((left, right) => {
-    const stateDelta = (STATE_SORT_ORDER.get(left.state) ?? 99) -
-      (STATE_SORT_ORDER.get(right.state) ?? 99);
-    if (stateDelta !== 0) return stateDelta;
     const updatedDelta = updatedAt(right) - updatedAt(left);
     if (updatedDelta !== 0) return updatedDelta;
     return left.id.localeCompare(right.id);

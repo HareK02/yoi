@@ -298,30 +298,6 @@
         ],
         "type": "object"
       },
-      "BrowserCloseTicketRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "expected_content_digest": {
-            "type": "string"
-          },
-          "expected_state": {
-            "$ref": "#/components/schemas/BrowserTicketWorkflowState"
-          },
-          "operation_key": {
-            "type": "string"
-          },
-          "resolution": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "operation_key",
-          "expected_content_digest",
-          "expected_state",
-          "resolution"
-        ],
-        "type": "object"
-      },
       "BrowserCreateWorkerResponse": {
         "additionalProperties": false,
         "properties": {
@@ -411,6 +387,13 @@
         "additionalProperties": false,
         "type": "object"
       },
+      "BrowserTicketState": {
+        "enum": [
+          "open",
+          "closed"
+        ],
+        "type": "string"
+      },
       "BrowserTicketTargetEdit": {
         "oneOf": [
           {
@@ -456,51 +439,6 @@
           "implementation_report"
         ],
         "type": "string"
-      },
-      "BrowserTicketWorkflowState": {
-        "enum": [
-          "planning",
-          "ready",
-          "queued",
-          "inprogress",
-          "done",
-          "closed"
-        ],
-        "type": "string"
-      },
-      "BrowserTransitionTicketStateRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "body": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "expected_content_digest": {
-            "type": "string"
-          },
-          "expected_state": {
-            "$ref": "#/components/schemas/BrowserTicketWorkflowState"
-          },
-          "operation_key": {
-            "type": "string"
-          },
-          "reason": {
-            "type": "string"
-          },
-          "state": {
-            "$ref": "#/components/schemas/BrowserTicketWorkflowState"
-          }
-        },
-        "required": [
-          "state",
-          "operation_key",
-          "expected_content_digest",
-          "expected_state",
-          "reason"
-        ],
-        "type": "object"
       },
       "BrowserWorkerWorkingDirectorySelection": {
         "additionalProperties": false,
@@ -1088,37 +1026,6 @@
           "target",
           "condition",
           "synthetic"
-        ],
-        "type": "object"
-      },
-      "CompleteTicketRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "expected_content_digest": {
-            "type": "string"
-          },
-          "expected_state": {
-            "$ref": "#/components/schemas/TicketWorkflowState"
-          },
-          "operation_key": {
-            "type": "string"
-          },
-          "reason": {
-            "type": "string"
-          },
-          "references": {
-            "default": [],
-            "items": {
-              "$ref": "#/components/schemas/TicketReference"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "operation_key",
-          "expected_content_digest",
-          "expected_state",
-          "reason"
         ],
         "type": "object"
       },
@@ -5638,7 +5545,7 @@
           "workflow_state": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/TicketWorkflowState"
+                "$ref": "#/components/schemas/TicketState"
               },
               {
                 "type": "null"
@@ -10598,6 +10505,29 @@
             },
             "type": "array"
           },
+          "case_history": {
+            "items": {
+              "$ref": "#/components/schemas/TicketCaseHistoryEntry"
+            },
+            "type": "array"
+          },
+          "closure_operation_key": {
+            "description": "Last closure/correction operation key; retained when reopened (ABA guard).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current_closure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketClosureJudgment"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "document": {
             "$ref": "#/components/schemas/TicketDocument"
           },
@@ -10606,6 +10536,16 @@
               "$ref": "#/components/schemas/TicketEvent"
             },
             "type": "array"
+          },
+          "legacy_workflow_snapshot": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketLegacyWorkflowSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "meta": {
             "$ref": "#/components/schemas/TicketMeta"
@@ -10629,7 +10569,8 @@
           "document",
           "events",
           "artifacts",
-          "relations"
+          "relations",
+          "case_history"
         ],
         "type": "object"
       },
@@ -10777,6 +10718,19 @@
         ],
         "type": "object"
       },
+      "TicketAttention": {
+        "enum": [
+          "unresolved_review",
+          "missing_commit",
+          "blocked",
+          "unblocked",
+          "awaiting_review",
+          "unresolved_changes",
+          "stale_after_rescope",
+          "missing_evidence"
+        ],
+        "type": "string"
+      },
       "TicketBodyReplacement": {
         "properties": {
           "new_string": {
@@ -10796,12 +10750,105 @@
         ],
         "type": "object"
       },
-      "TicketCompletion": {
-        "additionalProperties": false,
-        "description": "Audited completion independent of repositories, Git, or Merge Requests.",
+      "TicketCaseAction": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "const": "close",
+                "type": "string"
+              },
+              "reason": {
+                "$ref": "#/components/schemas/TicketClosureReason"
+              }
+            },
+            "required": [
+              "action",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "const": "reopen",
+                "type": "string"
+              }
+            },
+            "required": [
+              "action"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "const": "correct_closure",
+                "type": "string"
+              },
+              "reason": {
+                "$ref": "#/components/schemas/TicketClosureReason"
+              }
+            },
+            "required": [
+              "action",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "TicketCaseHistoryEntry": {
+        "description": "Immutable case decision, including reopening and corrections. A correction\nadds a new judgment; it never overwrites the old reason, actor or references.",
         "properties": {
+          "action": {
+            "$ref": "#/components/schemas/TicketCaseAction"
+          },
+          "at": {
+            "type": "string"
+          },
           "author": {
-            "default": null,
+            "type": "string"
+          },
+          "explanation": {
+            "type": "string"
+          },
+          "operation_key": {
+            "type": "string"
+          },
+          "previous_closure_operation_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "references": {
+            "items": {
+              "$ref": "#/components/schemas/TicketReference"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "operation_key",
+          "action",
+          "explanation",
+          "references",
+          "author",
+          "at"
+        ],
+        "type": "object"
+      },
+      "TicketCaseUpdateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/TicketCaseAction"
+          },
+          "expected_closure_operation_key": {
             "type": [
               "string",
               "null"
@@ -10811,12 +10858,12 @@
             "type": "string"
           },
           "expected_state": {
-            "$ref": "#/components/schemas/TicketWorkflowState"
+            "$ref": "#/components/schemas/TicketState"
           },
-          "operation_key": {
+          "explanation": {
             "type": "string"
           },
-          "reason": {
+          "operation_key": {
             "type": "string"
           },
           "references": {
@@ -10830,10 +10877,72 @@
         "required": [
           "expected_content_digest",
           "expected_state",
+          "expected_closure_operation_key",
           "operation_key",
-          "reason"
+          "action",
+          "explanation"
         ],
         "type": "object"
+      },
+      "TicketClosureJudgment": {
+        "properties": {
+          "at": {
+            "type": "string"
+          },
+          "author": {
+            "type": "string"
+          },
+          "explanation": {
+            "type": "string"
+          },
+          "operation_key": {
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/TicketClosureReason"
+          },
+          "references": {
+            "items": {
+              "$ref": "#/components/schemas/TicketReference"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "operation_key",
+          "reason",
+          "explanation",
+          "references",
+          "author",
+          "at"
+        ],
+        "type": "object"
+      },
+      "TicketClosureReason": {
+        "description": "Reason attached to a closure judgment, not a classification tag or success inference.\n`Other` must be nonblank, at most 1024 UTF-8 bytes, and contain no NUL.",
+        "oneOf": [
+          {
+            "enum": [
+              "completed",
+              "not_planned",
+              "duplicate",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "other": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "other"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "TicketDependencyCheck": {
         "properties": {
@@ -10904,6 +11013,19 @@
           "body_truncated": {
             "type": "boolean"
           },
+          "closure_history": {
+            "items": {
+              "$ref": "#/components/schemas/TicketCaseHistoryEntry"
+            },
+            "type": "array"
+          },
+          "closure_operation_key": {
+            "description": "Last closure/correction key, retained across reopening for ABA-safe CAS.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "content_digest": {
             "type": "string"
           },
@@ -10911,6 +11033,16 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "current_closure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketClosureJudgment"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "current_worker": {
@@ -10949,6 +11081,17 @@
               "$ref": "#/components/schemas/TicketEvidenceEvent"
             },
             "type": "array"
+          },
+          "legacy_handoff": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketLegacyWorkflowSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Original migration handoff; not another current state authority."
           },
           "linked_objectives": {
             "items": {
@@ -11015,7 +11158,7 @@
             "type": "array"
           },
           "state": {
-            "type": "string"
+            "$ref": "#/components/schemas/BrowserTicketState"
           },
           "targets": {
             "items": {
@@ -11057,7 +11200,8 @@
           "action_eligibility",
           "merge_requests",
           "evidence",
-          "record_source"
+          "record_source",
+          "closure_history"
         ],
         "type": "object"
       },
@@ -11696,6 +11840,44 @@
         },
         "type": "object"
       },
+      "TicketLegacyWorkflowSnapshot": {
+        "description": "Original migration snapshot for downstream routing/tracking handoff only.\nThis is not a second current state authority.",
+        "properties": {
+          "queued_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "queued_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolution": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "workflow_state": {
+            "type": "string"
+          },
+          "workflow_state_explicit": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "workflow_state",
+          "workflow_state_explicit",
+          "status"
+        ],
+        "type": "object"
+      },
       "TicketListHttpQuery": {
         "additionalProperties": false,
         "properties": {
@@ -11726,8 +11908,36 @@
       "TicketListItemSummary": {
         "additionalProperties": false,
         "properties": {
+          "closure_operation_key": {
+            "description": "Last closure/correction key, retained across reopening for ABA-safe CAS.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current_closure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketClosureJudgment"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "id": {
             "type": "string"
+          },
+          "legacy_handoff": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketLegacyWorkflowSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Original migration handoff; not another current state authority."
           },
           "priority": {
             "type": "string"
@@ -11751,7 +11961,7 @@
             "type": "string"
           },
           "state": {
-            "type": "string"
+            "$ref": "#/components/schemas/BrowserTicketState"
           },
           "title": {
             "type": "string"
@@ -12014,7 +12224,8 @@
             ]
           },
           "workflow_state": {
-            "$ref": "#/components/schemas/TicketWorkflowState"
+            "$ref": "#/components/schemas/TicketState",
+            "description": "Case state only; field name retained temporarily, never execution progress."
           },
           "workflow_state_explicit": {
             "type": "boolean"
@@ -12070,6 +12281,13 @@
             "minimum": 0,
             "type": "integer"
           },
+          "closure_operation_key": {
+            "description": "Last closure/correction key, retained across reopening for ABA-safe CAS.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "content_digest": {
             "type": "string"
           },
@@ -12077,6 +12295,16 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "current_closure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketClosureJudgment"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "current_worker": {
@@ -12094,6 +12322,17 @@
           },
           "id": {
             "type": "string"
+          },
+          "legacy_handoff": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketLegacyWorkflowSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Original migration handoff; not another current state authority."
           },
           "linked_objective_ids": {
             "items": {
@@ -12164,7 +12403,7 @@
             ]
           },
           "state": {
-            "type": "string"
+            "$ref": "#/components/schemas/BrowserTicketState"
           },
           "title": {
             "type": "string"
@@ -12217,7 +12456,7 @@
           "attention": {
             "default": [],
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/TicketAttention"
             },
             "type": "array"
           },
@@ -12289,7 +12528,7 @@
           "states": {
             "default": [],
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/BrowserTicketState"
             },
             "type": "array"
           },
@@ -12449,7 +12688,7 @@
       "TicketRelationBlocker": {
         "properties": {
           "blocking_state": {
-            "$ref": "#/components/schemas/TicketWorkflowState"
+            "$ref": "#/components/schemas/TicketState"
           },
           "blocking_ticket": {
             "type": "string"
@@ -12762,48 +13001,12 @@
           }
         ]
       },
-      "TicketStateUpdate": {
-        "additionalProperties": false,
-        "description": "External state mutation with content/state CAS and an immutable operation receipt.\nExact replay returns the current authoritative Ticket without a new event or\nreapplying the recorded state, even after later edits or reopening.\nSetting `state` to Closed also stores `reason` as the resolution; reopening\nchanges Ticket metadata only and never revives released work identities.",
-        "properties": {
-          "author": {
-            "default": null,
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "expected_content_digest": {
-            "type": "string"
-          },
-          "expected_state": {
-            "$ref": "#/components/schemas/TicketWorkflowState"
-          },
-          "operation_key": {
-            "type": "string"
-          },
-          "reason": {
-            "type": "string"
-          },
-          "references": {
-            "default": [],
-            "items": {
-              "$ref": "#/components/schemas/TicketReference"
-            },
-            "type": "array"
-          },
-          "state": {
-            "$ref": "#/components/schemas/TicketWorkflowState"
-          }
-        },
-        "required": [
-          "expected_content_digest",
-          "expected_state",
-          "state",
-          "operation_key",
-          "reason"
+      "TicketState": {
+        "enum": [
+          "open",
+          "closed"
         ],
-        "type": "object"
+        "type": "string"
       },
       "TicketStatus": {
         "enum": [
@@ -12869,7 +13072,8 @@
             ]
           },
           "workflow_state": {
-            "$ref": "#/components/schemas/TicketWorkflowState"
+            "$ref": "#/components/schemas/TicketState",
+            "description": "Case state only; field name retained temporarily, never execution progress."
           },
           "workflow_state_explicit": {
             "type": "boolean"
@@ -12993,17 +13197,6 @@
           "connection_id"
         ],
         "type": "object"
-      },
-      "TicketWorkflowState": {
-        "enum": [
-          "planning",
-          "ready",
-          "queued",
-          "in_progress",
-          "done",
-          "closed"
-        ],
-        "type": "string"
       },
       "TicketWorkspaceNextAction": {
         "enum": [
@@ -16135,7 +16328,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:fc25104c077ab8c5c43f77611f505171585d2d40fd54c6538774ac17aae6cce3"
+    "x-yoi-source-digest": "sha256:6f5ab2a613fca9996680d3a08962dc580563457811e68679574ff4325c86ec4e"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -34048,260 +34241,6 @@
         ]
       }
     },
-    "/api/w/{workspace_id}/tickets/{id}/close": {
-      "post": {
-        "operationId": "ticket_close",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/BrowserCloseTicketRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TicketDetail"
-                }
-              }
-            },
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
-    "/api/w/{workspace_id}/tickets/{id}/complete": {
-      "post": {
-        "operationId": "ticket_complete",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CompleteTicketRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Ticket"
-                }
-              }
-            },
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
     "/api/w/{workspace_id}/tickets/{id}/dependency-check": {
       "get": {
         "operationId": "ticket_dependency_check",
@@ -35744,510 +35683,6 @@
         ]
       }
     },
-    "/api/w/{workspace_id}/tickets/{id}/state": {
-      "post": {
-        "operationId": "ticket_state_transition",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/BrowserTransitionTicketStateRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TicketDetail"
-                }
-              }
-            },
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
-    "/api/w/{workspace_id}/tickets/{id}/state-changes": {
-      "post": {
-        "operationId": "ticket_state_change_add",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TicketStateUpdate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
-    "/api/w/{workspace_id}/tickets/{id}/state-fields/{field}": {
-      "post": {
-        "operationId": "ticket_state_field_set",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "field",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TicketStateUpdate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
-    "/api/w/{workspace_id}/tickets/{id}/state-update": {
-      "post": {
-        "operationId": "ticket_state_update",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TicketStateUpdate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Ticket"
-                }
-              }
-            },
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
     "/api/w/{workspace_id}/tickets/{id}/thread-events": {
       "post": {
         "operationId": "ticket_thread_event_add",
@@ -36328,246 +35763,6 @@
             "description": "Error response"
           },
           "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
-    "/api/w/{workspace_id}/tickets/{id}/workflow-state": {
-      "post": {
-        "operationId": "ticket_workflow_state_set",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TicketStateUpdate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
-    "/api/w/{workspace_id}/tickets/{id}/workflow/close": {
-      "post": {
-        "operationId": "ticket_close_record",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TicketCompletion"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "422": {
             "content": {
               "application/json": {
                 "schema": {
@@ -38875,6 +38070,133 @@
             "description": "Error response"
           }
         }
+      }
+    },
+    "/workspaces/{workspace_id}/tickets/{ticket_id}/case": {
+      "post": {
+        "operationId": "ticket_case_update",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TicketCaseUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketSummary"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
       }
     }
   }

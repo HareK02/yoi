@@ -131,8 +131,7 @@ async fn generated_cancellation_errors_preserve_response_and_log_details() {
         })
         .unwrap();
     let backend = browser_ticket_backend(&api).unwrap();
-    let mut input = ticket::NewTicket::new("Cancellation logging");
-    input.workflow_state = Some(TicketWorkflowState::InProgress);
+    let input = ticket::NewTicket::new("Cancellation logging");
     let ticket = backend.create(input).unwrap();
     api.store
         .set_current_ticket_worker_assignment(
@@ -197,8 +196,8 @@ async fn generated_cancellation_errors_preserve_response_and_log_details() {
         "{diagnostics}"
     );
     assert_eq!(
-        api.authority.ticket(&ticket.id).unwrap().state,
-        "inprogress"
+        api.authority.ticket(&ticket.id).unwrap().state.as_str(),
+        "open"
     );
 
     // Errors without diagnostics still carry a useful kind and message.
@@ -213,7 +212,32 @@ async fn generated_cancellation_errors_preserve_response_and_log_details() {
     *execution.cancel_failure.lock().unwrap() = None;
     let (status, body, events) = request_with_logs(app, request("body-secret")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["state"], "ready");
+    assert_eq!(body["state"], "open");
+    assert!(
+        api.store
+            .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        api.store
+            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket.id)
+            .unwrap()
+            .is_none()
+    );
+    let assignment_history = api
+        .store
+        .list_ticket_worker_assignment_events(TEST_WORKSPACE_ID, &ticket.id, 10)
+        .unwrap();
+    assert!(
+        assignment_history
+            .iter()
+            .any(|event| event.action == "unassigned"
+                && event.previous_assignment_id.as_deref() == Some("logging-assignment"))
+    );
+    let after = backend.show(ticket.id.into()).unwrap();
+    assert!(after.case_history.is_empty());
+    assert!(after.current_closure.is_none());
     assert!(
         events.is_empty(),
         "successful cancellation logged as failure: {events:?}"

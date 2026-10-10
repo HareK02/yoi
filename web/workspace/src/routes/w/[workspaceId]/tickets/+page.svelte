@@ -168,7 +168,7 @@
       labels: [],
       body: createBody,
       risk_flags: [],
-      workflow_state: "planning",
+      workflow_state: "open",
       targets: normalizedCreateTargets(),
     };
     try {
@@ -297,7 +297,7 @@
     </p>
   {:else if !orchestrator.data?.online}
     <p class="workspace-callout">
-      Orchestrator is offline. Requests can be queued; progress and results can still be recorded directly.
+      Orchestrator is offline. Requests can be queued; case decisions and results can still be recorded directly.
     </p>
   {/if}
 
