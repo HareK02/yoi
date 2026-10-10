@@ -8837,62 +8837,14 @@ pub struct RuntimeSummary {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum WorkspaceRuntimeBindingState {
-    Configured,
-    Verified,
-    Revoked,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeConnectionDisplayState {
-    Configured,
-    Verified,
-    Unavailable,
-    Revoked,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeVerificationOutcome {
-    Verified,
-    ChallengeIssued,
-    VerificationFailed,
-    ConnectivityFailed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeVerificationEvidenceSummary {
-    pub verified_at: Option<String>,
-    pub last_checked_at: String,
-    pub last_outcome: RuntimeVerificationOutcome,
-    pub binding_id: String,
-    pub workspace_key_id: String,
-    pub workspace_public_key_fingerprint: String,
-    pub workspace_trust_id: String,
-    pub runtime_public_key_fingerprint: String,
-}
-
+/// Binding identity and explicit revocation only. Each signed request authenticates
+/// using the current Workspace signing identity, not a stored approval.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceRuntimeBindingSummary {
-    pub state: WorkspaceRuntimeBindingState,
-    pub connection_state: RuntimeConnectionDisplayState,
     pub binding_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_key_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_trust_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification: Option<RuntimeVerificationEvidenceSummary>,
+    pub revoked_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -9076,9 +9028,6 @@ pub struct RuntimePublicIdentityBundle {
 #[serde(deny_unknown_fields)]
 pub struct CreateRemoteRuntimeRequest {
     pub public_bundle: RuntimePublicIdentityBundle,
-    /// Exact Runtime-issued enrollment identity from `trust-workspace add/show`.
-    /// A key fingerprint alone cannot distinguish revocation and re-enrollment.
-    pub workspace_trust_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub endpoint: String,
@@ -9121,12 +9070,11 @@ pub enum RuntimeConnectionTestFailureKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
+/// Observation of an actual signed ping, not a grant or cached approval.
 pub struct RuntimeConnectionTestResponse {
     pub workspace_id: String,
     pub runtime_id: String,
     pub binding_id: String,
-    pub connection_state: RuntimeConnectionDisplayState,
-    pub verification: Option<RuntimeVerificationEvidenceSummary>,
     pub checked_at: String,
     pub status: RuntimeConnectionTestStatus,
     pub failure_kind: Option<RuntimeConnectionTestFailureKind>,
@@ -12626,18 +12574,22 @@ mod tests {
     }
 
     #[test]
-    fn runtime_registration_requires_explicit_runtime_issued_trust_identity() {
-        let mut value = serde_json::json!({
+    fn runtime_registration_uses_runtime_bundle_without_workspace_identity_copies() {
+        let value = serde_json::json!({
             "public_bundle": {"identity_id": "runtime", "public_key": "public-key"},
-            "endpoint": "https://runtime.example.test",
-            "workspace_trust_id": "runtime-issued-enrollment"
+            "endpoint": "https://runtime.example.test"
         });
         let request: CreateRemoteRuntimeRequest = serde_json::from_value(value.clone()).unwrap();
-        assert_eq!(request.workspace_trust_id, "runtime-issued-enrollment");
-        value.as_object_mut().unwrap().remove("workspace_trust_id");
-        assert!(serde_json::from_value::<CreateRemoteRuntimeRequest>(value.clone()).is_err());
-        value["workspace_key_generation"] = serde_json::json!(1);
-        assert!(serde_json::from_value::<CreateRemoteRuntimeRequest>(value).is_err());
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+        for field in [
+            "workspace_trust_id",
+            "workspace_key_id",
+            "workspace_key_generation",
+        ] {
+            let mut obsolete = value.clone();
+            obsolete[field] = serde_json::json!("obsolete");
+            assert!(serde_json::from_value::<CreateRemoteRuntimeRequest>(obsolete).is_err());
+        }
     }
 
     #[test]
@@ -12646,8 +12598,6 @@ mod tests {
             "workspace_id": "workspace-test",
             "runtime_id": "runtime-test",
             "binding_id": "binding-test",
-            "connection_state": "verified",
-            "verification": null,
             "checked_at": "2026-09-01T12:00:00Z",
             "status": "compatible",
             "failure_kind": null,
@@ -12665,21 +12615,22 @@ mod tests {
     }
 
     #[test]
-    fn runtime_trust_contract_binds_concrete_keys_and_binding_lifetimes() {
-        let evidence = RuntimeVerificationEvidenceSummary {
-            verified_at: Some("2026-10-06T00:00:00Z".into()),
-            last_checked_at: "2026-10-06T00:00:00Z".into(),
-            last_outcome: RuntimeVerificationOutcome::Verified,
-            binding_id: "binding-new".into(),
-            workspace_key_id: "workspace-key".into(),
-            workspace_public_key_fingerprint: "sha256:workspace-key".into(),
-            workspace_trust_id: "trust-new".into(),
-            runtime_public_key_fingerprint: "sha256:runtime-key".into(),
-        };
-        round_trip(evidence.clone());
-        let mut stale = serde_json::to_value(evidence).unwrap();
-        stale["unexpected_state_guard"] = serde_json::json!(1);
-        assert!(serde_json::from_value::<RuntimeVerificationEvidenceSummary>(stale).is_err());
+    fn runtime_binding_rejects_cached_authentication_and_requires_observed_identity_for_mutation() {
+        let binding = serde_json::json!({"binding_id": "binding-new", "revoked_at": null});
+        let parsed: WorkspaceRuntimeBindingSummary =
+            serde_json::from_value(binding.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), binding);
+        for field in [
+            "state",
+            "connection_state",
+            "workspace_key_id",
+            "workspace_trust_id",
+            "verification",
+        ] {
+            let mut obsolete = binding.clone();
+            obsolete[field] = serde_json::json!("obsolete");
+            assert!(serde_json::from_value::<WorkspaceRuntimeBindingSummary>(obsolete).is_err());
+        }
         round_trip(RevokeRuntimeTrustKeyRequest {
             expected_binding_id: "binding-observed".into(),
         });

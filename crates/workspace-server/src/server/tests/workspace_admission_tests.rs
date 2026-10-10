@@ -694,7 +694,6 @@ async fn revoked_runtime_and_persisted_workspace_fence_reject_new_requests() {
                 .unwrap()
                 .unwrap();
             binding.revoked_at = Some("revoked".into());
-            binding.state = StoredRuntimeBindingState::Revoked;
             f.api
                 .store
                 .upsert_workspace_runtime_binding_record(binding, true)

@@ -673,38 +673,14 @@
   {
     "path": "crates/worker-runtime/src/workspace_issuer.rs",
     "kind": "saved_data",
-    "reason": "LegacyWorkspaceIssuerTrustRecord/LegacyVerificationDocumentの保存済みenrollment・verification keyとfixture。旧trustをrevokedへ移行し、旧verification bytesをarchiveするがlive recordsを空にするconsumerがある。削除すると既存記録を読めないか、旧capabilityを再承認なしに復活させない移行検証を失う。",
+    "reason": "LegacyWorkspaceIssuerTrustRecordの保存済みenrollment keyとfixture。旧形式の管理者によるWorkspace信頼登録を読み取る境界だけに綴りを保持する。通常要求の署名検証は現行の信頼済み公開鍵を使い、旧counterや過去のverification記録は認可に使わない。削除すると既存の信頼登録を読めなくなる。",
     "lines": [
       {
         "sha256": "56e399dc4e828e66677d4ad09b4c66a9c09658322b3886a06b4ae688c63dfc84",
         "count": 1
       },
       {
-        "sha256": "ea16c387d0048571bd0a5576f1358af32acf63f8ee5ebe08c262da83c5a04d88",
-        "count": 1
-      },
-      {
-        "sha256": "bfd48831eb694b879a2859d42dba00fe74a4a817177acc61a44795cbd19b1056",
-        "count": 1
-      },
-      {
-        "sha256": "94af0abdfb45c712e9cd1949ac6a15d1a21c3b271f004c9282f81b5fd5ae4f5d",
-        "count": 1
-      },
-      {
         "sha256": "d099e3a7216349c0ef30026967b8fe344e3b08b58a77bad6437468502b56bf71",
-        "count": 1
-      },
-      {
-        "sha256": "bed791d41faa85b38602c238d30460681e6d9ebbe56c4c08b843dd1971a589b2",
-        "count": 1
-      },
-      {
-        "sha256": "ce36822c65f785f330e42b7d37241062d994dc4e1c18abaa327b7996da5b6521",
-        "count": 1
-      },
-      {
-        "sha256": "5f4aed5ed50f2bbf54bbb9293948c3294eb2d30086d0fbe7cb07899efb5c96ba",
         "count": 1
       }
     ]

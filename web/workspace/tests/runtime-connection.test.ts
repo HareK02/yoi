@@ -20,8 +20,6 @@ function compatibleResponse(): Record<string, unknown> {
     workspace_id: "workspace-a",
     runtime_id: "runtime-a",
     binding_id: "binding-3",
-    connection_state: "verified",
-    verification: null,
     checked_at: "2026-09-01T12:00:00Z",
     status: "compatible",
     failure_kind: null,
@@ -63,16 +61,7 @@ Deno.test("runtime connection response rejects unknown fields and incoherent com
   assertEquals(
     parseRuntimeConnectionTestResponse({
       ...compatibleResponse(),
-      verification: {
-        verified_at: "2026-09-01T12:00:00Z",
-        last_checked_at: "2026-09-01T12:00:01Z",
-        last_outcome: "verified",
-        binding_id: "binding-2",
-        workspace_key_id: "WK-a",
-        workspace_public_key_fingerprint: "sha256:workspace",
-        workspace_trust_id: "trust-a",
-        runtime_public_key_fingerprint: "sha256:runtime",
-      },
+      verification: {},
     }),
     null,
   );
@@ -118,5 +107,28 @@ Deno.test("runtime connection request rejects a mismatched response identity", a
   assertEquals(
     message,
     "Connection test response did not match the selected Runtime",
+  );
+});
+
+Deno.test("runtime authentication failure remains an observed result without granting approval", async () => {
+  const failed = {
+    ...compatibleResponse(),
+    status: "failed",
+    failure_kind: "authentication",
+    actual_protocol_version: null,
+  };
+  assertEquals(parseRuntimeConnectionTestResponse(failed), failed);
+  const fetched = await testRuntimeConnection(
+    "workspace-a",
+    "runtime-a",
+    (() => Promise.resolve(Response.json(failed))) as typeof fetch,
+  );
+  assertEquals(fetched, failed);
+  assertEquals(
+    parseRuntimeConnectionTestResponse({
+      ...failed,
+      connection_state: "verified",
+    }),
+    null,
   );
 });

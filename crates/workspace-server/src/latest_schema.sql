@@ -442,49 +442,43 @@ CREATE TABLE workspace_runtime_bindings (
     public_key TEXT NOT NULL,
     public_key_fingerprint TEXT NOT NULL,
     binding_id TEXT NOT NULL CHECK (length(binding_id) > 0),
-    state TEXT NOT NULL CHECK (state IN ('configured', 'verified', 'revoked')),
     authentication_mode TEXT NOT NULL CHECK (authentication_mode IN ('legacy_server_issuer', 'workspace_identity')),
-    workspace_key_id TEXT,
-    workspace_public_key_fingerprint TEXT,
-    workspace_trust_id TEXT CHECK (length(workspace_trust_id) > 0),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     revoked_at TEXT,
     PRIMARY KEY (workspace_id, runtime_id),
     UNIQUE (workspace_id, public_key_fingerprint),
-    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
-    CHECK (
-        (authentication_mode = 'legacy_server_issuer' AND workspace_key_id IS NULL AND workspace_public_key_fingerprint IS NULL AND workspace_trust_id IS NULL)
-        OR
-        (authentication_mode = 'workspace_identity' AND workspace_key_id IS NOT NULL AND (state != 'verified' OR (workspace_trust_id IS NOT NULL AND workspace_public_key_fingerprint IS NOT NULL)))
-    ),
-    CHECK (
-        (state = 'revoked' AND revoked_at IS NOT NULL)
-        OR
-        (state != 'revoked' AND revoked_at IS NULL)
-    )
+    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT
 );
-CREATE TABLE workspace_runtime_verifications (
+-- Historical authentication metadata only, never current admission authority.
+CREATE TABLE workspace_runtime_binding_verification_archive (
     workspace_id TEXT NOT NULL,
     runtime_id TEXT NOT NULL,
-    binding_id TEXT NOT NULL CHECK(length(binding_id) > 0),
+    binding_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    workspace_key_id TEXT,
+    workspace_public_key_fingerprint TEXT,
+    workspace_trust_id TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, runtime_id, binding_id),
+    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+CREATE TABLE workspace_runtime_verification_archive (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    binding_id TEXT NOT NULL,
     workspace_key_id TEXT NOT NULL,
-    workspace_public_key_fingerprint TEXT NOT NULL CHECK(length(workspace_public_key_fingerprint) > 0),
-    workspace_trust_id TEXT NOT NULL CHECK(length(workspace_trust_id) > 0),
+    workspace_public_key_fingerprint TEXT NOT NULL,
+    workspace_trust_id TEXT NOT NULL,
     runtime_public_key_fingerprint TEXT NOT NULL,
     challenge_id TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('pending', 'verified', 'failed')),
+    state TEXT NOT NULL,
     last_outcome TEXT NOT NULL,
     verified_at TEXT,
     checked_at TEXT NOT NULL,
-    PRIMARY KEY(workspace_id, runtime_id),
-    FOREIGN KEY(workspace_id, runtime_id)
-        REFERENCES workspace_runtime_bindings(workspace_id, runtime_id) ON DELETE CASCADE,
-    CHECK((state = 'verified' AND verified_at IS NOT NULL)
-       OR (state != 'verified' AND verified_at IS NULL))
+    PRIMARY KEY (workspace_id, runtime_id),
+    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
 );
-CREATE INDEX workspace_runtime_verifications_state_idx
-    ON workspace_runtime_verifications(workspace_id, state, checked_at DESC);
 CREATE TABLE workspace_runtime_binding_audit (
     workspace_id TEXT NOT NULL,
     runtime_id TEXT NOT NULL,

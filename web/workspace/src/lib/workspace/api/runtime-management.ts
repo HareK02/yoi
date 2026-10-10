@@ -3,7 +3,6 @@ import type {
   Diagnostic,
   RemoveRuntimeRequest,
   RevokeRuntimeTrustKeyRequest,
-  RuntimeConnectionDisplayState,
   RuntimeIdentityAuthority,
   RuntimeManagementApiError,
   RuntimeManagementSummary,
@@ -17,14 +16,13 @@ import type {
   RuntimeTrustKeyRevealResponse,
   RuntimeTrustKeyState,
   RuntimeTrustKeyStatus,
-  RuntimeVerificationEvidenceSummary,
   UpdateRemoteRuntimeRequest,
-  WorkspaceRuntimeBindingState,
   WorkspaceRuntimeBindingSummary,
   WorkspaceRuntimeDetail,
   WorkspaceRuntimeListResponse,
   WorkspaceRuntimeResource,
 } from "#lib/generated/runtime-api.ts";
+import type { RepositoryApiError } from "#lib/generated/repository-api.ts";
 import { workspaceApiPath } from "./http.ts";
 
 export type WorkspaceRuntimeList =
@@ -89,17 +87,6 @@ const AUDIT_ACTIONS = new Set<RuntimeTrustAuditAction>([
 const CONFLICT_KINDS = new Set<RuntimeTrustConflictKind>([
   "stale_binding",
   "fingerprint_in_use",
-]);
-const BINDING_STATES = new Set<WorkspaceRuntimeBindingState>([
-  "configured",
-  "verified",
-  "revoked",
-]);
-const CONNECTION_STATES = new Set<RuntimeConnectionDisplayState>([
-  "configured",
-  "verified",
-  "unavailable",
-  "revoked",
 ]);
 const REMOVAL_OPERATION_STATES = new Set<RuntimeRemovalOperationState>([
   "pending",
@@ -326,140 +313,16 @@ function runtimeSource(value: unknown, path: string): RuntimeSourceSummary {
   };
 }
 
-function runtimeVerification(
-  value: unknown,
-  path: string,
-): RuntimeVerificationEvidenceSummary {
-  const item = object(value, path);
-  exactKeys(
-    item,
-    [
-      "verified_at",
-      "last_checked_at",
-      "last_outcome",
-      "binding_id",
-      "workspace_key_id",
-      "workspace_public_key_fingerprint",
-      "workspace_trust_id",
-      "runtime_public_key_fingerprint",
-    ],
-    [],
-    path,
-  );
-  const verifiedAt = item.verified_at === null
-    ? null
-    : boundedString(item.verified_at, `${path}.verified_at`, 128);
-  const lastOutcome = enumValue(
-    item.last_outcome,
-    `${path}.last_outcome`,
-    new Set(
-      [
-        "verified",
-        "challenge_issued",
-        "verification_failed",
-        "connectivity_failed",
-      ] as const,
-    ),
-  );
-  return {
-    verified_at: verifiedAt,
-    last_checked_at: boundedString(
-      item.last_checked_at,
-      `${path}.last_checked_at`,
-      128,
-    ),
-    last_outcome: lastOutcome,
-    binding_id: boundedIdentity(
-      item.binding_id,
-      `${path}.binding_id`,
-    ),
-    workspace_key_id: boundedString(
-      item.workspace_key_id,
-      `${path}.workspace_key_id`,
-      LIMITS.idBytes,
-    ),
-    workspace_public_key_fingerprint: boundedIdentity(
-      item.workspace_public_key_fingerprint,
-      `${path}.workspace_public_key_fingerprint`,
-    ),
-    workspace_trust_id: boundedIdentity(
-      item.workspace_trust_id,
-      `${path}.workspace_trust_id`,
-    ),
-    runtime_public_key_fingerprint: boundedString(
-      item.runtime_public_key_fingerprint,
-      `${path}.runtime_public_key_fingerprint`,
-      LIMITS.fingerprintBytes,
-    ),
-  };
-}
-
 function runtimeBinding(
   value: unknown,
   path: string,
-  requiresWorkspaceIdentity: boolean,
 ): WorkspaceRuntimeBindingSummary {
   const item = object(value, path);
-  exactKeys(
-    item,
-    ["state", "connection_state", "binding_id"],
-    ["workspace_key_id", "workspace_trust_id", "verification"],
-    path,
-  );
-  const workspaceKeyId = optionalNullableString(
-    item.workspace_key_id,
-    `${path}.workspace_key_id`,
-    LIMITS.idBytes,
-  );
-  const workspaceTrustId = optionalNullableIdentity(
-    item.workspace_trust_id,
-    `${path}.workspace_trust_id`,
-  );
-  const state = enumValue(item.state, `${path}.state`, BINDING_STATES);
-  if (
-    requiresWorkspaceIdentity &&
-    state !== "revoked" &&
-    (workspaceKeyId == null || workspaceTrustId == null)
-  ) {
-    return fail(path, "requires Workspace signing key identity metadata");
-  }
-  const connectionState = enumValue(
-    item.connection_state,
-    `${path}.connection_state`,
-    CONNECTION_STATES,
-  );
-  const binding_id = boundedIdentity(item.binding_id, `${path}.binding_id`);
-  const verification = item.verification === undefined
-    ? undefined
-    : runtimeVerification(item.verification, `${path}.verification`);
-  if (
-    verification !== undefined && verification.binding_id !== binding_id
-  ) {
-    return fail(path, "verification must match the current binding binding_id");
-  }
-  if (
-    requiresWorkspaceIdentity &&
-    connectionState === "verified" &&
-    (verification === undefined ||
-      verification.verified_at === null ||
-      verification.last_outcome !== "verified")
-  ) {
-    return fail(
-      path,
-      "verified Workspace identity binding requires verification evidence",
-    );
-  }
+  exactKeys(item, ["binding_id"], ["revoked_at"], path);
   return {
-    state,
-    connection_state: connectionState,
-    binding_id,
-    ...(workspaceKeyId === undefined
-      ? {}
-      : { workspace_key_id: workspaceKeyId }),
-    ...(workspaceTrustId === undefined
-      ? {}
-      : { workspace_trust_id: workspaceTrustId }),
-    ...(verification === undefined ? {} : { verification }),
+    binding_id: boundedIdentity(item.binding_id, `${path}.binding_id`),
+    revoked_at:
+      optionalNullableTimestamp(item.revoked_at, `${path}.revoked_at`) ?? null,
   };
 }
 
@@ -483,7 +346,7 @@ function runtimeManagement(
   const builtIn = boolean(item.built_in, `${path}.built_in`);
   const binding = item.binding == null
     ? undefined
-    : runtimeBinding(item.binding, `${path}.binding`, !builtIn);
+    : runtimeBinding(item.binding, `${path}.binding`);
   return {
     built_in: builtIn,
     config_managed: boolean(item.config_managed, `${path}.config_managed`),
@@ -763,7 +626,7 @@ export function parseRuntimeTrustConflict(
   exactKeys(
     response,
     ["error", "message"],
-    ["current_binding_id", "current_fingerprint"],
+    ["current_binding_id", "current_fingerprint", "diagnostics"],
     "Runtime trust conflict",
   );
   return {
@@ -786,6 +649,15 @@ export function parseRuntimeTrustConflict(
       "Runtime trust conflict.current_fingerprint",
       LIMITS.fingerprintBytes,
     ),
+    ...(response.diagnostics === undefined ? {} : {
+      diagnostics: array(
+        response.diagnostics,
+        "Runtime trust conflict.diagnostics",
+        LIMITS.diagnostics,
+      ).map((entry, index) =>
+        diagnostic(entry, `Runtime trust conflict.diagnostics[${index}]`)
+      ),
+    }),
   };
 }
 
@@ -891,6 +763,37 @@ async function readBoundedJson(response: Response): Promise<unknown> {
   }
 }
 
+function repositoryApiError(value: unknown): RepositoryApiError {
+  const response = object(value, "Runtime trust error");
+  exactKeys(
+    response,
+    ["error", "message"],
+    ["diagnostics"],
+    "Runtime trust error",
+  );
+  return {
+    error: boundedString(
+      response.error,
+      "Runtime trust error.error",
+      LIMITS.idBytes,
+    ),
+    message: boundedString(
+      response.message,
+      "Runtime trust error.message",
+      LIMITS.conflictMessageBytes,
+    ),
+    ...(response.diagnostics === undefined ? {} : {
+      diagnostics: array(
+        response.diagnostics,
+        "Runtime trust error.diagnostics",
+        LIMITS.diagnostics,
+      ).map((entry, index) =>
+        diagnostic(entry, `Runtime trust error.diagnostics[${index}]`)
+      ),
+    }),
+  };
+}
+
 function requestErrorFrom(
   value: unknown,
   status: number,
@@ -917,30 +820,13 @@ function requestErrorFrom(
         ),
       );
     }
-    exactKeys(
-      response,
-      ["error", "message", "diagnostics"],
-      [],
-      "Runtime trust error",
-    );
-    const diagnostics = array(
-      response.diagnostics,
-      "Runtime trust error.diagnostics",
-      LIMITS.diagnostics,
-    ).map((entry, index) =>
-      diagnostic(entry, `Runtime trust error.diagnostics[${index}]`)
-    );
-    const message = boundedString(
-      response.message,
-      "Runtime trust error.message",
-      LIMITS.conflictMessageBytes,
-    );
-    const field = diagnostics.some((entry) =>
+    const error = repositoryApiError(response);
+    const field = (error.diagnostics ?? []).some((entry) =>
         entry.code.startsWith("runtime_public_key_")
       )
       ? "public_key"
       : null;
-    return new RuntimeTrustRequestError(message, field);
+    return new RuntimeTrustRequestError(error.message, field);
   } catch {
     return new RuntimeTrustRequestError(
       `Runtime trust request failed (${status})`,
@@ -958,6 +844,21 @@ function throwRuntimeTrustConflict(payload: unknown): never {
     );
   }
   throw new RuntimeTrustConflictError(conflict);
+}
+
+function throwRuntimeCreationConflict(payload: unknown): never {
+  let error: RepositoryApiError;
+  try {
+    error = repositoryApiError(payload);
+  } catch {
+    throw new RuntimeTrustRequestError(
+      "Runtime trust conflict response was invalid",
+    );
+  }
+  if (CONFLICT_KINDS.has(error.error as RuntimeTrustConflictKind)) {
+    throwRuntimeTrustConflict(error);
+  }
+  throw requestErrorFrom(error, 409);
 }
 
 async function finishMutation(
@@ -990,17 +891,16 @@ export async function createRemoteRuntime(
   request: CreateRemoteRuntimeRequest,
   fetchImpl: typeof fetch = fetch,
 ): Promise<WorkspaceRuntimeResource> {
-  const enrollmentId = boundedIdentity(request.workspace_trust_id, "workspace_trust_id");
   const response = await fetchImpl(
     workspaceApiPath(workspaceId, "/runtimes"),
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ...request, workspace_trust_id: enrollmentId }),
+      body: JSON.stringify(request),
     },
   );
   const payload = await readBoundedJson(response);
-  if (response.status === 409) throwRuntimeTrustConflict(payload);
+  if (response.status === 409) throwRuntimeCreationConflict(payload);
   if (!response.ok) throw requestErrorFrom(payload, response.status);
   const runtime = runtimeResource(payload, "Runtime create response");
   if (runtime.runtime_id !== request.public_bundle.identity_id) {

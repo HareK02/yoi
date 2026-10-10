@@ -228,36 +228,7 @@ impl WorkspaceSigningIdentityService {
     }
 
     pub fn sign(&self, workspace_id: &str, payload: &[u8]) -> Result<Vec<u8>> {
-        let identity = self.get_validated(workspace_id)?;
-        if identity.state != "active" {
-            return Err(identity_error(
-                "workspace_signing_identity_not_provisioned",
-                "Workspace signing identity is not provisioned",
-            ));
-        }
-        let material = self
-            .materials
-            .load(&identity.private_material_ref)?
-            .ok_or_else(|| {
-                identity_error(
-                    "workspace_signing_identity_material_missing",
-                    "Workspace signing private material is missing",
-                )
-            })?;
-        let fingerprint = identity.public_key_fingerprint.as_deref().ok_or_else(|| {
-            identity_error(
-                "workspace_signing_identity_material_mismatch",
-                "Workspace signing public key fingerprint is missing",
-            )
-        })?;
-        let signing_key = material.signing_key(workspace_id, &identity.key_id)?;
-        let public_key = encode_public_key(signing_key.public_key().as_ref());
-        if public_key_fingerprint(&public_key)? != fingerprint {
-            return Err(identity_error(
-                "workspace_signing_identity_material_mismatch",
-                "Workspace signing private material does not match public metadata",
-            ));
-        }
+        let (_, signing_key) = self.select_signing_key(workspace_id)?;
         Ok(signing_key.sign(payload).as_ref().to_vec())
     }
 
@@ -266,9 +237,20 @@ impl WorkspaceSigningIdentityService {
         workspace_id: &str,
         claims: &WorkspaceCapabilityClaims,
     ) -> Result<String> {
+        let (identity, signing_key) = self.select_signing_key(workspace_id)?;
+        if claims.issuer_workspace_id != identity.workspace_id
+            || claims.issuer_key_id != identity.key_id
+            || Some(claims.issuer_public_key_fingerprint.as_str())
+                != identity.public_key_fingerprint.as_deref()
+        {
+            return Err(identity_error(
+                "workspace_capability_identity_mismatch",
+                "Workspace capability claims do not match the current signing identity",
+            ));
+        }
         let input = workspace_capability_signing_input(claims).map_err(capability_error)?;
-        let signature = self.sign(workspace_id, input.bytes())?;
-        assemble_workspace_capability_token(input, &signature).map_err(capability_error)
+        let signature = signing_key.sign(input.bytes());
+        assemble_workspace_capability_token(input, signature.as_ref()).map_err(capability_error)
     }
 
     pub fn delete_material(&self, workspace_id: &str) -> Result<()> {
@@ -306,7 +288,40 @@ impl WorkspaceSigningIdentityService {
         })
     }
 
+    fn select_signing_key(
+        &self,
+        workspace_id: &str,
+    ) -> Result<(
+        WorkspaceSigningIdentityRecord,
+        ring::signature::Ed25519KeyPair,
+    )> {
+        let identity = self
+            .store
+            .get_workspace_signing_identity(workspace_id)?
+            .ok_or_else(|| {
+                identity_error(
+                    "workspace_signing_identity_metadata_missing",
+                    "Workspace signing identity metadata is missing",
+                )
+            })?;
+        if identity.state != "active" {
+            return Err(identity_error(
+                "workspace_signing_identity_not_provisioned",
+                "Workspace signing identity is not provisioned",
+            ));
+        }
+        let signing_key = self.validated_signing_key(&identity)?;
+        Ok((identity, signing_key))
+    }
+
     fn validate_active_material(&self, identity: &WorkspaceSigningIdentityRecord) -> Result<()> {
+        self.validated_signing_key(identity).map(|_| ())
+    }
+
+    fn validated_signing_key(
+        &self,
+        identity: &WorkspaceSigningIdentityRecord,
+    ) -> Result<ring::signature::Ed25519KeyPair> {
         let material = self
             .materials
             .load(&identity.private_material_ref)?
@@ -316,8 +331,8 @@ impl WorkspaceSigningIdentityService {
                     "Workspace signing private material is missing",
                 )
             })?;
-        let public_key =
-            material.validate_and_public_key(&identity.workspace_id, &identity.key_id)?;
+        let signing_key = material.signing_key(&identity.workspace_id, &identity.key_id)?;
+        let public_key = encode_public_key(signing_key.public_key().as_ref());
         let fingerprint = public_key_fingerprint(&public_key)?;
         if identity.public_key.as_deref() != Some(public_key.as_str())
             || identity.public_key_fingerprint.as_deref() != Some(fingerprint.as_str())
@@ -327,7 +342,7 @@ impl WorkspaceSigningIdentityService {
                 "Workspace signing private material does not match public metadata",
             ));
         }
-        Ok(())
+        Ok(signing_key)
     }
 }
 
@@ -843,6 +858,14 @@ mod tests {
                 loads: std::sync::atomic::AtomicUsize::new(0),
             }),
         );
+        let selected_signature = swapping_service.sign("workspace-1", payload).unwrap();
+        ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ED25519,
+            worker_runtime::auth::decode_public_key(provisioned.public_key.as_deref().unwrap())
+                .unwrap(),
+        )
+        .verify(payload, &selected_signature)
+        .unwrap();
         assert!(matches!(
             swapping_service.sign("workspace-1", payload),
             Err(Error::WorkspaceSigningIdentity { ref code, .. })

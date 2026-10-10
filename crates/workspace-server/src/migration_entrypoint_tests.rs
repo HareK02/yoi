@@ -80,10 +80,10 @@ fn migration_dry_run_and_apply_share_the_original_repository_secret_authority() 
     let conn = Connection::open(&path).unwrap();
     configure_sqlite(&conn).unwrap();
     seed_migration_workspace(&conn);
-    conn.execute_batch("INSERT INTO repository_secret_operations VALUES('space','create-key','intent','credential','key',7,'created');
-        INSERT INTO repository_ssh_credentials VALUES('space','key','Key','ssh-ed25519','fingerprint',7,'active','created',NULL);
-        INSERT INTO repository_ssh_credential_revisions VALUES('space','key',7,'ssh-ed25519','fingerprint','created');
-        INSERT INTO repository_secret_audit_events VALUES('space','audit','credential_created','key',7,'owner','created');").unwrap();
+    conn.execute_batch("INSERT INTO repository_secret_operations VALUES('space','create-key','intent','credential','key',7,'2026-01-01T00:00:00.000Z');
+        INSERT INTO repository_ssh_credentials VALUES('space','key','Key','ssh-ed25519','fingerprint',7,'active','2026-01-01T00:00:00.000Z',NULL);
+        INSERT INTO repository_ssh_credential_revisions VALUES('space','key',7,'ssh-ed25519','fingerprint','2026-01-01T00:00:00.000Z');
+        INSERT INTO repository_secret_audit_events VALUES('space','audit','credential_created','key',7,'owner','2026-01-01T00:00:00.000Z');").unwrap();
     let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &[42; 32]).unwrap());
     let mut ciphertext = b"private bytes".to_vec();
     key.seal_in_place_append_tag(
@@ -92,7 +92,7 @@ fn migration_dry_run_and_apply_share_the_original_repository_secret_authority() 
         &mut ciphertext,
     )
     .unwrap();
-    conn.execute("INSERT INTO server_secret_versions VALUES('space','key',7,'private_key','aes-256-gcm-v1',?1,?2,'created')",params![[1u8;12].as_slice(),ciphertext]).unwrap();
+    conn.execute("INSERT INTO server_secret_versions VALUES('space','key',7,'private_key','aes-256-gcm-v1',?1,?2,'2026-01-01T00:00:00.000Z')",params![[1u8;12].as_slice(),ciphertext]).unwrap();
     drop(conn);
     let master_key = dir.path().join("repository-secrets.master-key");
     std::fs::write(&master_key, [42; 32]).unwrap();

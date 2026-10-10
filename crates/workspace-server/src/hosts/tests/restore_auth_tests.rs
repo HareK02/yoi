@@ -9,36 +9,18 @@ use worker_runtime::{
     auth::RuntimeIdentityMaterial,
     http_server::{WorkspaceRuntimeHttpAuth, runtime_http_router_with_workspace_auth},
     workspace_issuer::{
-        InMemoryWorkspaceClaimReplayProtection, InMemoryWorkspaceRuntimeVerificationAuthority,
-        RuntimeVerificationSigner, WorkspaceCapabilityVerifier, WorkspaceIssuerTrustRecord,
-        WorkspaceIssuerTrustState, WorkspaceRuntimeVerificationAuthority,
-        WorkspaceRuntimeVerificationRecord, issue_workspace_capability_token,
+        InMemoryWorkspaceClaimReplayProtection, WorkspaceCapabilityVerifier,
+        WorkspaceIssuerTrustRecord, WorkspaceIssuerTrustState, issue_workspace_capability_token,
     },
 };
 
 #[tokio::test]
 async fn restore_capabilities_authorize_runtime_routes_without_relaxing_request_binding() {
     let workspace_identity = RuntimeIdentityMaterial::generate("workspace-key").unwrap();
-    let runtime_identity = RuntimeIdentityMaterial::generate("runtime-test").unwrap();
-    let signer = RuntimeVerificationSigner::from_identity(&runtime_identity).unwrap();
     let now = Utc::now().timestamp();
     let workspace_public_key_fingerprint =
         crate::workspace_signing_identity::public_key_fingerprint(&workspace_identity.public_key)
             .unwrap();
-    let binding_id = "binding-restore-test".to_string();
-    let verifications = Arc::new(InMemoryWorkspaceRuntimeVerificationAuthority::default());
-    verifications
-        .record(WorkspaceRuntimeVerificationRecord {
-            workspace_id: "workspace-test".into(),
-            runtime_id: "runtime-test".into(),
-            binding_id: binding_id.clone(),
-            workspace_trust_id: "trust-restore-test".to_string(),
-            workspace_key_id: "workspace-key".into(),
-            workspace_public_key_fingerprint: workspace_public_key_fingerprint.clone(),
-            runtime_public_key_fingerprint: signer.public_key_fingerprint().to_owned(),
-            verified_at: now,
-        })
-        .unwrap();
     let public_key =
         worker_runtime::auth::decode_public_key(&workspace_identity.public_key).unwrap();
     let verifier = WorkspaceCapabilityVerifier::new(
@@ -69,8 +51,7 @@ async fn restore_capabilities_authorize_runtime_routes_without_relaxing_request_
         None,
         WorkspaceRuntimeHttpAuth {
             verifier,
-            signer,
-            verifications,
+            runtime_id: "runtime-test".into(),
         },
     );
     let worker_id = EmbeddedWorkerId::from_legacy_u64(1).to_string();
@@ -93,8 +74,6 @@ async fn restore_capabilities_authorize_runtime_routes_without_relaxing_request_
             "wrong-worker",
             "wrong-body",
             "wrong-key-fingerprint",
-            "wrong-binding-id",
-            "wrong-trust-id",
         ] {
             let claims = WorkspaceCapabilityClaims {
                 issuer: "https://backend.test".into(),
@@ -110,16 +89,6 @@ async fn restore_capabilities_authorize_runtime_routes_without_relaxing_request_
                     )
                 } else {
                     workspace_public_key_fingerprint.clone()
-                },
-                binding_id: if case == "wrong-binding-id" {
-                    "binding-retired".to_string()
-                } else {
-                    binding_id.clone()
-                },
-                trust_id: if case == "wrong-trust-id" {
-                    "trust-retired".to_string()
-                } else {
-                    "trust-restore-test".to_string()
                 },
                 runtime_id: "runtime-test".into(),
                 worker_id: if case == "wrong-worker" {
@@ -176,27 +145,16 @@ async fn restore_capabilities_authorize_runtime_routes_without_relaxing_request_
             } else {
                 assert_eq!(
                     status,
-                    if case == "wrong-binding-id" {
-                        StatusCode::FORBIDDEN
-                    } else {
-                        StatusCode::UNAUTHORIZED
-                    },
+                    StatusCode::UNAUTHORIZED,
                     "{path} {case}: {}",
                     error.error.message
                 );
-                assert_eq!(
-                    error.error.code,
-                    if case == "wrong-binding-id" {
-                        "workspace_runtime_verification_stale"
-                    } else {
-                        "unauthorized"
-                    }
-                );
+                assert_eq!(error.error.code, "unauthorized");
                 let expected = match case {
                     "wrong-operation" => Some("does not authorize this operation"),
                     "wrong-worker" => Some("targets another Worker"),
                     "wrong-body" => Some("does not bind this request body"),
-                    "wrong-key-fingerprint" | "wrong-binding-id" | "wrong-trust-id" => None,
+                    "wrong-key-fingerprint" => None,
                     _ => unreachable!(),
                 };
                 if let Some(expected) = expected {
