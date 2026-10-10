@@ -2804,7 +2804,9 @@ async fn authorize_workspace_api_request(
     mut request: Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if !request.uri().path().starts_with("/api/") {
+    if !request.uri().path().starts_with("/api/")
+        && ticket_case_workspace_id(request.uri().path()).is_none()
+    {
         return next.run(request).await;
     }
     let request_path = request.uri().path().to_owned();
@@ -3024,7 +3026,9 @@ async fn dispatch_workspace_request(
         None
     };
     if let Some(workspace_id) = workspace_id
-        && (path.starts_with("/api/w/") || path.starts_with("/api/runtime/v1/workspaces/"))
+        && (path.starts_with("/api/w/")
+            || path.starts_with("/api/runtime/v1/workspaces/")
+            || ticket_case_workspace_id(&path).is_some())
         && let Err(response) =
             authorize_scoped_workspace_request(&api, workspace_id, &mut request).await
     {
@@ -3098,7 +3102,26 @@ async fn serve_server_static_shell(api: &WorkspaceServerApi, path: &str) -> Resp
     static_file_or_spa_response(static_root, path).await
 }
 
+// The canonical case route is deliberately not an /api/w alias. Recognize only
+// this operation so its authentication/scope is identical without broadening CRUD.
+fn ticket_case_workspace_id(path: &str) -> Option<&str> {
+    let mut segments = path.strip_prefix("/workspaces/")?.split('/');
+    let workspace_id = segments.next()?;
+    let resource = segments.next()?;
+    let ticket_id = segments.next()?;
+    let operation = segments.next()?;
+    (!workspace_id.is_empty()
+        && resource == "tickets"
+        && !ticket_id.is_empty()
+        && operation == "case"
+        && segments.next().is_none())
+    .then_some(workspace_id)
+}
+
 fn scoped_workspace_id(path: &str) -> Option<&str> {
+    if let Some(workspace_id) = ticket_case_workspace_id(path) {
+        return Some(workspace_id);
+    }
     if let Some(rest) = path.strip_prefix("/api/runtime/v1/workspaces/") {
         return rest
             .split('/')
@@ -10279,9 +10302,10 @@ impl server_api::ServerApi for ServerApiContractService {
         ticket_id: String,
         request: server_api::TicketCaseUpdateRequest,
     ) -> std::result::Result<server_api::TicketSummary, server_api::RepositoryApiError> {
-        let Json(updated) = scoped_ticket_case_update(
+        let Json(updated) = scoped_ticket_case_update_with_context(
             State(self.workspace_api()?.clone()),
             contract_request_headers(&context)?,
+            &context,
             AxumPath((workspace_id, ticket_id)),
             Json(ticket::TicketCaseUpdate {
                 expected_content_digest: request.expected_content_digest,
@@ -14450,9 +14474,15 @@ async fn execute_ticket_rest_operation_with_context(
 ) -> ApiResult<TicketBackendOperationResult> {
     validate_workspace_scope(api, workspace_id)?;
     if let TicketBackendOperation::UpdateCase { ticket, request } = operation {
-        let Json(updated) = scoped_ticket_case_update(
+        let context = context.ok_or_else(|| {
+            Error::WorkspacePermissionDenied(
+                "Ticket case decisions require verified request context".into(),
+            )
+        })?;
+        let Json(updated) = scoped_ticket_case_update_with_context(
             State(api.clone()),
             headers,
+            context,
             AxumPath((workspace_id.to_string(), ticket)),
             Json(request),
         )
@@ -16466,9 +16496,74 @@ async fn scoped_complete_merge_request(
         .map_err(Into::into)
 }
 
+// Header-only entry point is retained solely for explicit legacy internal tests.
+// Public dispatch must use the middleware-populated context below.
+#[cfg(test)]
 async fn scoped_ticket_case_update(
     State(api): State<WorkspaceApi>,
     headers: HeaderMap,
+    path: AxumPath<(String, String)>,
+    request: Json<ticket::TicketCaseUpdate>,
+) -> ApiResult<Json<ticket::Ticket>> {
+    let source = optional_worker_mutation_source(&api, &path.0.0, &headers)?;
+    apply_ticket_case_update(State(api), source, None, path, request).await
+}
+
+async fn scoped_ticket_case_update_with_context(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    context: &server_api::ServerRequestContext,
+    path: AxumPath<(String, String)>,
+    request: Json<ticket::TicketCaseUpdate>,
+) -> ApiResult<Json<ticket::Ticket>> {
+    // Authentication already verified membership and the request's signature/body.
+    // Hints are redundant assertions, never authority or a required identity source.
+    let source = if let Some(source) = context.runtime_source.as_ref() {
+        let worker_id = source.worker_id.as_ref().ok_or_else(|| {
+            Error::WorkspacePermissionDenied(
+                "Ticket case decisions require a verified Runtime Worker identity".into(),
+            )
+        })?;
+        Some(RuntimeWorkerRef::new(&source.runtime_id, worker_id))
+    } else {
+        context
+            .worker_source
+            .as_ref()
+            .map(|source| RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id))
+    };
+    if headers.contains_key("x-yoi-runtime-id") || headers.contains_key("x-yoi-worker-id") {
+        let matching = source.as_ref().is_some_and(|source| {
+            [
+                ("x-yoi-runtime-id", &source.runtime_id),
+                ("x-yoi-worker-id", &source.worker_id),
+            ]
+            .into_iter()
+            .all(|(name, expected)| {
+                headers
+                    .get(name)
+                    .is_some_and(|value| value.as_bytes() == expected.as_bytes())
+            })
+        });
+        if !matching {
+            return Err(Error::WorkspacePermissionDenied(
+                "Ticket case source hints do not match the verified Runtime Worker".into(),
+            )
+            .into());
+        }
+    }
+    if source.is_none() && context.actor.is_none() {
+        return Err(Error::WorkspacePermissionDenied(
+            "Ticket case decisions require an authenticated actor".into(),
+        )
+        .into());
+    }
+    apply_ticket_case_update(State(api), source, context.actor.as_ref(), path, request).await
+}
+
+async fn apply_ticket_case_update(
+    State(api): State<WorkspaceApi>,
+    source: Option<WorkerMutationSource>,
+    actor: Option<&RequestActor>,
     AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
     Json(mut request): Json<ticket::TicketCaseUpdate>,
 ) -> ApiResult<Json<ticket::Ticket>> {
@@ -16478,7 +16573,7 @@ async fn scoped_ticket_case_update(
     let before = backend
         .show(TicketIdOrSlug::Id(ticket_id.clone()))
         .map_err(Error::from)?;
-    if let Some(source) = optional_worker_mutation_source(&api, &workspace_id, &headers)? {
+    if let Some(source) = source {
         let author = format!("worker:{}/{}", source.runtime_id, source.worker_id);
         let replay_event = before.events.iter().find(|event| {
             event.author.as_deref() == Some(author.as_str())
@@ -16509,7 +16604,19 @@ async fn scoped_ticket_case_update(
             context.attributes("case_update")
         };
         backend = backend.with_event_attributes(attributes);
+    } else if let Some(actor) = actor {
+        // Include both verified IDs in the author (and thus the receipt fingerprint).
+        // JSON tuple encoding avoids ambiguous identity concatenation; proof tokens,
+        // auth method and signature timestamps are not replay identity.
+        let identity = serde_json::to_string(&(&actor.account_id, &actor.user_id))
+            .map_err(|error| Error::Config(format!("failed to encode case actor: {error}")))?;
+        request.author = Some(format!("workspace-user:{identity}"));
+        backend = backend.with_event_attributes(BTreeMap::from([
+            ("source_account_id".into(), actor.account_id.clone()),
+            ("source_user_id".into(), actor.user_id.clone()),
+        ]));
     } else {
+        // Only the test-only header adapter can reach this legacy attribution.
         request.author = Some("workspace-user".into());
     }
     let ticket = backend
@@ -32381,6 +32488,10 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
+    mod ticket_case_signed_tests {
+        include!("server_ticket_case_signed_tests.rs");
+    }
+
     mod ticket_tags_tests {
         include!("server_ticket_tags_tests.rs");
     }

@@ -11,7 +11,7 @@ Ticketの現行案件状態は `open` / `closed` のみ。`open` は引き続き
 - `CorrectClosure { reason }`: closedの現在判断を訂正する。過去の判断は変更しない。
 - 理由は `completed` / `not_planned` / `duplicate` / `unknown` / `{ other: string }`。`completed` だけが要求実現済みを表す。すべての操作に説明を必要とし、任意のtyped成果参照を保持する。
 
-`ShowTicket`/detailは現在の終了判断、最後の終了判断のoperation key、close/reopen/訂正のimmutable履歴とlegacy handoffを返す。query/listにも現在の判断と観測用key、handoffを公開する。再開後も過去の理由、説明、成果参照、判断主体、時刻を失わない。判断主体は認証済みBackend actorから設定し、公開API/LLM入力からの偽装を許可しない。案件のcloseにRepository/MR/第三者承認や固定段階の通過を一律要求しない。
+`ShowTicket`/detailは現在の終了判断、最後の終了判断のoperation key、close/reopen/訂正のimmutable履歴とlegacy handoffを返す。query/listにも現在の判断と観測用key、handoffを公開する。再開後も過去の理由、説明、成果参照、判断主体、時刻を失わない。判断主体は認証済みBackend actorから設定し、公開API/LLM入力からの偽装を許可しない。Runtime Workerのidentityは検証済みHTTP contextを正本とし、任意のsource hint headersがなくても失わない。hintがある場合は検証済みidentityとの一致を確認し、Worker identityのないRuntime-only要求を人間の判断として扱わない。人間の操作も認証済みaccount/user identityを判断主体・再送に結び付ける。案件のcloseにRepository/MR/第三者承認や固定段階の通過を一律要求しない。
 
 ## 更新競合と再送
 

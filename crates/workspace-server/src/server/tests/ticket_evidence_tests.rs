@@ -739,8 +739,13 @@ async fn mrless_completed_closure_is_a_ticket_judgment_not_approved_or_missing_m
     }
 }
 
-// Exercise the generated public API through the router, then reread the real
-// Ticket authority. No live Runtime, repository provider, or Worker process runs.
+// Exercise the generated handler's JSON/CAS boundary, then reread the real
+// Ticket authority. Supply the actor normally established by middleware; signed
+// case-route tests cover real authentication. No live Runtime/provider runs.
+fn case_actor_router(api: WorkspaceApi) -> Router {
+    build_inner_router(api).layer(Extension(test_browser_request_actor()))
+}
+
 fn case_request(before: &ticket::Ticket, operation_key: &str, action: Value) -> Value {
     json!({
         "operation_key": operation_key,
@@ -762,7 +767,7 @@ async fn case_route_rejects_missing_cas_client_author_and_removed_workflow_route
         .create(ticket::NewTicket::new("Transport decisions"))
         .unwrap();
     let before = backend.show(reference.id.clone().into()).unwrap();
-    let app = build_inner_router(api);
+    let app = case_actor_router(api);
     let path = format!(
         "/workspaces/{TEST_WORKSPACE_ID}/tickets/{}/case",
         reference.id
@@ -863,7 +868,7 @@ async fn case_route_preserves_corrected_history_replay_and_reopen_aba_guard_with
         .unwrap();
     let before = backend.show(reference.id.clone().into()).unwrap();
     let digest = ticket::ticket_content_digest(&before);
-    let app = build_inner_router(api);
+    let app = case_actor_router(api);
     let path = format!(
         "/workspaces/{TEST_WORKSPACE_ID}/tickets/{}/case",
         reference.id
@@ -885,10 +890,18 @@ async fn case_route_preserves_corrected_history_replay_and_reopen_aba_guard_with
     let summary: server_api::TicketSummary = serde_json::from_value(response).unwrap();
     assert_eq!(summary.0.workflow_state, ticket::TicketState::Closed);
     let closed = backend.show(reference.id.clone().into()).unwrap();
+    let actor = test_browser_request_actor();
+    let expected_author = format!(
+        "workspace-user:{}",
+        serde_json::to_string(&(&actor.account_id, &actor.user_id)).unwrap()
+    );
     assert_eq!(
         closed.current_closure.as_ref().unwrap().author,
-        "workspace-user"
+        expected_author
     );
+    let event = closed.events.last().unwrap();
+    assert_eq!(event.attributes["source_account_id"], actor.account_id);
+    assert_eq!(event.attributes["source_user_id"], actor.user_id);
     assert_eq!(
         closed.current_closure.as_ref().unwrap().reason,
         ticket::TicketClosureReason::Completed
@@ -1031,7 +1044,7 @@ async fn case_route_rejects_stale_content_state_and_invalid_actions_without_audi
         .create(ticket::NewTicket::new("CAS decision"))
         .unwrap();
     let before = backend.show(reference.id.clone().into()).unwrap();
-    let app = build_inner_router(api);
+    let app = case_actor_router(api);
     let path = format!(
         "/workspaces/{TEST_WORKSPACE_ID}/tickets/{}/case",
         reference.id
