@@ -6609,6 +6609,15 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::ticket_close_record(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::workspace_ticket_tag_list(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_ticket_tag_mutate(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_tags_set(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::ticket_relation_view(
             service.clone(),
         ))
@@ -10408,6 +10417,81 @@ impl server_api::ServerApi for ServerApiContractService {
         .await
         .map_err(ApiError::into_repository_api_error)?;
         Ok(())
+    }
+
+    async fn workspace_ticket_tag_list(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::WorkspaceTicketTagListRequest,
+    ) -> std::result::Result<server_api::WorkspaceTicketTagList, server_api::RepositoryApiError>
+    {
+        let result = execute_ticket_rest_operation_with_actor(
+            self.workspace_api()?,
+            &workspace_id,
+            contract_request_headers(&context)?,
+            context.actor.as_ref(),
+            TicketBackendOperation::ListWorkspaceTags { request: request.0 },
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        let Json(value) = ticket_rest_result(result, |result| match result {
+            TicketBackendOperationResult::WorkspaceTags(value) => Some(value),
+            _ => None,
+        })
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::WorkspaceTicketTagList(value))
+    }
+
+    async fn workspace_ticket_tag_mutate(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::WorkspaceTicketTagMutationRequest,
+    ) -> std::result::Result<server_api::WorkspaceTicketTag, server_api::RepositoryApiError> {
+        let result = execute_ticket_rest_operation_with_actor(
+            self.workspace_api()?,
+            &workspace_id,
+            contract_request_headers(&context)?,
+            context.actor.as_ref(),
+            TicketBackendOperation::MutateWorkspaceTag { request: request.0 },
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        let Json(value) = ticket_rest_result(result, |result| match result {
+            TicketBackendOperationResult::WorkspaceTag(value) => Some(value),
+            _ => None,
+        })
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::WorkspaceTicketTag(value))
+    }
+
+    async fn ticket_tags_set(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::TicketTagsSetRequest,
+    ) -> std::result::Result<server_api::WorkspaceTicketTagList, server_api::RepositoryApiError>
+    {
+        let result = execute_ticket_rest_operation_with_actor(
+            self.workspace_api()?,
+            &workspace_id,
+            contract_request_headers(&context)?,
+            context.actor.as_ref(),
+            TicketBackendOperation::SetTicketTags {
+                id: TicketIdOrSlug::Query(id),
+                request: request.0,
+            },
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        let Json(value) = ticket_rest_result(result, |result| match result {
+            TicketBackendOperationResult::WorkspaceTags(value) => Some(value),
+            _ => None,
+        })
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::WorkspaceTicketTagList(value))
     }
 
     async fn ticket_relation_view(
@@ -14606,6 +14690,16 @@ async fn execute_ticket_rest_operation(
     api: &WorkspaceApi,
     workspace_id: &str,
     headers: HeaderMap,
+    operation: TicketBackendOperation,
+) -> ApiResult<TicketBackendOperationResult> {
+    execute_ticket_rest_operation_with_actor(api, workspace_id, headers, None, operation).await
+}
+
+async fn execute_ticket_rest_operation_with_actor(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    headers: HeaderMap,
+    actor: Option<&RequestActor>,
     mut operation: TicketBackendOperation,
 ) -> ApiResult<TicketBackendOperationResult> {
     validate_workspace_scope(api, workspace_id)?;
@@ -14654,6 +14748,12 @@ async fn execute_ticket_rest_operation(
         .map(|ticket| ticket.meta.workflow_state.as_str().to_string())
         .unwrap_or_else(|| ticket_operation_initial_state(&operation));
     let mut event_attributes = BTreeMap::new();
+    if source.is_none()
+        && let Some(actor) = actor
+    {
+        event_attributes.insert("source_account_id".into(), actor.account_id.clone());
+        event_attributes.insert("source_user_id".into(), actor.user_id.clone());
+    }
     if matches!(operation, TicketBackendOperation::QueueReady { .. }) {
         let ticket = before.as_ref().ok_or_else(|| {
             Error::TicketAssignmentConflict(
@@ -14784,7 +14884,8 @@ async fn execute_ticket_rest_operation(
             None,
         ),
     };
-    if is_mutation {
+    // Classification has no routing or execution side effects.
+    if is_mutation && !matches!(operation_kind, "mutate_workspace_tag" | "set_ticket_tags") {
         if let TicketBackendOperationResult::QueueOutcome(outcome) = &result {
             for ticket_id in &outcome.queued_tickets {
                 notify_ticket_recipients(
@@ -16948,6 +17049,7 @@ fn ticket_mutation_target(operation: &TicketBackendOperation) -> Option<&TicketI
         | TicketBackendOperation::MarkReady { id, .. }
         | TicketBackendOperation::QueueReady { id, .. }
         | TicketBackendOperation::Close { id, .. }
+        | TicketBackendOperation::SetTicketTags { id, .. }
         | TicketBackendOperation::AddTicketRelation { id, .. }
         | TicketBackendOperation::RemoveTicketRelation { id, .. }
         | TicketBackendOperation::AddOrchestrationPlanRecord { id, .. } => Some(id),
@@ -17015,6 +17117,8 @@ fn ticket_mutation_operation_kind(operation: &TicketBackendOperation) -> &'stati
         TicketBackendOperation::MarkReady { .. } => "mark_ready",
         TicketBackendOperation::QueueReady { .. } => "queue_ready",
         TicketBackendOperation::Close { .. } => "close",
+        TicketBackendOperation::MutateWorkspaceTag { .. } => "mutate_workspace_tag",
+        TicketBackendOperation::SetTicketTags { .. } => "set_ticket_tags",
         TicketBackendOperation::AddTicketRelation { .. } => "add_relation",
         TicketBackendOperation::RemoveTicketRelation { .. } => "remove_relation",
         TicketBackendOperation::AddOrchestrationPlanRecord { .. } => "add_plan_record",
@@ -33006,6 +33110,10 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
+    mod ticket_tags_tests {
+        include!("server_ticket_tags_tests.rs");
+    }
+
     mod api_logging_tests;
     mod auth_logging_tests;
     mod drive_api_tests;

@@ -91,6 +91,56 @@ impl BackendWorkspaceProductClient {
             .map_err(|error| crate::backend_workspace::server_client_error(&self.api, error))
     }
 
+    pub fn list_workspace_tags(
+        &self,
+        request: &ticket::TagListRequest,
+    ) -> Result<Vec<ticket::WorkspaceTag>, BackendWorkspaceClientError> {
+        let workspace_id = self.workspace_id.clone();
+        let request = request.clone();
+        self.generated(move |client| async move {
+            client
+                .workspace_ticket_tag_list(
+                    workspace_id,
+                    server_api::WorkspaceTicketTagListRequest(request),
+                )
+                .await
+                .map(|response| response.0)
+        })
+    }
+
+    pub fn mutate_workspace_tag(
+        &self,
+        request: &ticket::WorkspaceTagMutation,
+    ) -> Result<ticket::WorkspaceTag, BackendWorkspaceClientError> {
+        let workspace_id = self.workspace_id.clone();
+        let request = request.clone();
+        self.generated(move |client| async move {
+            client
+                .workspace_ticket_tag_mutate(
+                    workspace_id,
+                    server_api::WorkspaceTicketTagMutationRequest(request),
+                )
+                .await
+                .map(|response| response.0)
+        })
+    }
+
+    pub fn set_ticket_tags(
+        &self,
+        id: &TicketIdOrSlug,
+        request: &ticket::TicketTagSetRequest,
+    ) -> Result<Vec<ticket::WorkspaceTag>, BackendWorkspaceClientError> {
+        let workspace_id = self.workspace_id.clone();
+        let id = ticket_reference(id);
+        let request = request.clone();
+        self.generated(move |client| async move {
+            client
+                .ticket_tags_set(workspace_id, id, server_api::TicketTagsSetRequest(request))
+                .await
+                .map(|response| response.0)
+        })
+    }
+
     pub fn list_tickets(
         &self,
         query: &TicketListQuery,
@@ -602,6 +652,31 @@ impl BackendWorkspaceProductClient {
 }
 
 impl TicketBackend for BackendWorkspaceProductClient {
+    fn list_workspace_tags(
+        &self,
+        request: ticket::TagListRequest,
+    ) -> ticket::Result<Vec<ticket::WorkspaceTag>> {
+        BackendWorkspaceProductClient::list_workspace_tags(self, &request)
+            .map_err(ticket_client_error)
+    }
+
+    fn mutate_workspace_tag(
+        &self,
+        request: ticket::WorkspaceTagMutation,
+    ) -> ticket::Result<ticket::WorkspaceTag> {
+        BackendWorkspaceProductClient::mutate_workspace_tag(self, &request)
+            .map_err(ticket_client_error)
+    }
+
+    fn set_ticket_tags(
+        &self,
+        id: TicketIdOrSlug,
+        request: ticket::TicketTagSetRequest,
+    ) -> ticket::Result<Vec<ticket::WorkspaceTag>> {
+        BackendWorkspaceProductClient::set_ticket_tags(self, &id, &request)
+            .map_err(ticket_client_error)
+    }
+
     fn default_intake_ready_state_change_body(&self, from: &str) -> String {
         let workspace_id = self.workspace_id.clone();
         let from = from.to_string();
@@ -994,6 +1069,112 @@ mod tests {
             }
         });
         (format!("http://{address}"), receiver, handle)
+    }
+
+    #[test]
+    fn classification_client_uses_scoped_routes_and_preserves_cas_and_replay_input() {
+        let tag = serde_json::json!({"workspace_id":"workspace-a", "id":"tag-a", "name":"Ready", "last_operation_key":"create-1", "deleted":false});
+        let single = tag.to_string();
+        let list = serde_json::json!([tag]).to_string();
+        let (base_url, requests, handle) = response_sequence_server(vec![
+            ("200 OK", &list),
+            ("200 OK", &single),
+            ("200 OK", &list),
+        ]);
+        let client = BackendWorkspaceProductClient::new_with_access_token(
+            base_url,
+            "workspace-a",
+            "test-token",
+        )
+        .unwrap();
+        let listed = client
+            .list_workspace_tags(&ticket::TagListRequest {
+                after: Some("tag-0".into()),
+                limit: Some(7),
+            })
+            .unwrap();
+        assert_eq!(listed[0].id, "tag-a");
+        let request = requests.recv().unwrap();
+        assert!(
+            request.starts_with("GET /api/w/workspace-a/ticket-tags?"),
+            "{request}"
+        );
+        assert!(
+            request.contains("after=tag-0") && request.contains("limit=7"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_lowercase()
+                .contains("authorization: bearer test-token")
+        );
+        let mutation = ticket::WorkspaceTagMutation {
+            operation_key: "rename-1".into(),
+            action: ticket::WorkspaceTagAction::Rename {
+                tag_id: "tag-a".into(),
+                expected_last_operation_key: "create-1".into(),
+                name: "New".into(),
+            },
+        };
+        TicketBackend::mutate_workspace_tag(&client, mutation.clone()).unwrap();
+        let request = requests.recv().unwrap();
+        assert!(
+            request.starts_with("POST /api/w/workspace-a/ticket-tags "),
+            "{request}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body, serde_json::json!(mutation));
+        let set = ticket::TicketTagSetRequest {
+            operation_key: "set-1".into(),
+            expected_tag_ids: vec!["tag-old".into()],
+            tag_ids: vec!["tag-a".into(), "tag-b".into()],
+        };
+        let receipt =
+            TicketBackend::set_ticket_tags(&client, TicketIdOrSlug::from("T-740"), set.clone())
+                .unwrap();
+        assert_eq!(receipt[0].name, "Ready");
+        let request = requests.recv().unwrap();
+        assert!(
+            request.starts_with("PUT /api/w/workspace-a/tickets/T-740/tags "),
+            "{request}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body, serde_json::json!(set));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn classification_client_returns_backend_denials_without_local_fallback() {
+        for status in ["403 Forbidden", "409 Conflict"] {
+            let (base_url, requests, handle) = one_response_server(
+                status,
+                r#"{"error":"ticket_conflict","message":"stale or unauthorized","diagnostics":[]}"#,
+            );
+            let client = BackendWorkspaceProductClient::new_with_access_token(
+                base_url,
+                "workspace-a",
+                "token",
+            )
+            .unwrap();
+            let result = client.set_ticket_tags(
+                &TicketIdOrSlug::from("T-740"),
+                &ticket::TicketTagSetRequest {
+                    operation_key: "retry-key".into(),
+                    expected_tag_ids: vec![],
+                    tag_ids: vec!["tag-a".into()],
+                },
+            );
+            assert!(result.is_err());
+            assert!(
+                requests
+                    .recv()
+                    .unwrap()
+                    .starts_with("PUT /api/w/workspace-a/tickets/T-740/tags ")
+            );
+            handle.join().unwrap();
+        }
     }
 
     #[test]

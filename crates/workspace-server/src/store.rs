@@ -13512,7 +13512,7 @@ fn apply_ticket_targets_and_workdir_capabilities_schema(conn: &Connection) -> Re
                 TICKET_SCHEMA_BASELINE_NAME
             ],
         )?;
-        ticket::verify_sqlite_ticket_schema(db).map_err(|error| {
+        ticket::verify_pre_classification_ticket_schema(db).map_err(|error| {
             Error::Store(format!(
                 "schema-66 Ticket schema verification failed: {error}"
             ))
@@ -14896,6 +14896,9 @@ mod tests {
     }
 
     fn downgrade_schema_66_ticket_and_workdir_authority(conn: &Connection) -> Result<()> {
+        // A retained pre-target fixture must not carry today's classification
+        // tables while resetting the component migration marker to v6.
+        conn.execute_batch("DROP TABLE typed_ticket_tags; DROP TABLE workspace_tag_operations; DROP TABLE workspace_tags;")?;
         conn.execute_batch("DROP TABLE IF EXISTS worker_restore_intents;")?;
         conn.execute_batch(
             "DROP TABLE backend_job_deliveries;
@@ -15935,7 +15938,7 @@ mod tests {
         migrate_ticket_targets_and_workdir_capabilities_v65_to_v66(&conn).unwrap();
 
         assert_eq!(current_schema_version(&conn).unwrap(), 66);
-        ticket::verify_sqlite_ticket_schema(&conn).unwrap();
+        ticket::verify_pre_classification_ticket_schema(&conn).unwrap();
         assert!(!column_exists(&conn, "typed_tickets", "repository_id").unwrap());
         assert!(!column_exists(&conn, "typed_tickets", "ref_selector").unwrap());
         assert_eq!(

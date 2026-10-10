@@ -22,9 +22,16 @@ use thiserror::Error;
 
 pub mod config;
 mod sqlite_schema;
+mod tags;
+pub use tags::{
+    TagListRequest, TicketTagSetRequest, WorkspaceTag, WorkspaceTagAction, WorkspaceTagMutation,
+};
 pub mod tool;
 
-pub use sqlite_schema::{migrate_sqlite_ticket_schema, verify_sqlite_ticket_schema};
+pub use sqlite_schema::{
+    migrate_sqlite_ticket_schema, verify_pre_classification_ticket_schema,
+    verify_sqlite_ticket_schema,
+};
 
 const MAX_INTAKE_SUMMARY_BODY_BYTES: usize = 16 * 1024;
 const MAX_ORCHESTRATION_PLAN_TEXT_BYTES: usize = 16 * 1024;
@@ -116,6 +123,7 @@ fn io_err(path: impl Into<PathBuf>, source: io::Error) -> TicketError {
 fn read_ticket_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TicketSummary> {
     let workflow_state = row.get::<_, String>(7)?;
     Ok(TicketSummary {
+        tags: Vec::new(),
         id: row.get(0)?,
         resource_key: None,
         slug: row.get(1)?,
@@ -360,6 +368,7 @@ pub enum TicketEventKind {
     Decision,
     ImplementationReport,
     StateChanged,
+    TagsChanged,
     IntakeSummary,
     StatusChanged,
     Close,
@@ -375,6 +384,7 @@ impl TicketEventKind {
             Self::Decision => "decision",
             Self::ImplementationReport => "implementation_report",
             Self::StateChanged => "state_changed",
+            Self::TagsChanged => "tags_changed",
             Self::IntakeSummary => "intake_summary",
             Self::StatusChanged => "status_changed",
             Self::Close => "close",
@@ -390,6 +400,7 @@ impl TicketEventKind {
             Self::Decision => "Decision".to_string(),
             Self::ImplementationReport => "Implementation report".to_string(),
             Self::StateChanged => "State changed".to_string(),
+            Self::TagsChanged => "Tags changed".to_string(),
             Self::IntakeSummary => "Intake summary".to_string(),
             Self::StatusChanged => "Status changed".to_string(),
             Self::Close => "Closed".to_string(),
@@ -408,6 +419,7 @@ impl From<&str> for TicketEventKind {
             "implementation_report" => Self::ImplementationReport,
             "review" => Self::Comment,
             "state_changed" => Self::StateChanged,
+            "tags_changed" => Self::TagsChanged,
             "intake_summary" => Self::IntakeSummary,
             "status_changed" => Self::StatusChanged,
             "close" | "closed" => Self::Close,
@@ -1635,6 +1647,8 @@ pub struct TicketMeta {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketSummary {
+    #[serde(default)]
+    pub tags: Vec<WorkspaceTag>,
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_key: Option<String>,
@@ -1718,6 +1732,8 @@ pub struct TicketArtifactRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Ticket {
+    #[serde(default)]
+    pub tags: Vec<WorkspaceTag>,
     pub meta: TicketMeta,
     pub document: TicketDocument,
     pub events: Vec<TicketEvent>,
@@ -1774,6 +1790,13 @@ impl TicketDoctorReport {
 }
 
 pub trait TicketBackend {
+    fn list_workspace_tags(&self, request: TagListRequest) -> Result<Vec<WorkspaceTag>>;
+    fn mutate_workspace_tag(&self, request: WorkspaceTagMutation) -> Result<WorkspaceTag>;
+    fn set_ticket_tags(
+        &self,
+        id: TicketIdOrSlug,
+        request: TicketTagSetRequest,
+    ) -> Result<Vec<WorkspaceTag>>;
     fn default_intake_ready_state_change_body(&self, from: &str) -> String;
     fn list(&self, filter: TicketListQuery) -> Result<Vec<TicketSummary>>;
     fn show(&self, id: TicketIdOrSlug) -> Result<Ticket>;
@@ -1848,6 +1871,16 @@ pub trait TicketBackend {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum TicketBackendOperation {
+    ListWorkspaceTags {
+        request: TagListRequest,
+    },
+    MutateWorkspaceTag {
+        request: WorkspaceTagMutation,
+    },
+    SetTicketTags {
+        id: TicketIdOrSlug,
+        request: TicketTagSetRequest,
+    },
     DefaultIntakeReadyStateChangeBody {
         from: String,
     },
@@ -1938,6 +1971,8 @@ pub enum TicketBackendOperation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result", content = "value", rename_all = "snake_case")]
 pub enum TicketBackendOperationResult {
+    WorkspaceTags(Vec<WorkspaceTag>),
+    WorkspaceTag(WorkspaceTag),
     Text(String),
     Unit,
     Tickets(Vec<TicketSummary>),
@@ -1961,6 +1996,15 @@ where
     B: TicketBackend + ?Sized,
 {
     Ok(match operation {
+        TicketBackendOperation::ListWorkspaceTags { request } => {
+            TicketBackendOperationResult::WorkspaceTags(backend.list_workspace_tags(request)?)
+        }
+        TicketBackendOperation::MutateWorkspaceTag { request } => {
+            TicketBackendOperationResult::WorkspaceTag(backend.mutate_workspace_tag(request)?)
+        }
+        TicketBackendOperation::SetTicketTags { id, request } => {
+            TicketBackendOperationResult::WorkspaceTags(backend.set_ticket_tags(id, request)?)
+        }
         TicketBackendOperation::DefaultIntakeReadyStateChangeBody { from } => {
             TicketBackendOperationResult::Text(
                 backend.default_intake_ready_state_change_body(&from),
@@ -2259,6 +2303,7 @@ impl SqliteTicketBackend {
                 .map_err(sqlite_err)?;
             for summary in &mut summaries {
                 summary.resource_key = Self::resource_key_for(conn, &self.workspace_id, &summary.id)?;
+                summary.tags = self.load_ticket_tags(conn, &summary.id)?;
             }
             let has_more = summaries.len() > query.limit;
             summaries.truncate(query.limit);
@@ -2343,6 +2388,7 @@ impl SqliteTicketBackend {
                 updated_at,
             ) = row.map_err(sqlite_err)?;
             summaries.push(TicketSummary {
+                tags: self.load_ticket_tags(conn, &id)?,
                 resource_key: Self::resource_key_for(conn, &self.workspace_id, &id)?,
                 id,
                 slug,
@@ -2929,6 +2975,7 @@ impl SqliteTicketBackend {
         let artifacts = self.load_artifacts(conn, ticket_id)?;
         let relations = self.relation_view_for_meta(conn, &meta)?;
         Ok(Ticket {
+            tags: self.load_ticket_tags(conn, ticket_id)?,
             meta,
             document: TicketDocument {
                 body: MarkdownText::new(body),
@@ -3098,7 +3145,9 @@ impl SqliteTicketBackend {
             }
             meta.labels =
                 self.load_ordered_values(conn, "typed_ticket_labels", "label", &meta.id)?;
-            summaries.push(ticket_summary_from_meta(meta));
+            let mut summary = ticket_summary_from_meta(meta);
+            summary.tags = self.load_ticket_tags(conn, &summary.id)?;
+            summaries.push(summary);
         }
         Ok(summaries)
     }
@@ -3173,6 +3222,19 @@ fn finish_sqlite_transaction<R>(conn: &Connection, result: Result<R>) -> Result<
 }
 
 impl TicketBackend for SqliteTicketBackend {
+    fn list_workspace_tags(&self, request: TagListRequest) -> Result<Vec<WorkspaceTag>> {
+        self.list_tags(request)
+    }
+    fn mutate_workspace_tag(&self, request: WorkspaceTagMutation) -> Result<WorkspaceTag> {
+        self.mutate_tag(request)
+    }
+    fn set_ticket_tags(
+        &self,
+        id: TicketIdOrSlug,
+        request: TicketTagSetRequest,
+    ) -> Result<Vec<WorkspaceTag>> {
+        self.set_tags(id, request)
+    }
     fn default_intake_ready_state_change_body(&self, from: &str) -> String {
         if is_japanese_record_language(self.record_language()) {
             format!("Ticket planning が完了しました。state {from} -> ready。\n")
@@ -3253,6 +3315,7 @@ impl TicketBackend for SqliteTicketBackend {
                 .author
                 .unwrap_or_else(|| "SqliteTicketBackend".to_string());
             let ticket = Ticket {
+                tags: Vec::new(),
                 meta,
                 document: TicketDocument {
                     body,
@@ -3400,7 +3463,8 @@ impl TicketBackend for SqliteTicketBackend {
             let states = self.state_index(conn)?;
             let relations = self.all_relations(conn)?;
             let blockers = transitive_dependency_blockers(&ticket_id, &states, &relations)?;
-            let summary = ticket_summary_from_meta(ticket.meta);
+            let mut summary = ticket_summary_from_meta(ticket.meta);
+            summary.tags = ticket.tags;
             let mut projection = project_ticket_workspace_item(&summary, &blockers, None);
             projection.queue_guard = ticket_queue_guard(&summary, &blockers, None);
             let queue_tickets = vec![ticket_id];
@@ -3854,6 +3918,7 @@ impl TicketBackend for SqliteTicketBackend {
 
 fn ticket_summary_from_meta(meta: TicketMeta) -> TicketSummary {
     TicketSummary {
+        tags: Vec::new(),
         id: meta.id,
         resource_key: meta.resource_key,
         slug: meta.slug,
@@ -4664,6 +4729,7 @@ mod tests {
 
     fn summary_with_state(state: TicketWorkflowState) -> TicketSummary {
         TicketSummary {
+            tags: Vec::new(),
             id: "000TEST".to_string(),
             resource_key: Some("T-1".to_string()),
             slug: "000TEST".to_string(),

@@ -4,6 +4,8 @@
 //! module binds an authority-scoped Workspace client, declares the built-in
 //! feature, and contributes those tools through the normal registry path.
 
+mod tags;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -167,6 +169,18 @@ struct WorkspaceQueryTicketInput {
     /// Related Ticket reference. Prefer `T-*`; canonical internal ids remain accepted for compatibility.
     related_ticket_id: Option<String>,
     relation_kind: Option<WorkspaceTicketRelationFilter>,
+    /// All stable tag IDs must be attached (AND); at most 100 unique IDs.
+    #[serde(default)]
+    #[schemars(length(max = 100))]
+    tag_ids: Vec<String>,
+    /// At least one stable tag ID must be attached (OR), unless empty.
+    #[serde(default)]
+    #[schemars(length(max = 100))]
+    tag_ids_any: Vec<String>,
+    /// None of these stable tag IDs may be attached (NOT).
+    #[serde(default)]
+    #[schemars(length(max = 100))]
+    tag_ids_none: Vec<String>,
     /// Linked Objective reference. Prefer `O-*`; canonical internal ids remain accepted for compatibility.
     linked_objective_id: Option<String>,
     updated_after: Option<String>,
@@ -210,6 +224,13 @@ impl Tool for WorkspaceTicketReadTool {
             WorkspaceTicketReadKind::Query => {
                 let input: WorkspaceQueryTicketInput = serde_json::from_str(&input)
                     .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
+                for (name, ids) in [
+                    ("tag_ids", &input.tag_ids),
+                    ("tag_ids_any", &input.tag_ids_any),
+                    ("tag_ids_none", &input.tag_ids_none),
+                ] {
+                    tags::validate_ids(name, ids)?;
+                }
                 (
                     format!("/api/w/{workspace_id}/tickets/query"),
                     serde_json::to_value(input)
@@ -502,6 +523,7 @@ fn workspace_ticket_tool_description(name: &str) -> String {
         "CompleteTicket" => COMPLETE_TICKET_DESCRIPTION.into(),
         "TicketWorkflowState" => TICKET_STATE_UPDATE_DESCRIPTION.into(),
         "TicketClose" => TICKET_CLOSE_DESCRIPTION.into(),
+        name if tags::TAG_TOOL_NAMES.contains(&name) => tags::description(name).into(),
         _ => ticket_tool_description(name, None),
     }
 }
@@ -632,6 +654,9 @@ impl TicketFeatureAccess {
             .copied()
             .filter(|name| self.allows_tool(name))
             .chain((self.authoring || self.workflow || self.thread).then_some("CompleteTicket"))
+            .chain(tags::TAG_TOOL_NAMES.iter().copied().filter(|name| {
+                *name == "WorkspaceTagList" || self.authoring || self.workflow || self.thread
+            }))
             .collect()
     }
 
@@ -648,7 +673,7 @@ impl TicketFeatureAccess {
     }
 }
 
-const READ_ONLY_TOOL_NAMES: &[&str] = &["QueryTicket", "ShowTicket"];
+const READ_ONLY_TOOL_NAMES: &[&str] = &["QueryTicket", "ShowTicket", "WorkspaceTagList"];
 
 const AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketCreate",
@@ -678,6 +703,11 @@ const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketRelationRecord",
     "TicketRelationRemove",
     "CompleteTicket",
+    "WorkspaceTagList",
+    "WorkspaceTagCreate",
+    "WorkspaceTagRename",
+    "WorkspaceTagDelete",
+    "TicketTagsSet",
 ];
 
 #[cfg(test)]
@@ -693,6 +723,11 @@ const WORKFLOW_TOOL_NAMES: &[&str] = &[
     "TicketOrchestrationPlanRecord",
     "TicketOrchestrationPlanQuery",
     "CompleteTicket",
+    "WorkspaceTagList",
+    "WorkspaceTagCreate",
+    "WorkspaceTagRename",
+    "WorkspaceTagDelete",
+    "TicketTagsSet",
 ];
 
 const WORKFLOW_ADDITIONAL_TOOL_NAMES: &[&str] = &[
@@ -1022,6 +1057,32 @@ impl WorkspaceHttpTicketBackend {
     ) -> TicketResult<TicketBackendOperationResult> {
         let base = format!("/api/w/{workspace_id}/tickets");
         match operation {
+            TicketBackendOperation::ListWorkspaceTags { request } => {
+                let mut endpoint = format!(
+                    "/api/w/{workspace_id}/ticket-tags?limit={}",
+                    request.limit.unwrap_or(200).min(200)
+                );
+                if let Some(after) = request.after {
+                    endpoint.push_str("&after=");
+                    endpoint.push_str(&Self::ticket_path(&TicketIdOrSlug::Id(after)));
+                }
+                Self::request(client, WorkspaceRequestMethod::Get, endpoint, None)
+                    .map(TicketBackendOperationResult::WorkspaceTags)
+            }
+            TicketBackendOperation::MutateWorkspaceTag { request } => Self::request(
+                client,
+                WorkspaceRequestMethod::Post,
+                format!("/api/w/{workspace_id}/ticket-tags"),
+                Some(json!(request)),
+            )
+            .map(TicketBackendOperationResult::WorkspaceTag),
+            TicketBackendOperation::SetTicketTags { id, request } => Self::request(
+                client,
+                WorkspaceRequestMethod::Put,
+                format!("{base}/{}/tags", Self::ticket_path(&id)),
+                Some(json!(request)),
+            )
+            .map(TicketBackendOperationResult::WorkspaceTags),
             TicketBackendOperation::DefaultIntakeReadyStateChangeBody { from } => {
                 let value = Self::request::<String>(
                     client,
@@ -1332,6 +1393,35 @@ macro_rules! expect_ticket_result {
 }
 
 impl TicketBackend for WorkspaceHttpTicketBackend {
+    fn list_workspace_tags(
+        &self,
+        request: ticket::TagListRequest,
+    ) -> TicketResult<Vec<ticket::WorkspaceTag>> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::ListWorkspaceTags { request }),
+            TicketBackendOperationResult::WorkspaceTags
+        )
+    }
+    fn mutate_workspace_tag(
+        &self,
+        request: ticket::WorkspaceTagMutation,
+    ) -> TicketResult<ticket::WorkspaceTag> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::MutateWorkspaceTag { request }),
+            TicketBackendOperationResult::WorkspaceTag
+        )
+    }
+    fn set_ticket_tags(
+        &self,
+        id: TicketIdOrSlug,
+        request: ticket::TicketTagSetRequest,
+    ) -> TicketResult<Vec<ticket::WorkspaceTag>> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::SetTicketTags { id, request }),
+            TicketBackendOperationResult::WorkspaceTags
+        )
+    }
+
     fn default_intake_ready_state_change_body(&self, from: &str) -> String {
         match self.invoke(TicketBackendOperation::DefaultIntakeReadyStateChangeBody {
             from: from.to_string(),
@@ -1577,6 +1667,36 @@ struct NativeTicketOperation {
 
 fn native_ticket_operation(tool_name: &str) -> Option<NativeTicketOperation> {
     let operation = match tool_name {
+        "WorkspaceTagList" => NativeTicketOperation {
+            operation: "tag_list",
+            surface: NativeTicketSurface::Collection,
+            identity_field: None,
+            mutating: false,
+        },
+        "WorkspaceTagCreate" => NativeTicketOperation {
+            operation: "tag_create",
+            surface: NativeTicketSurface::Collection,
+            identity_field: None,
+            mutating: true,
+        },
+        "WorkspaceTagRename" => NativeTicketOperation {
+            operation: "tag_rename",
+            surface: NativeTicketSurface::Collection,
+            identity_field: None,
+            mutating: true,
+        },
+        "WorkspaceTagDelete" => NativeTicketOperation {
+            operation: "tag_delete",
+            surface: NativeTicketSurface::Collection,
+            identity_field: None,
+            mutating: true,
+        },
+        "TicketTagsSet" => NativeTicketOperation {
+            operation: "tags_set",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: true,
+        },
         "QueryTicket" => NativeTicketOperation {
             operation: "query",
             surface: NativeTicketSurface::Collection,
@@ -1721,9 +1841,20 @@ pub(crate) fn enabled_ticket_definitions(
         .collect();
     if allowed.contains(&"CompleteTicket") {
         definitions.push(workspace_ticket_decision_definition(
-            client,
+            client.clone(),
             WorkspaceTicketDecisionKind::Complete,
         ));
+    }
+    for kind in [
+        tags::TagToolKind::List,
+        tags::TagToolKind::Create,
+        tags::TagToolKind::Rename,
+        tags::TagToolKind::Delete,
+        tags::TagToolKind::Set,
+    ] {
+        if allowed.contains(&kind.name()) {
+            definitions.push(tags::definition(client.clone(), kind));
+        }
     }
     definitions
 }
@@ -1959,13 +2090,16 @@ impl WipOperationHandler for TicketItemWipHandler {
         )?;
         let output = execute_native_ticket_tool(tool, &self.permissions, input, context).await?;
         let response = ticket_tool_output_json(output)?;
-        record_ticket_observation(
-            &self.observations,
-            Some(&self.ticket_reference),
-            &response,
-            tool.projection.mutating,
-        );
-        if tool.projection.mutating {
+        // Classification has its own membership CAS and never changes item content.
+        if operation != "tags_set" {
+            record_ticket_observation(
+                &self.observations,
+                Some(&self.ticket_reference),
+                &response,
+                tool.projection.mutating,
+            );
+        }
+        if tool.projection.mutating && operation != "tags_set" {
             record_affected_ticket_mutations(&self.observations, &self.ticket_reference, &response);
         }
         Ok(WipOperationOutput::native(
@@ -3053,6 +3187,11 @@ mod tests {
                 "record_relation",
                 "remove_relation",
                 "complete",
+                "tag_list",
+                "tag_create",
+                "tag_rename",
+                "tag_delete",
+                "tags_set",
             ]
         );
         let item = ticket_descriptor(
@@ -3102,6 +3241,11 @@ mod tests {
                 "record_orchestration_plan",
                 "query_orchestration_plans",
                 "complete",
+                "tag_list",
+                "tag_create",
+                "tag_rename",
+                "tag_delete",
+                "tags_set",
             ]
         );
         assert_eq!(
@@ -3110,7 +3254,7 @@ mod tests {
                 .iter()
                 .map(|tool| tool.projection.operation)
                 .collect::<Vec<_>>(),
-            ["query", "read"]
+            ["query", "read", "tag_list"]
         );
     }
 
@@ -3404,18 +3548,13 @@ mod tests {
         assert_eq!(show.name, "ShowTicket");
         assert!(show.input_schema["properties"]["event_limit"].is_object());
         let tool_names = TicketFeatureAccess::workspace_authoring().tool_names();
-        assert_eq!(tool_names.len(), 12);
-        assert!(
-            tool_names.len() < 13,
-            "authoring catalog must stay below the prior broad catalog"
-        );
+        assert_eq!(tool_names, WORKSPACE_AUTHORING_TOOL_NAMES);
         let workflow_names = TicketFeatureAccess::workflow().tool_names();
-        assert_eq!(workflow_names.len(), 11);
-        assert!(
-            workflow_names.len() < 12,
-            "workflow catalog must stay below the prior broad catalog"
+        assert_eq!(workflow_names, WORKFLOW_TOOL_NAMES);
+        assert_eq!(
+            TicketFeatureAccess::review().tool_names(),
+            READ_ONLY_TOOL_NAMES
         );
-        assert_eq!(TicketFeatureAccess::review().tool_names().len(), 2);
         assert!(tool_names.contains(&"QueryTicket"));
         assert!(tool_names.contains(&"ShowTicket"));
         assert!(!tool_names.contains(&"TicketList"));

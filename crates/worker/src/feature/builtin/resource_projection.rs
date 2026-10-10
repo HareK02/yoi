@@ -14,6 +14,7 @@ struct ModelTicketQueryItem {
     ticket: String,
     title: String,
     state: String,
+    tags: Vec<ticket::WorkspaceTag>,
     readiness: Option<String>,
     priority: Option<String>,
     created_at: Option<String>,
@@ -39,6 +40,7 @@ pub(super) struct ModelTicketDetail {
     title: String,
     body: String,
     state: String,
+    tags: Vec<ticket::WorkspaceTag>,
     readiness: Option<String>,
     priority: Option<String>,
     created_at: Option<String>,
@@ -95,7 +97,15 @@ struct ModelWorkerSummary {
 }
 
 #[derive(Debug, Serialize)]
+struct ModelTicketTagChange {
+    before: Vec<ticket::WorkspaceTag>,
+    after: Vec<ticket::WorkspaceTag>,
+}
+
+#[derive(Debug, Serialize)]
 struct ModelTicketEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag_changes: Option<ModelTicketTagChange>,
     sequence: usize,
     kind: String,
     body: Option<String>,
@@ -236,6 +246,7 @@ fn project_ticket_query_item(value: &Value) -> Result<ModelTicketQueryItem, Stri
         ticket: resource_ref(item, "resource_key", "T-")?,
         title: string_field(item, "title")?,
         state: string_field(item, "state")?,
+        tags: project_tags(item)?,
         readiness: optional_string(item, "readiness")?,
         priority: optional_string(item, "priority")?,
         created_at: optional_string(item, "created_at")?,
@@ -287,6 +298,7 @@ pub(super) fn project_ticket_detail(value: Value) -> Result<ModelTicketDetail, S
         title: string_field(root, "title")?,
         body: string_field(root, "body")?,
         state: string_field(root, "state")?,
+        tags: project_tags(root)?,
         readiness: optional_string(root, "readiness")?,
         priority: optional_string(root, "priority")?,
         created_at: optional_string(root, "created_at")?,
@@ -394,7 +406,27 @@ fn project_worker(value: &Value) -> Result<ModelWorkerSummary, String> {
 
 fn project_ticket_event(value: &Value) -> Result<ModelTicketEvent, String> {
     let event = object(value, "Ticket event")?;
+    let tag_changes = if event.get("kind").and_then(Value::as_str) == Some("tags_changed") {
+        let attributes = event
+            .get("attributes")
+            .ok_or("missing tag audit attributes")?;
+        let snapshot = |field| -> Result<Vec<ticket::WorkspaceTag>, String> {
+            let encoded = attributes
+                .get(field)
+                .and_then(Value::as_str)
+                .ok_or("missing tag audit snapshot")?;
+            serde_json::from_str(encoded)
+                .map_err(|error| format!("invalid tag audit snapshot: {error}"))
+        };
+        Some(ModelTicketTagChange {
+            before: snapshot("tags_before")?,
+            after: snapshot("tags_after")?,
+        })
+    } else {
+        None
+    };
     Ok(ModelTicketEvent {
+        tag_changes,
         sequence: usize_field(event, "sequence")?,
         kind: string_field(event, "kind")?,
         body: match event.get("body") {
@@ -616,6 +648,24 @@ fn object_field<'a>(
         .ok_or_else(|| format!("missing or invalid {key}"))
 }
 
+fn project_tags(object: &Map<String, Value>) -> Result<Vec<ticket::WorkspaceTag>, String> {
+    let values = array_field(object, "tags")?;
+    if values.len() > 100 {
+        return Err("Ticket projection exceeds 100 tags".into());
+    }
+    values
+        .iter()
+        .map(|value| {
+            let tag: ticket::WorkspaceTag = serde_json::from_value(value.clone())
+                .map_err(|error| format!("invalid Workspace tag: {error}"))?;
+            if tag.deleted {
+                return Err("current Ticket projection contains a deleted tag".into());
+            }
+            Ok(tag)
+        })
+        .collect()
+}
+
 fn array_field<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a [Value], String> {
     object
         .get(key)
@@ -703,7 +753,7 @@ mod tests {
             "closed",
         ] {
             let projected = project_ticket_detail(json!({
-                "resource_key": "T-718", "content_digest": "rev-1", "title": "No Git required", "body": "Decision",
+                "resource_key": "T-718", "tags": [], "content_digest": "rev-1", "title": "No Git required", "body": "Decision",
                 "state": state, "events": [{"sequence": 1, "kind": "completed", "body": "No Git needed"}],
                 "linked_objectives": [], "assignments": [], "implementation_reports": [],
                 "merge_requests": [], "merge_request": null,
@@ -738,7 +788,7 @@ mod tests {
             "linked_tickets": ["00001M0E82D1V"],
             "linked_ticket_summaries": [{
                 "id": "00001M0E82D1V",
-                "resource_key": "T-496",
+                "resource_key": "T-496", "tags": [],
                 "title": "Ticket",
                 "state": "done",
                 "updated_at": "2026-01-02T00:00:00Z"
@@ -769,7 +819,7 @@ mod tests {
             "record_authority": "workspace_sqlite",
             "items": [{
                 "id": "00001TICKETINTERNAL",
-                "resource_key": "T-543",
+                "resource_key": "T-543", "tags": [],
                 "title": "Ticket",
                 "state": "inprogress",
                 "readiness": null,
@@ -840,7 +890,7 @@ mod tests {
     fn ticket_detail_projection_accepts_current_blocker_shape() {
         let projected = project_ticket_detail(json!({
             "id": "internal-ticket",
-            "resource_key": "T-588",
+            "resource_key": "T-588", "tags": [],
             "content_digest": "ticket-content-digest",
             "title": "Queued Submit",
             "body": "Body",
@@ -943,7 +993,7 @@ mod tests {
                 "review_excerpt": "Reviewed source"
             });
             let projected = project_ticket_detail(json!({
-                "resource_key": "T-716",
+                "resource_key": "T-716", "tags": [],
                 "content_digest": "current-ticket-content-digest",
                 "title": "Source evidence",
                 "body": "Body",
@@ -1122,5 +1172,20 @@ mod tests {
         let error = project_worker(&json!({"worker_resource_key": null}))
             .expect_err("missing W-key must fail");
         assert!(error.contains("W-"));
+    }
+    #[test]
+    fn ticket_tag_history_projection_preserves_observed_names_and_identities() {
+        let tag = serde_json::json!({"workspace_id":"ws","id":"tag-1","name":"Old name","last_operation_key":"create","deleted":false});
+        let event = serde_json::json!({"sequence":3,"kind":"tags_changed","body":"Ticket tags changed","at":"then","attributes":{"tags_before":serde_json::json!([tag.clone()]).to_string(),"tags_after":"[]"}});
+        let projected = serde_json::to_value(project_ticket_event(&event).unwrap()).unwrap();
+        assert_eq!(projected["tag_changes"]["before"], serde_json::json!([tag]));
+        assert_eq!(projected["tag_changes"]["after"], serde_json::json!([]));
+        let ordinary = serde_json::json!({"sequence":0,"kind":"comment","body":"hello","at":null});
+        assert!(
+            serde_json::to_value(project_ticket_event(&ordinary).unwrap())
+                .unwrap()
+                .get("tag_changes")
+                .is_none()
+        );
     }
 }

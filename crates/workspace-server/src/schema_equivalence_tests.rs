@@ -42,6 +42,9 @@ fn fresh_and_upgraded_state_contract_schemas_enforce_the_same_constraints() {
     let fresh = SqliteWorkspaceStore::in_memory().unwrap();
     let mut mismatches = Vec::new();
     for table in [
+        "workspace_tags",
+        "typed_ticket_tags",
+        "workspace_tag_operations",
         "artifacts",
         "workspace_config_trees",
         "workspace_config_tree_history",
