@@ -148,6 +148,32 @@ pub async fn verify_runtime_request_source_proof_with_store(
     path: &str,
     body_digest: &str,
 ) -> Result<VerifiedRuntimeRequestSource, RuntimeRequestProofError> {
+    verify_runtime_request_source_proof_with_clock(
+        store,
+        config,
+        proof,
+        workspace_id,
+        permission,
+        method,
+        path,
+        body_digest,
+        &|| i64::try_from(unix_now_seconds()).unwrap_or(i64::MAX),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn verify_runtime_request_source_proof_with_clock(
+    store: &dyn ControlPlaneStore,
+    config: &ServerConfig,
+    proof: &str,
+    workspace_id: &str,
+    permission: &str,
+    method: &str,
+    path: &str,
+    body_digest: &str,
+    clock: &(dyn Fn() -> i64 + Send + Sync),
+) -> Result<VerifiedRuntimeRequestSource, RuntimeRequestProofError> {
     let unverified = decode_runtime_request_source_claims(proof)
         .map_err(|error| RuntimeRequestProofError::undecoded().auth_error(error))?;
     let diagnostic = RuntimeRequestProofError::decoded(&unverified);
@@ -176,7 +202,7 @@ pub async fn verify_runtime_request_source_proof_with_store(
         method,
         path,
         body_digest,
-        now_unix: i64::try_from(unix_now_seconds()).unwrap_or(i64::MAX),
+        now_unix: clock(),
     };
     let claims =
         verify_runtime_request_source(proof, &trusted.public_key, &expected).map_err(|error| {

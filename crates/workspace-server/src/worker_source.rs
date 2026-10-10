@@ -12,6 +12,7 @@ use worker_runtime::worker_source::InProcessWorkerMutationProof;
 use crate::server::{ServerConfig, WorkspaceApi};
 
 mod runtime_request;
+pub(crate) use runtime_request::verify_runtime_request_source_proof_with_clock;
 pub use runtime_request::{
     RuntimeRequestProofError, VerifiedRuntimeRequestSource, diagnostic_id_hash,
     verify_runtime_request_source_proof, verify_runtime_request_source_proof_with_store,
