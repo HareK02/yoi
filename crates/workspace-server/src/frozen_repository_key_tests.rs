@@ -32,12 +32,12 @@ fn legacy_repository_keys(path: &std::path::Path) -> Connection {
         let end = start + frozen[start..].find(end).unwrap();
         conn.execute_batch(&frozen[start..end]).unwrap();
     }
-    conn.execute_batch("INSERT INTO repository_secret_operations VALUES('space','create-key','intent','credential','key',7,'created');
-        INSERT INTO repository_ssh_credentials VALUES('space','key','Key','ssh-ed25519','fingerprint',7,'active','created',NULL);
-        INSERT INTO repository_ssh_credential_revisions VALUES('space','key',7,'ssh-ed25519','fingerprint','created');
-        INSERT INTO repository_secret_audit_events VALUES('space','audit','credential_created','key',7,'actor','created');
+    conn.execute_batch("INSERT INTO repository_secret_operations VALUES('space','create-key','intent','credential','key',7,'2026-01-01T00:00:00.000Z');
+        INSERT INTO repository_ssh_credentials VALUES('space','key','Key','ssh-ed25519','fingerprint',7,'active','2026-01-01T00:00:00.000Z',NULL);
+        INSERT INTO repository_ssh_credential_revisions VALUES('space','key',7,'ssh-ed25519','fingerprint','2026-01-01T00:00:00.000Z');
+        INSERT INTO repository_secret_audit_events VALUES('space','audit','credential_created','key',7,'actor','2026-01-01T00:00:00.000Z');
         INSERT INTO workdir_create_operations(workspace_id,operation_id,request_fingerprint,repository_id,resolved_runtime_id,config_revision,config_projection_digest,working_directory_id,state,created_at,updated_at,credential_id,credential_revision)
-            VALUES('space','create-workdir','intent','repo','runtime',3,'projection','workdir','pending','created','created','key',7);
+            VALUES('space','create-workdir','intent','repo','runtime',3,'projection','workdir','pending','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z','key',7);
         INSERT INTO workdir_create_credential_candidates VALUES('space','create-workdir',0,'primary','key',7);
         INSERT INTO workdir_create_credential_revision_retentions VALUES('space','create-workdir',0,'key',7);
         CREATE TRIGGER workdir_create_insert_blocked_by_runtime_removal
@@ -59,9 +59,298 @@ fn legacy_repository_keys(path: &std::path::Path) -> Connection {
             &mut ciphertext,
         )
         .unwrap();
-        conn.execute("INSERT INTO server_secret_versions VALUES('space','key',7,?1,'aes-256-gcm-v1',?2,?3,'created')",params![purpose,nonce.as_slice(),ciphertext]).unwrap();
+        conn.execute("INSERT INTO server_secret_versions VALUES('space','key',7,?1,'aes-256-gcm-v1',?2,?3,'2026-01-01T00:00:00.000Z')",params![purpose,nonce.as_slice(),ciphertext]).unwrap();
     }
     conn
+}
+
+// Exercise the actual persisted formats, including failed creates whose SSH
+// snapshot remains retry authority. The encrypted fixture uses the real old AAD.
+fn legacy_ssh_snapshot_times(conn: &Connection, key_created: &str, workdir_updated: &str) {
+    conn.execute(
+        "UPDATE repository_secret_operations SET created_at=?1",
+        [key_created],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE repository_secret_audit_events SET created_at=?1",
+        [key_created],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE repository_ssh_credentials SET created_at=?1",
+        [key_created],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE repository_ssh_credential_revisions SET created_at=?1",
+        [key_created],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE server_secret_versions SET created_at=?1",
+        [key_created],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO repository_secret_operations VALUES('space','create-host','intent','host_trust','host',3,?1)", [key_created]).unwrap();
+    conn.execute("INSERT INTO repository_secret_audit_events VALUES('space','host-audit','host_trust_created','host',3,'actor',?1)", [key_created]).unwrap();
+    conn.execute("INSERT INTO repository_ssh_host_trusts VALUES('space','host','example.test',22,'ssh-ed25519','host-key','host-fingerprint',3,?1,?1)", [key_created]).unwrap();
+    conn.execute("INSERT INTO repository_ssh_host_trust_revisions VALUES('space','host',3,'example.test',22,'ssh-ed25519','host-key','host-fingerprint',?1)", [key_created]).unwrap();
+    conn.execute("UPDATE workdir_create_operations SET state='failed',failure='runtime_workdir_create_failed',host_trust_id='host',host_trust_revision=3,repository_access_mode='read_only',updated_at=?1", [workdir_updated]).unwrap();
+}
+
+#[test]
+fn repository_key_cutover_compares_mixed_timestamp_formats_as_instants() {
+    for (key_created, workdir_updated) in [
+        ("2026-01-01T00:00:00.000Z", "1767225600000"),
+        ("2026-01-01T00:00:00.000Z", "1767225600001"),
+        ("2026-01-01T09:00:00.000+09:00", "2026-01-01T00:00:00Z"),
+        (
+            "2026-01-01T00:00:00.000000001Z",
+            "2026-01-01T00:00:00.000000002Z",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = legacy_repository_keys(&dir.path().join("server.db"));
+        std::fs::write(dir.path().join("repository-secrets.master-key"), [42; 32]).unwrap();
+        legacy_ssh_snapshot_times(&conn, key_created, workdir_updated);
+        migrate_repository_keys_v86_to_v87(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 87);
+        let snapshot: (String, String, String, String) = conn.query_row(
+            "SELECT state,credential_fingerprint,host_trust_fingerprint,updated_at FROM workdir_create_operations",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).unwrap();
+        assert_eq!(
+            snapshot,
+            (
+                "failed".into(),
+                "fingerprint".into(),
+                "host-fingerprint".into(),
+                workdir_updated.into()
+            )
+        );
+        let retained: (String, String, String) = conn.query_row(
+            "SELECT c.credential_fingerprint,r.credential_fingerprint,r.credential_operation_id
+             FROM workdir_create_credential_candidates c JOIN workdir_create_credential_retentions r
+             ON r.workspace_id=c.workspace_id AND r.operation_id=c.operation_id AND r.ordinal=c.ordinal",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            retained,
+            (
+                "fingerprint".into(),
+                "fingerprint".into(),
+                "create-key".into()
+            )
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT created_at FROM repository_ssh_credential_keys",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            key_created
+        );
+        assert!(
+            !conn
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .exists([])
+                .unwrap()
+        );
+    }
+}
+
+fn assert_timestamp_cutover_rolls_back(conn: &Connection, expected_context: &str) {
+    let before =
+        frozen_repository_json_rows(conn, "SELECT * FROM workdir_create_operations", &[]).unwrap();
+    let ciphertext: Vec<u8> = conn
+        .query_row(
+            "SELECT ciphertext FROM server_secret_versions WHERE purpose='private_key'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let error = migrate_repository_keys_v86_to_v87(conn)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(expected_context), "{error}");
+    assert!(error.contains("timestamp"), "{error}");
+    assert_eq!(current_schema_version(conn).unwrap(), 86);
+    assert_eq!(
+        frozen_repository_json_rows(conn, "SELECT * FROM workdir_create_operations", &[]).unwrap(),
+        before
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT ciphertext FROM server_secret_versions WHERE purpose='private_key'",
+            [],
+            |r| r.get::<_, Vec<u8>>(0)
+        )
+        .unwrap(),
+        ciphertext
+    );
+    assert!(table_exists(conn, "repository_ssh_credential_revisions").unwrap());
+    assert!(!table_exists(conn, "repository_ssh_credential_keys").unwrap());
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM workdir_create_credential_candidates",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM workdir_create_credential_revision_retentions",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(conn.query_row("SELECT count(*) FROM sqlite_temp_master WHERE name IN ('repository_key_cutover','repository_cutover_times','workdir_terminal_archive_cutover')", [], |r| r.get::<_,i64>(0)).unwrap(), 0);
+    assert_eq!(
+        conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row("PRAGMA legacy_alter_table", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn repository_key_cutover_rejects_newer_reused_snapshot_keys_without_committing_authority() {
+    for source in ["credential", "host_trust", "candidate"] {
+        for later in ["2026-01-01T00:00:00.001Z", "2026-01-01T00:00:00.000000001Z"] {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = legacy_repository_keys(&dir.path().join("server.db"));
+            std::fs::write(dir.path().join("repository-secrets.master-key"), [42; 32]).unwrap();
+            legacy_ssh_snapshot_times(&conn, "2026-01-01T00:00:00.000Z", "1767225600000");
+            if source == "host_trust" {
+                conn.execute(
+                    "UPDATE repository_ssh_host_trust_revisions SET created_at=?1",
+                    [later],
+                )
+                .unwrap();
+                conn.execute("UPDATE repository_secret_operations SET created_at=?1 WHERE resource_kind='host_trust'", [later]).unwrap();
+                conn.execute("UPDATE repository_secret_audit_events SET created_at=?1 WHERE kind='host_trust_created'", [later]).unwrap();
+            } else {
+                conn.execute(
+                    "UPDATE repository_ssh_credential_revisions SET created_at=?1",
+                    [later],
+                )
+                .unwrap();
+                conn.execute("UPDATE repository_secret_operations SET created_at=?1 WHERE resource_kind='credential'", [later]).unwrap();
+                conn.execute("UPDATE repository_secret_audit_events SET created_at=?1 WHERE kind='credential_created'", [later]).unwrap();
+                if source == "candidate" {
+                    conn.execute("UPDATE workdir_create_operations SET credential_id=NULL,credential_revision=NULL", []).unwrap();
+                }
+            }
+            assert_timestamp_cutover_rolls_back(&conn, "Workdir SSH snapshot");
+        }
+    }
+}
+
+#[test]
+fn repository_key_cutover_invalid_authority_timestamps_roll_back_with_source_context() {
+    for (source, invalid) in [
+        ("workdir_create_operations.updated_at", "not-a-date"),
+        (
+            "workdir_create_operations.updated_at",
+            "9223372036854775807",
+        ),
+        (
+            "repository_ssh_credential_revisions.created_at",
+            "not-a-date",
+        ),
+        (
+            "repository_ssh_host_trust_revisions.created_at",
+            "not-a-date",
+        ),
+        ("repository_secret_operations.created_at", "not-a-date"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = legacy_repository_keys(&dir.path().join("server.db"));
+        std::fs::write(dir.path().join("repository-secrets.master-key"), [42; 32]).unwrap();
+        legacy_ssh_snapshot_times(&conn, "2026-01-01T00:00:00.000Z", "1767225600000");
+        match source {
+            "workdir_create_operations.updated_at" => {
+                conn.execute(
+                    "UPDATE workdir_create_operations SET updated_at=?1",
+                    [invalid],
+                )
+                .unwrap();
+            }
+            "repository_ssh_credential_revisions.created_at" => {
+                conn.execute(
+                    "UPDATE repository_ssh_credential_revisions SET created_at=?1",
+                    [invalid],
+                )
+                .unwrap();
+                conn.execute("UPDATE repository_secret_operations SET created_at=?1 WHERE resource_kind='credential'", [invalid]).unwrap();
+            }
+            "repository_ssh_host_trust_revisions.created_at" => {
+                conn.execute(
+                    "UPDATE repository_ssh_host_trust_revisions SET created_at=?1",
+                    [invalid],
+                )
+                .unwrap();
+                conn.execute("UPDATE repository_secret_operations SET created_at=?1 WHERE resource_kind='host_trust'", [invalid]).unwrap();
+            }
+            "repository_secret_operations.created_at" => {
+                conn.execute("INSERT INTO repository_secret_operations VALUES('space','old-delete','intent','credential','gone',1,?1)", [invalid]).unwrap();
+                conn.execute("INSERT INTO repository_secret_audit_events VALUES('space','old-delete-audit','credential_deleted','gone',1,'actor',?1)", [invalid]).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert_timestamp_cutover_rolls_back(&conn, source);
+    }
+}
+
+#[test]
+fn repository_key_cutover_rejects_orphan_candidates_without_dropping_source_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = legacy_repository_keys(&dir.path().join("server.db"));
+    std::fs::write(dir.path().join("repository-secrets.master-key"), [42; 32]).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=OFF;
+        INSERT INTO workdir_create_credential_candidates VALUES('space','missing-parent',0,'primary','key',7);
+        PRAGMA foreign_keys=ON;").unwrap();
+    let before = frozen_repository_json_rows(
+        &conn,
+        "SELECT * FROM workdir_create_credential_candidates ORDER BY operation_id,ordinal",
+        &[],
+    )
+    .unwrap();
+    let error = migrate_repository_keys_v86_to_v87(&conn).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("credential candidates without a Workdir create operation"),
+        "{error}"
+    );
+    assert_eq!(current_schema_version(&conn).unwrap(), 86);
+    assert_eq!(
+        frozen_repository_json_rows(
+            &conn,
+            "SELECT * FROM workdir_create_credential_candidates ORDER BY operation_id,ordinal",
+            &[]
+        )
+        .unwrap(),
+        before
+    );
+    assert!(table_exists(&conn, "repository_ssh_credential_revisions").unwrap());
+    assert!(!table_exists(&conn, "repository_ssh_credential_keys").unwrap());
+    assert_eq!(
+        conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -150,12 +439,12 @@ fn repository_key_cutover_reseals_secrets_and_preserves_retention_and_audit() {
         .unwrap();
     assert!(
         conn.execute(
-            "UPDATE workdir_create_operations SET updated_at='later'",
+            "UPDATE workdir_create_operations SET updated_at='2026-01-04T00:00:00.000Z'",
             []
         )
         .is_err()
     );
-    assert!(conn.execute("INSERT INTO workdir_create_operations(workspace_id,operation_id,request_fingerprint,repository_id,resolved_runtime_id,config_projection_digest,working_directory_id,state,created_at,updated_at) VALUES('space','blocked','intent','repo','runtime','projection','other-workdir','pending','created','created')", []).is_err());
+    assert!(conn.execute("INSERT INTO workdir_create_operations(workspace_id,operation_id,request_fingerprint,repository_id,resolved_runtime_id,config_projection_digest,working_directory_id,state,created_at,updated_at) VALUES('space','blocked','intent','repo','runtime','projection','other-workdir','pending','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')", []).is_err());
     assert!(
         !conn
             .prepare("PRAGMA foreign_key_check")
@@ -274,14 +563,14 @@ fn repository_key_cutover_preserves_host_endpoints_deleted_audit_and_nondefault_
             let dir = tempfile::tempdir().unwrap();
             let conn = legacy_repository_keys(&dir.path().join("server.db"));
             std::fs::write(dir.path().join("repository-secrets.master-key"), [42; 32]).unwrap();
-            conn.execute_batch("INSERT INTO repository_secret_operations VALUES('space','host-create','intent','host_trust','host',3,'created');
-                INSERT INTO repository_secret_operations VALUES('space','host-move','intent','host_trust','host',4,'updated');
-                INSERT INTO repository_ssh_host_trusts VALUES('space','host','new.example.test',2222,'ssh-ed25519','host-key','host-fingerprint',4,'created','updated');
-                INSERT INTO repository_ssh_host_trust_revisions VALUES('space','host',3,'old.example.test',22,'ssh-ed25519','host-key','host-fingerprint','created');
-                INSERT INTO repository_ssh_host_trust_revisions VALUES('space','host',4,'new.example.test',2222,'ssh-ed25519','host-key','host-fingerprint','updated');
-                INSERT INTO repository_secret_audit_events VALUES('space','host-audit','host_trust_rotated','host',4,'host-actor','updated');
-                INSERT INTO repository_secret_operations VALUES('space','delete-gone','intent','credential','gone',5,'deleted');
-                INSERT INTO repository_secret_audit_events VALUES('space','delete-audit','credential_deleted','gone',5,'delete-actor','deleted');
+            conn.execute_batch("INSERT INTO repository_secret_operations VALUES('space','host-create','intent','host_trust','host',3,'2026-01-01T00:00:00.000Z');
+                INSERT INTO repository_secret_operations VALUES('space','host-move','intent','host_trust','host',4,'2026-01-02T00:00:00.000Z');
+                INSERT INTO repository_ssh_host_trusts VALUES('space','host','new.example.test',2222,'ssh-ed25519','host-key','host-fingerprint',4,'2026-01-01T00:00:00.000Z','2026-01-02T00:00:00.000Z');
+                INSERT INTO repository_ssh_host_trust_revisions VALUES('space','host',3,'old.example.test',22,'ssh-ed25519','host-key','host-fingerprint','2026-01-01T00:00:00.000Z');
+                INSERT INTO repository_ssh_host_trust_revisions VALUES('space','host',4,'new.example.test',2222,'ssh-ed25519','host-key','host-fingerprint','2026-01-02T00:00:00.000Z');
+                INSERT INTO repository_secret_audit_events VALUES('space','host-audit','host_trust_rotated','host',4,'host-actor','2026-01-02T00:00:00.000Z');
+                INSERT INTO repository_secret_operations VALUES('space','delete-gone','intent','credential','gone',5,'2026-01-03T00:00:00.000Z');
+                INSERT INTO repository_secret_audit_events VALUES('space','delete-audit','credential_deleted','gone',5,'delete-actor','2026-01-03T00:00:00.000Z');
                 UPDATE workdir_create_operations SET host_trust_id='host',host_trust_revision=3;").unwrap();
             conn.execute_batch(&format!(
                 "PRAGMA foreign_keys={foreign_keys}; PRAGMA legacy_alter_table={legacy_alter};"
@@ -342,8 +631,8 @@ fn deleted_successful_workdir_archives_verbatim_history_without_authorizing_retr
     let digest = "sha256:db15419814117c33c089a36c5348bda85d01a53fccd8d4d427685daf5983353b";
     conn.execute("UPDATE workdir_create_operations SET state='succeeded',request_fingerprint=?1,selector='main',source_kind='local_path',source_uri='/tmp/repo',source_revision=9,source_fingerprint='source'",[digest]).unwrap();
     conn.execute_batch("DELETE FROM workdir_create_credential_revision_retentions;
-        INSERT INTO repository_secret_operations VALUES('space','delete-key','delete-intent','credential','key',7,'deleted');
-        INSERT INTO repository_secret_audit_events VALUES('space','delete-audit','credential_deleted','key',7,'deleting-actor','deleted');
+        INSERT INTO repository_secret_operations VALUES('space','delete-key','delete-intent','credential','key',7,'2026-01-03T00:00:00.000Z');
+        INSERT INTO repository_secret_audit_events VALUES('space','delete-audit','credential_deleted','key',7,'deleting-actor','2026-01-03T00:00:00.000Z');
         DELETE FROM repository_ssh_credentials;").unwrap();
     let original =
         frozen_repository_json_rows(&conn, "SELECT * FROM workdir_create_operations", &[])
@@ -666,7 +955,7 @@ fn migrated_ssh_mutations_replay_complete_old_input_without_reexecution_or_recei
             "credential",
             "key",
             1,
-            "2026-01-01",
+            "2026-01-01T00:00:00.000Z",
             "credential_created",
         ),
         (
@@ -675,7 +964,7 @@ fn migrated_ssh_mutations_replay_complete_old_input_without_reexecution_or_recei
             "credential",
             "key",
             2,
-            "2026-01-02",
+            "2026-01-02T00:00:00.000Z",
             "credential_rotated",
         ),
         (
@@ -684,7 +973,7 @@ fn migrated_ssh_mutations_replay_complete_old_input_without_reexecution_or_recei
             "host_trust",
             "host",
             1,
-            "2026-01-01",
+            "2026-01-01T00:00:00.000Z",
             "host_trust_created",
         ),
         (
@@ -693,7 +982,7 @@ fn migrated_ssh_mutations_replay_complete_old_input_without_reexecution_or_recei
             "host_trust",
             "host",
             2,
-            "2026-01-02",
+            "2026-01-02T00:00:00.000Z",
             "host_trust_rotated",
         ),
     ] {
@@ -708,11 +997,11 @@ fn migrated_ssh_mutations_replay_complete_old_input_without_reexecution_or_recei
         )
         .unwrap();
     }
-    conn.execute("INSERT INTO repository_ssh_credentials VALUES('space','key','Key','ssh-ed25519',?1,2,'active','2026-01-01','2026-01-02')",[&next_fp]).unwrap();
+    conn.execute("INSERT INTO repository_ssh_credentials VALUES('space','key','Key','ssh-ed25519',?1,2,'active','2026-01-01T00:00:00.000Z','2026-01-02T00:00:00.000Z')",[&next_fp]).unwrap();
     let encryption_key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &[42; 32]).unwrap());
     for (legacy_counter, fingerprint, private, timestamp) in [
-        (1u64, &old_fp, &old_private, "2026-01-01"),
-        (2, &next_fp, &next_private, "2026-01-02"),
+        (1u64, &old_fp, &old_private, "2026-01-01T00:00:00.000Z"),
+        (2, &next_fp, &next_private, "2026-01-02T00:00:00.000Z"),
     ] {
         conn.execute("INSERT INTO repository_ssh_credential_revisions VALUES('space','key',?1,'ssh-ed25519',?2,?3)",params![legacy_counter,fingerprint,timestamp]).unwrap();
         let nonce = [legacy_counter as u8; 12];
@@ -727,10 +1016,10 @@ fn migrated_ssh_mutations_replay_complete_old_input_without_reexecution_or_recei
             .unwrap();
         conn.execute("INSERT INTO server_secret_versions VALUES('space','key',?1,'private_key','aes-256-gcm-v1',?2,?3,?4)",params![legacy_counter,nonce.as_slice(),ciphertext,timestamp]).unwrap();
     }
-    conn.execute("INSERT INTO repository_ssh_host_trusts VALUES('space','host','new.example.test',22,'ssh-ed25519',?1,?2,2,'2026-01-01','2026-01-02')",params![public,old_fp]).unwrap();
+    conn.execute("INSERT INTO repository_ssh_host_trusts VALUES('space','host','new.example.test',22,'ssh-ed25519',?1,?2,2,'2026-01-01T00:00:00.000Z','2026-01-02T00:00:00.000Z')",params![public,old_fp]).unwrap();
     for (legacy_counter, hostname, timestamp) in [
-        (1, "old.example.test", "2026-01-01"),
-        (2, "new.example.test", "2026-01-02"),
+        (1, "old.example.test", "2026-01-01T00:00:00.000Z"),
+        (2, "new.example.test", "2026-01-02T00:00:00.000Z"),
     ] {
         conn.execute("INSERT INTO repository_ssh_host_trust_revisions VALUES('space','host',?1,?2,22,'ssh-ed25519',?3,?4,?5)",params![legacy_counter,hostname,public,old_fp,timestamp]).unwrap();
     }
@@ -884,8 +1173,8 @@ fn deleted_legacy_receipt_does_not_bind_to_later_reused_key_ordinal() {
     // The old deleted ID has been recreated using the same ordinal. Its earlier
     // delete receipt must remain history, not acquire proof from this new key.
     conn.execute_batch("DELETE FROM workdir_create_operations;
-        INSERT INTO repository_secret_operations VALUES('space','old-delete','intent','credential','key',7,'2025-01-01');
-        INSERT INTO repository_secret_audit_events VALUES('space','old-delete-audit','credential_deleted','key',7,'actor','2025-01-01');").unwrap();
+        INSERT INTO repository_secret_operations VALUES('space','old-delete','intent','credential','key',7,'2025-01-01T00:00:00.000Z');
+        INSERT INTO repository_secret_audit_events VALUES('space','old-delete-audit','credential_deleted','key',7,'actor','2025-01-01T00:00:00.000Z');").unwrap();
     migrate_repository_keys_v86_to_v87(&conn).unwrap();
     // The service consumes current receipt columns; unrelated schemas are not this fixture.
     rename_saved_secret_receipt_counters(&conn).unwrap();
@@ -966,8 +1255,8 @@ fn repository_key_cutover_failure_preserves_schema_ciphertext_and_connection_pra
             }
             "inconsistent_retention" => {
                 // A different valid retained key passes the ordinal-only candidate FK.
-                conn.execute_batch("INSERT INTO repository_secret_operations VALUES('space','another-key','intent','credential','key',8,'later');
-                    INSERT INTO repository_ssh_credential_revisions VALUES('space','key',8,'ssh-ed25519','other','later');
+                conn.execute_batch("INSERT INTO repository_secret_operations VALUES('space','another-key','intent','credential','key',8,'2026-01-04T00:00:00.000Z');
+                    INSERT INTO repository_ssh_credential_revisions VALUES('space','key',8,'ssh-ed25519','other','2026-01-04T00:00:00.000Z');
                     UPDATE workdir_create_credential_revision_retentions SET credential_revision=8;").unwrap();
             }
             "missing_audit_receipt" => {
@@ -978,12 +1267,12 @@ fn repository_key_cutover_failure_preserves_schema_ciphertext_and_connection_pra
                 .unwrap();
             }
             "missing_host_receipt" => {
-                conn.execute_batch("INSERT INTO repository_ssh_host_trusts VALUES('space','host','example.test',22,'ssh-ed25519','key','host-fingerprint',4,'created','created');
-                INSERT INTO repository_ssh_host_trust_revisions VALUES('space','host',4,'example.test',22,'ssh-ed25519','key','host-fingerprint','created');").unwrap();
+                conn.execute_batch("INSERT INTO repository_ssh_host_trusts VALUES('space','host','example.test',22,'ssh-ed25519','key','host-fingerprint',4,'2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z');
+                INSERT INTO repository_ssh_host_trust_revisions VALUES('space','host',4,'example.test',22,'ssh-ed25519','key','host-fingerprint','2026-01-01T00:00:00.000Z');").unwrap();
             }
             "foreign_key_violation" => {
                 conn.execute_batch("PRAGMA foreign_keys=OFF;
-                INSERT INTO repository_secret_operations VALUES('missing-space','orphan','intent','credential','deleted',1,'created');
+                INSERT INTO repository_secret_operations VALUES('missing-space','orphan','intent','credential','deleted',1,'2026-01-01T00:00:00.000Z');
                 PRAGMA foreign_keys=ON;").unwrap();
             }
             _ => {}

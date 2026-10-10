@@ -32,7 +32,8 @@ fn migrate_repository_keys_v86_to_v87_with_secret_source(
         tx.execute_batch(
             "CREATE TEMP TABLE repository_key_cutover (
             workspace_id TEXT NOT NULL, kind TEXT NOT NULL, resource_id TEXT NOT NULL,
-            legacy_counter INTEGER NOT NULL, operation_id TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at TEXT NOT NULL,
+            legacy_counter INTEGER NOT NULL, operation_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+            created_at_seconds INTEGER NOT NULL, created_at_subsec_nanos INTEGER NOT NULL,
             PRIMARY KEY(workspace_id,kind,resource_id,legacy_counter));",
         )?;
         for (table, kind, id, fingerprint) in [
@@ -68,15 +69,20 @@ fn migrate_repository_keys_v86_to_v87_with_secret_source(
             for (workspace, resource, legacy_counter, fingerprint, created) in rows {
                 let mut statement = tx.prepare("SELECT operation_id FROM repository_secret_operations WHERE workspace_id=?1 AND resource_kind=?2 AND resource_id=?3 AND result_revision=?4 AND created_at=?5")?;
                 let matches = statement
-                    .query_map(params![workspace, kind, resource, legacy_counter, created], |r| {
-                        r.get::<_, String>(0)
-                    })?
+                    .query_map(
+                        params![workspace, kind, resource, legacy_counter, created],
+                        |r| r.get::<_, String>(0),
+                    )?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 if matches.len() != 1 || matches[0].is_empty() {
                     return Err(Error::Store("Repository key cutover requires one unambiguous mutation receipt per stored key".into()));
                 }
+                let created_time = frozen_repository_timestamp(
+                    &created,
+                    &format!("{table}.created_at (workspace {workspace}, resource {resource})"),
+                )?;
                 tx.execute(
-                    "INSERT INTO repository_key_cutover VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    "INSERT INTO repository_key_cutover VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                     params![
                         workspace,
                         kind,
@@ -84,10 +90,25 @@ fn migrate_repository_keys_v86_to_v87_with_secret_source(
                         legacy_counter,
                         matches[0],
                         fingerprint,
-                        created
+                        created_time.timestamp(),
+                        created_time.timestamp_subsec_nanos()
                     ],
                 )?;
             }
+        }
+        // Candidate copying uses an INNER JOIN: reject corrupt source rows before
+        // they can disappear and evade the destination foreign-key check.
+        let orphaned_candidates: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workdir_create_credential_candidates c
+             LEFT JOIN workdir_create_operations o ON o.workspace_id=c.workspace_id AND o.operation_id=c.operation_id
+             WHERE o.operation_id IS NULL)",
+            [],
+            |row| row.get(0),
+        )?;
+        if orphaned_candidates {
+            return Err(Error::Store(
+                "Repository key cutover found credential candidates without a Workdir create operation".into(),
+            ));
         }
         // Current rows must agree with their pointed-to historical key, not merely
         // resolve to a nonempty receipt. FK checks alone cannot prove this identity.
@@ -148,8 +169,17 @@ fn migrate_repository_keys_v86_to_v87_with_secret_source(
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        for (workspace, id, legacy_counter, purpose, algorithm, nonce, ciphertext, created, operation) in
-            secrets
+        for (
+            workspace,
+            id,
+            legacy_counter,
+            purpose,
+            algorithm,
+            nonce,
+            ciphertext,
+            created,
+            operation,
+        ) in secrets
         {
             if algorithm != "aes-256-gcm-v1" {
                 return Err(Error::Store(
@@ -233,8 +263,9 @@ fn migrate_repository_keys_v86_to_v87_with_secret_source(
             SELECT o.workspace_id,o.operation_id FROM workdir_create_operations_v86 o
             WHERE o.state='succeeded'
             AND NOT EXISTS(SELECT 1 FROM workdir_create_credential_revision_retentions_v86 r WHERE r.workspace_id=o.workspace_id AND r.operation_id=o.operation_id)
-            AND (o.credential_id IS NOT NULL OR o.host_trust_id IS NOT NULL OR EXISTS(SELECT 1 FROM workdir_create_credential_candidates_v86 c WHERE c.workspace_id=o.workspace_id AND c.operation_id=o.operation_id));
-            INSERT INTO repository_secret_legacy_receipts
+            AND (o.credential_id IS NOT NULL OR o.host_trust_id IS NOT NULL OR EXISTS(SELECT 1 FROM workdir_create_credential_candidates_v86 c WHERE c.workspace_id=o.workspace_id AND c.operation_id=o.operation_id));")?;
+        prepare_repository_cutover_times(&tx)?;
+        tx.execute_batch("INSERT INTO repository_secret_legacy_receipts
             SELECT e.workspace_id,e.operation_id,e.request_fingerprint,e.resource_kind,e.resource_id,e.result_revision,e.created_at,e.mutation_kind,
                 CASE WHEN e.mutation_kind IN ('credential_created','host_trust_created') THEN 0
                      WHEN e.mutation_kind IN ('credential_rotated','host_trust_rotated') AND e.result_revision>1 THEN e.result_revision-1
@@ -244,8 +275,9 @@ fn migrate_repository_keys_v86_to_v87_with_secret_source(
                 WHERE a.workspace_id=o.workspace_id AND a.resource_id=o.resource_id AND a.revision=o.result_revision AND a.created_at=o.created_at
                   AND ((o.resource_kind='credential' AND a.kind LIKE 'credential_%') OR (o.resource_kind='host_trust' AND a.kind LIKE 'host_trust_%'))
                 HAVING count(*)=1) AS mutation_kind FROM repository_secret_operations_v86 o) e
+            JOIN repository_cutover_times t ON t.kind='receipt' AND t.workspace_id=e.workspace_id AND t.operation_id=e.operation_id
             LEFT JOIN repository_key_cutover m ON m.workspace_id=e.workspace_id AND m.kind=e.resource_kind AND m.resource_id=e.resource_id
-                AND m.created_at<=e.created_at
+                AND (m.created_at_seconds,m.created_at_subsec_nanos)<=(t.seconds,t.subsec_nanos)
                 AND m.legacy_counter=CASE WHEN e.mutation_kind IN ('credential_rotated','host_trust_rotated') THEN e.result_revision-1
                     WHEN e.mutation_kind IN ('credential_deleted','host_trust_deleted') THEN e.result_revision END;
             INSERT INTO workdir_create_operations
@@ -257,12 +289,14 @@ fn migrate_repository_keys_v86_to_v87_with_secret_source(
                 CASE WHEN a.operation_id IS NULL THEN o.repository_access_mode END
             FROM workdir_create_operations_v86 o
             LEFT JOIN workdir_terminal_archive_cutover a ON a.workspace_id=o.workspace_id AND a.operation_id=o.operation_id
-            LEFT JOIN repository_key_cutover c ON c.workspace_id=o.workspace_id AND c.kind='credential' AND c.resource_id=o.credential_id AND c.legacy_counter=o.credential_revision AND c.created_at<=o.updated_at
-            LEFT JOIN repository_key_cutover h ON h.workspace_id=o.workspace_id AND h.kind='host_trust' AND h.resource_id=o.host_trust_id AND h.legacy_counter=o.host_trust_revision AND h.created_at<=o.updated_at;
+            LEFT JOIN repository_cutover_times t ON t.kind='workdir' AND t.workspace_id=o.workspace_id AND t.operation_id=o.operation_id
+            LEFT JOIN repository_key_cutover c ON c.workspace_id=o.workspace_id AND c.kind='credential' AND c.resource_id=o.credential_id AND c.legacy_counter=o.credential_revision AND (c.created_at_seconds,c.created_at_subsec_nanos)<=(t.seconds,t.subsec_nanos)
+            LEFT JOIN repository_key_cutover h ON h.workspace_id=o.workspace_id AND h.kind='host_trust' AND h.resource_id=o.host_trust_id AND h.legacy_counter=o.host_trust_revision AND (h.created_at_seconds,h.created_at_subsec_nanos)<=(t.seconds,t.subsec_nanos);
             INSERT INTO workdir_create_credential_candidates
             SELECT c.workspace_id,c.operation_id,c.ordinal,c.role,c.credential_id,m.fingerprint
-            FROM workdir_create_credential_candidates_v86 c JOIN workdir_create_operations_v86 o ON o.workspace_id=c.workspace_id AND o.operation_id=c.operation_id LEFT JOIN repository_key_cutover m
-                ON m.workspace_id=c.workspace_id AND m.kind='credential' AND m.resource_id=c.credential_id AND m.legacy_counter=c.credential_revision AND m.created_at<=o.updated_at
+            FROM workdir_create_credential_candidates_v86 c JOIN workdir_create_operations_v86 o ON o.workspace_id=c.workspace_id AND o.operation_id=c.operation_id
+            JOIN repository_cutover_times t ON t.kind='workdir' AND t.workspace_id=o.workspace_id AND t.operation_id=o.operation_id
+            LEFT JOIN repository_key_cutover m ON m.workspace_id=c.workspace_id AND m.kind='credential' AND m.resource_id=c.credential_id AND m.legacy_counter=c.credential_revision AND (m.created_at_seconds,m.created_at_subsec_nanos)<=(t.seconds,t.subsec_nanos)
             WHERE NOT EXISTS(SELECT 1 FROM workdir_terminal_archive_cutover a WHERE a.workspace_id=c.workspace_id AND a.operation_id=c.operation_id);
             INSERT INTO workdir_create_credential_retentions SELECT c.workspace_id,c.operation_id,c.ordinal,c.credential_id,m.fingerprint,m.operation_id FROM workdir_create_credential_revision_retentions_v86 c LEFT JOIN repository_key_cutover m ON m.workspace_id=c.workspace_id AND m.kind='credential' AND m.resource_id=c.credential_id AND m.legacy_counter=c.credential_revision;")?;
         let missing:i64=tx.query_row("SELECT count(*) FROM workdir_create_operations WHERE (credential_id IS NOT NULL AND credential_fingerprint IS NULL) OR (host_trust_id IS NOT NULL AND host_trust_fingerprint IS NULL)",[],|r|r.get(0))?;
@@ -313,7 +347,7 @@ fn migrate_repository_keys_v86_to_v87_with_secret_source(
         ] {
             tx.execute_batch(&format!("DROP TABLE {table}_v86;"))?;
         }
-        tx.execute_batch("DROP TABLE repository_key_cutover;
+        tx.execute_batch("DROP TABLE repository_key_cutover; DROP TABLE repository_cutover_times;
             CREATE INDEX idx_repository_secret_audit_workspace_created ON repository_secret_audit_events(workspace_id,created_at,event_id);
             CREATE INDEX idx_repository_ssh_credentials_workspace_status ON repository_ssh_credentials(workspace_id,status,credential_id);
             CREATE INDEX idx_repository_ssh_host_trusts_workspace_host ON repository_ssh_host_trusts(workspace_id,hostname,port);")?;
@@ -358,6 +392,109 @@ BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
         ))
         .map_err(Error::from);
     result.and(restore)
+}
+
+// Schema 86 used RFC3339 for Repository secrets and epoch-millisecond text for
+// registry operations. Compare typed instants, never their persisted spelling.
+fn frozen_repository_timestamp(
+    value: &str,
+    context: &str,
+) -> Result<chrono::DateTime<chrono::Utc>> {
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok(timestamp.with_timezone(&chrono::Utc));
+    }
+    if let Ok(millis) = value.parse::<i64>()
+        && let Some(timestamp) = chrono::DateTime::from_timestamp_millis(millis)
+    {
+        return Ok(timestamp);
+    }
+    Err(Error::Store(format!(
+        "Repository key migration found invalid timestamp in {context}"
+    )))
+}
+
+fn prepare_repository_cutover_times(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    // These temporary normalized values never rewrite audit history or the
+    // original timestamps used to identify receipts and encrypted envelopes.
+    // Seconds + nanoseconds also preserve sub-millisecond ordering and offsets.
+    tx.execute_batch(
+        "CREATE TEMP TABLE repository_cutover_times (
+        kind TEXT NOT NULL, workspace_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+        seconds INTEGER NOT NULL, subsec_nanos INTEGER NOT NULL,
+        PRIMARY KEY(kind,workspace_id,operation_id));",
+    )?;
+    for (kind, context, query) in [
+        (
+            "receipt",
+            "repository_secret_operations.created_at",
+            "SELECT workspace_id,operation_id,created_at FROM repository_secret_operations_v86",
+        ),
+        (
+            "workdir",
+            "workdir_create_operations.updated_at",
+            "SELECT o.workspace_id,o.operation_id,o.updated_at FROM workdir_create_operations_v86 o
+             WHERE NOT EXISTS(SELECT 1 FROM workdir_terminal_archive_cutover a
+                 WHERE a.workspace_id=o.workspace_id AND a.operation_id=o.operation_id)
+             AND (o.credential_id IS NOT NULL OR o.host_trust_id IS NOT NULL OR
+                 EXISTS(SELECT 1 FROM workdir_create_credential_candidates_v86 c
+                     WHERE c.workspace_id=o.workspace_id AND c.operation_id=o.operation_id))",
+        ),
+    ] {
+        let rows = tx
+            .prepare(query)?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (workspace, operation, value) in rows {
+            let timestamp = frozen_repository_timestamp(
+                &value,
+                &format!("{context} (workspace {workspace}, operation {operation})"),
+            )?;
+            tx.execute(
+                "INSERT INTO repository_cutover_times VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    kind,
+                    workspace,
+                    operation,
+                    timestamp.timestamp(),
+                    timestamp.timestamp_subsec_nanos()
+                ],
+            )?;
+        }
+    }
+    // Refuse missing or newer/reused keys with a domain error before a NULL
+    // fingerprint reaches a NOT NULL column. Archived successes are excluded:
+    // they retain opaque history, not authority to retry with a current key.
+    let missing: Option<(String, String)> = tx.query_row(
+        "SELECT r.workspace_id,r.operation_id FROM (
+            SELECT workspace_id,operation_id,'credential' AS kind,credential_id AS resource_id,credential_revision AS legacy_counter
+                FROM workdir_create_operations_v86 WHERE credential_id IS NOT NULL
+            UNION
+            SELECT workspace_id,operation_id,'host_trust',host_trust_id,host_trust_revision
+                FROM workdir_create_operations_v86 WHERE host_trust_id IS NOT NULL
+            UNION
+            SELECT workspace_id,operation_id,'credential',credential_id,credential_revision
+                FROM workdir_create_credential_candidates_v86
+        ) r
+        JOIN repository_cutover_times t ON t.kind='workdir' AND t.workspace_id=r.workspace_id AND t.operation_id=r.operation_id
+        LEFT JOIN repository_key_cutover k ON k.workspace_id=r.workspace_id AND k.kind=r.kind
+            AND k.resource_id=r.resource_id AND k.legacy_counter=r.legacy_counter
+            AND (k.created_at_seconds,k.created_at_subsec_nanos)<=(t.seconds,t.subsec_nanos)
+        WHERE k.operation_id IS NULL LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    if let Some((workspace, operation)) = missing {
+        return Err(Error::Store(format!(
+            "Workdir SSH snapshot is missing key identity evidence at or before its timestamp (workspace {workspace}, operation {operation})"
+        )));
+    }
+    Ok(())
 }
 
 // Preserve every SQLite field and NULL verbatim as typed JSON. Frozen archives
