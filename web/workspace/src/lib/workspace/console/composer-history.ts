@@ -11,7 +11,6 @@ export type ComposerHistoryCursor = {
   cursorLine: number;
   lineCount: number;
   selectionEmpty: boolean;
-  readOnly: boolean;
   composing: boolean;
 };
 
@@ -85,7 +84,7 @@ function sameEntry(
 export function shouldBrowseComposerHistory(
   cursor: ComposerHistoryCursor,
 ): boolean {
-  if (cursor.readOnly || cursor.composing || !cursor.selectionEmpty) {
+  if (cursor.composing || !cursor.selectionEmpty) {
     return false;
   }
   return cursor.direction === "older"

@@ -1,6 +1,5 @@
 <script lang="ts">
   import {
-    Compartment,
     EditorSelection,
     EditorState,
     Prec,
@@ -62,7 +61,6 @@
   } from "#lib/workspace/console/composer-invocation.ts";
 
   interface Props {
-    disabled?: boolean;
     ariaLabel?: string;
     ariaKeyShortcuts?: string;
     historyScope: string;
@@ -85,7 +83,6 @@
   }
 
   let {
-    disabled = false,
     ariaLabel = "Message",
     ariaKeyShortcuts = "Meta+Enter Control+Enter",
     historyScope,
@@ -137,7 +134,6 @@
       return retained;
     },
   });
-  const editable = new Compartment();
 
   const completionId = $props.id();
   let completionToken = $state<ComposerCompletionToken | null>(null);
@@ -151,7 +147,7 @@
   const completionStart = $derived(Math.max(0, (completionSelected ?? 0) - 5));
   const visibleCompletions = $derived(completionEntries.slice(completionStart, completionStart + 6));
 
-  function closeCompletion(): void {
+  export function closeCompletion(): void {
     completionVersion++;
     completionAbort?.abort();
     completionAbort = null;
@@ -170,7 +166,7 @@
     if (!force && context === completionContext) return;
     completionContext = context;
     closeCompletion();
-    if (disabled || !view.hasFocus || view.composing || !selection.empty) return;
+    if (!view.hasFocus || view.composing || !selection.empty) return;
     const token = completionTokenAt(
       document,
       selection.head,
@@ -213,7 +209,7 @@
   }
 
   function acceptCompletion(action: "tab" | "accept", index = completionSelected): void {
-    if (!view || !completionToken || disabled) return;
+    if (!view || !completionToken) return;
     const token = completionToken;
     const document = view.state.doc.toString();
     if (token.kind === "command" && index === null) {
@@ -256,7 +252,7 @@
   }
 
   function completionKeydown(event: KeyboardEvent): boolean {
-    if (disabled || event.isComposing || view?.composing || event.keyCode === 229) return false;
+    if (event.isComposing || view?.composing || event.keyCode === 229) return false;
     if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return false;
     if (event.key === "Escape" && completionToken) {
       event.preventDefault(); closeCompletion(); return true;
@@ -295,12 +291,6 @@
   $effect(() => {
     void completionScope;
     selectedFeatureInvocations.clear();
-    closeCompletion();
-    completionContext = "";
-  });
-
-  $effect(() => {
-    void disabled;
     closeCompletion();
     completionContext = "";
   });
@@ -503,7 +493,7 @@
     segment: Segment,
     options: { from?: number; to?: number; cleanup?: boolean; label?: string; uploadReservation?: boolean } = {},
   ): number | null {
-    if (!view || view.state.readOnly) return null;
+    if (!view) return null;
     const selection = view.state.selection.main;
     const from = options.from ?? selection.from;
     const to = options.to ?? selection.to;
@@ -525,7 +515,7 @@
   }
 
   function chipifySelectedInvocation(strict = false): void {
-    if (!view || view.composing || view.state.readOnly) return;
+    if (!view || view.composing) return;
     // Only completion-selected or explicitly edited calls become structured input.
     // Descriptor discovery must never promote unrelated typed or pasted prose.
     for (const selected of [...view.state.field(selectedInvocationState)].reverse()) {
@@ -553,7 +543,7 @@
   let editVersion = 0;
   let editorGeneration = 0;
   async function editInvocation(key: number): Promise<void> {
-    if (!view || disabled) return;
+    if (!view) return;
     const scope = completionScope;
     const version = ++editVersion;
     const document = view.state.doc.toString();
@@ -570,7 +560,7 @@
         descriptor = entries.find((entry) => entry.invocation?.identity === invocation.identity)?.invocation ?? undefined;
       } catch { return; }
     }
-    if (!descriptor || !view || disabled || version !== editVersion || scope !== completionScope ||
+    if (!descriptor || !view || version !== editVersion || scope !== completionScope ||
         generation !== editorGeneration || document !== view.state.doc.toString() ||
         selection.from !== view.state.selection.main.from || selection.to !== view.state.selection.main.to) return;
     atom = composerTypedAtoms(view.state.doc.toString(), view.state.field(typedRegistry))
@@ -622,7 +612,6 @@
       cursorLine,
       lineCount: currentView.state.doc.lines,
       selectionEmpty: selection.empty,
-      readOnly: currentView.state.readOnly,
       composing: currentView.composing,
     })) return false;
 
@@ -679,7 +668,6 @@
   }
 
   function handlePasteEvent(event: ClipboardEvent): boolean {
-    if (disabled || view?.state.readOnly) return false;
     if (handleComposerImagePaste(event, onpasteimages)) return true;
     const content = event.clipboardData?.getData("text/plain");
     if (!content) return false;
@@ -718,7 +706,6 @@
     currentView: EditorView,
     direction: "backward" | "forward",
   ): boolean {
-    if (currentView.state.readOnly) return false;
     const selection = currentView.state.selection.main;
     const atoms = [
       ...composerPasteAtoms(
@@ -754,18 +741,6 @@
           Prec.highest(EditorView.domEventHandlers({ keydown: completionKeydown })),
           Prec.highest(keymap.of([
             {
-              key: "Mod-z",
-              run: (currentView) => currentView.state.readOnly,
-            },
-            {
-              key: "Mod-Shift-z",
-              run: (currentView) => currentView.state.readOnly,
-            },
-            {
-              key: "Mod-y",
-              run: (currentView) => currentView.state.readOnly,
-            },
-            {
               key: "ArrowUp",
               run: (currentView) => browseHistory(currentView, "older"),
             },
@@ -791,10 +766,6 @@
             : []),
           pasteChips,
           typedChips,
-          editable.of([
-            EditorView.editable.of(!disabled),
-            EditorState.readOnly.of(disabled),
-          ]),
           EditorState.allowMultipleSelections.of(false),
           EditorView.lineWrapping,
           EditorView.contentAttributes.of({
@@ -840,7 +811,7 @@
               const target = event.target instanceof Element
                 ? event.target.closest(".composer-typed-chip")
                 : null;
-              if (!target || currentView.state.readOnly) return false;
+              if (!target) return false;
               let position: number;
               try {
                 position = currentView.posAtDOM(target);
@@ -867,7 +838,6 @@
               return true;
             },
             cut(event, currentView) {
-              if (disabled) return false;
               const content = selectedClipboardContent(currentView.state);
               if (content === null || !event.clipboardData) return false;
               event.preventDefault();
@@ -887,7 +857,7 @@
                 shouldSubmitChatKey(event, {
                   mode: "mod-enter",
                   modKey: "auto",
-                  enabled: !disabled,
+                  enabled: true,
                 })
               ) {
                 event.preventDefault();
@@ -916,16 +886,6 @@
       view?.destroy();
       view = null;
     };
-  });
-
-  $effect(() => {
-    const isDisabled = disabled;
-    view?.dispatch({
-      effects: editable.reconfigure([
-        EditorView.editable.of(!isDisabled),
-        EditorState.readOnly.of(isDisabled),
-      ]),
-    });
   });
 
   export function snapshot(): ComposerDraftSnapshot {
@@ -957,7 +917,7 @@
   }
 
   export function replaceRange(from: number, to: number, content: string): void {
-    if (!view || view.state.readOnly) return;
+    if (!view) return;
     view.dispatch({
       changes: { from, to, insert: content },
       selection: EditorSelection.cursor(from + content.length),
@@ -1007,9 +967,6 @@
     closeCompletion();
     completionContext = "";
     view.setState(EditorState.create({ extensions: editorExtensions }));
-    view.dispatch({ effects: editable.reconfigure([
-      EditorView.editable.of(!disabled), EditorState.readOnly.of(disabled),
-    ]) });
     emitChange();
   }
 
@@ -1070,7 +1027,7 @@
   }
 </script>
 
-<div class="composer-input" class:disabled>
+<div class="composer-input">
   {#if completionToken}
     <div class="completion-popup">
       <div id={completionId} role="listbox" aria-label="Composer completions" aria-busy={completionBusy}>
@@ -1146,10 +1103,6 @@
     text-overflow: ellipsis;
   }
   .completion-hint { padding: var(--space-1) var(--space-2); color: var(--text-muted); }
-
-  .composer-input.disabled {
-    opacity: 0.56;
-  }
 
   .composer-input :global(.cm-editor) {
     min-height: 2.65rem;

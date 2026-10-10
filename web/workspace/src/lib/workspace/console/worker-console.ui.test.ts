@@ -1050,13 +1050,13 @@ Deno.test("Worker Console paste chips preserve typed draft and target authority"
       composerInput.includes(
         "composerDeletionRange(selection, atoms, direction)",
       ) &&
-      composerInput.includes("EditorState.readOnly.of(isDisabled)") &&
-      composerInput.includes('key: "Mod-z"') &&
-      composerInput.includes("if (!view || view.state.readOnly) return") &&
-      composerInput.includes("if (currentView.state.readOnly) return false") &&
+      !composerInput.includes("readOnly") &&
+      !composerInput.includes("disabled") &&
+      !composerInput.includes("EditorView.editable") &&
+      composerInput.includes("...historyKeymap") &&
       consolePage.includes("completionScope={activeComposerTargetKey}") &&
       composerInput.includes("version !== completionVersion") &&
-      consolePage.includes("if (!composerEditable) return") &&
+      consolePage.includes("if (!canUploadAttachments) return") &&
       composerInput.includes('chip.setAttribute("aria-label", label)') &&
       composerInput.includes("preserveExactText = false") &&
       consolePage.includes("const command = buildComposerSegmentsRequest(") &&
@@ -1083,20 +1083,18 @@ Deno.test("Worker Console routes image paste through the existing attachment upl
     input.indexOf("function selectedClipboardContent"),
   );
   assert(
-    paste.indexOf("if (disabled || view?.state.readOnly)") <
-        paste.indexOf("handleComposerImagePaste(event, onpasteimages)") &&
-      paste.indexOf("handleComposerImagePaste(event, onpasteimages)") <
+    paste.indexOf("handleComposerImagePaste(event, onpasteimages)") <
         paste.indexOf('getData("text/plain")') &&
       consolePage.includes("onpasteimages={addPastedImages}") &&
       consolePage.includes("addAttachmentFiles(files.map(namePastedImage))"),
-    "image paste must respect editability and take priority over text before using the attachment callback",
+    "image paste must take priority over text before using the attachment callback",
   );
   const attach = consolePage.slice(
     consolePage.indexOf("function addAttachmentFiles"),
     consolePage.indexOf("async function removeAttachment"),
   );
   assert(
-    attach.includes("if (!composerEditable) return") &&
+    attach.includes("if (!canUploadAttachments) return") &&
       attach.includes("MAX_FILES_PER_SUBMISSION - attachments.length") &&
       attach.includes(".slice(0, available)") &&
       attach.includes("startAttachmentUpload(attachment)"),
@@ -1273,14 +1271,15 @@ Deno.test("Worker Console route resolves logical Worker authority before Runtime
       'const workerRunning = $derived(workerState === "running");',
     ) &&
       consolePage.includes(
-        'const composerEditable = $derived(protocolState === "open" && !sending);',
+        'const canSendComposerControl = $derived(protocolState === "open" && !sending);',
       ) &&
       consolePage.includes('sendWorkerControl("cancel")') &&
       consolePage.includes("lifecycleMethod(command)") &&
       consolePage.includes("command_id: commandId") &&
       !consolePage.includes("expected_execution_generation") &&
       consolePage.includes("onsubmit={handleComposerSubmit}") &&
-      consolePage.includes("disabled={!composerEditable}") &&
+      !consolePage.includes("disabled={!composerEditable}") &&
+      consolePage.includes("if (!canSendComposerControl) return;") &&
       consolePage.includes("class:stop={workerRunning}") &&
       consolePage.includes('"Stop Worker"') &&
       consolePage.includes("disabled={composerSubmitDisabled}") &&

@@ -181,6 +181,67 @@ async function attach(page: Page, name: string): Promise<void> {
     buffer: Buffer.from("Synthetic fixture document"),
   });
 }
+Deno.test("production Composer stays editable before connection and during admission without losing history focus or later edits", () =>
+  fixture(async (page, base, errors) => {
+    await page.evaluate(() => localStorage.setItem(
+      "yoi.composer-history.v1.workspace.console-live-review",
+      JSON.stringify({ version: 1, entries: [{ segments: [{ kind: "text", content: "previous input" }], preserveExactText: false }] }),
+    ));
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => { release = resolve; });
+    await page.route("**/workers/worker-a/session", async (route) => {
+      await waiting;
+      await route.continue();
+    });
+    try {
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.locator(".cm-content[contenteditable=true]").waitFor();
+      await draft(page, "offline draft");
+      const editor = page.locator(".cm-content");
+      const assertFocused = async () => assert(await editor.evaluate((node) =>
+        node === document.activeElement && node.getAttribute("contenteditable") === "true"
+      ));
+      await page.keyboard.press("Control+Enter");
+      assertEquals((await state(base)).methods.filter((method) => method.method === "submit"), []);
+      assert(await page.locator(".composer-send-button").isDisabled());
+      await page.keyboard.press("ArrowUp");
+      assertEquals(await editor.textContent(), "previous input");
+      await assertFocused();
+      await page.keyboard.press("ArrowDown");
+      assertEquals(await editor.textContent(), "offline draft");
+      await assertFocused();
+      await page.keyboard.type(" edited");
+      assertEquals(await editor.textContent(), "offline draft edited");
+      release();
+      await page.getByText("Ready. Choose a Feature", { exact: false }).waitFor();
+      await page.waitForFunction(() => !(document.querySelector(".composer-send-button") as HTMLButtonElement)?.disabled);
+      await assertFocused();
+      await control(base, { submit: "hold" });
+      await page.keyboard.press("Control+Enter");
+      await eventually(base, (value) => value.methods.filter((method) => method.method === "submit").length === 1);
+      assert(await page.locator(".composer-send-button").isDisabled());
+      await assertFocused();
+      await page.keyboard.type(" while pending");
+      await page.keyboard.press("Control+Enter");
+      assertEquals((await state(base)).methods.filter((method) => method.method === "submit").length, 1);
+      await control(base, { accept_pending: true });
+      await page.getByRole("button", { name: "Stop Worker", exact: true }).waitFor();
+      assertEquals(await editor.textContent(), "offline draft edited while pending");
+      await assertFocused();
+      await page.keyboard.type(" while running");
+      assertEquals(await editor.textContent(), "offline draft edited while pending while running");
+      await page.keyboard.press("ArrowUp");
+      assertEquals(await editor.textContent(), "offline draft edited");
+      await assertFocused();
+      await page.keyboard.press("ArrowDown");
+      assertEquals(await editor.textContent(), "offline draft edited while pending while running");
+      await assertFocused();
+      assertEquals(errors, []);
+    } finally {
+      release();
+    }
+  }));
+
 Deno.test("production leading slash remains responsive after loop fix", () =>
   fixture(async (page, base, errors, caseOutput) => {
     await draft(page, "/");

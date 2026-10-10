@@ -76,7 +76,6 @@ Deno.test("Composer history uses only the multiline input boundaries", () => {
   const base = {
     lineCount: 3,
     selectionEmpty: true,
-    readOnly: false,
     composing: false,
   };
 
@@ -106,14 +105,6 @@ Deno.test("Composer history uses only the multiline input boundaries", () => {
       direction: "older",
       cursorLine: 1,
       selectionEmpty: false,
-    }),
-  );
-  assert(
-    !shouldBrowseComposerHistory({
-      ...base,
-      direction: "newer",
-      cursorLine: 3,
-      readOnly: true,
     }),
   );
   assert(

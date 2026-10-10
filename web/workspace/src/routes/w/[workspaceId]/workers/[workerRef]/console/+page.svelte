@@ -114,6 +114,7 @@
     let workerError = $state<string | null>(untrack(() => data.workerError));
     type ComposerInputHandle = {
         snapshot(): ComposerDraftSnapshot;
+        closeCompletion(): void;
         focus(): void;
         containsTarget(target: EventTarget | null): boolean;
         cursor(): number;
@@ -313,7 +314,8 @@
     );
     const workerRunning = $derived(workerState === "running");
     const workerPaused = $derived(workerState === "paused");
-    const composerEditable = $derived(protocolState === "open" && !sending);
+    const canSendComposerControl = $derived(protocolState === "open" && !sending);
+    const canUploadAttachments = $derived(consoleTarget !== null);
     const draftHasText = $derived(draft.content.trim().length > 0);
     const draftHasAttachments = $derived(
         attachments.length > 0 || draft.segments.some((segment) => segment.kind === "uploaded_file"),
@@ -348,7 +350,7 @@
             hasAttachments: draftHasAttachments,
         }),
     );
-    const canStopFromComposer = $derived(workerRunning && composerEditable);
+    const canStopFromComposer = $derived(workerRunning && canSendComposerControl);
     const composerSubmitDisabled = $derived(
         workerRunning ? !canStopFromComposer : !canSubmitDraft,
     );
@@ -1024,12 +1026,12 @@
         activeComposerTargetKey = nextKey;
         syncAdmission();
         const pending = admissions.get(nextKey);
-        const restored = pending && pending.status !== "rejected"
-            ? cachedComposerDraft(pending.snapshot)
-            : composerDrafts.get(nextKey) ?? {
-                segments: [],
-                preserveExactText: false,
-            };
+        // A pending request owns its snapshot, not subsequent edits to the draft.
+        const restored = composerDrafts.get(nextKey) ?? (
+            pending && pending.status !== "rejected"
+                ? cachedComposerDraft(pending.snapshot)
+                : { segments: [], preserveExactText: false }
+        );
         void tick().then(() => {
             if (activeComposerTargetKey !== nextKey) return;
             composerInputElement?.restoreSegments(
@@ -1055,6 +1057,7 @@
     }
 
     function handleComposerSubmit() {
+        if (!canSendComposerControl) return;
         const value = composerSnapshotOrReport();
         if (!value) return;
         if (value.document.trimStart().startsWith(":")) {
@@ -1108,7 +1111,7 @@
         reference: NonNullable<ComposerAttachment["reference"]>,
     ): void {
         if (!attachments.some((candidate) => candidate.id === attachment.id) ||
-            !composerInputElement || !composerEditable || attachment.uploadPath !== attachmentPath()) {
+            !composerInputElement || !consoleTarget || attachment.uploadPath !== attachmentPath()) {
             const reservation = uploadReservations.get(attachment.id);
             uploadReservations.delete(attachment.id);
             if (reservation !== undefined) composerInputElement?.cancelUpload(reservation);
@@ -1164,7 +1167,7 @@
     }
 
     function addAttachmentFiles(files: Iterable<File>): void {
-        if (!composerEditable) return;
+        if (!canUploadAttachments) return;
         const stagedFiles = draft.segments.filter((segment) => segment.kind === "uploaded_file").length;
         const available = Math.max(0, MAX_FILES_PER_SUBMISSION - attachments.length - stagedFiles);
         for (const file of Array.from(files).slice(0, available)) {
@@ -1289,7 +1292,7 @@
         // Commands are controls, not idle-only chat submissions. Keep the
         // removed header controls available while the Worker is busy too.
         const isCommand = delivery === "submit" && command.request.kind !== "user";
-        if (isCommand ? !composerEditable : !canDeliverComposerDraft(deliveryState)) {
+        if (isCommand ? !canSendComposerControl : !canDeliverComposerDraft(deliveryState)) {
             return;
         }
 
@@ -1590,8 +1593,8 @@
                     if (segment.kind === "uploaded_file") stagedAttachmentPaths.delete(segment.file.artifact_id);
                 }
                 composerInputElement?.recordHistory(record.snapshot);
-                // A late acceptance of a previously rejected attempt must not erase
-                // edits made while the recovered draft was unlocked.
+                // Admission never locks the editor. Do not erase edits made
+                // after this request's snapshot, including after a rejection.
                 if (JSON.stringify(draft.segments) === JSON.stringify(record.snapshot.segments)) {
                     composerInputElement?.clear(true);
                     attachments = [];
@@ -1600,8 +1603,8 @@
                     liveWorkerState = "running";
                 }
             } else {
-                // The editor has stayed frozen with the exact typed input, Undo state
-                // and staged resources. Unlock it; unchanged retries reuse the IDs.
+                // Keep the current draft and Undo state; the pending snapshot
+                // remains available for unchanged retries with the same IDs.
                 reportComposerError(message ?? "Worker rejected the input.");
             }
             syncAdmission();
@@ -1652,6 +1655,8 @@
 
     function rejectPendingCompletion(error: Error, targetKey = activeComposerTargetKey) {
         admissionDisconnected(targetKey);
+        // Invalidate suggestions on disconnect without locking the draft.
+        composerInputElement?.closeCompletion();
         fileCompletions.close(error);
         featureCompletions.close(error);
         for (const lane of featureArgumentCompletions.values()) lane.close(error);
@@ -2151,7 +2156,6 @@
                 historyScope={workspaceId}
                 ariaLabel="Console input"
                 ariaKeyShortcuts="Meta+Enter Control+Enter"
-                disabled={!composerEditable}
                 onchange={handleComposerChange}
                 onkeydown={handleComposerKeydown}
                 completionScope={activeComposerTargetKey}
@@ -2212,7 +2216,7 @@
                         type="button"
                         aria-label="Attach file"
                         title="Attach file"
-                        disabled={!composerEditable || attachments.length >= MAX_FILES_PER_SUBMISSION}
+                        disabled={!canUploadAttachments || attachments.length >= MAX_FILES_PER_SUBMISSION}
                         onclick={() => fileInput?.click()}
                     >
                         <svg

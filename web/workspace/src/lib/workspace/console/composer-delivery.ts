@@ -37,7 +37,7 @@ export class ComposerAdmissions {
     const prior = this.get(target);
     if (prior && prior.status !== "rejected") {
       throw new Error(
-        "Resolve the in-flight admission before editing or sending a new draft.",
+        "Resolve the in-flight admission before sending a new draft.",
       );
     }
     const unchanged = prior && prior.method.method === method.method &&

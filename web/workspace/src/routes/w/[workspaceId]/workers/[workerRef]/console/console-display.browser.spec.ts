@@ -397,6 +397,40 @@ test("Feature and argument completion correlate same-prefix ABA, context and oth
   expect((await screen.findByRole("option")).textContent).toContain("a b/資料");
 });
 
+test.each(["running", "paused"] as const)("Composer edits remain available while Worker is %s", async (state) => {
+  const { cm, view } = await liveComposer();
+  protocolEvent({ event: "worker_state", data: { snapshot: { last_command_id: 0, state: { kind: "busy", state: { kind: "run", state } } } } });
+  await settleMicrotasks();
+  cm.focus();
+  await fireEvent.paste(cm.contentDOM, { clipboardData: { getData: () => "next input" } });
+  expect(cm.state.doc.toString()).toBe("next input");
+  expect(cm.state.readOnly).toBe(false);
+  expect(cm.contentDOM.getAttribute("contenteditable")).toBe("true");
+  expect(undo(cm)).toBe(true);
+  expect(cm.state.doc.toString()).toBe("");
+  expect(cm.hasFocus).toBe(true);
+  expect(view.container.querySelector(".composer-input.disabled")).toBeNull();
+});
+
+test("stopped Worker with retained conversation allows drafting but not sending", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => Response.json(
+    String(input).includes("/session/history") ? emptyHistoryPage() : { availability: "retained_snapshot", snapshot: emptySession() },
+  )));
+  const data = pageData();
+  data.worker.state = "stopped";
+  const view = render(ConsolePage, { data });
+  await screen.findByText("Read-only retained conversation");
+  const cm = EditorView.findFromDOM(view.container.querySelector(".cm-editor") as HTMLElement)!;
+  cm.focus();
+  await fireEvent.paste(cm.contentDOM, { clipboardData: { getData: () => "draft for later" } });
+  expect(cm.state.doc.toString()).toBe("draft for later");
+  expect(cm.state.readOnly).toBe(false);
+  expect(cm.contentDOM.getAttribute("contenteditable")).toBe("true");
+  await fireEvent.submit(view.container.querySelector(".console-composer")!);
+  expect(multiplexer.sendWorkerMethod).not.toHaveBeenCalled();
+  expect(cm.state.doc.toString()).toBe("draft for later");
+});
+
 test("Submit rejection keeps exact typed draft, request/invocation IDs, and only acceptance clears", async () => {
   const alert = vi.spyOn(alerts, "pushWorkspaceAlert");
   const { cm, form } = await liveComposer();
@@ -406,13 +440,16 @@ test("Submit rejection keeps exact typed draft, request/invocation IDs, and only
   expect(first.method).toBe("submit");
   expect(first.params.input[0]).toMatchObject({ kind: "feature_invoke", invocation: { identity: runDescriptor.identity, arguments: [{ name: "path", value: { kind: "string", value: "a b/資料" } }] } });
   const doc = cm.state.doc.toString();
-  await waitFor(() => expect(cm.state.readOnly).toBe(true));
+  expect(cm.state.readOnly).toBe(false);
   await fireEvent.keyDown(cm.contentDOM, { key: "Backspace" });
-  await fireEvent.keyDown(cm.contentDOM, { key: "z", ctrlKey: true });
+  expect(cm.state.doc.toString()).not.toBe(doc);
+  expect(undo(cm)).toBe(true);
   expect(cm.state.doc.toString()).toBe(doc);
+  await fireEvent.submit(form);
+  expect(multiplexer.sendWorkerMethod.mock.calls.filter(([method]) => method.method === "submit")).toHaveLength(1);
   protocolEvent({ event: "submission_rejected", data: { submission_request_id: "other-client", message: "foreign" } });
   await settleMicrotasks();
-  expect(cm.state.readOnly).toBe(true);
+  expect(cm.state.readOnly).toBe(false);
   protocolEvent({ event: "submission_rejected", data: { submission_request_id: first.params.submission_request_id, message: "Feature validation failed" } });
   await waitFor(() => expect(cm.state.readOnly).toBe(false));
   expect(alert).toHaveBeenCalledWith("error", "Feature validation failed", expect.any(Object));
@@ -505,12 +542,18 @@ test("cached unsent typed draft survives target round-trip and remains sendable"
   expect(multiplexer.sendWorkerMethod).toHaveBeenLastCalledWith({ method: "submit", params: { submission_request_id: expect.any(String), input: [expect.objectContaining({ kind: "feature_invoke" })] } });
 });
 
-test("unknown Submit survives target ABA and cannot be deleted into a new admission", async () => {
+test("unknown Submit keeps its original retry while edits survive disconnect and target ABA", async () => {
   const { cm, form, view } = await liveComposer();
   await selectRun(cm);
   await fireEvent.submit(form);
   const first = multiplexer.sendWorkerMethod.mock.calls.at(-1)![0] as Extract<Method, { method: "submit" }>;
-  await waitFor(() => expect(cm.state.readOnly).toBe(true));
+  latestListener().onStatus?.("closed", { kind: "transport", message: "ack lost" });
+  await settleMicrotasks();
+  expect(cm.state.readOnly).toBe(false);
+  await fireEvent.keyDown(cm.contentDOM, { key: "Backspace" });
+  cm.dispatch({ changes: { from: 0, to: cm.state.doc.length, insert: "new draft while disconnected" }, selection: { anchor: 28 } });
+  await fireEvent.submit(form);
+  expect(multiplexer.sendWorkerMethod.mock.calls.filter(([method]) => method.method === "submit")).toHaveLength(1);
   await view.rerender({ data: pageData("worker-b", "runtime-b") });
   await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledTimes(2));
   latestListener().onFrame(subscribedFrame());
@@ -518,13 +561,15 @@ test("unknown Submit survives target ABA and cannot be deleted into a new admiss
   await view.rerender({ data: pageData() });
   await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledTimes(3));
   latestListener().onFrame(subscribedFrame());
-  await waitFor(() => expect(cm.dom.querySelector(".composer-typed-chip")).not.toBeNull());
-  expect(cm.state.readOnly).toBe(true);
-  const doc = cm.state.doc.toString();
-  await fireEvent.keyDown(cm.contentDOM, { key: "Backspace" });
-  expect(cm.state.doc.toString()).toBe(doc);
+  await waitFor(() => expect(cm.state.doc.toString()).toBe("new draft while disconnected"));
+  expect(cm.state.readOnly).toBe(false);
+  await fireEvent.submit(form);
+  expect(multiplexer.sendWorkerMethod.mock.calls.filter(([method]) => method.method === "submit")).toHaveLength(1);
   await fireEvent.click(screen.getByRole("button", { name: "Retry admission" }));
   expect(multiplexer.sendWorkerMethod).toHaveBeenLastCalledWith(first);
+  protocolEvent({ event: "submission_accepted", data: { submission_request_id: first.params.submission_request_id, submission_id: "accepted", disposition: "queued" } });
+  await settleMicrotasks();
+  expect(cm.state.doc.toString()).toBe("new draft while disconnected");
   view.unmount();
 });
 

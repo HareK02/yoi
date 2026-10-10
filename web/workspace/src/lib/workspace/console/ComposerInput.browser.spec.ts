@@ -27,6 +27,42 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+test("history, clear and restore keep editing and focus without stealing focus from elsewhere", async () => {
+  const ui = render(ComposerInput, { historyScope: "always-editable" });
+  const cm = editor(ui.container);
+  type(cm, "previous input");
+  ui.component.recordHistory(ui.component.snapshot());
+  ui.component.clear();
+  type(cm, "draft");
+  const editable = () => {
+    expect(cm.state.readOnly).toBe(false);
+    expect(cm.contentDOM.getAttribute("contenteditable")).toBe("true");
+    expect(cm.hasFocus).toBe(true);
+  };
+  await fireEvent.keyDown(cm.contentDOM, { key: "ArrowUp" });
+  expect(cm.state.doc.toString()).toBe("previous input");
+  editable();
+  await fireEvent.keyDown(cm.contentDOM, { key: "ArrowDown" });
+  expect(cm.state.doc.toString()).toBe("draft");
+  editable();
+  await fireEvent.paste(cm.contentDOM, { clipboardData: { getData: () => " pasted" } });
+  expect(cm.state.doc.toString()).toBe("draft pasted");
+  expect(undo(cm)).toBe(true);
+  expect(cm.state.doc.toString()).toBe("draft");
+  expect(redo(cm)).toBe(true);
+  expect(cm.state.doc.toString()).toBe("draft pasted");
+  editable();
+  ui.component.clear();
+  editable();
+  ui.component.restoreSegments([{ kind: "text", content: "restored" }]);
+  editable();
+  ui.component.replaceRange(8, 8, " edit");
+  expect(cm.state.doc.toString()).toBe("restored edit");
+  cm.contentDOM.blur();
+  ui.component.restoreSegments([{ kind: "text", content: "background restore" }]);
+  expect(cm.hasFocus).toBe(false);
+});
+
 test("commands auto-open with descriptions; ambiguous Tab does not choose the first; arrows beat history", async () => {
   const oncommand = vi.fn();
   const onsubmit = vi.fn();
@@ -122,7 +158,7 @@ test("file popup scrolls selection, drills into directories and Enter accepts wi
   expect(onsubmit).not.toHaveBeenCalled();
 });
 
-test("cursor changes, Escape, scope changes and disable discard late file results", async () => {
+test("cursor changes, Escape and scope changes discard late file results", async () => {
   const old = deferred<Array<{ value: string }>>();
   const resolveFileCompletions = vi.fn(() => old.promise);
   const ui = render(ComposerInput, {
@@ -145,10 +181,7 @@ test("cursor changes, Escape, scope changes and disable discard late file result
   await ui.findByRole("listbox");
   await ui.rerender({ completionScope: "b" });
   expect(ui.queryByRole("listbox")).toBeNull();
-  type(cm, ":rew");
-  await ui.findByRole("listbox");
-  await ui.rerender({ disabled: true });
-  expect(ui.queryByRole("listbox")).toBeNull();
+
 });
 
 test("synchronous draft and cursor ABA invalidate old Feature completion generations", async () => {
