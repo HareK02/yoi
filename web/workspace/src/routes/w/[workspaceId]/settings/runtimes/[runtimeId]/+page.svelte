@@ -2,6 +2,7 @@
   import { goto, invalidateAll } from '$app/navigation';
   import type {
     RevokeRuntimeTrustKeyRequest,
+    RuntimeConnectionTestResponse,
     RuntimeTrustKeyStatus,
   } from '#lib/generated/runtime-api.ts';
   import {
@@ -17,6 +18,7 @@
     RuntimeTrustRequestError,
     type RuntimeTrustRouteOperation,
   } from '#lib/workspace/api/runtime-management.ts';
+  import { testRuntimeConnection } from '#lib/workspace/api/runtime-connection.ts';
   import type { PageProps } from './$types';
 
   type TrustAction = 'create' | 'replace' | 'reactivate';
@@ -25,18 +27,19 @@
   let showPublicKey = $state(false);
   let revealedPublicKey = $state<string | null>(null);
   let publicKey = $state('');
-  let workspaceTrustId = $state('');
   let displayName = $state('');
   let endpoint = $state('');
   let editingMetadata = $state(false);
   let deleteRuntimeConfirmation = $state('');
-  let busyAction = $state<'metadata' | 'trust' | 'revoke' | 'reveal' | 'copy' | 'delete' | null>(null);
+  let busyAction = $state<'metadata' | 'trust' | 'revoke' | 'reveal' | 'copy' | 'delete' | 'test' | null>(null);
   let fieldError = $state<string | null>(null);
   let deleteRuntimeError = $state<string | null>(null);
   let requestError = $state<string | null>(null);
   let successMessage = $state<string | null>(null);
   let replacementFingerprint = $state<string | null>(null);
   let replacementFingerprintError = $state<string | null>(null);
+  let connectionResult = $state<RuntimeConnectionTestResponse | null>(null);
+  let connectionError = $state<string | null>(null);
   let fingerprintGeneration = 0;
   const routeFence = new RuntimeTrustRouteFence();
   const runtimeRemovalAttempt = new RuntimeRemovalAttempt();
@@ -47,10 +50,11 @@
     if (nextGeneration === routeGeneration) return;
     routeGeneration = nextGeneration;
     fingerprintGeneration += 1;
+    connectionResult = null;
+    connectionError = null;
     showPublicKey = false;
     revealedPublicKey = null;
     publicKey = '';
-    workspaceTrustId = '';
     displayName = data.runtimeDetail?.runtime.label ?? '';
     endpoint = data.runtimeDetail?.endpoint ?? '';
     editingMetadata = false;
@@ -107,6 +111,28 @@
 
   function utf8Bytes(value: string): number {
     return new TextEncoder().encode(value).byteLength;
+  }
+
+  async function testConnection(): Promise<void> {
+    const bindingId = data.runtimeDetail?.runtime.management.binding?.binding_id;
+    if (busyAction !== null || !bindingId) return;
+    const operation = routeFence.capture(data.runtimeId);
+    const workspaceId = data.workspaceId;
+    busyAction = 'test';
+    connectionResult = null;
+    connectionError = null;
+    try {
+      const result = await testRuntimeConnection(workspaceId, operation.runtimeId);
+      if (!isCurrentRoute(operation) || workspaceId !== data.workspaceId ||
+        result.binding_id !== data.runtimeDetail?.runtime.management.binding?.binding_id) return;
+      connectionResult = result;
+    } catch (error) {
+      if (isCurrentRoute(operation) && workspaceId === data.workspaceId) {
+        connectionError = error instanceof Error ? error.message : String(error);
+      }
+    } finally {
+      if (isCurrentRoute(operation) && workspaceId === data.workspaceId) busyAction = null;
+    }
   }
 
   async function reloadAuthority(): Promise<void> {
@@ -195,7 +221,7 @@
       const binding = data.runtimeDetail.runtime.management.binding;
       if (!binding || !data.runtimeDetail.endpoint) {
         throw new RuntimeTrustRequestError(
-          'The Workspace identity binding and authoritative Runtime endpoint are required.',
+          'The Runtime binding and authoritative endpoint are required.',
         );
       }
       await createRemoteRuntime(data.workspaceId, {
@@ -203,14 +229,12 @@
           identity_id: operation.runtimeId,
           public_key: key,
         },
-        workspace_trust_id: workspaceTrustId,
         display_name: data.runtimeDetail.runtime.label,
         endpoint: data.runtimeDetail.endpoint,
         expected_binding_id: binding.binding_id,
       });
       if (!isCurrentRoute(operation)) return;
       publicKey = '';
-      workspaceTrustId = '';
       showPublicKey = false;
       revealedPublicKey = null;
       successMessage = action === 'create'
@@ -396,8 +420,8 @@
     {@const detail = data.runtimeDetail}
     {@const runtime = detail.runtime}
     {@const trust = detail.trust_key}
-    {@const verifiedTrust = runtime.management.binding?.state === 'verified'}
     {@const currentAction = trustAction(trust.status)}
+    {@const latestResult = connectionResult?.workspace_id === data.workspaceId && connectionResult?.runtime_id === data.runtimeId && connectionResult?.binding_id === runtime.management.binding?.binding_id ? connectionResult : null}
 
     <section class="runtime-detail-section" aria-labelledby="runtime-identity-heading">
       <h2 id="runtime-identity-heading">Identity and binding</h2>
@@ -405,17 +429,32 @@
         <div><dt>Runtime ID</dt><dd><code>{runtime.runtime_id}</code></dd></div>
         <div><dt>Kind</dt><dd>{runtime.kind}</dd></div>
         <div><dt>Endpoint</dt><dd>{detail.endpoint ?? 'Not configured'}</dd></div>
-        <div><dt>Status</dt><dd>{runtime.status}</dd></div>
-        <div><dt>Connection state</dt><dd>{runtime.management.binding?.connection_state ?? 'Not configured'}</dd></div>
-        <div><dt>Workspace signing key</dt><dd><code>{runtime.management.binding?.workspace_key_id ?? '—'}</code></dd></div>
-        <div><dt>Verified</dt><dd>{formatTimestamp(runtime.management.binding?.verification?.verified_at)}</dd></div>
-        <div><dt>Last verification check</dt><dd>{runtime.management.binding?.verification?.last_outcome ?? '—'} · {formatTimestamp(runtime.management.binding?.verification?.last_checked_at)}</dd></div>
+        <div><dt>Connection test</dt><dd>{runtime.management.binding?.revoked_at ? 'Revoked' : latestResult ? latestResult.status === 'compatible' ? 'Signed ping succeeded' : `Signed ping failed · ${latestResult.failure_kind}` : 'Not tested'}</dd></div>
+        <div><dt>Binding ID</dt><dd><code>{runtime.management.binding?.binding_id ?? '—'}</code></dd></div>
         <div><dt>Runtime key status</dt><dd>{trust.status}</dd></div>
         <div><dt>Fingerprint</dt><dd><code>{trust.fingerprint ?? '—'}</code></dd></div>
         <div><dt>Created</dt><dd>{formatTimestamp(trust.created_at)}</dd></div>
         <div><dt>Updated</dt><dd>{formatTimestamp(trust.updated_at)}</dd></div>
         <div><dt>Revoked</dt><dd>{formatTimestamp(trust.revoked_at)}</dd></div>
       </dl>
+      {#if runtime.management.config_managed && !runtime.management.binding?.revoked_at}
+        <div class="settings-action-row">
+          <button type="button" disabled={busyAction !== null} onclick={testConnection}>
+            {busyAction === 'test' ? 'Testing…' : 'Test'}
+          </button>
+        </div>
+      {/if}
+      {#if latestResult}
+        <p class="section-state" class:error={latestResult.status === 'failed'}>
+          Checked {formatTimestamp(latestResult.checked_at)}
+          {#each latestResult.diagnostics ?? [] as diagnostic}
+            <span>{diagnostic.message}</span>
+          {/each}
+        </p>
+      {/if}
+      {#if connectionError}
+        <p class="section-state error" role="alert">{connectionError}</p>
+      {/if}
       {#if (runtime.diagnostics ?? []).length > 0}
         <ul class="settings-diagnostics-list">
           {#each runtime.diagnostics ?? [] as diagnostic}
@@ -495,25 +534,7 @@
           {/if}
         {/if}
 
-        {#if verifiedTrust}
-          <div class="runtime-public-key-readonly">
-            <strong>Runtime public key</strong>
-            <p>
-              This verified key is read-only. Revoke Workspace trust and register the Runtime again to use a different public key.
-            </p>
-            <code>{trust.fingerprint}</code>
-          </div>
-        {:else}
-          <form class="runtime-trust-form" onsubmit={saveTrustKey}>
-          <label for="runtime-workspace-trust-id-input">Workspace trust ID</label>
-          <input
-            id="runtime-workspace-trust-id-input"
-            bind:value={workspaceTrustId}
-            required
-            autocomplete="off"
-            spellcheck="false"
-          />
-          <p>Copy the Runtime-issued <code>workspace_trust_id</code> from <code>trust-workspace add/show</code> for the current enrollment. Do not use a key fingerprint or a revoked enrollment ID.</p>
+        <form class="runtime-trust-form" onsubmit={saveTrustKey}>
           <label for="runtime-public-key-input">Runtime public key</label>
           <textarea
             id="runtime-public-key-input"
@@ -548,8 +569,7 @@
               {busyAction === 'trust' ? 'Saving…' : actionLabel(currentAction)}
             </button>
           </div>
-          </form>
-        {/if}
+        </form>
 
         <div class="runtime-revoke-row">
           <div>

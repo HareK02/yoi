@@ -27,11 +27,11 @@ use worker_runtime::http_server::{
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 use worker_runtime::working_directory::RuntimeGitMaterializer;
 use worker_runtime::workspace_issuer::{
-    FileWorkspaceClaimReplayProtection, FileWorkspaceRuntimeVerificationAuthority,
-    MAX_WORKSPACE_ISSUER_TRUST_RECORDS, RuntimeVerificationSigner, WorkspaceCapabilityVerifier,
-    WorkspaceIssuerTrustError, WorkspaceIssuerTrustMutation, WorkspaceIssuerTrustRecord,
-    WorkspaceIssuerTrustState, add_workspace_issuer_trust, replace_workspace_issuer_trust,
-    revoke_workspace_issuer_trust, validate_workspace_issuer_trust_records,
+    FileWorkspaceClaimReplayProtection, MAX_WORKSPACE_ISSUER_TRUST_RECORDS,
+    WorkspaceCapabilityVerifier, WorkspaceIssuerTrustError, WorkspaceIssuerTrustMutation,
+    WorkspaceIssuerTrustRecord, WorkspaceIssuerTrustState, add_workspace_issuer_trust,
+    replace_workspace_issuer_trust, revoke_workspace_issuer_trust,
+    validate_workspace_issuer_trust_records,
 };
 use worker_runtime::workspace_request::RuntimeWorkspaceRequestClient;
 use worker_runtime::{Runtime, RuntimeOptions};
@@ -972,7 +972,7 @@ fn read_runtime_auth_file(path: &Path) -> Result<RuntimeAuthFile, ProcessError> 
     validate_workspace_issuer_trust_records(&auth.workspace_issuers)
         .map_err(|_| ProcessError::auth("runtime Workspace issuer trust store is corrupt"))?;
     if migrated {
-        // Commit the revoked migration before exposing any issuer authority.
+        // Persist the validated migration without changing saved trust permissions.
         write_runtime_auth_file(path, &auth)?;
     }
     Ok(auth)
@@ -1025,25 +1025,15 @@ fn load_workspace_runtime_http_auth(
     let Some(identity) = auth.identity else {
         return Ok(None);
     };
-    if auth.workspace_issuers.is_empty() {
-        return Ok(None);
-    }
     let replay_path = runtime_auth_path(config).with_extension("workspace-replay.json");
     let verifier = WorkspaceCapabilityVerifier::new(
         auth.workspace_issuers,
         Arc::new(FileWorkspaceClaimReplayProtection::new(replay_path)),
     )
     .map_err(|error| ProcessError::auth(format!("invalid Workspace issuer trust: {error}")))?;
-    let signer = RuntimeVerificationSigner::from_identity(&identity)
-        .map_err(|error| ProcessError::auth(format!("invalid Runtime identity: {error}")))?;
-    let verifications_path =
-        runtime_auth_path(config).with_extension("workspace-verifications.json");
     Ok(Some(WorkspaceRuntimeHttpAuth {
         verifier,
-        signer,
-        verifications: Arc::new(FileWorkspaceRuntimeVerificationAuthority::new(
-            verifications_path,
-        )),
+        runtime_id: identity.identity_id,
     }))
 }
 
@@ -1408,6 +1398,34 @@ mod tests {
     }
 
     #[test]
+    fn runtime_identity_with_no_trusted_workspace_does_not_disable_request_authentication() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = ProcessConfig {
+            fs_root: Some(temp.path().to_path_buf()),
+            ..ProcessConfig::default().unwrap()
+        };
+        let path = runtime_auth_path(&config);
+        write_runtime_auth_file(
+            &path,
+            &RuntimeAuthFile {
+                identity: Some(RuntimeIdentityMaterial::generate("runtime-test").unwrap()),
+                ..RuntimeAuthFile::default()
+            },
+        )
+        .unwrap();
+        // Obsolete evidence is neither a startup prerequisite nor live authority.
+        let evidence = path.with_extension("workspace-verifications.json");
+        std::fs::write(&evidence, "obsolete evidence, not even valid JSON").unwrap();
+        let auth = load_workspace_runtime_http_auth(&config).unwrap().unwrap();
+        assert_eq!(auth.runtime_id, "runtime-test");
+        assert!(!auth.verifier.has_active_workspace_issuer("workspace-a"));
+        assert_eq!(
+            std::fs::read_to_string(&evidence).unwrap(),
+            "obsolete evidence, not even valid JSON"
+        );
+    }
+
+    #[test]
     fn workspace_issuer_trust_cli_persists_across_reload_and_writes_private_mode() {
         use server_api::WorkspacePublicIdentityBundle;
         use sha2::{Digest as _, Sha256};
@@ -1454,38 +1472,6 @@ mod tests {
         let first = read_runtime_auth_file(&path).unwrap();
         assert_eq!(first.workspace_issuers.len(), 1);
         assert!(!first.workspace_issuers[0].trust_id.is_empty());
-        // `trust-workspace show` serializes this persisted record. Owner
-        // registration must forward that exact enrollment ID, not derive one
-        // from the key fingerprint or an initial counter.
-        let shown = serde_json::to_value(&first.workspace_issuers[0]).unwrap();
-        let runtime_identity = RuntimeIdentityMaterial::generate("remote-runtime").unwrap();
-        let mut registration_wire = serde_json::json!({
-            "public_bundle": {
-                "identity_id": runtime_identity.identity_id,
-                "public_key": runtime_identity.public_key,
-            },
-            "endpoint": "https://runtime.example.test",
-            "workspace_trust_id": shown["trust_id"],
-        });
-        let registration: server_api::CreateRemoteRuntimeRequest =
-            serde_json::from_value(registration_wire.clone()).unwrap();
-        assert_eq!(
-            registration.workspace_trust_id,
-            first.workspace_issuers[0].trust_id
-        );
-        assert_ne!(
-            registration.workspace_trust_id,
-            first.workspace_issuers[0].public_key_fingerprint
-        );
-        registration_wire
-            .as_object_mut()
-            .unwrap()
-            .remove("workspace_trust_id");
-        assert!(
-            serde_json::from_value::<server_api::CreateRemoteRuntimeRequest>(registration_wire)
-                .is_err()
-        );
-
         run_trust_workspace_command(VecDeque::from([
             "add".to_string(),
             "--bundle".to_string(),
@@ -1645,9 +1631,14 @@ mod tests {
         assert_eq!(error, "invalid trust-workspace list arguments");
     }
 
-    #[test]
-    fn pre_id_issuer_migration_retains_history_without_restoring_authority() {
+    #[tokio::test]
+    async fn pre_id_issuer_migration_preserves_saved_permission_for_ordinary_signed_ping() {
         use sha2::{Digest as _, Sha256};
+        use tower::ServiceExt;
+        use worker_runtime::workspace_issuer::{
+            WorkspaceCapabilityClaims, issue_workspace_capability_token,
+            workspace_request_body_digest,
+        };
 
         let identity = RuntimeIdentityMaterial::generate("WK-legacy").unwrap();
         let public_key = decode_public_key(&identity.public_key).unwrap();
@@ -1680,16 +1671,97 @@ mod tests {
             std::fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
 
             let migrated = read_runtime_auth_file(&path).unwrap();
-            assert_eq!(
-                migrated.workspace_issuers[0].state,
-                worker_runtime::workspace_issuer::WorkspaceIssuerTrustState::Revoked
+            let expected_state = if state == "active" {
+                WorkspaceIssuerTrustState::Active
+            } else {
+                WorkspaceIssuerTrustState::Revoked
+            };
+            let record = &migrated.workspace_issuers[0];
+            assert_eq!(record.state, expected_state);
+            assert_eq!(record.workspace_id, "workspace-1");
+            assert_eq!(record.backend_url, "https://backend.example.test");
+            assert_eq!(record.key_id, "WK-legacy");
+            assert_eq!(record.public_key, identity.public_key);
+            assert_eq!(record.public_key_fingerprint, fingerprint);
+            assert_eq!(record.registered_at_unix, 10);
+            assert_eq!(record.updated_at_unix, 20);
+            // Migration is durably saved by the loader itself, not just by a later write.
+            assert_eq!(read_runtime_auth_file(&path).unwrap(), migrated);
+            let claims = WorkspaceCapabilityClaims {
+                issuer: record.backend_url.clone(),
+                issuer_workspace_id: record.workspace_id.clone(),
+                issuer_key_id: record.key_id.clone(),
+                issuer_public_key_fingerprint: record.public_key_fingerprint.clone(),
+                runtime_id: "runtime-test".into(),
+                worker_id: None,
+                operation: worker_runtime::http_server::RUNTIME_PING_PERMISSION.into(),
+                method: "GET".into(),
+                path_and_query: "/v1/ping".into(),
+                body_digest: workspace_request_body_digest(&[]),
+                iat: i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap(),
+                exp: i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap() + 60,
+                jti: uuid::Uuid::now_v7().to_string(),
+            };
+            let token = issue_workspace_capability_token(&identity.signing_key().unwrap(), &claims)
+                .unwrap();
+            let app = worker_runtime::http_server::runtime_http_router_with_workspace_auth(
+                Runtime::new_memory(), None, WorkspaceRuntimeHttpAuth {
+                    runtime_id: "runtime-test".into(),
+                    verifier: WorkspaceCapabilityVerifier::new(migrated.workspace_issuers.clone(),
+                        Arc::new(worker_runtime::workspace_issuer::InMemoryWorkspaceClaimReplayProtection::default())).unwrap(),
+                },
             );
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/v1/ping")
+                        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(
+                            worker_runtime::http_server::RUNTIME_WORKSPACE_SCOPE_HEADER,
+                            "workspace-1",
+                        )
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                if state == "active" {
+                    axum::http::StatusCode::OK
+                } else {
+                    axum::http::StatusCode::UNAUTHORIZED
+                },
+                "{state}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            if state == "active" {
+                let ping: runtime_api::RuntimePingResponse = serde_json::from_slice(&body).unwrap();
+                assert_eq!(ping.runtime_id, "runtime-test");
+            } else {
+                let error: worker_runtime::http_server::RuntimeHttpErrorResponse =
+                    serde_json::from_slice(&body).unwrap();
+                assert_eq!(error.error.code, "unauthorized");
+                assert!(error.error.message.contains("revoked"));
+            }
             assert_eq!(migrated.archived_legacy_issuers.len(), 1);
             let archived: toml::Value =
                 toml::from_str(&migrated.archived_legacy_issuers[0]).unwrap();
             assert_eq!(archived, original_record);
             write_runtime_auth_file(&path, &migrated).unwrap();
             assert_eq!(read_runtime_auth_file(&path).unwrap(), migrated);
+            if state == "active" {
+                // A current saved Revoked record stays revoked even if its archived
+                // pre-ID source was Active. Never guess revocation provenance.
+                let mut saved_revoked = migrated.clone();
+                saved_revoked.workspace_issuers[0].state = WorkspaceIssuerTrustState::Revoked;
+                write_runtime_auth_file(&path, &saved_revoked).unwrap();
+                assert_eq!(read_runtime_auth_file(&path).unwrap(), saved_revoked);
+            }
         }
     }
 

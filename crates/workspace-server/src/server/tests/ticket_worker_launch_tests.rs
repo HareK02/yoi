@@ -160,12 +160,10 @@ impl LaunchFixture {
         if remote {
             fixture.runtime_id = "ticket-worker-real-http".to_string();
             use worker_runtime::workspace_issuer::{
-                InMemoryWorkspaceClaimReplayProtection,
-                InMemoryWorkspaceRuntimeVerificationAuthority, RuntimeVerificationSigner,
-                WorkspaceCapabilityVerifier, WorkspaceIssuerTrustRecord, WorkspaceIssuerTrustState,
+                InMemoryWorkspaceClaimReplayProtection, WorkspaceCapabilityVerifier,
+                WorkspaceIssuerTrustRecord, WorkspaceIssuerTrustState,
             };
             let runtime_identity = RuntimeIdentityMaterial::generate(&fixture.runtime_id).unwrap();
-            let signer = RuntimeVerificationSigner::from_identity(&runtime_identity).unwrap();
             let workspace_identity = fixture
                 .api
                 .signing_identities
@@ -204,13 +202,11 @@ impl LaunchFixture {
                 display_name: "Ticket Worker real HTTP Runtime".into(),
                 base_url: endpoint.clone(),
                 public_key: runtime_identity.public_key.clone(),
-                public_key_fingerprint: signer.public_key_fingerprint().to_string(),
+                public_key_fingerprint: String::new(),
                 binding_id: "binding-launch-test".to_string(),
-                state: StoredRuntimeBindingState::Configured,
+
                 authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
-                workspace_key_id: Some(workspace_identity.key_id),
-                workspace_public_key_fingerprint: workspace_identity.public_key_fingerprint.clone(),
-                workspace_trust_id: Some("trust-launch-test".to_string()),
+
                 created_at: TEST_CREATED_AT.into(),
                 updated_at: TEST_CREATED_AT.into(),
                 revoked_at: None,
@@ -228,6 +224,7 @@ impl LaunchFixture {
                 .await
                 .unwrap()
                 .unwrap();
+            let runtime_id = fixture.runtime_id.clone();
             fixture.runtime_server = Some(tokio::spawn(async move {
                 worker_runtime::http_server::serve_runtime_http_with_workspace_auth(
                     runtime,
@@ -235,10 +232,7 @@ impl LaunchFixture {
                     None,
                     worker_runtime::http_server::WorkspaceRuntimeHttpAuth {
                         verifier,
-                        signer,
-                        verifications: Arc::new(
-                            InMemoryWorkspaceRuntimeVerificationAuthority::default(),
-                        ),
+                        runtime_id,
                     },
                 )
                 .await
@@ -258,27 +252,12 @@ impl LaunchFixture {
                 cached_status: "active".into(),
                 timeout: std::time::Duration::from_secs(5),
             };
-            fixture.api.runtime.register_or_replace(
-                RemoteWorkerRuntime::new(
-                    remote_config.clone(),
-                    TEST_WORKSPACE_ID.to_string(),
-                    backend_url.clone(),
-                )
-                .unwrap(),
-            );
-            let verified = perform_workspace_runtime_verification(
-                &fixture.api,
-                fixture.api.runtime.clone(),
-                &binding,
-            )
-            .await
-            .unwrap();
             remote_config.workspace_authorization =
                 Some(crate::hosts::WorkspaceRuntimeAuthorization::new(
                     fixture.api.store.clone(),
                     fixture.api.signing_identities.clone(),
                     backend_url.clone(),
-                    Some(verified),
+                    binding,
                 ));
             fixture.api.runtime.register_or_replace(
                 RemoteWorkerRuntime::new(remote_config, TEST_WORKSPACE_ID.to_string(), backend_url)

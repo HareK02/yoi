@@ -817,17 +817,12 @@ mod current_authority {
 
     fn binding_store() -> (SqliteWorkspaceStore, WorkspaceRuntimeBinding) {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        let workspace_key =
-            worker_runtime::auth::RuntimeIdentityMaterial::generate("workspace-key").unwrap();
         let runtime_key =
             worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-key").unwrap();
-        let workspace_fingerprint = normalize_runtime_public_key(&workspace_key.public_key)
-            .unwrap()
-            .1;
         store.with_conn(|conn| {
             conn.execute_batch("INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at) VALUES('owner','user','owner','Owner','created','updated');
-                INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at) VALUES('space','owner','Space','active','created','updated');")?;
-            conn.execute("INSERT INTO workspace_signing_identities(workspace_id,key_id,algorithm,public_key,public_key_fingerprint,private_material_ref,state,created_at,provisioned_at,updated_at) VALUES('space','workspace-key','ed25519',?1,?2,'material','active','created','provisioned','updated')", params![workspace_key.public_key,workspace_fingerprint])?;
+                INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at) VALUES('space','owner','Space','active','created','updated');
+                INSERT INTO workspace_signing_identities(workspace_id,key_id,algorithm,public_key,public_key_fingerprint,private_material_ref,state,created_at,provisioned_at,updated_at) VALUES('space','workspace-key','ed25519','public','sha256:workspace','material','active','created','provisioned','updated');")?;
             Ok(())
         }).unwrap();
         let request = WorkspaceRuntimeBinding {
@@ -838,11 +833,7 @@ mod current_authority {
             public_key: runtime_key.public_key,
             public_key_fingerprint: String::new(),
             binding_id: String::new(),
-            state: WorkspaceRuntimeBindingState::Configured,
             authentication_mode: WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity,
-            workspace_key_id: Some("workspace-key".into()),
-            workspace_public_key_fingerprint: Some(workspace_fingerprint),
-            workspace_trust_id: Some("runtime-issued-trust".into()),
             created_at: "created".into(),
             updated_at: "updated".into(),
             revoked_at: None,
@@ -853,36 +844,10 @@ mod current_authority {
         (store, binding)
     }
 
-    fn evidence(binding: &WorkspaceRuntimeBinding) -> WorkspaceRuntimeVerificationEvidence {
-        WorkspaceRuntimeVerificationEvidence {
-            workspace_id: binding.workspace_id.clone(),
-            runtime_id: binding.runtime_id.clone(),
-            binding_id: binding.binding_id.clone(),
-            workspace_key_id: binding.workspace_key_id.clone().unwrap(),
-            workspace_public_key_fingerprint: binding
-                .workspace_public_key_fingerprint
-                .clone()
-                .unwrap(),
-            workspace_trust_id: binding.workspace_trust_id.clone().unwrap(),
-            runtime_public_key_fingerprint: binding.public_key_fingerprint.clone(),
-            challenge_id: "challenge".into(),
-            state: "verified".into(),
-            last_outcome: "verified".into(),
-            verified_at: Some("verified-at".into()),
-            checked_at: "checked-at".into(),
-        }
-    }
-
     #[test]
-    fn same_key_reactivation_fences_old_cas_and_verification_evidence() {
+    fn same_key_reactivation_fences_old_config_and_admin_mutations() {
         let (store, binding) = binding_store();
-        let old_proof = evidence(&binding);
-        store
-            .record_workspace_runtime_verification_attempt(&old_proof)
-            .unwrap();
-        store
-            .complete_workspace_runtime_verification(&old_proof)
-            .unwrap();
+        assert!(store.workspace_runtime_binding_matches(&binding).unwrap());
         let (_, revoked) = store
             .revoke_workspace_runtime_binding_key(
                 "space",
@@ -893,16 +858,22 @@ mod current_authority {
             )
             .unwrap();
         assert_ne!(binding.binding_id, revoked.binding_id);
-        let mut replacement = binding.clone();
-        replacement.state = WorkspaceRuntimeBindingState::Configured;
+        assert!(!store.workspace_runtime_binding_matches(&binding).unwrap());
+        assert!(!store.workspace_runtime_binding_matches(&revoked).unwrap());
         let (_, reactivated) = store
-            .put_workspace_runtime_binding_key(replacement, Some(&revoked.binding_id), "owner")
+            .put_workspace_runtime_binding_key(binding.clone(), Some(&revoked.binding_id), "owner")
             .unwrap();
         assert_eq!(
             binding.public_key_fingerprint,
             reactivated.public_key_fingerprint
         );
         assert_ne!(binding.binding_id, reactivated.binding_id);
+        assert!(
+            store
+                .workspace_runtime_binding_matches(&reactivated)
+                .unwrap()
+        );
+        assert!(!store.workspace_runtime_binding_matches(&binding).unwrap());
         assert!(matches!(
             store.put_workspace_runtime_binding_key(
                 reactivated.clone(),
@@ -921,42 +892,27 @@ mod current_authority {
             ),
             Err(Error::RuntimeBindingIdConflict { .. })
         ));
-        assert!(
-            store
-                .record_workspace_runtime_verification_attempt(&old_proof)
-                .is_err()
-        );
-        assert!(
-            store
-                .complete_workspace_runtime_verification(&old_proof)
-                .is_err()
-        );
-        assert!(
-            !store
-                .workspace_runtime_verification_matches(
-                    &reactivated,
-                    &old_proof.workspace_public_key_fingerprint,
-                    &old_proof.workspace_trust_id
-                )
-                .unwrap()
-        );
     }
 
     #[test]
-    fn endpoint_aba_and_workspace_key_change_cannot_reuse_verification_authority() {
+    fn endpoint_aba_fences_old_config_without_copying_workspace_signing_identity() {
         let (store, binding) = binding_store();
-        let proof = evidence(&binding);
-        store
-            .record_workspace_runtime_verification_attempt(&proof)
+        let renamed = store
+            .update_workspace_runtime_binding_metadata(
+                "space",
+                "remote",
+                "Renamed",
+                &binding.base_url,
+                "renamed-at",
+            )
             .unwrap();
-        store
-            .complete_workspace_runtime_verification(&proof)
-            .unwrap();
+        assert_eq!(binding.binding_id, renamed.binding_id);
+        assert!(!store.workspace_runtime_binding_matches(&binding).unwrap());
         let moved = store
             .update_workspace_runtime_binding_metadata(
                 "space",
                 "remote",
-                "Remote",
+                "Renamed",
                 "https://other.test",
                 "changed",
             )
@@ -965,35 +921,166 @@ mod current_authority {
             .update_workspace_runtime_binding_metadata(
                 "space",
                 "remote",
-                "Remote",
+                "Renamed",
                 "https://remote.test",
                 "changed-back",
             )
             .unwrap();
         assert_ne!(moved.binding_id, binding.binding_id);
         assert_ne!(returned.binding_id, binding.binding_id);
-        assert!(
-            store
-                .record_workspace_runtime_verification_attempt(&proof)
-                .is_err()
-        );
-        let current = evidence(&returned);
-        store
-            .record_workspace_runtime_verification_attempt(&current)
-            .unwrap();
-        store.with_conn(|conn| { conn.execute("UPDATE workspace_signing_identities SET public_key_fingerprint='sha256:replacement' WHERE workspace_id='space'",[])?; Ok(()) }).unwrap();
-        assert!(
-            store
-                .complete_workspace_runtime_verification(&current)
-                .is_err()
-        );
+        assert!(!store.workspace_runtime_binding_matches(&renamed).unwrap());
+        store.with_conn(|conn| { conn.execute("UPDATE workspace_signing_identities SET public_key_fingerprint='sha256:replacement' WHERE workspace_id='space'", [])?; Ok(()) }).unwrap();
         assert_eq!(
             store
                 .get_workspace_runtime_binding("space", "remote")
+                .unwrap(),
+            Some(returned.clone())
+        );
+        assert!(store.workspace_runtime_binding_matches(&returned).unwrap());
+    }
+
+    fn rows(conn: &Connection, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let count = stmt.column_count();
+        stmt.query_map([], |row| (0..count).map(|i| row.get(i)).collect())
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn schema89_bindings() -> Connection {
+        let conn = legacy_binding_database();
+        migrate_runtime_bindings_v87_to_v88(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO __yoi_schema_migrations VALUES(89,'descriptive legacy evidence columns')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("INSERT INTO workspace_runtime_bindings VALUES
+            ('space','configured-trust','Configured','https://configured.test','key-c','fp-c','binding-c','configured','workspace_identity','workspace-key','sha256:workspace','trust-c','created-c','updated-c',NULL),
+            ('space','verified','Verified','https://verified.test','key-v','fp-v','binding-v','verified','workspace_identity','workspace-key','sha256:workspace','trust-v','created-v','updated-v',NULL),
+            ('space','revoked-null-trust','Revoked','https://revoked.test','key-r','fp-r','binding-r','revoked','workspace_identity','workspace-key',NULL,NULL,'created-r','updated-r','revoked-r'),
+            ('space','legacy-verified','Legacy','https://legacy.test','key-l','fp-l','binding-l','verified','legacy_server_issuer',NULL,NULL,NULL,'created-l','updated-l',NULL),
+            ('space','legacy-revoked','Legacy revoked','https://legacy-r.test','key-lr','fp-lr','binding-lr','revoked','legacy_server_issuer',NULL,NULL,NULL,'created-lr','updated-lr','revoked-lr');
+            INSERT INTO workspace_runtime_verifications VALUES
+            ('space','verified','binding-v','workspace-key','sha256:workspace','trust-v','fp-v','challenge-v','verified','verified','verified-at','checked-v'),
+            ('space','configured-trust','binding-c','workspace-key','sha256:workspace','trust-c','fp-c','challenge-c','pending','challenge_issued',NULL,'checked-c'),
+            ('space','revoked-null-trust','binding-r','workspace-key','sha256:workspace','old-trust','fp-r','challenge-r','failed','verification_failed',NULL,'checked-r');").unwrap();
+        conn
+    }
+
+    #[test]
+    fn schema90_preserves_connections_and_archives_all_auth_metadata_without_reenrollment() {
+        let conn = schema89_bindings();
+        let connections = rows(
+            &conn,
+            "SELECT workspace_id,runtime_id,display_name,base_url,public_key,public_key_fingerprint,binding_id,authentication_mode,created_at,updated_at,revoked_at FROM workspace_runtime_bindings ORDER BY runtime_id",
+        );
+        let metadata = rows(
+            &conn,
+            "SELECT workspace_id,runtime_id,binding_id,state,workspace_key_id,workspace_public_key_fingerprint,workspace_trust_id,updated_at FROM workspace_runtime_bindings ORDER BY runtime_id",
+        );
+        let proofs = rows(
+            &conn,
+            "SELECT * FROM workspace_runtime_verifications ORDER BY runtime_id",
+        );
+        let identities = rows(&conn, "SELECT * FROM workspace_signing_identities");
+        let audit = rows(&conn, "SELECT * FROM workspace_runtime_binding_audit");
+        let removal = rows(&conn, "SELECT * FROM runtime_removal_operations");
+        migrate_runtime_binding_connections_v89_to_v90(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 90);
+        assert_eq!(
+            rows(
+                &conn,
+                "SELECT * FROM workspace_runtime_bindings ORDER BY runtime_id"
+            ),
+            connections
+        );
+        assert_eq!(
+            rows(
+                &conn,
+                "SELECT * FROM workspace_runtime_binding_verification_archive ORDER BY runtime_id"
+            ),
+            metadata
+        );
+        assert_eq!(
+            rows(
+                &conn,
+                "SELECT * FROM workspace_runtime_verification_archive ORDER BY runtime_id"
+            ),
+            proofs
+        );
+        assert_eq!(
+            rows(&conn, "SELECT * FROM workspace_signing_identities"),
+            identities
+        );
+        assert_eq!(
+            rows(&conn, "SELECT * FROM workspace_runtime_binding_audit"),
+            audit
+        );
+        assert_eq!(
+            rows(&conn, "SELECT * FROM runtime_removal_operations"),
+            removal
+        );
+        verify_runtime_binding_connection_schema(&conn).unwrap();
+        assert!(!table_exists(&conn, "workspace_runtime_verifications").unwrap());
+        assert!(
+            conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, bool>(0))
                 .unwrap()
+        );
+        assert_eq!(
+            rows(&conn, "SELECT * FROM pragma_foreign_key_check"),
+            Vec::<Vec<rusqlite::types::Value>>::new()
+        );
+        conn.execute_batch("UPDATE workspace_runtime_bindings SET base_url='https://moved.test',binding_id='binding-new' WHERE runtime_id='verified';
+            UPDATE workspace_runtime_bindings SET revoked_at='admin-revoked' WHERE runtime_id='configured-trust';
+            DELETE FROM workspace_runtime_bindings WHERE runtime_id='legacy-revoked';").unwrap();
+        assert_eq!(
+            rows(
+                &conn,
+                "SELECT * FROM workspace_runtime_binding_verification_archive ORDER BY runtime_id"
+            ),
+            metadata
+        );
+        assert_eq!(
+            rows(
+                &conn,
+                "SELECT * FROM workspace_runtime_verification_archive ORDER BY runtime_id"
+            ),
+            proofs
+        );
+        conn.execute(
+            "UPDATE runtime_removal_operations SET state='cleanup_pending'",
+            [],
+        )
+        .unwrap();
+        assert!(conn.execute("UPDATE workspace_runtime_bindings SET display_name='Blocked' WHERE runtime_id='remote'", []).unwrap_err().to_string().contains("runtime_removal_in_progress"));
+    }
+
+    #[test]
+    fn schema90_failed_rebuild_rolls_back_connections_archives_and_schema_marker() {
+        let conn = schema89_bindings();
+        // An incompatible preexisting archive is not permission to discard historical evidence.
+        conn.execute_batch("CREATE TABLE workspace_runtime_verification_archive(existing TEXT);")
+            .unwrap();
+        let before = rows(
+            &conn,
+            "SELECT * FROM workspace_runtime_bindings ORDER BY runtime_id",
+        );
+        assert!(migrate_runtime_binding_connections_v89_to_v90(&conn).is_err());
+        assert_eq!(current_schema_version(&conn).unwrap(), 89);
+        assert_eq!(
+            rows(
+                &conn,
+                "SELECT * FROM workspace_runtime_bindings ORDER BY runtime_id"
+            ),
+            before
+        );
+        assert!(!table_exists(&conn, "workspace_runtime_binding_verification_archive").unwrap());
+        assert!(table_exists(&conn, "workspace_runtime_verifications").unwrap());
+        assert!(
+            conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, bool>(0))
                 .unwrap()
-                .state,
-            WorkspaceRuntimeBindingState::Configured
         );
     }
 }

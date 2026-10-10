@@ -10,7 +10,7 @@ use yoi_workspace_server::hosts::{
 };
 use yoi_workspace_server::store::{
     AccountRecord, ApiTokenRecord, SqliteWorkspaceStore, UserRecord,
-    WorkspaceRuntimeAuthenticationMode, WorkspaceRuntimeBinding, WorkspaceRuntimeBindingState,
+    WorkspaceRuntimeAuthenticationMode, WorkspaceRuntimeBinding,
 };
 use yoi_workspace_server::{
     ControlPlaneStore, ResolvedWorkspaceBackendConfig, ServerConfig, ServerHostConfigFile,
@@ -456,7 +456,7 @@ fn append_workspace_runtime_sources(
                         .into_iter()
                         .filter(|binding| {
                             binding.runtime_id != yoi_workspace_server::hosts::EMBEDDED_RUNTIME_ID
-                                && binding.state == WorkspaceRuntimeBindingState::Verified
+                                && binding.revoked_at.is_none()
                         })
                         .collect::<Vec<_>>()
                 })
@@ -787,11 +787,7 @@ mod tests {
             public_key: "unused".to_owned(),
             public_key_fingerprint: "unused".to_owned(),
             binding_id: "binding-test".to_owned(),
-            state: WorkspaceRuntimeBindingState::Verified,
             authentication_mode: WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer,
-            workspace_key_id: None,
-            workspace_public_key_fingerprint: None,
-            workspace_trust_id: None,
             created_at: "2026-09-01T00:00:00Z".to_owned(),
             updated_at: "2026-09-01T00:00:00Z".to_owned(),
             revoked_at: None,
@@ -815,11 +811,7 @@ mod tests {
             public_key: "unused".to_owned(),
             public_key_fingerprint: "unused".to_owned(),
             binding_id: "binding-test".to_owned(),
-            state: WorkspaceRuntimeBindingState::Verified,
             authentication_mode: WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity,
-            workspace_key_id: Some("WK-test".to_owned()),
-            workspace_public_key_fingerprint: Some("sha256:workspace-key".to_owned()),
-            workspace_trust_id: Some("trust-test".to_owned()),
             created_at: "2026-09-01T00:00:00Z".to_owned(),
             updated_at: "2026-09-01T00:00:00Z".to_owned(),
             revoked_at: None,

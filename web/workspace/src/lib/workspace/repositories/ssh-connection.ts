@@ -68,6 +68,6 @@ export function repositorySshProbeRuntimes(
     runtime.management.endpoint_configured &&
     runtime.management.binding !== undefined &&
     runtime.management.binding !== null &&
-    runtime.management.binding.state !== "revoked"
+    runtime.management.binding.revoked_at == null
   );
 }

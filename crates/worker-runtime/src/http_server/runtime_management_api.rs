@@ -164,7 +164,7 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
             .state
             .workspace_auth
             .as_ref()
-            .map(|auth| auth.signer.runtime_id().trim())
+            .map(|auth| auth.runtime_id.trim())
             .filter(|runtime_id| !runtime_id.is_empty())
             .ok_or_else(|| {
                 runtime_api::RuntimeApiError::new(

@@ -54,7 +54,8 @@ Deno.test("Repository SSH probe offers configured remote Runtimes regardless of 
       endpoint_configured: true,
       endpoint_display: "https://arcadia.example",
       binding: {
-        state: "verified",
+        binding_id: "observed-binding",
+        revoked_at: null,
       },
     },
   } as unknown as WorkspaceRuntimeResource;
@@ -68,7 +69,10 @@ Deno.test("Repository SSH probe offers configured remote Runtimes regardless of 
     runtime_id: "revoked",
     management: {
       ...configured.management,
-      binding: { state: "revoked" },
+      binding: {
+        binding_id: "revoked-binding",
+        revoked_at: "2026-10-10T00:00:00Z",
+      },
     },
   } as unknown as WorkspaceRuntimeResource;
   const unbound = {

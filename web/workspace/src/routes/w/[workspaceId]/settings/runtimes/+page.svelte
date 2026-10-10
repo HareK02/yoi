@@ -19,7 +19,6 @@
 
   let { data }: PageProps = $props();
   let runtimePublicBundle = $state('');
-  let workspaceTrustId = $state('');
   let displayName = $state('');
   let endpoint = $state('');
   let runtimeFingerprint = $state<string | null>(null);
@@ -36,9 +35,7 @@
 
   function connectionTestSummary(result: RuntimeConnectionTestResponse): string {
     if (result.status === 'compatible') {
-      return result.connection_state === 'verified'
-        ? `Verified · protocol v${result.actual_protocol_version}`
-        : `Compatible · ${result.connection_state} · protocol v${result.actual_protocol_version}`;
+      return `Signed ping succeeded · protocol v${result.actual_protocol_version}`;
     }
     switch (result.failure_kind) {
       case 'authentication': return 'Authentication failed';
@@ -145,18 +142,16 @@
       }
       await createRemoteRuntime(data.workspaceId, {
         public_bundle: publicBundle,
-        workspace_trust_id: workspaceTrustId,
         display_name: displayName || null,
         endpoint,
         expected_binding_id: null,
       });
       runtimePublicBundle = '';
-      workspaceTrustId = '';
       runtimeFingerprint = null;
       displayName = '';
       endpoint = '';
       showAddRuntime = false;
-      requestNotice = 'Runtime registered for this Workspace. Run Test to complete authenticated verification.';
+      requestNotice = 'Runtime registered for this Workspace. Run Test to observe a signed ping.';
       await invalidateAll();
     } catch (error) {
       requestError = error instanceof RuntimeTrustRequestError || error instanceof Error
@@ -171,7 +166,8 @@
     runtime: WorkspaceRuntimeResource,
   ): RuntimeConnectionTestResponse | undefined {
     const result = testResults[runtime.runtime_id];
-    return result?.binding_id === runtime.management?.binding?.binding_id
+    return result?.workspace_id === data.workspaceId &&
+      result?.binding_id === runtime.management?.binding?.binding_id
       ? result
       : undefined;
   }
@@ -179,12 +175,16 @@
   async function testRuntime(runtime: WorkspaceRuntimeResource): Promise<void> {
     const bindingId = runtime.management?.binding?.binding_id;
     if (typeof bindingId !== 'string') return;
+    const workspaceId = data.workspaceId;
     const generation = ++connectionTestGeneration;
     requestError = null;
+    const { [runtime.runtime_id]: _previousResult, ...remainingResults } = testResults;
+    testResults = remainingResults;
     busyRuntimeId = runtime.runtime_id;
     try {
       const result = await testRuntimeConnection(data.workspaceId, runtime.runtime_id);
       if (
+        workspaceId !== data.workspaceId ||
         generation !== connectionTestGeneration ||
         result.binding_id !== bindingId
       ) {
@@ -261,15 +261,9 @@
           </button>
           <pre>yoi-runtime trust-workspace add --bundle {workspaceBundleFilename()}</pre>
           <small>
-            Copy the Runtime-issued <code>workspace_trust_id</code> from <code>trust-workspace add/show</code>.
-            It identifies this enrollment, not the Workspace key fingerprint.
             Pass the same <code>--fs-root</code> and <code>--fs-runtime-dir</code> options used by the Runtime
             service. Existing Workspace trust entries are preserved.
           </small>
-          <label>
-            Workspace trust ID
-            <input bind:value={workspaceTrustId} required autocomplete="off" spellcheck="false" />
-          </label>
         {:else}
           <p class="section-state">Loading Workspace public identity…</p>
         {/if}
@@ -323,14 +317,14 @@
         </div>
         <p>
           Registration stores this Workspace-scoped binding. After it appears in the list, run
-          <strong>Test</strong> to complete authenticated verification.
+          <strong>Test</strong> to observe a signed ping. Each request authenticates independently.
         </p>
       </section>
 
       <div class="settings-action-row">
         <button
           type="submit"
-          disabled={busyRuntimeId !== null || !data.signingIdentity?.public_bundle || !runtimeFingerprint || !workspaceTrustId}
+          disabled={busyRuntimeId !== null || !runtimeFingerprint}
         >Register Runtime</button>
         <button type="button" disabled={busyRuntimeId !== null} onclick={() => showAddRuntime = false}>
           Cancel
@@ -368,7 +362,7 @@
         </thead>
         <tbody>
           {#each data.runtimes.items as runtime}
-            <tr class:inactive={runtime.status !== 'active'}>
+            <tr class:inactive={Boolean(runtime.management?.binding?.revoked_at) || currentTestResult(runtime)?.status === 'failed'}>
               <td>
                 <strong>
                   <a class="inline-link" href={`/w/${encodeURIComponent(data.workspaceId)}/settings/runtimes/${encodeURIComponent(runtime.runtime_id)}`}>
@@ -379,7 +373,7 @@
               </td>
               <td>{runtime.kind}</td>
               <td>
-                {runtime.management?.binding?.connection_state ?? runtime.status}
+                {runtime.management?.binding?.revoked_at ? 'Revoked' : currentTestResult(runtime) ? connectionTestSummary(currentTestResult(runtime)!) : 'Not tested'}
               </td>
               <td>{runtimePlatform(runtime)}</td>
               <td>{managementLabel(runtime)}</td>
@@ -390,16 +384,14 @@
               </td>
               <td>
                 <div class="settings-action-row">
-                  {#if runtime.management?.config_managed && runtime.management.binding?.connection_state !== 'revoked'}
+                  {#if runtime.management?.config_managed && !runtime.management.binding?.revoked_at}
                     <button
                       type="button"
                       disabled={busyRuntimeId !== null}
                       onclick={() => testRuntime(runtime)}
                     >Test</button>
                   {/if}
-                  {#if runtime.management?.binding?.state === 'configured'}
-                    <span class="settings-muted-action">Verification required</span>
-                  {:else if !runtime.management?.config_managed}
+                  {#if !runtime.management?.config_managed}
                     <span class="settings-muted-action">Test unavailable</span>
                   {/if}
                 </div>

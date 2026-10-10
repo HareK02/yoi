@@ -8,11 +8,11 @@ Never use the live dogfood Server or Runtime as the first startup test for a new
 
 1. Build the production entrypoints: `cargo build -p worker-runtime --bin yoi-runtime -p yoi-workspace-server --bin yoi-server`.
 2. Run the focused and dependent tests for the changed contracts, followed by workspace-root `cargo check`, `cargo fmt --all -- --check`, and `git diff --check HEAD`.
-3. Exercise the provisioning and operational checks in [Workspace ↔ Runtime authentication](server-runtime-auth.md) against isolated Server DB, Runtime data, and ports. The Workspace owner must create the binding, the Runtime operator must install the Workspace issuer bundle, and the challenge proof must become verified.
+3. Exercise the provisioning and operational checks in [Workspace ↔ Runtime authentication](server-runtime-auth.md) against isolated Server DB, Runtime data, and ports. The Workspace owner must configure the Runtime endpoint and pinned Runtime key, the Runtime operator must install the Workspace issuer bundle, and actual signed requests must authenticate. A connection-test result describes only that attempt; no stored verification state is a readiness prerequisite.
 4. Have an external supervisor or operator restart Server and Runtime from the same validated source commit/build artifacts. A Worker hosted by the target Runtime must never terminate its own Runtime.
 5. Verify post-restart readiness through the Workspace Runtime projection, ping, Worker list/create, protocol subscription, and a Runtime-to-Server source-proof operation before treating the environment as healthy.
 
-The former isolated startup shell harness depended on removed Server-global trust commands and is intentionally not a fallback smoke path. New automated startup coverage must provision the same Workspace-scoped binding and challenge authority used by production rather than recreating global trust or seeding private authority directly.
+The former isolated startup shell harness depended on removed Server-global trust commands and is intentionally not a fallback smoke path. New automated startup coverage must configure the same Workspace-scoped connection and explicit Runtime-side Workspace trust used by production, then exercise per-request authentication rather than recreating global trust or seeding a past verification result.
 
 ## What to record
 
@@ -25,7 +25,7 @@ A report is useful when it explains:
 - what design boundary was missing
 - what evidence was observed
 
-For a Remote Runtime rollout, also record the source commit, binary artifact digest, Server schema version, Runtime `binding_id`, Workspace `key_id` and `workspace_trust_id`, and typed HTTP/WebSocket outcomes. A successful document response does not outweigh visible UI, console, or API errors.
+For a Remote Runtime rollout, also record the source commit, binary artifact digest, Server schema version, Runtime `binding_id` and pinned key fingerprint, the current Workspace `key_id` and public fingerprint, the Runtime-side trust registration/revocation, and typed HTTP/WebSocket outcomes. Do not copy a Runtime trust ID into the Server connection configuration or treat a successful connection test as persisted authentication. A successful document response does not outweigh visible UI, console, or API errors.
 
 ## Runtime command caveat
 

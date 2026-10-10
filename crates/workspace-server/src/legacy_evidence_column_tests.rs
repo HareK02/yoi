@@ -48,7 +48,7 @@ fn evidence_column_cutover_preserves_all_values_and_current_schema_names() {
     let upgraded = SqliteWorkspaceStore::open(&path).unwrap();
     upgraded
         .with_conn(|conn| {
-            assert_eq!(current_schema_version(conn)?, 89);
+            assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
             assert_eq!(evidence_rows(conn, "artifacts"), artifacts);
             assert_eq!(
                 evidence_rows(conn, "repository_secret_legacy_receipts"),

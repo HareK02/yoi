@@ -1139,10 +1139,6 @@ pub struct RemainingRuntimeRoute {
     pub reason: &'static str,
 }
 
-pub const RUNTIME_ROUTE_VERIFICATION_CHALLENGE: &str =
-    "/v1/workspace-runtime-verification/challenge";
-pub const RUNTIME_ROUTE_VERIFICATION_ACK: &str =
-    "/v1/workspace-runtime-verification/acknowledgement";
 pub const RUNTIME_ROUTE_CONFIG_BUNDLES: &str = "/v1/config-bundles";
 pub const RUNTIME_ROUTE_CONFIG_BUNDLE_AVAILABILITY: &str =
     "/v1/config-bundles/{bundle_id}/availability";
@@ -1169,16 +1165,6 @@ pub const RUNTIME_ROUTE_WORKER_SESSION_ATTACHMENT: &str =
 /// Intentionally out-of-contract Runtime routes. This inventory keeps manual paths visible rather
 /// than letting them be mistaken for management-contract omissions.
 pub const REMAINING_RUNTIME_ROUTES: &[RemainingRuntimeRoute] = &[
-    RemainingRuntimeRoute {
-        method: "POST",
-        path: RUNTIME_ROUTE_VERIFICATION_CHALLENGE,
-        reason: "Workspace verification handshake",
-    },
-    RemainingRuntimeRoute {
-        method: "POST",
-        path: RUNTIME_ROUTE_VERIFICATION_ACK,
-        reason: "Workspace verification handshake",
-    },
     RemainingRuntimeRoute {
         method: "GET",
         path: RUNTIME_ROUTE_CONFIG_BUNDLES,
@@ -1625,7 +1611,7 @@ mod tests {
 
     #[test]
     fn remaining_route_inventory_does_not_overlap_contract() {
-        assert_eq!(REMAINING_RUNTIME_ROUTES.len(), 21);
+        assert_eq!(REMAINING_RUNTIME_ROUTES.len(), 19);
         for remaining in REMAINING_RUNTIME_ROUTES {
             assert!(!RuntimeApiMetadata::OPERATIONS.iter().any(|operation| {
                 format!("{:?}", operation.method).eq_ignore_ascii_case(remaining.method)

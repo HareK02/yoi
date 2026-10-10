@@ -64,7 +64,7 @@ Deno.test("Runtime registration presents the complete multi-Workspace trust sequ
       "yoi-runtime identity show --json",
       "3. Register the connection",
       "Register Runtime",
-      "Run Test to complete authenticated verification.",
+      "Run Test to observe a signed ping.",
     ]
   ) {
     assert(
@@ -129,16 +129,14 @@ Deno.test("Runtime detail keeps trust controls owner-only and conflict-safe", as
 
   const ownerGate = page.indexOf("data.workspace.permissions.manage_runtimes");
   const reveal = page.indexOf("Reveal public key");
-  const verifiedKey = page.indexOf("{#if verifiedTrust}");
   const mutation = page.indexOf('id="runtime-public-key-input"');
   const metadataStart = page.indexOf("async function saveRuntimeMetadata");
   const trustStart = page.indexOf("async function saveTrustKey");
   const metadataMutation = page.slice(metadataStart, trustStart);
   assert(ownerGate >= 0, "Runtime trust controls should use manage_runtimes");
   assert(
-    verifiedKey >= 0 && verifiedKey < mutation &&
-      page.slice(verifiedKey, mutation).includes("{:else}"),
-    "verified Runtime public key must be read-only while unverified trust keeps key input",
+    !page.includes("verifiedTrust") && !page.includes("workspace_trust_id"),
+    "cached verification and copied enrollment identity must not gate key editing",
   );
   assert(
     metadataMutation.includes("updateRemoteRuntime(") &&
@@ -150,7 +148,7 @@ Deno.test("Runtime detail keeps trust controls owner-only and conflict-safe", as
     !metadataMutation.includes("publicKey") &&
       !metadataMutation.includes("public_bundle") &&
       !metadataMutation.includes("public_key"),
-    "verified Runtime metadata updates must not carry public key authority",
+    "Runtime metadata updates must not carry public key authority",
   );
   assert(
     page.includes("Current fingerprint"),
@@ -195,7 +193,6 @@ Deno.test("Runtime detail keeps trust controls owner-only and conflict-safe", as
       "saveRuntimeMetadata",
       "Runtime settings",
       "Edit Runtime",
-      "This verified key is read-only",
       "publicKey = ''",
       "requestError = null",
       "successMessage = null",
@@ -245,4 +242,34 @@ Deno.test("Runtime detail uses flat sections instead of nested cards", async () 
       css.includes("border-top: 1px solid var(--line)"),
     "Runtime detail hierarchy should use flat section separators",
   );
+});
+
+Deno.test("Runtime labels and recovery controls do not depend on persisted authentication approval", async () => {
+  for (const name of ["+page.svelte", "[runtimeId]/+page.svelte"]) {
+    const page = await Deno.readTextFile(
+      new URL(
+        "../src/routes/w/[workspaceId]/settings/runtimes/" + name,
+        import.meta.url,
+      ),
+    );
+    for (
+      const field of [
+        "connection_state",
+        "verification",
+        "workspace_key_id",
+        "workspace_trust_id",
+        "Verification required",
+      ]
+    ) {
+      assert(!page.includes(field), "Runtime page retained " + field);
+    }
+    assert(
+      page.includes("revoked_at"),
+      "explicit revocation must remain visible",
+    );
+    assert(
+      page.includes("testRuntimeConnection("),
+      "actual test must remain available",
+    );
+  }
 });
