@@ -13059,8 +13059,13 @@ fn apply_ticket_targets_and_workdir_capabilities_schema(conn: &Connection) -> Re
                 TICKET_SCHEMA_BASELINE_NAME
             ],
         )?;
-        // This retained step composes the historical Ticket schema 7.
-        // Current-domain verification follows the shared case migration at schema 91.
+        // Verify the retained six-state v7 boundary here; the shared domain
+        // migrator installs classification and cases only after Workspace auth90.
+        ticket::verify_pre_classification_ticket_schema(db).map_err(|error| {
+            Error::Store(format!(
+                "schema-66 Ticket schema verification failed: {error}"
+            ))
+        })?;
 
         let foreign_key_violations =
             db.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
@@ -14547,6 +14552,9 @@ mod tests {
     }
 
     fn downgrade_schema_66_ticket_and_workdir_authority(conn: &Connection) -> Result<()> {
+        // A retained pre-target fixture must not carry today's classification
+        // tables while resetting the component migration marker to v6.
+        conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_tags; DROP TABLE IF EXISTS workspace_tag_operations; DROP TABLE IF EXISTS workspace_tags;")?;
         conn.execute_batch("DROP TABLE IF EXISTS worker_restore_intents;")?;
         conn.execute_batch(
             "DROP TABLE backend_job_deliveries;
@@ -15586,7 +15594,7 @@ mod tests {
         migrate_ticket_targets_and_workdir_capabilities_v65_to_v66(&conn).unwrap();
 
         assert_eq!(current_schema_version(&conn).unwrap(), 66);
-        // The retained step is Ticket-7; current verification runs after schema 91.
+        ticket::verify_pre_classification_ticket_schema(&conn).unwrap();
         assert!(!column_exists(&conn, "typed_tickets", "repository_id").unwrap());
         assert!(!column_exists(&conn, "typed_tickets", "ref_selector").unwrap());
         assert_eq!(
@@ -15899,7 +15907,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     fn create_frozen_schema_v85(conn: &Connection) -> Result<()> {
         // Compose the frozen Ticket-7 baseline, not current Ticket case tables.
         conn.execute_batch(
-            "DROP TABLE IF EXISTS typed_ticket_case_metadata;
+            "DROP TABLE IF EXISTS typed_ticket_tags;
+            DROP TABLE IF EXISTS workspace_tag_operations;
+            DROP TABLE IF EXISTS workspace_tags;
+            DROP TABLE IF EXISTS typed_ticket_case_metadata;
             DROP TABLE IF EXISTS typed_ticket_case_history;
             DROP TABLE IF EXISTS typed_ticket_legacy_workflow_snapshot;
             DELETE FROM ticket_schema_migrations;
@@ -15984,11 +15995,12 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         "#,
         )?;
         conn.execute_batch(include_str!("assignment_work.sql"))?;
-        // Verification uses current schema 9 only after the real retained chain.
+        // Current composed Ticket verification follows the real retained chain.
         Ok(())
     }
 
     include!("schema_equivalence_tests.rs");
+    include!("ticket_tag_upgrade_tests.rs");
     include!("migration_entrypoint_tests.rs");
     include!("legacy_evidence_column_tests.rs");
 
@@ -18954,7 +18966,18 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             VALUES('case-workspace','case-runtime','pending-worker','Pending','normal','1','1')", []).unwrap();
         conn.execute("INSERT INTO ticket_assignment_operations(workspace_id,operation_id,action,ticket_id,role,runtime_id,worker_id,created_at,request_fingerprint,claim_state)
             VALUES('case-workspace','pending-claim','assign','pending-queue','worker','case-runtime','pending-worker','1','pending-fingerprint','pending')", []).unwrap();
+        // Compose real retained Ticket8 classification data across the full
+        // six-state × MR matrix, before either auth90 or case91 runs.
+        install_retained_ticket_tags8(&conn);
+        let retained_tags = seed_retained_classification(&conn, "case-workspace", "done-true");
+        conn.execute("INSERT OR IGNORE INTO typed_ticket_tags(workspace_id,ticket_id,tag_id)
+            SELECT workspace_id,ticket_id,?1 FROM typed_tickets WHERE workspace_id='case-workspace'",
+            [&retained_tags.active_ids[0]]).unwrap();
         let unchanged = [
+            "workspace_tags",
+            "typed_ticket_tags",
+            "workspace_tag_operations",
+            "typed_ticket_labels",
             "typed_ticket_events",
             "typed_ticket_event_attributes",
             "typed_ticket_event_references",
@@ -19049,6 +19072,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             for has_mr in [false, true] {
                 let id = format!("{state}-{has_mr}");
                 let ticket = backend.show(id.clone().into()).unwrap();
+                assert!(!ticket.tags.is_empty(), "matrix classification {id}");
                 assert_eq!(ticket.document.body.as_str(), "Original requirements");
                 let snapshot = ticket.legacy_workflow_snapshot.as_ref().unwrap();
                 assert_eq!(snapshot.workflow_state, state);
@@ -19082,6 +19106,19 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     assert_eq!(reopened.meta.workflow_state, ticket::TicketState::Open);
                     assert_eq!(reopened.case_history.len(), 2);
                     assert_eq!(reopened.case_history[0], ticket.case_history[0]);
+                    assert_eq!(reopened.tags, ticket.tags);
+                    assert_eq!(
+                        reopened
+                            .events
+                            .iter()
+                            .filter(|event| event.kind == ticket::TicketEventKind::TagsChanged)
+                            .collect::<Vec<_>>(),
+                        ticket
+                            .events
+                            .iter()
+                            .filter(|event| event.kind == ticket::TicketEventKind::TagsChanged)
+                            .collect::<Vec<_>>()
+                    );
                     assert!(
                         store
                             .get_active_ticket_worker_assignment("case-workspace", &id)
@@ -19193,11 +19230,15 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             VALUES('case-workspace','terminal','terminal','Terminal','closed','task','P2','','done',1);
             DROP VIEW ticket_active_worker_assignments;
             CREATE TABLE ticket_active_worker_assignments(collision TEXT);").unwrap();
+        install_retained_ticket_tags8(&conn);
+        let _tags = seed_retained_classification(&conn, "case-workspace", "terminal");
+        let tags_before = classification_rows(&conn);
         let auth_before = fixture_auth_rows(&conn);
         let error = migrate_ticket_cases_v90_to_v91(&conn).unwrap_err();
         assert!(error.to_string().contains("DROP TABLE"));
         assert_eq!(current_schema_version(&conn).unwrap(), 90);
         assert_eq!(fixture_auth_rows(&conn), auth_before);
+        assert_eq!(classification_rows(&conn), tags_before);
         // The shared transaction completed, but Workspace did not advertise a
         // composed schema. Its immutable evidence remains the retry authority.
         let before = stored_fixture_rows(&conn, "typed_ticket_case_history");
@@ -19207,6 +19248,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         migrate_ticket_cases_v90_to_v91(&conn).unwrap();
         assert_eq!(current_schema_version(&conn).unwrap(), 91);
         assert_eq!(fixture_auth_rows(&conn), auth_before);
+        assert_eq!(classification_rows(&conn), tags_before);
         assert_eq!(
             stored_fixture_rows(&conn, "typed_ticket_case_history"),
             before
@@ -19349,6 +19391,9 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         let upgraded = SqliteWorkspaceStore::open(&path).unwrap();
         let fresh = SqliteWorkspaceStore::in_memory().unwrap();
         for object in [
+            "workspace_tags",
+            "typed_ticket_tags",
+            "workspace_tag_operations",
             "typed_tickets",
             "typed_ticket_targets",
             "typed_ticket_case_metadata",

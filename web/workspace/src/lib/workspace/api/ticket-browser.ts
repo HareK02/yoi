@@ -46,6 +46,7 @@ import type {
   TicketRoleAssignmentSummary,
   TicketSummary,
   TicketTarget,
+  WorkspaceTag,
 } from "#lib/generated/ticket-api.ts";
 
 export const TICKET_BROWSER_API_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
@@ -331,6 +332,31 @@ function caseProjection(item: Record<string, unknown>, label: string) {
   };
 }
 
+function parseWorkspaceTag(value: unknown, label: string): WorkspaceTag {
+  const item = object(value, label);
+  exact(item, [
+    "workspace_id",
+    "id",
+    "name",
+    "last_operation_key",
+    "deleted",
+  ], label);
+  const id = string(item.id, `${label}.id`);
+  if (id.trim().length === 0 || new TextEncoder().encode(id).length > 128) {
+    throw new Error(`${label}.id must be nonempty and at most 128 UTF-8 bytes`);
+  }
+  return {
+    workspace_id: string(item.workspace_id, `${label}.workspace_id`),
+    id,
+    name: string(item.name, `${label}.name`),
+    last_operation_key: string(
+      item.last_operation_key,
+      `${label}.last_operation_key`,
+    ),
+    deleted: boolean(item.deleted, `${label}.deleted`),
+  };
+}
+
 export function parseTicketSummary(value: unknown): TicketSummary {
   const label = "Ticket summary";
   const item = object(value, label);
@@ -345,6 +371,7 @@ export function parseTicketSummary(value: unknown): TicketSummary {
     "resource_key",
     "slug",
     "status",
+    "tags",
     "title",
     "updated_at",
     "workflow_state",
@@ -371,6 +398,7 @@ export function parseTicketSummary(value: unknown): TicketSummary {
     ),
     slug: string(item.slug, `${label}.slug`),
     status,
+    tags: array(item.tags, `${label}.tags`, parseWorkspaceTag),
     title: string(item.title, `${label}.title`),
     updated_at: optionalNullableString(item.updated_at, `${label}.updated_at`),
     workflow_state: parseTicketState(
@@ -400,6 +428,7 @@ function parseTicketListItem(
     "record_source",
     "resource_key",
     "state",
+    "tags",
     "title",
     "updated_at",
     "workspace_action_priority",
@@ -413,6 +442,7 @@ function parseTicketListItem(
     record_source: string(item.record_source, `${label}.record_source`),
     resource_key: string(item.resource_key, `${label}.resource_key`),
     state: parseTicketState(item.state, `${label}.state`),
+    tags: array(item.tags, `${label}.tags`, parseWorkspaceTag),
     title: string(item.title, `${label}.title`),
     updated_at: optionalNullableString(item.updated_at, `${label}.updated_at`),
     workspace_action_priority: string(
@@ -960,6 +990,7 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     "resource_key",
     "risk_flags",
     "state",
+    "tags",
     "targets",
     "title",
     "updated_at",
@@ -1036,6 +1067,7 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     resource_key: string(item.resource_key, `${label}.resource_key`),
     risk_flags: strings(item.risk_flags, `${label}.risk_flags`),
     state: parseTicketState(item.state, `${label}.state`),
+    tags: array(item.tags, `${label}.tags`, parseWorkspaceTag),
     targets: array(item.targets, `${label}.targets`, parseTicketTarget),
     title: string(item.title, `${label}.title`),
     updated_at: optionalNullableString(item.updated_at, `${label}.updated_at`),

@@ -17,6 +17,7 @@ struct ModelTicketQueryItem {
     closure_operation_key: Option<String>,
     current_closure: Option<ticket::TicketClosureJudgment>,
     legacy_handoff: Option<ticket::TicketLegacyWorkflowSnapshot>,
+    tags: Vec<ticket::WorkspaceTag>,
     readiness: Option<String>,
     priority: Option<String>,
     created_at: Option<String>,
@@ -45,6 +46,7 @@ pub(super) struct ModelTicketDetail {
     closure_operation_key: Option<String>,
     current_closure: Option<ticket::TicketClosureJudgment>,
     legacy_handoff: Option<ticket::TicketLegacyWorkflowSnapshot>,
+    tags: Vec<ticket::WorkspaceTag>,
     readiness: Option<String>,
     priority: Option<String>,
     created_at: Option<String>,
@@ -102,7 +104,15 @@ struct ModelWorkerSummary {
 }
 
 #[derive(Debug, Serialize)]
+struct ModelTicketTagChange {
+    before: Vec<ticket::WorkspaceTag>,
+    after: Vec<ticket::WorkspaceTag>,
+}
+
+#[derive(Debug, Serialize)]
 struct ModelTicketEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag_changes: Option<ModelTicketTagChange>,
     sequence: usize,
     kind: String,
     body: Option<String>,
@@ -256,6 +266,7 @@ fn project_ticket_query_item(value: &Value) -> Result<ModelTicketQueryItem, Stri
         closure_operation_key: typed_field(item, "closure_operation_key")?,
         current_closure: typed_field(item, "current_closure")?,
         legacy_handoff: typed_field(item, "legacy_handoff")?,
+        tags: project_tags(item)?,
         readiness: optional_string(item, "readiness")?,
         priority: optional_string(item, "priority")?,
         created_at: optional_string(item, "created_at")?,
@@ -311,6 +322,7 @@ pub(super) fn project_ticket_detail(value: Value) -> Result<ModelTicketDetail, S
         current_closure: typed_field(root, "current_closure")?,
         legacy_handoff: typed_field(root, "legacy_handoff")?,
         closure_history: typed_field(root, "closure_history")?,
+        tags: project_tags(root)?,
         readiness: optional_string(root, "readiness")?,
         priority: optional_string(root, "priority")?,
         created_at: optional_string(root, "created_at")?,
@@ -418,7 +430,27 @@ fn project_worker(value: &Value) -> Result<ModelWorkerSummary, String> {
 
 fn project_ticket_event(value: &Value) -> Result<ModelTicketEvent, String> {
     let event = object(value, "Ticket event")?;
+    let tag_changes = if event.get("kind").and_then(Value::as_str) == Some("tags_changed") {
+        let attributes = event
+            .get("attributes")
+            .ok_or("missing tag audit attributes")?;
+        let snapshot = |field| -> Result<Vec<ticket::WorkspaceTag>, String> {
+            let encoded = attributes
+                .get(field)
+                .and_then(Value::as_str)
+                .ok_or("missing tag audit snapshot")?;
+            serde_json::from_str(encoded)
+                .map_err(|error| format!("invalid tag audit snapshot: {error}"))
+        };
+        Some(ModelTicketTagChange {
+            before: snapshot("tags_before")?,
+            after: snapshot("tags_after")?,
+        })
+    } else {
+        None
+    };
     Ok(ModelTicketEvent {
+        tag_changes,
         sequence: usize_field(event, "sequence")?,
         kind: string_field(event, "kind")?,
         body: match event.get("body") {
@@ -640,6 +672,24 @@ fn object_field<'a>(
         .ok_or_else(|| format!("missing or invalid {key}"))
 }
 
+fn project_tags(object: &Map<String, Value>) -> Result<Vec<ticket::WorkspaceTag>, String> {
+    let values = array_field(object, "tags")?;
+    if values.len() > 100 {
+        return Err("Ticket projection exceeds 100 tags".into());
+    }
+    values
+        .iter()
+        .map(|value| {
+            let tag: ticket::WorkspaceTag = serde_json::from_value(value.clone())
+                .map_err(|error| format!("invalid Workspace tag: {error}"))?;
+            if tag.deleted {
+                return Err("current Ticket projection contains a deleted tag".into());
+            }
+            Ok(tag)
+        })
+        .collect()
+}
+
 fn array_field<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a [Value], String> {
     object
         .get(key)
@@ -720,7 +770,7 @@ mod tests {
     fn mrless_evidence_is_inapplicable_not_missing_or_vacuously_approved() {
         for state in ["open", "closed"] {
             let projected = project_ticket_detail(json!({
-                "resource_key": "T-718", "content_digest": "rev-1", "title": "No Git required", "body": "Decision",
+                "resource_key": "T-718", "tags": [], "content_digest": "rev-1", "title": "No Git required", "body": "Decision",
                 "closure_operation_key": null, "current_closure": null, "closure_history": [], "legacy_handoff": null,
                 "state": state, "events": [{"sequence": 1, "kind": "completed", "body": "No Git needed"}],
                 "linked_objectives": [], "assignments": [], "implementation_reports": [],
@@ -762,6 +812,7 @@ mod tests {
             "queued_by": "workspace-user:alice", "queued_at": "2025-12-31T00:00:00Z", "resolution": null
         });
         let response = json!({
+            "tags": [{"workspace_id":"ws", "id":"tag-1", "name":"closed", "last_operation_key":"tag-create", "deleted":false}],
             "resource_key": "T-739", "content_digest": "content-digest", "title": "Case", "body": "Requirements",
             "state": "open", "closure_operation_key": "close-1", "current_closure": null,
             "closure_history": history, "legacy_handoff": legacy,
@@ -775,6 +826,8 @@ mod tests {
         assert_eq!(projected["current_closure"], Value::Null);
         assert_eq!(projected["closure_history"], history);
         assert_eq!(projected["legacy_handoff"], legacy);
+        assert_eq!(projected["tags"], response["tags"]);
+        assert_eq!(projected["content_digest"], "content-digest");
 
         // Missing observations must not silently become null: the model must be
         // able to distinguish an observed never-closed case from unknown data.
@@ -804,9 +857,9 @@ mod tests {
             "linked_tickets": ["00001M0E82D1V"],
             "linked_ticket_summaries": [{
                 "id": "00001M0E82D1V",
-                "resource_key": "T-496",
+                "resource_key": "T-496", "tags": [],
                 "title": "Ticket",
-                "state": "done",
+                "state": "closed",
                 "updated_at": "2026-01-02T00:00:00Z"
             }],
             "events": [{
@@ -835,7 +888,7 @@ mod tests {
             "record_authority": "workspace_sqlite",
             "items": [{
                 "id": "00001TICKETINTERNAL",
-                "resource_key": "T-543",
+                "resource_key": "T-543", "tags": [],
                 "title": "Ticket",
                 "state": "open",
                 "closure_operation_key": null, "current_closure": null, "legacy_handoff": null,
@@ -907,7 +960,7 @@ mod tests {
     fn ticket_detail_projection_accepts_current_blocker_shape() {
         let projected = project_ticket_detail(json!({
             "id": "internal-ticket",
-            "resource_key": "T-588",
+            "resource_key": "T-588", "tags": [],
             "content_digest": "ticket-content-digest",
                 "closure_operation_key": null, "current_closure": null, "closure_history": [], "legacy_handoff": null,
             "title": "Queued Submit",
@@ -927,7 +980,7 @@ mod tests {
                     "reason_kind": "depends_on",
                     "relation_kind": "depends_on",
                     "note": "required foundation",
-                    "blocking_state": "planning"
+                    "blocking_state": "open"
                 }],
                 "notices": []
             },
@@ -966,7 +1019,7 @@ mod tests {
             json!([{
                 "ticket": "T-584",
                 "kind": "depends_on",
-                "state": "planning"
+                "state": "open"
             }])
         );
         assert!(!projected.to_string().contains("internal-blocker"));
@@ -1011,7 +1064,7 @@ mod tests {
                 "review_excerpt": "Reviewed source"
             });
             let projected = project_ticket_detail(json!({
-                "resource_key": "T-716",
+                "resource_key": "T-716", "tags": [],
                 "content_digest": "current-ticket-content-digest",
                 "closure_operation_key": null, "current_closure": null, "closure_history": [], "legacy_handoff": null,
                 "title": "Source evidence",
@@ -1191,5 +1244,124 @@ mod tests {
         let error = project_worker(&json!({"worker_resource_key": null}))
             .expect_err("missing W-key must fail");
         assert!(error.contains("W-"));
+    }
+    #[test]
+    fn ticket_query_and_detail_preserve_classification_separately_from_closure_judgment() {
+        let tag = json!({"workspace_id":"ws", "id":"tag-1", "name":"closed", "last_operation_key":"tag-create", "deleted":false});
+        let closure = json!({"operation_key":"close-1", "reason":"not_planned", "explanation":"Not proceeding", "references":[{"kind":"ticket", "target":"T-12"}], "author":"workspace-user:alice", "at":"2026-01-01T00:00:00Z"});
+        let history = json!([{"operation_key":"close-1", "previous_closure_operation_key":null, "action":{"action":"close", "reason":"not_planned"}, "explanation":"Not proceeding", "references":[{"kind":"ticket", "target":"T-12"}], "author":"workspace-user:alice", "at":"2026-01-01T00:00:00Z"}]);
+        let detail = json!({
+            "resource_key":"T-739", "title":"Case", "body":"Requirements", "content_digest":"content-1",
+            "state":"closed", "tags":[tag], "closure_operation_key":"close-1", "current_closure":closure,
+            "legacy_handoff":null, "closure_history":history, "events":[], "linked_objectives":[], "assignments":[], "implementation_reports":[], "merge_requests":[]
+        });
+        let mut item = detail.clone();
+        item["matched_fields"] = json!([]);
+        item["linked_objective_keys"] = json!([]);
+        for field in [
+            "relation_count",
+            "blocker_count",
+            "unresolved_blocker_count",
+            "unresolved_review_count",
+        ] {
+            item[field] = json!(0);
+        }
+        let projected_detail =
+            serde_json::to_value(project_ticket_detail(detail.clone()).unwrap()).unwrap();
+        let projected_query = serde_json::to_value(
+            project_ticket_query(
+                json!({"items":[item.clone()], "page":{"has_more":false, "next_cursor":null}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for field in [
+            "tags",
+            "state",
+            "closure_operation_key",
+            "current_closure",
+            "legacy_handoff",
+        ] {
+            assert_eq!(projected_detail[field], detail[field], "detail {field}");
+            assert_eq!(
+                projected_query["tickets"][0][field], detail[field],
+                "query {field}"
+            );
+        }
+        assert_eq!(projected_detail["closure_history"], history);
+        assert_eq!(projected_detail["content_digest"], "content-1");
+        // Unknown observations must not be replaced with empty/null values.
+        for field in [
+            "tags",
+            "closure_operation_key",
+            "current_closure",
+            "legacy_handoff",
+            "state",
+        ] {
+            let mut missing_detail = detail.clone();
+            missing_detail.as_object_mut().unwrap().remove(field);
+            assert!(
+                project_ticket_detail(missing_detail)
+                    .unwrap_err()
+                    .contains(field),
+                "detail {field}"
+            );
+            let mut missing_item = item.clone();
+            missing_item.as_object_mut().unwrap().remove(field);
+            assert!(
+                project_ticket_query(
+                    json!({"items":[missing_item], "page":{"has_more":false, "next_cursor":null}})
+                )
+                .unwrap_err()
+                .contains(field),
+                "query {field}"
+            );
+        }
+        for invalid_tags in [
+            json!([{"id":"tag-1"}]),
+            json!(vec![detail["tags"][0].clone(); 101]),
+            {
+                let mut deleted = detail["tags"].clone();
+                deleted[0]["deleted"] = json!(true);
+                deleted
+            },
+        ] {
+            let mut malformed = detail.clone();
+            malformed["tags"] = invalid_tags;
+            assert!(project_ticket_detail(malformed).is_err());
+        }
+        for state in [
+            "planning",
+            "ready",
+            "queued",
+            "inprogress",
+            "done",
+            "unknown",
+        ] {
+            let mut malformed = detail.clone();
+            malformed["state"] = json!(state);
+            assert!(
+                project_ticket_detail(malformed)
+                    .unwrap_err()
+                    .contains("state"),
+                "{state}"
+            );
+        }
+    }
+
+    #[test]
+    fn ticket_tag_history_projection_preserves_observed_names_and_identities() {
+        let tag = serde_json::json!({"workspace_id":"ws","id":"tag-1","name":"Old name","last_operation_key":"create","deleted":false});
+        let event = serde_json::json!({"sequence":3,"kind":"tags_changed","body":"Ticket tags changed","at":"then","attributes":{"tags_before":serde_json::json!([tag.clone()]).to_string(),"tags_after":"[]"}});
+        let projected = serde_json::to_value(project_ticket_event(&event).unwrap()).unwrap();
+        assert_eq!(projected["tag_changes"]["before"], serde_json::json!([tag]));
+        assert_eq!(projected["tag_changes"]["after"], serde_json::json!([]));
+        let ordinary = serde_json::json!({"sequence":0,"kind":"comment","body":"hello","at":null});
+        assert!(
+            serde_json::to_value(project_ticket_event(&ordinary).unwrap())
+                .unwrap()
+                .get("tag_changes")
+                .is_none()
+        );
     }
 }

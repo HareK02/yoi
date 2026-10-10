@@ -25,6 +25,7 @@ export function fixtureTicket(
     current_closure: null,
     legacy_handoff: null,
     state,
+    tags: [],
     priority: "normal",
     queued_at: null,
     queued_by: null,

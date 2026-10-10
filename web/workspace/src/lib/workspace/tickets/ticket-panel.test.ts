@@ -29,15 +29,35 @@ Deno.test("ticketLanes separates open and closed cases and orders updates determ
       id: "old",
       state: "open",
       title: "Open old",
+      tags: [{
+        workspace_id: "workspace-a",
+        id: "tag-closed",
+        name: "closed",
+        last_operation_key: "create-closed",
+        deleted: false,
+      }],
       updated_at: "2026-07-29T12:00:00Z",
     },
     {
       id: "new",
       state: "open",
       title: "Open new",
+      tags: [],
       updated_at: "2026-07-30T12:00:00Z",
     },
-    { id: "closed", state: "closed", title: "Closed", updated_at: null },
+    {
+      id: "closed",
+      state: "closed",
+      title: "Closed",
+      tags: [{
+        workspace_id: "workspace-a",
+        id: "tag-ready",
+        name: "ready",
+        last_operation_key: "create-ready",
+        deleted: false,
+      }],
+      updated_at: null,
+    },
   ] as TicketSummary[];
   const lanes = ticketLanes(tickets);
   assertEquals(lanes.map((lane) => lane.id), ["open", "closed"]);

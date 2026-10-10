@@ -372,6 +372,11 @@ impl_openapi_schema!(
     TicketShowRequest,
     TicketSummarySearchQuery,
     TicketThreadEventRequest,
+    WorkspaceTicketTagListRequest,
+    WorkspaceTicketTagMutationRequest,
+    TicketTagsSetRequest,
+    WorkspaceTicketTagList,
+    WorkspaceTicketTag,
     RuntimeManagementApiError,
     RuntimeWorkersQuery,
     RuntimeWorkerSpawnRequest,
@@ -2971,6 +2976,31 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: CreateTicketRecordRequest,
     ) -> Result<TicketRecordRef, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/ticket-tags", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn workspace_ticket_tag_list(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] request: WorkspaceTicketTagListRequest,
+    ) -> Result<WorkspaceTicketTagList, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/ticket-tags", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn workspace_ticket_tag_mutate(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: WorkspaceTicketTagMutationRequest,
+    ) -> Result<WorkspaceTicketTag, RepositoryApiError>;
+
+    #[put("/api/w/{workspace_id}/tickets/{id}/tags", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_tags_set(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: TicketTagsSetRequest,
+    ) -> Result<WorkspaceTicketTagList, RepositoryApiError>;
 
     #[post("/api/w/{workspace_id}/tickets/query", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_query(
@@ -7198,6 +7228,9 @@ pub struct InvalidProjectRecord {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct TicketListItemSummary {
+    #[serde(default)]
+    #[cfg_attr(feature = "typescript", ts(type = "Array<WorkspaceTag>"))]
+    pub tags: Vec<ticket::WorkspaceTag>,
     pub id: String,
     pub resource_key: String,
     pub title: String,
@@ -7536,7 +7569,8 @@ impl TicketAttention {
 pub struct TicketQueryRequest {
     pub query: Option<String>,
     #[serde(default)]
-    pub states: Vec<BrowserTicketState>,
+    #[cfg_attr(feature = "typescript", ts(type = "Array<BrowserTicketState>"))]
+    pub states: Vec<ticket::TicketState>,
     #[serde(default)]
     pub event_kinds: Vec<String>,
     #[serde(default)]
@@ -7544,6 +7578,15 @@ pub struct TicketQueryRequest {
     pub review_status: Option<String>,
     #[serde(default)]
     pub attention: Vec<TicketAttention>,
+    /// Match tickets containing every supplied tag ID (AND).
+    #[serde(default)]
+    pub tag_ids: Vec<String>,
+    /// Match tickets containing at least one supplied tag ID (OR).
+    #[serde(default)]
+    pub tag_ids_any: Vec<String>,
+    /// Exclude tickets containing any supplied tag ID (NOT).
+    #[serde(default)]
+    pub tag_ids_none: Vec<String>,
     pub related_ticket_id: Option<String>,
     pub relation_kind: Option<String>,
     pub linked_objective_id: Option<String>,
@@ -7560,6 +7603,8 @@ pub struct TicketQueryRequest {
 #[serde(deny_unknown_fields)]
 pub struct TicketQueryItem {
     pub id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "Array<WorkspaceTag>"))]
+    pub tags: Vec<ticket::WorkspaceTag>,
     pub resource_key: String,
     pub title: String,
     pub state: BrowserTicketState,
@@ -7625,6 +7670,8 @@ pub struct TicketShowRequest {
 #[serde(deny_unknown_fields)]
 pub struct TicketDetail {
     pub id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "Array<WorkspaceTag>"))]
+    pub tags: Vec<ticket::WorkspaceTag>,
     pub resource_key: String,
     pub title: String,
     pub state: BrowserTicketState,
@@ -7730,6 +7777,14 @@ pub struct TicketCaseUpdateRequest {
     #[serde(default)]
     pub references: Vec<ticket::TicketReference>,
 }
+transparent_ticket_dto!(WorkspaceTicketTagListRequest, ticket::TagListRequest);
+transparent_ticket_dto!(
+    WorkspaceTicketTagMutationRequest,
+    ticket::WorkspaceTagMutation
+);
+transparent_ticket_dto!(TicketTagsSetRequest, ticket::TicketTagSetRequest);
+transparent_ticket_dto!(WorkspaceTicketTagList, Vec<ticket::WorkspaceTag>);
+transparent_ticket_dto!(WorkspaceTicketTag, ticket::WorkspaceTag);
 transparent_ticket_dto!(TicketRecordRef, ticket::TicketRef);
 transparent_ticket_dto!(TicketRecordSummaryList, Vec<ticket::TicketSummary>);
 transparent_ticket_dto!(TicketDependencyCheckResponse, ticket::TicketDependencyCheck);
@@ -11075,6 +11130,210 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ticket_tag_query_filters_default_empty_and_roundtrip() {
+        let request: TicketQueryRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(request.tag_ids.is_empty());
+        assert!(request.tag_ids_any.is_empty());
+        assert!(request.tag_ids_none.is_empty());
+        let request: TicketQueryRequest = serde_json::from_value(serde_json::json!({
+            "states": ["open", "closed"],
+            "tag_ids": ["tag-a", "tag-b"],
+            "tag_ids_any": ["tag-c", "tag-d"],
+            "tag_ids_none": ["tag-e"]
+        }))
+        .unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["tag_ids"], serde_json::json!(["tag-a", "tag-b"]));
+        assert_eq!(value["tag_ids_any"], serde_json::json!(["tag-c", "tag-d"]));
+        assert_eq!(value["tag_ids_none"], serde_json::json!(["tag-e"]));
+        assert_eq!(value["states"], serde_json::json!(["open", "closed"]));
+    }
+
+    #[test]
+    fn ticket_tag_mutations_require_operation_keys_and_observed_cas() {
+        for action in [
+            serde_json::json!({"kind": "create", "name": "bug"}),
+            serde_json::json!({"kind": "rename", "tag_id": "tag-a", "expected_last_operation_key": "observed", "name": "defect"}),
+            serde_json::json!({"kind": "delete", "tag_id": "tag-a", "expected_last_operation_key": "observed"}),
+        ] {
+            let value = serde_json::json!({"operation_key": "new-operation", "action": action});
+            let parsed: WorkspaceTicketTagMutationRequest =
+                serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+            let mut missing_operation = value.clone();
+            missing_operation
+                .as_object_mut()
+                .unwrap()
+                .remove("operation_key");
+            assert!(
+                serde_json::from_value::<WorkspaceTicketTagMutationRequest>(missing_operation)
+                    .is_err()
+            );
+            if action["kind"] != "create" {
+                let mut missing_cas = value;
+                missing_cas["action"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("expected_last_operation_key");
+                assert!(
+                    serde_json::from_value::<WorkspaceTicketTagMutationRequest>(missing_cas)
+                        .is_err()
+                );
+            }
+        }
+        let value = serde_json::json!({
+            "operation_key": "replace-tags",
+            "expected_tag_ids": ["tag-a", "tag-b"],
+            "tag_ids": ["tag-b", "tag-c"]
+        });
+        let parsed: TicketTagsSetRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+        for key in ["operation_key", "expected_tag_ids", "tag_ids"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                serde_json::from_value::<TicketTagsSetRequest>(missing).is_err(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn ticket_tag_list_and_responses_are_transparent() {
+        let query = serde_json::json!({"after": "tag-a", "limit": 200});
+        let parsed: WorkspaceTicketTagListRequest = serde_json::from_value(query.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), query);
+        let tag = serde_json::json!({
+            "workspace_id": "workspace-a", "id": "tag-a", "name": "bug",
+            "last_operation_key": "create-tag", "deleted": false
+        });
+        let parsed: WorkspaceTicketTag = serde_json::from_value(tag.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), tag);
+        let list = serde_json::json!([tag]);
+        let parsed: WorkspaceTicketTagList = serde_json::from_value(list.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), list);
+        for schema in [
+            schemars::schema_for!(TicketDetail),
+            schemars::schema_for!(TicketQueryItem),
+            schemars::schema_for!(TicketListItemSummary),
+        ] {
+            let schema = serde_json::to_value(schema).unwrap();
+            assert_eq!(schema["properties"]["tags"]["type"], "array");
+            assert_eq!(
+                schema["properties"]["tags"]["items"]["$ref"],
+                "#/$defs/WorkspaceTag"
+            );
+            for field in ["closure_operation_key", "current_closure", "legacy_handoff"] {
+                assert!(schema["properties"].get(field).is_some(), "{field}");
+            }
+            assert_eq!(
+                schema["$defs"]["BrowserTicketState"]["enum"],
+                serde_json::json!(["open", "closed"])
+            );
+        }
+        let detail = serde_json::to_value(schemars::schema_for!(TicketDetail)).unwrap();
+        assert!(detail["properties"]["closure_history"].is_object());
+    }
+
+    #[test]
+    fn ticket_classification_requests_reject_case_judgments_and_actor_claims() {
+        let mutation = serde_json::json!({"operation_key":"classify", "action":{"kind":"create", "name":"closed"}});
+        let set = serde_json::json!({"operation_key":"classify", "expected_tag_ids":[], "tag_ids":["tag-1"]});
+        for (field, value) in [
+            ("author", serde_json::json!("orchestrator")),
+            ("expected_state", serde_json::json!("closed")),
+            ("expected_content_digest", serde_json::json!("digest")),
+            ("reason", serde_json::json!("completed")),
+        ] {
+            let mut invalid_mutation = mutation.clone();
+            invalid_mutation[field] = value.clone();
+            assert!(
+                serde_json::from_value::<WorkspaceTicketTagMutationRequest>(invalid_mutation)
+                    .is_err(),
+                "mutation {field}"
+            );
+            let mut invalid_set = set.clone();
+            invalid_set[field] = value;
+            assert!(
+                serde_json::from_value::<TicketTagsSetRequest>(invalid_set).is_err(),
+                "set {field}"
+            );
+        }
+        let query = serde_json::json!({"states":["closed"], "tag_ids":["tag-1"], "tag_ids_any":["tag-2"], "tag_ids_none":["tag-3"]});
+        assert!(serde_json::from_value::<TicketQueryRequest>(query.clone()).is_ok());
+        for state in [
+            "planning",
+            "ready",
+            "queued",
+            "inprogress",
+            "done",
+            "invalid",
+        ] {
+            let mut invalid = query.clone();
+            invalid["states"] = serde_json::json!([state]);
+            assert!(
+                serde_json::from_value::<TicketQueryRequest>(invalid).is_err(),
+                "{state}"
+            );
+        }
+    }
+
+    #[test]
+    fn ticket_tag_operations_are_typed_workspace_routes() {
+        for (name, method, path) in [
+            (
+                "workspace_ticket_tag_list",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/ticket-tags",
+            ),
+            (
+                "workspace_ticket_tag_mutate",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/ticket-tags",
+            ),
+            (
+                "ticket_tags_set",
+                HttpMethod::Put,
+                "/api/w/{workspace_id}/tickets/{id}/tags",
+            ),
+        ] {
+            let operation = ServerApiMetadata::OPERATIONS
+                .iter()
+                .find(|operation| operation.operation_id == name)
+                .unwrap();
+            assert_eq!(operation.method, method);
+            assert_eq!(operation.path, path);
+        }
+        let contract = canonical_openapi_document().unwrap().to_json().unwrap();
+        let contract: serde_json::Value = serde_json::from_str(&contract).unwrap();
+        for (path, method) in [
+            ("/api/w/{workspace_id}/ticket-tags", "post"),
+            ("/api/w/{workspace_id}/tickets/{id}/tags", "put"),
+        ] {
+            let operation = &contract["paths"][path][method];
+            assert!(
+                operation["responses"].get("409").is_some(),
+                "CAS conflict must be documented"
+            );
+            assert!(operation["requestBody"]["required"].as_bool().unwrap());
+        }
+    }
+
+    #[cfg(feature = "typescript")]
+    #[test]
+    fn ticket_tag_typescript_references_are_registered() {
+        use ts_rs::TS;
+        let config = ts_rs::Config::default();
+        assert!(TicketDetail::decl(&config).contains("tags: Array<WorkspaceTag>"));
+        assert!(TicketQueryItem::decl(&config).contains("tags: Array<WorkspaceTag>"));
+        let contract = canonical_openapi_document().unwrap().to_json().unwrap();
+        let generated =
+            repository_openapi_typescript::generate_ticket_browser_typescript(&contract).unwrap();
+        assert!(generated.contains("export type WorkspaceTag ="));
+        assert!(generated.contains("tags: Array<WorkspaceTag>"));
+    }
+
+    #[test]
     fn ticket_role_assignment_request_defaults_empty_bindings_and_requires_each_selected_connection()
      {
         let base = serde_json::json!({"operation_id":"claim", "principal":{"kind":"worker","runtime_id":"r","worker_id":"w"}, "expected_assignment_id":null});
@@ -12769,7 +13028,7 @@ mod tests {
             "states": ["open", "closed"], "attention": ["blocked", "missing_evidence"]
         }))
         .unwrap();
-        assert_eq!(parsed.states[0], BrowserTicketState::Open);
+        assert_eq!(parsed.states[0], ticket::TicketState::Open);
         for state in [
             "planning",
             "ready",

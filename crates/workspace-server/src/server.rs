@@ -6575,6 +6575,15 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::ticket_case_update(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::workspace_ticket_tag_list(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_ticket_tag_mutate(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_tags_set(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::ticket_relation_view(
             service.clone(),
         ))
@@ -10297,6 +10306,7 @@ impl server_api::ServerApi for ServerApiContractService {
             kind: meta.kind,
             priority: meta.priority,
             labels: meta.labels,
+            tags: updated.tags,
             readiness: meta.readiness,
             workflow_state: meta.workflow_state,
             workflow_state_explicit: meta.workflow_state_explicit,
@@ -10304,6 +10314,81 @@ impl server_api::ServerApi for ServerApiContractService {
             queued_at: meta.queued_at,
             updated_at: meta.updated_at,
         }))
+    }
+
+    async fn workspace_ticket_tag_list(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::WorkspaceTicketTagListRequest,
+    ) -> std::result::Result<server_api::WorkspaceTicketTagList, server_api::RepositoryApiError>
+    {
+        let result = execute_ticket_rest_operation_with_context(
+            self.workspace_api()?,
+            &workspace_id,
+            contract_request_headers(&context)?,
+            Some(&context),
+            TicketBackendOperation::ListWorkspaceTags { request: request.0 },
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        let Json(value) = ticket_rest_result(result, |result| match result {
+            TicketBackendOperationResult::WorkspaceTags(value) => Some(value),
+            _ => None,
+        })
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::WorkspaceTicketTagList(value))
+    }
+
+    async fn workspace_ticket_tag_mutate(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::WorkspaceTicketTagMutationRequest,
+    ) -> std::result::Result<server_api::WorkspaceTicketTag, server_api::RepositoryApiError> {
+        let result = execute_ticket_rest_operation_with_context(
+            self.workspace_api()?,
+            &workspace_id,
+            contract_request_headers(&context)?,
+            Some(&context),
+            TicketBackendOperation::MutateWorkspaceTag { request: request.0 },
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        let Json(value) = ticket_rest_result(result, |result| match result {
+            TicketBackendOperationResult::WorkspaceTag(value) => Some(value),
+            _ => None,
+        })
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::WorkspaceTicketTag(value))
+    }
+
+    async fn ticket_tags_set(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::TicketTagsSetRequest,
+    ) -> std::result::Result<server_api::WorkspaceTicketTagList, server_api::RepositoryApiError>
+    {
+        let result = execute_ticket_rest_operation_with_context(
+            self.workspace_api()?,
+            &workspace_id,
+            contract_request_headers(&context)?,
+            Some(&context),
+            TicketBackendOperation::SetTicketTags {
+                id: TicketIdOrSlug::Query(id),
+                request: request.0,
+            },
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        let Json(value) = ticket_rest_result(result, |result| match result {
+            TicketBackendOperationResult::WorkspaceTags(value) => Some(value),
+            _ => None,
+        })
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::WorkspaceTicketTagList(value))
     }
 
     async fn ticket_relation_view(
@@ -14351,6 +14436,16 @@ async fn execute_ticket_rest_operation(
     api: &WorkspaceApi,
     workspace_id: &str,
     headers: HeaderMap,
+    operation: TicketBackendOperation,
+) -> ApiResult<TicketBackendOperationResult> {
+    execute_ticket_rest_operation_with_context(api, workspace_id, headers, None, operation).await
+}
+
+async fn execute_ticket_rest_operation_with_context(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    headers: HeaderMap,
+    context: Option<&server_api::ServerRequestContext>,
     mut operation: TicketBackendOperation,
 ) -> ApiResult<TicketBackendOperationResult> {
     validate_workspace_scope(api, workspace_id)?;
@@ -14379,7 +14474,31 @@ async fn execute_ticket_rest_operation(
     // Human clients are authorized by the Workspace route boundary. Runtime-forwarded Worker
     // calls carry source headers; when either header is present, the complete pair is required
     // and authenticated before source attribution is attached.
-    let source = optional_worker_mutation_source(api, workspace_id, &headers)?;
+    let hinted_source = optional_worker_mutation_source(api, workspace_id, &headers)?;
+    // The signed Workspace request carries verified identity in the middleware
+    // extension, independently of optional legacy source hints. Classification
+    // receipts and audit must not collapse distinct Workers into a human/no-source
+    // identity just because those redundant headers are absent.
+    let verified_source = context
+        .and_then(|context| context.runtime_source.as_ref())
+        .map(|source| {
+            let worker_id = source.worker_id.as_ref().ok_or_else(|| {
+                Error::WorkspacePermissionDenied(
+                    "Classification requests require a verified Runtime Worker identity".into(),
+                )
+            })?;
+            Ok::<_, Error>(RuntimeWorkerRef::new(&source.runtime_id, worker_id))
+        })
+        .transpose()?;
+    if let (Some(verified), Some(hinted)) = (&verified_source, &hinted_source)
+        && verified != hinted
+    {
+        return Err(Error::WorkspacePermissionDenied(
+            "Classification source hints do not match the verified Runtime Worker".into(),
+        )
+        .into());
+    }
+    let source = verified_source.or(hinted_source);
     validate_ticket_repository_operation(api, &operation)?;
     let before = target.as_ref().and_then(|id| backend.show(id.clone()).ok());
     if let Some(source) = source.as_ref()
@@ -14408,6 +14527,12 @@ async fn execute_ticket_rest_operation(
         .map(|ticket| ticket.meta.workflow_state.as_str().to_string())
         .unwrap_or_else(|| ticket_operation_initial_state(&operation));
     let mut event_attributes = BTreeMap::new();
+    if source.is_none()
+        && let Some(actor) = context.and_then(|context| context.actor.as_ref())
+    {
+        event_attributes.insert("source_account_id".into(), actor.account_id.clone());
+        event_attributes.insert("source_user_id".into(), actor.user_id.clone());
+    }
     if matches!(operation, TicketBackendOperation::QueueReady { .. }) {
         let ticket = before.as_ref().ok_or_else(|| {
             Error::TicketAssignmentConflict(
@@ -14495,7 +14620,8 @@ async fn execute_ticket_rest_operation(
             None,
         ),
     };
-    if is_mutation {
+    // Classification has no routing or execution side effects.
+    if is_mutation && !matches!(operation_kind, "mutate_workspace_tag" | "set_ticket_tags") {
         if let TicketBackendOperationResult::QueueOutcome(outcome) = &result {
             for ticket_id in &outcome.queued_tickets {
                 notify_ticket_recipients(
@@ -16558,6 +16684,7 @@ fn ticket_mutation_target(operation: &TicketBackendOperation) -> Option<&TicketI
         | TicketBackendOperation::AddIntakeSummary { id, .. }
         | TicketBackendOperation::MarkReady { id, .. }
         | TicketBackendOperation::QueueReady { id, .. }
+        | TicketBackendOperation::SetTicketTags { id, .. }
         | TicketBackendOperation::AddTicketRelation { id, .. }
         | TicketBackendOperation::RemoveTicketRelation { id, .. }
         | TicketBackendOperation::AddOrchestrationPlanRecord { id, .. } => Some(id),
@@ -16621,6 +16748,8 @@ fn ticket_mutation_operation_kind(operation: &TicketBackendOperation) -> &'stati
         TicketBackendOperation::AddIntakeSummary { .. } => "add_intake_summary",
         TicketBackendOperation::MarkReady { .. } => "mark_ready",
         TicketBackendOperation::QueueReady { .. } => "queue_ready",
+        TicketBackendOperation::MutateWorkspaceTag { .. } => "mutate_workspace_tag",
+        TicketBackendOperation::SetTicketTags { .. } => "set_ticket_tags",
         TicketBackendOperation::AddTicketRelation { .. } => "add_relation",
         TicketBackendOperation::RemoveTicketRelation { .. } => "remove_relation",
         TicketBackendOperation::AddOrchestrationPlanRecord { .. } => "add_plan_record",
@@ -32252,6 +32381,10 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
+    mod ticket_tags_tests {
+        include!("server_ticket_tags_tests.rs");
+    }
+
     mod api_logging_tests;
     mod auth_logging_tests;
     mod drive_api_tests;

@@ -10,6 +10,7 @@ import {
   parseTicketListResponse,
   parseTicketRecordRef,
   parseTicketRoleAssignmentMutationResponse,
+  parseTicketSummary,
 } from "./ticket-browser.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
@@ -48,6 +49,7 @@ Deno.test("Ticket Browser parser accepts the generated Ticket list shape", () =>
       id: "ticket-id",
       resource_key: "T-1",
       title: "Ticket",
+      tags: [],
       state: "open",
       priority: "P2",
       updated_at: null,
@@ -176,6 +178,7 @@ function ticketDetailFixture() {
     resource_key: "T-1",
     risk_flags: [],
     state: "open",
+    tags: [],
     targets: [
       {
         repository_key: "docs",
@@ -452,6 +455,14 @@ Deno.test("Ticket Browser parser validates the canonical Merge Request thread", 
   );
 });
 
+const tags = ["ready", "closed"].map((name) => ({
+  workspace_id: "workspace-a",
+  id: `tag-${name}`,
+  name,
+  last_operation_key: `create-${name}`,
+  deleted: false,
+}));
+
 const closure = {
   operation_key: "close-1",
   reason: "not_planned",
@@ -499,10 +510,11 @@ const legacyHandoff = {
   resolution: "Historical result, not a current case state",
 };
 
-Deno.test("case projections retain reasons, actors, references and migration history after reopening", () => {
+Deno.test("tags named ready and closed coexist with case judgment and retained reopen history without inferring state", () => {
   const fixture = {
     ...ticketDetailFixture(),
     state: "open",
+    tags,
     closure_operation_key: "correct-1",
     current_closure: null,
     closure_history: closureHistory,
@@ -513,11 +525,16 @@ Deno.test("case projections retain reasons, actors, references and migration his
   assertEquals(parsed.closure_operation_key, "correct-1");
   assertEquals(parsed.closure_history, closureHistory);
   assertEquals(parsed.legacy_handoff, legacyHandoff);
-  assertEquals(
-    parseTicketDetail({ ...fixture, state: "closed", current_closure: closure })
-      .current_closure,
-    closure,
-  );
+  assertEquals(parsed.tags, tags);
+  const closed = parseTicketDetail({
+    ...fixture,
+    state: "closed",
+    current_closure: closure,
+  });
+  assertEquals(closed.state, "closed");
+  assertEquals(closed.current_closure, closure);
+  assertEquals(closed.closure_history, closureHistory);
+  assertEquals(closed.tags, tags);
   const list = parseTicketListResponse({
     workspace_id: "workspace-a",
     limit: 30,
@@ -529,6 +546,7 @@ Deno.test("case projections retain reasons, actors, references and migration his
       resource_key: "T-1",
       title: "Ticket",
       state: "closed",
+      tags,
       priority: "P2",
       record_source: "sqlite",
       workspace_action_priority: "background",
@@ -537,8 +555,71 @@ Deno.test("case projections retain reasons, actors, references and migration his
       legacy_handoff: legacyHandoff,
     }],
   });
+  assertEquals(list.items[0].state, "closed");
+  assertEquals(list.items[0].tags, tags);
   assertEquals(list.items[0].current_closure, closure);
   assertEquals(list.items[0].legacy_handoff, legacyHandoff);
+});
+
+Deno.test("Ticket tag projections reject missing collections and malformed identities, types and unknown fields", () => {
+  const parsers = [
+    (tags: unknown) => parseTicketDetail({ ...ticketDetailFixture(), tags }),
+    (tags: unknown) =>
+      parseTicketSummary({
+        id: "ticket-id",
+        slug: "ticket",
+        title: "Ticket",
+        kind: "task",
+        labels: [],
+        priority: "P2",
+        status: "Open",
+        workflow_state: "open",
+        workflow_state_explicit: true,
+        tags,
+      }),
+    (tags: unknown) =>
+      parseTicketListResponse({
+        workspace_id: "workspace-a",
+        limit: 30,
+        page,
+        invalid_records: [],
+        record_authority: "sqlite",
+        items: [{
+          id: "ticket-id",
+          resource_key: "T-1",
+          title: "Ticket",
+          state: "open",
+          priority: "P2",
+          record_source: "sqlite",
+          workspace_action_priority: "background",
+          tags,
+        }],
+      }),
+  ];
+  const tag = tags[0];
+  for (const parse of parsers) {
+    for (const value of [undefined, null, {}, "ready"]) {
+      assertThrows(() => parse(value), "tags must be an array");
+    }
+    for (
+      const [value, message] of [
+        [{ ...tag, id: undefined }, "id must be a string"],
+        [{ ...tag, id: 1 }, "id must be a string"],
+        [{ ...tag, id: " " }, "id must be nonempty"],
+        [{ ...tag, id: "é".repeat(65) }, "at most 128 UTF-8 bytes"],
+        [{ ...tag, workspace_id: false }, "workspace_id must be a string"],
+        [{ ...tag, name: null }, "name must be a string"],
+        [
+          { ...tag, last_operation_key: 1 },
+          "last_operation_key must be a string",
+        ],
+        [{ ...tag, deleted: "false" }, "deleted must be a boolean"],
+        [{ ...tag, state: "closed" }, "unknown field state"],
+      ] as const
+    ) {
+      assertThrows(() => parse([value]), message);
+    }
+  }
 });
 
 Deno.test("case decoders reject legacy current states and malformed closure judgments", () => {

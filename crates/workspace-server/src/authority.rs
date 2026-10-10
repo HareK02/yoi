@@ -391,6 +391,21 @@ impl SqliteWorkspaceAuthority {
                 .collect::<Vec<_>>();
             predicates.push(format!("t.workflow_state IN ({})", states.join(",")));
         }
+        for id in &query.tag_ids {
+            let id = bind(SqlValue::Text(id.clone()));
+            predicates.push(format!("EXISTS (SELECT 1 FROM typed_ticket_tags l JOIN workspace_tags tag ON tag.workspace_id=l.workspace_id AND tag.tag_id=l.tag_id WHERE l.workspace_id=t.workspace_id AND l.ticket_id=t.ticket_id AND l.tag_id={id} AND tag.deleted=0)"));
+        }
+        for (ids, negate) in [(&query.tag_ids_any, false), (&query.tag_ids_none, true)] {
+            if !ids.is_empty() {
+                let ids = ids
+                    .iter()
+                    .map(|id| bind(SqlValue::Text(id.clone())))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let not = if negate { "NOT " } else { "" };
+                predicates.push(format!("{not}EXISTS (SELECT 1 FROM typed_ticket_tags l JOIN workspace_tags tag ON tag.workspace_id=l.workspace_id AND tag.tag_id=l.tag_id WHERE l.workspace_id=t.workspace_id AND l.ticket_id=t.ticket_id AND l.tag_id IN ({ids}) AND tag.deleted=0)"));
+            }
+        }
         if let Some(text) = query.query.as_deref().filter(|text| !text.is_empty()) {
             let pattern = bind(SqlValue::Text(format!("%{}%", text.to_lowercase())));
             predicates.push(format!(
@@ -908,6 +923,7 @@ impl SqliteWorkspaceAuthority {
             queued_at: ticket.meta.queued_at,
             targets,
             risk_flags: ticket.meta.risk_flags,
+            tags: ticket.tags,
             body,
             body_truncated,
             event_count: ticket.events.len(),
@@ -1954,6 +1970,13 @@ fn ticket_evidence_summary(
 }
 
 fn validate_ticket_query(query: &TicketQueryRequest) -> Result<()> {
+    for ids in [&query.tag_ids, &query.tag_ids_any, &query.tag_ids_none] {
+        if ids.len() > 100 || ids.iter().any(|id| id.is_empty() || id.len() > 128) {
+            return Err(Error::InvalidInput(
+                "tag filters require at most 100 nonempty stable IDs of at most 128 bytes".into(),
+            ));
+        }
+    }
     for evidence in &query.evidence {
         if !matches!(
             evidence.as_str(),
@@ -2142,7 +2165,19 @@ fn ticket_matches_query(
     authoritative_events: &[TicketEvent],
     query: &TicketQueryRequest,
 ) -> bool {
-    if !query.states.is_empty() && !query.states.iter().any(|state| state == &summary.state) {
+    let has_tag = |id: &String| detail.tags.iter().any(|tag| &tag.id == id);
+    if !query.tag_ids.iter().all(has_tag)
+        || (!query.tag_ids_any.is_empty() && !query.tag_ids_any.iter().any(has_tag))
+        || query.tag_ids_none.iter().any(has_tag)
+    {
+        return false;
+    }
+    if !query.states.is_empty()
+        && !query
+            .states
+            .iter()
+            .any(|state| server_api::BrowserTicketState::from(*state) == summary.state)
+    {
         return false;
     }
     if query
@@ -2300,6 +2335,7 @@ fn ticket_query_item(
         title: summary.title,
         state: summary.state,
         readiness: detail.readiness.clone(),
+        tags: detail.tags.clone(),
         priority: summary.priority,
         created_at: detail.created_at.clone(),
         updated_at: summary.updated_at,
@@ -2659,6 +2695,7 @@ fn ticket_summary_from_ticket(ticket: &ticket::Ticket) -> Result<TicketSummary> 
         kind: ticket.meta.kind.clone(),
         priority: ticket.meta.priority.clone(),
         labels: ticket.meta.labels.clone(),
+        tags: ticket.tags.clone(),
         readiness: ticket.meta.readiness.clone(),
         workflow_state: ticket.meta.workflow_state,
         workflow_state_explicit: ticket.meta.workflow_state_explicit,
@@ -2690,6 +2727,7 @@ fn ticket_summary_from_sqlite_item(item: SqliteTicketListItem) -> Result<TicketS
         state: item.summary.workflow_state.into(),
         priority: item.summary.priority,
         updated_at: item.summary.updated_at,
+        tags: item.summary.tags,
         queued_by: item.summary.queued_by,
         queued_at: item.summary.queued_at,
         workspace_action_priority: workspace_action_priority_name(projection.priority).to_string(),
@@ -3497,7 +3535,7 @@ VALUES ('workspace-test', 'ticket', 4);
         let ticket_query = authority
             .query_tickets(TicketQueryRequest {
                 query: Some("Deep Ticket marker".to_string()),
-                states: vec![server_api::BrowserTicketState::Open],
+                states: vec![ticket::TicketState::Open],
                 linked_objective_id: Some("00000000001J3".to_string()),
                 attention: vec![server_api::TicketAttention::MissingCommit],
                 limit: Some(1),

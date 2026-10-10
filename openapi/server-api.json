@@ -81,6 +81,12 @@
         },
         "type": "array"
       },
+      "Array_of_WorkspaceTag": {
+        "items": {
+          "$ref": "#/components/schemas/WorkspaceTag"
+        },
+        "type": "array"
+      },
       "AttachmentUploadCancelResponse": {
         "additionalProperties": false,
         "properties": {
@@ -10419,6 +10425,27 @@
         ],
         "type": "string"
       },
+      "TagListRequest": {
+        "description": "Active tags in ascending ID order, strictly after `after`; default/max 200.\nLarger limits are clamped to 200; zero returns an empty page.",
+        "properties": {
+          "after": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "uint",
+            "maximum": 200,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "Ticket": {
         "properties": {
           "artifacts": {
@@ -10484,6 +10511,13 @@
                 "type": "null"
               }
             ]
+          },
+          "tags": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceTag"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -11082,6 +11116,12 @@
           "state": {
             "$ref": "#/components/schemas/BrowserTicketState"
           },
+          "tags": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceTag"
+            },
+            "type": "array"
+          },
           "targets": {
             "items": {
               "$ref": "#/components/schemas/TicketTarget"
@@ -11100,6 +11140,7 @@
         },
         "required": [
           "id",
+          "tags",
           "resource_key",
           "title",
           "state",
@@ -11537,6 +11578,7 @@
               "decision",
               "implementation_report",
               "state_changed",
+              "tags_changed",
               "intake_summary",
               "status_changed",
               "close"
@@ -11884,6 +11926,13 @@
           },
           "state": {
             "$ref": "#/components/schemas/BrowserTicketState"
+          },
+          "tags": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceTag"
+            },
+            "type": "array"
           },
           "title": {
             "type": "string"
@@ -12327,6 +12376,12 @@
           "state": {
             "$ref": "#/components/schemas/BrowserTicketState"
           },
+          "tags": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceTag"
+            },
+            "type": "array"
+          },
           "title": {
             "type": "string"
           },
@@ -12354,6 +12409,7 @@
         },
         "required": [
           "id",
+          "tags",
           "resource_key",
           "title",
           "state",
@@ -12450,7 +12506,31 @@
           "states": {
             "default": [],
             "items": {
-              "$ref": "#/components/schemas/BrowserTicketState"
+              "$ref": "#/components/schemas/TicketState"
+            },
+            "type": "array"
+          },
+          "tag_ids": {
+            "default": [],
+            "description": "Match tickets containing every supplied tag ID (AND).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tag_ids_any": {
+            "default": [],
+            "description": "Match tickets containing at least one supplied tag ID (OR).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tag_ids_none": {
+            "default": [],
+            "description": "Exclude tickets containing any supplied tag ID (NOT).",
+            "items": {
+              "type": "string"
             },
             "type": "array"
           },
@@ -12984,6 +13064,13 @@
           "status": {
             "$ref": "#/components/schemas/ExtensibleTicketStatus"
           },
+          "tags": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceTag"
+            },
+            "type": "array"
+          },
           "title": {
             "type": "string"
           },
@@ -13033,6 +13120,33 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "TicketTagSetRequest": {
+        "additionalProperties": false,
+        "description": "Compare entire active ID set, then replace it atomically. IDs must be unique;\ninput order is immaterial to CAS, but remains significant for exact replay.",
+        "properties": {
+          "expected_tag_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "operation_key": {
+            "type": "string"
+          },
+          "tag_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "expected_tag_ids",
+          "tag_ids",
+          "operation_key"
+        ],
         "type": "object"
       },
       "TicketTarget": {
@@ -16126,6 +16240,117 @@
         ],
         "type": "object"
       },
+      "WorkspaceTag": {
+        "description": "Workspace-scoped immutable identity with a mutable display name.\nNames are Unicode-whitespace trimmed, limited to 128 UTF-8 bytes, and\ndeduplicated among active tags using Rust Unicode lowercase (not full case\nfolding or NFC/NFKC). Empty names and any input control characters are invalid.",
+        "properties": {
+          "deleted": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "last_operation_key": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "id",
+          "name",
+          "last_operation_key",
+          "deleted"
+        ],
+        "type": "object"
+      },
+      "WorkspaceTagAction": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "create",
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "name"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "expected_last_operation_key": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "rename",
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "tag_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "tag_id",
+              "expected_last_operation_key",
+              "name"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "expected_last_operation_key": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "delete",
+                "type": "string"
+              },
+              "tag_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "tag_id",
+              "expected_last_operation_key"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WorkspaceTagMutation": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/WorkspaceTagAction"
+          },
+          "operation_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_key",
+          "action"
+        ],
+        "type": "object"
+      },
       "WorkspaceWorkerDiscoveryItem": {
         "additionalProperties": false,
         "description": "Bounded, model-safe projection used by privileged Workspace Worker discovery.\nRuntime placement appears only in the typed subject required by Worker\ncontrol operations; provider and launch internals are intentionally omitted.",
@@ -16219,7 +16444,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:2e8dcd75d5d7b70c5d820999afcabf3d1377896732c7a3e8c3839e73a994974c"
+    "x-yoi-source-digest": "sha256:ba017607e313ba3eb500e4eb78f94c2bd95a08acde96688b8d2a0014abd94ea3"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -32797,6 +33022,208 @@
         ]
       }
     },
+    "/api/w/{workspace_id}/ticket-tags": {
+      "get": {
+        "operationId": "workspace_ticket_tag_list",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "request",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TagListRequest"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Array_of_WorkspaceTag"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "post": {
+        "operationId": "workspace_ticket_tag_mutate",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceTagMutation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceTag"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
     "/api/w/{workspace_id}/tickets": {
       "get": {
         "operationId": "ticket_list",
@@ -35544,6 +35971,123 @@
             "description": "Error response"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/tickets/{id}/tags": {
+      "put": {
+        "operationId": "ticket_tags_set",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TicketTagSetRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Array_of_WorkspaceTag"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
             "content": {
               "application/json": {
                 "schema": {

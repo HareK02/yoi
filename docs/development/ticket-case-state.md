@@ -31,7 +31,7 @@ closeは案件の実作業拘束を終える一方、T-715の終端担当責任�
 
 ## 旧保存データの移行
 
-T-739 sourceではTicket component schema7→9を使用する。Workspaceは現developのauth/runtime connection移行89→90をそのまま保持し、案件移行90→91を追加する。旧89からはauth→案件の順に進み、現90からは案件移行だけを行う。component6からの既存移行も維持する。
+T-739/T-740合成sourceのTicket componentはschema10（タグと案件判断）とする。旧schema7（六状態）・8（六状態とタグ）を明示的な移行入力として扱い、番号だけで旧保存形式を推測しない。Workspaceはdevelopのauth/runtime connection移行89→90をそのまま保持し、案件移行90→91を追加する。旧89からはauth→案件の順に進み、現90からは案件移行だけを行う。component6からの既存移行も維持する。案件のみのcomponent9は、表・列・FKとimmutable triggerの保存形式を検証したうえでタグだけを追加し、既存の終了判断・receipt・migration actor/key・handoffを再生成しない。偽のversion markerや欠けたschema objectは拒否する。
 
 | 旧workflow state | 現行案件状態 | 終了理由 |
 | --- | --- | --- |
@@ -40,14 +40,14 @@ T-739 sourceではTicket component schema7→9を使用する。Workspaceは現d
 
 旧doneを成功の証拠に昇格しない。移行による終了判断はmigration actorを明示し、旧resolutionの説明を保持する。旧thread、completion/close receipt、担当履歴、MR証跡を改ざんしない。旧phase、explicit flag、status、queued_by/queued_at、resolutionをimmutable `typed_ticket_legacy_workflow_snapshot` に保存し、`legacy_handoff` として後続追跡/routing移行へ渡す。これは現行案件状態の第二正本ではない。移行だけで過去のWorkerや終了済み作業を起動しない。
 
-component schema8は並行T-740のタグ契約が所有するため、この独立sourceは8を推測して9へ変換せず安全に拒否する。T-740との統合時には、タグschemaと案件schemaの明示的な合成、7およびタグあり8からの移行、再実行、タグ/監査/終了履歴保持を検証する必要がある。番号を分けただけでは合成完了と扱わない。
+T-740のタグschemaを案件schemaへ合成する際、タグのID・名前・tombstone・membership、operation receiptの入力・認証済みsource identity・応答、audit/threadの観測時snapshotを保持する。タグ変化からclose/reopen/訂正やeditable content digestの更新を起こさない。旧7およびタグあり8からの移行、再実行、タグ/監査/終了履歴、FKとauth archiveの保持を合成fixtureで検証する。番号を分けただけでは合成完了と扱わない。
 
 ## 検証境界
 
 - `crates/ticket/tests/case.rs`: Repository/MRなしの理由、再開/訂正、actor/ref/history、CAS/ABA、exact replay/異入力拒否、並行close、Workspace境界、transaction rollback。
-- `crates/ticket/tests/migration.rs`: 六状態、旧thread/receipt/担当/MR参照の保持、理由不明、再open、schema8の安全な拒否。
+- `crates/ticket/tests/migration.rs`: 六状態、旧thread/receipt/担当/MR参照の保持、理由不明、再open、タグあり8との合成と再実行。
 - Workspace Store: 六状態×MRあり/なし、終端担当、旧queue/handoff、migration resumption、Workerを起動しない移行。
 - Workspace API/authority/lifecycle: 偽装actor・無権限・他Workspace・旧route拒否、作業releaseと表示責任、reopen時の新routing identity、独立削除guardとWorkspace purge rollback。
 - Worker通常Tool/WIP、Client、CLI、Web parser: 同じcase入力、モデルに見えるnullable観測keyと履歴、Backend以外のfallback禁止、stale失敗の伝達。
 
-実経路統合・Orchestrator追跡の置換は後続単位の責務であり、以上の単独source検証をT-740合成や実環境更新の検証と混同しない。
+実経路統合・Orchestrator追跡の置換は後続単位の責務であり、以上の合成source検証を実環境のmigration・更新や全経路統合検証と混同しない。

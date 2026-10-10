@@ -1,5 +1,5 @@
 //! Adopted compatibility contract: canonical standalone schema7 six-state snapshots
-//! migrate independently to schema9, preserving original evidence and routing handoff.
+//! compose into schema10, preserving original evidence and routing handoff.
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
 use ticket::*;
@@ -78,7 +78,7 @@ fn standalone_schema7_migration_preserves_six_state_snapshot_and_evidence_withou
             row.get(0)
         })
         .unwrap();
-    assert_eq!(marker, 9);
+    assert_eq!(marker, 10);
     let after_events: Vec<_> = connection.prepare("SELECT ticket_id, from_state, to_state, reason, author, body FROM typed_ticket_events ORDER BY ticket_id").unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?))).unwrap().collect::<std::result::Result<_, _>>().unwrap();
     assert_eq!(after_events, historical_events);
     let store = SqliteTicketBackend::open_verified(&path, "workspace").unwrap();
@@ -234,7 +234,7 @@ fn unknown_legacy_state_rolls_back_the_independent_case_migration() {
 }
 
 #[test]
-fn schema8_tag_composition_is_rejected_until_explicitly_integrated() {
+fn falsely_numbered_schema8_without_tags_is_rejected_without_writes() {
     let connection = Connection::open_in_memory().unwrap();
     schema7(&connection);
     connection
@@ -249,4 +249,570 @@ fn schema8_tag_composition_is_rejected_until_explicitly_integrated() {
             .unwrap(),
         8
     );
+}
+
+// Read actual SQLite values, not merely counts: receipt JSON, original context,
+// name snapshots and event/reference/attribute rows must survive byte-for-byte.
+fn rows(connection: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let mut stmt = connection
+        .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+        .unwrap();
+    let count = stmt.column_count();
+    stmt.query_map([], |row| (0..count).map(|i| row.get(i)).collect())
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap()
+}
+
+fn copy_tables(connection: &Connection, source: &std::path::Path, tables: &[&str]) {
+    connection
+        .execute(
+            "ATTACH DATABASE ?1 AS fixture_source",
+            [source.to_str().unwrap()],
+        )
+        .unwrap();
+    for table in tables {
+        connection
+            .execute_batch(&format!(
+                "INSERT INTO {table} SELECT * FROM fixture_source.{table}"
+            ))
+            .unwrap();
+    }
+    connection
+        .execute_batch("DETACH DATABASE fixture_source")
+        .unwrap();
+}
+
+fn mutate(backend: &SqliteTicketBackend, key: &str, action: WorkspaceTagAction) -> WorkspaceTag {
+    backend
+        .mutate_workspace_tag(WorkspaceTagMutation {
+            operation_key: key.into(),
+            action,
+        })
+        .unwrap()
+}
+
+fn case_request(ticket: &Ticket, key: &str, action: TicketCaseAction) -> TicketCaseUpdate {
+    TicketCaseUpdate {
+        expected_content_digest: ticket_content_digest(ticket),
+        expected_state: ticket.meta.workflow_state,
+        expected_closure_operation_key: ticket.closure_operation_key.clone(),
+        operation_key: key.into(),
+        action,
+        explanation: "Retain this judgment".into(),
+        references: vec![TicketReference {
+            kind: "result".into(),
+            target: "retained-result".into(),
+        }],
+        author: Some("authenticated-user".into()),
+    }
+}
+
+#[test]
+fn tagged_schema8_composes_cases_preserving_tombstones_membership_context_receipts_and_thread() {
+    let temp = TempDir::new().unwrap();
+    let source_path = temp.path().join("tag-operations.db");
+    let source = SqliteTicketBackend::open(&source_path, "workspace")
+        .unwrap()
+        .with_event_attributes(std::collections::BTreeMap::from([
+            ("source_account_id".into(), "account".into()),
+            ("source_user_id".into(), "user".into()),
+            ("source_actor_role".into(), "human".into()),
+        ]));
+    let id = source
+        .create(NewTicket::new("historical tagged ticket"))
+        .unwrap()
+        .id;
+    // Generate real durable T-740 receipts/audit/event snapshots through its
+    // unchanged classification boundary, then seed only those rows into frozen8.
+    let create = WorkspaceTagMutation {
+        operation_key: "create".into(),
+        action: WorkspaceTagAction::Create {
+            name: "open".into(),
+        },
+    };
+    let original = source.mutate_workspace_tag(create.clone()).unwrap();
+    let attach = TicketTagSetRequest {
+        operation_key: "attach".into(),
+        expected_tag_ids: vec![],
+        tag_ids: vec![original.id.clone()],
+    };
+    let attach_result = source
+        .set_ticket_tags(id.clone().into(), attach.clone())
+        .unwrap();
+    let renamed = mutate(
+        &source,
+        "rename",
+        WorkspaceTagAction::Rename {
+            tag_id: original.id.clone(),
+            expected_last_operation_key: "create".into(),
+            name: "closed".into(),
+        },
+    );
+    let deleted = mutate(
+        &source,
+        "delete",
+        WorkspaceTagAction::Delete {
+            tag_id: renamed.id.clone(),
+            expected_last_operation_key: "rename".into(),
+        },
+    );
+    let recreated = mutate(
+        &source,
+        "recreate",
+        WorkspaceTagAction::Create {
+            name: "closed".into(),
+        },
+    );
+    assert_ne!(recreated.id, deleted.id);
+    source
+        .set_ticket_tags(
+            id.clone().into(),
+            TicketTagSetRequest {
+                operation_key: "attach-recreated".into(),
+                expected_tag_ids: vec![],
+                tag_ids: vec![recreated.id.clone()],
+            },
+        )
+        .unwrap();
+
+    let path = temp.path().join("retained8.db");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    schema7(&connection);
+    connection
+        .execute_batch(include_str!("fixtures/schema8_tags.sql"))
+        .unwrap();
+    connection
+        .execute("UPDATE ticket_schema_migrations SET version=8", [])
+        .unwrap();
+    let preserved = [
+        "workspace_tags",
+        "typed_ticket_tags",
+        "workspace_tag_operations",
+        "typed_ticket_events",
+        "typed_ticket_event_attributes",
+        "typed_ticket_event_references",
+    ];
+    copy_tables(&connection, &source_path, &["typed_tickets"]);
+    copy_tables(&connection, &source_path, &preserved);
+    // Six-state retained data, not a current10 DB with its number changed.
+    connection.execute("UPDATE typed_tickets SET workflow_state='done', status='done', resolution='Historical explanation', queued_by='old-router',queued_at='old-time'", []).unwrap();
+    connection.execute("INSERT INTO typed_ticket_events (workspace_id,ticket_id,event_index,kind,author,body) VALUES ('workspace',?1,99,'close','old-user','Original close')", [&id]).unwrap();
+    connection.execute("INSERT INTO typed_ticket_event_attributes VALUES ('workspace',?1,99,'operation_key','old-close-receipt')", [&id]).unwrap();
+    connection.execute("INSERT INTO typed_ticket_event_attributes VALUES ('workspace',?1,99,'request_fingerprint','old-close-fingerprint')", [&id]).unwrap();
+    let before: Vec<_> = preserved.iter().map(|t| rows(&connection, t)).collect();
+    verify_legacy_sqlite_ticket_schema(&connection).unwrap();
+    assert!(verify_sqlite_ticket_schema(&connection).is_err());
+    assert!(verify_pre_classification_ticket_schema(&connection).is_err());
+    migrate_sqlite_ticket_schema(&connection).unwrap();
+    verify_sqlite_ticket_schema(&connection).unwrap();
+    assert_eq!(
+        rows(&connection, "ticket_schema_migrations")[0][0],
+        rusqlite::types::Value::Integer(10)
+    );
+    for (table, expected) in preserved.iter().zip(&before) {
+        assert_eq!(&rows(&connection, table), expected, "changed {table}");
+    }
+    let backend = SqliteTicketBackend::open_verified(&path, "workspace")
+        .unwrap()
+        .with_event_attributes(std::collections::BTreeMap::from([
+            ("source_account_id".into(), "account".into()),
+            ("source_user_id".into(), "user".into()),
+            ("source_actor_role".into(), "human".into()),
+        ]));
+    let ticket = backend.show(id.clone().into()).unwrap();
+    assert_eq!(ticket.tags, vec![recreated]);
+    assert_eq!(
+        ticket_content_digest(&ticket),
+        ticket_content_digest(&source.show(id.clone().into()).unwrap())
+    );
+    assert!(matches!(
+        backend.update_case(
+            &id,
+            case_request(&ticket, "old-close-receipt", TicketCaseAction::Reopen)
+        ),
+        Err(TicketError::OperationFingerprintMismatch { .. })
+    ));
+    assert_eq!(
+        ticket.current_closure.as_ref().unwrap().reason,
+        TicketClosureReason::Unknown
+    );
+    assert_eq!(
+        ticket.current_closure.as_ref().unwrap().explanation,
+        "Historical explanation"
+    );
+    assert_eq!(
+        ticket
+            .legacy_workflow_snapshot
+            .as_ref()
+            .unwrap()
+            .workflow_state,
+        "done"
+    );
+    assert_eq!(
+        backend.mutate_workspace_tag(create.clone()).unwrap(),
+        original
+    );
+    assert_eq!(
+        backend
+            .set_ticket_tags(id.clone().into(), attach.clone())
+            .unwrap(),
+        attach_result
+    );
+    let other = backend
+        .clone()
+        .with_event_attributes(std::collections::BTreeMap::from([
+            ("source_account_id".into(), "other-account".into()),
+            ("source_user_id".into(), "user".into()),
+        ]));
+    assert!(matches!(
+        other.mutate_workspace_tag(create),
+        Err(TicketError::OperationFingerprintMismatch { .. })
+    ));
+    assert!(matches!(
+        other.set_ticket_tags(id.clone().into(), attach),
+        Err(TicketError::OperationFingerprintMismatch { .. })
+    ));
+    assert!(
+        backend
+            .set_ticket_tags(
+                id.clone().into(),
+                TicketTagSetRequest {
+                    operation_key: "attach-deleted".into(),
+                    expected_tag_ids: ticket.tags.iter().map(|t| t.id.clone()).collect(),
+                    tag_ids: vec![deleted.id.clone()],
+                }
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO typed_ticket_tags VALUES ('foreign',?1,?2)",
+                params![id, deleted.id]
+            )
+            .is_err()
+    );
+    let judgments = rows(&connection, "typed_ticket_case_history");
+    migrate_sqlite_ticket_schema(&connection).unwrap();
+    assert_eq!(rows(&connection, "typed_ticket_case_history"), judgments);
+    for (table, expected) in preserved.iter().zip(&before) {
+        assert_eq!(
+            &rows(&connection, table),
+            expected,
+            "replay changed {table}"
+        );
+    }
+    let reopened = backend
+        .update_case(
+            &id,
+            case_request(&ticket, "reopen", TicketCaseAction::Reopen),
+        )
+        .unwrap();
+    assert_eq!(reopened.tags, ticket.tags);
+    assert_eq!(reopened.case_history[0], ticket.case_history[0]);
+    assert_eq!(
+        ticket_content_digest(&reopened),
+        ticket_content_digest(&ticket)
+    );
+    assert!(reopened.current_closure.is_none());
+    let fk_failures: i64 = connection
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(fk_failures, 0);
+}
+
+#[test]
+fn independent_case_schema9_adds_only_tags_without_reapplying_judgments_or_receipts() {
+    let temp = TempDir::new().unwrap();
+    let source_path = temp.path().join("case-operations.db");
+    let source = SqliteTicketBackend::open(&source_path, "workspace")
+        .unwrap()
+        .with_event_attributes(std::collections::BTreeMap::from([
+            ("source_runtime_id".into(), "runtime".into()),
+            ("source_worker_id".into(), "worker".into()),
+        ]));
+    let id = source.create(NewTicket::new("existing case")).unwrap().id;
+    let before = source.show(id.clone().into()).unwrap();
+    let close = case_request(
+        &before,
+        "close",
+        TicketCaseAction::Close {
+            reason: TicketClosureReason::Duplicate,
+        },
+    );
+    let closed = source.update_case(&id, close.clone()).unwrap();
+    let corrected = source
+        .update_case(
+            &id,
+            case_request(
+                &closed,
+                "correct",
+                TicketCaseAction::CorrectClosure {
+                    reason: TicketClosureReason::NotPlanned,
+                },
+            ),
+        )
+        .unwrap();
+    let reopened = source
+        .update_case(
+            &id,
+            case_request(&corrected, "reopen", TicketCaseAction::Reopen),
+        )
+        .unwrap();
+    let path = temp.path().join("retained9.db");
+    let connection = Connection::open(&path).unwrap();
+    schema7(&connection);
+    connection
+        .execute_batch(include_str!("fixtures/schema9_cases.sql"))
+        .unwrap();
+    connection
+        .execute("UPDATE ticket_schema_migrations SET version=9", [])
+        .unwrap();
+    let tables = [
+        "typed_tickets",
+        "typed_ticket_case_metadata",
+        "typed_ticket_case_history",
+        "typed_ticket_legacy_workflow_snapshot",
+        "typed_ticket_events",
+        "typed_ticket_event_attributes",
+        "typed_ticket_event_references",
+        "workspace_resource_keys",
+        "workspace_resource_key_counters",
+    ];
+    copy_tables(&connection, &source_path, &tables);
+    // A migrated closed case already judged Unknown by standalone9 must remain
+    // exactly that judgment, with its original migration actor/key and handoff.
+    connection.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit,resolution) VALUES ('workspace','old9','old9','Old migrated case','closed','task','P2','criteria','closed',1,'Original legacy close')", []).unwrap();
+    let snapshot = TicketLegacyWorkflowSnapshot {
+        workflow_state: "done".into(),
+        workflow_state_explicit: true,
+        status: "done".into(),
+        queued_by: Some("original-router".into()),
+        queued_at: Some("original-time".into()),
+        resolution: Some("Original legacy close".into()),
+    };
+    let judgment = TicketCaseHistoryEntry {
+        operation_key: "migration-v9:old9".into(),
+        previous_closure_operation_key: None,
+        action: TicketCaseAction::Close {
+            reason: TicketClosureReason::Unknown,
+        },
+        explanation: "Original legacy close".into(),
+        references: vec![],
+        author: "ticket-schema-migration-v9".into(),
+        at: "original-migration-time".into(),
+    };
+    connection
+        .execute(
+            "INSERT INTO typed_ticket_legacy_workflow_snapshot VALUES ('workspace','old9',?1)",
+            [serde_json::to_string(&snapshot).unwrap()],
+        )
+        .unwrap();
+    connection.execute("INSERT INTO typed_ticket_case_history VALUES ('workspace','old9',0,'migration-v9:old9','migration-v9',?1)", [serde_json::to_string(&judgment).unwrap()]).unwrap();
+    connection.execute("INSERT INTO typed_ticket_case_metadata VALUES ('workspace','old9','migration-v9:old9')", []).unwrap();
+    let original: Vec<_> = tables.iter().map(|t| rows(&connection, t)).collect();
+    migrate_sqlite_ticket_schema(&connection).unwrap();
+    migrate_sqlite_ticket_schema(&connection).unwrap();
+    for (table, expected) in tables.iter().zip(&original) {
+        assert_eq!(
+            &rows(&connection, table),
+            expected,
+            "changed independent9 {table}"
+        );
+    }
+    assert!(rows(&connection, "workspace_tags").is_empty());
+    let backend = SqliteTicketBackend::open_verified(&path, "workspace")
+        .unwrap()
+        .with_event_attributes(std::collections::BTreeMap::from([
+            ("source_runtime_id".into(), "runtime".into()),
+            ("source_worker_id".into(), "worker".into()),
+        ]));
+    let old9 = backend.show("old9".into()).unwrap();
+    assert_eq!(old9.case_history, vec![judgment]);
+    assert_eq!(old9.legacy_workflow_snapshot, Some(snapshot));
+    assert_eq!(
+        old9.current_closure.unwrap().reason,
+        TicketClosureReason::Unknown
+    );
+    assert_eq!(backend.show(id.clone().into()).unwrap(), reopened);
+    assert_eq!(backend.update_case(&id, close.clone()).unwrap(), reopened);
+    let other = backend
+        .clone()
+        .with_event_attributes(std::collections::BTreeMap::from([
+            ("source_runtime_id".into(), "runtime".into()),
+            ("source_worker_id".into(), "other-worker".into()),
+        ]));
+    assert!(matches!(
+        other.update_case(&id, close),
+        Err(TicketError::OperationFingerprintMismatch { .. })
+    ));
+    assert_eq!(rows(&connection, "typed_ticket_case_history"), original[2]);
+}
+
+#[test]
+fn migration_inside_host_transaction_is_resumable_and_never_commits_host_writes() {
+    let connection = Connection::open_in_memory().unwrap();
+    schema7(&connection);
+    verify_pre_classification_ticket_schema(&connection).unwrap();
+    assert!(migrate_sqlite_ticket_schema_in_transaction(&connection).is_err());
+    connection.execute_batch("CREATE TABLE host_work (value TEXT); BEGIN IMMEDIATE; INSERT INTO host_work VALUES ('pending');").unwrap();
+    migrate_sqlite_ticket_schema_in_transaction(&connection).unwrap();
+    verify_sqlite_ticket_schema(&connection).unwrap();
+    assert!(!connection.is_autocommit());
+    connection.execute_batch("ROLLBACK").unwrap();
+    verify_pre_classification_ticket_schema(&connection).unwrap();
+    assert!(rows(&connection, "host_work").is_empty());
+    connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+    migrate_sqlite_ticket_schema_in_transaction(&connection).unwrap();
+    migrate_sqlite_ticket_schema_in_transaction(&connection).unwrap();
+    connection.execute_batch("COMMIT").unwrap();
+    verify_sqlite_ticket_schema(&connection).unwrap();
+}
+
+#[test]
+fn falsely_numbered_schema9_and_weakened_immutable_triggers_are_rejected_without_migration() {
+    for drift in [
+        "UPDATE ticket_schema_migrations SET version=9",
+        "UPDATE ticket_schema_migrations SET version=9; DROP TRIGGER typed_ticket_case_history_no_update; CREATE TRIGGER typed_ticket_case_history_no_update BEFORE UPDATE ON typed_ticket_case_history BEGIN SELECT 1; END;",
+    ] {
+        let connection = Connection::open_in_memory().unwrap();
+        schema7(&connection);
+        if drift.contains("DROP TRIGGER") {
+            connection
+                .execute_batch(include_str!("fixtures/schema9_cases.sql"))
+                .unwrap();
+        }
+        connection.execute_batch(drift).unwrap();
+        let marker = rows(&connection, "ticket_schema_migrations");
+        assert!(migrate_sqlite_ticket_schema(&connection).is_err());
+        assert_eq!(rows(&connection, "ticket_schema_migrations"), marker);
+        let tags: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='workspace_tags'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tags, 0);
+    }
+}
+
+#[test]
+fn failed_component_conversion_rolls_back_its_ddl_and_keeps_host_transaction_retryable() {
+    let connection = Connection::open_in_memory().unwrap();
+    schema7(&connection);
+    connection.execute_batch("CREATE TABLE host_work (value TEXT);
+        INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit)
+        VALUES ('workspace','ticket','ticket','Case','open','task','P2','criteria','ready',1);
+        CREATE TRIGGER host_abort_case_update BEFORE UPDATE OF workflow_state ON typed_tickets
+        BEGIN SELECT RAISE(ABORT,'host failure'); END;
+        BEGIN IMMEDIATE; INSERT INTO host_work VALUES ('retained host work');").unwrap();
+    assert!(migrate_sqlite_ticket_schema_in_transaction(&connection).is_err());
+    assert!(!connection.is_autocommit());
+    verify_pre_classification_ticket_schema(&connection).unwrap();
+    assert_eq!(rows(&connection, "host_work").len(), 1);
+    let tags: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='workspace_tags'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tags, 0, "DDL before failed state conversion must roll back");
+    connection
+        .execute_batch("DROP TRIGGER host_abort_case_update")
+        .unwrap();
+    migrate_sqlite_ticket_schema_in_transaction(&connection).unwrap();
+    connection.execute_batch("COMMIT").unwrap();
+    verify_sqlite_ticket_schema(&connection).unwrap();
+    assert_eq!(rows(&connection, "host_work").len(), 1);
+}
+
+#[test]
+fn retained_workspace_foreign_keys_survive_composition_without_rebuilding_ticket_or_tags() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    connection.execute_batch("CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY); INSERT INTO workspaces VALUES ('workspace');").unwrap();
+    // Ticket accepts stricter host-owned Workspace references and must preserve
+    // them, not rebuild parents against its weaker standalone authority schema.
+    let schema = include_str!("fixtures/schema7.sql");
+    let (before, ticket) = schema.split_once("CREATE TABLE typed_tickets (").unwrap();
+    let (ticket, after) = ticket
+        .split_once("CREATE TABLE typed_ticket_targets (")
+        .unwrap();
+    let ticket = ticket.replace("PRIMARY KEY (workspace_id, ticket_id)",
+        "PRIMARY KEY (workspace_id, ticket_id), FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE");
+    connection
+        .execute_batch(&format!(
+            "{before}CREATE TABLE typed_tickets ({ticket}CREATE TABLE typed_ticket_targets ({after}"
+        ))
+        .unwrap();
+    let tags = include_str!("fixtures/schema8_tags.sql")
+        .replace("PRIMARY KEY (workspace_id, tag_id)", "PRIMARY KEY (workspace_id, tag_id), FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE")
+        .replace("PRIMARY KEY (workspace_id, operation_key)", "PRIMARY KEY (workspace_id, operation_key), FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE");
+    connection.execute_batch(&tags).unwrap();
+    connection.execute_batch("CREATE TABLE ticket_schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL);
+        INSERT INTO ticket_schema_migrations VALUES(8,'ticket schema baseline','retained');
+        INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit)
+        VALUES('workspace','ticket','ticket','Case','done','task','P2','criteria','done',1);
+        INSERT INTO workspace_tags VALUES('workspace','tag','closed','closed','create',0);
+        INSERT INTO typed_ticket_tags VALUES('workspace','ticket','tag');").unwrap();
+    let signature = |table| {
+        let mut stmt = connection
+            .prepare(&format!(
+                "SELECT * FROM pragma_foreign_key_list('{table}') ORDER BY id,seq"
+            ))
+            .unwrap();
+        let count = stmt.column_count();
+        stmt.query_map([], |row| {
+            (0..count)
+                .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    };
+    let tables = [
+        "typed_tickets",
+        "workspace_tags",
+        "workspace_tag_operations",
+        "typed_ticket_tags",
+    ];
+    let before: Vec<_> = tables.iter().map(|t| signature(t)).collect();
+    verify_legacy_sqlite_ticket_schema(&connection).unwrap();
+    migrate_sqlite_ticket_schema(&connection).unwrap();
+    for (table, expected) in tables.iter().zip(before) {
+        assert_eq!(signature(table), expected, "lost host FK on {table}");
+    }
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO workspace_tags VALUES('foreign','tag','open','open','create',0)",
+                []
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO typed_ticket_tags VALUES('foreign','ticket','tag')",
+                []
+            )
+            .is_err()
+    );
+    let failures: i64 = connection
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(failures, 0);
 }

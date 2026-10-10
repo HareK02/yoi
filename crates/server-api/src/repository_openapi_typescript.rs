@@ -424,6 +424,34 @@ fn validate_ticket_browser_operations(
 ) -> Result<BTreeSet<String>, GenerationError> {
     let operations = [
         OperationContract {
+            path: "/api/w/{workspace_id}/ticket-tags",
+            method: "get",
+            operation_id: "workspace_ticket_tag_list",
+            request: None,
+            successes: &[("200", "Array_of_WorkspaceTag")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/ticket-tags",
+            method: "post",
+            operation_id: "workspace_ticket_tag_mutate",
+            request: Some("WorkspaceTagMutation"),
+            successes: &[("200", "WorkspaceTag")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/tickets/{id}/tags",
+            method: "put",
+            operation_id: "ticket_tags_set",
+            request: Some("TicketTagSetRequest"),
+            successes: &[("200", "Array_of_WorkspaceTag")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/tickets/query",
+            method: "post",
+            operation_id: "ticket_query",
+            request: Some("TicketQueryRequest"),
+            successes: &[("200", "TicketQueryResponse")],
+        },
+        OperationContract {
             path: "/api/w/{workspace_id}/tickets",
             method: "get",
             operation_id: "ticket_list",

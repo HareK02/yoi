@@ -34,6 +34,13 @@ const summary = {
   title: "Case",
   kind: "task",
   labels: [],
+  tags: [{
+    workspace_id: "workspace one",
+    id: "tag-closed",
+    name: "closed",
+    last_operation_key: "create-tag",
+    deleted: false,
+  }],
   priority: "P2",
   status: "Closed",
   workflow_state: "closed",
@@ -73,11 +80,9 @@ Deno.test("case actions carry content/state/last-closure CAS without browser aut
         assertEquals(JSON.parse(String(options.body)), request);
         return Promise.resolve(Response.json(summary));
       };
-      assertEquals(
-        (await updateTicketCase("workspace one", "T/1", request))
-          .workflow_state,
-        "closed",
-      );
+      const result = await updateTicketCase("workspace one", "T/1", request);
+      assertEquals(result.workflow_state, "closed");
+      assertEquals(result.tags, summary.tags);
     }
   } finally {
     globalThis.fetch = original;

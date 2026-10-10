@@ -1336,6 +1336,7 @@ mod tests {
             current_closure: None,
             case_history: vec![],
             legacy_workflow_snapshot: None,
+            tags: vec![],
         }
     }
 
@@ -1447,6 +1448,9 @@ mod tests {
             Ok(current.clone())
         }
         unused_backend_methods! {
+            fn list_workspace_tags(&self, request: ticket::TagListRequest) -> ticket::Result<Vec<ticket::WorkspaceTag>>;
+            fn mutate_workspace_tag(&self, request: ticket::WorkspaceTagMutation) -> ticket::Result<ticket::WorkspaceTag>;
+            fn set_ticket_tags(&self, id: TicketIdOrSlug, request: ticket::TicketTagSetRequest) -> ticket::Result<Vec<ticket::WorkspaceTag>>;
             fn default_intake_ready_state_change_body(&self, from: &str) -> String;
             fn create(&self, input: NewTicket) -> ticket::Result<ticket::TicketRef>;
             fn edit_item(&self, id: TicketIdOrSlug, edit: ticket::TicketItemEdit) -> ticket::Result<ticket::Ticket>;

@@ -242,6 +242,28 @@ impl From<crate::SqliteTicketBackend> for TicketToolBackend {
 }
 
 impl TicketBackend for TicketToolBackend {
+    fn list_workspace_tags(
+        &self,
+        request: crate::TagListRequest,
+    ) -> TicketResult<Vec<crate::WorkspaceTag>> {
+        self.backend.list_workspace_tags(request)
+    }
+
+    fn mutate_workspace_tag(
+        &self,
+        request: crate::WorkspaceTagMutation,
+    ) -> TicketResult<crate::WorkspaceTag> {
+        self.backend.mutate_workspace_tag(request)
+    }
+
+    fn set_ticket_tags(
+        &self,
+        id: TicketIdOrSlug,
+        request: crate::TicketTagSetRequest,
+    ) -> TicketResult<Vec<crate::WorkspaceTag>> {
+        self.backend.set_ticket_tags(id, request)
+    }
+
     fn default_intake_ready_state_change_body(&self, from: &str) -> String {
         self.backend.default_intake_ready_state_change_body(from)
     }
