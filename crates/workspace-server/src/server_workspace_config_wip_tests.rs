@@ -152,18 +152,25 @@ fn config_interface(path: &str) -> wip_protocol::InterfaceReference {
 async fn inspect_interface(runtime: &worker::wip::WipRuntime, path: &str, base: &str) -> Value {
     let tree = runtime.tree(path.into(), 0, true).await.unwrap();
     let tree: Value = serde_json::from_str(tree.content.as_deref().unwrap()).unwrap();
-    assert_eq!(tree["path"], path, "Object must come from live Tree: {tree}");
+    assert_eq!(
+        tree["path"], path,
+        "Object must come from live Tree: {tree}"
+    );
     let output = runtime.inspect(path.into(), true).await.unwrap();
     let observed: Value = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
     assert_eq!(observed["path"], path);
+    for interface in observed["interfaces"].as_array().unwrap() {
+        runtime
+            .inspect(interface["path"].as_str().unwrap().into(), true)
+            .await
+            .unwrap();
+    }
     assert!(
         observed["interfaces"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|interface| {
-                interface["reference"] == json!({"scope": path, "name": base})
-            }),
+            .any(|interface| { interface["reference"] == json!({"scope": path, "name": base}) }),
         "interface must come from live inspection: {observed}"
     );
     observed
@@ -628,14 +635,22 @@ async fn assert_config_production_http_adapter(
     .unwrap();
     assert_config_catalog(&wip, &attached).await;
     let main_interface = config_inspect(&wip, "/workspace-config/main.dcdl").await;
-    assert!(
-        main_interface["interfaces"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|interface| !interface["signature"].as_str().unwrap().contains("delete(")),
-        "required entrypoint cannot advertise delete: {main_interface}"
-    );
+    for interface in main_interface["interfaces"].as_array().unwrap() {
+        assert!(interface.get("signature").is_none());
+        let definition = wip
+            .inspect(interface["path"].as_str().unwrap().into(), false)
+            .await
+            .unwrap();
+        let definition: Value =
+            serde_json::from_str(definition.content.as_deref().unwrap()).unwrap();
+        assert!(
+            !definition["interface_signature"]
+                .as_str()
+                .unwrap()
+                .contains("delete("),
+            "required entrypoint cannot advertise delete: {definition}"
+        );
+    }
     let main = config_call(&wip, "/workspace-config/main.dcdl", "read", json!({}))
         .await
         .unwrap();

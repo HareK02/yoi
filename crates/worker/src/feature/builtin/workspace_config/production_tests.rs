@@ -440,7 +440,10 @@ fn interface(path: &str, attached: bool) -> wip_protocol::InterfaceReference {
 }
 async fn observe_interface(runtime: &WipRuntime, path: &str, _attached: bool) {
     runtime.tree(path.into(), 0, true).await.unwrap();
-    runtime.inspect(path.into(), true).await.unwrap();
+    runtime
+        .prepare_call_observations(path.into(), true)
+        .await
+        .unwrap();
 }
 async fn call(
     runtime: &WipRuntime,
@@ -630,13 +633,20 @@ async fn workspace_config_production_revocation_ro_cross_workspace_and_cache_iso
     );
     observe_interface(&runtime, path, true).await;
     let descriptor = runtime
-        .inspect(path.into(), true)
+        .inspect(
+            format!(
+                "{}::{}",
+                serde_json::to_string(path).unwrap(),
+                serde_json::to_string(&interface(path, true).name).unwrap()
+            ),
+            true,
+        )
         .await
         .unwrap()
         .content
         .unwrap();
     let descriptor: Json = serde_json::from_str(&descriptor).unwrap();
-    let signature = descriptor["interfaces"][0]["signature"].as_str().unwrap();
+    let signature = descriptor["interface_signature"].as_str().unwrap();
     assert!(signature.contains("operation read("));
     assert!(!signature.contains("operation write("));
     assert!(

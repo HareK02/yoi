@@ -160,7 +160,7 @@ async fn live_root_and_intermediate_ancestors_use_one_current_publication_not_pl
             let fetched = runtime.host.fetch_interface_live(&selected).await.unwrap();
             assert_eq!(fetched.scope_ref, with_ref.then(|| "live-scope".into()));
             runtime
-                .inspect(provider.target_path.clone(), false)
+                .prepare_call_observations(provider.target_path.clone(), false)
                 .await
                 .unwrap();
             provider.state.lock().unwrap().lookups.clear();
@@ -217,7 +217,7 @@ async fn deletion_without_prior_scope_inspect_rejects_cached_invoke_and_orphan_o
             let (runtime, provider) = fixture(scope, with_ref, false);
             let selected = reference(scope, "read");
             runtime
-                .inspect(provider.target_path.clone(), false)
+                .prepare_call_observations(provider.target_path.clone(), false)
                 .await
                 .unwrap();
             provider.state.lock().unwrap().visible = false;
@@ -235,7 +235,7 @@ async fn deletion_without_prior_scope_inspect_rejects_cached_invoke_and_orphan_o
             assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
             assert!(
                 runtime
-                    .inspect(provider.target_path.clone(), true)
+                    .prepare_call_observations(provider.target_path.clone(), true)
                     .await
                     .is_err()
             );
@@ -267,7 +267,7 @@ async fn republishing_scope_never_restores_old_registration_even_without_refs() 
         let (runtime, provider) = fixture("/github", with_ref, false);
         let old = reference("/github", "read");
         runtime
-            .inspect(provider.target_path.clone(), false)
+            .prepare_call_observations(provider.target_path.clone(), false)
             .await
             .unwrap();
         provider.state.lock().unwrap().visible = false;
@@ -311,7 +311,7 @@ async fn republishing_scope_never_restores_old_registration_even_without_refs() 
         );
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
         runtime
-            .inspect(provider.target_path.clone(), true)
+            .prepare_call_observations(provider.target_path.clone(), true)
             .await
             .unwrap();
         let new = reference("/github", "new");
@@ -401,7 +401,7 @@ async fn ancestor_replacement_during_in_flight_call_keeps_the_original_descripto
     let (runtime, provider) = fixture("/github/team", true, true);
     let selected = reference("/github/team", "read");
     runtime
-        .inspect(provider.target_path.clone(), false)
+        .prepare_call_observations(provider.target_path.clone(), false)
         .await
         .unwrap();
     let pending = runtime.invoke(
@@ -419,10 +419,18 @@ async fn ancestor_replacement_during_in_flight_call_keeps_the_original_descripto
             state.generation = 1;
         }
         let updated = runtime
-            .inspect(provider.target_path.clone(), true)
+            .prepare_call_observations(provider.target_path.clone(), true)
             .await
             .unwrap();
-        assert!(updated.content.unwrap().contains("integer"));
+        let updated: Json = serde_json::from_str(updated.content.as_deref().unwrap()).unwrap();
+        let definition = runtime
+            .inspect(
+                updated["interfaces"][0]["path"].as_str().unwrap().into(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(definition.content.unwrap().contains("integer"));
         provider.release.notify_one();
     };
     let (old, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -464,7 +472,7 @@ async fn same_name_scope_replacement_or_loss_of_ref_rejects_old_metadata_without
         let (runtime, provider) = fixture("/github/team", true, false);
         let selected = reference("/github/team", "read");
         runtime
-            .inspect(provider.target_path.clone(), false)
+            .prepare_call_observations(provider.target_path.clone(), false)
             .await
             .unwrap();
         {
@@ -510,7 +518,7 @@ async fn same_name_scope_replacement_or_loss_of_ref_rejects_old_metadata_without
             }
         );
         runtime
-            .inspect(provider.target_path.clone(), true)
+            .prepare_call_observations(provider.target_path.clone(), true)
             .await
             .unwrap();
         runtime

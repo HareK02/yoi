@@ -44,6 +44,11 @@ removal commits registry deletion only after Runtime confirms physical deletion
 or authoritative not-found. An unknown result leaves the registry in place so
 retry can reconcile the provider's current state.
 
+A retained partial-removal Workdir is listed as `cleanup_pending` with cleanliness
+`unknown`. List/detail observation checks its saved identity but does not read or
+hash surviving checkout content. The saved removal witness is not a current
+cleanliness assertion; only an actual removal retry runs the full content checks.
+
 ## Runtime safety boundary
 
 The Runtime keeps removal content/identity evidence outside the tree being
@@ -55,9 +60,22 @@ ignored/untracked content. Do not edit this witness manually.
 Mount-safe removal currently requires Linux `openat2` and `/proc` inspection.
 Unavailable inspection fails closed with `mount_check_unavailable`; there is no
 fallback to recursive deletion across an unchecked filesystem boundary.
-Removal retains the Runtime occupancy mutex through its filesystem effect.
-Unrelated Runtime state operations can therefore wait during hashing/unlink;
-releasing it would require equivalent exclusion on all attachment paths.
+Runtime HTTP list, detail and removal requests run synchronous provider work on
+blocking workers rather than the HTTP executor. Removal reserves only the target
+Workdir under the Runtime state mutex, then releases that mutex before content
+inspection and unlink. Unrelated Worker list/detail, session observation and
+subscription snapshots remain available while removal runs. Conflicting use,
+attachment, creation or removal of the same Workdir is rejected promptly rather
+than waiting under the global mutex.
+
+Provider leases protect in-flight creation/access and live session resources,
+including their command tasks. Cloned sessions retain protection until safe close
+or final resource release; passive bindings alone do not prevent removal. Removed
+bindings cannot activate against a recreated Workdir with the same ID. Creation
+owns a fresh root exclusively so failed creation cannot roll back another
+creator's checkout or adopt an existing partial-removal directory. Reservations
+are transient and released on provider success, error or unwind; they do not
+replace the durable cleanup witness or attachment authority.
 
 ## Diagnostics
 

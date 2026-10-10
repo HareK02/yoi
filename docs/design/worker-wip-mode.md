@@ -31,10 +31,25 @@ The implementation uses the published **WIP 0.2.0** Client, HTTP, Protocol and o
 A WIP Worker exposes exactly these generic LLM tools instead of exposing every enabled ordinary tool twice:
 
 - `Tree(path, depth)`: retrieve the full indexable range within depth 0..8, or report incomplete/loading/failed/limited coverage as an error. Children at the requested boundary remain unobserved (null), not empty. Cached nonindexable paths are never included by prefix scanning Known Space.
-- `Inspect(path)`: directly acquire an Object, then every published Interface, and return complete official Object/Interface signatures in declaration order. It requires no prior Tree or manual descriptor fetching. The path is explicit JSON envelope context outside the path-free signature. Summaries are complete; runtime metadata and documentation details are not appended to signatures.
+- `Inspect(path)`: acquire and display exactly the selected entity. An Object path returns only its official Object signature and ordered Interface references (each with an explicit inspection path); it does not fetch Interface descriptors. An absolute `scope::name` Interface address returns only that Interface's complete official signature. Neither form requires a prior Tree or Inspect. The path is explicit JSON envelope context outside the path-free signature. Summaries are complete; runtime metadata and documentation details are not appended to signatures.
 - `Invoke(path, interface, operation, arguments)`: use a structured `{scope, name}` reference and named argument record. The Client owns validators and observed scope_ref. Missing/stale/failed observations are recovered with at most one pre-dispatch retrieval per subject. A dispatched operation is never automatically retried.
 
-Tree and Inspect accept explicit `refresh: true` for blocked observations. An ensure API returning None is never itself readiness evidence: freshness, complete edge coverage and retained data are checked. Loading and capacity pressure are reported rather than superseded or busy-looped.
+Tree and Inspect accept explicit `refresh: true` for blocked observations. Inspect refreshes only the selected Object or Interface, not referenced entities. An ensure API returning None is never itself readiness evidence: freshness, complete edge coverage and retained data are checked. Loading and capacity pressure are reported rather than superseded or busy-looped.
+
+The Yoi binding uses the Text View compact reference notation as an **input address**, not a parser for rendered signatures. For example:
+
+```json
+{"path":"/tickets"}
+{"path":"/::\"yoi.tool/Read/v1\""}
+```
+
+The first inspects an Object; the second inspects one root-scoped Interface. Object results contain `object_signature` and `interfaces: [{reference: {scope, name}, path}]`, without Interface signatures. Pass an entry's `path` directly to Inspect to obtain `{path, reference, interface_signature}`. This explicit per-entity display selection is a Yoi binding policy; it replaces the earlier automatic expansion of every Interface. Invoke continues to acquire missing observations automatically and accepts structured references, never a compact string.
+
+Reference components follow Text View quoting: scope allows unquoted `[A-Za-z0-9_./-]+`, name allows `[A-Za-z0-9_.-]+`; other components use JSON string quoting/escapes. There is no scope inference, normalization, relative resolution, or operation suffix. A literal Object path containing `::` must be JSON-quoted inside the `path` value (for example `{"path":"\"/literal::name\""}`) to distinguish it from an Interface address. Ordinary Object paths retain Protocol path syntax, including Unicode. Invalid or unavailable Interface addresses fail rather than falling back to Object lookup.
+
+### Model usage guidance
+
+The three tool descriptions are the recurring model-facing usage instructions, including after compaction. Use a shallow Tree only when needed to locate entrances, inspect only relevant Objects and unknown Interface contracts, and then work through Invoke. Reuse known paths and understood contracts for the **same exact scope/name reference**; do not inspect every node or repeat Inspect as a prerequisite for every operation. Same local names under different scopes are not evidence of the same contract. Reinspect only when a reference/contract is new, changed, or no longer available in the conversation context. Cache maintenance is the Client's responsibility, not a reason for extra model calls. Use domain read/list/search/query Operations for content and large/nonindexable collections. Current authorization checks and the prohibition on blindly retrying dispatched operations remain unchanged.
 
 The compatibility projection mounts enabled ordinary tools at:
 
@@ -48,9 +63,11 @@ Each compatibility Object publishes an explicit root-scoped reference:
 {"scope":"/", "name":"yoi.tool/<exact-tool-registration-name>/v1"}
 ```
 
-Its single operation is `call`. For this compatibility route, `Invoke.arguments` is `{ "input": <original ordinary tool argument object> }`, matching the descriptor's named Json parameter. Native projections instead receive a JSON object keyed by the descriptor's declared parameter names. Native input is decoded with the published `wip-http` descriptor-bound codec, so named and composite types are resolved, an integral JSON number remains a WIP `Number` when declared as such, and WIP `Bytes` use the codec's canonical RFC 4648 base64 JSON representation. Tool argument IDs remain JSON values; the adapter never infers a domain object or Worldspace route from them.
+Its single operation is `call`. For this compatibility route, `Invoke.arguments` is `{ "input": <original ordinary tool argument object> }`, matching the descriptor's named `input` parameter. Native projections instead receive a JSON object keyed by the descriptor's declared parameter names. Native input is decoded with the published `wip-http` descriptor-bound codec, so named and composite types are resolved, an integral JSON number remains a WIP `Number` when declared as such, and WIP `Bytes` use the codec's canonical RFC 4648 base64 JSON representation. Tool argument IDs remain JSON values; the adapter never infers a domain object or Worldspace route from them.
 
-The interface descriptor uses WIP `Json` for compatibility input and includes the exact original JSON Schema in descriptor documentation. Before execution, the Host validates the JSON value with that original schema and then delegates to the original async `Tool`. Constraints are therefore neither approximated nor silently dropped. A schema that cannot be compiled prevents WIP startup instead of creating a weaker projection.
+Compatibility input is projected conservatively into JSON-shape-preserving WIP types: primitives, closed records with required/optional fields, homogeneous lists, and string enums. Local JSON Pointer references are expanded within bounded depth/node budgets; cycles and unsupported constructs stay `Json`. Open records, nullable/mixed unions, composition, and tuple elements are not falsely modeled as closed records or tagged WIP unions. The original input JSON Schema, including constraints, descriptions, defaults, and local definitions, is included in the **visible parameter summary** as well as retained documentation details. Thus a single Interface Inspect reveals the usable input contract even where WIP's type system cannot express it or an expansion budget is reached; it is never just an opaque `input: json` with hidden instructions. Full Inspect output still obeys response limits and is not silently truncated.
+
+The call envelope remains `{ "input": <original JSON value> }`; no tagged union wrapper, field renaming, or default insertion is introduced. Before execution, the Host validates the reconstructed JSON value with the exact original schema and then delegates to the original async `Tool`. Structural projection never replaces original-schema constraints or permission checks. A schema that cannot be compiled prevents WIP startup instead of creating a weaker projection.
 
 ## Native projection extension and collisions
 

@@ -59,6 +59,54 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+mod workdir_session;
+
+#[derive(Debug)]
+enum WorkdirOperation {
+    Use(usize),
+    Cleanup,
+}
+
+/// Transient admission authority, not persisted cleanup or recovery state.
+#[derive(Debug)]
+struct WorkdirOperationGuard {
+    state: Weak<Mutex<RuntimeState>>,
+    ids: Vec<String>,
+    cleanup: bool,
+}
+
+impl Drop for WorkdirOperationGuard {
+    fn drop(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for id in &self.ids {
+            match state.workdir_operations.get_mut(id) {
+                Some(WorkdirOperation::Use(count)) if !self.cleanup && *count > 1 => *count -= 1,
+                Some(WorkdirOperation::Use(_)) if !self.cleanup => {
+                    state.workdir_operations.remove(id);
+                }
+                Some(WorkdirOperation::Cleanup) if self.cleanup => {
+                    state.workdir_operations.remove(id);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn workdir_operation_busy() -> RuntimeError {
+    RuntimeError::WorkingDirectory(
+        crate::working_directory::WorkingDirectoryDiagnostic::rejected(
+            "working_directory_cleanup_resource_busy",
+            "Workdir has an in-progress operation; retry after it finishes",
+        ),
+    )
+}
+
 /// Workspace-scoped Runtime authorization context supplied by a trusted backend.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeWorkspaceScope {
@@ -296,6 +344,37 @@ impl Drop for WorkerOperationLease {
 }
 
 impl Runtime {
+    fn reserve_workdir_use<'a>(
+        &self,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<WorkdirOperationGuard, RuntimeError> {
+        let mut ids: Vec<String> = ids.into_iter().map(str::to_string).collect();
+        ids.sort();
+        ids.dedup();
+        let mut state = self.lock()?;
+        state.ensure_running()?;
+        for id in &ids {
+            state.ensure_workdir_not_removing(id)?;
+        }
+        for id in &ids {
+            match state
+                .workdir_operations
+                .entry(id.clone())
+                .or_insert(WorkdirOperation::Use(0))
+            {
+                WorkdirOperation::Use(count) => *count += 1,
+                WorkdirOperation::Cleanup => {
+                    unreachable!("cleanup admission checked under state lock")
+                }
+            }
+        }
+        Ok(WorkdirOperationGuard {
+            state: Arc::downgrade(&self.inner),
+            ids,
+            cleanup: false,
+        })
+    }
+
     /// Create a memory-backed Runtime with generated identity.
     pub fn new_memory() -> Self {
         Self::with_options(RuntimeOptions::default())
@@ -515,8 +594,15 @@ impl Runtime {
     /// Create a Runtime-owned working directory through the attached execution backend.
     pub fn create_working_directory(
         &self,
-        request: WorkingDirectoryRequest,
+        mut request: WorkingDirectoryRequest,
     ) -> Result<CatalogWorkingDirectoryStatus, RuntimeError> {
+        let id = request
+            .backend_workdir_id
+            .get_or_insert_with(|| {
+                crate::working_directory::next_working_directory_id(&request.repository.id)
+            })
+            .clone();
+        let _operation = self.reserve_workdir_use([id.as_str()])?;
         let backend = {
             let state = self.lock()?;
             state.ensure_running()?;
@@ -581,6 +667,7 @@ impl Runtime {
         &self,
         request: WorkingDirectoryRepositoryAccessRequest,
     ) -> Result<(), RuntimeError> {
+        let _operation = self.reserve_workdir_use([request.working_directory_id.as_str()])?;
         let backend = {
             let state = self.lock()?;
             state.ensure_running()?;
@@ -775,6 +862,7 @@ impl Runtime {
         working_directory_id: &str,
         owner_worker_ref: Option<&WorkerRef>,
     ) -> Result<workdir::WorkdirSessionHandle, RuntimeError> {
+        let operation = self.reserve_workdir_use([working_directory_id])?;
         let backend = {
             let mut state = self.lock()?;
             state.ensure_running()?;
@@ -809,9 +897,10 @@ impl Runtime {
         backend
             .working_directory(working_directory_id)
             .map_err(RuntimeError::WorkingDirectory)?;
-        backend
+        let session = backend
             .open_workdir_session(working_directory_id)
-            .map_err(RuntimeError::WorkingDirectory)
+            .map_err(RuntimeError::WorkingDirectory)?;
+        Ok(workdir_session::retain_operation(session, operation))
     }
 
     /// Cleanup a Runtime-owned working directory.
@@ -819,30 +908,40 @@ impl Runtime {
         &self,
         working_directory_id: &str,
     ) -> Result<CatalogWorkingDirectoryStatus, RuntimeError> {
-        // Hold occupancy authority through the side effect, preventing an
-        // attachment from entering between the check and physical removal.
-        // This synchronous provider call must not reenter Runtime. The Git
-        // materializer does filesystem/Git work only. The global guard also
-        // delays unrelated state operations during hashing/unlink; releasing it
-        // would require equivalent per-workdir exclusion on ALL attachment paths,
-        // not just moving the occupied check before the provider call.
-        let state = self.lock()?;
-        state.ensure_running()?;
-        if let Some(worker_id) = state.worker_id_for_workdir(working_directory_id) {
-            return Err(RuntimeError::InvalidRequest(format!(
-                "working directory {working_directory_id} is assigned to worker {worker_id}"
-            )));
-        }
-        let backend = state.execution_backend.clone().ok_or_else(|| {
-            RuntimeError::ExecutionBackendUnavailable {
-                message: "working directory cleanup requires an execution backend".to_string(),
+        // Admit cleanup atomically with attachment/use admission, but reserve
+        // only this Workdir while the provider hashes/unlinks. No filesystem
+        // work or wait for a Workdir operation may hold the global state mutex.
+        let backend = {
+            let mut state = self.lock()?;
+            state.ensure_running()?;
+            if state.workdir_operations.contains_key(working_directory_id) {
+                return Err(workdir_operation_busy());
             }
-        })?;
-        let result = backend
+            if let Some(worker_id) = state.worker_id_for_workdir(working_directory_id) {
+                return Err(RuntimeError::InvalidRequest(format!(
+                    "working directory {working_directory_id} is assigned to worker {worker_id}"
+                )));
+            }
+            let backend = state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::ExecutionBackendUnavailable {
+                    message: "working directory cleanup requires an execution backend".to_string(),
+                }
+            })?;
+            state
+                .workdir_operations
+                .insert(working_directory_id.to_string(), WorkdirOperation::Cleanup);
+            backend
+        };
+        // Construct/drop the RAII owner outside the state guard: failure, panic
+        // and request cancellation must not leave stale exclusion or deadlock.
+        let _operation = WorkdirOperationGuard {
+            state: Arc::downgrade(&self.inner),
+            ids: vec![working_directory_id.to_string()],
+            cleanup: true,
+        };
+        backend
             .cleanup_working_directory(working_directory_id)
-            .map_err(RuntimeError::from);
-        drop(state);
-        result
+            .map_err(RuntimeError::from)
     }
 
     fn annotate_working_directory_statuses(
@@ -1041,7 +1140,7 @@ impl Runtime {
 
     fn create_worker_with_workspace_inner(
         &self,
-        request: CreateWorkerRequest,
+        mut request: CreateWorkerRequest,
         scope: Option<&RuntimeWorkspaceScope>,
     ) -> Result<WorkerDetail, RuntimeError> {
         let operation_lock = self.worker_operation_lock(request.worker_id)?;
@@ -1051,6 +1150,17 @@ impl Runtime {
         if let Some(existing) = self.existing_worker_for_create(&request, scope)? {
             return Ok(existing);
         }
+        // Assign generated materializations before publishing the durable
+        // request, so cleanup cannot discover an unclaimed creation mid-spawn.
+        for attachment in &mut request.workdir_attachment_requests {
+            let directory = &mut attachment.working_directory;
+            if directory.backend_workdir_id.is_none() {
+                directory.backend_workdir_id = Some(
+                    crate::working_directory::next_working_directory_id(&directory.repository.id),
+                );
+            }
+        }
+        let _workdir_operation = self.reserve_workdir_use(requested_workdir_ids(&request))?;
         self.refresh_workspace_config(&request)?;
         let (backend, worker_ref, spawn_request) = {
             let mut state = self.lock()?;
@@ -1565,6 +1675,9 @@ impl Runtime {
         attachments.sort_by(|left, right| left.alias.cmp(&right.alias));
 
         let mut state = self.lock()?;
+        for attachment in &attachments {
+            state.ensure_workdir_not_removing(&attachment.working_directory_id)?;
+        }
         let previous = state.worker(worker_ref)?.clone();
         {
             let worker = state.worker_mut(worker_ref)?;
@@ -1875,6 +1988,13 @@ impl Runtime {
                 if let Some(receipt) = &owner.receipt {
                     return Ok((Some(receipt.clone()), None));
                 }
+                if let Some(preparation) = &owner.request.preparation {
+                    for id in
+                        preparation_workdir_ids(preparation, state.runtime_identity.as_deref())
+                    {
+                        state.ensure_workdir_not_removing(id)?;
+                    }
+                }
                 if candidate.restore_guard.active_request_id.as_deref() != Some(&request.request_id)
                     || candidate
                         .pending_restore
@@ -2074,6 +2194,19 @@ impl Runtime {
                     state.ensure_workspace_owner(scope, true)?;
                     state.persist_runtime_snapshot()?;
                 }
+                // Recovery uses the persisted operation, not new preparation.
+                // Discard it before checking Workdir admission as well as before
+                // publishing the owner; unrelated cleanup must not reject recovery.
+                if recovering_pending {
+                    request.preparation = None;
+                }
+                if let Some(preparation) = &request.preparation {
+                    for id in
+                        preparation_workdir_ids(preparation, state.runtime_identity.as_deref())
+                    {
+                        state.ensure_workdir_not_removing(id)?;
+                    }
+                }
                 let pending = candidate
                     .pending_restore
                     .unwrap_or_else(|| PendingWorkerRestore {
@@ -2083,9 +2216,6 @@ impl Runtime {
                     });
                 let operation_id = pending.operation_id;
                 candidate.pending_restore = Some(pending);
-                if recovering_pending {
-                    request.preparation = None;
-                }
                 candidate.restore_guard.rotate();
                 candidate.restore_guard.active_request_id = Some(request.request_id.clone());
                 candidate.restore_guard.owners.insert(
@@ -2517,6 +2647,28 @@ impl Runtime {
             )
         };
 
+        let _workdir_operation = self.reserve_workdir_use(
+            requested_workdir_ids(&request.request)
+                .into_iter()
+                .chain(
+                    request
+                        .previous_workdir_attachments
+                        .iter()
+                        .map(|attachment| {
+                            attachment
+                                .working_directory
+                                .summary
+                                .working_directory_id
+                                .as_str()
+                        }),
+                )
+                .chain(
+                    request
+                        .logical_workdir_attachments
+                        .iter()
+                        .map(|attachment| attachment.working_directory_id.as_str()),
+                ),
+        )?;
         if !reconcile && let Err(result) = backend.preflight_restore(&request) {
             // A preflight may attest an already-connected Controller snapshot.
             // Repeated restore is read-only; do not replace its operation owner.
@@ -4853,6 +5005,7 @@ struct RuntimeState {
     #[cfg(feature = "fs-store")]
     next_diagnostic_id: u64,
     workers: BTreeMap<WorkerId, WorkerRecord>,
+    workdir_operations: BTreeMap<String, WorkdirOperation>,
     workspace_owners: BTreeMap<String, String>,
     config_bundles: BTreeMap<String, ConfigBundle>,
     workspace_config_latest: BTreeMap<String, ConfigBundleRef>,
@@ -4882,6 +5035,7 @@ impl RuntimeState {
             #[cfg(feature = "fs-store")]
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
+            workdir_operations: BTreeMap::new(),
             workspace_owners: BTreeMap::new(),
             config_bundles: BTreeMap::new(),
             workspace_config_latest: BTreeMap::new(),
@@ -4912,6 +5066,7 @@ impl RuntimeState {
             #[cfg(feature = "fs-store")]
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
+            workdir_operations: BTreeMap::new(),
             workspace_owners: BTreeMap::new(),
             config_bundles: BTreeMap::new(),
             workspace_config_latest: BTreeMap::new(),
@@ -5056,6 +5211,7 @@ impl RuntimeState {
             workspace_backend_resource_clients: BTreeMap::new(),
             next_diagnostic_id,
             workers,
+            workdir_operations: BTreeMap::new(),
             config_bundles: BTreeMap::new(),
             workspace_config_latest: BTreeMap::new(),
             workspace_config_fetch_gates: BTreeMap::new(),
@@ -5470,6 +5626,16 @@ impl RuntimeState {
         }
     }
 
+    fn ensure_workdir_not_removing(&self, id: &str) -> Result<(), RuntimeError> {
+        if matches!(
+            self.workdir_operations.get(id),
+            Some(WorkdirOperation::Cleanup)
+        ) {
+            return Err(workdir_operation_busy());
+        }
+        Ok(())
+    }
+
     fn worker_id_for_workdir(&self, working_directory_id: &str) -> Option<WorkerId> {
         self.workers.values().find_map(|worker| {
             let has_status = worker.workdir_attachments.iter().any(|attachment| {
@@ -5478,7 +5644,23 @@ impl RuntimeState {
             let has_request = worker.request.as_ref().is_some_and(|request| {
                 requested_workdir_ids(request).contains(&working_directory_id)
             });
-            (has_status || has_request).then_some(worker.worker_id)
+            let has_logical = worker
+                .logical_workdir_attachments
+                .iter()
+                .any(|attachment| attachment.working_directory_id == working_directory_id);
+            let has_preparation = worker
+                .restore_guard
+                .active_request_id
+                .as_ref()
+                .and_then(|id| worker.restore_guard.owners.get(id))
+                .filter(|owner| owner.receipt.is_none())
+                .and_then(|owner| owner.request.preparation.as_ref())
+                .is_some_and(|preparation| {
+                    preparation_workdir_ids(preparation, self.runtime_identity.as_deref())
+                        .contains(&working_directory_id)
+                });
+            (has_status || has_request || has_logical || has_preparation)
+                .then_some(worker.worker_id)
         })
     }
 
@@ -6177,6 +6359,33 @@ fn durable_create_worker_request(request: &CreateWorkerRequest) -> CreateWorkerR
         }
     }
     durable
+}
+
+fn preparation_workdir_ids<'a>(
+    preparation: &'a runtime_api::WorkerRestorePreparation,
+    runtime_id: Option<&str>,
+) -> Vec<&'a str> {
+    let local = |owner: &str| runtime_id.is_none_or(|runtime_id| runtime_id == owner);
+    preparation
+        .workdir_attachments
+        .iter()
+        .flatten()
+        .map(|attachment| attachment.working_directory_id.as_str())
+        .chain(
+            preparation
+                .repository_access_workdirs
+                .iter()
+                .filter(|reference| local(&reference.runtime_id))
+                .map(|reference| reference.working_directory_id.as_str()),
+        )
+        .chain(
+            preparation
+                .repository_access
+                .iter()
+                .filter(|access| local(&access.materialization.runtime_id))
+                .map(|access| access.working_directory_id.as_str()),
+        )
+        .collect()
 }
 
 fn requested_workdir_ids(request: &CreateWorkerRequest) -> Vec<&str> {
@@ -7641,6 +7850,35 @@ mod tests {
         }
     }
 
+    struct WorkdirEffectGate {
+        entered: std::sync::mpsc::Sender<String>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl WorkdirEffectGate {
+        fn wait(slot: &Mutex<Option<Self>>, id: &str) {
+            let gate = slot.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.send(id.to_string()).unwrap();
+                gate.release
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("Workdir effect did not receive release before timeout");
+            }
+        }
+
+        fn install(
+            slot: &Mutex<Option<Self>>,
+        ) -> (
+            std::sync::mpsc::Receiver<String>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (entered, receiver) = std::sync::mpsc::channel();
+            let (sender, release) = std::sync::mpsc::channel();
+            *slot.lock().unwrap() = Some(Self { entered, release });
+            (receiver, sender)
+        }
+    }
+
     #[derive(Default)]
     struct TestExecutionBackend {
         spawn_result: Mutex<Option<WorkerExecutionSpawnResult>>,
@@ -7673,6 +7911,10 @@ mod tests {
         repository_access_available: AtomicBool,
         working_directory_requests: Mutex<Vec<WorkingDirectoryRequest>>,
         cleanup_occupancy_probe: Mutex<Option<Arc<Mutex<RuntimeState>>>>,
+        cleanup_gate: Mutex<Option<WorkdirEffectGate>>,
+        workdir_use_gate: Mutex<Option<WorkdirEffectGate>>,
+        cleanup_calls: std::sync::atomic::AtomicUsize,
+        cleanup_panics: AtomicBool,
         preserve_submission_acknowledgement_id: AtomicBool,
         #[cfg(feature = "ws-server")]
         snapshots: Mutex<BTreeMap<WorkerId, protocol::Event>>,
@@ -7717,10 +7959,21 @@ mod tests {
             &self,
             _id: &str,
         ) -> Result<CatalogWorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
+            self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+            WorkdirEffectGate::wait(&self.cleanup_gate, _id);
+            if self.cleanup_panics.load(Ordering::SeqCst) {
+                panic!("cleanup provider failed after admission");
+            }
             if let Some(state) = self.cleanup_occupancy_probe.lock().unwrap().as_ref() {
+                let state = state
+                    .try_lock()
+                    .expect("physical cleanup must not hold global Runtime state");
                 assert!(
-                    matches!(state.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
-                    "occupancy must remain exclusive during physical cleanup"
+                    matches!(
+                        state.workdir_operations.get(_id),
+                        Some(WorkdirOperation::Cleanup)
+                    ),
+                    "the target Workdir must remain reserved during physical cleanup"
                 );
             }
             Err(WorkingDirectoryDiagnostic::rejected(
@@ -7749,6 +8002,10 @@ mod tests {
             &self,
             request: &WorkingDirectoryRequest,
         ) -> Result<CatalogWorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
+            WorkdirEffectGate::wait(
+                &self.workdir_use_gate,
+                request.backend_workdir_id.as_deref().unwrap(),
+            );
             self.working_directory_requests
                 .lock()
                 .unwrap()
@@ -7763,6 +8020,7 @@ mod tests {
             &self,
             request: &WorkingDirectoryRepositoryAccessRequest,
         ) -> Result<(), WorkingDirectoryDiagnostic> {
+            WorkdirEffectGate::wait(&self.workdir_use_gate, &request.working_directory_id);
             self.repository_accesses
                 .lock()
                 .unwrap()
@@ -8068,7 +8326,7 @@ mod tests {
     }
 
     #[test]
-    fn workdir_removal_keeps_occupancy_exclusive_during_provider_side_effect() {
+    fn workdir_removal_reserves_only_its_target_and_releases_on_failure() {
         let (runtime, backend) = runtime_and_backend();
         *backend.cleanup_occupancy_probe.lock().unwrap() = Some(runtime.inner.clone());
         let error = runtime
@@ -8078,9 +8336,382 @@ mod tests {
             matches!(error, RuntimeError::WorkingDirectory(ref diagnostic)
             if diagnostic.code == "working_directory_cleanup_resource_busy")
         );
-        // The lock is released on failure, permitting normal attachment/retry.
-        assert!(runtime.inner.try_lock().is_ok());
+        // Failure releases the per-target reservation for normal use/retry.
+        assert!(runtime.inner.lock().unwrap().workdir_operations.is_empty());
         *backend.cleanup_occupancy_probe.lock().unwrap() = None;
+    }
+
+    fn workdir_effect_request(id: Option<&str>) -> WorkingDirectoryRequest {
+        WorkingDirectoryRequest {
+            repository: WorkingDirectoryRepository {
+                id: "repository-1".into(),
+                provider: "git".into(),
+                source: server_api::RepositorySource {
+                    kind: server_api::RepositorySourceKind::LocalPath,
+                    uri: "/unused-test-repository".into(),
+                },
+                source_revision: 1,
+                source_fingerprint: "sha256:test-source".into(),
+                selector: None,
+            },
+            display_name: None,
+            materializer: MaterializerKind::RuntimeGitClone,
+            backend_workdir_id: id.map(str::to_string),
+            materialization: None,
+        }
+    }
+
+    fn workdir_access_request(id: &str) -> WorkingDirectoryRepositoryAccessRequest {
+        WorkingDirectoryRepositoryAccessRequest {
+            working_directory_id: id.into(),
+            materialization: RepositoryMaterializationContext {
+                workspace_id: "workspace-a".into(),
+                runtime_id: "runtime-1".into(),
+                operation_id: "operation-1".into(),
+                config_revision: 1,
+                config_projection_digest: "sha256:test-projection".into(),
+                ssh: None,
+            },
+        }
+    }
+
+    fn assert_workdir_busy(error: RuntimeError) {
+        assert!(
+            matches!(error, RuntimeError::WorkingDirectory(ref diagnostic)
+            if diagnostic.code == "working_directory_cleanup_resource_busy"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn active_workdir_cleanup_rejects_same_id_admissions_without_blocking_other_workers() {
+        let (runtime, backend) = runtime_and_backend();
+        let owner = scope("workspace-a", "server-a");
+        let worker = runtime
+            .create_worker_scoped(&owner, scoped_task_request("unrelated", "workspace-a"))
+            .unwrap();
+        let id = "workdir-cleanup-active";
+        let (entered, release) = WorkdirEffectGate::install(&backend.cleanup_gate);
+        let cleanup_runtime = runtime.clone();
+        let cleanup = std::thread::spawn(move || cleanup_runtime.cleanup_working_directory(id));
+        assert_eq!(
+            entered
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            id
+        );
+
+        assert_eq!(runtime.list_workers_scoped(&owner).unwrap().len(), 1);
+        assert_workdir_busy(runtime.cleanup_working_directory(id).unwrap_err());
+        assert_workdir_busy(
+            runtime
+                .create_working_directory(workdir_effect_request(Some(id)))
+                .unwrap_err(),
+        );
+        assert_workdir_busy(
+            runtime
+                .authorize_working_directory_repository_access(workdir_access_request(id))
+                .unwrap_err(),
+        );
+        assert_workdir_busy(
+            runtime
+                .open_workdir_session_scoped(&owner, id, None)
+                .unwrap_err(),
+        );
+        let mut create = scoped_task_request("conflicting attachment", "workspace-a");
+        create.workdir_attachments = vec![WorkingDirectoryAttachmentClaim {
+            alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
+            working_directory_id: id.into(),
+            relative_cwd: None,
+            capabilities: workdir::WorkdirSessionCapabilities::ALL,
+        }];
+        assert_workdir_busy(runtime.create_worker_scoped(&owner, create).unwrap_err());
+        let attachment = LogicalWorkdirAttachment {
+            alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
+            working_directory_id: id.into(),
+            capabilities: workdir::WorkdirSessionCapabilities::ALL,
+        };
+        assert_workdir_busy(
+            runtime
+                .replace_worker_workdir_attachments_scoped(
+                    &owner,
+                    &worker.worker_ref,
+                    vec![attachment.clone()],
+                )
+                .unwrap_err(),
+        );
+        runtime
+            .stop_worker_scoped(&owner, &worker.worker_ref, None)
+            .unwrap();
+        let restore = runtime.test_restore_request(&worker.worker_ref);
+        assert_workdir_busy(
+            runtime
+                .coordinate_worker_restore_operation(
+                    &worker.worker_ref,
+                    runtime_api::WorkerRestoreCoordinationRequest {
+                        expected_observation_token: restore.expected_observation_token,
+                        request_id: restore.request_id,
+                        preparation: Some(runtime_api::WorkerRestorePreparation {
+                            workdir_attachments: Some(vec![
+                                runtime_api::LogicalWorkdirAttachment {
+                                    alias: attachment.alias,
+                                    working_directory_id: attachment.working_directory_id,
+                                    capabilities: attachment.capabilities,
+                                },
+                            ]),
+                            ..Default::default()
+                        }),
+                    },
+                    Some(&owner),
+                )
+                .unwrap_err(),
+        );
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .worker(&worker.worker_ref)
+                .unwrap()
+                .pending_restore
+                .is_none()
+        );
+        assert_eq!(runtime.list_workers_scoped(&owner).unwrap().len(), 1);
+        // Different IDs and Worker creation remain available during cleanup.
+        runtime
+            .create_worker_scoped(
+                &owner,
+                scoped_task_request("another unrelated", "workspace-a"),
+            )
+            .unwrap();
+        let other = runtime
+            .create_working_directory(workdir_effect_request(Some("workdir-other")))
+            .unwrap_err();
+        assert!(
+            matches!(other, RuntimeError::WorkingDirectory(ref diagnostic) if diagnostic.code == "working_directory_unsupported")
+        );
+        assert_eq!(backend.cleanup_calls.load(Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        assert_workdir_busy(cleanup.join().unwrap().unwrap_err());
+        assert!(runtime.lock().unwrap().workdir_operations.is_empty());
+    }
+
+    #[test]
+    fn in_flight_creation_and_access_exclude_cleanup_including_generated_ids() {
+        for operation in ["explicit-create", "generated-create", "access"] {
+            let (runtime, backend) = runtime_and_backend();
+            let (entered, release) = WorkdirEffectGate::install(&backend.workdir_use_gate);
+            let effect_runtime = runtime.clone();
+            let effect = std::thread::spawn(move || {
+                if operation == "access" {
+                    effect_runtime.authorize_working_directory_repository_access(
+                        workdir_access_request("workdir-in-use"),
+                    )
+                } else {
+                    effect_runtime
+                        .create_working_directory(workdir_effect_request(
+                            (operation == "explicit-create").then_some("workdir-in-use"),
+                        ))
+                        .map(|_| ())
+                }
+            });
+            let id = entered
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(!id.is_empty());
+            assert_workdir_busy(runtime.cleanup_working_directory(&id).unwrap_err());
+            assert_eq!(backend.cleanup_calls.load(Ordering::SeqCst), 0);
+            runtime
+                .create_worker(task_request("unrelated during effect"))
+                .unwrap();
+            release.send(()).unwrap();
+            assert!(effect.join().unwrap().is_err());
+            // Failed provider effects release their reservation for ordinary retry.
+            assert_workdir_busy(runtime.cleanup_working_directory(&id).unwrap_err());
+            assert_eq!(backend.cleanup_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn logical_attachments_and_unsettled_restore_preparation_exclude_cleanup() {
+        for pending in [false, true] {
+            let (runtime, backend) = runtime_and_backend();
+            let owner = scope("workspace-a", "server-a");
+            let worker = runtime
+                .create_worker_scoped(&owner, scoped_task_request("logical owner", "workspace-a"))
+                .unwrap();
+            let id = "workdir-logical-owner";
+            let attachment = LogicalWorkdirAttachment {
+                alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
+                working_directory_id: id.into(),
+                capabilities: workdir::WorkdirSessionCapabilities::ALL,
+            };
+            if pending {
+                runtime
+                    .stop_worker_scoped(&owner, &worker.worker_ref, None)
+                    .unwrap();
+                let restore = runtime.test_restore_request(&worker.worker_ref);
+                let preparation = runtime_api::WorkerRestorePreparation {
+                    workdir_attachments: Some(vec![runtime_api::LogicalWorkdirAttachment {
+                        alias: attachment.alias,
+                        working_directory_id: attachment.working_directory_id,
+                        capabilities: attachment.capabilities,
+                    }]),
+                    ..Default::default()
+                };
+                let coordinated = runtime
+                    .coordinate_worker_restore_operation(
+                        &worker.worker_ref,
+                        runtime_api::WorkerRestoreCoordinationRequest {
+                            expected_observation_token: restore.expected_observation_token,
+                            request_id: restore.request_id,
+                            preparation: Some(preparation.clone()),
+                        },
+                        Some(&owner),
+                    )
+                    .unwrap();
+                assert_eq!(coordinated, (None, Some(preparation)));
+            } else {
+                runtime
+                    .replace_worker_workdir_attachments_scoped(
+                        &owner,
+                        &worker.worker_ref,
+                        vec![attachment],
+                    )
+                    .unwrap();
+            }
+            assert!(
+                matches!(runtime.cleanup_working_directory(id).unwrap_err(), RuntimeError::InvalidRequest(message) if message.contains("assigned to worker"))
+            );
+            assert_eq!(backend.cleanup_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn unowned_restore_recovery_ignores_new_preparation_for_a_workdir_being_cleaned() {
+        let (runtime, backend) = runtime_and_backend();
+        let owner = scope("workspace-a", "server-a");
+        let worker = runtime
+            .create_worker_scoped(
+                &owner,
+                scoped_task_request("recover persisted operation", "workspace-a"),
+            )
+            .unwrap();
+        runtime
+            .stop_worker_scoped(&owner, &worker.worker_ref, None)
+            .unwrap();
+        // Persisted lifecycle recovery may have no request owner (e.g. after an
+        // interrupted older admission). New preparation is not its authority.
+        runtime
+            .lock()
+            .unwrap()
+            .worker_mut(&worker.worker_ref)
+            .unwrap()
+            .pending_restore = Some(PendingWorkerRestore {
+            operation_id: WorkerLifecycleOperationId::new(),
+            mode: WorkerRestoreMode::Explicit,
+            last_settled_status: WorkerStatus::Stopped,
+        });
+        let id = "workdir-irrelevant-to-recovery";
+        let (entered, release) = WorkdirEffectGate::install(&backend.cleanup_gate);
+        let cleanup_runtime = runtime.clone();
+        let cleanup = std::thread::spawn(move || cleanup_runtime.cleanup_working_directory(id));
+        entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let restore = runtime.test_restore_request(&worker.worker_ref);
+        let (result, preparation) = runtime
+            .coordinate_worker_restore_operation(
+                &worker.worker_ref,
+                runtime_api::WorkerRestoreCoordinationRequest {
+                    expected_observation_token: restore.expected_observation_token,
+                    request_id: restore.request_id,
+                    preparation: Some(runtime_api::WorkerRestorePreparation {
+                        workdir_attachments: Some(vec![runtime_api::LogicalWorkdirAttachment {
+                            alias: workdir::WorkdirAttachmentAlias::new("ignored").unwrap(),
+                            working_directory_id: id.into(),
+                            capabilities: workdir::WorkdirSessionCapabilities::ALL,
+                        }]),
+                        ..Default::default()
+                    }),
+                },
+                Some(&owner),
+            )
+            .unwrap();
+        assert_eq!(result.unwrap().state, WorkerRestoreState::Accepted);
+        assert!(preparation.is_none());
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .worker(&worker.worker_ref)
+                .unwrap()
+                .logical_workdir_attachments
+                .is_empty()
+        );
+        release.send(()).unwrap();
+        assert_workdir_busy(cleanup.join().unwrap().unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn live_workdir_session_clones_exclude_cleanup_until_close_or_final_drop() {
+        for close in [false, true] {
+            let (runtime, backend) = runtime_and_backend();
+            let root = tempfile::tempdir().unwrap();
+            let id = "workdir-live-session";
+            let provider: workdir::WorkdirSessionHandle = Arc::new(
+                workdir::LocalWorkdirSession::materialized_bound_with_environment(
+                    workdir::Workdir::new(id),
+                    root.path().to_path_buf(),
+                    root.path().to_path_buf(),
+                    manifest::SharedScope::new(manifest::Scope::writable(root.path()).unwrap()),
+                    workdir::WorkdirSessionCapabilities::ALL,
+                    BTreeMap::new(),
+                    Vec::new(),
+                ),
+            );
+            let session = workdir_session::retain_operation(
+                provider,
+                runtime.reserve_workdir_use([id]).unwrap(),
+            );
+            let clone = session.clone();
+            drop(session);
+            assert_workdir_busy(runtime.cleanup_working_directory(id).unwrap_err());
+            assert_eq!(backend.cleanup_calls.load(Ordering::SeqCst), 0);
+            if close {
+                clone.close().await.unwrap();
+                clone.close().await.unwrap();
+                // A closed wrapper may remain alive without reserving storage.
+                assert_workdir_busy(runtime.cleanup_working_directory(id).unwrap_err());
+                assert_eq!(backend.cleanup_calls.load(Ordering::SeqCst), 1);
+            } else {
+                drop(clone);
+                assert_workdir_busy(runtime.cleanup_working_directory(id).unwrap_err());
+                assert_eq!(backend.cleanup_calls.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn workdir_cleanup_panic_releases_reservation_without_poisoning_runtime() {
+        let (runtime, backend) = runtime_and_backend();
+        backend.cleanup_panics.store(true, Ordering::SeqCst);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || runtime.cleanup_working_directory("workdir-panic")
+            ))
+            .is_err()
+        );
+        assert!(runtime.lock().unwrap().workdir_operations.is_empty());
+        backend.cleanup_panics.store(false, Ordering::SeqCst);
+        runtime
+            .create_worker(task_request("after cleanup panic"))
+            .unwrap();
+        assert_workdir_busy(
+            runtime
+                .cleanup_working_directory("workdir-panic")
+                .unwrap_err(),
+        );
+        assert_eq!(backend.cleanup_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

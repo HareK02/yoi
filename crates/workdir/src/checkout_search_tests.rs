@@ -212,17 +212,17 @@ async fn checkout_search_composes_actual_nested_wrappers_and_output_root() {
     };
     assert_eq!(result.entries[0].path, path("keep/yes.txt"));
     // A second actual scoped wrapper has its own cwd and nonrecursive layer.
-    // Logical rules avoid requesting resolved authorization from a wrapper
-    // that conservatively does not expose host-side resolution authority.
+    // Default resolved authorization must survive every wrapper.
     std::fs::create_dir(root.path().join("child/keep/deep")).unwrap();
     std::fs::write(
         root.path().join("child/keep/deep/secret"),
         "needle hidden nested",
     )
     .unwrap();
-    let mut own_rule = rule("keep", false);
-    own_rule.symlink_policy = manifest::SymlinkPolicy::Logical;
-    let second = stacked.scope(scope(vec![own_rule], "keep")).await.unwrap();
+    let second = stacked
+        .scope(scope(vec![rule("keep", false)], "keep"))
+        .await
+        .unwrap();
     let result = second
         .tool_session()
         .grep(grep(GrepOutputMode::Content))

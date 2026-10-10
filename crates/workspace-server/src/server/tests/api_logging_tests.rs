@@ -531,10 +531,13 @@ async fn self_workdir_provider_refusals_log_operation_identity_without_request_t
             Reason::ScopedCapabilityDenied,
         ),
         (
+            // Scoped forwarding validates this READ_ONLY parent's capabilities
+            // before provider resolution. Local now supports scope resolution;
+            // denying write rules is not a missing-resolver failure.
             json!({"operation": "authorize_scope", "request": {"path": "secret.txt", "permission": "write", "rules": [{"target": "", "permission": "write", "recursive": true}]}}),
             "authorize_scope",
             "denied",
-            Reason::ScopeResolutionUnavailable,
+            Reason::ParentCapabilityDenied,
         ),
     ];
     for (operation, label, code, reason) in cases {
@@ -577,6 +580,34 @@ async fn self_workdir_provider_refusals_log_operation_identity_without_request_t
             "unbounded log: {events:?}"
         );
     }
+    // Control: the same READ_ONLY provider can authorize read rules through
+    // scoped forwarding and native resolution. Keep a capability refusal
+    // distinct from an unavailable scope resolver; successful authorization
+    // must not emit an api_error or mutate the filesystem.
+    let read_scope = runtime_source_request(
+        &identity,
+        Some(&fixture.worker.worker_id),
+        "POST",
+        &format!("{path}?token=query-secret"),
+        serde_json::to_vec(&json!({
+            "target_workdir": "checkout",
+            "operation": {"operation": "authorize_scope", "request": {
+                "path": "", "permission": "read",
+                "rules": [{"target": "", "permission": "read", "recursive": true}],
+            }},
+        }))
+        .unwrap(),
+    );
+    let (status, body, events) = request_with_logs(app, read_scope).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        serde_json::to_value(WorkdirSessionOperationResult::AuthorizeScope).unwrap(),
+    );
+    assert!(
+        events.is_empty(),
+        "successful scope authorization logged as failure: {events:?}"
+    );
     assert!(
         !root.path().join("secret.txt").exists(),
         "refusal changed filesystem"

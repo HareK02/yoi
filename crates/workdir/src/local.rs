@@ -1830,6 +1830,9 @@ impl WorkdirSession for LocalWorkdirSession {
 
     async fn start_command(&self, request: CommandRequest) -> Result<CommandHandle, WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Command)?;
+        // Command admission, resource capture and registration must be atomic
+        // with terminal close, which drains commands and releases resources.
+        let _admission = self.inner.close_lock.lock().await;
         self.ensure_open()?;
         if let Some(spill_dir) = request.spill_dir.as_deref()
             && !self
@@ -1854,6 +1857,15 @@ impl WorkdirSession for LocalWorkdirSession {
         let telemetry = self.inner.command_telemetry.clone();
         let command_environment = self.inner.command_environment.clone();
         let (cancel, cancel_rx) = watch::channel(false);
+        // A session drop only schedules command cancellation. Keep its Runtime
+        // resources (including cleanup exclusion) alive until the task actually
+        // finishes or its future is dropped, not just until the handle disappears.
+        let resources = self
+            .inner
+            .resources
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
         let task = tokio::spawn(async move {
             let output = run_command(
                 cwd,
@@ -1862,6 +1874,7 @@ impl WorkdirSession for LocalWorkdirSession {
                 telemetry,
                 command_environment,
                 cancel_rx,
+                resources,
             )
             .await;
             let _ = completion_tx.send(true);
@@ -2194,6 +2207,7 @@ async fn run_command(
     telemetry: CommandTelemetry,
     command_environment: BTreeMap<String, String>,
     mut cancel: watch::Receiver<bool>,
+    resources: Vec<Arc<dyn WorkdirSessionResource>>,
 ) -> Result<CommandOutput, WorkdirError> {
     let stdout = tempfile::NamedTempFile::new().map_err(|error| WorkdirError::io(&cwd, error))?;
     let stderr = tempfile::NamedTempFile::new().map_err(|error| WorkdirError::io(&cwd, error))?;
@@ -2313,7 +2327,7 @@ async fn run_command(
             let stdout_path = stdout_path.to_path_buf();
             let stderr_path = stderr_path.to_path_buf();
             Some(
-                tokio::task::spawn_blocking(move || {
+                spawn_resource_owned_blocking(resources.clone(), move || {
                     persist_command_output(&stdout_path, &stderr_path, &spill_dir)
                 })
                 .await
@@ -2332,6 +2346,18 @@ async fn run_command(
         next_cursor: None,
         truncated,
         output_path,
+    })
+}
+
+// Blocking spills cannot be aborted with their async waiter. Transfer resource
+// ownership into the actual filesystem task so cleanup waits for its completion.
+fn spawn_resource_owned_blocking<T: Send + 'static>(
+    resources: Vec<Arc<dyn WorkdirSessionResource>>,
+    effect: impl FnOnce() -> T + Send + 'static,
+) -> JoinHandle<T> {
+    tokio::task::spawn_blocking(move || {
+        let _resources = resources;
+        effect()
     })
 }
 
@@ -4178,6 +4204,152 @@ mod tests {
             }
         }
         assert_eq!(terminal, Some((handle.0, CommandStatus::TimedOut, None)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn command_admission_serializes_with_close_before_capturing_resources() {
+        let dir = TempDir::new().unwrap();
+        let session = Arc::new(make_fs(&dir));
+        let held = session.inner.close_lock.lock().await;
+        let (closing, close_entered) = tokio::sync::oneshot::channel();
+        let close_session = session.clone();
+        let close = tokio::spawn(async move {
+            closing.send(()).unwrap();
+            WorkdirSession::close(close_session.as_ref()).await
+        });
+        close_entered.await.unwrap();
+        let (starting, start_entered) = tokio::sync::oneshot::channel();
+        let start_session = session.clone();
+        let start = tokio::spawn(async move {
+            starting.send(()).unwrap();
+            WorkdirSession::start_command(
+                start_session.as_ref(),
+                CommandRequest {
+                    command: "true".into(),
+                    timeout_secs: 5,
+                    output_limit: 1024,
+                    cwd: WorkdirPath::root(),
+                    spill_dir: None,
+                    tool_call_id: None,
+                },
+            )
+            .await
+        });
+        start_entered.await.unwrap();
+        assert!(
+            !start.is_finished(),
+            "command started outside terminal-close admission"
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), close)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), start)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(WorkdirError::Unavailable(message)) if message.contains("is closed")
+        ));
+        assert!(
+            session.command_snapshot().is_empty(),
+            "closed admission launched a command"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_output_spill_retains_resources_after_waiter_is_cancelled() {
+        #[derive(Debug)]
+        struct Resource(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Resource {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let (released, mut release) = tokio::sync::oneshot::channel();
+        let resources: Vec<Arc<dyn WorkdirSessionResource>> =
+            vec![Arc::new(Resource(Some(released)))];
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (finish, wait) = std::sync::mpsc::channel();
+        // Exercise the resource-transfer policy at the same blocking boundary
+        // used by output persistence, without filesystem timing assumptions.
+        let waiter = tokio::spawn(async move {
+            spawn_resource_owned_blocking(resources, move || {
+                entered.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(5), started)
+            .await
+            .unwrap()
+            .unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(
+            matches!(
+                release.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "blocking spill lost its resources when the waiter was cancelled"
+        );
+        finish.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), release)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_drop_retains_resources_until_command_task_cancellation_completes() {
+        #[derive(Debug)]
+        struct Resource(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Resource {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let (released, mut release) = tokio::sync::oneshot::channel();
+        let session = LocalWorkdirSession::materialized_bound_with_environment(
+            Workdir::new("command-resource-session"),
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            SharedScope::new(Scope::writable(dir.path()).unwrap()),
+            WorkdirSessionCapabilities::ALL,
+            BTreeMap::new(),
+            vec![Arc::new(Resource(Some(released)))],
+        );
+        WorkdirSession::start_command(
+            &session,
+            CommandRequest {
+                command: "true".into(),
+                timeout_secs: 5,
+                output_limit: 1024,
+                cwd: WorkdirPath::root(),
+                spill_dir: None,
+                tool_call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        // The sole executor has not polled the command task, so dropping the
+        // session schedules its abort but cannot yet complete cancellation.
+        drop(session);
+        assert!(
+            matches!(
+                release.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "resources released before the aborted command future was dropped"
+        );
+        tokio::time::timeout(Duration::from_secs(5), release)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
