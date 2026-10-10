@@ -2,15 +2,12 @@ import type {
   Diagnostic,
   RuntimeConnectionTestFailureKind,
   RuntimeConnectionTestResponse,
-  RuntimeVerificationEvidenceSummary,
 } from "#lib/generated/runtime-api.ts";
 
 const RESPONSE_KEYS = [
   "workspace_id",
   "runtime_id",
   "binding_id",
-  "connection_state",
-  "verification",
   "checked_at",
   "status",
   "failure_kind",
@@ -108,87 +105,17 @@ export function parseRuntimeConnectionTestResponse(
     return null;
   }
   const bindingId = value.binding_id;
-  const connectionState = parseConnectionState(value.connection_state);
-  const verification = parseVerificationEvidence(value.verification);
-  if (
-    !isBoundedString(bindingId) ||
-    connectionState === null ||
-    (value.verification !== null && verification === null) ||
-    (verification !== null &&
-      verification.binding_id !== bindingId) ||
-    (connectionState === "verified" && value.status !== "compatible") ||
-    (connectionState === "verified" && verification !== null &&
-      (verification.last_outcome !== "verified" ||
-        verification.verified_at === null))
-  ) {
-    return null;
-  }
+  if (!isBoundedString(bindingId, 256)) return null;
   return {
     workspace_id: value.workspace_id,
     runtime_id: value.runtime_id,
     binding_id: bindingId,
-    connection_state: connectionState,
-    verification,
     checked_at: value.checked_at,
     status: value.status,
     failure_kind: failureKind as RuntimeConnectionTestFailureKind | null,
     expected_protocol_version: value.expected_protocol_version,
     actual_protocol_version: value.actual_protocol_version,
     diagnostics: diagnostics as Diagnostic[],
-  };
-}
-
-function parseConnectionState(
-  value: unknown,
-): "configured" | "verified" | "unavailable" | "revoked" | null {
-  return value === "configured" || value === "verified" ||
-      value === "unavailable" || value === "revoked"
-    ? value
-    : null;
-}
-
-function parseVerificationEvidence(
-  value: unknown,
-): RuntimeVerificationEvidenceSummary | null {
-  if (value === null) return null;
-  const keys = [
-    "verified_at",
-    "last_checked_at",
-    "last_outcome",
-    "binding_id",
-    "workspace_key_id",
-    "workspace_public_key_fingerprint",
-    "workspace_trust_id",
-    "runtime_public_key_fingerprint",
-  ] as const;
-  if (!isRecord(value) || !hasExactKeys(value, keys)) return null;
-  if (
-    (value.verified_at !== null &&
-      (!isBoundedString(value.verified_at, 128) ||
-        Number.isNaN(Date.parse(value.verified_at)))) ||
-    !isBoundedString(value.last_checked_at, 128) ||
-    Number.isNaN(Date.parse(value.last_checked_at)) ||
-    (value.last_outcome !== "verified" &&
-      value.last_outcome !== "challenge_issued" &&
-      value.last_outcome !== "verification_failed" &&
-      value.last_outcome !== "connectivity_failed") ||
-    !isBoundedString(value.binding_id) ||
-    !isBoundedString(value.workspace_key_id, 128) ||
-    !isBoundedString(value.workspace_public_key_fingerprint) ||
-    !isBoundedString(value.workspace_trust_id) ||
-    !isBoundedString(value.runtime_public_key_fingerprint, 128)
-  ) {
-    return null;
-  }
-  return {
-    verified_at: value.verified_at,
-    last_checked_at: value.last_checked_at,
-    last_outcome: value.last_outcome,
-    binding_id: value.binding_id,
-    workspace_key_id: value.workspace_key_id,
-    workspace_public_key_fingerprint: value.workspace_public_key_fingerprint,
-    workspace_trust_id: value.workspace_trust_id,
-    runtime_public_key_fingerprint: value.runtime_public_key_fingerprint,
   };
 }
 

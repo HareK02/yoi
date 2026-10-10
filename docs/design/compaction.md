@@ -26,11 +26,96 @@ auto-read files, references, retained tail, and TaskStore context. Exceeding it 
 warning and continues without discarding the generated summary or stripping auto-read/retained
 content. `0` disables this warning. Normal request-time safety checks still apply after activation.
 
-## Large sessions
+## Compactor inputs and continuity policy
 
-Large-session compaction should not send an entire prefix transcript as the summary input. Prefer bounded overview/index inputs plus exploration, then keep the retained tail small and explicit.
+The compactor receives the previous Host-produced summary in full as mandatory source
+material, separately from the bounded overview of this Segment's ordinary prefix. It must
+preserve ongoing user goals, directives, completion conditions, and unresolved work from
+that summary and from the current Segment's user messages. Recent progress and the
+TaskStore snapshot are supporting evidence, not replacements for the original request.
+Important wording or ambiguous completion state should be checked through exploration
+rather than reconstructed from recent activity.
 
-This keeps compaction cost predictable and avoids turning a context-recovery mechanism into the largest prompt in the session.
+The first model input includes:
+
+- `## Initial compaction summary (full text)`, when a prior summary exists, containing its
+  complete body without overview truncation;
+- recently touched file references, when available;
+- the full current Session TaskStore snapshot;
+- `## Conversation overview/index`, a bounded index of the ordinary prefix selected for
+  summarization, with exploration tools for omitted details.
+
+The inherited summary is selected by `LoggedSessionHistoryOrigin::CompactionSummary`,
+not by message role or pasted text. Only the Host-produced opening compaction summary
+receives that origin. Auto-read contents, related-file context, and TaskStore snapshots
+remain `DerivedSummary` and follow ordinary prefix/retention policy. A user or system
+message containing `[Compacted context summary]` is not sufficient to qualify.
+
+Restore recognizes one explicitly adopted legacy construction: the first history item of
+an `AnnotatedSegmentStart` with `compacted_from: Some(...)`, whose origin is
+`DerivedSummary`, whose role is System, and whose text starts with the exact Host summary
+marker. That item is interpreted as `CompactionSummary` in restored history. Restore does
+not promote later derived items, user messages, unknown origins, or marker-bearing items
+without compacted lineage, and does not rewrite the original durable record.
+
+## Retained tail
+
+The retained-token budget selects an ordinary history tail, at item granularity. Retained
+entries remain in the replacement Segment with their item and metadata preserved, except
+for documented binary-attachment projection. They are outside the prefix overview.
+
+The previous `CompactionSummary` is an explicit exception: its full body is supplied to the
+compactor regardless of whether the cut lies before or after it, but the old summary is
+excluded from both the ordinary overview and the retained tail. The newly generated
+summary supersedes it. Keeping both would duplicate inherited context on every compaction.
+Other derived context is not removed merely because its origin is `DerivedSummary`.
+
+## Limits and large sessions
+
+Large-session compaction does not send an entire prefix transcript as the initial input.
+The ordinary prefix uses a bounded overview/index plus exploration. This keeps the
+transcript portion predictable without allowing an overview limit to erase inherited goals.
+
+`overview_target_tokens` is a packing target, `overview_warning_tokens` emits a warning,
+and `overview_deadline_tokens` switches the ordinary overview to a coarse index. These
+limits and `compact.overview_tokens` accounting cover the overview only, not the separate
+full inherited summary. Small targets, warnings, and coarse fallback must not shorten or
+omit that summary.
+
+The inherited summary still occupies the compactor's context. It counts against
+`worker_context_max_tokens`; moving it outside the overview does not exempt it from the
+hard input-occupancy check. If mandatory input exceeds that cap, compaction fails explicitly
+before sending the oversized request, leaving the source Segment active rather than
+silently clipping source material or activating an incomplete replacement. The budget guard
+is installed through the internal Worker's normal `WorkerInterceptor`, not an Engine
+interceptor that Worker startup would replace. Before a provider usage measurement exists,
+the estimate includes the full input, system prompt, and installed tool definitions. Later
+provider input measurements include that request shape already. A budget warning is an
+append-only history item and is also checked against the hard cap; if it cannot fit alongside
+the mandatory input, the run fails explicitly. Provider context-window failures likewise do
+not activate a replacement; estimates are not an exact model-token guarantee.
+
+`summary_target_tokens` guides the new `write_summary` output. A nonzero
+`summary_max_tokens` is a hard output bound: an oversized result receives a rewrite request;
+if the rewritten output still exceeds the maximum, compaction fails without activation.
+This output bound is distinct from overview packing, the compactor input cap, and the
+advisory `result_context_max_tokens` warning on the assembled replacement.
+
+## Assessment boundary
+
+Deterministic integration tests inspect the actual `LlmClient::Request` to prove full
+inherited-summary transport, separation from overview packing, provenance-aware retention,
+shared history-restoration behavior, hard-limit rejection without activation, and inheritance
+through at least three chained compactions. Their `write_summary` outputs are predetermined
+mock responses: they do **not** prove that a model understood or semantically retained user
+goals, directives, or completion conditions. Shared restore-path coverage is not a complete
+cold Runtime restart assessment.
+
+Live semantic assessment remains pending. It should use a real model on long, repeated
+compactions and compare the resulting summaries against the original request and explicit
+completion conditions, including facts near the end of a long inherited summary and facts
+absent from recent progress. Report semantic omissions separately from successful transport;
+a mock echo or a successful activation cannot establish semantic continuity.
 
 ## History integrity
 

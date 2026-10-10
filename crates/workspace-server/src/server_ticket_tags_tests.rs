@@ -1,5 +1,565 @@
 use super::*;
 
+// Exercise the generated tag routes behind real Runtime authentication. Each
+// operation retry gets a fresh proof; an HTTP proof itself is single-use.
+async fn runtime_tag_response(
+    app: Router,
+    request: Request<Body>,
+    expected: StatusCode,
+) -> serde_json::Value {
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(status, expected, "{}", String::from_utf8_lossy(&body));
+    if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap_or_else(|error| {
+            panic!(
+                "invalid JSON response: {error}: {}",
+                String::from_utf8_lossy(&body)
+            )
+        })
+    }
+}
+
+async fn runtime_tag_json(
+    app: Router,
+    identity: &RuntimeIdentityMaterial,
+    worker_id: &str,
+    method: &str,
+    path: &str,
+    input: serde_json::Value,
+    expected: StatusCode,
+) -> serde_json::Value {
+    runtime_tag_response(
+        app,
+        runtime_source_request(
+            identity,
+            Some(worker_id),
+            method,
+            path,
+            serde_json::to_vec(&input).unwrap(),
+        ),
+        expected,
+    )
+    .await
+}
+
+fn tag_execution_authority_snapshot(api: &WorkspaceApi) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+    let conn = rusqlite::Connection::open(&api.config.database_path).unwrap();
+    [
+        "worker_registry",
+        "worker_control_grants",
+        "ticket_current_worker_assignments",
+        "ticket_assignment_operations",
+        "backend_jobs",
+    ]
+    .into_iter()
+    .map(|table| {
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT * FROM {table} WHERE workspace_id=?1 ORDER BY rowid"
+            ))
+            .unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([TEST_WORKSPACE_ID], |row| {
+                (0..columns)
+                    .map(|column| row.get(column))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    })
+    .collect()
+}
+
+#[tokio::test]
+async fn runtime_tag_mutations_replay_original_receipts_and_preserve_execution_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut api, execution) = test_api_with_recording_backend(dir.path()).await;
+    let identity = RuntimeIdentityMaterial::generate("runtime-tags").unwrap();
+    configure_runtime_request_auth(&mut api, &identity, "runtime-tags");
+    let source = RuntimeWorkerRef::new("runtime-tags", "classifier");
+    let recipient = RuntimeWorkerRef::new("runtime-tags", "recipient");
+    seed_worker_source_member(&api, &source.runtime_id, &source.worker_id);
+    seed_worker_source_member(&api, &recipient.runtime_id, &recipient.worker_id);
+    seed_worker_control_grant(&api, &source, &recipient, "existing-control");
+    let backend = browser_ticket_backend(&api).unwrap();
+    let reference = backend
+        .create(ticket::NewTicket::new("Classification is not a decision"))
+        .unwrap();
+    api.store
+        .set_current_ticket_role_assignment(
+            &TicketRoleAssignmentRecord {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                ticket_id: reference.id.clone(),
+                assignment_id: "existing-assignment".into(),
+                role: TicketAssignmentRole::Worker,
+                principal: TicketAssignmentPrincipal::Worker {
+                    runtime_id: recipient.runtime_id.clone(),
+                    worker_id: recipient.worker_id.clone(),
+                },
+                assigned_by: "test".into(),
+                assigned_at: TEST_CREATED_AT.into(),
+            },
+            None,
+            "existing-assignment-event",
+            "existing-assignment-operation",
+            false,
+        )
+        .unwrap();
+    let authority_before = tag_execution_authority_snapshot(&api);
+    let ticket_before = backend.show(reference.id.clone().into()).unwrap();
+    let app = build_router(api.clone());
+    let tags_path = format!("/api/w/{TEST_WORKSPACE_ID}/ticket-tags");
+    let membership_path = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{}/tags", reference.id);
+    let create =
+        json!({"operation_key":"runtime-create", "action":{"kind":"create", "name":" ready "}});
+    let tag = runtime_tag_json(
+        app.clone(),
+        &identity,
+        &source.worker_id,
+        "POST",
+        &tags_path,
+        create.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(tag["name"], "ready");
+    assert_eq!(tag["workspace_id"], TEST_WORKSPACE_ID);
+    let attach =
+        json!({"operation_key":"runtime-attach", "expected_tag_ids":[], "tag_ids":[tag["id"]]});
+    let attached = runtime_tag_json(
+        app.clone(),
+        &identity,
+        &source.worker_id,
+        "PUT",
+        &membership_path,
+        attach.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(attached, json!([tag.clone()]));
+    assert_eq!(
+        runtime_tag_json(
+            app.clone(),
+            &identity,
+            &source.worker_id,
+            "PUT",
+            &membership_path,
+            attach.clone(),
+            StatusCode::OK
+        )
+        .await,
+        attached
+    );
+    let rename = json!({"operation_key":"runtime-rename", "action":{"kind":"rename", "tag_id":tag["id"], "expected_last_operation_key":"runtime-create", "name":"Ready now"}});
+    let renamed = runtime_tag_json(
+        app.clone(),
+        &identity,
+        &source.worker_id,
+        "POST",
+        &tags_path,
+        rename.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(renamed["id"], tag["id"]);
+    assert_eq!(renamed["name"], "Ready now");
+    assert_eq!(
+        serde_json::to_value(&backend.show(reference.id.clone().into()).unwrap().tags).unwrap(),
+        json!([renamed.clone()])
+    );
+    let delete = json!({"operation_key":"runtime-delete", "action":{"kind":"delete", "tag_id":tag["id"], "expected_last_operation_key":"runtime-rename"}});
+    let deleted = runtime_tag_json(
+        app.clone(),
+        &identity,
+        &source.worker_id,
+        "POST",
+        &tags_path,
+        delete.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(deleted["deleted"], true);
+    assert!(
+        backend
+            .show(reference.id.clone().into())
+            .unwrap()
+            .tags
+            .is_empty()
+    );
+    // Receipts return their original snapshots, even after rename/delete changed
+    // live state. Retries must not recreate membership or duplicate audit events.
+    for (input, expected) in [(create, tag), (rename, renamed), (delete, deleted)] {
+        assert_eq!(
+            runtime_tag_json(
+                app.clone(),
+                &identity,
+                &source.worker_id,
+                "POST",
+                &tags_path,
+                input,
+                StatusCode::OK
+            )
+            .await,
+            expected
+        );
+    }
+    assert_eq!(
+        runtime_tag_json(
+            app.clone(),
+            &identity,
+            &source.worker_id,
+            "PUT",
+            &membership_path,
+            attach,
+            StatusCode::OK
+        )
+        .await,
+        attached
+    );
+    runtime_tag_json(app.clone(), &identity, &source.worker_id, "PUT", &membership_path,
+        json!({"operation_key":"runtime-stale-set", "expected_tag_ids":[attached[0]["id"]], "tag_ids":[]}), StatusCode::CONFLICT).await;
+    let empty = runtime_tag_json(
+        app,
+        &identity,
+        &source.worker_id,
+        "PUT",
+        &membership_path,
+        json!({"operation_key":"runtime-empty-set", "expected_tag_ids":[], "tag_ids":[]}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(empty, json!([]));
+    let ticket_after = backend.show(reference.id.into()).unwrap();
+    assert_eq!(
+        ticket::ticket_content_digest(&ticket_before),
+        ticket::ticket_content_digest(&ticket_after)
+    );
+    assert_eq!(
+        ticket_before.meta.workflow_state,
+        ticket_after.meta.workflow_state
+    );
+    assert!(ticket_after.tags.is_empty());
+    assert_eq!(tag_execution_authority_snapshot(&api), authority_before);
+    assert!(
+        execution.protocol_methods().is_empty(),
+        "classification dispatched execution/routing"
+    );
+    let tag_events: Vec<_> = ticket_after
+        .events
+        .iter()
+        .filter(|event| event.kind == ticket::TicketEventKind::TagsChanged)
+        .collect();
+    assert_eq!(
+        tag_events.len(),
+        2,
+        "attach/delete retries duplicated membership audit"
+    );
+    let conn = rusqlite::Connection::open(&api.config.database_path).unwrap();
+    let mut statement = conn.prepare("SELECT operation_key,source_context_json FROM workspace_tag_operations WHERE workspace_id=?1 ORDER BY operation_key").unwrap();
+    let receipts = statement
+        .query_map([TEST_WORKSPACE_ID], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(receipts.len(), 5);
+    for (key, context) in receipts {
+        let context: serde_json::Value = serde_json::from_str(&context).unwrap();
+        assert_eq!(
+            context["source_runtime_id"], source.runtime_id,
+            "receipt {key}: {context}"
+        );
+        assert_eq!(
+            context["source_worker_id"], source.worker_id,
+            "receipt {key}: {context}"
+        );
+        assert!(
+            context.get("source_account_id").is_none(),
+            "signed source became a human actor: {context}"
+        );
+    }
+    for event in tag_events {
+        assert_eq!(
+            event.attributes.get("source_runtime_id"),
+            Some(&source.runtime_id)
+        );
+        assert_eq!(
+            event.attributes.get("source_worker_id"),
+            Some(&source.worker_id)
+        );
+    }
+}
+
+#[tokio::test]
+async fn runtime_tag_receipt_replay_is_bound_to_verified_worker_not_transport_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut api = test_api(dir.path()).await;
+    let identity = RuntimeIdentityMaterial::generate("runtime-tags").unwrap();
+    configure_runtime_request_auth(&mut api, &identity, "runtime-tags");
+    for worker in ["classifier", "other"] {
+        seed_worker_source_member(&api, "runtime-tags", worker);
+    }
+    let app = build_router(api.clone());
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/ticket-tags");
+    let input =
+        json!({"operation_key":"worker-receipt", "action":{"kind":"create", "name":"ready"}});
+    let request = runtime_source_request(
+        &identity,
+        Some("classifier"),
+        "POST",
+        &path,
+        serde_json::to_vec(&input).unwrap(),
+    );
+    let proof =
+        request.headers()[worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER].clone();
+    let tag = runtime_tag_response(app.clone(), request, StatusCode::OK).await;
+    runtime_tag_response(
+        app.clone(),
+        Request::builder()
+            .method("POST")
+            .uri(&path)
+            .header(CONTENT_TYPE, "application/json")
+            .header(
+                worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+                proof,
+            )
+            .body(Body::from(serde_json::to_vec(&input).unwrap()))
+            .unwrap(),
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    assert_eq!(
+        runtime_tag_json(
+            app.clone(),
+            &identity,
+            "classifier",
+            "POST",
+            &path,
+            input.clone(),
+            StatusCode::OK
+        )
+        .await,
+        tag
+    );
+    runtime_tag_json(
+        app.clone(),
+        &identity,
+        "classifier",
+        "POST",
+        &path,
+        json!({"operation_key":"worker-receipt", "action":{"kind":"create", "name":"changed"}}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    runtime_tag_json(
+        app,
+        &identity,
+        "other",
+        "POST",
+        &path,
+        input,
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(
+        browser_ticket_backend(&api)
+            .unwrap()
+            .list_workspace_tags(ticket::TagListRequest::default())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn runtime_tag_mutations_reject_invalid_proofs_and_changed_binding_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut api, execution) = test_api_with_recording_backend(dir.path()).await;
+    let identity = RuntimeIdentityMaterial::generate("runtime-tags").unwrap();
+    configure_runtime_request_auth(&mut api, &identity, "runtime-tags");
+    seed_worker_source_member(&api, "runtime-tags", "classifier");
+    let backend = browser_ticket_backend(&api).unwrap();
+    let ticket = backend
+        .create(ticket::NewTicket::new("Rejected classification"))
+        .unwrap();
+    let ticket_before = backend.show(ticket.id.clone().into()).unwrap();
+    let authority_before = tag_execution_authority_snapshot(&api);
+    let app = build_router(api.clone());
+    let tags_path = format!("/api/w/{TEST_WORKSPACE_ID}/ticket-tags");
+    let membership_path = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{}/tags", ticket.id);
+    let attacker = RuntimeIdentityMaterial::generate("runtime-tags").unwrap();
+    // Both mutation routes must reject before writing tags, memberships, receipts
+    // or audit events. There is no persisted verification status in this fixture.
+    for (method, path, input) in [
+        (
+            "POST",
+            tags_path.as_str(),
+            json!({"operation_key":"denied-create", "action":{"kind":"create", "name":"denied"}}),
+        ),
+        (
+            "PUT",
+            membership_path.as_str(),
+            json!({"operation_key":"denied-set", "expected_tag_ids":[], "tag_ids":[]}),
+        ),
+    ] {
+        let body = serde_json::to_vec(&input).unwrap();
+        let unsigned = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-yoi-runtime-id", "runtime-tags")
+            .header("x-yoi-worker-id", "classifier")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        runtime_tag_response(app.clone(), unsigned, StatusCode::UNAUTHORIZED).await;
+        runtime_tag_json(
+            app.clone(),
+            &attacker,
+            "classifier",
+            method,
+            path,
+            input.clone(),
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        runtime_tag_json(
+            app.clone(),
+            &identity,
+            "not-a-member",
+            method,
+            path,
+            input.clone(),
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        let proof = worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&identity)
+            .issue(
+                "server-test",
+                "another-workspace",
+                Some("classifier"),
+                worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION,
+                method,
+                path,
+                &body,
+                i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap(),
+                30,
+            )
+            .unwrap();
+        runtime_tag_response(
+            app.clone(),
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header(CONTENT_TYPE, "application/json")
+                .header(
+                    worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+                    proof,
+                )
+                .body(Body::from(body.clone()))
+                .unwrap(),
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        let mut tampered =
+            runtime_source_request(&identity, Some("classifier"), method, path, body);
+        *tampered.body_mut() = Body::from(format!("{} ", input));
+        runtime_tag_response(app.clone(), tampered, StatusCode::UNAUTHORIZED).await;
+    }
+    let store = SqliteWorkspaceStore::open(&api.config.database_path).unwrap();
+    let original = api
+        .store
+        .get_workspace_runtime_binding(TEST_WORKSPACE_ID, "runtime-tags")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut replacement = original.clone();
+    replacement.public_key = attacker.public_key.clone();
+    replacement.public_key_fingerprint = String::new();
+    store
+        .upsert_workspace_runtime_binding(replacement, true)
+        .unwrap();
+    for (method, path, input) in [
+        (
+            "POST",
+            tags_path.as_str(),
+            json!({"operation_key":"stale-key-create", "action":{"kind":"create", "name":"stale"}}),
+        ),
+        (
+            "PUT",
+            membership_path.as_str(),
+            json!({"operation_key":"stale-key-set", "expected_tag_ids":[], "tag_ids":[]}),
+        ),
+    ] {
+        runtime_tag_json(
+            app.clone(),
+            &identity,
+            "classifier",
+            method,
+            path,
+            input,
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+    }
+    store
+        .upsert_workspace_runtime_binding(original, true)
+        .unwrap();
+    store
+        .revoke_workspace_runtime_binding(TEST_WORKSPACE_ID, "runtime-tags", TEST_CREATED_AT)
+        .unwrap();
+    for (method, path, input) in [
+        (
+            "POST",
+            tags_path.as_str(),
+            json!({"operation_key":"revoked-create", "action":{"kind":"create", "name":"revoked"}}),
+        ),
+        (
+            "PUT",
+            membership_path.as_str(),
+            json!({"operation_key":"revoked-set", "expected_tag_ids":[], "tag_ids":[]}),
+        ),
+    ] {
+        runtime_tag_json(
+            app.clone(),
+            &identity,
+            "classifier",
+            method,
+            path,
+            input,
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+    }
+    assert!(
+        backend
+            .list_workspace_tags(ticket::TagListRequest::default())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        serde_json::to_value(backend.show(ticket.id.into()).unwrap()).unwrap(),
+        serde_json::to_value(ticket_before).unwrap()
+    );
+    assert_eq!(tag_execution_authority_snapshot(&api), authority_before);
+    assert!(execution.protocol_methods().is_empty());
+    let conn = rusqlite::Connection::open(&api.config.database_path).unwrap();
+    let receipts: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM workspace_tag_operations WHERE workspace_id=?1",
+            [TEST_WORKSPACE_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(receipts, 0);
+}
+
 #[tokio::test]
 async fn ticket_tags_round_trip_filter_and_preserve_execution_and_decision_projections() {
     let dir = tempfile::tempdir().unwrap();

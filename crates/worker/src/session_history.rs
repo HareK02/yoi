@@ -17,6 +17,8 @@ pub type WorkerHistoryProvenance = LoggedSessionHistoryOrigin;
 pub type SessionHistoryDerivation = LoggedHistoryDerivation;
 pub type WorkerSubjectSnapshot = LoggedWorkerSubject;
 
+pub(crate) const COMPACTION_SUMMARY_HEADER: &str = "[Compacted context summary]\n\n";
+
 #[cfg(test)]
 pub(crate) fn test_logged_history_entry(item: impl Into<Item>) -> LoggedHistoryEntry {
     LoggedHistoryEntry {
@@ -108,8 +110,32 @@ pub(crate) fn restore_history_entries(
     let mut history = Vec::new();
     for entry in entries {
         match entry {
-            LogEntry::AnnotatedSegmentStart { history: seed, .. } => {
+            LogEntry::AnnotatedSegmentStart {
+                history: seed,
+                compacted_from,
+                ..
+            } => {
                 history = seed.iter().map(from_logged).collect();
+                // Older Host compactions always put this DerivedSummary system item
+                // first in the replacement seed. Only that trusted construction boundary
+                // may interpret the marker; never infer origin from appended/pasted text.
+                if compacted_from.is_some()
+                    && let Some(first) = history.first_mut()
+                    && first.annotation.origin == WorkerHistoryProvenance::DerivedSummary
+                    && matches!(
+                        &first.item,
+                        Item::Message {
+                            role: agen::Role::System,
+                            ..
+                        }
+                    )
+                    && first
+                        .item
+                        .as_text()
+                        .is_some_and(|text| text.starts_with(COMPACTION_SUMMARY_HEADER))
+                {
+                    first.annotation.origin = WorkerHistoryProvenance::CompactionSummary;
+                }
             }
             LogEntry::AnnotatedUserInput { history: input, .. } => {
                 history.extend(input.iter().map(from_logged))
@@ -143,6 +169,79 @@ mod tests {
     use agen::llm_client::RequestConfig;
     use protocol::Segment;
     use session_store::LogEntry;
+
+    #[test]
+    fn restore_recognizes_only_legacy_host_compaction_seed_summary() {
+        let summary = history_entry(
+            Item::system_message(format!("{COMPACTION_SUMMARY_HEADER}host summary")),
+            WorkerHistoryProvenance::DerivedSummary,
+        );
+        for compacted in [false, true] {
+            let seed = LogEntry::AnnotatedSegmentStart {
+                ts: 0,
+                session_id: SessionId::now_v7(),
+                system_prompt: None,
+                config: RequestConfig::default(),
+                history: vec![to_logged_history_entry(&summary)],
+                forked_from: None,
+                compacted_from: compacted.then(|| session_store::SegmentOrigin {
+                    segment_id: SegmentId::now_v7(),
+                    at_turn_index: 0,
+                }),
+            };
+            let appended = LogEntry::AnnotatedUserInput {
+                ts: 1,
+                segments: vec![],
+                extensions: vec![],
+                history: vec![to_logged_history_entry(&summary)],
+            };
+            let restored = restore_history_entries(
+                SessionId::now_v7(),
+                SegmentId::now_v7(),
+                &[seed, appended],
+            )
+            .unwrap();
+            assert_eq!(
+                restored[0].annotation.origin,
+                if compacted {
+                    WorkerHistoryProvenance::CompactionSummary
+                } else {
+                    WorkerHistoryProvenance::DerivedSummary
+                }
+            );
+            assert_eq!(
+                restored[1].annotation.origin,
+                WorkerHistoryProvenance::DerivedSummary
+            );
+            assert_eq!(restored[0].annotation.entry_id, summary.annotation.entry_id);
+        }
+        for item in [
+            Item::user_message(format!("{COMPACTION_SUMMARY_HEADER}pasted summary")),
+            Item::system_message("[Session TaskStore snapshot] tasks"),
+        ] {
+            let seed = LogEntry::AnnotatedSegmentStart {
+                ts: 0,
+                session_id: SessionId::now_v7(),
+                system_prompt: None,
+                config: RequestConfig::default(),
+                history: vec![to_logged_history_entry(&history_entry(
+                    item,
+                    WorkerHistoryProvenance::DerivedSummary,
+                ))],
+                forked_from: None,
+                compacted_from: Some(session_store::SegmentOrigin {
+                    segment_id: SegmentId::now_v7(),
+                    at_turn_index: 0,
+                }),
+            };
+            let restored =
+                restore_history_entries(SessionId::now_v7(), SegmentId::now_v7(), &[seed]).unwrap();
+            assert_eq!(
+                restored[0].annotation.origin,
+                WorkerHistoryProvenance::DerivedSummary
+            );
+        }
+    }
 
     #[test]
     fn typed_flow_and_unknown_caller_input_round_trip_without_role_inference() {

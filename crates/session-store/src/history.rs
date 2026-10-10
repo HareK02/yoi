@@ -67,6 +67,8 @@ pub enum LoggedSessionHistoryOrigin {
     ToolOutput {
         worker: LoggedWorkerSubject,
     },
+    /// Host-produced opening context summary; not auto-read or TaskStore material.
+    CompactionSummary,
     DerivedSummary,
     LegacyUnknown,
 }

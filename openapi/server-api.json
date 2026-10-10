@@ -1536,15 +1536,10 @@
           },
           "public_bundle": {
             "$ref": "#/components/schemas/RuntimePublicIdentityBundle"
-          },
-          "workspace_trust_id": {
-            "description": "Exact Runtime-issued enrollment identity from `trust-workspace add/show`.\nA key fingerprint alone cannot distinguish revocation and re-enrollment.",
-            "type": "string"
           }
         },
         "required": [
           "public_bundle",
-          "workspace_trust_id",
           "endpoint"
         ],
         "type": "object"
@@ -7846,15 +7841,6 @@
         ],
         "type": "object"
       },
-      "RuntimeConnectionDisplayState": {
-        "enum": [
-          "configured",
-          "verified",
-          "unavailable",
-          "revoked"
-        ],
-        "type": "string"
-      },
       "RuntimeConnectionTestFailureKind": {
         "enum": [
           "authentication",
@@ -7871,6 +7857,7 @@
       },
       "RuntimeConnectionTestResponse": {
         "additionalProperties": false,
+        "description": "Observation of an actual signed ping, not a grant or cached approval.",
         "properties": {
           "actual_protocol_version": {
             "format": "uint32",
@@ -7886,9 +7873,6 @@
           },
           "checked_at": {
             "type": "string"
-          },
-          "connection_state": {
-            "$ref": "#/components/schemas/RuntimeConnectionDisplayState"
           },
           "diagnostics": {
             "default": [],
@@ -7919,16 +7903,6 @@
           "status": {
             "$ref": "#/components/schemas/RuntimeConnectionTestStatus"
           },
-          "verification": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/RuntimeVerificationEvidenceSummary"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
           "workspace_id": {
             "type": "string"
           }
@@ -7937,7 +7911,6 @@
           "workspace_id",
           "runtime_id",
           "binding_id",
-          "connection_state",
           "checked_at",
           "status",
           "expected_protocol_version"
@@ -8388,57 +8361,6 @@
           "unconfigured",
           "active",
           "revoked"
-        ],
-        "type": "string"
-      },
-      "RuntimeVerificationEvidenceSummary": {
-        "additionalProperties": false,
-        "properties": {
-          "binding_id": {
-            "type": "string"
-          },
-          "last_checked_at": {
-            "type": "string"
-          },
-          "last_outcome": {
-            "$ref": "#/components/schemas/RuntimeVerificationOutcome"
-          },
-          "runtime_public_key_fingerprint": {
-            "type": "string"
-          },
-          "verified_at": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "workspace_key_id": {
-            "type": "string"
-          },
-          "workspace_public_key_fingerprint": {
-            "type": "string"
-          },
-          "workspace_trust_id": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "last_checked_at",
-          "last_outcome",
-          "binding_id",
-          "workspace_key_id",
-          "workspace_public_key_fingerprint",
-          "workspace_trust_id",
-          "runtime_public_key_fingerprint"
-        ],
-        "type": "object"
-      },
-      "RuntimeVerificationOutcome": {
-        "enum": [
-          "verified",
-          "challenge_issued",
-          "verification_failed",
-          "connectivity_failed"
         ],
         "type": "string"
       },
@@ -15449,43 +15371,14 @@
         ],
         "type": "object"
       },
-      "WorkspaceRuntimeBindingState": {
-        "enum": [
-          "configured",
-          "verified",
-          "revoked"
-        ],
-        "type": "string"
-      },
       "WorkspaceRuntimeBindingSummary": {
         "additionalProperties": false,
+        "description": "Binding identity and explicit revocation only. Each signed request authenticates\nusing the current Workspace signing identity, not a stored approval.",
         "properties": {
           "binding_id": {
             "type": "string"
           },
-          "connection_state": {
-            "$ref": "#/components/schemas/RuntimeConnectionDisplayState"
-          },
-          "state": {
-            "$ref": "#/components/schemas/WorkspaceRuntimeBindingState"
-          },
-          "verification": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/RuntimeVerificationEvidenceSummary"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "workspace_key_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "workspace_trust_id": {
+          "revoked_at": {
             "type": [
               "string",
               "null"
@@ -15493,8 +15386,6 @@
           }
         },
         "required": [
-          "state",
-          "connection_state",
           "binding_id"
         ],
         "type": "object"
@@ -16360,7 +16251,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:d65d33e53c3a08f21be2c5d3de1870b4748fdba71e2b960ea773043235977066"
+    "x-yoi-source-digest": "sha256:77c5da6cf4f7e71ff35800eddb637901c34f17f8265fc0eff1e9e0adbb78326c"
   },
   "openapi": "3.1.0",
   "paths": {

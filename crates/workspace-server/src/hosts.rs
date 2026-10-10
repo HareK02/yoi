@@ -2,9 +2,7 @@ use crate::Error;
 use crate::resource_broker::BackendResourceBroker;
 #[cfg(test)]
 use crate::resource_broker::BackendResourceTarget;
-use crate::store::{
-    ControlPlaneStore, WorkspaceRuntimeAuthenticationMode, WorkspaceRuntimeBindingState,
-};
+use crate::store::{ControlPlaneStore, WorkspaceRuntimeAuthenticationMode};
 use crate::workspace_signing_identity::WorkspaceSigningIdentityService;
 use chrono::Utc;
 use protocol::Segment;
@@ -66,11 +64,7 @@ use worker_runtime::ssh_host_key_probe::{
     SSH_HOST_KEY_PROBE_OPERATION, SSH_HOST_KEY_PROBE_PATH, SshHostKeyProbeRequest,
     SshHostKeyProbeResponse,
 };
-use worker_runtime::workspace_issuer::{
-    WorkspaceCapabilityClaims, WorkspaceRuntimeVerificationAcknowledgement,
-    WorkspaceRuntimeVerificationChallenge, WorkspaceRuntimeVerificationReceipt,
-    WorkspaceRuntimeVerificationResponse, workspace_request_body_digest,
-};
+use worker_runtime::workspace_issuer::{WorkspaceCapabilityClaims, workspace_request_body_digest};
 
 pub const EMBEDDED_RUNTIME_ID: &str = "embedded-worker-runtime";
 const EMBEDDED_HOST_KIND: &str = "embedded-worker-runtime-host";
@@ -923,32 +917,6 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
             code: "ssh_host_key_probe_unsupported".to_string(),
             message: "Runtime does not support SSH host key probing".to_string(),
         })
-    }
-
-    fn activate_workspace_authorization(&self, _binding: crate::store::WorkspaceRuntimeBinding) {}
-
-    fn send_workspace_verification_challenge(
-        &self,
-        _challenge: &WorkspaceRuntimeVerificationChallenge,
-        _bearer_token: &str,
-    ) -> Result<WorkspaceRuntimeVerificationResponse, RuntimePingFailure> {
-        Err(RuntimePingFailure::new(
-            RuntimePingFailureKind::Unsupported,
-            "runtime_workspace_verification_unsupported",
-            "Workspace Runtime verification is unavailable for this Runtime provider",
-        ))
-    }
-
-    fn send_workspace_verification_acknowledgement(
-        &self,
-        _acknowledgement: &WorkspaceRuntimeVerificationAcknowledgement,
-        _bearer_token: &str,
-    ) -> Result<WorkspaceRuntimeVerificationReceipt, RuntimePingFailure> {
-        Err(RuntimePingFailure::new(
-            RuntimePingFailureKind::Unsupported,
-            "runtime_workspace_verification_unsupported",
-            "Workspace Runtime verification is unavailable for this Runtime provider",
-        ))
     }
 
     fn list_hosts(&self, limit: usize) -> RuntimeList<InternalHostSummary>;
@@ -2277,48 +2245,6 @@ impl RuntimeRegistry {
         runtime.ping()
     }
 
-    pub fn activate_workspace_authorization(
-        &self,
-        runtime_id: &str,
-        binding: crate::store::WorkspaceRuntimeBinding,
-    ) -> Result<(), RuntimeRegistryError> {
-        self.runtime(runtime_id)?
-            .activate_workspace_authorization(binding);
-        Ok(())
-    }
-
-    pub fn send_workspace_verification_challenge(
-        &self,
-        runtime_id: &str,
-        challenge: &WorkspaceRuntimeVerificationChallenge,
-        bearer_token: &str,
-    ) -> Result<WorkspaceRuntimeVerificationResponse, RuntimePingFailure> {
-        let runtime = self.runtime(runtime_id).map_err(|_| {
-            RuntimePingFailure::new(
-                RuntimePingFailureKind::Configuration,
-                "runtime_verification_registration_unavailable",
-                "Registered Runtime binding is unavailable",
-            )
-        })?;
-        runtime.send_workspace_verification_challenge(challenge, bearer_token)
-    }
-
-    pub fn send_workspace_verification_acknowledgement(
-        &self,
-        runtime_id: &str,
-        acknowledgement: &WorkspaceRuntimeVerificationAcknowledgement,
-        bearer_token: &str,
-    ) -> Result<WorkspaceRuntimeVerificationReceipt, RuntimePingFailure> {
-        let runtime = self.runtime(runtime_id).map_err(|_| {
-            RuntimePingFailure::new(
-                RuntimePingFailureKind::Configuration,
-                "runtime_verification_registration_unavailable",
-                "Registered Runtime binding is unavailable",
-            )
-        })?;
-        runtime.send_workspace_verification_acknowledgement(acknowledgement, bearer_token)
-    }
-
     fn runtimes_snapshot(&self) -> Vec<Arc<dyn WorkspaceWorkerRuntime>> {
         self.runtimes
             .read()
@@ -3518,7 +3444,9 @@ pub struct WorkspaceRuntimeAuthorization {
     store: Arc<dyn ControlPlaneStore>,
     signing_identities: WorkspaceSigningIdentityService,
     backend_url: String,
-    binding: Arc<RwLock<Option<crate::store::WorkspaceRuntimeBinding>>>,
+    // The connection selected for this client. Compare it with the current
+    // administrative configuration before sending, never with a past auth result.
+    binding: crate::store::WorkspaceRuntimeBinding,
 }
 
 impl std::fmt::Debug for WorkspaceRuntimeAuthorization {
@@ -3535,19 +3463,13 @@ impl WorkspaceRuntimeAuthorization {
         store: Arc<dyn ControlPlaneStore>,
         signing_identities: WorkspaceSigningIdentityService,
         backend_url: impl Into<String>,
-        binding: Option<crate::store::WorkspaceRuntimeBinding>,
+        binding: crate::store::WorkspaceRuntimeBinding,
     ) -> Self {
         Self {
             store,
             signing_identities,
             backend_url: backend_url.into(),
-            binding: Arc::new(RwLock::new(binding)),
-        }
-    }
-
-    fn activate(&self, binding: crate::store::WorkspaceRuntimeBinding) {
-        if let Ok(mut current) = self.binding.write() {
-            *current = Some(binding);
+            binding,
         }
     }
 
@@ -3559,30 +3481,14 @@ impl WorkspaceRuntimeAuthorization {
         worker_id: Option<&str>,
         body: &[u8],
     ) -> Result<String, RuntimeDiagnostic> {
-        let binding = self
-            .binding
-            .read()
-            .map_err(|_| {
-                diagnostic(
-                    "workspace_runtime_authorization_unavailable",
-                    HostDiagnosticSeverity::Error,
-                    "Workspace Runtime authorization is unavailable".to_string(),
-                )
-            })?
-            .clone()
-            .ok_or_else(|| {
-                diagnostic(
-                    "workspace_runtime_verification_required",
-                    HostDiagnosticSeverity::Error,
-                    "Workspace Runtime binding is not verified".to_string(),
-                )
-            })?;
-        if binding.state != WorkspaceRuntimeBindingState::Verified
-            || binding.authentication_mode != WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity
+        let binding = &self.binding;
+        // A removed/replaced endpoint must not be used by an old client. This
+        // compares connection configuration, not cached authentication success.
+        if binding.authentication_mode != WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity
             || binding.revoked_at.is_some()
             || !self
                 .store
-                .workspace_runtime_binding_matches(&binding)
+                .workspace_runtime_binding_matches(binding)
                 .map_err(|error| {
                     diagnostic(
                         "workspace_runtime_authorization_unavailable",
@@ -3594,7 +3500,7 @@ impl WorkspaceRuntimeAuthorization {
             return Err(diagnostic(
                 "workspace_runtime_authorization_stale",
                 HostDiagnosticSeverity::Error,
-                "Workspace Runtime binding changed or was revoked".to_string(),
+                "Workspace Runtime connection changed or was revoked".to_string(),
             ));
         }
         let identity = self
@@ -3607,63 +3513,26 @@ impl WorkspaceRuntimeAuthorization {
                     error.to_string(),
                 )
             })?;
-        let workspace_key_id = binding.workspace_key_id.as_deref().ok_or_else(|| {
-            diagnostic(
-                "workspace_runtime_authorization_invalid",
-                HostDiagnosticSeverity::Error,
-                "Workspace Runtime binding is missing its Workspace key".to_string(),
-            )
-        })?;
-        let workspace_public_key_fingerprint = binding
-            .workspace_public_key_fingerprint
-            .as_deref()
-            .ok_or_else(|| {
-                diagnostic(
-                    "workspace_runtime_authorization_invalid",
-                    HostDiagnosticSeverity::Error,
-                    "Workspace Runtime binding is missing its Workspace public key fingerprint"
-                        .to_string(),
-                )
-            })?;
-        let workspace_trust_id = binding.workspace_trust_id.as_deref().ok_or_else(|| {
-            diagnostic(
-                "workspace_runtime_authorization_invalid",
-                HostDiagnosticSeverity::Error,
-                "Workspace Runtime binding is missing its Workspace trust ID".to_string(),
-            )
-        })?;
-        if identity.state != "active"
-            || identity.key_id != workspace_key_id
-            || identity.public_key_fingerprint.as_deref() != Some(workspace_public_key_fingerprint)
-            || !self
-                .store
-                .workspace_runtime_verification_matches(
-                    &binding,
-                    workspace_public_key_fingerprint,
-                    workspace_trust_id,
-                )
-                .map_err(|error| {
-                    diagnostic(
-                        "workspace_runtime_authorization_unavailable",
-                        HostDiagnosticSeverity::Error,
-                        error.to_string(),
-                    )
-                })?
-        {
+        if identity.state != "active" {
             return Err(diagnostic(
-                "workspace_runtime_authorization_stale",
+                "workspace_signing_identity_unavailable",
                 HostDiagnosticSeverity::Error,
-                "Workspace signing identity no longer matches the verified binding".to_string(),
+                "Workspace signing identity is not active".to_string(),
             ));
         }
+        let fingerprint = identity.public_key_fingerprint.ok_or_else(|| {
+            diagnostic(
+                "workspace_signing_identity_unavailable",
+                HostDiagnosticSeverity::Error,
+                "Workspace signing identity has no public key fingerprint".to_string(),
+            )
+        })?;
         let now = Utc::now().timestamp();
         let claims = WorkspaceCapabilityClaims {
             issuer: self.backend_url.clone(),
             issuer_workspace_id: binding.workspace_id.clone(),
             issuer_key_id: identity.key_id,
-            issuer_public_key_fingerprint: workspace_public_key_fingerprint.to_string(),
-            trust_id: workspace_trust_id.to_string(),
-            binding_id: binding.binding_id.clone(),
+            issuer_public_key_fingerprint: fingerprint,
             runtime_id: binding.runtime_id.clone(),
             worker_id: worker_id.map(str::to_string),
             operation: operation.to_string(),
@@ -3674,6 +3543,8 @@ impl WorkspaceRuntimeAuthorization {
             exp: now.saturating_add(60),
             jti: uuid::Uuid::now_v7().to_string(),
         };
+        // The signer validates that these claims still name the selected current
+        // identity; a concurrent rotation cannot silently sign mismatched claims.
         self.signing_identities
             .issue_workspace_capability(&binding.workspace_id, &claims)
             .map_err(|error| {
@@ -4251,49 +4122,6 @@ impl RemoteWorkerRuntime {
         format!("{base}/v1/workers/{worker_id}/protocol/ws")
     }
 
-    fn post_bearer_json<T, U>(
-        &self,
-        path: &str,
-        body: &T,
-        bearer_token: &str,
-    ) -> Result<U, RuntimePingFailure>
-    where
-        T: Serialize + ?Sized,
-        U: DeserializeOwned,
-    {
-        let response = self
-            .http
-            .post(self.endpoint(path))
-            .bearer_auth(bearer_token)
-            .json(body)
-            .send()
-            .map_err(|error| {
-                RuntimePingFailure::new(
-                    RuntimePingFailureKind::NetworkUnreachable,
-                    "runtime_workspace_verification_unreachable",
-                    format!("Runtime verification request failed: {error}"),
-                )
-            })?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(RuntimePingFailure::new(
-                RuntimePingFailureKind::MalformedResponse,
-                "runtime_workspace_verification_rejected",
-                format!(
-                    "Runtime verification request returned HTTP {}",
-                    status.as_u16()
-                ),
-            ));
-        }
-        response.json::<U>().map_err(|error| {
-            RuntimePingFailure::new(
-                RuntimePingFailureKind::MalformedResponse,
-                "runtime_workspace_verification_invalid_response",
-                format!("Runtime verification response was invalid: {error}"),
-            )
-        })
-    }
-
     fn get_json<T>(&self, path: &str) -> Result<T, RuntimeDiagnostic>
     where
         T: DeserializeOwned + Send + 'static,
@@ -4700,36 +4528,6 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             };
             RuntimePingFailure::new(kind, code, message)
         })
-    }
-
-    fn activate_workspace_authorization(&self, binding: crate::store::WorkspaceRuntimeBinding) {
-        if let Some(authorization) = &self.workspace_authorization {
-            authorization.activate(binding);
-        }
-    }
-
-    fn send_workspace_verification_challenge(
-        &self,
-        challenge: &WorkspaceRuntimeVerificationChallenge,
-        bearer_token: &str,
-    ) -> Result<WorkspaceRuntimeVerificationResponse, RuntimePingFailure> {
-        self.post_bearer_json(
-            worker_runtime::workspace_issuer::WORKSPACE_VERIFICATION_CHALLENGE_PATH,
-            challenge,
-            bearer_token,
-        )
-    }
-
-    fn send_workspace_verification_acknowledgement(
-        &self,
-        acknowledgement: &WorkspaceRuntimeVerificationAcknowledgement,
-        bearer_token: &str,
-    ) -> Result<WorkspaceRuntimeVerificationReceipt, RuntimePingFailure> {
-        self.post_bearer_json(
-            worker_runtime::workspace_issuer::WORKSPACE_VERIFICATION_ACK_PATH,
-            acknowledgement,
-            bearer_token,
-        )
     }
 
     fn list_hosts(&self, limit: usize) -> RuntimeList<InternalHostSummary> {
@@ -6536,6 +6334,7 @@ pub fn placeholder_spawn_response(host_id: impl Into<String>) -> WorkerSpawnResu
 #[cfg(test)]
 mod tests {
     mod restore_auth_tests;
+    mod workspace_auth_tests;
 
     use super::*;
     use serde_json::json;
