@@ -46,25 +46,96 @@ retry can reconcile the provider's current state.
 
 A retained partial-removal Workdir is listed as `cleanup_pending` with cleanliness
 `unknown`. List/detail observation checks its saved identity but does not read or
-hash surviving checkout content. The saved removal witness is not a current
-cleanliness assertion; only an actual removal retry runs the full content checks.
+hash surviving checkout content. Saved removal authority is not a current
+cleanliness assertion; an actual removal retry rechecks current safety conditions
+and the metadata of surviving entries.
 
 ## Runtime safety boundary
 
-The Runtime keeps removal content/identity evidence outside the tree being
-removed. This is a factual witness for partial deletion, not a new recovery
-state or cleanup stage. Surviving files are rechecked against it; an intact,
-currently clean checkout can renew obsolete evidence without discarding newly
-ignored/untracked content. Do not edit this witness manually.
+The Runtime keeps removal identity and metadata evidence outside the tree being
+removed, in `.cleanup-authority`. This is factual authority for partial deletion,
+not a new recovery state or cleanup stage. Do not edit it manually.
+
+### Metadata-only removal authority
+
+Initial cleanup, ordinary retry, partial-removal recovery and each pre-unlink
+check use descriptor-relative entry metadata, without following symlinks or
+crossing mount boundaries. Cleanup does not read regular-file bodies or compute
+content hashes, and does not create, refresh or compare durable content digests.
+The inventory records:
+
+- entry identity (device/inode) and filesystem type;
+- executable bits for regular files, plus size and modification time with
+  nanosecond precision for regular files and symlinks;
+- identity and type only for directories. Directory size, permissions and
+  timestamps are not a change witness: cleanup's own child unlinks change
+  directory timestamps.
+
+This is metadata change protection, not a byte-equality guarantee. Deliberate
+same-size writes that restore the recorded timestamp are not promised to be
+detected. Symlink targets are not traversed or read for a content digest.
+Necessary entry enumeration, metadata inspection and unlink remain; their work
+is not proportional to the total regular-file body size. Normal Git inspection
+may still read repository content, and the Runtime still reads its small managed
+metadata records. Neither is a cleanup-specific full-content scan.
+
+### Clean checkout and ordinary retry
+
+Initial admission and metadata renewal from a usable checkout still require the
+normal Git dirty check, including non-ignored untracked files. Dirty content is
+not authorized for removal. Ignored entries already present at the initial clean
+attempt are included in that attempt's metadata authority; Git ignoring a path
+alone is not permission to discard later changes to it.
+
+On retry with an intact, usable Git checkout, new or metadata-changed ignored
+entries and entries outside the tracked checkout/Git set are protected with
+`changes_present`. A currently clean checkout may renew tracked-file and Git-entry
+metadata only after the same Workdir root, checkout and Git identities and
+materialization ownership are confirmed. Clean Git does not renew authority for
+changed ignored/outside entries. A replaced Workdir root, checkout or Git directory,
+or substituted ownership, is rejected with `ownership_unknown`.
+
+With the new metadata format, surviving entries that match a subset of the
+persisted metadata authority can be removed after partial deletion even when Git
+is no longer usable or present. Any surviving Runtime materialization record must
+still be validated as the same materialization. Missing entries do not invalidate
+that authority, and directory timestamp changes from earlier unlinks do not block
+retry. If new entries or metadata changes break the subset match and usable Git
+is unavailable, the partial cleanup returns `changes_unknown`, not
+`changes_present`: it cannot establish current change safety or renew the
+metadata authority. Unknown partial residue without metadata authority likewise
+returns `changes_unknown`; a prior failed attempt is not proof of cleanliness.
+Validated metadata-only residue (the Runtime materialization record and, at most,
+an empty checkout directory) may finish without Git.
+
+### Existing digest-based authority
+
+Old `.cleanup-authority` entries may contain `digest` fields. Those digests are
+ignored/discarded, not recomputed or compared, and do not authorize residual file
+content under the new contract. Migration can establish new metadata authority
+only with a usable current clean Git checkout, the same root, checkout and Git
+identities, and validated materialization ownership. Even then, surviving ignored
+entries or other entries outside the tracked checkout/Git set block migration
+with `changes_unknown`: legacy entries have no size/mtime metadata against which
+to verify these non-tracked survivors. Clean Git alone cannot authorize them.
+
+An incomplete legacy cleanup cannot use the new-format subset rule. Residual
+files without usable clean Git return `changes_unknown`; they are not adopted,
+and digest regeneration is not required. Metadata-only residue may finish only
+with validated saved ownership, confirmed remaining identities, and validation
+of any surviving Runtime materialization record. An empty same-identity root can
+finish even when its record was already removed. Replaced root/checkout/Git identities or substituted ownership remain
+`ownership_unknown`. Ordinary retry and Runtime restart use these same rules;
+manual metadata edits and a new recovery lifecycle are not required.
 
 Mount-safe removal currently requires Linux `openat2` and `/proc` inspection.
 Unavailable inspection fails closed with `mount_check_unavailable`; there is no
 fallback to recursive deletion across an unchecked filesystem boundary.
 Runtime HTTP list, detail and removal requests run synchronous provider work on
 blocking workers rather than the HTTP executor. Removal reserves only the target
-Workdir under the Runtime state mutex, then releases that mutex before content
-inspection and unlink. Unrelated Worker list/detail, session observation and
-subscription snapshots remain available while removal runs. Conflicting use,
+Workdir under the Runtime state mutex, then releases that mutex before metadata
+and Git inspection and unlink. Unrelated Worker list/detail, session observation
+and subscription snapshots remain available while removal runs. Conflicting use,
 attachment, creation or removal of the same Workdir is rejected promptly rather
 than waiting under the global mutex.
 

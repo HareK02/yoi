@@ -741,22 +741,12 @@ impl RuntimeGitMaterializer {
         // Frozen evidence normalization can write the record. Keep it inside
         // use admission so observational reads cannot race physical cleanup.
         let _use_lease = self.occupancy.acquire_use(working_directory_id)?;
-        self.read_binding_record(working_directory_id, true)
-    }
-
-    fn read_binding_for_cleanup(
-        &self,
-        working_directory_id: &str,
-    ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
-        // Cleanup already owns exclusive admission and validates the original
-        // bytes. Its witnessed status write performs any canonicalization.
-        self.read_binding_record(working_directory_id, false)
+        self.read_binding_record(working_directory_id)
     }
 
     fn read_binding_record(
         &self,
         working_directory_id: &str,
-        migrate: bool,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
         let working_directory_root = self.working_directory_root(working_directory_id);
         let path = working_directory_root.join(MATERIALIZATION_RECORD);
@@ -793,7 +783,7 @@ impl RuntimeGitMaterializer {
                 "materialization evidence is invalid",
             )
         })?;
-        if migrate && canonical != raw {
+        if canonical != raw {
             let temporary = path.with_extension(format!("migration-{}.tmp", uuid::Uuid::now_v7()));
             let result = (|| -> std::io::Result<()> {
                 let mut file = fs::OpenOptions::new()
@@ -4783,9 +4773,16 @@ mod tests {
             materializer.read_binding(id).unwrap_err().code,
             "working_directory_cleanup_resource_busy"
         );
-        materializer.read_binding_for_cleanup(id).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), original);
         drop(cleanup);
+        // Actual cleanup admission reads the legacy record without rewriting it
+        // before change protection has admitted removal.
+        fs::write(binding.root.join("README.md"), "preserve change").unwrap();
+        assert_eq!(
+            materializer.cleanup_working_directory(id).unwrap_err().code,
+            "working_directory_cleanup_changes_present"
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        git(binding.root(), &["restore", "README.md"]);
 
         materializer.read_binding(id).unwrap();
         let canonical: serde_json::Value =

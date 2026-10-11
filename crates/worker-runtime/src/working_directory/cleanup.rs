@@ -1,8 +1,8 @@
-//! Ordinary removal authority, not a recovery lifecycle. The content witness is
-//! outside the tree being removed so a crash/partial unlink cannot erase it.
-//! Every retry checks current identities, mounts and remaining content. Missing
-//! entries are expected after partial deletion. The same intact clean checkout
-//! may renew its witness after owner recovery, never discarding new ignored content.
+//! Ordinary removal authority, not a recovery lifecycle. Durable entry metadata
+//! outside the removed tree permits a surviving subset after partial unlink.
+//! No ordinary file body is read by deletion. Git protects a usable checkout;
+//! identity/type/size/mtime protect other entries, not byte-for-byte equality.
+//! Directory timestamps are excluded because our own unlink changes them.
 use super::*;
 use std::io;
 
@@ -30,7 +30,7 @@ fn cause(kind: &str) -> WorkingDirectoryDiagnostic {
             "New or changed content is present. Preserve or resolve those changes before retrying removal."
         }
         _ => {
-            "The checkout is incomplete and remaining content has no usable removal witness. Preserve residual content outside this Workdir and restore the same usable checkout, or ask its owner to remove verified residual content before retrying. Do not edit removal metadata."
+            "Remaining entries cannot be authorized from saved entry metadata and a usable clean checkout. Preserve residual content outside this Workdir and restore the same usable checkout, or ask its owner to remove verified residual content before retrying. Do not edit removal metadata."
         }
     };
     WorkingDirectoryDiagnostic::new(format!("working_directory_cleanup_{kind}"), message)
@@ -77,7 +77,7 @@ pub(super) fn remaining_status(
     let mut summary = saved.working_directory.status_summary();
     summary.status = WorkingDirectoryStatusKind::CleanupPending;
     // Observation is not removal admission: do not inventory or hash the
-    // surviving checkout just to list it. The witness can be stale, so neither
+    // surviving checkout just to list it. The entry authority can be stale, so neither
     // its old cleanliness nor a successful identity check proves current content
     // is safe to remove. Actual retries still perform the full safety checks.
     summary.cleanliness = Some("unknown".to_string());
@@ -165,7 +165,7 @@ fn remove_with_checks(
         }
     })?;
     // Mount table preflight catches mounted files and same-device bind mounts
-    // before Git/status/hash reads; descriptor NO_XDEV remains the race guard.
+    // before Git status or Runtime metadata reads; descriptor NO_XDEV remains the race guard.
     check_mounts(
         &materializer.working_directory_root(id),
         &mount_info().map_err(|e| {
@@ -174,28 +174,30 @@ fn remove_with_checks(
         })?,
     )?;
     let authority = if let Some(saved) = saved {
-        if saved.working_directory.id != id || saved.root_identity != root_identity {
+        validate_directory_owner(id, &saved.working_directory)?;
+        if saved.root_identity != root_identity {
             return Err(cause("ownership_unknown"));
         }
         let entries = retry_inventory(materializer, id, &tree, &saved)?;
-        if verify_remaining(&saved.entries, &entries).is_ok() {
+        if !saved.legacy && verify_remaining(&saved.entries, &entries).is_ok() {
             saved
         } else {
-            let authority = Authority { entries, ..saved };
-            // Renew obsolete content evidence only from a current clean, intact
-            // checkout. Partial deletion without Git retains the old witness.
+            let authority = Authority {
+                entries,
+                legacy: false,
+                ..saved
+            };
+            // Renew only after retry admission proves a usable clean checkout.
+            // Legacy byte digests are never read back from checkout content.
             persist_authority(&parent, id, &authority)
                 .map_err(|e| os_failure(id, "refresh_removal_authority", e))?;
             authority
         }
     } else {
-        let mut binding = materializer
-            .read_binding_for_cleanup(id)
-            .map_err(|_| cause("ownership_unknown"))?;
-        validate_binding(materializer, id, &binding)?;
-        // Preflight the entire tree without following links or crossing mounts,
-        // before asking Git to inspect the checkout.
+        // Preflight identities and entry metadata, never ordinary file bodies.
         let before = inventory(&tree).map_err(|e| os_failure(id, "inspect_tree", e))?;
+        let mut binding = read_cleanup_binding(materializer, id, &tree)?;
+        validate_binding(materializer, id, &binding)?;
         // Validated metadata-only residue contains no user content to discard.
         if !metadata_only(&before) {
             check_clean_checkout(id, &binding, &before, None)?;
@@ -211,9 +213,9 @@ fn remove_with_checks(
         let raw = serde_json::to_vec_pretty(&record).map_err(|_| cause("storage_unavailable"))?;
         rewrite_record(&tree, &raw, before.get(Path::new(MATERIALIZATION_RECORD)))
             .map_err(|e| os_failure(id, "write_cleanup_pending", e))?;
-        let entries = inventory(&tree).map_err(|e| os_failure(id, "capture_removal_content", e))?;
+        let entries = inventory(&tree).map_err(|e| os_failure(id, "capture_entry_metadata", e))?;
         // Only our status-record write may differ between the clean observation
-        // and durable witness. Never authorize a newly arrived user change.
+        // and durable entry authority. Never authorize a newly arrived user change.
         let mut without_record = entries.clone();
         without_record.remove(Path::new(MATERIALIZATION_RECORD));
         let mut before_without_record = before;
@@ -225,26 +227,22 @@ fn remove_with_checks(
             working_directory: binding.working_directory.clone(),
             root_identity,
             entries,
+            legacy: false,
         };
         persist_authority(&parent, id, &authority)
             .map_err(|e| os_failure(id, "persist_removal_authority", e))?;
         authority
     };
-    let current = inventory(&tree).map_err(|e| os_failure(id, "recheck_remaining_content", e))?;
+    let current = inventory(&tree).map_err(|e| os_failure(id, "recheck_remaining_metadata", e))?;
     verify_remaining(&authority.entries, &current)?;
-    // Repeat the content/identity comparison at each unlink. No unverified
+    check_live_root(&parent, id, authority.root_identity)?;
+    // Repeat entry metadata/identity comparison at each unlink. No unverified
     // recursion into a replaced entry, even if a mount arrives after preflight.
     erase_tree(&tree, Path::new(""), &authority.entries).map_err(|e| match e {
         EraseError::Io(e) => os_failure(id, "unlink_remaining_tree", e),
         EraseError::Changed => cause("changes_present"),
     })?;
-    let current_root = open_directory(&parent, std::ffi::OsStr::new(id))
-        .map_err(|e| os_failure(id, "recheck_root_identity", e))?;
-    if identity(&current_root).map_err(|e| os_failure(id, "recheck_root_identity", e))?
-        != authority.root_identity
-    {
-        return Err(cause("ownership_unknown"));
-    }
+    check_live_root(&parent, id, authority.root_identity)?;
     unlink(&parent, std::ffi::OsStr::new(id), true)
         .map_err(|e| os_failure(id, "unlink_cleanup_root", e))?;
     parent
@@ -261,6 +259,57 @@ fn remove_with_checks(
     summary.status = WorkingDirectoryStatusKind::NotFound;
     summary.cleanliness = Some("unknown".to_string());
     Ok(WorkingDirectoryStatus { summary })
+}
+
+#[cfg(target_os = "linux")]
+fn check_live_root(
+    parent: &fs::File,
+    id: &str,
+    expected: (u64, u64),
+) -> Result<(), WorkingDirectoryDiagnostic> {
+    let live =
+        open_directory(parent, std::ffi::OsStr::new(id)).map_err(|_| cause("ownership_unknown"))?;
+    if identity(&live).map_err(|e| os_failure(id, "recheck_root_identity", e))? != expected {
+        return Err(cause("ownership_unknown"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_cleanup_binding(
+    materializer: &RuntimeGitMaterializer,
+    id: &str,
+    tree: &fs::File,
+) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
+    // This small, typed Runtime-owned record is distinct from checkout bodies.
+    // Descriptor-relative access also rejects symlink/mount substitution.
+    let raw = read_runtime_metadata(
+        tree,
+        std::ffi::OsStr::new(MATERIALIZATION_RECORD),
+        1024 * 1024,
+    )
+    .map_err(|e| {
+        if e.kind() == io::ErrorKind::InvalidData
+            || matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR))
+        {
+            cause("ownership_unknown")
+        } else {
+            os_failure(id, "read_cleanup_record", e)
+        }
+    })?;
+    let record: WorkingDirectoryMaterializationRecord =
+        serde_json::from_slice(&raw).map_err(|_| cause("ownership_unknown"))?;
+    Ok(WorkingDirectoryBinding {
+        working_directory: record.working_directory,
+        root: record.root.clone(),
+        cwd: record.root,
+        working_directory_root: materializer.working_directory_root(id),
+        command_environment: BTreeMap::new(),
+        session_resources: Vec::new(),
+        occupancy: materializer.occupancy.clone(),
+        occupancy_id: id.to_string(),
+        generation: materializer.occupancy.generation(&id),
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -293,21 +342,36 @@ fn retry_inventory(
     saved: &Authority,
 ) -> Result<BTreeMap<PathBuf, Entry>, WorkingDirectoryDiagnostic> {
     let before = inventory(tree).map_err(|e| os_failure(id, "inspect_retry_tree", e))?;
-    if verify_remaining(&saved.entries, &before).is_ok() {
-        // With no Git left, only the old witness authorizes the surviving subset.
+    // A surviving Runtime record must still describe the same materialization,
+    // even when its entry metadata matches. Access proof refresh is allowed.
+    for required in [Path::new(CHECKOUT_DIR), Path::new("checkout/.git")] {
+        if let Some(entry) = before.get(required) {
+            if saved.entries.get(required) != Some(entry) {
+                return Err(cause("ownership_unknown"));
+            }
+        }
+    }
+    let binding = if before.contains_key(Path::new(MATERIALIZATION_RECORD)) {
+        let binding = read_cleanup_binding(materializer, id, tree)?;
+        validate_binding(materializer, id, &binding)?;
+        if !same_materialization(&saved.working_directory, &binding.working_directory) {
+            return Err(cause("ownership_unknown"));
+        }
+        Some(binding)
+    } else {
+        None
+    };
+    if !saved.legacy && verify_remaining(&saved.entries, &before).is_ok() {
+        // Missing entries are expected after partial unlink. Only the matching
+        // surviving subset is admitted, even without a usable Git checkout.
         return Ok(before);
     }
-    let binding = materializer
-        .read_binding_for_cleanup(id)
-        .map_err(|_| cause("changes_present"))?;
-    validate_binding(materializer, id, &binding)?;
-    if !same_materialization(&saved.working_directory, &binding.working_directory)
-        || before
-            .get(Path::new(MATERIALIZATION_RECORD))
-            .is_none_or(|entry| entry.mode & libc::S_IFMT != libc::S_IFREG)
-    {
-        return Err(cause("ownership_unknown"));
+    if metadata_only(&before) {
+        // Even a legacy root with no entries left has no user content. Root
+        // identity and saved ownership are still required; validate any record.
+        return Ok(before);
     }
+    let binding = binding.ok_or_else(|| cause("changes_unknown"))?;
     check_clean_checkout(id, &binding, &before, Some(saved))?;
     let parent = fs::File::open(&materializer.runtime_root)
         .map_err(|e| os_failure(id, "reopen_runtime_root", e))?;
@@ -318,7 +382,7 @@ fn retry_inventory(
     {
         return Err(cause("ownership_unknown"));
     }
-    if inventory(tree).map_err(|e| os_failure(id, "recheck_retry_content", e))? != before {
+    if inventory(tree).map_err(|e| os_failure(id, "recheck_retry_metadata", e))? != before {
         return Err(cause("changes_present"));
     }
     Ok(before)
@@ -345,6 +409,8 @@ fn check_clean_checkout(
         }
     }
     let run = |args: &[&str]| -> Result<Vec<u8>, WorkingDirectoryDiagnostic> {
+        #[cfg(test)]
+        io_observation::record(io_observation::Event::GitInspection);
         let output = isolated_git_command()
             .env("GIT_OPTIONAL_LOCKS", "0")
             // Do not run repository-configured fsmonitor hooks while Runtime
@@ -381,14 +447,20 @@ fn check_clean_checkout(
             }
         }
         // Git clean is not ignored-content permission. Current tracked content
-        // and Git metadata may change; all other entries stay witness-protected.
+        // and Git metadata may change; all other entries stay metadata-protected.
         for (path, entry) in before {
             if path != Path::new(MATERIALIZATION_RECORD)
                 && !path.starts_with("checkout/.git")
                 && !git_paths.contains(path)
-                && saved.entries.get(path) != Some(entry)
             {
-                return Err(cause("changes_present"));
+                // Old digests cannot establish current ignored/outside-tree
+                // safety without body reads. Never renew uncertain residue.
+                if saved.legacy {
+                    return Err(cause("changes_unknown"));
+                }
+                if saved.entries.get(path) != Some(entry) {
+                    return Err(cause("changes_present"));
+                }
             }
         }
     }
@@ -453,7 +525,17 @@ pub(super) fn validate_binding(
     id: &str,
     binding: &WorkingDirectoryBinding,
 ) -> Result<(), WorkingDirectoryDiagnostic> {
-    let directory = &binding.working_directory;
+    validate_directory_owner(id, &binding.working_directory)?;
+    if binding.root != materializer.working_directory_root(id).join(CHECKOUT_DIR) {
+        return Err(cause("ownership_unknown"));
+    }
+    Ok(())
+}
+
+fn validate_directory_owner(
+    id: &str,
+    directory: &WorkingDirectory,
+) -> Result<(), WorkingDirectoryDiagnostic> {
     if directory.id != id
         || directory.materializer_kind != MaterializerKind::RuntimeGitClone
         || directory.evidence.materializer_kind != MaterializerKind::RuntimeGitClone
@@ -461,7 +543,6 @@ pub(super) fn validate_binding(
         || directory.cleanup_target.working_directory_id != id
         || directory.cleanup_target.repository_id != directory.repository_id
         || directory.cleanup_target.kind != "runtime_git_clone"
-        || binding.root != materializer.working_directory_root(id).join(CHECKOUT_DIR)
     {
         return Err(cause("ownership_unknown"));
     }
@@ -473,7 +554,60 @@ pub(super) fn validate_binding(
 struct Authority {
     working_directory: WorkingDirectory,
     root_identity: (u64, u64),
+    #[serde(rename = "entry_metadata")]
     entries: BTreeMap<PathBuf, Entry>,
+    #[serde(skip)]
+    legacy: bool,
+}
+
+// Isolated reader for the old persisted shape. Serde discards its digest field;
+// we never recompute or compare it. Lack of metadata cannot authorize uncertain
+// partial or ignored residue.
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+struct LegacyAuthority {
+    working_directory: WorkingDirectory,
+    root_identity: (u64, u64),
+    entries: BTreeMap<PathBuf, LegacyEntry>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+struct LegacyEntry {
+    identity: (u64, u64),
+    mode: u32,
+}
+
+#[cfg(target_os = "linux")]
+fn decode_authority(raw: &[u8]) -> io::Result<Authority> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Metadata(Authority),
+        Legacy(LegacyAuthority),
+    }
+    match serde_json::from_slice(raw).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))? {
+        Stored::Metadata(authority) => Ok(authority),
+        Stored::Legacy(saved) => Ok(Authority {
+            working_directory: saved.working_directory,
+            root_identity: saved.root_identity,
+            entries: saved
+                .entries
+                .into_iter()
+                .map(|(path, entry)| {
+                    (
+                        path,
+                        Entry {
+                            identity: entry.identity,
+                            mode: entry.mode,
+                            file_change: None,
+                        },
+                    )
+                })
+                .collect(),
+            legacy: true,
+        }),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -481,7 +615,16 @@ struct Authority {
 struct Entry {
     identity: (u64, u64),
     mode: u32,
-    digest: Option<String>,
+    // None for directories: removing children legitimately changes timestamps.
+    file_change: Option<FileChange>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FileChange {
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
 }
 
 #[cfg(target_os = "linux")]
@@ -555,7 +698,7 @@ fn bounded_authority_bytes(authority: &Authority, limit: usize) -> io::Result<Ve
     if raw.len() > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "removal content authority exceeds its readable size limit",
+            "removal entry authority exceeds its readable size limit",
         ));
     }
     Ok(raw)
@@ -577,6 +720,20 @@ mod linux {
     }
 
     fn open(parent: &fs::File, name: &OsStr, flags: i32) -> io::Result<fs::File> {
+        let file = open_inner(parent, name, flags)?;
+        // Audit the actual access mode at the descriptor boundary. O_PATH stat
+        // cannot read a body; directory reads enumerate names. Runtime metadata
+        // uses its separate bounded reader below, Git runs outside this walker.
+        #[cfg(test)]
+        if flags & (libc::O_PATH | libc::O_DIRECTORY | libc::O_WRONLY) == 0
+            && file.metadata()?.is_file()
+        {
+            io_observation::record(io_observation::Event::EntryReadableOpen);
+        }
+        Ok(file)
+    }
+
+    fn open_inner(parent: &fs::File, name: &OsStr, flags: i32) -> io::Result<fs::File> {
         let name = CString::new(name.as_bytes())
             .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
         // NO_XDEV catches bind mounts too (st_dev comparisons do not).
@@ -641,21 +798,12 @@ mod linux {
     pub(super) fn load_authority(parent: &fs::File, id: &str) -> io::Result<Option<Authority>> {
         let read = || -> io::Result<Authority> {
             let directory = authority_directory(parent, false)?;
-            let file = open(
+            let raw = read_runtime_metadata(
                 &directory,
                 OsStr::new(&format!("{id}.json")),
-                libc::O_RDONLY,
+                MAX_AUTHORITY_BYTES,
             )?;
-            if !file.metadata()?.is_file() || file.metadata()?.len() > MAX_AUTHORITY_BYTES as u64 {
-                return Err(io::Error::from(io::ErrorKind::InvalidData));
-            }
-            let mut raw = Vec::new();
-            file.take(MAX_AUTHORITY_BYTES as u64 + 1)
-                .read_to_end(&mut raw)?;
-            if raw.len() > MAX_AUTHORITY_BYTES {
-                return Err(io::Error::from(io::ErrorKind::InvalidData));
-            }
-            serde_json::from_slice(&raw).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
+            decode_authority(&raw)
         };
         match read() {
             Ok(authority) => Ok(Some(authority)),
@@ -664,12 +812,31 @@ mod linux {
         }
     }
 
+    pub(super) fn read_runtime_metadata(
+        dir: &fs::File,
+        name: &OsStr,
+        limit: usize,
+    ) -> io::Result<Vec<u8>> {
+        let file = open_inner(dir, name, libc::O_RDONLY)?;
+        if !file.metadata()?.is_file() || file.metadata()?.len() > limit as u64 {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        let mut raw = Vec::new();
+        file.take(limit as u64 + 1).read_to_end(&mut raw)?;
+        #[cfg(test)]
+        io_observation::record(io_observation::Event::RuntimeMetadataRead(raw.len()));
+        if raw.len() > limit {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        Ok(raw)
+    }
+
     pub(super) fn persist_authority(
         parent: &fs::File,
         id: &str,
         authority: &Authority,
     ) -> io::Result<()> {
-        // Never publish a witness that the next normal retry cannot read.
+        // Never publish entry authority that the next normal retry cannot read.
         let raw = bounded_authority_bytes(authority, MAX_AUTHORITY_BYTES)?;
         let directory = authority_directory(parent, true)?;
         let temporary = CString::new(format!(".{id}-{}.tmp", uuid::Uuid::now_v7())).unwrap();
@@ -720,55 +887,13 @@ mod linux {
     }
 
     pub(super) fn inspect(dir: &fs::File, name: &OsStr) -> io::Result<Entry> {
+        #[cfg(test)]
+        io_observation::record(io_observation::Event::EntryInspection);
         let file = open(dir, name, libc::O_PATH)?;
         let metadata = file.metadata()?;
-        let digest = if metadata.is_file() {
-            let mut reader = open(dir, name, libc::O_RDONLY)?;
-            if identity(&reader)? != (metadata.dev(), metadata.ino()) {
-                return Err(io::Error::from_raw_os_error(libc::EAGAIN));
-            }
-            let mut hash = Sha256::new();
-            let mut buffer = [0u8; 65536];
-            loop {
-                let count = reader.read(&mut buffer)?;
-                if count == 0 {
-                    break;
-                }
-                hash.update(&buffer[..count]);
-            }
-            Some(
-                hash.finalize()
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect(),
-            )
-        } else if metadata.file_type().is_symlink() {
-            let mut buffer = vec![0u8; 65536];
-            // SAFETY: valid O_PATH symlink descriptor; empty path reads that
-            // symlink, not its target. The mutable buffer has the stated length.
-            let count = unsafe {
-                libc::readlinkat(
-                    file.as_raw_fd(),
-                    c"".as_ptr(),
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
-                )
-            };
-            if count < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            buffer.truncate(count as usize);
-            Some(
-                Sha256::digest(&buffer)
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect(),
-            )
-        } else if metadata.is_dir() {
-            None
-        } else {
+        if !metadata.is_file() && !metadata.is_dir() && !metadata.file_type().is_symlink() {
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
-        };
+        }
         Ok(Entry {
             identity: (metadata.dev(), metadata.ino()),
             // Permission repair is not a content change. Preserve the file type
@@ -779,7 +904,11 @@ mod linux {
                 } else {
                     0
                 },
-            digest,
+            file_change: (!metadata.is_dir()).then(|| FileChange {
+                size: metadata.len(),
+                modified_seconds: metadata.mtime(),
+                modified_nanoseconds: metadata.mtime_nsec(),
+            }),
         })
     }
 
@@ -798,7 +927,11 @@ mod linux {
                 let path = path.join(&name);
                 entries.insert(path.clone(), entry);
                 if is_dir {
-                    walk(&open_directory(dir, &name)?, &path, entries)?;
+                    let directory = open_directory(dir, &name)?;
+                    if identity(&directory)? != entries[&path].identity {
+                        return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+                    }
+                    walk(&directory, &path, entries)?;
                 }
             }
             Ok(())
@@ -827,6 +960,8 @@ mod linux {
     }
 
     pub(super) fn unlink(dir: &fs::File, name: &OsStr, directory: bool) -> io::Result<()> {
+        #[cfg(test)]
+        io_observation::before_unlink()?;
         let name = CString::new(name.as_bytes())
             .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
         // SAFETY: valid descriptor and NUL-terminated single entry name.
@@ -918,6 +1053,74 @@ mod linux {
     }
 }
 
+// Scoped instrumentation of production open/read/Git/unlink boundaries.
+// Thread-local state keeps parallel fixture tests independent.
+#[cfg(all(test, target_os = "linux"))]
+mod io_observation {
+    use super::*;
+    use std::cell::RefCell;
+    #[derive(Debug, Default)]
+    pub(super) struct Audit {
+        pub entry_readable_opens: usize,
+        pub runtime_metadata_bytes: usize,
+        pub git_inspections: usize,
+        pub entry_inspections: usize,
+        pub unlinks: usize,
+        fail_after: Option<usize>,
+    }
+    pub(super) enum Event {
+        EntryReadableOpen,
+        RuntimeMetadataRead(usize),
+        GitInspection,
+        EntryInspection,
+    }
+    thread_local! {
+        static ACTIVE: RefCell<Option<Audit>> = const { RefCell::new(None) };
+    }
+    pub(super) fn record(event: Event) {
+        ACTIVE.with_borrow_mut(|active| {
+            if let Some(audit) = active {
+                match event {
+                    Event::EntryReadableOpen => audit.entry_readable_opens += 1,
+                    Event::RuntimeMetadataRead(bytes) => audit.runtime_metadata_bytes += bytes,
+                    Event::GitInspection => audit.git_inspections += 1,
+                    Event::EntryInspection => audit.entry_inspections += 1,
+                }
+            }
+        });
+    }
+    pub(super) fn before_unlink() -> io::Result<()> {
+        ACTIVE.with_borrow_mut(|active| {
+            if let Some(audit) = active {
+                if audit.fail_after == Some(audit.unlinks) {
+                    return Err(io::Error::from_raw_os_error(libc::EACCES));
+                }
+                audit.unlinks += 1;
+            }
+            Ok(())
+        })
+    }
+    pub(super) fn observe<T>(fail_after: Option<usize>, action: impl FnOnce() -> T) -> (T, Audit) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ACTIVE.with_borrow_mut(|active| *active = None);
+            }
+        }
+        ACTIVE.with_borrow_mut(|active| {
+            assert!(active.is_none(), "nested cleanup I/O audit");
+            *active = Some(Audit {
+                fail_after,
+                ..Audit::default()
+            });
+        });
+        let _reset = Reset;
+        let result = action();
+        let audit = ACTIVE.with_borrow_mut(|active| active.take().unwrap());
+        (result, audit)
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 pub(super) mod tests {
     use super::super::tests::{create_clean_repo, request};
@@ -943,13 +1146,423 @@ pub(super) mod tests {
         assert_eq!(error.code, "working_directory_cleanup_permission_denied");
     }
 
+    struct BodyWatch(fs::File);
+    impl BodyWatch {
+        fn new(paths: &[PathBuf]) -> Self {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            use std::os::unix::ffi::OsStrExt;
+            // SAFETY: inotify_init1 returns a new descriptor; no pointer args.
+            let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            assert!(fd >= 0, "{}", io::Error::last_os_error());
+            // SAFETY: freshly owned fd, transferred once to File.
+            let events = unsafe { fs::File::from_raw_fd(fd) };
+            for path in paths {
+                let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                // SAFETY: live descriptor and NUL-terminated fixture path.
+                let watch = unsafe {
+                    libc::inotify_add_watch(
+                        events.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::IN_OPEN | libc::IN_ACCESS,
+                    )
+                };
+                assert!(watch >= 0, "{}", io::Error::last_os_error());
+            }
+            Self(events)
+        }
+        fn assert_no_body_access(&mut self) {
+            let mut buffer = [0u8; 8192];
+            loop {
+                let count = match self.0.read(&mut buffer) {
+                    Ok(count) => count,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    other => panic!("inotify read: {other:?}"),
+                };
+                assert!(count > 0);
+                let mut offset = 0;
+                while offset < count {
+                    let mask =
+                        u32::from_ne_bytes(buffer[offset + 4..offset + 8].try_into().unwrap());
+                    let len =
+                        u32::from_ne_bytes(buffer[offset + 12..offset + 16].try_into().unwrap())
+                            as usize;
+                    assert_eq!(
+                        mask & (libc::IN_OPEN | libc::IN_ACCESS | libc::IN_Q_OVERFLOW),
+                        0,
+                        "ordinary fixture body accessed: {mask:#x}"
+                    );
+                    offset += 16 + len;
+                }
+            }
+        }
+    }
+
+    fn sized_fixture(
+        size: u64,
+    ) -> (
+        tempfile::TempDir,
+        RuntimeGitMaterializer,
+        WorkingDirectoryBinding,
+        BodyWatch,
+    ) {
+        let (runtime, materializer, binding) = fixture();
+        fs::write(binding.root.join(".git/info/exclude"), "target/\n").unwrap();
+        fs::create_dir(binding.root.join("target")).unwrap();
+        // Entry count remains constant, including .git and many ignored files.
+        let mut watched = Vec::new();
+        for i in 0..96 {
+            let path = binding.root.join(format!("target/result-{i}"));
+            fs::write(&path, b"ignored build output").unwrap();
+            watched.push(path);
+        }
+        for path in [
+            binding.root.join("target/large-artifact"),
+            binding.root.join(".git/objects/unused-cleanup-artifact"),
+        ] {
+            let mut file = fs::File::create(&path).unwrap();
+            file.write_all(b"payload").unwrap();
+            file.set_len(size).unwrap(); // Owned sparse files, no expensive allocation.
+            watched.push(path);
+        }
+        let watch = BodyWatch::new(&watched);
+        (runtime, materializer, binding, watch)
+    }
+
     #[test]
-    fn persisted_removal_witness_must_fit_the_same_readable_limit() {
+    fn actual_cleanup_and_restart_retry_never_open_bodies_when_only_file_sizes_grow() {
+        use io_observation::observe;
+        for failure in [None, Some(0), Some(10)] {
+            let mut small_counts = None;
+            for size in [256, 128 * 1024 * 1024] {
+                let (runtime, materializer, binding, mut watch) = sized_fixture(size);
+                let id = &binding.working_directory.id;
+                let (first, first_io) =
+                    observe(failure, || materializer.cleanup_working_directory(id));
+                assert_eq!(first_io.entry_readable_opens, 0, "{first_io:?}");
+                assert!(
+                    first_io.git_inspections >= 2,
+                    "Git inspection is a separate necessary operation"
+                );
+                assert!(
+                    first_io.runtime_metadata_bytes > 0
+                        && first_io.runtime_metadata_bytes < 1024 * 1024
+                );
+                assert!(first_io.entry_inspections > 100);
+                watch.assert_no_body_access();
+                let retry_io = if let Some(unlinked) = failure {
+                    assert_eq!(
+                        first.unwrap_err().code,
+                        "working_directory_cleanup_permission_denied"
+                    );
+                    assert_eq!(first_io.unlinks, unlinked);
+                    assert!(binding.working_directory_root.exists());
+                    let raw: serde_json::Value = serde_json::from_slice(
+                        &fs::read(
+                            runtime
+                                .path()
+                                .join(".cleanup-authority")
+                                .join(format!("{id}.json")),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert!(raw.get("entries").is_none());
+                    for entry in raw["entry_metadata"].as_object().unwrap().values() {
+                        assert!(entry.get("digest").is_none());
+                        assert!(entry.get("file_change").is_some());
+                    }
+                    drop(materializer);
+                    let restarted = RuntimeGitMaterializer::new(runtime.path());
+                    let (removed, io) = observe(None, || restarted.cleanup_working_directory(id));
+                    assert_eq!(
+                        removed.unwrap().summary.status,
+                        WorkingDirectoryStatusKind::NotFound
+                    );
+                    assert_eq!(io.entry_readable_opens, 0, "{io:?}");
+                    assert!(
+                        io.runtime_metadata_bytes > 0 && io.runtime_metadata_bytes < 1024 * 1024
+                    );
+                    assert!(io.unlinks > 0 && io.entry_inspections > 0);
+                    watch.assert_no_body_access();
+                    Some(io)
+                } else {
+                    assert_eq!(
+                        first.unwrap().summary.status,
+                        WorkingDirectoryStatusKind::NotFound
+                    );
+                    assert!(first_io.unlinks > 100);
+                    None
+                };
+                eprintln!(
+                    "cleanup size={size} fail_after={failure:?}: first={first_io:?}, retry={retry_io:?}"
+                );
+                assert!(!binding.working_directory_root.exists());
+                assert!(
+                    !runtime
+                        .path()
+                        .join(".cleanup-authority")
+                        .join(format!("{id}.json"))
+                        .exists()
+                );
+                let counts = (
+                    first_io.entry_inspections,
+                    first_io.unlinks,
+                    retry_io
+                        .as_ref()
+                        .map(|io| (io.entry_inspections, io.unlinks)),
+                );
+                if let Some(small) = small_counts {
+                    assert_eq!(
+                        counts, small,
+                        "size growth cannot add body I/O or walker work"
+                    );
+                } else {
+                    small_counts = Some(counts);
+                }
+            }
+        }
+    }
+
+    fn seed_legacy_authority(
+        runtime: &Path,
+        materializer: &RuntimeGitMaterializer,
+        binding: &WorkingDirectoryBinding,
+    ) {
+        let mut binding = binding.clone();
+        binding.working_directory.status = WorkingDirectoryStatusKind::CleanupPending;
+        materializer.write_record(&binding).unwrap();
+        let tree = fs::File::open(&binding.working_directory_root).unwrap();
+        let entries: BTreeMap<_, _> = inventory(&tree).unwrap().into_iter().map(|(path, entry)| (path, serde_json::json!({"identity": entry.identity, "mode": entry.mode, "digest": "obsolete-not-recomputed"}))).collect();
+        let raw = serde_json::to_vec(&serde_json::json!({"working_directory": binding.working_directory, "root_identity": identity(&tree).unwrap(), "entries": entries})).unwrap();
+        let private = runtime.join(".cleanup-authority");
+        fs::create_dir(&private).unwrap();
+        fs::write(
+            private.join(format!("{}.json", binding.working_directory.id)),
+            raw,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn legacy_migration_persists_entry_metadata_before_partial_unlink_and_restart() {
+        use io_observation::observe;
+        let (runtime, materializer, binding) = fixture();
+        let payload = binding.root.join(".git/objects/unused-cleanup-artifact");
+        fs::File::create(&payload)
+            .unwrap()
+            .set_len(128 * 1024 * 1024)
+            .unwrap();
+        let mut watch = BodyWatch::new(&[payload]);
+        seed_legacy_authority(runtime.path(), &materializer, &binding);
+        let id = &binding.working_directory.id;
+        let (failed, first_io) = observe(Some(10), || materializer.cleanup_working_directory(id));
+        assert_eq!(
+            failed.unwrap_err().code,
+            "working_directory_cleanup_permission_denied"
+        );
+        assert_eq!(first_io.entry_readable_opens, 0);
+        assert_eq!(first_io.unlinks, 10);
+        assert!(first_io.git_inspections >= 3);
+        watch.assert_no_body_access();
+        let raw: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                runtime
+                    .path()
+                    .join(".cleanup-authority")
+                    .join(format!("{id}.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(raw.get("entries").is_none());
+        assert!(raw["entry_metadata"].is_object());
+        drop(materializer);
+        let restarted = RuntimeGitMaterializer::new(runtime.path());
+        let (removed, retry_io) = observe(None, || restarted.cleanup_working_directory(id));
+        assert_eq!(
+            removed.unwrap().summary.status,
+            WorkingDirectoryStatusKind::NotFound
+        );
+        assert_eq!(retry_io.entry_readable_opens, 0);
+        assert_eq!(retry_io.git_inspections, 0);
+        assert!(retry_io.unlinks > 0);
+        watch.assert_no_body_access();
+        assert!(!binding.working_directory_root.exists());
+    }
+
+    #[test]
+    fn legacy_authority_normal_retry_migrates_clean_checkout_or_explains_uncertain_residue() {
+        use io_observation::observe;
+        for remaining in [
+            "clean",
+            "dirty",
+            "ignored",
+            "partial",
+            "metadata_only",
+            "empty",
+            "replacement",
+        ] {
+            let (runtime, materializer, binding) = fixture();
+            if remaining == "ignored" {
+                fs::write(binding.root.join(".git/info/exclude"), "output\n").unwrap();
+                fs::write(binding.root.join("output"), "legacy ignored residue").unwrap();
+            }
+            seed_legacy_authority(runtime.path(), &materializer, &binding);
+            match remaining {
+                "partial" => fs::remove_dir_all(binding.root.join(".git")).unwrap(),
+                "metadata_only" => fs::remove_dir_all(binding.root()).unwrap(),
+                "empty" => {
+                    fs::remove_dir_all(binding.root()).unwrap();
+                    fs::remove_file(binding.working_directory_root.join(MATERIALIZATION_RECORD))
+                        .unwrap();
+                }
+                "dirty" => fs::write(binding.root.join("README.md"), "user change").unwrap(),
+                "replacement" => {
+                    fs::rename(
+                        &binding.working_directory_root,
+                        runtime.path().join("original"),
+                    )
+                    .unwrap();
+                    fs::create_dir(&binding.working_directory_root).unwrap();
+                }
+                _ => {}
+            }
+            drop(materializer);
+            let restarted = RuntimeGitMaterializer::new(runtime.path());
+            let (result, io) = observe(None, || {
+                restarted.cleanup_working_directory(&binding.working_directory.id)
+            });
+            assert_eq!(io.entry_readable_opens, 0, "{remaining}: {io:?}");
+            match remaining {
+                "clean" | "metadata_only" | "empty" => {
+                    assert_eq!(
+                        result.unwrap().summary.status,
+                        WorkingDirectoryStatusKind::NotFound
+                    );
+                    assert!(!binding.working_directory_root.exists());
+                }
+                _ => {
+                    assert_eq!(
+                        result.unwrap_err().code,
+                        format!(
+                            "working_directory_cleanup_{}",
+                            match remaining {
+                                "dirty" => "changes_present",
+                                "replacement" => "ownership_unknown",
+                                _ => "changes_unknown",
+                            }
+                        ),
+                        "{remaining}"
+                    );
+                    assert_eq!(io.unlinks, 0);
+                    assert!(binding.working_directory_root.exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_metadata_mismatch_without_git_preserves_uncertain_residue() {
+        for change in ["new", "same_size_mtime", "replaced"] {
+            let (runtime, materializer, binding) = fixture();
+            fail_once(&materializer, &binding.working_directory.id);
+            fs::remove_dir_all(binding.root.join(".git")).unwrap();
+            match change {
+                "new" => fs::write(binding.root.join("new"), "new").unwrap(),
+                "same_size_mtime" => {
+                    use std::os::fd::AsRawFd;
+                    let mut file = fs::OpenOptions::new()
+                        .write(true)
+                        .open(binding.root.join("README.md"))
+                        .unwrap();
+                    file.write_all(b"x").unwrap();
+                    // Explicit metadata change, deterministic even on coarse clocks.
+                    let times = [libc::timespec {
+                        tv_sec: 1,
+                        tv_nsec: 0,
+                    }; 2];
+                    // SAFETY: live fixture fd and two valid timespec values.
+                    assert_eq!(
+                        unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) },
+                        0
+                    );
+                }
+                _ => {
+                    fs::rename(
+                        binding.root.join("README.md"),
+                        runtime.path().join("old-file"),
+                    )
+                    .unwrap();
+                    fs::write(binding.root.join("README.md"), "replacement").unwrap();
+                }
+            }
+            let restarted = RuntimeGitMaterializer::new(runtime.path());
+            assert_eq!(
+                restarted
+                    .cleanup_working_directory(&binding.working_directory.id)
+                    .unwrap_err()
+                    .code,
+                "working_directory_cleanup_changes_unknown",
+                "{change}"
+            );
+            assert!(binding.root.join("README.md").exists());
+        }
+    }
+
+    #[test]
+    fn unlink_rechecks_metadata_and_rejects_arriving_or_replaced_entries() {
+        for change in ["new", "same_size", "replacement", "symlink"] {
+            let (runtime, materializer, binding) = fixture();
+            fs::write(binding.root.join(".git/info/exclude"), "output\n").unwrap();
+            let file = binding.root.join("output");
+            fs::write(&file, b"initial").unwrap();
+            let error = remove_with_eraser(
+                &materializer,
+                &binding.working_directory.id,
+                |dir, path, expected| {
+                    match change {
+                        "new" => fs::write(binding.root.join("new"), b"new").unwrap(),
+                        "same_size" => {
+                            use std::os::fd::AsRawFd;
+                            let mut f = fs::OpenOptions::new().write(true).open(&file).unwrap();
+                            f.write_all(b"changed").unwrap();
+                            let times = [libc::timespec {
+                                tv_sec: 1,
+                                tv_nsec: 0,
+                            }; 2];
+                            // SAFETY: live fixture fd and two valid timespec values.
+                            assert_eq!(unsafe { libc::futimens(f.as_raw_fd(), times.as_ptr()) }, 0);
+                        }
+                        "replacement" => {
+                            fs::rename(&file, runtime.path().join("old-output")).unwrap();
+                            fs::write(&file, b"initial").unwrap();
+                        }
+                        _ => {
+                            fs::remove_file(&file).unwrap();
+                            std::os::unix::fs::symlink(runtime.path(), &file).unwrap();
+                        }
+                    }
+                    erase(dir, path, expected)
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.code, "working_directory_cleanup_changes_present",
+                "{change}"
+            );
+            assert!(binding.working_directory_root.exists());
+            assert!(file.symlink_metadata().is_ok());
+        }
+    }
+
+    #[test]
+    fn persisted_entry_authority_must_fit_the_same_readable_limit() {
         let (runtime, _, binding) = fixture();
         let authority = Authority {
             working_directory: binding.working_directory.clone(),
             root_identity: (0, 0),
             entries: BTreeMap::new(),
+            legacy: false,
         };
         let bytes = bounded_authority_bytes(&authority, MAX_AUTHORITY_BYTES).unwrap();
         assert_eq!(
@@ -991,7 +1604,7 @@ pub(super) mod tests {
         fail_once(&materializer, id);
 
         // Observe actual file opens rather than a timing threshold or a large
-        // fixture. Inventory would open this surviving tracked file to hash it.
+        // fixture. A content-scanning regression would open this surviving tracked file.
         // SAFETY: inotify_init1 has no pointer arguments.
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         assert!(fd >= 0, "{}", io::Error::last_os_error());
@@ -1024,7 +1637,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn partial_deletion_missing_checkout_and_restart_finish_with_durable_content_authority() {
+    fn partial_deletion_missing_checkout_and_restart_finish_with_durable_entry_authority() {
         for removed in [
             "checkout/README.md",
             "checkout/.git",
@@ -1071,7 +1684,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn missing_checkout_with_only_validated_metadata_can_be_removed_without_witness() {
+    fn missing_checkout_with_only_validated_metadata_can_be_removed_without_entry_authority() {
         let (_runtime, materializer, binding) = fixture();
         fs::remove_dir_all(binding.root()).unwrap();
         let removed = materializer
@@ -1082,7 +1695,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn incomplete_checkout_without_witness_preserves_residue_and_explains_recovery() {
+    fn incomplete_checkout_without_entry_authority_preserves_residue_and_explains_recovery() {
         let (_runtime, materializer, binding) = fixture();
         fs::remove_dir_all(binding.root.join(".git")).unwrap();
         let error = materializer
@@ -1094,7 +1707,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn failure_then_dirty_then_owner_resolution_renews_witness_on_ordinary_retry() {
+    fn failure_then_dirty_then_owner_resolution_renews_entry_authority_on_ordinary_retry() {
         use super::super::tests::git;
         for resolution in ["commit", "restore"] {
             let (runtime, materializer, binding) = fixture();
@@ -1154,7 +1767,7 @@ pub(super) mod tests {
                 Some("unknown"),
                 "{resolution}"
             );
-            // Renewal itself can fail at unlink. Its new witness must survive a
+            // Renewal itself can fail at unlink. Its new entry authority must survive a
             // later partial deletion/restart, even with no remaining Git.
             fail_once(&restarted, id);
             fs::remove_dir_all(binding.root.join(".git")).unwrap();
@@ -1207,11 +1820,11 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn pending_witness_accepts_access_refresh_but_rejects_materialization_substitution() {
+    fn pending_entry_authority_accepts_access_refresh_but_rejects_materialization_substitution() {
         for update in ["access", "repository", "creation"] {
             let (_runtime, materializer, binding) = fixture();
             let id = &binding.working_directory.id;
-            // Model an existing SSH materialization before taking the witness.
+            // Model an existing SSH materialization before capturing entry metadata.
             // Refresh replaces its access proof, not its requirement for SSH authority.
             let mut record = materializer.read_binding(id).unwrap();
             record.working_directory.evidence.repository_access_required = true;
