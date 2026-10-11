@@ -392,7 +392,7 @@ mod tests {
         })
         .unwrap();
         let store = Arc::new(
-            SqliteWorkspaceStore::open(&db_path)
+            SqliteWorkspaceStore::open_for_test(&db_path)
                 .unwrap()
                 .with_db_executor(executor),
         );

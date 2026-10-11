@@ -38,8 +38,8 @@ fn fresh_and_upgraded_state_contract_schemas_enforce_the_same_constraints() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("upgraded.db");
     prepare_retained_schema(&path, 85);
-    let upgraded = SqliteWorkspaceStore::open(&path).unwrap();
-    let fresh = SqliteWorkspaceStore::in_memory().unwrap();
+    let upgraded = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+    let fresh = SqliteWorkspaceStore::in_memory_for_test().unwrap();
     let mut mismatches = Vec::new();
     for table in [
         "workspace_tags",

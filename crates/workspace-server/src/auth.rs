@@ -203,7 +203,7 @@ mod tests {
         })
         .unwrap();
         let store = Arc::new(
-            SqliteWorkspaceStore::in_memory()
+            SqliteWorkspaceStore::in_memory_for_test()
                 .unwrap()
                 .with_db_executor(executor),
         );

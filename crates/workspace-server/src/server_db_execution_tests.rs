@@ -63,7 +63,7 @@ impl Fixture {
             backend_base_url: Some("http://localhost:8787".into()),
         };
         let store = Arc::new(
-            SqliteWorkspaceStore::open(&config.database_path)
+            SqliteWorkspaceStore::open_for_test(&config.database_path)
                 .unwrap()
                 .with_db_executor(executor.clone()),
         );
@@ -90,10 +90,10 @@ impl Fixture {
                 revoked_at: None,
             })
             .unwrap();
-        let api = WorkspaceApi::new(config.clone(), store.clone())
+        let api = WorkspaceApi::new_for_test(config.clone(), store.clone())
             .await
             .unwrap();
-        let server = WorkspaceServerApi::new(config, store);
+        let server = WorkspaceServerApi::new_for_test(config, store);
         // Cache only the real inner router; avoid starting the unrelated hook.
         server
             .apis
@@ -452,7 +452,9 @@ async fn ticket_create_waiting_for_sqlite_does_not_block_timer_or_control() {
     assert!(body["id"].is_string(), "{body}");
     // Ticket dispatch can call Runtime callbacks, so its operation owner is
     // the separate bounded host executor, not the store executor.
-    observed(host_io_executor().unwrap().drain()).await.unwrap();
+    observed(fixture.api.host_executors.host().unwrap().drain())
+        .await
+        .unwrap();
     fixture.executor.drain().await.unwrap();
     let count: i64 = reader.query_row("SELECT count(*) FROM typed_tickets WHERE workspace_id = ?1 AND title = 'locked Ticket'", [WORKSPACE], |row| row.get(0)).unwrap();
     assert_eq!(count, 1, "one accepted HTTP mutation must commit once");
@@ -603,4 +605,87 @@ async fn cancelled_queued_http_mutation_keeps_capacity_until_commit_and_drain() 
         1,
         "drain must release actual-job capacity"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn saturated_cancelled_host_jobs_keep_their_budget_but_not_other_fixture_or_cleanup_admission()
+ {
+    use std::sync::{
+        Condvar,
+        atomic::{AtomicUsize, Ordering},
+    };
+    // A drop guard releases workers even when an assertion panics.
+    struct Release(Arc<(Mutex<bool>, Condvar)>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            *self.0.0.lock().unwrap() = true;
+            self.0.1.notify_all();
+        }
+    }
+    let owner = HostExecutors::default();
+    let other = HostExecutors::default();
+    let host = owner.host().unwrap();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = Release(gate.clone());
+    let completed = Arc::new(AtomicUsize::new(0));
+    let mut waiters = Vec::new();
+    for _ in 0..2 {
+        let host = host.clone();
+        let gate = gate.clone();
+        let completed = completed.clone();
+        let (started, accepted) = tokio::sync::oneshot::channel();
+        waiters.push(tokio::spawn(async move {
+            host.run(move || {
+                started.send(()).unwrap();
+                let mut released = gate.0.lock().unwrap();
+                while !*released {
+                    released = gate.1.wait(released).unwrap();
+                }
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(())
+            })
+            .await
+        }));
+        accepted.await.unwrap();
+    }
+    for _ in 0..16 {
+        let completed = completed.clone();
+        host.dispatch(move || {
+            completed.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+    }
+    for waiter in waiters {
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+    }
+    assert!(matches!(
+        host.run(|| Ok::<_, Error>(())).await,
+        Err(Error::DbCapacityExceeded)
+    ));
+    // Paused Tokio time can advance without completing or releasing actual Host
+    // work. Neither another fixture nor cleanup needs this saturated Host lane.
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    assert_eq!(completed.load(Ordering::SeqCst), 0);
+    other
+        .host()
+        .unwrap()
+        .run(|| Ok::<_, Error>(()))
+        .await
+        .unwrap();
+    owner
+        .cleanup()
+        .unwrap()
+        .run(|| Ok::<_, Error>(()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        host.run(|| Ok::<_, Error>(())).await,
+        Err(Error::DbCapacityExceeded)
+    ));
+    drop(release);
+    host.drain().await.unwrap();
+    assert_eq!(completed.load(Ordering::SeqCst), 18);
+    host.run(|| Ok::<_, Error>(())).await.unwrap();
+    host.drain().await.unwrap();
 }

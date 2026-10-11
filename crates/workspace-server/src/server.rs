@@ -1589,6 +1589,7 @@ fn orchestrator_attention_state(
 
 #[derive(Clone)]
 pub struct WorkspaceApi {
+    host_executors: HostExecutors,
     pub(crate) config: ServerConfig,
     pub(crate) store: Arc<dyn ControlPlaneStore>,
     config_store: Arc<crate::SqliteWorkspaceStore>,
@@ -1687,6 +1688,7 @@ impl ServerApiContractService {
 struct WorkerRemovalService {
     workspace_id: String,
     store: Arc<dyn ControlPlaneStore>,
+    host_executors: HostExecutors,
     runtime: Weak<RuntimeRegistry>,
     workdir_sessions: Arc<Mutex<WorkdirSessionRegistry>>,
     workdir_session_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
@@ -1700,6 +1702,7 @@ impl WorkerRemovalService {
         Self {
             workspace_id: api.config.workspace_id.clone(),
             store: api.store.clone(),
+            host_executors: api.host_executors.clone(),
             runtime: Arc::downgrade(&api.runtime),
             workdir_sessions: api.workdir_sessions.clone(),
             workdir_session_locks: api.workdir_session_locks.clone(),
@@ -1870,12 +1873,15 @@ impl WorkerRemovalService {
         let runtime_id = target_runtime_id.to_owned();
         let worker_id = target_worker_id.to_owned();
         let reason = reason.to_owned();
-        run_host_workflow(async move {
-            service
-                .execute_async_on_host(source, &runtime_id, &worker_id, &reason)
-                .await
-                .map_err(Error::Store)
-        })
+        run_host_workflow(
+            self.host_executors.host().map_err(|e| e.to_string())?,
+            async move {
+                service
+                    .execute_async_on_host(source, &runtime_id, &worker_id, &reason)
+                    .await
+                    .map_err(Error::Store)
+            },
+        )
         .await
         .map_err(|error| error.to_string())
     }
@@ -1976,12 +1982,15 @@ impl WorkerRemovalService {
         let target = target.clone();
         let reason = reason.to_owned();
         let parent = parent_workspace_deletion_operation_id.map(str::to_owned);
-        run_host_workflow(async move {
-            service
-                .execute_target_removal_on_host(&runtime, &target, &reason, parent.as_deref())
-                .await
-                .map_err(Error::Store)
-        })
+        run_host_workflow(
+            self.host_executors.host().map_err(|e| e.to_string())?,
+            async move {
+                service
+                    .execute_target_removal_on_host(&runtime, &target, &reason, parent.as_deref())
+                    .await
+                    .map_err(Error::Store)
+            },
+        )
         .await
         .map_err(|error| error.to_string())
     }
@@ -2235,6 +2244,7 @@ use workspace_admission::WorkspaceAdmission;
 
 #[derive(Clone)]
 pub struct WorkspaceServerApi {
+    host_executors: HostExecutors,
     template: Arc<ServerConfig>,
     store: Arc<dyn ControlPlaneStore>,
     catalog: WorkspaceCatalogService,
@@ -2265,6 +2275,7 @@ impl WorkspaceServerApi {
                 workspace_signing_material_root(&template.database_path),
             ));
         Self {
+            host_executors: HostExecutors::shared(),
             template: Arc::new(template),
             catalog: WorkspaceCatalogService::new(store.clone(), signing_materials.clone()),
             signing_materials,
@@ -2278,6 +2289,13 @@ impl WorkspaceServerApi {
             }),
             hook_handles: Arc::new(AsyncMutex::new(HashMap::new())),
         }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(template: ServerConfig, store: Arc<dyn ControlPlaneStore>) -> Self {
+        let mut api = Self::new(template, store);
+        api.host_executors = HostExecutors::default();
+        api
     }
 
     // Own the complete synchronous store stage; callers retain their async
@@ -2312,7 +2330,12 @@ impl WorkspaceServerApi {
         let config = self
             .template
             .for_catalog_workspace(&workspace, repositories)?;
-        let api = WorkspaceApi::new(config, self.store.clone()).await?;
+        let api = WorkspaceApi::new_with_host_executors(
+            config,
+            self.store.clone(),
+            self.host_executors.clone(),
+        )
+        .await?;
         apis.insert(workspace_id.to_string(), api.clone());
         Ok(Some(api))
     }
@@ -2387,7 +2410,7 @@ impl WorkspaceServerApi {
         let workers = self
             .execute_store_stage(move |store| store.list_worker_registry(&id, i64::MAX as usize))
             .await?;
-        host_io_executor()?.run(move || -> Result<_> {
+        api.host_executors.host()?.run(move || -> Result<_> {
         for registry_worker in workers {
             let worker_key = registry_worker.display_name;
             match api.runtime.worker(&registry_worker.worker) {
@@ -2493,7 +2516,9 @@ impl WorkspaceServerApi {
                 let removal_api = api.clone();
                 let workdir_id = workdir.workdir_id.clone();
                 let parent_id = operation_id.to_owned();
-                match host_io_executor()?
+                match api
+                    .host_executors
+                    .host()?
                     .run(move || {
                         execute_workdir_removal_for_workspace_deletion(
                             &removal_api,
@@ -3487,6 +3512,19 @@ impl WorkspaceApi {
     }
 
     pub async fn new(config: ServerConfig, store: Arc<dyn ControlPlaneStore>) -> Result<Self> {
+        Self::new_with_host_executors(config, store, HostExecutors::shared()).await
+    }
+
+    #[cfg(test)]
+    async fn new_for_test(config: ServerConfig, store: Arc<dyn ControlPlaneStore>) -> Result<Self> {
+        Self::new_with_host_executors(config, store, HostExecutors::default()).await
+    }
+
+    async fn new_with_host_executors(
+        config: ServerConfig,
+        store: Arc<dyn ControlPlaneStore>,
+        host_executors: HostExecutors,
+    ) -> Result<Self> {
         let resource_broker = BackendResourceBroker::default();
         if store.get_workspace(&config.workspace_id).await?.is_none() {
             return Err(crate::Error::Config(format!(
@@ -3563,6 +3601,7 @@ impl WorkspaceApi {
             store,
             Arc::new(execution_backend),
             resource_broker,
+            host_executors,
             Some(worker_remove_dispatcher),
         )
         .await?;
@@ -3623,6 +3662,7 @@ impl WorkspaceApi {
             store,
             execution_backend,
             BackendResourceBroker::default(),
+            HostExecutors::default(),
             None,
         )
         .await
@@ -3633,6 +3673,7 @@ impl WorkspaceApi {
         store: Arc<dyn ControlPlaneStore>,
         execution_backend: Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
         resource_broker: BackendResourceBroker,
+        host_executors: HostExecutors,
         worker_remove_dispatcher: Option<
             Arc<crate::worker_source::EmbeddedServerWorkerMutationDispatcher>,
         >,
@@ -3783,6 +3824,7 @@ impl WorkspaceApi {
         let drive_host =
             Arc::new(crate::workspace_drive_host::WorkspaceDriveHost::new(&feature_storage).await?);
         let mut api = Self {
+            host_executors,
             drive_host,
             config_store,
             repository_secrets,
@@ -3877,11 +3919,13 @@ impl WorkspaceApi {
             schedule_external_workdir_expiry(&api, &grant)?;
         }
         let workdir_recovery_api = api.clone();
-        host_io_executor()?
+        api.host_executors
+            .host()?
             .run(move || recover_workdir_removals(&workdir_recovery_api))
             .await?;
         recover_runtime_removals(&api).await;
-        host_io_executor()?
+        api.host_executors
+            .host()?
             .run(move || {
                 let recovery_now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
                 let deliveries = api
@@ -4323,7 +4367,7 @@ impl WorkspaceApi {
         let attempt_id = attempt.attempt_id.clone();
         // Admit before claiming: overload must leave durable Pending/Failed
         // ownership recoverable, never strand a Running claim without a job.
-        let admission = backend_job_cleanup_executor().and_then(|executor| {
+        let admission = self.host_executors.cleanup().and_then(|executor| {
             executor.dispatch(move || {
             let cleanup = || -> Result<()> {
                 let (attempt, claimed) = api.store.claim_backend_job_worker_cleanup(
@@ -4679,7 +4723,7 @@ impl WorkspaceApi {
         let attempt_id = attempt_id.to_string();
         handle.spawn(async move {
             tokio::time::sleep(delay).await;
-            let admission = host_io_executor().and_then(|executor| executor.dispatch(move || {
+            let admission = api.host_executors.host().and_then(|executor| executor.dispatch(move || {
             let Ok(Some(attempt)) =
                 api.store
                     .get_backend_job_attempt(&api.config.workspace_id, &job_id, &attempt_id)
@@ -11686,7 +11730,9 @@ impl server_api::ServerApi for ServerApiContractService {
         let api = self.workspace_api()?.clone();
         let headers = current_worker_contract_headers(&context)?;
         let stage_api = api.clone();
-        let worker = host_io_executor()
+        let worker = api
+            .host_executors
+            .host()
             .map_err(ApiError::from)
             .map_err(ApiError::into_repository_api_error)?
             .run(move || -> ApiResult<_> {
@@ -11720,7 +11766,9 @@ impl server_api::ServerApi for ServerApiContractService {
         let api = self.workspace_api()?.clone();
         let headers = current_worker_contract_headers(&context)?;
         let stage_api = api.clone();
-        let worker = host_io_executor()
+        let worker = api
+            .host_executors
+            .host()
             .map_err(ApiError::from)
             .map_err(ApiError::into_repository_api_error)?
             .run(move || -> ApiResult<_> {
@@ -13774,7 +13822,7 @@ async fn start_manual_ticket_worker_assignment(
     let operation_id = operation_id.to_owned();
     let selected = selected.to_vec();
     let delegation = delegation.cloned();
-    run_host_workflow(async move {
+    run_host_workflow(api.host_executors.host()?, async move {
         start_manual_ticket_worker_assignment_on_host(
             &api,
             &record,
@@ -14263,7 +14311,9 @@ async fn scoped_set_ticket_assignment_with_context(
     validate_workspace_scope(&api, &path.0.0)?;
     let source_api = api.clone();
     let context = context.clone();
-    let (author, source) = host_io_executor()?
+    let (author, source) = api
+        .host_executors
+        .host()?
         .run(move || authenticated_assignment_source(&source_api, &headers, &context))
         .await?;
     apply_set_ticket_assignment(State(api), path, request, author, Some(source)).await
@@ -14415,7 +14465,9 @@ async fn scoped_clear_ticket_assignment_with_context(
     validate_workspace_scope(&api, &path.0.0)?;
     let source_api = api.clone();
     let context = context.clone();
-    let (author, source) = host_io_executor()?
+    let (author, source) = api
+        .host_executors
+        .host()?
         .run(move || authenticated_assignment_source(&source_api, &headers, &context))
         .await?;
     apply_clear_ticket_assignment(State(api), path, query, author, Some(source)).await
@@ -15263,7 +15315,7 @@ fn schedule_ticket_item_check(
         }
     };
     let api = api.clone();
-    let admission = host_io_executor().and_then(|executor| {
+    let admission = api.host_executors.host().and_then(|executor| {
         executor.dispatch(move || {
             if let Err(error) = api.dispatch_backend_job_reservation(reservation) {
                 tracing::warn!(
@@ -15319,7 +15371,7 @@ async fn execute_ticket_rest_operation_with_context(
     let job_api = api.clone();
     let workspace_id = workspace_id.to_owned();
     let context = context.cloned();
-    host_io_executor()?.run(move || {
+    api.host_executors.host()?.run(move || {
         let api = &job_api;
         let workspace_id = workspace_id.as_str();
         let context = context.as_ref();
@@ -16483,7 +16535,7 @@ async fn scoped_list_merge_requests(
     AxumPath(workspace_id): AxumPath<String>,
     Query(query): Query<server_api::MergeRequestListQuery>,
 ) -> ApiResult<Json<MergeRequestListResponse>> {
-    host_io_executor()?.run(move || {
+    api.host_executors.host()?.run(move || {
 
     let workspace_id = parse_workspace_id(&workspace_id)?;
     require_workspace_access(&workspace_id, &api)?;
@@ -16700,7 +16752,8 @@ async fn scoped_show_merge_request(
     AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Query(query): Query<server_api::MergeRequestThreadQuery>,
 ) -> ApiResult<Json<server_api::MergeRequestDetailResponse>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let workspace_id = parse_workspace_id(&workspace_id)?;
             require_workspace_access(&workspace_id, &api)?;
@@ -16795,7 +16848,8 @@ async fn scoped_merge_request_readiness(
     State(api): State<WorkspaceApi>,
     AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
 ) -> ApiResult<Json<server_api::MergeRequestReadinessResponse>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let workspace_id = parse_workspace_id(&workspace_id)?;
             let store = merge_request_store(&api, &workspace_id)?;
@@ -16869,7 +16923,8 @@ async fn scoped_open_merge_request(
     AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
     Json(input): Json<server_api::OpenMergeRequestRequest>,
 ) -> ApiResult<Json<server_api::PublicMergeRequest>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let workspace_id = parse_workspace_id(&workspace_id)?;
             let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
@@ -16948,7 +17003,8 @@ async fn scoped_merge_request_thread(
     AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Query(query): Query<server_api::MergeRequestThreadQuery>,
 ) -> ApiResult<Json<Vec<server_api::MergeRequestThreadEvent>>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let workspace_id = parse_workspace_id(&workspace_id)?;
             let events = merge_request_store(&api, &workspace_id)?.thread_page_by_id(
@@ -17019,7 +17075,8 @@ async fn scoped_register_reviewer_child_session(
     AxumPath(workspace_id): AxumPath<String>,
     Json(input): Json<server_api::RegisterReviewerChildSessionRequest>,
 ) -> ApiResult<StatusCode> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let workspace_id = parse_workspace_id(&workspace_id)?;
             require_workspace_access(&workspace_id, &api)?;
@@ -17045,7 +17102,8 @@ async fn scoped_register_merge_request_review_capability(
     AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Json(input): Json<server_api::RegisterMergeRequestReviewCapabilityRequest>,
 ) -> ApiResult<StatusCode> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let workspace_id = parse_workspace_id(&workspace_id)?;
             require_workspace_access(&workspace_id, &api)?;
@@ -17160,7 +17218,8 @@ async fn scoped_submit_merge_request_review(
     AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Json(input): Json<server_api::SubmitMergeRequestReviewRequest>,
 ) -> ApiResult<Json<server_api::ReviewEvent>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let workspace_id = parse_workspace_id(&workspace_id)?;
             let store = merge_request_store(&api, &workspace_id)?;
@@ -17235,7 +17294,8 @@ async fn scoped_revoke_merge_request_review(
     AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Json(input): Json<server_api::RevokeMergeRequestReviewRequest>,
 ) -> ApiResult<Json<server_api::ReviewRevokedEvent>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let workspace_id = parse_workspace_id(&workspace_id)?;
             require_workspace_access(&workspace_id, &api)?;
@@ -17287,7 +17347,8 @@ async fn scoped_complete_merge_request(
     AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Json(input): Json<server_api::CompleteMergeRequestRequest>,
 ) -> ApiResult<Json<server_api::MergeEvent>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let workspace_id = parse_workspace_id(&workspace_id)?;
             require_workspace_access(&workspace_id, &api)?;
@@ -18396,7 +18457,8 @@ async fn open_current_worker_workdir_session_locked(
         // The accepted Runtime authorization must retain the actual session lock,
         // not just the async waiter that submitted it.
         let stage_guard = session_guard.clone();
-        host_io_executor()?
+        api.host_executors
+            .host()?
             .run(move || {
                 let _session_guard = stage_guard;
                 stage_api
@@ -18634,7 +18696,8 @@ async fn sync_runtime_worker_workdir_attachments_locked(
     let stage_api = api.clone();
     let stage_worker = worker.clone();
     let stage_guard = session_guard.clone();
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let _session_guard = stage_guard;
             replace_runtime_worker_workdir_attachments(&stage_api, &stage_worker, attachments)
@@ -18695,7 +18758,8 @@ async fn scoped_submit_backend_job_result(
     headers: HeaderMap,
     Json(request): Json<SubmitBackendJobResultRequest>,
 ) -> ApiResult<Json<BackendJobResultAcceptance>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let worker = current_worker_identity(&api, &path.workspace_id, &headers)?;
@@ -18771,7 +18835,9 @@ async fn import_current_worker_workdir_observation(
         let stage_api = api.clone();
         let stage_worker = worker.clone();
         let stage_guard = session_guard.cloned();
-        let observed_worker = host_io_executor()?
+        let observed_worker = api
+            .host_executors
+            .host()?
             .run(move || {
                 let _session_guard = stage_guard;
                 stage_api
@@ -18802,7 +18868,9 @@ async fn scoped_attach_current_worker_workdir(
     Json(request): Json<AttachCurrentWorkerWorkdirRequest>,
 ) -> ApiResult<Json<server_api::CurrentWorkerWorkdirAttachmentResponse>> {
     let stage_api = api.clone();
-    let worker = host_io_executor()?
+    let worker = api
+        .host_executors
+        .host()?
         .run(move || -> ApiResult<_> {
             validate_workspace_scope(&stage_api, &path.workspace_id)?;
             Ok(current_worker_identity(
@@ -19123,7 +19191,9 @@ async fn scoped_detach_current_worker_workdir(
     let alias = workdir::WorkdirAttachmentAlias::new(alias)
         .map_err(|error| Error::InvalidInput(error.to_string()))?;
     let stage_api = api.clone();
-    let worker = host_io_executor()?
+    let worker = api
+        .host_executors
+        .host()?
         .run(move || current_worker_identity(&stage_api, &workspace_id, &headers))
         .await?;
     detach_current_worker_workdir(
@@ -19383,7 +19453,7 @@ async fn scoped_execute_current_worker_workdir_operation(
     validate_workspace_scope(&api, &path.workspace_id)?;
     context.stage = "worker_identity";
     let stage_api = api.clone();
-    let worker = host_io_executor()?.run(move || {
+    let worker = api.host_executors.host()?.run(move || {
         current_worker_identity(&stage_api, &path.workspace_id, &headers)
     }).await?;
     context.runtime_id_hash = Some(crate::worker_source::diagnostic_id_hash(&worker.runtime_id));
@@ -19608,7 +19678,7 @@ async fn run_orchestrator_turn_end_hook(api: WorkspaceApi) {
     let mut worker_states = HashMap::new();
     while let Some(update) = subscription.recv().await {
         let stage_api = api.clone();
-        let result = host_io_executor().map(|executor| async move {
+        let result = api.host_executors.host().map(|executor| async move {
             executor
                 .run(move || -> Result<_> {
                     let keep_running =
@@ -19714,7 +19784,7 @@ fn enqueue_orchestrator_assignment_attention(
 ) -> Option<tokio::sync::oneshot::Receiver<()>> {
     let api = api.clone();
     let (done, completion) = tokio::sync::oneshot::channel();
-    match host_io_executor().and_then(|executor| {
+    match api.host_executors.host().and_then(|executor| {
         executor.dispatch(move || {
             if let Some(orchestrator) = find_workspace_orchestrator(&api) {
                 dispatch_orchestrator_assignment_attention(&api, &orchestrator.worker);
@@ -20180,33 +20250,39 @@ const SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE: &str = "subjektiv-memory-consolida
 // Teardown waits must not occupy the ordinary Host lane: a Job may need a
 // user stop/control operation on that lane before its Run can finish. Cleanup
 // therefore has its own finite owner, still independent of the DB callback lane.
-fn backend_job_cleanup_executor() -> Result<crate::db_executor::DbExecutor> {
-    static CLEANUP: std::sync::OnceLock<Option<crate::db_executor::DbExecutor>> =
-        std::sync::OnceLock::new();
-    CLEANUP
-        .get_or_init(|| {
-            crate::db_executor::DbExecutor::new(crate::db_executor::DbExecutorLimits {
-                workers: std::num::NonZeroUsize::new(2).unwrap(),
-                queued: std::num::NonZeroUsize::new(16).unwrap(),
-            })
-            .ok()
-        })
-        .clone()
-        .ok_or(Error::DbExecutorUnavailable)
+#[derive(Clone, Default)]
+struct HostExecutors {
+    host: Arc<std::sync::OnceLock<Option<crate::db_executor::DbExecutor>>>,
+    cleanup: Arc<std::sync::OnceLock<Option<crate::db_executor::DbExecutor>>>,
 }
 
-fn host_io_executor() -> Result<crate::db_executor::DbExecutor> {
-    static HOST: std::sync::OnceLock<Option<crate::db_executor::DbExecutor>> =
-        std::sync::OnceLock::new();
-    HOST.get_or_init(|| {
-        crate::db_executor::DbExecutor::new(crate::db_executor::DbExecutorLimits {
-            workers: std::num::NonZeroUsize::new(2).unwrap(),
-            queued: std::num::NonZeroUsize::new(16).unwrap(),
-        })
-        .ok()
-    })
-    .clone()
-    .ok_or(Error::DbExecutorUnavailable)
+impl HostExecutors {
+    fn shared() -> Self {
+        static SHARED: std::sync::OnceLock<HostExecutors> = std::sync::OnceLock::new();
+        SHARED.get_or_init(Self::default).clone()
+    }
+
+    fn lane(
+        owner: &std::sync::OnceLock<Option<crate::db_executor::DbExecutor>>,
+    ) -> Result<crate::db_executor::DbExecutor> {
+        owner
+            .get_or_init(|| {
+                crate::db_executor::DbExecutor::new(crate::db_executor::DbExecutorLimits {
+                    workers: std::num::NonZeroUsize::new(2).unwrap(),
+                    queued: std::num::NonZeroUsize::new(16).unwrap(),
+                })
+                .ok()
+            })
+            .clone()
+            .ok_or(Error::DbExecutorUnavailable)
+    }
+
+    fn host(&self) -> Result<crate::db_executor::DbExecutor> {
+        Self::lane(&self.host)
+    }
+    fn cleanup(&self) -> Result<crate::db_executor::DbExecutor> {
+        Self::lane(&self.cleanup)
+    }
 }
 
 // Some existing lifecycle workflows interleave owned async resource locks with
@@ -20216,6 +20292,7 @@ fn host_io_executor() -> Result<crate::db_executor::DbExecutor> {
 // No SQL transaction contains an await/Runtime call, and this lane is separate
 // from the DB worker needed by Runtime callbacks. Do not nest this helper.
 async fn run_host_workflow<T, E>(
+    executor: crate::db_executor::DbExecutor,
     future: impl std::future::Future<Output = std::result::Result<T, E>> + Send + 'static,
 ) -> std::result::Result<T, E>
 where
@@ -20224,10 +20301,7 @@ where
 {
     let runtime =
         tokio::runtime::Handle::try_current().map_err(|_| E::from(Error::DbExecutorUnavailable))?;
-    host_io_executor()
-        .map_err(E::from)?
-        .run(move || runtime.block_on(future))
-        .await
+    executor.run(move || runtime.block_on(future)).await
 }
 
 fn open_subjektiv_store(api: &WorkspaceApi) -> ApiResult<crate::subjektiv::SubjektivStore> {
@@ -22452,7 +22526,8 @@ async fn start_subjektiv_staging_consolidation(
     }
 
     let subject = subject_id.to_owned();
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || subjektiv_job::dispatch(&api, &subject, candidate_count, total_bytes))
         .await
 }
@@ -22462,7 +22537,8 @@ async fn scoped_memory_consolidation(
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     Json(operation): Json<MemoryConsolidateStagingOperation>,
 ) -> ApiResult<Json<MemoryConsolidationOutput>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             Ok(Json(start_memory_staging_consolidation(api, operation)?))
@@ -23499,7 +23575,8 @@ async fn scoped_get_workspace_worker(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspaceWorkerReferencePath>,
 ) -> ApiResult<Json<server_api::WorkerSummary>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let worker_ref = api
@@ -23656,7 +23733,8 @@ async fn list_known_workers(
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     headers: HeaderMap,
 ) -> ApiResult<Json<server_api::WorkerControlListResponse>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
@@ -23719,7 +23797,7 @@ async fn spawn_known_worker_authenticated(
     context: Option<&server_api::ServerRequestContext>,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
     let context = context.cloned();
-    run_host_workflow(async move {
+    run_host_workflow(api.host_executors.host()?, async move {
         spawn_known_worker_authenticated_on_host(
             State(api),
             AxumPath(path),
@@ -23958,7 +24036,8 @@ async fn scoped_list_worker_observation_sessions(
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     headers: HeaderMap,
 ) -> ApiResult<Json<server_api::WorkerObservationSessionsResponse>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
@@ -24084,7 +24163,7 @@ async fn scoped_start_workspace_orchestrator(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
 ) -> ApiResult<Json<BrowserWorkspaceOrchestratorResponse>> {
-    host_io_executor()?.run(move || {
+    api.host_executors.host()?.run(move || {
     #[cfg(test)]
     tests::seed_test_delivery_binding(&api);
     validate_workspace_scope(&api, &path.workspace_id)?;
@@ -24345,7 +24424,8 @@ async fn scoped_list_runtime_working_directories(
 ) -> ApiResult<Json<BrowserWorkingDirectoryListResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     require_active_workspace_runtime_binding(&api, &path.runtime_id).await?;
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let (items, diagnostics) = runtime_working_directory_summaries(&api, &path.runtime_id)?;
             let items = items.into_iter().map(Into::into).collect();
@@ -24379,7 +24459,8 @@ async fn scoped_runtime_working_directory_detail(
 ) -> ApiResult<Json<BrowserWorkingDirectoryDetailResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     require_active_workspace_runtime_binding(&api, &path.runtime_id).await?;
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             working_directory_detail_for_runtime(api, &path.runtime_id, &path.working_directory_id)
         })
@@ -24469,7 +24550,8 @@ async fn cleanup_runtime_working_directory(
 ) -> ApiResult<WorkingDirectoryRemovalResponse> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     require_active_workspace_runtime_binding(&api, &path.runtime_id).await?;
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let registered_runtime =
                 registered_workdir_runtime_id(&api, &path.working_directory_id)?;
@@ -25703,7 +25785,8 @@ async fn scoped_working_directory_detail(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkingDirectoryPath>,
 ) -> ApiResult<Json<BrowserWorkingDirectoryDetailResponse>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let record = api
@@ -25752,7 +25835,8 @@ async fn cleanup_working_directory(
     request: WorkingDirectoryRemovalRequest,
 ) -> ApiResult<WorkingDirectoryRemovalResponse> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             execute_workdir_removal(
                 &api,
@@ -26067,7 +26151,9 @@ async fn create_workspace_working_directory(
 
     if reserved.state == "succeeded" {
         let stage_api = api.clone();
-        return host_io_executor()?
+        return api
+            .host_executors
+            .host()?
             .run(move || {
                 working_directory_detail_for_runtime(
                     stage_api,
@@ -26113,7 +26199,9 @@ async fn create_workspace_working_directory(
 
     let stage_api = api.clone();
     let stage_runtime_id = reserved.resolved_runtime_id.clone();
-    let runtime = match host_io_executor()?
+    let runtime = match api
+        .host_executors
+        .host()?
         .run(move || {
             Ok::<_, Error>(
                 stage_api
@@ -26199,7 +26287,9 @@ async fn create_workspace_working_directory(
     working_directory_request.backend_workdir_id = Some(reserved.working_directory_id.clone());
     let stage_api = api.clone();
     let stage_reserved = reserved.clone();
-    let existing = match host_io_executor()?
+    let existing = match api
+        .host_executors
+        .host()?
         .run(move || {
             Ok::<_, Error>(stage_api.runtime.working_directory(
                 &stage_reserved.resolved_runtime_id,
@@ -26228,7 +26318,9 @@ async fn create_workspace_working_directory(
     } else {
         let stage_api = api.clone();
         let stage_runtime_id = reserved.resolved_runtime_id.clone();
-        match host_io_executor()?
+        match api
+            .host_executors
+            .host()?
             .run(move || {
                 Ok::<_, Error>(
                     stage_api
@@ -27174,7 +27266,9 @@ async fn execute_runtime_cleanup_with_context(
     context.authorize_workspace(api).await?;
     let plan_api = api.clone();
     let plan_runtime = runtime_id.to_owned();
-    let plan = host_io_executor()?
+    let plan = api
+        .host_executors
+        .host()?
         .run(move || build_runtime_cleanup_plan(&plan_api, &plan_runtime))
         .await?;
     // Rebuild the actual candidate set immediately before executing. The digest
@@ -27297,7 +27391,9 @@ async fn execute_runtime_cleanup_with_context(
                 let removal_api = api.clone();
                 let removal_candidate = candidate.clone();
                 let requester = format!("runtime-cleanup:{runtime_id}");
-                let removal = host_io_executor()?
+                let removal = api
+                    .host_executors
+                    .host()?
                     .run(move || {
                         execute_workdir_removal(
                             &removal_api,
@@ -27354,7 +27450,9 @@ async fn execute_runtime_cleanup_with_context(
 
     let plan_api = api.clone();
     let plan_runtime = runtime_id.to_owned();
-    let plan_after = host_io_executor()?
+    let plan_after = api
+        .host_executors
+        .host()?
         .run(move || build_runtime_cleanup_plan(&plan_api, &plan_runtime))
         .await?;
     let executed_at = now_registry_timestamp();
@@ -27664,7 +27762,8 @@ async fn scoped_runtime_cleanup_plan(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
 ) -> ApiResult<Json<RuntimeCleanupPlanResponse>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let plan = build_runtime_cleanup_plan(&api, path.runtime_id.as_str())?;
@@ -27715,7 +27814,8 @@ async fn scoped_create_attachment_upload_grant(
     AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
     Query(query): Query<WorkerFileUploadQuery>,
 ) -> ApiResult<Json<AttachmentUploadGrantResponse>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             resolve_workspace_worker_reference(
@@ -27857,7 +27957,8 @@ async fn scoped_cancel_attachment_upload(
     Extension(actor): Extension<RequestActor>,
     AxumPath(path): AxumPath<ScopedAttachmentUploadPath>,
 ) -> ApiResult<Json<AttachmentUploadCancelResponse>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let completed = {
@@ -28885,7 +28986,8 @@ async fn repository_log(
 async fn list_hosts(
     State(api): State<WorkspaceApi>,
 ) -> ApiResult<Json<InternalRuntimeListResponse<InternalHostSummary>>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let limit = api.config.max_records.min(200);
             let runtime_hosts = api.runtime.list_hosts(limit);
@@ -28903,7 +29005,8 @@ async fn list_hosts(
 async fn list_runtimes(
     State(api): State<WorkspaceApi>,
 ) -> ApiResult<Json<server_api::RuntimeListResponse>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let limit = api.config.max_records.min(200);
             let runtimes = api.runtime.list_runtimes(limit);
@@ -29100,7 +29203,10 @@ async fn execute_runtime_removal(
     let api = api.clone();
     // Retain registration/commit recovery as one owned lifecycle workflow;
     // SQL transaction boundaries and commit-before-Runtime order are unchanged.
-    run_host_workflow(async move { execute_runtime_removal_on_host(&api, operation).await }).await
+    run_host_workflow(api.host_executors.host()?, async move {
+        execute_runtime_removal_on_host(&api, operation).await
+    })
+    .await
 }
 
 async fn execute_runtime_removal_on_host(
@@ -29582,7 +29688,7 @@ async fn create_workspace_worker_authenticated(
     context: Option<&server_api::ServerRequestContext>,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
     let context = context.cloned();
-    run_host_workflow(async move {
+    run_host_workflow(api.host_executors.host()?, async move {
         create_workspace_worker_authenticated_on_host(
             api,
             headers,
@@ -30411,7 +30517,8 @@ async fn get_runtime_worker(
     State(api): State<WorkspaceApi>,
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
 ) -> ApiResult<Json<server_api::RuntimeWorkerShowResponse>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let worker_ref = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
             let worker = api
@@ -30508,7 +30615,8 @@ async fn list_runtime_workers(
     AxumPath(runtime_id): AxumPath<String>,
     Query(query): Query<RuntimeWorkersQuery>,
 ) -> ApiResult<Json<server_api::RuntimeWorkerListResponse>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let limit = api.config.max_records.min(200);
             let (runtime_workers, source) = match query.status {
@@ -30941,7 +31049,7 @@ async fn create_runtime_worker_authenticated(
     context: Option<&server_api::ServerRequestContext>,
 ) -> ApiResult<Json<server_api::RuntimeWorkerSpawnResponse>> {
     let context = context.cloned();
-    run_host_workflow(async move {
+    run_host_workflow(api.host_executors.host()?, async move {
         create_runtime_worker_authenticated_on_host(
             State(api),
             AxumPath(runtime_id),
@@ -31159,7 +31267,8 @@ async fn sync_runtime_config_bundle(
     AxumPath(runtime_id): AxumPath<String>,
     Json(request): Json<server_api::RuntimeConfigBundleSyncRequest>,
 ) -> ApiResult<Json<server_api::RuntimeConfigBundleResult>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let bundle = serde_json::from_value::<ConfigBundle>(request.bundle)
                 .map_err(|error| invalid_contract_value("Runtime ConfigBundle", error))?;
@@ -31181,7 +31290,8 @@ async fn check_runtime_config_bundle(
     AxumPath((runtime_id, bundle_id)): AxumPath<(String, String)>,
     Query(query): Query<server_api::RuntimeConfigBundleAvailabilityQuery>,
 ) -> ApiResult<Json<server_api::RuntimeConfigBundleResult>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let result = api
                 .runtime
@@ -31230,7 +31340,8 @@ async fn delete_runtime_worker_uploaded_file(
     State(api): State<WorkspaceApi>,
     AxumPath((runtime_id, worker_id, artifact_id)): AxumPath<(String, String, String)>,
 ) -> ApiResult<Json<WorkerFileDeleteResponse>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
             api.runtime
@@ -31246,7 +31357,8 @@ async fn runtime_worker_completions(
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
     Json(request): Json<server_api::RuntimeWorkerCompletionsRequest>,
 ) -> ApiResult<Json<server_api::RuntimeWorkerCompletionsResult>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let request = worker_completions_request_from_api(request)?;
             let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
@@ -31825,7 +31937,8 @@ async fn list_host_workers(
     State(api): State<WorkspaceApi>,
     AxumPath(host_id): AxumPath<String>,
 ) -> ApiResult<Json<server_api::HostWorkerListResponse>> {
-    host_io_executor()?
+    api.host_executors
+        .host()?
         .run(move || {
             let limit = api.config.max_records.min(200);
             let runtime_workers = api
@@ -38312,7 +38425,7 @@ mod tests {
             cached_status: "connected".to_owned(),
             timeout: std::time::Duration::from_secs(1),
         });
-        SqliteWorkspaceStore::open(&api.config.database_path)
+        SqliteWorkspaceStore::open_for_test(&api.config.database_path)
             .unwrap()
             .upsert_workspace_runtime_binding(
                 WorkspaceRuntimeBinding {
@@ -39819,9 +39932,9 @@ mod tests {
     async fn workspace_api_does_not_register_a_missing_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_server_config(dir.path());
-        let store = Arc::new(SqliteWorkspaceStore::open(&config.database_path).unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap());
 
-        let error = match WorkspaceApi::new(config, store.clone()).await {
+        let error = match WorkspaceApi::new_for_test(config, store.clone()).await {
             Ok(_) => panic!("missing Workspace registration must fail closed"),
             Err(error) => error,
         };
@@ -39838,11 +39951,12 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let config = test_server_config(workspace.path());
-        let store = Arc::new(SqliteWorkspaceStore::open(config.database_path.clone()).unwrap());
+        let store =
+            Arc::new(SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap());
         seed_test_registered_workspace(store.as_ref(), &config)
             .await
             .unwrap();
-        let api = WorkspaceApi::new(config, store).await.unwrap();
+        let api = WorkspaceApi::new_for_test(config, store).await.unwrap();
         let workspace_id = api.config.workspace_id.clone();
 
         let result = scoped_start_workspace_orchestrator(
@@ -39897,7 +40011,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let config = test_server_config(workspace.path());
-        let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
         let api = WorkspaceApi::new_with_execution_backend(
             config,
             Arc::new(store),
@@ -44441,8 +44555,8 @@ mod tests {
         let restored_config = test_server_config(&root)
             .with_embedded_runtime_store_root(root.join("restored-embedded-runtime"));
         let restored_store =
-            SqliteWorkspaceStore::open(restored_config.database_path.clone()).unwrap();
-        let restored = WorkspaceApi::new(restored_config, Arc::new(restored_store))
+            SqliteWorkspaceStore::open_for_test(restored_config.database_path.clone()).unwrap();
+        let restored = WorkspaceApi::new_for_test(restored_config, Arc::new(restored_store))
             .await
             .unwrap();
         assert!(
@@ -46768,7 +46882,8 @@ mod tests {
             notification_target: None,
             limits: crate::backend_job::BackendJobLimits::default(),
         };
-        let store = Arc::new(SqliteWorkspaceStore::open(config.database_path.clone()).unwrap());
+        let store =
+            Arc::new(SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap());
         seed_test_registered_workspace(store.as_ref(), &config)
             .await
             .unwrap();
@@ -46906,7 +47021,8 @@ mod tests {
         drop(store);
         drop(execution);
 
-        let restarted_store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        let restarted_store =
+            SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
         let restarted_execution = Arc::new(DeterministicExecutionBackend::default());
         restarted_execution.accept_restores();
         let restarted = WorkspaceApi::new_with_execution_backend(
@@ -47096,7 +47212,7 @@ mod tests {
     async fn backend_job_delivery_recovery_replays_same_tracked_notification_id() {
         let temp = tempfile::tempdir().unwrap();
         let config = test_server_config(temp.path());
-        let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
         let execution = Arc::new(DeterministicExecutionBackend::default());
         let api = WorkspaceApi::new_with_execution_backend(
             config.clone(),
@@ -47671,7 +47787,7 @@ mod tests {
         if let Some(parent) = config.database_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
-        SqliteWorkspaceStore::open(&config.database_path).unwrap()
+        SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap()
     }
 
     #[tokio::test]
@@ -47732,7 +47848,7 @@ mod tests {
         .unwrap();
         let mut template = test_server_config(dir.path());
         template.static_assets_dir = Some(static_dir);
-        let store = Arc::new(SqliteWorkspaceStore::open(&template.database_path).unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::open_for_test(&template.database_path).unwrap());
         let app = build_workspace_server_router(template, store)
             .await
             .unwrap();
@@ -47815,7 +47931,7 @@ mod tests {
     async fn repository_free_workspace_can_be_created_selected_and_used_then_register_repository() {
         let temp = tempfile::tempdir().unwrap();
         let config = test_server_config(temp.path());
-        let store = Arc::new(SqliteWorkspaceStore::open(&config.database_path).unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap());
         let owner = seed_test_api_token(store.as_ref(), "empty-owner");
         let foreign = seed_test_api_token(store.as_ref(), "empty-foreign");
         let app = build_workspace_server_router(config.clone(), store.clone())
@@ -48067,7 +48183,7 @@ mod tests {
             ..
         } = &config.auth;
         let expected_origin = expected_origin.clone();
-        let store = Arc::new(SqliteWorkspaceStore::open(&config.database_path).unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap());
         store
             .upsert_account(&AccountRecord {
                 account_id: "account-auth".to_owned(),
@@ -49344,7 +49460,7 @@ mod tests {
         .unwrap();
         let mut template = test_server_config(dir.path());
         template.static_assets_dir = Some(static_dir);
-        let store = Arc::new(SqliteWorkspaceStore::open(&template.database_path).unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::open_for_test(&template.database_path).unwrap());
         let token = seed_test_api_token(store.as_ref(), "two-workspaces");
         let catalog = WorkspaceCatalogService::new(
             store.clone(),
@@ -49485,7 +49601,7 @@ mod tests {
         let repository = dir.path().join("repository");
         std::fs::create_dir_all(repository.join(".git")).unwrap();
         let template = test_server_config(dir.path());
-        let store = Arc::new(SqliteWorkspaceStore::open(&template.database_path).unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::open_for_test(&template.database_path).unwrap());
         let app = build_workspace_server_router(template, store)
             .await
             .unwrap();
@@ -49554,7 +49670,7 @@ mod tests {
     async fn memory_consolidation_backlog_ignores_legacy_filesystem_staging() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_server_config(dir.path());
-        let store = SqliteWorkspaceStore::open(&config.database_path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap();
         let api = WorkspaceApi::new_with_execution_backend(
             config,
             Arc::new(store),
@@ -49587,7 +49703,7 @@ mod tests {
     async fn memory_consolidation_reuses_existing_idle_worker() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_server_config(dir.path());
-        let store = SqliteWorkspaceStore::open(&config.database_path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap();
         let api = WorkspaceApi::new_with_execution_backend(
             config,
             Arc::new(store),
@@ -52982,7 +53098,7 @@ mod tests {
         workspace_root: impl Into<PathBuf>,
     ) -> (WorkspaceApi, Arc<DeterministicExecutionBackend>) {
         let config = test_server_config(workspace_root);
-        let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
         let execution = Arc::new(DeterministicExecutionBackend::default());
         let api =
             WorkspaceApi::new_with_execution_backend(config, Arc::new(store), execution.clone())
@@ -53006,7 +53122,7 @@ mod tests {
         config.repositories[0].source = source;
         config.repositories[0].path = None;
         config.repositories[0].default_selector = Some("develop".to_string());
-        let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
         WorkspaceApi::new_with_execution_backend(
             config,
             Arc::new(store),
@@ -53035,7 +53151,7 @@ mod tests {
         docs.path = Some(docs_root);
         docs.default_selector = Some("develop".to_string());
         config.repositories.push(docs);
-        let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
         WorkspaceApi::new_with_execution_backend(
             config,
             Arc::new(store),
@@ -53470,6 +53586,7 @@ mod tests {
             store,
             Arc::new(DeterministicExecutionBackend::default()),
             BackendResourceBroker::default(),
+            HostExecutors::default(),
             Some(dispatcher.clone()),
         )
         .await
@@ -53715,7 +53832,7 @@ mod tests {
             cached_status: "connected".to_string(),
             timeout: std::time::Duration::from_secs(1),
         });
-        let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
         let owner_account_id = format!("account-{TEST_WORKSPACE_ID}");
         store
             .upsert_account(&crate::store::AccountRecord {
@@ -54015,7 +54132,8 @@ mod tests {
 
         let mut revoked = trust;
         revoked.revoked_at = Some("2026-08-11T00:01:00Z".to_string());
-        let authority = SqliteWorkspaceStore::open(api.config.database_path.clone()).unwrap();
+        let authority =
+            SqliteWorkspaceStore::open_for_test(api.config.database_path.clone()).unwrap();
         authority
             .upsert_workspace_runtime_binding(revoked, true)
             .unwrap();
@@ -54945,7 +55063,7 @@ mod tests {
                 .unwrap()
                 .digest
         );
-        let restarted = SqliteWorkspaceStore::open(&api.config.database_path).unwrap();
+        let restarted = SqliteWorkspaceStore::open_for_test(&api.config.database_path).unwrap();
         assert_eq!(
             changed.digest,
             restarted
@@ -55491,7 +55609,7 @@ mod tests {
                 .unwrap();
         assert_eq!(capability_changed.items, reattached.items);
         assert_ne!(capability_changed.digest, reattached.digest);
-        let restarted = SqliteWorkspaceStore::open(&api.config.database_path).unwrap();
+        let restarted = SqliteWorkspaceStore::open_for_test(&api.config.database_path).unwrap();
         let (restarted_page, restarted_digest) = restarted
             .list_worker_workdir_links_page_with_digest(
                 TEST_WORKSPACE_ID,
@@ -55510,7 +55628,7 @@ mod tests {
             .unwrap()
             .run_to_completion(128, std::time::Duration::from_millis(1), None)
             .unwrap();
-        let restored = SqliteWorkspaceStore::from_connection(snapshot).unwrap();
+        let restored = SqliteWorkspaceStore::from_connection_for_test(snapshot).unwrap();
         assert_eq!(
             restored
                 .list_worker_workdir_links_page_with_digest(
@@ -55555,7 +55673,7 @@ mod tests {
             )
             .unwrap();
         assert_ne!(read_write_digest, capability_changed.digest);
-        let reader = SqliteWorkspaceStore::open(&api.config.database_path).unwrap();
+        let reader = SqliteWorkspaceStore::open_for_test(&api.config.database_path).unwrap();
         let barrier = Arc::new(std::sync::Barrier::new(2));
         std::thread::scope(|scope| {
             let worker = &fixture.worker;
@@ -57415,7 +57533,7 @@ mod tests {
         let identity =
             worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-test").unwrap();
         configure_runtime_request_auth(&mut api, &identity, "runtime-test");
-        let store = SqliteWorkspaceStore::open(&api.config.database_path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&api.config.database_path).unwrap();
         let memory_settings = store
             .get_workspace_memory_settings(TEST_WORKSPACE_ID)
             .unwrap();
@@ -59615,9 +59733,9 @@ mod tests {
         std::fs::write(static_dir.join("index.html"), "<main>Yoi Workspace</main>").unwrap();
         std::fs::write(static_dir.join("assets/app.js"), "console.log('yoi');").unwrap();
 
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         let mut config = test_server_config(dir.path());
-        let sqlite_store = SqliteWorkspaceStore::open(&config.database_path).unwrap();
+        let sqlite_store = SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap();
         sqlite_store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
@@ -59652,7 +59770,7 @@ mod tests {
             "API Ticket",
             ticket::TicketState::Open,
         );
-        let sqlite_store = SqliteWorkspaceStore::open(&config.database_path).unwrap();
+        let sqlite_store = SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap();
         sqlite_store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
@@ -62176,7 +62294,7 @@ mod tests {
     async fn objective_mutation_endpoints_round_trip_through_workspace_authority() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_server_config(dir.path());
-        let store = Arc::new(SqliteWorkspaceStore::open(&config.database_path).unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap());
         let owner_account_id = format!("account-{TEST_WORKSPACE_ID}");
         store
             .upsert_account(&crate::store::AccountRecord {

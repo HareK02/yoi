@@ -68,7 +68,9 @@ pub(super) async fn retire_legacy_worker(api: &WorkspaceApi, subject_id: &str) -
     let job_api = api.clone();
     let subject_id = subject_id.to_owned();
     let key = format!("{SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX}{subject_id}");
-    let (worker, complete) = host_io_executor()?
+    let (worker, complete) = api
+        .host_executors
+        .host()?
         .run(move || {
             let api = &job_api;
             let key = format!("{SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX}{subject_id}");

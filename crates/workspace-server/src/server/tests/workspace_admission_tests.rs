@@ -56,7 +56,7 @@ impl Fixture {
         api.runtime.register_or_replace(runtime);
         let now = Arc::new(AtomicI64::new(START));
         let clock = now.clone();
-        let mut server = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
+        let mut server = WorkspaceServerApi::new_for_test(api.config.clone(), api.store.clone());
         server.proof_clock = Arc::new(move || clock.load(Ordering::SeqCst));
         server
             .apis

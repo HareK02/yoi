@@ -818,7 +818,7 @@ mod current_authority {
     use super::*;
 
     fn binding_store() -> (SqliteWorkspaceStore, WorkspaceRuntimeBinding) {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         let runtime_key =
             worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-key").unwrap();
         store.with_conn(|conn| {

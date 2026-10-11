@@ -119,7 +119,7 @@ async fn assignment_delivery_response_loss_returns_immutable_payload_after_progr
         .update_ticket_assignment_tracking("w", "tracking", &update, &source)
         .unwrap();
     drop(store);
-    let store = SqliteWorkspaceStore::open(directory.path().join("workspace.db")).unwrap();
+    let store = SqliteWorkspaceStore::open_for_test(directory.path().join("workspace.db")).unwrap();
     assert_eq!(
         store
             .list_pending_ticket_assignment_deliveries("w", 100)
@@ -180,7 +180,7 @@ async fn assignment_delivery_simultaneous_reservations_converge_to_one_receipt()
             let path = directory.path().join("workspace.db");
             let input = pending.input_event_id.clone();
             std::thread::spawn(move || {
-                let store = SqliteWorkspaceStore::open(path).unwrap();
+                let store = SqliteWorkspaceStore::open_for_test(path).unwrap();
                 barrier.wait();
                 store
                     .reserve_ticket_assignment_delivery("w", "a", &input, &tracking_store_source())
@@ -540,7 +540,7 @@ async fn assignment_delivery_rendered_content_is_immutable_across_restart_and_co
         "original rendered prompt"
     );
     drop(store);
-    let store = SqliteWorkspaceStore::open(directory.path().join("workspace.db")).unwrap();
+    let store = SqliteWorkspaceStore::open_for_test(directory.path().join("workspace.db")).unwrap();
     assert_eq!(
         store
             .prepare_ticket_assignment_delivery_content(
@@ -606,7 +606,7 @@ fn assignment_delivery_schema92_upgrade_uses_reconciled_migration_evidence_not_l
     let operations = stored_fixture_rows(&conn, "ticket_assignment_operations");
     let tracking = stored_fixture_rows(&conn, "typed_ticket_assignment_tracking_history");
     drop(conn);
-    let store = SqliteWorkspaceStore::open(&path).unwrap();
+    let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     let pending = store
         .list_pending_ticket_assignment_deliveries("w", 100)
         .unwrap();
@@ -656,7 +656,7 @@ async fn assignment_startup_simultaneous_reservations_admit_runtime_effects_once
             let barrier = barrier.clone();
             let path = directory.path().join("workspace.db");
             std::thread::spawn(move || {
-                let store = SqliteWorkspaceStore::open(path).unwrap();
+                let store = SqliteWorkspaceStore::open_for_test(path).unwrap();
                 barrier.wait();
                 delivery_store_start_reserve(&store, "start-a", "a", &tracking_store_source())
                     .unwrap()
@@ -688,8 +688,8 @@ fn assignment_delivery_fresh_and_upgraded_operational_schemas_are_identical() {
     let conn = tracking_schema91_fixture(&path);
     migrate_ticket_tracking_v91_to_v92(&conn).unwrap();
     drop(conn);
-    let upgraded = SqliteWorkspaceStore::open(&path).unwrap();
-    let fresh = SqliteWorkspaceStore::in_memory().unwrap();
+    let upgraded = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+    let fresh = SqliteWorkspaceStore::in_memory_for_test().unwrap();
     let objects = |store: &SqliteWorkspaceStore| {
         store.with_conn(|conn| {
         let mut statement=conn.prepare("SELECT type,name,sql FROM sqlite_schema WHERE name LIKE 'ticket_assignment_delivery_%' OR name LIKE 'ticket_assignment_operation_fence%' ORDER BY name")?;
@@ -713,7 +713,7 @@ async fn assignment_delivery_missing_immutable_request_guard_refuses_startup() {
         .unwrap();
     drop(store);
     assert!(
-        matches!(SqliteWorkspaceStore::open(directory.path().join("workspace.db")),Err(Error::Store(message)) if message.contains("ticket_assignment_delivery_request_no_update"))
+        matches!(SqliteWorkspaceStore::open_for_test(directory.path().join("workspace.db")),Err(Error::Store(message)) if message.contains("ticket_assignment_delivery_request_no_update"))
     );
 }
 

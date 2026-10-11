@@ -634,7 +634,7 @@ pub(super) async fn commit(
                         // a DB worker or an open SQL transaction.
                         let (complete, publication) = tokio::sync::oneshot::channel();
                         let runtime = persistence_api.runtime.clone();
-                        let admission = host_io_executor().and_then(|executor| {
+                        let admission = persistence_api.host_executors.host().and_then(|executor| {
                             executor.dispatch(move || {
                                 let _guard = guard;
                                 let _diagnostics = runtime
@@ -681,7 +681,9 @@ pub(super) async fn create_grant(
     let guard = lock(api, &worker).await?;
     let runtime = api.runtime.clone();
     let lookup_worker = worker.clone();
-    let (summary, guard) = host_io_executor()
+    let (summary, guard) = api
+        .host_executors
+        .host()
         .map_err(pre_error)?
         .run(move || {
             Ok::<_, Error>((|| {

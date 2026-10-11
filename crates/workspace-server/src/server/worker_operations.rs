@@ -356,7 +356,9 @@ impl WorkspaceWorker {
     ) -> ApiResult<InternalWorkerRestoreResult> {
         let guard = self.authorize_operation(context, "restore").await?;
         let worker = self.clone();
-        host_io_executor()?
+        self.api
+            .host_executors
+            .host()?
             .run(move || {
                 let _guard = guard;
                 worker.restore_internal(request)
@@ -381,7 +383,10 @@ impl WorkspaceWorker {
     ) -> ApiResult<WorkerLifecycleResult> {
         let guard = self.authorize_operation(context, "stop").await?;
         let worker = self.clone();
-        let (result, guard) = host_io_executor()?
+        let (result, guard) = self
+            .api
+            .host_executors
+            .host()?
             .run(move || -> ApiResult<_> {
                 let result = worker
                     .api
@@ -399,7 +404,9 @@ impl WorkspaceWorker {
         let session_guard = session_lock.lock_owned().await;
         close_current_worker_session_locked(&self.api, &self.identity).await?;
         let worker = self.clone();
-        host_io_executor()?
+        self.api
+            .host_executors
+            .host()?
             .run(move || -> ApiResult<_> {
                 let (_control, _session) = (guard, session_guard);
                 if let Some(record) = worker
@@ -425,7 +432,9 @@ impl WorkspaceWorker {
     ) -> ApiResult<WorkerLifecycleResult> {
         let guard = self.authorize_operation(context, "cancel").await?;
         let worker = self.clone();
-        host_io_executor()?
+        self.api
+            .host_executors
+            .host()?
             .run(move || -> ApiResult<_> {
                 let _guard = guard;
                 Ok(worker
@@ -457,7 +466,9 @@ impl WorkspaceWorker {
             request.kind = WorkerInputKind::UserIfIdle;
         }
         let worker = self.clone();
-        host_io_executor()?
+        self.api
+            .host_executors
+            .host()?
             .run(move || -> ApiResult<_> {
                 let (_control, _session) = (guard, session_guard);
                 Ok(worker

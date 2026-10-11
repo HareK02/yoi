@@ -463,7 +463,7 @@ mod tests {
     ) {
         let temp = tempfile::tempdir().unwrap();
         let store = Arc::new(
-            SqliteWorkspaceStore::open(temp.path().join("workspace.db"))
+            SqliteWorkspaceStore::open_for_test(temp.path().join("workspace.db"))
                 .unwrap()
                 .with_db_executor(crate::db_executor::DbExecutor::new(Default::default()).unwrap()),
         );

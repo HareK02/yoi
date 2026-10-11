@@ -922,7 +922,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn setup() -> (SqliteWorkspaceStore, String, String) {
-        seed_workspaces(SqliteWorkspaceStore::in_memory().expect("store"))
+        seed_workspaces(SqliteWorkspaceStore::in_memory_for_test().expect("store"))
     }
 
     fn seed_workspaces(store: SqliteWorkspaceStore) -> (SqliteWorkspaceStore, String, String) {
@@ -989,7 +989,7 @@ mod tests {
             let dir = tempdir().expect("tempdir");
             let path = dir.path().join("server.db");
             let (store, owner, workspace_id) =
-                seed_workspaces(SqliteWorkspaceStore::open(&path).expect("store"));
+                seed_workspaces(SqliteWorkspaceStore::open_for_test(&path).expect("store"));
             for workspace in ["workspace-a", "workspace-b"] {
                 let backend = ticket::SqliteTicketBackend::open_verified(&path, workspace).unwrap();
                 let initial = backend

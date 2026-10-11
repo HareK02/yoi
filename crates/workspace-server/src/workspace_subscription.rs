@@ -738,10 +738,11 @@ mod tests {
             AccountRecord, ControlPlaneStore, SqliteWorkspaceStore, WorkerRegistryRecord,
             WorkspaceRecord,
         };
-        let store =
-            std::sync::Arc::new(SqliteWorkspaceStore::in_memory().unwrap().with_db_executor(
-                crate::db_executor::DbExecutor::new(Default::default()).unwrap(),
-            ));
+        let store = std::sync::Arc::new(
+            SqliteWorkspaceStore::in_memory_for_test()
+                .unwrap()
+                .with_db_executor(crate::db_executor::DbExecutor::new(Default::default()).unwrap()),
+        );
         store
             .upsert_account(&AccountRecord {
                 account_id: "owner".into(),

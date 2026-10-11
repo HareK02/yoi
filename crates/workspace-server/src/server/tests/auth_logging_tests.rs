@@ -54,7 +54,7 @@ async fn rejected_runtime_proofs_log_reason_and_verification_without_secrets_on_
     configure_runtime_request_auth(&mut api, &identity, "runtime-test");
     let revoked = RuntimeIdentityMaterial::generate("revoked-runtime-secret").unwrap();
     configure_runtime_request_auth(&mut api, &revoked, "revoked-runtime-secret");
-    SqliteWorkspaceStore::open(&api.config.database_path)
+    SqliteWorkspaceStore::open_for_test(&api.config.database_path)
         .unwrap()
         .revoke_workspace_runtime_binding(
             TEST_WORKSPACE_ID,
@@ -70,7 +70,7 @@ async fn rejected_runtime_proofs_log_reason_and_verification_without_secrets_on_
     let body = "body-secret";
     let apps = [
         build_router(api.clone()),
-        workspace_server_router(WorkspaceServerApi::new(
+        workspace_server_router(WorkspaceServerApi::new_for_test(
             api.config.clone(),
             api.store.clone(),
         )),
@@ -347,7 +347,7 @@ async fn repository_runtime_proof_401_keeps_generic_envelope_on_both_routers() {
     let path = format!("/api/w/{TEST_WORKSPACE_ID}/repositories");
     for app in [
         build_router(api.clone()),
-        workspace_server_router(WorkspaceServerApi::new(
+        workspace_server_router(WorkspaceServerApi::new_for_test(
             api.config.clone(),
             api.store.clone(),
         )),

@@ -2278,11 +2278,38 @@ impl SqliteWorkspaceStore {
     }
 
     pub fn from_connection(conn: Connection) -> Result<Self> {
+        Self::from_connection_with_executor(conn, crate::db_executor::DbExecutor::shared())
+    }
+
+    fn from_connection_with_executor(
+        conn: Connection,
+        db_executor: crate::db_executor::DbExecutor,
+    ) -> Result<Self> {
         prepare_connection(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
-            db_executor: crate::db_executor::DbExecutor::shared(),
+            db_executor,
         })
+    }
+
+    // Ordinary fixtures own the same finite budget as production, not another
+    // fixture's admission/SQL/drain lifetime or a permanent global worker.
+    #[cfg(test)]
+    pub(crate) fn open_for_test(path: impl AsRef<Path>) -> Result<Self> {
+        Self::from_connection_for_test(Connection::open(path)?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_memory_for_test() -> Result<Self> {
+        Self::from_connection_for_test(Connection::open_in_memory()?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_connection_for_test(conn: Connection) -> Result<Self> {
+        Self::from_connection_with_executor(
+            conn,
+            crate::db_executor::DbExecutor::new(crate::db_executor::DbExecutorLimits::default())?,
+        )
     }
 
     /// Override execution limits for a hermetic fixture; subsequent clones share it.
@@ -14861,7 +14888,7 @@ mod tests {
     fn drive_grants_migrate_and_preserve_audit_through_revoke_worker_delete_and_restart() {
         let t = tempfile::tempdir().unwrap();
         let path = t.path().join("server.db");
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         let legacy = Connection::open_in_memory().unwrap();
         configure_sqlite(&legacy).unwrap();
         legacy.execute_batch("CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY);
@@ -14951,7 +14978,7 @@ mod tests {
             Some(other)
         );
         drop(store);
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         assert_eq!(
             store
                 .get_workspace_drive_grant("drive-ws", &first.grant_id)
@@ -14986,7 +15013,7 @@ mod tests {
     }
     #[test]
     fn drive_grants_baseline_constraints_and_worker_lifetime_fail_closed() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         let proposed = drive_grant_fixture(&store);
         let first = store.create_workspace_drive_grant(&proposed).unwrap();
         store.with_conn(|c| {
@@ -15022,7 +15049,7 @@ mod tests {
     fn schema_v74_migrates_historical_worker_projection_rows_without_counter_state() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("workspace.db");
-        drop(SqliteWorkspaceStore::open(&path).unwrap());
+        drop(SqliteWorkspaceStore::open_for_test(&path).unwrap());
         let conn = Connection::open(&path).unwrap();
         configure_sqlite(&conn).unwrap();
         conn.execute_batch(
@@ -15347,7 +15374,7 @@ mod tests {
 
     #[tokio::test]
     async fn external_workdir_grant_persists_typed_source_and_fences_generations() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         store
             .upsert_account(&AccountRecord {
                 account_id: "owner".to_string(),
@@ -15719,7 +15746,7 @@ mod tests {
 
     fn runtime_removal_test_store() -> (tempfile::TempDir, SqliteWorkspaceStore) {
         let temp = tempfile::tempdir().unwrap();
-        let store = SqliteWorkspaceStore::open(temp.path().join("server.db")).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(temp.path().join("server.db")).unwrap();
         store
             .with_conn(|conn| {
                 conn.execute_batch(
@@ -16103,7 +16130,7 @@ mod tests {
         let path = temp.path().join("server.db");
         prepare_retained_schema(&path, 59);
 
-        let migrated = SqliteWorkspaceStore::open(&path).unwrap();
+        let migrated = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         migrated
             .with_conn(|conn| {
                 let table_count: i64 = conn.query_row(
@@ -16139,7 +16166,7 @@ mod tests {
         let path = temp.path().join("server.db");
         prepare_retained_schema(&path, 60);
 
-        drop(SqliteWorkspaceStore::open(&path).unwrap());
+        drop(SqliteWorkspaceStore::open_for_test(&path).unwrap());
         let conn = Connection::open(&path).unwrap();
         assert_eq!(
             current_schema_version(&conn).unwrap(),
@@ -16169,7 +16196,7 @@ mod tests {
     #[test]
     fn schema_v59_runtime_removal_migration_rolls_back_partial_ddl_and_marker() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SqliteWorkspaceStore::open(temp.path().join("server.db")).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(temp.path().join("server.db")).unwrap();
         store
             .with_conn(|conn| {
                 let trigger_names = {
@@ -16433,7 +16460,7 @@ mod tests {
     fn fresh_database_uses_only_the_canonical_workspace_baseline() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         store
             .with_conn(|conn| {
                 let migrations = conn
@@ -16581,7 +16608,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .collect::<Vec<_>>(),
             (83..=LATEST_SCHEMA_VERSION).collect::<Vec<_>>()
         );
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         let assignment = store
             .get_active_ticket_worker_assignment("workspace-a", "ticket")
             .unwrap()
@@ -17052,7 +17079,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 
         let applied = SqliteWorkspaceStore::migrate_database(&path).unwrap();
         assert_eq!(applied, plan);
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         store
             .with_conn(|conn| {
                 assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
@@ -17601,7 +17628,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             "migrated databases must reject incomplete singleton leases"
         );
         drop(conn);
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         let legacy = RuntimeWorkerRef::new("legacy-runtime", "legacy-orchestrator");
         let lease = store
             .require_current_worker_singleton_owner("workspace-a", &legacy)
@@ -17789,7 +17816,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         .unwrap();
         drop(conn);
 
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         store
             .with_conn(|conn| {
                 assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
@@ -17890,7 +17917,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         .unwrap();
         drop(conn);
 
-        let error = SqliteWorkspaceStore::open(&path)
+        let error = SqliteWorkspaceStore::open_for_test(&path)
             .err()
             .expect("migration must fail")
             .to_string();
@@ -17915,7 +17942,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     fn runtime_binding_identity_and_trust_uniqueness_are_workspace_scoped() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         store
             .with_conn(|conn| {
                 conn.execute_batch(
@@ -18017,7 +18044,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         );
         drop(store);
 
-        let reopened = SqliteWorkspaceStore::open(&path).unwrap();
+        let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         assert!(
             reopened
                 .list_workspace_runtime_bindings("workspace-a", false)
@@ -18067,7 +18094,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     fn workspace_runtime_connection_persists_without_authentication_evidence() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         store
             .with_conn(|conn| {
                 conn.execute_batch(
@@ -18112,7 +18139,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             .unwrap();
         assert!(store.workspace_runtime_binding_matches(&persisted).unwrap());
         drop(store);
-        let reopened = SqliteWorkspaceStore::open(&path).unwrap();
+        let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         assert_eq!(
             reopened
                 .get_workspace_runtime_binding("workspace-a", "runtime-a")
@@ -18366,7 +18393,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 
     #[test]
     fn runtime_binding_key_mutations_are_identity_guarded_idempotent_and_audited() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         store
             .with_conn(|conn| {
                 conn.execute_batch(
@@ -18504,7 +18531,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 
     #[test]
     fn embedded_runtime_binding_can_explicitly_rotate_restart_identity() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         store
             .with_conn(|conn| {
                 conn.execute_batch(
@@ -18604,7 +18631,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         conn.execute_batch("DROP TABLE typed_ticket_artifacts")
             .unwrap();
 
-        let result = SqliteWorkspaceStore::from_connection(conn);
+        let result = SqliteWorkspaceStore::from_connection_for_test(conn);
         let error = match result {
             Ok(_) => panic!("schema drift unexpectedly passed startup verification"),
             Err(error) => error,
@@ -18616,7 +18643,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     async fn workspace_schema_rejects_cross_workspace_ticket_repository_reference_at_write_time() {
         let dir = tempfile::tempdir().unwrap();
         let database_path = dir.path().join("workspace.sqlite");
-        let store = SqliteWorkspaceStore::open(&database_path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&database_path).unwrap();
         for workspace_id in ["workspace-a", "workspace-b"] {
             store
                 .upsert_workspace(&WorkspaceRecord {
@@ -18670,14 +18697,14 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         );
         drop(backend);
 
-        SqliteWorkspaceStore::open(&database_path).unwrap();
+        SqliteWorkspaceStore::open_for_test(&database_path).unwrap();
     }
 
     #[tokio::test]
     async fn migrates_sqlite_and_preserves_workspace_record() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("control-plane.sqlite");
-        let store = SqliteWorkspaceStore::open(&db).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&db).unwrap();
 
         assert_eq!(store.schema_version().await.unwrap(), LATEST_SCHEMA_VERSION);
         assert!(
@@ -18695,7 +18722,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         };
         store.upsert_workspace(&record).await.unwrap();
 
-        let reopened = SqliteWorkspaceStore::open(&db).unwrap();
+        let reopened = SqliteWorkspaceStore::open_for_test(&db).unwrap();
         assert_eq!(
             reopened.schema_version().await.unwrap(),
             LATEST_SCHEMA_VERSION
@@ -18710,7 +18737,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     async fn workspace_display_name_update_is_timestamp_guarded_and_preserves_identity() {
         let dir = tempfile::tempdir().unwrap();
         let database_path = dir.path().join("server.db");
-        let store = SqliteWorkspaceStore::open(&database_path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&database_path).unwrap();
         let record = WorkspaceRecord {
             workspace_id: "workspace-a".to_string(),
             owner_account_id: "owner-account".to_string(),
@@ -18749,7 +18776,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             updated
         );
         drop(store);
-        let reopened = SqliteWorkspaceStore::open(database_path).unwrap();
+        let reopened = SqliteWorkspaceStore::open_for_test(database_path).unwrap();
         assert_eq!(
             reopened
                 .get_workspace(&record.workspace_id)
@@ -18763,7 +18790,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     #[tokio::test]
     async fn objective_creation_allocates_and_resolves_workspace_resource_key() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SqliteWorkspaceStore::open(dir.path().join("server.db")).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(dir.path().join("server.db")).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-a".into(),
@@ -18809,7 +18836,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     #[tokio::test]
     async fn worker_create_reservation_allocates_uuid_before_runtime_and_replays_exact_input() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SqliteWorkspaceStore::open(dir.path().join("server.db")).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(dir.path().join("server.db")).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-a".to_string(),
@@ -19113,7 +19140,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     async fn worker_singleton_restart_retry_replays_exact_workdir_intent_and_rejects_changes() {
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("server.db");
-        let store = SqliteWorkspaceStore::open(&database).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&database).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-a".to_string(),
@@ -19173,7 +19200,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             .unwrap();
         drop(store);
 
-        let reopened = SqliteWorkspaceStore::open(&database).unwrap();
+        let reopened = SqliteWorkspaceStore::open_for_test(&database).unwrap();
         let retried = reopened
             .reserve_worker_create(
                 "workspace-a",
@@ -19217,7 +19244,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     async fn worker_singleton_ownership_is_workspace_scoped_durable_and_fences_old_generations() {
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("server.db");
-        let store = SqliteWorkspaceStore::open(&database).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&database).unwrap();
         for workspace_id in ["workspace-a", "workspace-b"] {
             store
                 .upsert_workspace(&WorkspaceRecord {
@@ -19330,7 +19357,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         );
         drop(store);
 
-        let reopened = SqliteWorkspaceStore::open(database).unwrap();
+        let reopened = SqliteWorkspaceStore::open_for_test(database).unwrap();
         assert_eq!(
             reopened
                 .current_worker_singleton_owner("workspace-a", key)
@@ -19343,7 +19370,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     async fn concurrent_worker_singleton_reservations_have_one_winner() {
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("server.db");
-        let store = SqliteWorkspaceStore::open(&database).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&database).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-a".to_string(),
@@ -19363,7 +19390,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 let database = database.clone();
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
-                    let store = SqliteWorkspaceStore::open(database).unwrap();
+                    let store = SqliteWorkspaceStore::open_for_test(database).unwrap();
                     let memory = store.get_workspace_memory_settings("workspace-a").unwrap();
                     barrier.wait();
                     store.reserve_worker_create(
@@ -19383,7 +19410,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             .collect::<Vec<_>>();
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
         assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
-        let store = SqliteWorkspaceStore::open(database).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(database).unwrap();
         let owner = store
             .current_worker_singleton_owner("workspace-a", "shared-key")
             .unwrap()
@@ -19399,7 +19426,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     #[tokio::test]
     async fn workspace_flow_sources_pin_content_and_builtins_stay_resources() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SqliteWorkspaceStore::open(dir.path().join("server.db")).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(dir.path().join("server.db")).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-a".to_string(),
@@ -19492,7 +19519,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             "returning to earlier content must reuse the immutable content"
         );
         drop(store);
-        let reopened = SqliteWorkspaceStore::open(dir.path().join("server.db")).unwrap();
+        let reopened = SqliteWorkspaceStore::open_for_test(dir.path().join("server.db")).unwrap();
         assert_eq!(
             reopened
                 .get_flow_source_content(
@@ -19748,7 +19775,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             }
         );
         drop(conn);
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         let backend = ticket::SqliteTicketBackend::open_verified(&path, "case-workspace").unwrap();
         store
             .with_conn(|conn| {
@@ -19915,7 +19942,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         );
         drop(store);
         drop(backend);
-        let reopened = SqliteWorkspaceStore::open(&path).unwrap();
+        let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         reopened
             .with_conn(|conn| {
                 assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
@@ -19982,7 +20009,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             before
         );
         drop(conn);
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         let backend = ticket::SqliteTicketBackend::open_verified(&path, "case-workspace").unwrap();
         assert_eq!(
             backend
@@ -20116,8 +20143,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("equivalence.db");
         prepare_retained_schema(&path, 90);
-        let upgraded = SqliteWorkspaceStore::open(&path).unwrap();
-        let fresh = SqliteWorkspaceStore::in_memory().unwrap();
+        let upgraded = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        let fresh = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         for object in [
             "workspace_tags",
             "typed_ticket_tags",
@@ -20170,7 +20197,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 
     #[test]
     fn schema_v91_case_constraint_verification_rejects_legacy_view_predicates() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         store.with_conn(|conn| {
             conn.execute_batch("DROP VIEW ticket_active_worker_assignments;
                 CREATE VIEW ticket_active_worker_assignments AS
@@ -20331,7 +20358,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     // boundary under test. Targets need not be materialized by a Runtime.
     async fn manual_worker_start_store() -> (tempfile::TempDir, SqliteWorkspaceStore) {
         let dir = tempfile::tempdir().unwrap();
-        let store = SqliteWorkspaceStore::open(dir.path().join("workspace.db")).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(dir.path().join("workspace.db")).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "w".into(),
@@ -20419,7 +20446,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             let threads = (0..2)
                 .map(|index| {
                     let store =
-                        SqliteWorkspaceStore::open(dir.path().join("workspace.db")).unwrap();
+                        SqliteWorkspaceStore::open_for_test(dir.path().join("workspace.db"))
+                            .unwrap();
                     let barrier = barrier.clone();
                     std::thread::spawn(move || {
                         barrier.wait();
@@ -20784,7 +20812,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .retain_ticket_claim_recovery("w", "claim", &fingerprint, &changed)
                 .is_err()
         );
-        let reopened = SqliteWorkspaceStore::open(dir.path().join("workspace.db")).unwrap();
+        let reopened =
+            SqliteWorkspaceStore::open_for_test(dir.path().join("workspace.db")).unwrap();
         assert_eq!(
             reopened.get_ticket_claim_recovery("w", "claim").unwrap(),
             Some(recovery)
@@ -20842,7 +20871,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         store
             .rollback_ticket_assignment_operation("w", "claim")
             .unwrap();
-        let reopened = SqliteWorkspaceStore::open(dir.path().join("workspace.db")).unwrap();
+        let reopened =
+            SqliteWorkspaceStore::open_for_test(dir.path().join("workspace.db")).unwrap();
         let receipt = reopened
             .get_ticket_assignment_operation("w", "claim")
             .unwrap()
@@ -21062,7 +21092,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         use ticket::TicketBackend;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("workspace.db");
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "w".into(),
@@ -21190,7 +21220,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     async fn ticket_worker_assignment_replaces_current_and_preserves_audit_history() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("server.db");
-        let store = SqliteWorkspaceStore::open(&db).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&db).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-a".to_string(),
@@ -21379,7 +21409,7 @@ INSERT INTO worker_registry (
             )
             .unwrap();
         drop(store);
-        let store = SqliteWorkspaceStore::open(&db).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&db).unwrap();
         let pending = store
             .get_ticket_assignment_operation("workspace-a", "reserved-operation")
             .unwrap()
@@ -21503,7 +21533,7 @@ INSERT INTO worker_registry (
     async fn role_assignment_routes_and_manual_start_are_state_fenced_atomically() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("workspace.db");
-        let store = SqliteWorkspaceStore::open(&db_path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&db_path).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-role".to_string(),
@@ -21792,7 +21822,7 @@ INSERT INTO worker_registry (
     fn startup_rejects_missing_workspace_resource_constraint_trigger() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         store
             .with_conn(|conn| {
                 conn.execute_batch("DROP TRIGGER ticket_worker_assignments_validate_insert")?;
@@ -21801,7 +21831,7 @@ INSERT INTO worker_registry (
             .unwrap();
         drop(store);
 
-        let error = match SqliteWorkspaceStore::open(&path) {
+        let error = match SqliteWorkspaceStore::open_for_test(&path) {
             Ok(_) => panic!("missing assignment constraint trigger must fail closed"),
             Err(error) => error,
         };
@@ -21817,7 +21847,7 @@ INSERT INTO worker_registry (
     fn startup_accepts_retained_assignment_history_after_parent_cleanup() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         store
             .with_conn(|conn| {
                 conn.execute_batch(
@@ -21881,7 +21911,7 @@ INSERT INTO worker_registry (
             .unwrap();
         drop(store);
 
-        let reopened = SqliteWorkspaceStore::open(&path).unwrap();
+        let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         reopened
             .with_conn(|conn| {
                 let retained: i64 = conn.query_row(
@@ -21909,7 +21939,7 @@ INSERT INTO worker_registry (
 
     #[tokio::test]
     async fn workspace_bootstrap_validates_key_and_rejects_duplicate_workspace() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         store
             .upsert_account(&AccountRecord {
                 account_id: "owner-account".to_string(),
@@ -22041,7 +22071,7 @@ INSERT INTO worker_registry (
 
     #[tokio::test]
     async fn repository_records_round_trip() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         assert_eq!(store.schema_version().await.unwrap(), LATEST_SCHEMA_VERSION);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
@@ -22122,7 +22152,7 @@ INSERT INTO worker_registry (
 
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         assert_eq!(store.schema_version().await.unwrap(), LATEST_SCHEMA_VERSION);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
@@ -22197,7 +22227,7 @@ INSERT INTO worker_registry (
 
     #[tokio::test]
     async fn legacy_memory_reset_is_atomic_scoped_idempotent_and_exact() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         for (workspace_id, display_name) in [
             ("local-dev", "Local Dev"),
             ("other-workspace", "Other Workspace"),
@@ -22364,7 +22394,7 @@ INSERT INTO worker_registry (
     async fn worker_workdir_registry_round_trips_and_preserves_pinned_retention() {
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("workspace.db");
-        let store = SqliteWorkspaceStore::open(&db).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&db).unwrap();
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: "owner-account".to_string(),
@@ -22733,7 +22763,7 @@ INSERT INTO worker_registry (
             );
         }
         drop(store);
-        let store = SqliteWorkspaceStore::open(&db).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&db).unwrap();
         assert_eq!(
             store
                 .list_worker_workdir_links_page("local-dev", &worker.worker, 1, 0, None)
@@ -22763,7 +22793,7 @@ INSERT INTO worker_registry (
         let workdir_conflict = store.attach_worker_workdir(&workdir_conflict).unwrap();
 
         drop(store);
-        let reopened = SqliteWorkspaceStore::open(&db).unwrap();
+        let reopened = SqliteWorkspaceStore::open_for_test(&db).unwrap();
         assert_eq!(
             reopened
                 .list_worker_workdir_links("local-dev", &worker.worker)
@@ -22781,7 +22811,7 @@ INSERT INTO worker_registry (
     #[tokio::test]
     async fn worker_projection_preserves_equal_local_ids_from_distinct_runtimes() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SqliteWorkspaceStore::open(temp.path().join("workspace.db")).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(temp.path().join("workspace.db")).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "local-dev".to_string(),
@@ -22907,7 +22937,7 @@ INSERT INTO worker_registry (
     #[tokio::test]
     async fn worker_projection_reconciles_snapshots_and_preserves_unavailable_lifecycle() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SqliteWorkspaceStore::open(temp.path().join("workspace.db")).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(temp.path().join("workspace.db")).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "local-dev".to_string(),
@@ -23082,7 +23112,7 @@ INSERT INTO worker_registry (
     #[tokio::test]
     async fn late_runtime_event_does_not_recreate_retention_deleted_catalog_worker() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SqliteWorkspaceStore::open(temp.path().join("workspace.db")).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(temp.path().join("workspace.db")).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "local-dev".to_string(),
@@ -23177,7 +23207,7 @@ INSERT INTO worker_registry (
     async fn worker_control_grants_are_idempotent_scoped_and_support_internal_invalidation() {
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("control-grants.db");
-        let store = SqliteWorkspaceStore::open(&database).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&database).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-control".to_string(),
@@ -23247,7 +23277,7 @@ INSERT INTO worker_registry (
         );
 
         drop(store);
-        let store = SqliteWorkspaceStore::open(&database).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&database).unwrap();
         assert_eq!(
             store
                 .list_active_worker_control_grants(
@@ -23305,7 +23335,7 @@ INSERT INTO worker_registry (
 
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         assert_eq!(store.schema_version().await.unwrap(), LATEST_SCHEMA_VERSION);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
@@ -23664,9 +23694,9 @@ INSERT INTO worker_registry (
     async fn backend_job_resource_reserve_converges_across_connections_without_changing_input() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("resource-jobs.sqlite");
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         seed_resource_job_workspace(&store).await;
-        let other = SqliteWorkspaceStore::open(&path).unwrap();
+        let other = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         let requests = [
             resource_job_request("first", "subject-a", "candidate-1"),
             resource_job_request("followup", "subject-a", "candidate-2"),
@@ -23782,7 +23812,7 @@ INSERT INTO worker_registry (
     async fn backend_job_resource_retry_and_unknown_are_fenced_by_durable_cleanup() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cleanup-jobs.sqlite");
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         seed_resource_job_workspace(&store).await;
         let request = resource_job_request("failed", "subject-a", "candidate-1");
         let first = store
@@ -23888,7 +23918,7 @@ INSERT INTO worker_registry (
             .unwrap();
         finish_resource_job_cleanup(&store, &second);
         drop(store);
-        let restarted = SqliteWorkspaceStore::open(&path).unwrap();
+        let restarted = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         let active = restarted
             .find_active_backend_job_for_resource(
                 "resource-workspace",
@@ -23948,7 +23978,7 @@ INSERT INTO worker_registry (
     async fn backend_job_resource_retry_races_new_intent_atomically_and_remains_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("retry-race.sqlite");
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         seed_resource_job_workspace(&store).await;
         // Generic resources use the same common reservation API without domain grants.
         let mut request = resource_job_request("generic", "subject-a", "candidate-1");
@@ -23971,7 +24001,7 @@ INSERT INTO worker_registry (
         let mut followup = request.clone();
         followup.job_id = "generic-followup".into();
         followup.input = serde_json::json!({"candidate": "new"});
-        let other = SqliteWorkspaceStore::open(&path).unwrap();
+        let other = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         let barrier = std::sync::Barrier::new(2);
         let (retry, reserve) = std::thread::scope(|scope| {
             let a = scope.spawn(|| {
@@ -24057,7 +24087,7 @@ INSERT INTO worker_registry (
 
     #[tokio::test]
     async fn backend_job_all_older_attempt_cleanups_fence_retry_and_resource_release() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         seed_resource_job_workspace(&store).await;
         let mut request = resource_job_request("legacy-overlap", "subject-a", "candidate-1");
         request.limits.max_attempts = 3;
@@ -24181,7 +24211,7 @@ INSERT INTO worker_registry (
 
     #[tokio::test]
     async fn backend_job_empty_batch_surface_refresh_locks_subject_and_defers_candidates() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         seed_resource_job_workspace(&store).await;
         for surface_state in ["ungenerated", "stale", "failed"] {
             let subject = format!("subject-{surface_state}");
@@ -24301,7 +24331,7 @@ INSERT INTO worker_registry (
 
     #[tokio::test]
     async fn backend_job_completed_resource_releases_only_after_worker_cleanup() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         seed_resource_job_workspace(&store).await;
         let request = resource_job_request("completed", "subject-a", "candidate-1");
         let first = store
@@ -24355,7 +24385,7 @@ INSERT INTO worker_registry (
 
     #[tokio::test]
     async fn backend_jobs_fence_results_project_ownership_and_bound_retries() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         let workspace_id = "workspace-job";
         store
             .upsert_account(&AccountRecord {

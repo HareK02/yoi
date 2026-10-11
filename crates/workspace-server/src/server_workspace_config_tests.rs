@@ -318,7 +318,7 @@ mod workspace_config_integration {
                 };
                 for scoped in [false, true] {
                     let app = if scoped {
-                        workspace_server_router(WorkspaceServerApi::new(
+                        workspace_server_router(WorkspaceServerApi::new_for_test(
                             api.config.clone(),
                             api.store.clone(),
                         ))
@@ -1385,7 +1385,7 @@ mod workspace_config_integration {
         let api = &fixture.api;
         let granted = grant(api, &fixture.worker, Access::ReadWrite).await;
         let attached = attach(api, &fixture.worker).await;
-        let restarted = SqliteWorkspaceStore::open(&api.config.database_path).unwrap();
+        let restarted = SqliteWorkspaceStore::open_for_test(&api.config.database_path).unwrap();
         assert_eq!(
             restarted
                 .get_workspace_config_grant(TEST_WORKSPACE_ID, &granted.grant_id)
