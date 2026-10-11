@@ -473,6 +473,9 @@ pub struct WorkerLifecycleWorkdirAttachment {
 
 #[derive(Debug, Clone)]
 pub struct WorkerLifecycleSpawnRequest {
+    /// Observed delegation required for Orchestrator Ticket starts.
+    pub orchestrator_assignment_id: Option<String>,
+
     pub runtime_id: String,
     /// Ordered alias-keyed selections forwarded as canonical Workdir attachments.
     pub workdir_attachments: Vec<WorkerLifecycleWorkdirAttachment>,
@@ -494,6 +497,7 @@ fn workspace_worker_create_request(
     let ticket_assignment = match (request.ticket_id, request.operation_id) {
         (Some(ticket_id), Some(operation_id)) => {
             Some(CreateWorkspaceWorkerTicketAssignmentRequest {
+                orchestrator_assignment_id: request.orchestrator_assignment_id,
                 ticket_id,
                 operation_id,
             })
@@ -729,6 +733,9 @@ struct WorkerSpawnInput {
     /// neither the profile nor an initial Flow segment grants review authority.
     #[serde(default)]
     ticket_id: Option<String>,
+    /// Observed current Orchestrator delegation, required for a Ticket start by the Orchestrator.
+    #[serde(default)]
+    orchestrator_assignment_id: Option<String>,
     #[serde(default)]
     display_name: Option<String>,
     /// Normal typed initial user submission delivered after spawn. An empty
@@ -913,6 +920,10 @@ impl Tool for WorkspaceWorkerTool {
                     .transpose()?;
                 self.control
                     .spawn_worker(WorkerLifecycleSpawnRequest {
+                        orchestrator_assignment_id: input
+                            .orchestrator_assignment_id
+                            .map(|id| authority_id(&id, "orchestrator_assignment_id"))
+                            .transpose()?,
                         runtime_id: authority_id(&input.runtime_id, "runtime_id")?,
                         workdir_attachments: vec![WorkerLifecycleWorkdirAttachment {
                             alias: INITIAL_WORKDIR_ALIAS.to_string(),
@@ -1895,6 +1906,7 @@ mod tests {
     #[test]
     fn worker_lifecycle_spawn_request_preserves_canonical_attachment_collection() {
         let request = workspace_worker_create_request(WorkerLifecycleSpawnRequest {
+            orchestrator_assignment_id: None,
             runtime_id: "runtime-1".to_string(),
             workdir_attachments: vec![
                 WorkerLifecycleWorkdirAttachment {
@@ -1954,6 +1966,7 @@ mod tests {
     #[test]
     fn worker_lifecycle_spawn_serializes_ticket_assignment_without_workdirs_or_flow() {
         let request = workspace_worker_create_request(WorkerLifecycleSpawnRequest {
+            orchestrator_assignment_id: Some("delegation-742".into()),
             runtime_id: "runtime-1".to_string(),
             workdir_attachments: Vec::new(),
             profile: "project:ticket-worker".to_string(),
@@ -1971,6 +1984,7 @@ mod tests {
             value["ticket_assignment"],
             serde_json::json!({
                 "ticket_id": "T-719",
+                "orchestrator_assignment_id": "delegation-742",
                 "operation_id": "spawn-ticket-worker:T-719:call-1",
             })
         );

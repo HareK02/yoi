@@ -156,11 +156,15 @@ impl WorkerPrompt {
     ];
 }
 
-/// Model-visible queued Ticket projection shared by Server and TUI backlog attention paths.
+/// Model-visible Ticket projection shared by Server and TUI attention paths.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OrchestratorQueueAttentionTicket {
     resource_key: String,
     title: String,
+    assignment_id: Option<String>,
+    input_event_id: Option<String>,
+    waiting_reason: Option<String>,
+    next_action: Option<String>,
 }
 
 impl OrchestratorQueueAttentionTicket {
@@ -175,7 +179,27 @@ impl OrchestratorQueueAttentionTicket {
         Ok(Self {
             resource_key,
             title: bounded_queue_attention_text(&title.into(), 240),
+            assignment_id: None,
+            input_event_id: None,
+            waiting_reason: None,
+            next_action: None,
         })
+    }
+
+    /// Committed delegation/input identity, not a handling-status transition.
+    /// The receiving Worker must reread current authority before a new action.
+    pub fn with_assignment_input(
+        mut self,
+        assignment_id: &str,
+        input_event_id: &str,
+        waiting_reason: Option<&str>,
+        next_action: Option<&str>,
+    ) -> Self {
+        self.assignment_id = Some(bounded_queue_attention_text(assignment_id, 1024));
+        self.input_event_id = Some(bounded_queue_attention_text(input_event_id, 1024));
+        self.waiting_reason = waiting_reason.map(|text| bounded_queue_attention_text(text, 1024));
+        self.next_action = next_action.map(|text| bounded_queue_attention_text(text, 1024));
+        self
     }
 }
 
@@ -200,7 +224,7 @@ impl OrchestratorQueueAttentionContext {
     }
 }
 
-/// Prompt-catalog entries that must share the same backlog-attention body contract.
+/// Prompt-catalog entries sharing a bounded Ticket resource-key projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrchestratorQueueAttentionPrompt {
     Server,
@@ -841,8 +865,10 @@ mod tests {
             .orchestrator_queue_attention(OrchestratorQueueAttentionPrompt::Tui, &context)
             .unwrap();
 
-        assert_eq!(server, tui);
-        assert!(server.starts_with("Queued Tickets require attention:"));
+        assert!(server.starts_with("Assigned Tickets have unreceived input:"));
+        // TUI's final operation model is a separate downstream scope; both
+        // renderers still consume the same bounded resource-key projection.
+        assert!(tui.starts_with("Queued Tickets require attention:"));
         assert!(server.contains("- T-1 — Ticket 1 with control "));
         assert!(!server.contains("T-21"));
         assert!(server.contains("were omitted from this notice: 1"));
@@ -857,6 +883,28 @@ mod tests {
         ] {
             assert!(!server.contains(secret), "leaked {secret}: {server}");
         }
+    }
+
+    #[test]
+    fn assignment_attention_carries_input_identity_and_bounded_waiting_context() {
+        let ticket = OrchestratorQueueAttentionTicket::new("T-742", "Partial work")
+            .unwrap()
+            .with_assignment_input(
+                "assignment-a",
+                "answer-event",
+                Some("human\nanswer"),
+                Some(&"x".repeat(2048)),
+            );
+        let context = OrchestratorQueueAttentionContext::new(vec![ticket]);
+        let output = PromptCatalog::builtins_only()
+            .unwrap()
+            .orchestrator_queue_attention(OrchestratorQueueAttentionPrompt::Server, &context)
+            .unwrap();
+        assert!(output.contains("Delegation: assignment-a; input: answer-event."));
+        assert!(output.contains("Waiting reason: human answer"));
+        assert!(output.contains(&format!("Next action: {}…", "x".repeat(1024))));
+        assert!(!output.contains(&"x".repeat(1025)));
+        assert!(output.contains("no ready/Queue step is required"));
     }
 
     #[test]

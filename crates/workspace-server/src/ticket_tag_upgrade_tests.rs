@@ -265,7 +265,7 @@ fn assert_retained_classification_upgrade(workspace_version: i64, component: i64
     drop(conn);
     let store = SqliteWorkspaceStore::open(&path).unwrap();
     store.with_conn(|conn| {
-        assert_eq!(current_schema_version(conn)?,92);
+        assert_eq!(current_schema_version(conn)?,93);
         assert_eq!(conn.query_row("SELECT MAX(version) FROM ticket_schema_migrations",[],|row|row.get::<_,i64>(0))?,11);
         assert_eq!(fixture_auth_rows(conn),auth_before);
         for (table, rows) in preserved_tables.iter().zip(&preserved) {
@@ -493,7 +493,7 @@ fn workspace90_cases9_add_classification_without_reinterpreting_reasoned_history
     let store = SqliteWorkspaceStore::open(&path).unwrap();
     store
         .with_conn(|conn| {
-            assert_eq!(current_schema_version(conn)?, 92);
+            assert_eq!(current_schema_version(conn)?,93);
             assert_eq!(
                 conn.query_row(
                     "SELECT MAX(version) FROM ticket_schema_migrations",

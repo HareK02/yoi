@@ -68,7 +68,9 @@ async fn runtime_and_account_assign_retries_return_saved_result_after_clear_and_
         })).unwrap();
         tracking_response(
             app.clone(),
-            request("PUT", &worker_path, worker_input),
+            Request::builder().method("PUT").uri(&worker_path).header(CONTENT_TYPE, "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(worker_input)).unwrap(),
             StatusCode::OK,
         )
         .await;
@@ -117,15 +119,15 @@ async fn runtime_and_account_assign_retries_return_saved_result_after_clear_and_
             .await,
             saved
         );
-        // Only a genuinely new operation is refused; a receipt never restores
-        // the cleared current pointer, initializes tracking, or starts work.
-        tracking_response(
+        // Receipt replay does not recreate a delegation or transfer manual work.
+        assert_eq!(counts(), before);
+        let fresh = tracking_response(
             app,
             request("PUT", &path, input("new-assign")),
-            StatusCode::CONFLICT,
+            StatusCode::OK,
         )
         .await;
-        assert_eq!(counts(), before);
+        assert_ne!(fresh["assignment"]["assignment_id"].as_str(), Some(assignment));
         assert_eq!(
             api.store
                 .get_ticket_assignment_tracking(TEST_WORKSPACE_ID, &ticket, assignment)
@@ -144,16 +146,9 @@ async fn runtime_and_account_assign_retries_return_saved_result_after_clear_and_
                 .unwrap(),
             active
         );
-        assert!(
-            api.store
-                .get_current_ticket_role_assignment(
-                    TEST_WORKSPACE_ID,
-                    &ticket,
-                    TicketAssignmentRole::Orchestrator
-                )
-                .unwrap()
-                .is_none()
-        );
+        assert_eq!(api.store.get_current_ticket_role_assignment(TEST_WORKSPACE_ID, &ticket,
+            TicketAssignmentRole::Orchestrator).unwrap().unwrap().assignment_id,
+            fresh["assignment"]["assignment_id"].as_str().unwrap());
     }
 }
 

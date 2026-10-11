@@ -45,8 +45,10 @@ worker using the original Tokio handle; do not build a replacement runtime for
 cached services and do not submit to and await the Host lane from inside itself.
 Control/session guards needed by an accepted mutation belong to that actual job.
 
-Backend Job cleanup is admitted before its durable cleanup claim. Rejection leaves
-Pending/Failed ownership recoverable instead of abandoning a Running claim. Ticket
+Backend Job cleanup has a third finite lane (two workers, 16 queued jobs), so a
+long Run teardown wait cannot starve ordinary Host control/stop requests. It is
+admitted before its durable cleanup claim. Rejection leaves Pending/Failed
+ownership recoverable instead of abandoning an Executing claim. Ticket
 checker dispatch and timeout processing use bounded admission; overload leaves the
 saved reservation/deadline diagnosable. They are not automatically retried after an
 unknown DB outcome. Runtime teardown is still its own lifecycle fence, not proof

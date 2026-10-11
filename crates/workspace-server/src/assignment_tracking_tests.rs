@@ -439,12 +439,12 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
             .iter()
             .map(|m| m.version)
             .collect::<Vec<_>>(),
-        vec![92]
+        vec![92, 93]
     );
     let store = SqliteWorkspaceStore::open(&path).unwrap();
     store
         .with_conn(|conn| {
-            assert_eq!(current_schema_version(conn)?, 92);
+            assert_eq!(current_schema_version(conn)?, 93);
             assert_eq!(
                 conn.query_row(
                     "SELECT applied_at FROM ticket_schema_migrations WHERE version=10",
@@ -457,7 +457,8 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
                 workspace_schema_migration_history(conn)?,
                 vec![
                     (91, "workspace schema baseline".into()),
-                    (92, "Ticket-owned assignment tracking".into())
+                    (92, "Ticket-owned assignment tracking".into()),
+                    (93, "Durable assignment deliveries and source-bound startup fences".into())
                 ]
             );
             for (table, rows) in retained.iter().zip(original.iter()) {
@@ -595,7 +596,7 @@ fn tracking_store_schema91_closed_unknown_assignment_uses_assign_audit_for_first
                 .is_empty()
         );
         store.with_conn(|conn| {
-            assert_eq!(current_schema_version(conn)?, 92);
+            assert_eq!(current_schema_version(conn)?, 93);
             assert_eq!(conn.query_row("SELECT MAX(version) FROM ticket_schema_migrations", [], |row| row.get::<_,i64>(0))?, 11);
             assert_eq!(conn.query_row("SELECT workflow_state FROM typed_tickets WHERE ticket_id='historical-done'", [], |row| row.get::<_,String>(0))?, "closed");
             let stored: (Option<String>, Option<String>) = conn.query_row("SELECT tracking_json,last_tracking_event_id FROM ticket_worker_assignments WHERE assignment_id='a-historical-done'", [], |row| Ok((row.get(0)?,row.get(1)?)))?;

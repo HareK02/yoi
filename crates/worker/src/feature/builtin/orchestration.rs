@@ -21,7 +21,7 @@ use crate::feature::{
 
 const FEATURE_ID: &str = "orchestration";
 const TOOL_NAME: &str = "SpawnTicketWorker";
-const TOOL_DESCRIPTION: &str = "Spawn and atomically assign a generic Ticket Worker for the natural-language initial request. Profile is optional (defaults to builtin:ticket-worker); Flow and repository/Workdir attachments are optional. Results and return choices follow user intent, not a universal approval or MR gate. Backend validates claims and derives attachment access from Ticket targets; acceptance follows spawn, initial input, assignment, and resource finalization. Profile/Flow selection grants neither trusted review nor merge authority.";
+const TOOL_DESCRIPTION: &str = "Spawn and atomically assign a generic Ticket Worker for the natural-language initial request. Profile is optional (defaults to builtin:ticket-worker); Flow and repository/Workdir attachments are optional. Results and return choices follow user intent, not a universal approval or MR gate. Orchestrator starts must supply the observed orchestrator_assignment_id; stale delegations cannot start new work. Assign is enough (no Queue/ready); unresolved dependencies are diagnostics for partial work and never start implicitly. Backend validates claims and derives attachment access from Ticket targets; acceptance follows spawn, initial input, assignment, and resource finalization. Profile/Flow selection grants neither trusted review nor merge authority.";
 
 #[derive(Debug, Default)]
 pub struct OrchestrationFeature;
@@ -78,6 +78,9 @@ struct SpawnTicketWorkerWorkdirInput {
 #[serde(deny_unknown_fields)]
 struct SpawnTicketWorkerInput {
     ticket_id: String,
+    /// Observed current delegation identity. Required by Backend for an Orchestrator start; manual callers omit it.
+    #[serde(default)]
+    orchestrator_assignment_id: Option<String>,
     runtime_id: String,
     /// Optional registered profile selector; omitted/null selects builtin:ticket-worker.
     /// Backend resolves the profile and validates claims, not natural-language satisfaction.
@@ -132,6 +135,10 @@ impl Tool for SpawnTicketWorkerTool {
         let response = self
             .worker_service
             .spawn(WorkerLifecycleSpawnRequest {
+                orchestrator_assignment_id: input
+                    .orchestrator_assignment_id
+                    .map(|id| authority_id(id, "orchestrator_assignment_id"))
+                    .transpose()?,
                 runtime_id,
                 workdir_attachments,
                 profile,
@@ -307,6 +314,7 @@ mod tests {
         let service = Arc::new(RecordingService::default());
         let mut input = input();
         input["flow"] = serde_json::json!("project:investigation");
+        input["orchestrator_assignment_id"] = serde_json::json!("delegation-742");
         input["workdir_attachments"] = serde_json::json!([
             {
                 "alias": "checkout",
@@ -327,6 +335,10 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         assert_eq!(request.runtime_id, "runtime-1");
+        assert_eq!(
+            request.orchestrator_assignment_id.as_deref(),
+            Some("delegation-742")
+        );
         assert_eq!(request.profile, "project:ticket-worker");
         assert_eq!(request.ticket_id.as_deref(), Some("00001KZXN51C7"));
         assert_eq!(
@@ -475,6 +487,16 @@ mod tests {
                 "initial_request must not be empty",
             ),
             ("flow", serde_json::json!(" "), "flow must not be empty"),
+            (
+                "orchestrator_assignment_id",
+                serde_json::json!("http://invalid/id"),
+                "orchestrator_assignment_id must be an authority id",
+            ),
+            (
+                "orchestrator_assignment_id",
+                serde_json::json!(" "),
+                "orchestrator_assignment_id must not be empty",
+            ),
             (
                 "runtime_id",
                 serde_json::json!("runtime/1"),

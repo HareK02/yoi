@@ -1540,7 +1540,7 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
 #[derive(Default)]
 struct OrchestratorAttentionState {
     sending: bool,
-    restore_recheck: bool,
+    input_recheck: bool,
     accepted: Option<OrchestratorAttentionDelivery>,
     pending: Option<OrchestratorAttentionDelivery>,
 }
@@ -1550,6 +1550,7 @@ struct OrchestratorAttentionDelivery {
     fingerprint: String,
     request_id: String,
     content: String,
+    input: crate::store::TicketAssignmentDelivery,
 }
 
 struct OrchestratorAttentionReservation(Option<Arc<Mutex<OrchestratorAttentionState>>>);
@@ -1558,10 +1559,11 @@ impl OrchestratorAttentionReservation {
     fn complete(mut self) -> bool {
         let state = self.0.take().expect("active attention reservation");
         let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
-        // Release and take deferred work atomically. A Restore arriving after
-        // release can reserve its own check; one arriving before is ours to drain.
+        // Release and take deferred input checks atomically. A committed input or
+        // Restore arriving before release is ours to drain; one after release
+        // can reserve its own check.
         state.sending = false;
-        std::mem::take(&mut state.restore_recheck)
+        std::mem::take(&mut state.input_recheck)
     }
 }
 
@@ -3840,59 +3842,86 @@ impl WorkspaceApi {
                 ))
                 .map_err(|message| Error::Config(message.to_string()))?;
         }
-        let expired_external_workdirs = api.store.reconcile_external_workdir_grants_after_restart(
-            &api.config.workspace_id,
-            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-        )?;
+        let recovery_api = api.clone();
+        let expired_external_workdirs = api
+            .store
+            .db_executor()
+            .run(move || {
+                recovery_api
+                    .store
+                    .reconcile_external_workdir_grants_after_restart(
+                        &recovery_api.config.workspace_id,
+                        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    )
+            })
+            .await?;
         for workdir_id in expired_external_workdirs {
             cleanup_external_workdir_attachments(&api, &workdir_id)
                 .await
                 .map_err(|error| error.error)?;
         }
-        for grant in api
+        let grant_api = api.clone();
+        let grants = api
             .store
-            .list_external_workdir_grants(&api.config.workspace_id)?
+            .db_executor()
+            .run(move || {
+                grant_api
+                    .store
+                    .list_external_workdir_grants(&grant_api.config.workspace_id)
+            })
+            .await?;
+        for grant in grants
             .into_iter()
             .filter(|grant| !matches!(grant.status.as_str(), "revoked" | "expired"))
         {
             schedule_external_workdir_expiry(&api, &grant)?;
         }
-        recover_workdir_removals(&api)?;
+        let workdir_recovery_api = api.clone();
+        host_io_executor()?
+            .run(move || recover_workdir_removals(&workdir_recovery_api))
+            .await?;
         recover_runtime_removals(&api).await;
-        let recovery_now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-        let deliveries = api
-            .store
-            .recover_backend_job_deliveries(&api.config.workspace_id, &recovery_now)?;
-        for delivery in deliveries {
-            let Some(job) = api
-                .store
-                .get_backend_job(&api.config.workspace_id, &delivery.job_id)?
-            else {
-                continue;
-            };
-            let Some(attempt) = api.store.get_backend_job_attempt(
-                &api.config.workspace_id,
-                &delivery.job_id,
-                &delivery.attempt_id,
-            )?
-            else {
-                continue;
-            };
-            if job.state == BackendJobState::Completed
-                && attempt.state == BackendJobAttemptState::Completed
-            {
-                api.deliver_backend_job_result(
-                    &BackendJobResultAcceptance {
-                        job,
-                        attempt,
-                        replayed: true,
-                    },
-                    &delivery.target,
-                );
-            }
-        }
-        api.recover_backend_jobs()?;
-        Ok(api)
+        host_io_executor()?
+            .run(move || {
+                let recovery_now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+                let deliveries = api
+                    .store
+                    .recover_backend_job_deliveries(&api.config.workspace_id, &recovery_now)?;
+                for delivery in deliveries {
+                    let Some(job) = api
+                        .store
+                        .get_backend_job(&api.config.workspace_id, &delivery.job_id)?
+                    else {
+                        continue;
+                    };
+                    let Some(attempt) = api.store.get_backend_job_attempt(
+                        &api.config.workspace_id,
+                        &delivery.job_id,
+                        &delivery.attempt_id,
+                    )?
+                    else {
+                        continue;
+                    };
+                    if job.state == BackendJobState::Completed
+                        && attempt.state == BackendJobAttemptState::Completed
+                    {
+                        api.deliver_backend_job_result(
+                            &BackendJobResultAcceptance {
+                                job,
+                                attempt,
+                                replayed: true,
+                            },
+                            &delivery.target,
+                        );
+                    }
+                }
+                api.recover_backend_jobs()?;
+                if let Some(orchestrator) = find_online_workspace_orchestrator(&api) {
+                    dispatch_orchestrator_assignment_attention(&api, &orchestrator.worker);
+                }
+                Ok(api)
+            })
+            .await
     }
 
     pub fn workspace_id(&self) -> &str {
@@ -7041,6 +7070,7 @@ fn worker_ticket_assignment_from_api(
     assignment: server_api::RuntimeWorkerTicketAssignmentRequest,
 ) -> WorkerTicketAssignmentRequest {
     WorkerTicketAssignmentRequest {
+        orchestrator_assignment_id: assignment.orchestrator_assignment_id,
         ticket_id: assignment.ticket_id,
         operation_id: assignment.operation_id,
     }
@@ -8712,10 +8742,12 @@ impl server_api::ServerApi for ServerApiContractService {
         request: server_api::CreateWorkspaceWorkerRequest,
     ) -> std::result::Result<server_api::BrowserCreateWorkerResponse, server_api::RepositoryApiError>
     {
-        create_workspace_worker(
-            State(self.workspace_api()?.clone()),
+        create_workspace_worker_authenticated(
+            self.workspace_api()?.clone(),
             contract_request_headers(&context)?,
-            Json(request),
+            request,
+            None,
+            Some(&context),
         )
         .await
         .map(|Json(response)| response)
@@ -8777,11 +8809,12 @@ impl server_api::ServerApi for ServerApiContractService {
         request: server_api::CreateWorkspaceWorkerRequest,
     ) -> std::result::Result<server_api::BrowserCreateWorkerResponse, server_api::RepositoryApiError>
     {
-        spawn_known_worker(
+        spawn_known_worker_authenticated(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
             current_worker_contract_headers(&context)?,
             Json(request),
+            Some(&context),
         )
         .await
         .map(|Json(response)| response)
@@ -8955,11 +8988,14 @@ impl server_api::ServerApi for ServerApiContractService {
         request: server_api::CreateWorkspaceWorkerRequest,
     ) -> std::result::Result<server_api::BrowserCreateWorkerResponse, server_api::RepositoryApiError>
     {
-        scoped_create_workspace_worker(
-            State(self.workspace_api()?.clone()),
-            AxumPath(ScopedWorkspacePath { workspace_id }),
+        validate_workspace_scope(self.workspace_api()?, &workspace_id)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        create_workspace_worker_authenticated(
+            self.workspace_api()?.clone(),
             contract_request_headers(&context)?,
-            Json(request),
+            request,
+            None,
+            Some(&context),
         )
         .await
         .map(|Json(response)| response)
@@ -9421,14 +9457,16 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn runtime_worker_create_alias(
         &self,
+        context: server_api::ServerRequestContext,
         runtime_id: String,
         request: server_api::RuntimeWorkerSpawnRequest,
     ) -> std::result::Result<server_api::RuntimeWorkerSpawnResponse, server_api::RepositoryApiError>
     {
-        let Json(response) = create_runtime_worker(
+        let Json(response) = create_runtime_worker_authenticated(
             State(self.workspace_api()?.clone()),
             AxumPath(runtime_id),
             Json(request),
+            Some(&context),
         )
         .await
         .map_err(ApiError::into_repository_api_error)?;
@@ -9457,18 +9495,19 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn runtime_worker_create(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         runtime_id: String,
         request: server_api::RuntimeWorkerSpawnRequest,
     ) -> std::result::Result<server_api::RuntimeWorkerSpawnResponse, server_api::RepositoryApiError>
     {
-        let Json(response) = scoped_create_runtime_worker(
+        validate_workspace_scope(self.workspace_api()?, &workspace_id)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        let Json(response) = create_runtime_worker_authenticated(
             State(self.workspace_api()?.clone()),
-            AxumPath(ScopedRuntimePath {
-                workspace_id,
-                runtime_id,
-            }),
+            AxumPath(runtime_id),
             Json(request),
+            Some(&context),
         )
         .await
         .map_err(ApiError::into_repository_api_error)?;
@@ -13728,6 +13767,32 @@ async fn start_manual_ticket_worker_assignment(
     record: &TicketRoleAssignmentRecord,
     operation_id: &str,
     selected: &[server_api::TicketWorkerAttachmentBinding],
+    delegation: Option<&TicketStartDelegation>,
+) -> ApiResult<TicketRoleAssignmentRecord> {
+    let api = api.clone();
+    let record = record.clone();
+    let operation_id = operation_id.to_owned();
+    let selected = selected.to_vec();
+    let delegation = delegation.cloned();
+    run_host_workflow(async move {
+        start_manual_ticket_worker_assignment_on_host(
+            &api,
+            &record,
+            &operation_id,
+            &selected,
+            delegation.as_ref(),
+        )
+        .await
+    })
+    .await
+}
+
+async fn start_manual_ticket_worker_assignment_on_host(
+    api: &WorkspaceApi,
+    record: &TicketRoleAssignmentRecord,
+    operation_id: &str,
+    selected: &[server_api::TicketWorkerAttachmentBinding],
+    delegation: Option<&TicketStartDelegation>,
 ) -> ApiResult<TicketRoleAssignmentRecord> {
     let TicketAssignmentPrincipal::Worker {
         runtime_id,
@@ -13760,6 +13825,20 @@ async fn start_manual_ticket_worker_assignment(
         .store
         .get_ticket_assignment_operation(&api.config.workspace_id, operation_id)?
     {
+        if delegation.is_some() {
+            reserve_ticket_start(
+                api,
+                operation_id,
+                &record.ticket_id,
+                &worker.runtime_id,
+                Some(&worker.worker_id),
+                &fingerprint,
+                &record.assigned_at,
+                delegation,
+            )?;
+        }
+        api.store
+            .validate_ticket_assignment_operation_fence(&api.config.workspace_id, operation_id)?;
         if operation.request_fingerprint.as_deref() != Some(fingerprint.as_str()) {
             return Err(Error::TicketAssignmentConflict(
                 "manual Worker claim operation was reused with different input".into(),
@@ -13855,14 +13934,15 @@ async fn start_manual_ticket_worker_assignment(
     }
     let binding =
         validate_manual_ticket_worker_workdir_binding(api, &worker, &record.ticket_id, &selected)?;
-    let admitted = api.store.reserve_ticket_assignment_operation(
-        &api.config.workspace_id,
+    let admitted = reserve_ticket_start(
+        api,
         operation_id,
         &record.ticket_id,
         &worker.runtime_id,
         Some(&worker.worker_id),
         &fingerprint,
         &record.assigned_at,
+        delegation,
     )?;
     if !admitted {
         return Err(Error::TicketAssignmentConflict("manual Worker claim is already admitted; reread its durable result instead of redispatching".into()).into());
@@ -13886,6 +13966,8 @@ async fn start_manual_ticket_worker_assignment(
         )?;
         return Err(error.into());
     }
+    api.store
+        .validate_ticket_assignment_operation_fence(&api.config.workspace_id, operation_id)?;
     let stopped = api
         .runtime
         .stop_worker(
@@ -14232,9 +14314,10 @@ async fn apply_set_ticket_assignment(
             ))
         })
         .await?;
-    let assignment = match role {
+    let (assignment, notification) = match role {
         TicketAssignmentRole::Orchestrator => {
             let store = api.store.clone();
+            let notification_api = api.clone();
             let record = record.clone();
             let expected = expected_assignment_id.clone();
             let operation_id = operation_id.clone();
@@ -14242,7 +14325,7 @@ async fn apply_set_ticket_assignment(
                 .db_executor()
                 .run(move || {
                     let expected_assignment_id = expected;
-                    if let Some(source) = source.as_ref() {
+                    let assignment = if let Some(source) = source.as_ref() {
                         store.set_current_ticket_orchestrator_assignment(
                             &record,
                             expected_assignment_id.as_deref(),
@@ -14260,7 +14343,14 @@ async fn apply_set_ticket_assignment(
                             &operation_id,
                             expected_assignment_id.is_some(),
                         )
-                    }
+                    }?;
+                    // Dispatch from the accepted SQL owner after commit, even
+                    // when its waiter has gone. The response still observes the
+                    // same best-effort notification completion as before offload.
+                    Ok::<_, Error>((
+                        assignment,
+                        enqueue_orchestrator_assignment_attention(&notification_api),
+                    ))
                 })
                 .await?
         }
@@ -14272,8 +14362,21 @@ async fn apply_set_ticket_assignment(
                 )
                 .into());
             }
-            start_manual_ticket_worker_assignment(&api, &record, &operation_id, &workdir_bindings)
-                .await?
+            let delegation = ticket_start_delegation(
+                source.as_ref(),
+                request.orchestrator_assignment_id.as_deref(),
+            )?;
+            (
+                start_manual_ticket_worker_assignment(
+                    &api,
+                    &record,
+                    &operation_id,
+                    &workdir_bindings,
+                    delegation.as_ref(),
+                )
+                .await?,
+                None,
+            )
         }
         TicketAssignmentRole::Owner | TicketAssignmentRole::Contributor => {
             return Err(Error::TicketAssignmentConflict(
@@ -14283,6 +14386,9 @@ async fn apply_set_ticket_assignment(
             .into());
         }
     };
+    if let Some(notification) = notification {
+        let _ = notification.await;
+    }
     Ok(Json(server_api::TicketRoleAssignmentMutationResponse {
         workspace_id,
         ticket_id: ticket.id,
@@ -14482,6 +14588,118 @@ async fn cancel_ticket_worker(
     Ok(())
 }
 
+/// Observation-bound delegation for a new Ticket execution operation. This is
+/// distinct from self-reported handling and from the Worker work assignment.
+type TicketStartDelegation = (String, ticket::TicketAssignmentTrackingSourceContext);
+
+fn ticket_start_delegation(
+    source: Option<&crate::store::TicketOrchestratorAssignmentSourceContext>,
+    observed_assignment_id: Option<&str>,
+) -> Result<Option<TicketStartDelegation>> {
+    use crate::store::TicketOrchestratorAssignmentSourceContext;
+    match source {
+        Some(TicketOrchestratorAssignmentSourceContext::Runtime {
+            runtime_id,
+            worker_id,
+            agent_key,
+            authentication_binding_id,
+        }) => {
+            let assignment_id = observed_assignment_id.filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| Error::TicketAssignmentConflict("Orchestrator Ticket start requires the observed orchestrator_assignment_id".into()))?;
+            if assignment_id.len() > 1024 || assignment_id.chars().any(char::is_control) {
+                return Err(Error::InvalidInput(
+                    "orchestrator_assignment_id must be control-free and at most 1024 bytes".into(),
+                ));
+            }
+            Ok(Some((
+                assignment_id.to_owned(),
+                ticket::TicketAssignmentTrackingSourceContext {
+                    actor: format!("worker:{runtime_id}/{worker_id}"),
+                    runtime_id: runtime_id.clone(),
+                    worker_id: worker_id.clone(),
+                    agent_key: agent_key.clone(),
+                    authentication_binding_id: authentication_binding_id.clone(),
+                },
+            )))
+        }
+        _ if observed_assignment_id.is_some() => Err(Error::WorkspacePermissionDenied(
+            "Only the authenticated current Orchestrator may start under a delegation".into(),
+        )),
+        _ => Ok(None),
+    }
+}
+
+fn ticket_spawn_delegation(
+    api: &WorkspaceApi,
+    headers: &HeaderMap,
+    context: Option<&server_api::ServerRequestContext>,
+    observed_assignment_id: Option<&str>,
+) -> Result<Option<TicketStartDelegation>> {
+    if let Some(context) = context {
+        // Generic authenticated Worker/manual starts are not implicit delegation.
+        // Only the registered Orchestrator starts under its observed assignment.
+        let worker = authenticated_ticket_worker_source(headers, context)?;
+        if let Some(worker) = worker.as_ref() {
+            api.store
+                .require_current_worker_singleton_owner(&api.config.workspace_id, worker)?;
+            if find_workspace_orchestrator(api).is_some_and(|current| current.worker == *worker) {
+                let (_, source) = authenticated_assignment_source(api, headers, context)?;
+                return ticket_start_delegation(Some(&source), observed_assignment_id);
+            }
+        }
+        ticket_start_delegation(None, observed_assignment_id)
+    } else {
+        // Only direct test adapters omit middleware context. Production routes
+        // must preserve the binding that actually authenticated the request.
+        #[cfg(test)]
+        {
+            ticket_start_delegation(None, observed_assignment_id)
+        }
+        #[cfg(not(test))]
+        {
+            Err(Error::WorkspacePermissionDenied(
+                "Ticket start requires Backend-authenticated context".into(),
+            ))
+        }
+    }
+}
+
+fn reserve_ticket_start(
+    api: &WorkspaceApi,
+    operation_id: &str,
+    ticket_id: &str,
+    runtime_id: &str,
+    worker_id: Option<&str>,
+    fingerprint: &str,
+    created_at: &str,
+    delegation: Option<&TicketStartDelegation>,
+) -> Result<bool> {
+    if let Some((assignment_id, source)) = delegation {
+        api.store
+            .reserve_ticket_assignment_operation_for_orchestrator(
+                &api.config.workspace_id,
+                operation_id,
+                ticket_id,
+                runtime_id,
+                worker_id,
+                fingerprint,
+                created_at,
+                assignment_id,
+                source,
+            )
+    } else {
+        api.store.reserve_ticket_assignment_operation(
+            &api.config.workspace_id,
+            operation_id,
+            ticket_id,
+            runtime_id,
+            worker_id,
+            fingerprint,
+            created_at,
+        )
+    }
+}
+
 fn validate_ticket_assignment_state(
     api: &WorkspaceApi,
     assignment: &WorkerTicketAssignmentRequest,
@@ -14494,13 +14712,8 @@ fn validate_ticket_assignment_state(
             ticket.state.as_str()
         )));
     }
-    let dependencies =
-        browser_ticket_backend(api)?.dependency_check(TicketIdOrSlug::Id(ticket.id))?;
-    if !dependencies.blockers.is_empty() {
-        return Err(Error::TicketAssignmentConflict(
-            "Ticket work is blocked by unresolved relations".into(),
-        ));
-    }
+    // Dependencies remain diagnostics for the caller's partial-work decision;
+    // they are not authority, resource occupancy, or execution reservations.
     Ok(())
 }
 
@@ -17723,55 +17936,6 @@ fn active_orchestrator_assignment(
     }
 }
 
-fn orchestrator_interested(
-    api: &WorkspaceApi,
-    workspace_id: &str,
-    ticket_id: &str,
-    _state: &str,
-) -> Result<Option<TicketRoleAssignmentRecord>> {
-    let backend = browser_ticket_backend(api)?;
-    let ticket = backend.show(ticket_id.into()).map_err(Error::from)?;
-    if ticket.meta.workflow_state != TicketState::Open {
-        return Ok(None);
-    }
-    let has_unfinished_work = api
-        .store
-        .get_active_ticket_worker_assignment(workspace_id, ticket_id)?
-        .is_some();
-    // Transitional routing continues to require an explicit queue request or
-    // unfinished work. Openness alone is not a routing request. A later case
-    // decision fences older queue receipts; T-741/742 will replace this path.
-    let explicitly_queued = ticket
-        .events
-        .iter()
-        .rev()
-        .find_map(|event| {
-            if event.attributes.contains_key("queue_root_ticket") {
-                Some(true)
-            } else if event.attributes.contains_key("case_action") {
-                Some(false)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| {
-            // Old queued/inprogress cases may predate queue receipts. This frozen
-            // migration handoff preserves their intent, but any new case decision
-            // fences it so reopening never revives an old routing request.
-            ticket.case_history.is_empty()
-                && ticket
-                    .legacy_workflow_snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| {
-                        matches!(snapshot.workflow_state.as_str(), "queued" | "inprogress")
-                    })
-        });
-    if !has_unfinished_work && !explicitly_queued {
-        return Ok(None);
-    }
-    active_orchestrator_assignment(api, workspace_id, ticket_id)
-}
-
 fn worker_ticket_source_context(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -17930,13 +18094,8 @@ fn notify_ticket_recipients(
     {
         recipients.push(assignment.worker.clone());
     }
-    if orchestrator_interested(api, workspace_id, ticket_id, current_state)
-        .ok()
-        .flatten()
-        .is_some()
-        && let Some(orchestrator) = find_workspace_orchestrator(api)
-    {
-        recipients.push(orchestrator.worker.clone());
+    if let Some(orchestrator) = find_workspace_orchestrator(api) {
+        dispatch_orchestrator_assignment_attention(api, &orchestrator.worker);
     }
     recipients.sort();
     recipients.dedup();
@@ -19448,8 +19607,29 @@ async fn run_orchestrator_turn_end_hook(api: WorkspaceApi) {
     };
     let mut worker_states = HashMap::new();
     while let Some(update) = subscription.recv().await {
-        if !observe_orchestrator_turn_end(&api, &mut worker_states, update) {
-            return;
+        let stage_api = api.clone();
+        let result = host_io_executor().map(|executor| async move {
+            executor
+                .run(move || -> Result<_> {
+                    let keep_running =
+                        observe_orchestrator_turn_end(&stage_api, &mut worker_states, update);
+                    Ok((keep_running, worker_states))
+                })
+                .await
+        });
+        match result {
+            Ok(operation) => match operation.await {
+                Ok((true, states)) => worker_states = states,
+                Ok((false, _)) => return,
+                Err(error) => {
+                    tracing::warn!(%error, "Orchestrator hook stopped; durable inputs remain recoverable");
+                    return;
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "Orchestrator hook executor unavailable");
+                return;
+            }
         }
     }
 }
@@ -19515,24 +19695,51 @@ fn maybe_dispatch_orchestrator_turn_end(
     if orchestrator.worker.runtime_id == EMBEDDED_WORKER_RUNTIME_ID
         && orchestrator.worker.worker_id == worker_id
     {
-        dispatch_orchestrator_queue_attention(api, &orchestrator.worker, false);
+        // Idle can be a reentrant consequence of this very Runtime send. It is
+        // not evidence of a new input and must not retry a failed send forever.
+        // Concurrent committed-input notifications independently defer a check.
+        with_orchestrator_attention_reservation(
+            api,
+            &orchestrator.worker,
+            false,
+            |state, pending| {
+                check_orchestrator_assignment_attention(api, &orchestrator.worker, state, pending);
+            },
+        );
     }
 }
 
-fn dispatch_orchestrator_queue_attention(
+fn enqueue_orchestrator_assignment_attention(
     api: &WorkspaceApi,
-    worker: &RuntimeWorkerRef,
-    retry_only: bool,
-) {
-    with_orchestrator_attention_reservation(api, worker, retry_only, |state, pending| {
-        check_orchestrator_queue_attention(api, worker, state, pending);
+) -> Option<tokio::sync::oneshot::Receiver<()>> {
+    let api = api.clone();
+    let (done, completion) = tokio::sync::oneshot::channel();
+    match host_io_executor().and_then(|executor| {
+        executor.dispatch(move || {
+            if let Some(orchestrator) = find_workspace_orchestrator(&api) {
+                dispatch_orchestrator_assignment_attention(&api, &orchestrator.worker);
+            }
+            let _ = done.send(());
+        })
+    }) {
+        Ok(()) => Some(completion),
+        Err(error) => {
+            tracing::warn!(%error, "Assign notification was not admitted; input remains durable");
+            None
+        }
+    }
+}
+
+fn dispatch_orchestrator_assignment_attention(api: &WorkspaceApi, worker: &RuntimeWorkerRef) {
+    with_orchestrator_attention_reservation(api, worker, true, |state, pending| {
+        check_orchestrator_assignment_attention(api, worker, state, pending);
     });
 }
 
 fn with_orchestrator_attention_reservation(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
-    mut retry_only: bool,
+    defer_input_check_if_reserved: bool,
     mut check: impl FnMut(
         &Arc<Mutex<OrchestratorAttentionState>>,
         Option<OrchestratorAttentionDelivery>,
@@ -19542,7 +19749,10 @@ fn with_orchestrator_attention_reservation(
     loop {
         let pending = {
             let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
-            if state.sending || (retry_only && state.pending.is_none()) {
+            if state.sending {
+                // A no-op scan may already have read its empty snapshot. Retain
+                // committed input/startup/Restore triggers until its completion.
+                state.input_recheck |= defer_input_check_if_reserved;
                 return;
             }
             state.sending = true;
@@ -19553,74 +19763,78 @@ fn with_orchestrator_attention_reservation(
         if !reservation.complete() {
             return;
         }
-        // Accepted Restore is an explicit recheck even when the current check
-        // was a no-op or an already-online retry. Never infer it from Idle.
-        retry_only = false;
+        // Drain coalesced input triggers even when the first scan was a no-op.
+        // No recheck is created by a failed send or its own idle observation.
     }
 }
 
-fn check_orchestrator_queue_attention(
+fn orchestrator_delivery_target(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+) -> Result<ticket::TicketAssignmentTrackingSourceContext> {
+    if !find_online_workspace_orchestrator(api).is_some_and(|current| current.worker == *worker) {
+        return Err(Error::WorkspacePermissionDenied(
+            "Delivery target is not the current registered Orchestrator".into(),
+        ));
+    }
+    let binding = api
+        .config_store
+        .get_workspace_runtime_binding(&api.config.workspace_id, &worker.runtime_id)?
+        .filter(|binding| binding.revoked_at.is_none())
+        .ok_or_else(|| {
+            Error::WorkspacePermissionDenied("Delivery target has no active Runtime binding".into())
+        })?;
+    Ok(ticket::TicketAssignmentTrackingSourceContext {
+        actor: "backend:assignment-delivery".into(),
+        runtime_id: worker.runtime_id.clone(),
+        worker_id: worker.worker_id.clone(),
+        agent_key: "workspace-orchestrator".into(),
+        authentication_binding_id: binding.binding_id,
+    })
+}
+
+fn check_orchestrator_assignment_attention(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
     state: &Arc<Mutex<OrchestratorAttentionState>>,
     pending: Option<OrchestratorAttentionDelivery>,
 ) {
-    // Unknown outcomes keep the original immutable payload and ID, even if the
-    // backlog or prompt projection changed before this retry.
+    let Ok(target) = orchestrator_delivery_target(api, worker) else {
+        return;
+    };
     if let Some(delivery) = pending {
-        send_orchestrator_attention(api, worker, &state, delivery);
-        return;
-    }
-    let Ok(backend) = browser_ticket_backend(api) else {
-        return;
-    };
-    let Ok(mut queued) = backend.list(ticket::TicketListQuery::states([
-        ticket::TicketListState::Open,
-    ])) else {
-        return;
-    };
-    queued.retain(|ticket| {
-        orchestrator_interested(api, &api.config.workspace_id, &ticket.id, "open")
-            .ok()
-            .flatten()
-            .is_some()
-    });
-    queued.sort_by(|left, right| left.id.cmp(&right.id));
-    if queued.is_empty() {
-        state.lock().unwrap_or_else(|p| p.into_inner()).accepted = None;
-        return;
-    }
-    let fingerprint = queued
-        .iter()
-        .map(|ticket| ticket.id.as_str())
-        .collect::<Vec<_>>()
-        .join("|");
-    if state
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .accepted
-        .as_ref()
-        .map(|delivery| delivery.fingerprint.as_str())
-        == Some(fingerprint.as_str())
-    {
-        return;
-    }
-
-    let attention_context = match orchestrator_queue_attention_context(
-        &api.config.workspace_id,
-        &api.config.workspace_id,
-        &queued,
-    ) {
-        Ok(context) => context,
-        Err(error) => {
-            tracing::warn!(
-                workspace_id = %api.config.workspace_id,
-                candidate_count = queued.len(),
-                diagnostic = error,
-                "orchestrator backlog attention projection rejected"
-            );
-            return;
+        // Validate current identity before retrying an immutable request. Clear,
+        // reissue, close and Worker replacement cannot revive an old delivery.
+        if api
+            .store
+            .reserve_ticket_assignment_delivery(
+                &api.config.workspace_id,
+                &delivery.input.assignment_id,
+                &delivery.input.input_event_id,
+                &target,
+            )
+            .is_ok()
+        {
+            send_orchestrator_attention(api, worker, state, delivery);
+            if state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pending
+                .is_some()
+            {
+                return; // Unknown/failed acceptance needs an explicit later trigger.
+            }
+        } else {
+            state.lock().unwrap_or_else(|p| p.into_inner()).pending = None;
         }
+        // Discarding or acknowledging an old retry must not consume this new-
+        // input trigger. Continue the common scan in the same reservation.
+    }
+    let Ok(inputs) = api
+        .store
+        .list_pending_ticket_assignment_deliveries(&api.config.workspace_id, 20)
+    else {
+        return;
     };
     let Ok(Some(config_state)) = api
         .config_store
@@ -19637,27 +19851,66 @@ fn check_orchestrator_queue_attention(
     let Ok(catalog) = worker::PromptCatalog::from_projection(projection.catalog().clone()) else {
         return;
     };
-    let content = match catalog.orchestrator_queue_attention(
-        worker::OrchestratorQueueAttentionPrompt::Server,
-        &attention_context,
-    ) {
-        Ok(content) => content,
-        Err(error) => {
-            tracing::warn!(
-                workspace_id = %api.config.workspace_id,
-                diagnostic = %error,
-                "orchestrator backlog attention rendering failed"
-            );
-            return;
+    for input in inputs {
+        // Reserve from the same pending-input contract, rechecking current
+        // assignment and target binding under the write lock before any I/O.
+        let Ok(input) = api.store.reserve_ticket_assignment_delivery(
+            &api.config.workspace_id,
+            &input.assignment_id,
+            &input.input_event_id,
+            &target,
+        ) else {
+            continue;
+        };
+        let Ok(ticket) = api.authority.ticket(&input.ticket_id) else {
+            continue;
+        };
+        let Ok(projected) =
+            worker::OrchestratorQueueAttentionTicket::new(ticket.resource_key, ticket.title)
+        else {
+            continue;
+        };
+        let context =
+            worker::OrchestratorQueueAttentionContext::new(vec![projected.with_assignment_input(
+                &input.assignment_id,
+                &input.input_event_id,
+                input.waiting_reason.as_deref(),
+                input.next_action.as_deref(),
+            )]);
+        let Ok(content) = catalog.orchestrator_queue_attention(
+            worker::OrchestratorQueueAttentionPrompt::Server,
+            &context,
+        ) else {
+            continue;
+        };
+        // The complete rendered request, including title/catalog projection, is
+        // pinned before dispatch; restart retries never render a new payload
+        // under an already accepted Runtime request id.
+        let Ok(content) = api.store.prepare_ticket_assignment_delivery_content(
+            &api.config.workspace_id,
+            &input.delivery_id,
+            &content,
+            &target,
+        ) else {
+            continue;
+        };
+        let delivery = OrchestratorAttentionDelivery {
+            fingerprint: input.delivery_id.clone(),
+            request_id: input.request_id.clone(),
+            content,
+            input,
+        };
+        state.lock().unwrap_or_else(|p| p.into_inner()).pending = Some(delivery.clone());
+        send_orchestrator_attention(api, worker, state, delivery);
+        if state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pending
+            .is_some()
+        {
+            break;
         }
-    };
-    let delivery = OrchestratorAttentionDelivery {
-        fingerprint,
-        request_id: uuid::Uuid::now_v7().to_string(),
-        content,
-    };
-    state.lock().unwrap_or_else(|p| p.into_inner()).pending = Some(delivery.clone());
-    send_orchestrator_attention(api, worker, &state, delivery);
+    }
 }
 
 fn send_orchestrator_attention(
@@ -19666,30 +19919,76 @@ fn send_orchestrator_attention(
     state: &Mutex<OrchestratorAttentionState>,
     delivery: OrchestratorAttentionDelivery,
 ) {
-    // Bounded delivery-side retry, not an Idle-snapshot retry. Rejection and
-    // transport ambiguity leave pending available for the next attempt.
+    tracing::debug!(delivery_id = %delivery.fingerprint, assignment_id = %delivery.input.assignment_id, "dispatch committed assignment input");
     for _ in 0..2 {
-        let accepted = api
-            .runtime
-            .send_input(
-                worker,
-                WorkerInputRequest {
-                    kind: WorkerInputKind::Notify,
-                    content: delivery.content.clone(),
-                    submission_request_id: Some(delivery.request_id.clone()),
-                    segments: None,
-                },
-            )
-            .is_ok_and(|result| result.state == InternalWorkerOperationState::Accepted);
-        if accepted {
-            let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
-            state.accepted = Some(delivery);
-            state.pending = None;
+        let Ok(target) = orchestrator_delivery_target(api, worker) else {
             return;
+        };
+        if api
+            .store
+            .reserve_ticket_assignment_delivery(
+                &api.config.workspace_id,
+                &delivery.input.assignment_id,
+                &delivery.input.input_event_id,
+                &target,
+            )
+            .is_err()
+        {
+            state.lock().unwrap_or_else(|p| p.into_inner()).pending = None;
+            return;
+        }
+        let result = api.runtime.send_input(
+            worker,
+            WorkerInputRequest {
+                kind: WorkerInputKind::Notify,
+                content: delivery.content.clone(),
+                submission_request_id: Some(delivery.request_id.clone()),
+                segments: None,
+            },
+        );
+        if result
+            .as_ref()
+            .is_ok_and(|result| result.state == InternalWorkerOperationState::Accepted)
+        {
+            if api
+                .store
+                .ack_ticket_assignment_delivery(
+                    &api.config.workspace_id,
+                    &delivery.input.delivery_id,
+                    &target,
+                )
+                .is_ok()
+            {
+                let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
+                state.accepted = Some(delivery);
+                state.pending = None;
+            }
+            return;
+        }
+        if let Some(error_category) = ticket_notification_delivery_error_category(&result) {
+            tracing::warn!(
+                event = "ticket_assignment_delivery_pending",
+                workspace_id = %api.config.workspace_id,
+                assignment_id = %delivery.input.assignment_id,
+                input_event_id = %delivery.input.input_event_id,
+                delivery_id = %delivery.input.delivery_id,
+                recipient_runtime_id = %worker.runtime_id,
+                recipient_worker_id = %worker.worker_id,
+                error_category,
+                "committed delegation input remains pending; retry the saved request"
+            );
+            emit_ticket_notification_delivery_warning(TicketNotificationDeliveryWarning::new(
+                &api.config.workspace_id,
+                &delivery.input.ticket_id,
+                "open",
+                worker,
+                error_category,
+            ));
         }
     }
 }
 
+#[cfg(test)]
 fn orchestrator_queue_attention_context(
     expected_workspace_id: &str,
     candidate_workspace_id: &str,
@@ -23402,11 +23701,43 @@ fn scoped_worker_control_operation_id(controller: &RuntimeWorkerRef, operation_i
     )
 }
 
+#[cfg(test)]
 async fn spawn_known_worker(
+    api: State<WorkspaceApi>,
+    path: AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+    request: Json<CreateWorkspaceWorkerRequest>,
+) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
+    spawn_known_worker_authenticated(api, path, headers, request, None).await
+}
+
+async fn spawn_known_worker_authenticated(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+    Json(request): Json<CreateWorkspaceWorkerRequest>,
+    context: Option<&server_api::ServerRequestContext>,
+) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
+    let context = context.cloned();
+    run_host_workflow(async move {
+        spawn_known_worker_authenticated_on_host(
+            State(api),
+            AxumPath(path),
+            headers,
+            Json(request),
+            context.as_ref(),
+        )
+        .await
+    })
+    .await
+}
+
+async fn spawn_known_worker_authenticated_on_host(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     headers: HeaderMap,
     Json(mut request): Json<CreateWorkspaceWorkerRequest>,
+    context: Option<&server_api::ServerRequestContext>,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
@@ -23444,9 +23775,14 @@ async fn spawn_known_worker(
         operation_id: scoped_worker_control_operation_id(&controller, &operation_id),
         input_fingerprint,
     });
-    let response =
-        create_workspace_worker_inner(api.clone(), headers, request, resolved_control_operation)
-            .await?;
+    let response = create_workspace_worker_authenticated_on_host(
+        api.clone(),
+        headers,
+        request,
+        resolved_control_operation,
+        context,
+    )
+    .await?;
     if let Err(error) = api
         .store
         .create_worker_control_grant(&WorkerControlGrantRecord {
@@ -23749,7 +24085,8 @@ async fn scoped_start_workspace_orchestrator(
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
 ) -> ApiResult<Json<BrowserWorkspaceOrchestratorResponse>> {
     host_io_executor()?.run(move || {
-
+    #[cfg(test)]
+    tests::seed_test_delivery_binding(&api);
     validate_workspace_scope(&api, &path.workspace_id)?;
     let _guard = api.orchestrator_spawn_lock.lock().map_err(|_| {
         ApiError::with_diagnostics(
@@ -23766,8 +24103,9 @@ async fn scoped_start_workspace_orchestrator(
     if let Some(existing) = find_workspace_orchestrator(&api) {
         if workspace_orchestrator_is_online(&existing) {
             drop(_guard);
-            // Already-online is not a new startup. Only retry outstanding delivery.
-            dispatch_orchestrator_queue_attention(&api, &existing.worker, true);
+            // Already-online creation uses the same committed-input scan; neither
+            // local cache loss nor handled status alone creates new work.
+            dispatch_orchestrator_assignment_attention(&api, &existing.worker);
             return Ok(Json(workspace_orchestrator_response(&api, "existing")));
         }
         let attention = orchestrator_attention_state(&api, &existing.worker);
@@ -23789,14 +24127,9 @@ async fn scoped_start_workspace_orchestrator(
                 {
                     attention.accepted = None;
                 }
-                // A reserved caller may already have decided not to send. Carry
-                // the explicit Restore check through its completion in that case.
-                if attention.sending {
-                    attention.restore_recheck = true;
-                }
             }
             drop(_guard);
-            dispatch_orchestrator_queue_attention(&api, &existing.worker, false);
+            dispatch_orchestrator_assignment_attention(&api, &existing.worker);
             return Ok(Json(workspace_orchestrator_response(&api, "restored")));
         }
         if !diagnostics_indicate_unrecoverable_pending_workspace_restore(&restored.diagnostics) {
@@ -23876,7 +24209,7 @@ async fn scoped_start_workspace_orchestrator(
         WorkerRegistryDisplayNamePolicy::UseProvided,
     )?;
     drop(_guard);
-    dispatch_orchestrator_queue_attention(&api, &worker.worker, false);
+    dispatch_orchestrator_assignment_attention(&api, &worker.worker);
     Ok(Json(workspace_orchestrator_response(&api, disposition)))
 
     }).await
@@ -23955,6 +24288,7 @@ fn workspace_orchestrator_is_online(worker: &InternalWorkerSummary) -> bool {
     matches!(worker.state.as_str(), "idle" | "running" | "paused")
 }
 
+#[cfg(test)]
 async fn scoped_create_workspace_worker(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -27242,6 +27576,7 @@ async fn scoped_list_runtime_workers(
     list_runtime_workers(State(api), AxumPath(path.runtime_id), Query(query)).await
 }
 
+#[cfg(test)]
 async fn scoped_create_runtime_worker(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
@@ -29171,6 +29506,7 @@ fn browser_worker_spawn_policy(
                 },
                 WorkerSpawnAcceptanceRequirement::RunAccepted { expected_segments },
                 Some(WorkerTicketAssignmentRequest {
+                    orchestrator_assignment_id: assignment.orchestrator_assignment_id,
                     ticket_id,
                     operation_id,
                 }),
@@ -29218,6 +29554,7 @@ fn validate_caller_worker_singleton_key(singleton_key: Option<&str>) -> Result<(
     Ok(())
 }
 
+#[cfg(test)]
 async fn create_workspace_worker(
     State(api): State<WorkspaceApi>,
     headers: HeaderMap,
@@ -29226,11 +29563,44 @@ async fn create_workspace_worker(
     create_workspace_worker_inner(api, headers, request, None).await
 }
 
+#[cfg(test)]
 async fn create_workspace_worker_inner(
     api: WorkspaceApi,
     headers: HeaderMap,
     request: CreateWorkspaceWorkerRequest,
     resolved_control_operation: Option<WorkerControlOperation>,
+) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
+    create_workspace_worker_authenticated(api, headers, request, resolved_control_operation, None)
+        .await
+}
+
+async fn create_workspace_worker_authenticated(
+    api: WorkspaceApi,
+    headers: HeaderMap,
+    request: CreateWorkspaceWorkerRequest,
+    resolved_control_operation: Option<WorkerControlOperation>,
+    context: Option<&server_api::ServerRequestContext>,
+) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
+    let context = context.cloned();
+    run_host_workflow(async move {
+        create_workspace_worker_authenticated_on_host(
+            api,
+            headers,
+            request,
+            resolved_control_operation,
+            context.as_ref(),
+        )
+        .await
+    })
+    .await
+}
+
+async fn create_workspace_worker_authenticated_on_host(
+    api: WorkspaceApi,
+    headers: HeaderMap,
+    request: CreateWorkspaceWorkerRequest,
+    resolved_control_operation: Option<WorkerControlOperation>,
+    context: Option<&server_api::ServerRequestContext>,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
     let claim_lock = request
         .ticket_assignment
@@ -29251,7 +29621,23 @@ async fn create_workspace_worker_inner(
         feature_connections,
         control_operation_id: _,
     } = request;
-    let source = optional_worker_mutation_source(&api, &api.config.workspace_id, &headers)?;
+    let delegation = ticket_assignment
+        .as_ref()
+        .map(|assignment| {
+            ticket_spawn_delegation(
+                &api,
+                &headers,
+                context,
+                assignment.orchestrator_assignment_id.as_deref(),
+            )
+        })
+        .transpose()?
+        .flatten();
+    let source = if let Some(context) = context {
+        authenticated_ticket_worker_source(&headers, context)?
+    } else {
+        optional_worker_mutation_source(&api, &api.config.workspace_id, &headers)?
+    };
     let config_state = api
         .config_store
         .load_workspace_config(&api.config.workspace_id)?
@@ -29384,14 +29770,15 @@ async fn create_workspace_worker_inner(
     if let (Some(assignment), Some(fingerprint)) =
         (assignment.as_ref(), assignment_fingerprint.as_deref())
     {
-        fresh_ticket_claim = api.store.reserve_ticket_assignment_operation(
-            &api.config.workspace_id,
+        fresh_ticket_claim = reserve_ticket_start(
+            &api,
             &assignment.operation_id,
             &assignment.ticket_id,
             &runtime_id,
             None,
             fingerprint,
             &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            delegation.as_ref(),
         )?;
         let operation = api
             .store
@@ -29418,6 +29805,12 @@ async fn create_workspace_worker_inner(
             ))
             .into());
         }
+    }
+    if let Some(assignment) = assignment.as_ref() {
+        api.store.validate_ticket_assignment_operation_fence(
+            &api.config.workspace_id,
+            &assignment.operation_id,
+        )?;
     }
     let result = match api.spawn_workspace_worker_with_claim_admission(
         &runtime_id,
@@ -29969,6 +30362,13 @@ fn resume_internal_worker_restore_intent(
     request: server_api::WorkerRestoreRequest,
 ) -> ApiResult<InternalWorkerRestoreResult> {
     let request_id = request.request_id.clone();
+    if request_id.starts_with("manual-worker-restore:") {
+        let operation_id = request_id
+            .strip_prefix("manual-worker-restore:")
+            .expect("checked prefix");
+        api.store
+            .validate_ticket_assignment_operation_fence(&api.config.workspace_id, operation_id)?;
+    }
     let result = match WorkspaceWorker::resolve(api, &worker.runtime_id, &worker.worker_id)?
         .restore_internal(request)
     {
@@ -30525,12 +30925,59 @@ fn runtime_diagnostics_message(diagnostics: &[RuntimeDiagnostic]) -> String {
     }
 }
 
+#[cfg(test)]
 async fn create_runtime_worker(
+    api: State<WorkspaceApi>,
+    runtime_id: AxumPath<String>,
+    request: Json<server_api::RuntimeWorkerSpawnRequest>,
+) -> ApiResult<Json<server_api::RuntimeWorkerSpawnResponse>> {
+    create_runtime_worker_authenticated(api, runtime_id, request, None).await
+}
+
+async fn create_runtime_worker_authenticated(
     State(api): State<WorkspaceApi>,
     AxumPath(runtime_id): AxumPath<String>,
     Json(request): Json<server_api::RuntimeWorkerSpawnRequest>,
+    context: Option<&server_api::ServerRequestContext>,
+) -> ApiResult<Json<server_api::RuntimeWorkerSpawnResponse>> {
+    let context = context.cloned();
+    run_host_workflow(async move {
+        create_runtime_worker_authenticated_on_host(
+            State(api),
+            AxumPath(runtime_id),
+            Json(request),
+            context.as_ref(),
+        )
+        .await
+    })
+    .await
+}
+
+async fn create_runtime_worker_authenticated_on_host(
+    State(api): State<WorkspaceApi>,
+    AxumPath(runtime_id): AxumPath<String>,
+    Json(request): Json<server_api::RuntimeWorkerSpawnRequest>,
+    context: Option<&server_api::ServerRequestContext>,
 ) -> ApiResult<Json<server_api::RuntimeWorkerSpawnResponse>> {
     let mut request = worker_spawn_request_from_api(request)?;
+    let headers = context
+        .map(contract_request_headers)
+        .transpose()
+        .map_err(|error| Error::InvalidInput(error.message))?
+        .unwrap_or_default();
+    let delegation = request
+        .ticket_assignment
+        .as_ref()
+        .map(|assignment| {
+            ticket_spawn_delegation(
+                &api,
+                &headers,
+                context,
+                assignment.orchestrator_assignment_id.as_deref(),
+            )
+        })
+        .transpose()?
+        .flatten();
     let claim_lock = request
         .ticket_assignment
         .as_ref()
@@ -30597,14 +31044,15 @@ async fn create_runtime_worker(
     if let (Some(assignment), Some((_, fingerprint))) =
         (lifecycle_assignment.as_ref(), spawn_idempotency.as_ref())
     {
-        fresh_ticket_claim = match api.store.reserve_ticket_assignment_operation(
-            &api.config.workspace_id,
+        fresh_ticket_claim = match reserve_ticket_start(
+            &api,
             &assignment.operation_id,
             &assignment.ticket_id,
             &runtime_id,
             None,
             fingerprint,
             &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            delegation.as_ref(),
         ) {
             Ok(fresh) => fresh,
             Err(error) => {
@@ -30623,6 +31071,12 @@ async fn create_runtime_worker(
             acceptance_evidence: Vec::new(),
             diagnostics: Vec::new(),
         })?));
+    }
+    if let Some(assignment) = lifecycle_assignment.as_ref() {
+        api.store.validate_ticket_assignment_operation_fence(
+            &api.config.workspace_id,
+            &assignment.operation_id,
+        )?;
     }
     let result =
         api.spawn_workspace_worker_with_claim_admission(&runtime_id, request, fresh_ticket_claim)?;
@@ -34259,6 +34713,13 @@ mod db_execution_tests;
 
 #[cfg(test)]
 mod tests {
+    mod assignment_delivery_tests {
+        include!("server_assignment_delivery_tests.rs");
+    }
+
+    mod assignment_start_tests {
+        include!("server_assignment_start_tests.rs");
+    }
     mod assignment_tracking_tests {
         include!("server_assignment_tracking_tests.rs");
     }
@@ -38939,6 +39400,7 @@ mod tests {
             Segment::text("Implement Ticket 00001KZ9E0DBS"),
         ];
         let assignment_request = || CreateWorkspaceWorkerTicketAssignmentRequest {
+            orchestrator_assignment_id: None,
             ticket_id: "00001KZ9E0DBS".to_string(),
             operation_id: "worker-spawn:00001KZ9E0DBS:call-1".to_string(),
         };
@@ -38961,6 +39423,7 @@ mod tests {
         assert_eq!(
             assignment,
             Some(WorkerTicketAssignmentRequest {
+                orchestrator_assignment_id: None,
                 ticket_id: "00001KZ9E0DBS".to_string(),
                 operation_id: "worker-spawn:00001KZ9E0DBS:call-1".to_string(),
             })
@@ -38968,6 +39431,7 @@ mod tests {
         assert!(
             browser_worker_spawn_policy(
                 Some(CreateWorkspaceWorkerTicketAssignmentRequest {
+                    orchestrator_assignment_id: None,
                     ticket_id: " ".to_string(),
                     operation_id: "operation".to_string(),
                 }),
@@ -39034,6 +39498,7 @@ mod tests {
             },
             profile: ProfileSelector::Builtin("builtin:coder".to_string()),
             ticket_assignment: Some(WorkerTicketAssignmentRequest {
+                orchestrator_assignment_id: None,
                 ticket_id: ticket.id,
                 operation_id: "planning-spawn".to_string(),
             }),
@@ -39134,6 +39599,7 @@ mod tests {
                 singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: Some(CreateWorkspaceWorkerTicketAssignmentRequest {
+                    orchestrator_assignment_id: None,
                     ticket_id: ticket.id.clone(),
                     operation_id: "failed-queued-assignment".to_string(),
                 }),
@@ -46589,7 +47055,10 @@ mod tests {
                     protocol::WorkerRunState::Running,
                 ))
         }));
-        assert_eq!(
+        // Cleanup admission precedes its durable claim. The accepted job may
+        // still be queued, but neither queued nor executing ownership may stop
+        // this Run before the exact tracked finish marker below is published.
+        assert!(matches!(
             api.store
                 .get_backend_job_attempt(
                     TEST_WORKSPACE_ID,
@@ -46599,8 +47068,8 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .worker_cleanup_state,
-            Some(BackendJobWorkerCleanupState::Executing)
-        );
+            Some(BackendJobWorkerCleanupState::Pending | BackendJobWorkerCleanupState::Executing)
+        ));
 
         execution.publish_worker_state(
             &worker,
@@ -49619,6 +50088,7 @@ mod tests {
         accept_queued_ticket_after_worker_spawn(
             &api,
             &crate::hosts::WorkerTicketAssignmentRequest {
+                orchestrator_assignment_id: None,
                 ticket_id: ticket.id.clone(),
                 operation_id: "notification-source-assignment-operation".to_string(),
             },
@@ -49649,27 +50119,37 @@ mod tests {
         }
 
         let inputs = execution.take_inputs();
-        let expected_states = [
-            ("open", "open"),
-            ("open", "open"),
-            ("open", "open"),
-            ("open", "open"),
-        ];
-        assert_eq!(inputs.len(), expected_states.len());
-        for ((recipient, content), (previous_state, current_state)) in
-            inputs.iter().zip(expected_states)
-        {
+        assert_eq!(inputs.len(), 4, "Assign input plus three external events");
+        let unique = inputs
+            .iter()
+            .map(|(_, content)| content.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            unique.len(),
+            inputs.len(),
+            "each committed input has its own delivery identity"
+        );
+        for (recipient, content) in &inputs {
             assert_eq!(recipient.worker_id.to_string(), orchestrator.worker_id);
-            assert!(!content.contains(&ticket.id));
-            assert_eq!(
-                content,
-                &ticket_notification_content(
-                    ticket.resource_key.as_deref().unwrap(),
-                    previous_state,
-                    current_state,
-                )
-            );
+            assert!(content.starts_with("Assigned Tickets have unreceived input:"));
+            assert!(content.contains(ticket.resource_key.as_deref().unwrap()));
+            assert!(content.contains("Delegation:"));
+            assert!(content.contains("input:"));
         }
+        let tracking = api
+            .store
+            .list_current_ticket_assignment_tracking(TEST_WORKSPACE_ID, &ticket.id)
+            .unwrap();
+        assert_eq!(
+            tracking[0].tracking.as_ref().unwrap().status,
+            ticket::TicketAssignmentTrackingStatus::Waiting
+        );
+        assert!(
+            api.store
+                .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn case_test_request(
@@ -50037,6 +50517,7 @@ mod tests {
                 "orchestrator".to_string(),
             )),
             Json(server_api::SetTicketRoleAssignmentRequest {
+                orchestrator_assignment_id: None,
                 workdir_bindings: Vec::new(),
                 operation_id: "fresh-orchestrator-cycle".to_string(),
                 principal: server_api::TicketAssignmentPrincipal::WorkspaceAgent {
@@ -50083,10 +50564,12 @@ mod tests {
         let inputs = execution.take_inputs();
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].0.worker_id.to_string(), orchestrator.worker_id);
-        assert_eq!(
-            inputs[0].1,
-            ticket_notification_content(ticket.resource_key.as_deref().unwrap(), "open", "open")
+        assert!(
+            inputs[0]
+                .1
+                .starts_with("Assigned Tickets have unreceived input:")
         );
+        assert!(inputs[0].1.contains(&fresh_id));
         assert!(
             api.store
                 .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket.id)
@@ -50208,6 +50691,7 @@ mod tests {
         operation_id: &str,
     ) -> server_api::SetTicketRoleAssignmentRequest {
         server_api::SetTicketRoleAssignmentRequest {
+            orchestrator_assignment_id: None,
             workdir_bindings: fixture
                 .api
                 .store
@@ -50616,6 +51100,7 @@ mod tests {
             .create(ticket::NewTicket::new("Idempotent assignment"))
             .unwrap();
         let request = || server_api::SetTicketRoleAssignmentRequest {
+            orchestrator_assignment_id: None,
             workdir_bindings: Vec::new(),
             operation_id: "same-role-operation".to_string(),
             principal: server_api::TicketAssignmentPrincipal::WorkspaceAgent {
@@ -50672,6 +51157,7 @@ mod tests {
                 "worker".to_string(),
             )),
             Json(server_api::SetTicketRoleAssignmentRequest {
+                orchestrator_assignment_id: None,
                 workdir_bindings: Vec::new(),
                 operation_id: "invalid-workspace-agent-coder".to_string(),
                 principal: server_api::TicketAssignmentPrincipal::WorkspaceAgent {
@@ -50728,7 +51214,7 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.contains("Orchestrator and manual Worker"))
         );
-        assert!(!detail.action_eligibility.can_assign_orchestrator);
+        assert!(detail.action_eligibility.can_assign_orchestrator);
         assert!(!detail.action_eligibility.can_start_manual_worker);
 
         let stale = scoped_clear_ticket_assignment(
@@ -51640,19 +52126,21 @@ mod tests {
         assert!(!serialized.contains("Ticket notification:"));
 
         let notifications = execution.take_inputs();
-        assert_eq!(notifications.len(), 1);
+        assert_eq!(
+            notifications.len(),
+            2,
+            "initial delegation plus external comment"
+        );
         assert_eq!(
             notifications[0].0.worker_id.to_string(),
             orchestrator.worker_id
         );
-        assert_eq!(
-            notifications[0].1,
-            ticket_notification_content(
-                ticket_ref.resource_key.as_deref().unwrap(),
-                TicketState::Open.as_str(),
-                TicketState::Open.as_str()
-            )
+        assert!(
+            notifications
+                .iter()
+                .all(|(_, content)| content.starts_with("Assigned Tickets have unreceived input:"))
         );
+        assert_ne!(notifications[0].1, notifications[1].1);
 
         execution.reject_inputs("sensitive fake Runtime transport detail");
         TICKET_NOTIFICATION_DELIVERY_WARNING_CAPTURE
@@ -51693,7 +52181,11 @@ mod tests {
             .filter(|warning| warning.ticket_id == ticket_ref.id)
             .cloned()
             .collect::<Vec<_>>();
-        assert_eq!(warnings.len(), 2);
+        assert_eq!(
+            warnings.len(),
+            3,
+            "one missing Worker and two bounded Orchestrator delivery attempts"
+        );
         assert!(warnings.iter().any(|warning| {
             warning.recipient_worker_id == missing_recipient.worker_id
                 && warning.error_category == "unknown_worker"
@@ -51707,969 +52199,15 @@ mod tests {
         assert!(!serialized.contains("Ticket notification:"));
         assert!(!serialized.contains("sensitive fake Runtime transport detail"));
         let attempts = execution.take_inputs();
-        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(
+            attempts[0].1, attempts[1].1,
+            "bounded retry retains immutable request payload"
+        );
         assert_eq!(attempts[0].0.worker_id.to_string(), orchestrator.worker_id);
     }
 
-    async fn attention_test_api() -> (
-        tempfile::TempDir,
-        WorkspaceApi,
-        Arc<DeterministicExecutionBackend>,
-    ) {
-        let dir = tempfile::tempdir().unwrap();
-        init_clean_git_workspace(dir.path());
-        let (api, execution) = test_api_with_recording_backend(dir.path()).await;
-        let mut input = ticket::NewTicket::new("Attention backlog");
-        input.workflow_state = Some(TicketState::Open);
-        set_test_ticket_target(&mut input, "test-repository", "HEAD");
-        let ticket = browser_ticket_backend(&api).unwrap().create(input).unwrap();
-        assign_test_orchestrator(&api, &ticket.id);
-        browser_ticket_backend(&api)
-            .unwrap()
-            .queue_ready(ticket.id.into(), "test-request")
-            .unwrap();
-        (dir, api, execution)
-    }
-
-    async fn start_attention_test_orchestrator(
-        api: &WorkspaceApi,
-    ) -> BrowserWorkspaceOrchestratorResponse {
-        scoped_start_workspace_orchestrator(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-        )
-        .await
-        .unwrap()
-        .0
-    }
-
-    #[tokio::test]
-    async fn orchestrator_attention_parallel_start_and_idle_observation_send_once() {
-        let (_dir, api, execution) = attention_test_api().await;
-        let reentrant_api = api.clone();
-        execution.before_input_returns(move |worker| {
-            use protocol::subscription::SubscriptionWorkerState as S;
-            // The callback is inside Runtime send_input. Neither initial Idle nor
-            // a real turn end may deadlock or issue another in-flight delivery.
-            maybe_dispatch_orchestrator_turn_end(
-                &reentrant_api,
-                &worker.worker_id.to_string(),
-                None,
-                S::Idle,
-            );
-            maybe_dispatch_orchestrator_turn_end(
-                &reentrant_api,
-                &worker.worker_id.to_string(),
-                Some(S::Running),
-                S::Idle,
-            );
-        });
-        let barrier = Arc::new(std::sync::Barrier::new(8));
-        let results = std::thread::scope(|scope| {
-            let joins = (0..8)
-                .map(|_| {
-                    let api = api.clone();
-                    let barrier = barrier.clone();
-                    scope.spawn(move || {
-                        barrier.wait();
-                        futures::executor::block_on(start_attention_test_orchestrator(&api))
-                    })
-                })
-                .collect::<Vec<_>>();
-            joins
-                .into_iter()
-                .map(|j| j.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(
-            results
-                .iter()
-                .filter(|r| r.disposition == "created")
-                .count(),
-            1
-        );
-        assert_eq!(
-            results
-                .iter()
-                .filter(|r| r.disposition == "existing")
-                .count(),
-            7
-        );
-        assert_eq!(execution.take_inputs().len(), 1);
-        assert_eq!(execution.take_input_request_ids().len(), 1);
-        assert_eq!(
-            start_attention_test_orchestrator(&api).await.disposition,
-            "existing"
-        );
-        assert!(execution.take_inputs().is_empty());
-    }
-
-    #[tokio::test]
-    async fn orchestrator_attention_barrier_callers_share_unsent_reservation() {
-        let (_dir, api, execution) = attention_test_api().await;
-        let started = start_attention_test_orchestrator(&api).await;
-        let worker = RuntimeWorkerRef::new(
-            EMBEDDED_WORKER_RUNTIME_ID,
-            started.worker.unwrap().worker_id,
-        );
-        let state = orchestrator_attention_state(&api, &worker);
-        state.lock().unwrap().accepted = None;
-        execution.take_inputs();
-        execution.take_input_request_ids();
-        let barrier = Arc::new(std::sync::Barrier::new(8));
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        execution.before_input_returns(move |_| {
-            entered_tx.send(()).unwrap();
-            release_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .unwrap();
-        });
-        std::thread::scope(|scope| {
-            let joins = (0..8)
-                .map(|_| {
-                    let api = api.clone();
-                    let worker = worker.clone();
-                    let barrier = barrier.clone();
-                    scope.spawn(move || {
-                        barrier.wait();
-                        dispatch_orchestrator_queue_attention(&api, &worker, false);
-                    })
-                })
-                .collect::<Vec<_>>();
-            entered_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .unwrap();
-            assert!(state.lock().unwrap().sending);
-            assert!(state.lock().unwrap().accepted.is_none());
-            // The success record does not exist yet. A ninth caller must still
-            // return immediately rather than compare/send twice or wait on Runtime.
-            dispatch_orchestrator_queue_attention(&api, &worker, false);
-            release_tx.send(()).unwrap();
-            for join in joins {
-                join.join().unwrap();
-            }
-        });
-        assert_eq!(execution.take_inputs().len(), 1);
-        assert_eq!(execution.take_input_request_ids().len(), 1);
-        assert!(!state.lock().unwrap().sending);
-        assert!(state.lock().unwrap().accepted.is_some());
-    }
-
-    #[tokio::test]
-    async fn orchestrator_attention_restore_rechecks_reserved_noop_before_and_after_comparison() {
-        for pause_before_comparison in [true, false] {
-            let (_dir, api, execution) = attention_test_api().await;
-            let started = start_attention_test_orchestrator(&api).await;
-            let worker = RuntimeWorkerRef::new(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                started.worker.unwrap().worker_id,
-            );
-            let state = orchestrator_attention_state(&api, &worker);
-            let old_id = state
-                .lock()
-                .unwrap()
-                .accepted
-                .as_ref()
-                .unwrap()
-                .request_id
-                .clone();
-            execution.take_inputs();
-            execution.take_input_request_ids();
-            api.runtime
-                .stop_worker(
-                    &worker,
-                    WorkerLifecycleRequest {
-                        reason: None,
-                        ticket_assignment: None,
-                    },
-                )
-                .unwrap();
-            execution.accept_restores();
-            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-            let (release_tx, release_rx) = std::sync::mpsc::channel();
-            std::thread::scope(|scope| {
-                let api_for_caller = api.clone();
-                let worker_for_caller = worker.clone();
-                let caller = scope.spawn(move || {
-                    let mut first = true;
-                    with_orchestrator_attention_reservation(
-                        &api_for_caller,
-                        &worker_for_caller,
-                        false,
-                        |state, pending| {
-                            if first && pause_before_comparison {
-                                entered_tx.send(()).unwrap();
-                                release_rx
-                                    .recv_timeout(std::time::Duration::from_secs(5))
-                                    .unwrap();
-                            }
-                            check_orchestrator_queue_attention(
-                                &api_for_caller,
-                                &worker_for_caller,
-                                state,
-                                pending,
-                            );
-                            if first && !pause_before_comparison {
-                                // Old fingerprint matched: check returned without sending,
-                                // but the exact same production reservation still exists.
-                                assert_eq!(
-                                    state.lock().unwrap().accepted.as_ref().unwrap().request_id,
-                                    old_id
-                                );
-                                entered_tx.send(()).unwrap();
-                                release_rx
-                                    .recv_timeout(std::time::Duration::from_secs(5))
-                                    .unwrap();
-                            }
-                            first = false;
-                        },
-                    );
-                });
-                entered_rx
-                    .recv_timeout(std::time::Duration::from_secs(5))
-                    .unwrap();
-                assert!(state.lock().unwrap().sending);
-                let restored = futures::executor::block_on(start_attention_test_orchestrator(&api));
-                assert_eq!(restored.disposition, "restored");
-                let deferred = state.lock().unwrap().restore_recheck;
-                let old_retired = state.lock().unwrap().accepted.is_none();
-                let inputs_before_release = execution.take_inputs();
-                release_tx.send(()).unwrap();
-                caller.join().unwrap();
-                assert!(deferred);
-                assert!(old_retired);
-                assert!(inputs_before_release.is_empty());
-            });
-            assert_eq!(execution.take_inputs().len(), 1);
-            assert_eq!(execution.take_input_request_ids().len(), 1);
-            let state = state.lock().unwrap();
-            assert!(state.accepted.is_some());
-            assert!(!state.sending);
-            assert!(!state.restore_recheck);
-        }
-    }
-
-    #[tokio::test]
-    async fn orchestrator_attention_restore_keeps_pending_unknown_delivery_and_id() {
-        let (_dir, api, execution) = attention_test_api().await;
-        execution.reject_inputs("unknown acceptance response");
-        let started = start_attention_test_orchestrator(&api).await;
-        let worker = RuntimeWorkerRef::new(
-            EMBEDDED_WORKER_RUNTIME_ID,
-            started.worker.unwrap().worker_id,
-        );
-        let state = orchestrator_attention_state(&api, &worker);
-        let pending = state.lock().unwrap().pending.clone().unwrap();
-        execution.take_inputs();
-        execution.take_input_request_ids();
-        api.runtime
-            .stop_worker(
-                &worker,
-                WorkerLifecycleRequest {
-                    reason: None,
-                    ticket_assignment: None,
-                },
-            )
-            .unwrap();
-        execution.accept_restores();
-        *execution.input_failure.lock().unwrap() = None;
-        let restored = start_attention_test_orchestrator(&api).await;
-        assert_eq!(restored.disposition, "restored");
-        let attempts = execution.take_inputs();
-        assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].1, pending.content);
-        assert_eq!(
-            execution.take_input_request_ids(),
-            vec![Some(pending.request_id.clone())]
-        );
-        assert!(state.lock().unwrap().pending.is_none());
-        assert_eq!(
-            state.lock().unwrap().accepted.as_ref().unwrap().request_id,
-            pending.request_id
-        );
-    }
-
-    #[tokio::test]
-    async fn orchestrator_attention_unknown_response_retry_keeps_id_and_payload() {
-        let (_dir, api, execution) = attention_test_api().await;
-        execution.reject_inputs("accepted response lost (unknown transport outcome)");
-        let started = start_attention_test_orchestrator(&api).await;
-        let worker = RuntimeWorkerRef::new(
-            EMBEDDED_WORKER_RUNTIME_ID,
-            started.worker.unwrap().worker_id,
-        );
-        let state = orchestrator_attention_state(&api, &worker);
-        assert!(state.lock().unwrap().accepted.is_none());
-        let pending = state.lock().unwrap().pending.clone().unwrap();
-        let attempts = execution.take_inputs();
-        let ids = execution.take_input_request_ids();
-        assert_eq!(attempts.len(), 2);
-        assert_eq!(ids, vec![Some(pending.request_id.clone()); 2]);
-        // Change the backlog before retry: uncertain acceptance must never reuse
-        // the ID for a newly rendered payload.
-        let mut next = ticket::NewTicket::new("Changed backlog");
-        next.workflow_state = Some(TicketState::Open);
-        set_test_ticket_target(&mut next, "test-repository", "HEAD");
-        let next = browser_ticket_backend(&api).unwrap().create(next).unwrap();
-        assign_test_orchestrator(&api, &next.id);
-        browser_ticket_backend(&api)
-            .unwrap()
-            .queue_ready(next.id.clone().into(), "test-request")
-            .unwrap();
-        *execution.input_failure.lock().unwrap() = None;
-        assert_eq!(
-            start_attention_test_orchestrator(&api).await.disposition,
-            "existing"
-        );
-        let retry = execution.take_inputs();
-        assert_eq!(retry.len(), 1);
-        assert_eq!(retry[0].1, pending.content);
-        assert_eq!(
-            execution.take_input_request_ids(),
-            vec![Some(pending.request_id)]
-        );
-        assert!(state.lock().unwrap().pending.is_none());
-        assert!(state.lock().unwrap().accepted.is_some());
-        use protocol::subscription::SubscriptionWorkerState as S;
-        maybe_dispatch_orchestrator_turn_end(&api, &worker.worker_id, Some(S::Running), S::Idle);
-        let changed = execution.take_inputs();
-        assert_eq!(changed.len(), 1);
-        assert!(changed[0].1.contains("Changed backlog"));
-    }
-
-    #[tokio::test]
-    async fn orchestrator_attention_subscription_snapshots_only_establish_baselines() {
-        use crate::runtime_subscription::BrokerSubscriptionEvent as B;
-        use protocol::subscription::{
-            SubscriptionEventPayload, SubscriptionSnapshot, SubscriptionWorker,
-            SubscriptionWorkerState as S,
-        };
-        let (_dir, api, execution) = attention_test_api().await;
-        let started = start_attention_test_orchestrator(&api).await;
-        let worker = RuntimeWorkerRef::new(
-            EMBEDDED_WORKER_RUNTIME_ID,
-            started.worker.unwrap().worker_id,
-        );
-        let attention = orchestrator_attention_state(&api, &worker);
-        attention.lock().unwrap().accepted = None;
-        execution.take_inputs();
-        let summary = |state: S| -> SubscriptionWorker {
-            serde_json::from_value(serde_json::json!({
-                "worker_id": worker.worker_id, "state": state,
-            }))
-            .unwrap()
-        };
-        let snapshot = |state| B::Snapshot {
-            snapshot: SubscriptionSnapshot::Workers {
-                workers: vec![summary(state)],
-            },
-        };
-        let event = |state| B::Event {
-            payload: SubscriptionEventPayload::WorkerUpserted {
-                worker: summary(state),
-            },
-        };
-        let mut states = HashMap::new();
-        assert!(observe_orchestrator_turn_end(
-            &api,
-            &mut states,
-            snapshot(S::Idle)
-        ));
-        assert!(observe_orchestrator_turn_end(
-            &api,
-            &mut states,
-            event(S::Idle)
-        ));
-        observe_orchestrator_turn_end(&api, &mut states, event(S::Running));
-        // Neither snapshot itself nor an Idle event after reconnect is turn-end evidence.
-        observe_orchestrator_turn_end(
-            &api,
-            &mut states,
-            B::Disconnected {
-                message: "fixture reconnect".into(),
-            },
-        );
-        observe_orchestrator_turn_end(&api, &mut states, snapshot(S::Idle));
-        observe_orchestrator_turn_end(&api, &mut states, event(S::Idle));
-        observe_orchestrator_turn_end(&api, &mut states, snapshot(S::Running));
-        observe_orchestrator_turn_end(&api, &mut states, snapshot(S::Idle));
-        assert!(attention.lock().unwrap().accepted.is_none());
-        assert!(execution.take_inputs().is_empty());
-        observe_orchestrator_turn_end(&api, &mut states, event(S::Running));
-        observe_orchestrator_turn_end(&api, &mut states, event(S::Idle));
-        assert_eq!(execution.take_inputs().len(), 1);
-    }
-
-    // Real Controller and canonical Session storage with isolated local config.
-    // A closed loopback model endpoint prevents any production-provider access;
-    // notifications commit at the model boundary before that request can fail.
-    struct AttentionWorkerFactory {
-        root: PathBuf,
-    }
-
-    impl AttentionWorkerFactory {
-        async fn controller(
-            &self,
-            worker_id: String,
-            restore: bool,
-        ) -> std::result::Result<worker_runtime::worker_backend::RuntimeWorkerController, String>
-        {
-            let name = format!("attention-{worker_id}");
-            let root = self.root.join("workers").join(&worker_id);
-            let store = session_store::CombinedStore::new(
-                session_store::WorkerSessionStore::new(root.join("session"))
-                    .map_err(|e| e.to_string())?,
-                session_store::WorkerAggregateStore::new(&root, &name)
-                    .map_err(|e| e.to_string())?,
-            );
-            let manifest = manifest::WorkerManifest::from_toml(&format!(
-                r#"
-                [worker]
-                name = "{name}"
-                pwd = "./"
-                [model]
-                scheme = "anthropic"
-                model_id = "attention-test"
-                base_url = "http://127.0.0.1:1"
-                auth = {{ kind = "none" }}
-                [engine]
-                max_tokens = 10
-                [scope]
-                allow = []
-            "#
-            ))
-            .map_err(|e| e.to_string())?;
-            let context = worker::WorkerWorkspaceContext::local_filesystem(None);
-            let workspace_client = context.client_handle();
-            let loader = worker::PromptCatalogSource::builtins_only();
-            let worker = if restore {
-                worker::Worker::restore_from_worker_metadata_with_context(
-                    &name,
-                    manifest,
-                    store,
-                    loader,
-                    context,
-                    worker::WorkerFilesystemAuthority::None,
-                )
-                .await
-            } else {
-                worker::Worker::from_manifest_with_context(
-                    manifest,
-                    store,
-                    loader,
-                    context,
-                    worker::WorkerFilesystemAuthority::None,
-                )
-                .await
-            }
-            .map_err(|e| e.to_string())?;
-            let started = worker::PreparedWorker::new(
-                worker.with_notification_coalesce_delay(std::time::Duration::from_millis(10)),
-                worker::WorkerBootstrapLayout::RuntimeManagedRun {
-                    run_dir: root.join(uuid::Uuid::now_v7().to_string()),
-                    bash_output_dir: root.join("bash-output"),
-                },
-                worker::WorkerControllerTransport::InProcess,
-            )
-            .start()
-            .await
-            .map_err(|e| e.to_string())?;
-            Ok(worker_runtime::worker_backend::RuntimeWorkerController {
-                handle: started.handle,
-                shutdown: Arc::new(tokio::sync::Mutex::new(Some(started.shutdown))),
-                controller_task: started.controller_task,
-                workspace_client,
-            })
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl worker_runtime::worker_backend::RuntimeWorkerFactory for AttentionWorkerFactory {
-        async fn spawn_controller(
-            &self,
-            request: worker_runtime::execution::WorkerExecutionSpawnRequest,
-        ) -> std::result::Result<worker_runtime::worker_backend::RuntimeWorkerController, String>
-        {
-            self.controller(request.worker_ref.worker_id.to_string(), false)
-                .await
-        }
-        async fn restore_controller(
-            &self,
-            request: worker_runtime::execution::WorkerExecutionRestoreRequest,
-        ) -> std::result::Result<worker_runtime::worker_backend::RuntimeWorkerController, String>
-        {
-            self.controller(request.worker_ref.worker_id.to_string(), true)
-                .await
-        }
-    }
-
-    use worker_runtime::execution as attention_execution;
-
-    // Fault injection occurs AFTER the real Controller durably accepted input.
-    struct AttentionResponseLossBackend {
-        inner: Arc<dyn attention_execution::WorkerExecutionBackend>,
-        lose_next: std::sync::atomic::AtomicBool,
-        attempts: Mutex<Vec<String>>,
-    }
-
-    impl attention_execution::WorkerExecutionBackend for AttentionResponseLossBackend {
-        fn backend_id(&self) -> &str {
-            self.inner.backend_id()
-        }
-        fn spawn_worker(
-            &self,
-            r: attention_execution::WorkerExecutionSpawnRequest,
-        ) -> attention_execution::WorkerExecutionSpawnResult {
-            self.inner.spawn_worker(r)
-        }
-        fn preflight_restore(
-            &self,
-            r: &attention_execution::WorkerExecutionRestoreRequest,
-        ) -> std::result::Result<(), attention_execution::WorkerExecutionResult> {
-            self.inner.preflight_restore(r)
-        }
-        fn reconcile_restore(
-            &self,
-            r: attention_execution::WorkerExecutionRestoreRequest,
-        ) -> attention_execution::WorkerExecutionSpawnResult {
-            self.inner.reconcile_restore(r)
-        }
-        fn restore_worker(
-            &self,
-            r: attention_execution::WorkerExecutionRestoreRequest,
-        ) -> attention_execution::WorkerExecutionSpawnResult {
-            self.inner.restore_worker(r)
-        }
-        fn activate_restored_worker(
-            &self,
-            id: attention_execution::WorkerLifecycleOperationId,
-            worker_ref: &worker_runtime::identity::WorkerRef,
-        ) -> std::result::Result<(), String> {
-            self.inner.activate_restored_worker(id, worker_ref)
-        }
-        fn dispatch_input(
-            &self,
-            worker_ref: &worker_runtime::identity::WorkerRef,
-            input: worker_runtime::interaction::WorkerInput,
-        ) -> attention_execution::WorkerExecutionResult {
-            self.attempts
-                .lock()
-                .unwrap()
-                .push(input.submission_request_id.clone().unwrap());
-            let result = self.inner.dispatch_input(worker_ref, input);
-            assert_eq!(
-                result.outcome,
-                attention_execution::WorkerExecutionOutcome::Accepted
-            );
-            if self
-                .lose_next
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                attention_execution::WorkerExecutionResult::errored(
-                    attention_execution::WorkerExecutionOperation::Input,
-                    "injected loss of accepted response",
-                )
-            } else {
-                result
-            }
-        }
-        fn dispatch_method(
-            &self,
-            worker_ref: &worker_runtime::identity::WorkerRef,
-            method: protocol::Method,
-        ) -> attention_execution::WorkerExecutionResult {
-            self.inner.dispatch_method(worker_ref, method)
-        }
-        fn stop_worker_operation(
-            &self,
-            r: attention_execution::WorkerExecutionStopRequest,
-        ) -> attention_execution::WorkerExecutionResult {
-            self.inner.stop_worker_operation(r)
-        }
-        fn worker_snapshot(
-            &self,
-            worker_ref: &worker_runtime::identity::WorkerRef,
-        ) -> Option<protocol::Event> {
-            self.inner.worker_snapshot(worker_ref)
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn orchestrator_attention_real_worker_start_restore_accept_and_commit_once_each() {
-        real_attention_worker_start_restore(false).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn orchestrator_attention_real_worker_lost_response_retry_commits_once() {
-        real_attention_worker_start_restore(true).await;
-    }
-
-    async fn real_attention_worker_start_restore(lose_response: bool) {
-        use session_store::{LogEntry, Store, WorkerSessionStore};
-        let dir = tempfile::tempdir().unwrap();
-        init_clean_git_workspace(dir.path());
-        let config = test_server_config(dir.path());
-        let store = Arc::new(SqliteWorkspaceStore::open(&config.database_path).unwrap());
-        seed_test_registered_workspace(store.as_ref(), &config)
-            .await
-            .unwrap();
-        // Real Worker Runtime adapter/controller/storage, isolated from profile
-        // workspace callbacks and real LLM credentials.
-        let execution = Arc::new(
-            worker_runtime::worker_backend::WorkerRuntimeExecutionBackend::new(
-                AttentionWorkerFactory {
-                    root: config.embedded_runtime_store_root.clone(),
-                },
-            )
-            .unwrap(),
-        );
-        let execution = Arc::new(AttentionResponseLossBackend {
-            inner: execution,
-            lose_next: std::sync::atomic::AtomicBool::new(lose_response),
-            attempts: Mutex::new(Vec::new()),
-        });
-        let api = WorkspaceApi::new_with_execution_backend(config, store, execution.clone())
-            .await
-            .unwrap();
-        let mut input = ticket::NewTicket::new("Real notification backlog");
-        input.workflow_state = Some(TicketState::Open);
-        set_test_ticket_target(&mut input, "test-repository", "HEAD");
-        let ticket = browser_ticket_backend(&api).unwrap().create(input).unwrap();
-        assign_test_orchestrator(&api, &ticket.id);
-        browser_ticket_backend(&api)
-            .unwrap()
-            .queue_ready(ticket.id.clone().into(), "test-request")
-            .unwrap();
-        let started = start_attention_test_orchestrator(&api).await;
-        let worker = RuntimeWorkerRef::new(
-            EMBEDDED_WORKER_RUNTIME_ID,
-            started.worker.unwrap().worker_id,
-        );
-        let session = WorkerSessionStore::open_read_only(
-            api.config
-                .embedded_runtime_store_root
-                .join("workers")
-                .join(&worker.worker_id)
-                .join("session"),
-        )
-        .unwrap();
-        let entries = || {
-            let id = session.session_id().unwrap().unwrap();
-            session
-                .list_segments(id)
-                .unwrap()
-                .into_iter()
-                .flat_map(|segment| session.read_all_read_only(id, segment).unwrap())
-                .collect::<Vec<_>>()
-        };
-        let receipts = || {
-            entries()
-                .iter()
-                .rev()
-                .find_map(|entry| match entry {
-                    LogEntry::Extension {
-                        domain, payload, ..
-                    } if domain == "worker.pending_activations.v1" => {
-                        Some(payload["notification_receipts"].as_array().unwrap().clone())
-                    }
-                    LogEntry::AnnotatedSystemItem { extensions, .. } => extensions
-                        .iter()
-                        .find(|e| e.domain == "worker.pending_activations.v1")
-                        .map(|e| {
-                            e.payload["notification_receipts"]
-                                .as_array()
-                                .unwrap()
-                                .clone()
-                        }),
-                    _ => None,
-                })
-                .unwrap()
-        };
-        let commits = || {
-            entries().iter().filter(|entry| matches!(entry,
-            LogEntry::AnnotatedSystemItem { entry, .. }
-                if matches!(&entry.item, session_store::SystemItem::Notification { message, .. }
-                    if message.starts_with("Queued Tickets require attention:"))
-        )).count()
-        };
-        async fn wait_for_commits<F: Fn() -> usize>(count: F, expected: usize) {
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    let actual = count();
-                    assert!(actual <= expected, "duplicate canonical notifications");
-                    if actual == expected {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("controlled Worker notification commit");
-        }
-        assert_eq!(receipts().len(), 1);
-        wait_for_commits(&commits, 1).await;
-        assert_eq!(
-            execution.attempts.lock().unwrap().len(),
-            if lose_response { 2 } else { 1 }
-        );
-        let first_id = orchestrator_attention_state(&api, &worker)
-            .lock()
-            .unwrap()
-            .accepted
-            .as_ref()
-            .unwrap()
-            .request_id
-            .clone();
-        use protocol::subscription::SubscriptionWorkerState as S;
-        for previous in [
-            None,
-            Some(S::Idle),
-            Some(S::Stopped),
-            Some(S::Paused),
-            Some(S::Running),
-        ] {
-            maybe_dispatch_orchestrator_turn_end(&api, &worker.worker_id, previous, S::Idle);
-        }
-        assert_eq!(
-            start_attention_test_orchestrator(&api).await.disposition,
-            "existing"
-        );
-        assert_eq!(receipts().len(), 1);
-        api.runtime
-            .stop_worker(
-                &worker,
-                WorkerLifecycleRequest {
-                    reason: None,
-                    ticket_assignment: None,
-                },
-            )
-            .unwrap();
-        let restored = start_attention_test_orchestrator(&api).await;
-        assert_eq!(restored.disposition, "restored");
-        let second_id = orchestrator_attention_state(&api, &worker)
-            .lock()
-            .unwrap()
-            .accepted
-            .as_ref()
-            .unwrap()
-            .request_id
-            .clone();
-        assert_ne!(first_id, second_id);
-        wait_for_commits(&commits, 2).await;
-        let attempts = execution.attempts.lock().unwrap();
-        assert_eq!(attempts.len(), if lose_response { 3 } else { 2 });
-        assert_eq!(
-            attempts.iter().filter(|id| **id == first_id).count(),
-            if lose_response { 2 } else { 1 }
-        );
-        assert_eq!(attempts.iter().filter(|id| **id == second_id).count(), 1);
-        drop(attempts);
-        let receipts = receipts();
-        assert_eq!(receipts.len(), 2);
-        assert_eq!(
-            receipts
-                .iter()
-                .filter(|r| r["notification_request_id"] == first_id)
-                .count(),
-            1
-        );
-        assert_eq!(
-            receipts
-                .iter()
-                .filter(|r| r["notification_request_id"] == second_id)
-                .count(),
-            1
-        );
-        // Stop only this isolated test fixture; no live dogfooding Worker is touched.
-        api.runtime
-            .stop_worker(
-                &worker,
-                WorkerLifecycleRequest {
-                    reason: None,
-                    ticket_assignment: None,
-                },
-            )
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn orchestrator_attention_restore_and_replacement_have_first_delivery() {
-        let (_dir, api, execution) = attention_test_api().await;
-        let started = start_attention_test_orchestrator(&api).await;
-        let worker = RuntimeWorkerRef::new(
-            EMBEDDED_WORKER_RUNTIME_ID,
-            started.worker.unwrap().worker_id,
-        );
-        assert_eq!(execution.take_inputs().len(), 1);
-        api.runtime
-            .stop_worker(
-                &worker,
-                WorkerLifecycleRequest {
-                    reason: None,
-                    ticket_assignment: None,
-                },
-            )
-            .unwrap();
-        execution.accept_restores();
-        let restored = start_attention_test_orchestrator(&api).await;
-        assert_eq!(restored.disposition, "restored");
-        assert_eq!(restored.worker.unwrap().worker_id, worker.worker_id);
-        assert_eq!(execution.take_inputs().len(), 1);
-        use protocol::subscription::SubscriptionWorkerState as S;
-        maybe_dispatch_orchestrator_turn_end(&api, &worker.worker_id, None, S::Idle);
-        assert_eq!(
-            start_attention_test_orchestrator(&api).await.disposition,
-            "existing"
-        );
-        assert!(execution.take_inputs().is_empty());
-        // This is a fixture Worker, not the running dogfooding Orchestrator.
-        api.runtime.delete_worker(&worker).unwrap();
-        api.worker_projection
-            .publish_ordered(|| {
-                api.store
-                    .delete_worker_registry(TEST_WORKSPACE_ID, &worker)
-                    .map(|commit| ((), commit))
-            })
-            .unwrap();
-        let replacement = start_attention_test_orchestrator(&api).await;
-        assert_ne!(replacement.worker.unwrap().worker_id, worker.worker_id);
-        assert_eq!(execution.take_inputs().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn orchestrator_running_to_idle_recovers_queued_ticket_without_notification_memory() {
-        let dir = tempfile::tempdir().unwrap();
-        init_clean_git_workspace(dir.path());
-        let (api, execution) = test_api_with_recording_backend(dir.path()).await;
-        let backend = browser_ticket_backend(&api).unwrap();
-        let mut input = ticket::NewTicket::new("Recover queued work");
-        input.workflow_state = Some(TicketState::Open);
-        set_test_ticket_target(&mut input, "test-repository", "HEAD");
-        let ticket_ref = backend.create(input).unwrap();
-        assign_test_orchestrator(&api, &ticket_ref.id);
-        browser_ticket_backend(&api)
-            .unwrap()
-            .queue_ready(ticket_ref.id.clone().into(), "test-request")
-            .unwrap();
-
-        let Json(started) = scoped_start_workspace_orchestrator(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-        )
-        .await
-        .unwrap();
-        assert!(started.online);
-        let startup_inputs = execution.take_inputs();
-        assert_eq!(startup_inputs.len(), 1);
-        let worker_id = started.worker.as_ref().unwrap().worker_id.clone();
-        let worker = RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, &worker_id);
-        let attention = orchestrator_attention_state(&api, &worker);
-        assert_eq!(
-            attention
-                .lock()
-                .unwrap()
-                .accepted
-                .as_ref()
-                .unwrap()
-                .fingerprint,
-            ticket_ref.id
-        );
-        attention.lock().unwrap().accepted = None;
-        use protocol::subscription::SubscriptionWorkerState as S;
-        // Snapshot/reconnection and non-turn transitions cannot stand in for startup.
-        for previous in [None, Some(S::Idle), Some(S::Stopped), Some(S::Paused)] {
-            maybe_dispatch_orchestrator_turn_end(&api, &worker_id, previous, S::Idle);
-            assert!(attention.lock().unwrap().accepted.is_none());
-            assert!(execution.take_inputs().is_empty());
-        }
-        maybe_dispatch_orchestrator_turn_end(&api, &worker_id, Some(S::Running), S::Idle);
-        assert_eq!(
-            attention
-                .lock()
-                .unwrap()
-                .accepted
-                .as_ref()
-                .unwrap()
-                .fingerprint,
-            ticket_ref.id
-        );
-        maybe_dispatch_orchestrator_turn_end(&api, &worker_id, Some(S::Running), S::Idle);
-        let notifications = execution.take_inputs();
-        assert_eq!(notifications.len(), 1);
-        assert_eq!(notifications[0].0.worker_id.to_string(), worker_id);
-        let content = &notifications[0].1;
-        assert!(content.starts_with("Queued Tickets require attention:"));
-        assert!(
-            content.contains(&format!(
-                "- {} — Recover queued work",
-                ticket_ref.resource_key.as_deref().unwrap()
-            )),
-            "unexpected notification body: {content:?}"
-        );
-        assert!(content.contains("Reread the current Ticket state before acting"));
-        assert!(!content.contains(ticket_ref.id.as_str()));
-        assert!(!content.contains(TEST_WORKSPACE_ID));
-        assert!(!content.contains("bounded"));
-        assert!(!content.contains("omitted"));
-
-        let candidates = backend
-            .list(ticket::TicketListQuery::states([
-                ticket::TicketListState::Open,
-            ]))
-            .unwrap();
-        let mut truncated_candidates = (1..=worker::OrchestratorQueueAttentionContext::MAX_TICKETS
-            + 1)
-            .map(|index| {
-                let mut candidate = candidates[0].clone();
-                candidate.id = format!("opaque-{index}");
-                candidate.resource_key = Some(format!("T-{index}"));
-                candidate.title = format!("Queued {index}");
-                candidate
-            })
-            .collect::<Vec<_>>();
-        let truncated = orchestrator_queue_attention_context(
-            TEST_WORKSPACE_ID,
-            TEST_WORKSPACE_ID,
-            &truncated_candidates,
-        )
-        .unwrap();
-        let rendered = worker::PromptCatalog::builtins_only()
-            .unwrap()
-            .orchestrator_queue_attention(
-                worker::OrchestratorQueueAttentionPrompt::Server,
-                &truncated,
-            )
-            .unwrap();
-        assert!(rendered.contains("- T-20 — Queued 20"));
-        assert!(!rendered.contains("T-21"));
-        assert!(rendered.contains("were omitted from this notice: 1"));
-        assert!(!rendered.contains("opaque-"));
-
-        truncated_candidates[0].resource_key = None;
-        assert_eq!(
-            orchestrator_queue_attention_context(
-                TEST_WORKSPACE_ID,
-                TEST_WORKSPACE_ID,
-                &truncated_candidates
-            )
-            .unwrap_err(),
-            "missing_ticket_resource_key"
-        );
-        assert_eq!(
-            orchestrator_queue_attention_context(
-                TEST_WORKSPACE_ID,
-                "foreign-workspace",
-                &truncated_candidates
-            )
-            .unwrap_err(),
-            "foreign_workspace_ticket_projection"
-        );
-    }
+    include!("server_assignment_attention_tests.rs");
 
     #[tokio::test]
     async fn runtime_worker_create_rejects_reserved_singleton_key_squatting_and_authority_forgery()
@@ -52768,6 +52306,7 @@ mod tests {
             },
             profile: server_api::RuntimeProfileSelector::Builtin("builtin:intake".to_string()),
             ticket_assignment: Some(server_api::RuntimeWorkerTicketAssignmentRequest {
+                orchestrator_assignment_id: None,
                 ticket_id: ticket.id.clone(),
                 operation_id: "runtime-explicit-work".to_string(),
             }),
@@ -52858,6 +52397,7 @@ mod tests {
             ticket_id
         );
         let mut assignment = Some(CreateWorkspaceWorkerTicketAssignmentRequest {
+            orchestrator_assignment_id: None,
             ticket_id: ticket_resource_key.clone(),
             operation_id: "ticket-key-assignment".to_string(),
         });
@@ -53406,6 +52946,36 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(stale.into_response().status(), StatusCode::CONFLICT);
+    }
+
+    pub(super) fn seed_test_delivery_binding(api: &WorkspaceApi) {
+        if api
+            .config_store
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, EMBEDDED_WORKER_RUNTIME_ID)
+            .unwrap()
+            .is_some()
+        {
+            return;
+        }
+        let identity = (*EMBEDDED_RUNTIME_REQUEST_IDENTITY).clone();
+        api.config_store
+            .upsert_workspace_runtime_binding(
+                WorkspaceRuntimeBinding {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                    runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),
+                    display_name: "Embedded test Runtime".into(),
+                    base_url: "in-process://embedded".into(),
+                    public_key: identity.public_key,
+                    public_key_fingerprint: String::new(),
+                    binding_id: "binding-test".into(),
+                    authentication_mode: StoredRuntimeAuthenticationMode::LegacyServerIssuer,
+                    created_at: TEST_CREATED_AT.into(),
+                    updated_at: TEST_CREATED_AT.into(),
+                    revoked_at: None,
+                },
+                false,
+            )
+            .unwrap();
     }
 
     async fn test_api_with_recording_backend(
