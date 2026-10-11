@@ -783,12 +783,12 @@ impl SqliteWorkspaceAuthority {
                 })
             })
             .transpose()?;
-        // Responsibility remains visible after work ends; action eligibility must
-        // use only active unfinished work, including after a Ticket is reopened.
+        // Work start eligibility uses unfinished work. Delegation authoring and
+        // clearing use the retained current pointer, including after close.
         let active_role_assignments = self
             .store
             .list_active_ticket_role_assignments(&self.workspace_id, id)?;
-        let has_orchestrator = active_role_assignments
+        let has_orchestrator = role_assignments
             .iter()
             .any(|assignment| assignment.role == TicketAssignmentRole::Orchestrator);
         let has_worker = active_role_assignments
@@ -811,7 +811,6 @@ impl SqliteWorkspaceAuthority {
             })
             .collect::<Result<Vec<_>>>()?;
         let write_repository_keys = ticket_write_target_repository_keys(&targets);
-        let has_blockers = !ticket.relations.blockers.is_empty();
         let mut assignment_diagnostics = Vec::new();
         if let Some(legacy_assignee) = ticket
             .meta
@@ -827,12 +826,18 @@ impl SqliteWorkspaceAuthority {
         let action_eligibility = TicketActionEligibility {
             // Case openness is not readiness. These are explicit operations;
             // occupancy remains an independent resource constraint.
-            can_assign_orchestrator: !has_orchestrator && !has_worker,
+            // Delegation neither occupies nor transfers existing Worker work.
+            // Start eligibility below separately retains unfinished-work guards.
+            // A fresh operation explicitly delegates/reissues even to the same
+            // principal. Expected-assignment CAS (when supplied) and source
+            // authority are checked by the mutation, not by Ticket phase.
+            can_assign_orchestrator: true,
             can_unassign_orchestrator: has_orchestrator,
             can_queue: ticket.meta.workflow_state == TicketState::Open,
-            can_start_manual_worker: ticket.meta.workflow_state == TicketState::Open
-                && !has_worker
-                && !has_blockers,
+            // Unfinished dependencies remain relation diagnostics, not a blanket
+            // start refusal. Backend start/assign still validates authorization,
+            // resource grants, reservations and actual unfinished work.
+            can_start_manual_worker: ticket.meta.workflow_state == TicketState::Open && !has_worker,
             queue_tickets: dependency_check.queue_tickets.clone(),
             blockers: action_blockers,
         };
@@ -3229,6 +3234,81 @@ mod tests {
             !project_evidence(&[closed], "ticket-content-1", &[Ok("commit-1".into())])
                 .1
                 .complete_for_integration
+        );
+    }
+
+    #[tokio::test]
+    async fn unfinished_dependencies_remain_diagnostic_without_disabling_manual_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.db");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "w".into(),
+                owner_account_id: "owner-account".into(),
+                display_name: "W".into(),
+                state: "active".into(),
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            })
+            .await
+            .unwrap();
+        let backend = SqliteTicketBackend::open_verified(&path, "w").unwrap();
+        let dependent = backend
+            .create(ticket::NewTicket::new(
+                "Partial investigation without resources",
+            ))
+            .unwrap();
+        let prerequisite = backend
+            .create(ticket::NewTicket::new("Unfinished prerequisite"))
+            .unwrap();
+        backend
+            .add_ticket_relation(
+                dependent.id.clone().into(),
+                ticket::NewTicketRelation {
+                    kind: ticket::TicketRelationKind::DependsOn,
+                    target: prerequisite.id.clone(),
+                    note: Some("Partial work can proceed".into()),
+                    author: Some("owner-account".into()),
+                },
+            )
+            .unwrap();
+        let authority = SqliteWorkspaceAuthority::new(&path, "w").unwrap();
+        let detail = authority.ticket(&dependent.id).unwrap();
+        assert!(detail.targets.is_empty());
+        assert!(detail.action_eligibility.can_start_manual_worker);
+        assert!(detail.action_eligibility.blockers.is_empty());
+        assert_eq!(detail.relations.blockers.len(), 1);
+        assert_eq!(
+            detail.relations.blockers[0].blocking_ticket,
+            prerequisite.id
+        );
+        assert_eq!(detail.relations.outgoing[0].kind, "depends_on");
+        let blocked = authority
+            .query_tickets(TicketQueryRequest {
+                attention: vec![server_api::TicketAttention::Blocked],
+                ..TicketQueryRequest::default()
+            })
+            .unwrap();
+        assert_eq!(blocked.items.len(), 1);
+        assert_eq!(blocked.items[0].id, dependent.id);
+        assert_eq!(blocked.items[0].unresolved_blocker_count, 1);
+        let prerequisite_detail = authority.ticket(&prerequisite.id).unwrap();
+        assert!(prerequisite_detail.assignments.is_empty());
+        assert_eq!(prerequisite_detail.state.as_str(), "open");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE typed_tickets SET workflow_state='closed' WHERE ticket_id=?1",
+                [&dependent.id],
+            )
+            .unwrap();
+        assert!(
+            !authority
+                .ticket(&dependent.id)
+                .unwrap()
+                .action_eligibility
+                .can_start_manual_worker
         );
     }
 

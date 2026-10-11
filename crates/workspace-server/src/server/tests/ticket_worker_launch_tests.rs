@@ -1287,23 +1287,33 @@ async fn uncertain_launch_replay_after_target_edit_keeps_claim_and_blocks_compet
 // Direct policy composition is intentional: this protects routing interest,
 // independently of the transport/Runtime launch assertions above.
 #[tokio::test(flavor = "multi_thread")]
-async fn orchestrator_interest_requires_queue_receipt_or_unfinished_work_not_just_open_state() {
+async fn assignment_inputs_replace_queue_interest_without_reviving_released_work() {
     let fixture = LaunchFixture::new(false).await;
     let backend = browser_ticket_backend(&fixture.api).unwrap();
     let queued_id = fixture.ticket();
     assign_test_orchestrator(&fixture.api, &queued_id);
     assert!(
-        orchestrator_interested(&fixture.api, TEST_WORKSPACE_ID, &queued_id, "open")
+        fixture
+            .api
+            .store
+            .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
             .unwrap()
-            .is_none()
+            .iter()
+            .any(|input| input.ticket_id == queued_id)
+            == true
     );
     backend
         .queue_ready(queued_id.clone().into(), "fixture")
         .unwrap();
     assert!(
-        orchestrator_interested(&fixture.api, TEST_WORKSPACE_ID, &queued_id, "open")
+        fixture
+            .api
+            .store
+            .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
             .unwrap()
-            .is_some()
+            .iter()
+            .any(|input| input.ticket_id == queued_id)
+            == true
     );
     fixture.case_action(
         &queued_id,
@@ -1313,9 +1323,14 @@ async fn orchestrator_interest_requires_queue_receipt_or_unfinished_work_not_jus
         },
     );
     assert!(
-        orchestrator_interested(&fixture.api, TEST_WORKSPACE_ID, &queued_id, "closed")
+        fixture
+            .api
+            .store
+            .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
             .unwrap()
-            .is_none()
+            .iter()
+            .any(|input| input.ticket_id == queued_id)
+            == false
     );
     fixture.case_action(
         &queued_id,
@@ -1323,9 +1338,14 @@ async fn orchestrator_interest_requires_queue_receipt_or_unfinished_work_not_jus
         ticket::TicketCaseAction::Reopen,
     );
     assert!(
-        orchestrator_interested(&fixture.api, TEST_WORKSPACE_ID, &queued_id, "open")
+        fixture
+            .api
+            .store
+            .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
             .unwrap()
-            .is_none()
+            .iter()
+            .any(|input| input.ticket_id == queued_id)
+            == false
     );
 
     let active_id = fixture.ticket();
@@ -1347,9 +1367,14 @@ async fn orchestrator_interest_requires_queue_receipt_or_unfinished_work_not_jus
             .all(|event| !event.attributes.contains_key("queue_root_ticket"))
     );
     assert!(
-        orchestrator_interested(&fixture.api, TEST_WORKSPACE_ID, &active_id, "open")
+        fixture
+            .api
+            .store
+            .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
             .unwrap()
-            .is_some()
+            .iter()
+            .any(|input| input.ticket_id == active_id)
+            == true
     );
     fixture.case_action(
         &active_id,
@@ -1380,8 +1405,13 @@ async fn orchestrator_interest_requires_queue_receipt_or_unfinished_work_not_jus
             .is_none()
     );
     assert!(
-        orchestrator_interested(&fixture.api, TEST_WORKSPACE_ID, &active_id, "open")
+        fixture
+            .api
+            .store
+            .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
             .unwrap()
-            .is_none()
+            .iter()
+            .any(|input| input.ticket_id == active_id)
+            == false
     );
 }

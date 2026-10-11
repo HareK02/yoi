@@ -27,8 +27,11 @@ use crate::backend_job::{
 use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
+#[path = "assignment_delivery.rs"]
+mod assignment_delivery;
 #[path = "assignment_tracking.rs"]
 mod assignment_tracking;
+pub use assignment_delivery::TicketAssignmentDelivery;
 pub use assignment_tracking::TicketOrchestratorAssignmentSourceContext;
 pub use ticket::{
     TicketAssignmentTracking, TicketAssignmentTrackingHistoryEntry,
@@ -37,7 +40,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 92;
+const LATEST_SCHEMA_VERSION: i64 = 93;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -304,6 +307,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 92,
         name: "Ticket-owned assignment tracking",
         apply: migrate_ticket_tracking_v91_to_v92,
+    },
+    Migration {
+        version: 93,
+        name: "Durable assignment deliveries and source-bound startup fences",
+        apply: migrate_assignment_delivery_v92_to_v93,
     },
 ];
 
@@ -1804,6 +1812,52 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         request_fingerprint: &str,
         created_at: &str,
     ) -> Result<bool>;
+    /// Common scan for committed current delegation inputs, not handling status.
+    fn list_pending_ticket_assignment_deliveries(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TicketAssignmentDelivery>>;
+    /// Frozen payload/request identity for exact response-loss retry.
+    fn reserve_ticket_assignment_delivery(
+        &self,
+        workspace_id: &str,
+        assignment_id: &str,
+        input_event_id: &str,
+        source: &TicketAssignmentTrackingSourceContext,
+    ) -> Result<TicketAssignmentDelivery>;
+    /// Freeze exact rendered Runtime request bytes before dispatch.
+    fn prepare_ticket_assignment_delivery_content(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        content: &str,
+        source: &TicketAssignmentTrackingSourceContext,
+    ) -> Result<String>;
+    fn ack_ticket_assignment_delivery(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        source: &TicketAssignmentTrackingSourceContext,
+    ) -> Result<()>;
+    fn reserve_ticket_assignment_operation_for_orchestrator(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        ticket_id: &str,
+        runtime_id: &str,
+        worker_id: Option<&str>,
+        request_fingerprint: &str,
+        created_at: &str,
+        orchestrator_assignment_id: &str,
+        source: &TicketAssignmentTrackingSourceContext,
+    ) -> Result<bool>;
+    /// Recovery/pre-dispatch check; write boundaries also revalidate this fence.
+    fn validate_ticket_assignment_operation_fence(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+    ) -> Result<()>;
     fn bind_ticket_assignment_operation_worker(
         &self,
         workspace_id: &str,
@@ -7598,91 +7652,89 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         request_fingerprint: &str,
         created_at: &str,
     ) -> Result<bool> {
-        validate_non_empty("operation_id", operation_id)?;
-        validate_non_empty("request_fingerprint", request_fingerprint)?;
+        self.reserve_ticket_assignment_operation_with_fence(
+            workspace_id,
+            operation_id,
+            ticket_id,
+            runtime_id,
+            worker_id,
+            request_fingerprint,
+            created_at,
+            None,
+        )
+    }
+    fn reserve_ticket_assignment_operation_for_orchestrator(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        ticket_id: &str,
+        runtime_id: &str,
+        worker_id: Option<&str>,
+        request_fingerprint: &str,
+        created_at: &str,
+        orchestrator_assignment_id: &str,
+        source: &TicketAssignmentTrackingSourceContext,
+    ) -> Result<bool> {
+        self.reserve_ticket_assignment_operation_with_fence(
+            workspace_id,
+            operation_id,
+            ticket_id,
+            runtime_id,
+            worker_id,
+            request_fingerprint,
+            created_at,
+            Some((orchestrator_assignment_id, source)),
+        )
+    }
+    fn validate_ticket_assignment_operation_fence(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+    ) -> Result<()> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if let Some(existing) = read_assignment_operation(&tx, workspace_id, operation_id)? {
-                if existing.action == "assign"
-                    && existing.ticket_id == ticket_id
-                    && existing.runtime_id.as_deref() == Some(runtime_id)
-                    && (worker_id.is_none()
-                        || existing
-                            .worker
-                            .as_ref()
-                            .map(|worker| worker.worker_id.as_str())
-                            == worker_id)
-                    && existing.expected_assignment_id.is_none()
-                    && existing.request_fingerprint.as_deref() == Some(request_fingerprint)
-                {
-                    tx.commit()?;
-                    return Ok(false);
-                }
-                return Err(Error::TicketAssignmentConflict(format!(
-                    "assignment operation {operation_id} was already used with different input"
-                )));
-            }
-            let worker = worker_id.map(|id| RuntimeWorkerRef::new(runtime_id, id));
-            ensure_no_competing_ticket_claim(
-                &tx,
-                workspace_id,
-                ticket_id,
-                worker.as_ref(),
-                operation_id,
-            )?;
-            if let Some(worker) = &worker {
-                ensure_worker_assignment_available(&tx, workspace_id, worker)?;
-                let occupied: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments
-                    WHERE workspace_id=?1 AND role='worker' AND runtime_id=?2 AND worker_id=?3)",
-                    params![workspace_id, worker.runtime_id, worker.worker_id],
-                    |row| row.get(0),
-                )?;
-                if occupied {
-                    return Err(Error::TicketAssignmentConflict(
-                        "Worker has unfinished Ticket work".into(),
-                    ));
-                }
-            }
-            let state: String = tx.query_row(
-                "SELECT workflow_state FROM typed_tickets WHERE workspace_id=?1 AND ticket_id=?2",
-                params![workspace_id, ticket_id],
-                |row| row.get(0),
-            )?;
-            if state != "open" {
-                return Err(Error::TicketAssignmentConflict(format!(
-                    "Ticket `{ticket_id}` cannot claim work in state `{state}`"
-                )));
-            }
-            let occupied: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments
-                WHERE workspace_id=?1 AND ticket_id=?2 AND role='worker')",
-                params![workspace_id, ticket_id],
-                |row| row.get(0),
-            )?;
-            if occupied {
-                return Err(Error::TicketAssignmentConflict(
-                    "Ticket has unfinished Worker work".into(),
-                ));
-            }
-            tx.execute(
-                "INSERT INTO ticket_assignment_operations (
-                workspace_id,operation_id,action,ticket_id,runtime_id,worker_id,assignment_id,
-                expected_assignment_id,created_at,request_fingerprint,claim_state)
-                VALUES(?1,?2,'assign',?3,?4,?5,NULL,NULL,?6,?7,'pending')",
-                params![
-                    workspace_id,
-                    operation_id,
-                    ticket_id,
-                    runtime_id,
-                    worker_id,
-                    created_at,
-                    request_fingerprint
-                ],
-            )?;
+            assignment_delivery::operation_guard(&tx, workspace_id, operation_id)?;
             tx.commit()?;
-            Ok(true)
+            Ok(())
         })
+    }
+    fn list_pending_ticket_assignment_deliveries(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TicketAssignmentDelivery>> {
+        if !(1..=1000).contains(&limit) {
+            return Err(Error::InvalidInput(
+                "Assignment delivery scan limit must be 1..=1000".into(),
+            ));
+        }
+        self.with_conn(|conn| assignment_delivery::list_in_tx(conn, workspace_id, limit))
+    }
+    fn reserve_ticket_assignment_delivery(
+        &self,
+        workspace_id: &str,
+        assignment_id: &str,
+        input_event_id: &str,
+        source: &TicketAssignmentTrackingSourceContext,
+    ) -> Result<TicketAssignmentDelivery> {
+        assignment_delivery::reserve(self, workspace_id, assignment_id, input_event_id, source)
+    }
+    fn prepare_ticket_assignment_delivery_content(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        content: &str,
+        source: &TicketAssignmentTrackingSourceContext,
+    ) -> Result<String> {
+        assignment_delivery::prepare_content(self, workspace_id, delivery_id, content, source)
+    }
+    fn ack_ticket_assignment_delivery(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        source: &TicketAssignmentTrackingSourceContext,
+    ) -> Result<()> {
+        assignment_delivery::ack(self, workspace_id, delivery_id, source)
     }
 
     fn bind_ticket_assignment_operation_worker(
@@ -7693,6 +7745,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<()> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            assignment_delivery::operation_guard(&tx,workspace_id,operation_id)?;
             let receipt = read_assignment_operation(&tx, workspace_id, operation_id)?
                 .ok_or_else(|| Error::TicketAssignmentConflict(format!("missing Ticket claim `{operation_id}`")))?;
             // Exact binding replay is safe even after assignment finalization.
@@ -8036,6 +8089,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
 
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            assignment_delivery::operation_guard(&tx,&record.workspace_id,operation_id)?;
             if let Some(worker) = record.principal.worker() {
                 ensure_worker_assignment_available(&tx, &record.workspace_id, &worker)?;
             }
@@ -8091,29 +8145,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     "manual Worker assignment requires an open Ticket; current state is `{state}`"
                 )));
             }
-            let unresolved_blockers: i64 = tx.query_row(
-                "SELECT COUNT(*)
-                   FROM typed_ticket_relations AS relation
-                   JOIN typed_tickets AS related
-                     ON related.workspace_id = relation.workspace_id
-                    AND related.ticket_id = CASE
-                        WHEN relation.ticket_id = ?2 THEN relation.target
-                        ELSE relation.ticket_id
-                    END
-                  WHERE relation.workspace_id = ?1
-                    AND (
-                        (relation.ticket_id = ?2 AND relation.kind = 'depends_on')
-                        OR (relation.target = ?2 AND relation.kind = 'blocks')
-                    )
-                    AND related.workflow_state = 'open'",
-                params![record.workspace_id, record.ticket_id],
-                |row| row.get(0),
-            )?;
-            if unresolved_blockers != 0 {
-                return Err(Error::TicketAssignmentConflict(
-                    "manual Worker assignment is blocked by unresolved Ticket relations".to_string(),
-                ));
-            }
+            // Relations remain diagnostics; they do not reserve work or block partial starts.
             let conflicting: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM ticket_active_worker_assignments
                   WHERE workspace_id = ?1 AND ticket_id = ?2
@@ -8335,6 +8367,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<TicketWorkerAssignmentUpdate> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            assignment_delivery::operation_guard(&tx,&record.workspace_id,operation_id)?;
             let removal_blocks_assignment: bool = tx.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM worker_removal_operations
@@ -11360,6 +11393,119 @@ fn ensure_worker_assignment_available(
 }
 
 impl SqliteWorkspaceStore {
+    fn reserve_ticket_assignment_operation_with_fence(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        ticket_id: &str,
+        runtime_id: &str,
+        worker_id: Option<&str>,
+        request_fingerprint: &str,
+        created_at: &str,
+        fence: Option<(&str, &TicketAssignmentTrackingSourceContext)>,
+    ) -> Result<bool> {
+        validate_non_empty("operation_id", operation_id)?;
+        validate_non_empty("request_fingerprint", request_fingerprint)?;
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            assignment_delivery::operation_guard(&tx,workspace_id,operation_id)?;
+            if fence.is_none() {
+                let fenced:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_assignment_operation_fences WHERE workspace_id=?1 AND operation_id=?2)",params![workspace_id,operation_id],|r|r.get(0))?;
+                if fenced {return Err(Error::TicketAssignmentConflict("Source-bound reservation requires authenticated Orchestrator context".into()));}
+            }
+            if let Some(existing) = read_assignment_operation(&tx, workspace_id, operation_id)? {
+                if existing.action == "assign"
+                    && existing.ticket_id == ticket_id
+                    && existing.runtime_id.as_deref() == Some(runtime_id)
+                    && (worker_id.is_none()
+                        || existing
+                            .worker
+                            .as_ref()
+                            .map(|worker| worker.worker_id.as_str())
+                            == worker_id)
+                    && existing.expected_assignment_id.is_none()
+                    && existing.request_fingerprint.as_deref() == Some(request_fingerprint)
+                {
+                    if let Some((assignment_id,source))=fence {
+                        assignment_delivery::save_operation_fence(&tx,workspace_id,operation_id,ticket_id,assignment_id,source,true)?;
+                    }
+                    tx.commit()?;
+                    return Ok(false);
+                }
+                return Err(Error::TicketAssignmentConflict(format!(
+                    "assignment operation {operation_id} was already used with different input"
+                )));
+            }
+            if let Some((assignment_id,source))=fence {
+                assignment_tracking::require_runtime_source(&tx,workspace_id,&source.runtime_id,&source.worker_id,&source.agent_key,&source.authentication_binding_id)?;
+                assignment_delivery::require_current(&tx,workspace_id,ticket_id,assignment_id)?;
+            }
+            let worker = worker_id.map(|id| RuntimeWorkerRef::new(runtime_id, id));
+            ensure_no_competing_ticket_claim(
+                &tx,
+                workspace_id,
+                ticket_id,
+                worker.as_ref(),
+                operation_id,
+            )?;
+            if let Some(worker) = &worker {
+                ensure_worker_assignment_available(&tx, workspace_id, worker)?;
+                let occupied: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments
+                    WHERE workspace_id=?1 AND role='worker' AND runtime_id=?2 AND worker_id=?3)",
+                    params![workspace_id, worker.runtime_id, worker.worker_id],
+                    |row| row.get(0),
+                )?;
+                if occupied {
+                    return Err(Error::TicketAssignmentConflict(
+                        "Worker has unfinished Ticket work".into(),
+                    ));
+                }
+            }
+            let state: String = tx.query_row(
+                "SELECT workflow_state FROM typed_tickets WHERE workspace_id=?1 AND ticket_id=?2",
+                params![workspace_id, ticket_id],
+                |row| row.get(0),
+            )?;
+            if state != "open" {
+                return Err(Error::TicketAssignmentConflict(format!(
+                    "Ticket `{ticket_id}` cannot claim work in state `{state}`"
+                )));
+            }
+            let occupied: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments
+                WHERE workspace_id=?1 AND ticket_id=?2 AND role='worker')",
+                params![workspace_id, ticket_id],
+                |row| row.get(0),
+            )?;
+            if occupied {
+                return Err(Error::TicketAssignmentConflict(
+                    "Ticket has unfinished Worker work".into(),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO ticket_assignment_operations (
+                workspace_id,operation_id,action,ticket_id,runtime_id,worker_id,assignment_id,
+                expected_assignment_id,created_at,request_fingerprint,claim_state)
+                VALUES(?1,?2,'assign',?3,?4,?5,NULL,NULL,?6,?7,'pending')",
+                params![
+                    workspace_id,
+                    operation_id,
+                    ticket_id,
+                    runtime_id,
+                    worker_id,
+                    created_at,
+                    request_fingerprint
+                ],
+            )?;
+            if let Some((assignment_id,source))=fence {
+                assignment_delivery::save_operation_fence(&tx,workspace_id,operation_id,ticket_id,assignment_id,source,false)?;
+            }
+            tx.commit()?;
+            Ok(true)
+        })
+    }
+
     fn set_ticket_role_assignment_with_source(
         &self,
         record: &TicketRoleAssignmentRecord,
@@ -11421,6 +11567,7 @@ impl SqliteWorkspaceStore {
         };
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            assignment_delivery::operation_guard(&tx,&record.workspace_id,operation_id)?;
             if let Some(source)=source {assignment_tracking::require_assignment_source(&tx,&record.workspace_id,source)?;}
             if let Some(worker) = record.principal.worker() {
                 ensure_worker_assignment_available(&tx, &record.workspace_id, &worker)?;
@@ -11456,24 +11603,13 @@ impl SqliteWorkspaceStore {
                 return Ok(persisted);
             }
 
-            // This is a constraint on a new delegation, not on a saved result.
-            // Authenticate the source and resolve its full-input receipt first;
-            // work that began after the original Assign must not block replay.
-            if record.role == TicketAssignmentRole::Orchestrator {
-                let active_worker: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments
-                     WHERE workspace_id=?1 AND ticket_id=?2 AND role='worker')",
-                    params![record.workspace_id, record.ticket_id],
-                    |row| row.get(0),
-                )?;
-                if active_worker {
-                    return Err(Error::TicketAssignmentConflict(
-                        "Orchestrator assignment conflicts with an active Worker assignment".into(),
-                    ));
-                }
+            // Delegation has no Runtime/resource occupancy. It can invalidate
+            // an in-flight startup fence; existing actual Worker/claim resource
+            // exclusion is checked independently at the next work admission.
+            if record.role != TicketAssignmentRole::Orchestrator {
+                ensure_no_competing_ticket_claim(&tx, &record.workspace_id, &record.ticket_id,
+                    record.principal.worker().as_ref(), operation_id)?;
             }
-            ensure_no_competing_ticket_claim(&tx, &record.workspace_id, &record.ticket_id,
-                record.principal.worker().as_ref(), operation_id)?;
             let current_sql = ticket_role_assignment_select_sql(
                 "WHERE current.workspace_id = ?1 AND current.ticket_id = ?2 AND current.role = ?3 \
                  ORDER BY a.assigned_at, a.assignment_id",
@@ -11816,13 +11952,15 @@ fn clear_current_ticket_role_assignment_with_source_in_tx(
         }
         return Ok(true);
     }
-    ensure_no_competing_ticket_claim(
-        tx,
-        workspace_id,
-        ticket_id,
-        current.principal.worker().as_ref(),
-        operation_id,
-    )?;
+    if role != TicketAssignmentRole::Orchestrator {
+        ensure_no_competing_ticket_claim(
+            tx,
+            workspace_id,
+            ticket_id,
+            current.principal.worker().as_ref(),
+            operation_id,
+        )?;
+    }
     let is_current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_current_worker_assignments WHERE workspace_id=?1 AND ticket_id=?2 AND role=?3 AND assignment_id=?4)",params![workspace_id,ticket_id,role.as_str(),assignment_id],|row|row.get(0))?;
     if !is_current {
         return Ok(false);
@@ -13457,8 +13595,22 @@ fn migrate_ticket_tracking_v91_to_v92(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_assignment_delivery_v92_to_v93(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 92 {
+        return Err(Error::Store(
+            "Assignment delivery migration requires schema 92".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    assignment_delivery::install(&tx)?;
+    tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES(93,'Durable assignment deliveries and source-bound startup fences')",[])?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     create_workspace_schema_structure(conn)?;
+    assignment_delivery::install(conn)?;
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
         Error::Store(format!(
             "fresh Workspace Ticket schema verification failed: {error}"
@@ -13648,6 +13800,37 @@ fn verify_workspace_resource_constraints(conn: &Connection) -> Result<()> {
             if !sql.contains(predicate) || sql.contains("'done'") {
                 return Err(Error::Store(format!(
                     "Ticket case constraint {name} does not match schema 91"
+                )));
+            }
+        }
+    }
+    if current_schema_version(conn)? >= 93 {
+        for (kind, name) in [
+            ("table", "ticket_assignment_delivery_origins"),
+            ("table", "ticket_assignment_deliveries"),
+            ("table", "ticket_assignment_delivery_requests"),
+            ("table", "ticket_assignment_delivery_acknowledgements"),
+            ("table", "ticket_assignment_operation_fences"),
+            ("trigger", "ticket_assignment_delivery_origin_insert"),
+            ("trigger", "ticket_assignment_delivery_origin_no_update"),
+            ("trigger", "ticket_assignment_delivery_origin_no_delete"),
+            ("trigger", "ticket_assignment_delivery_payload_no_update"),
+            ("trigger", "ticket_assignment_delivery_payload_no_delete"),
+            ("trigger", "ticket_assignment_delivery_request_no_update"),
+            ("trigger", "ticket_assignment_delivery_request_no_delete"),
+            ("trigger", "ticket_assignment_delivery_ack_no_update"),
+            ("trigger", "ticket_assignment_delivery_ack_no_delete"),
+            ("trigger", "ticket_assignment_operation_fence_no_update"),
+            ("trigger", "ticket_assignment_operation_fence_no_delete"),
+        ] {
+            let present: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type=?1 AND name=?2)",
+                params![kind, name],
+                |row| row.get(0),
+            )?;
+            if !present {
+                return Err(Error::Store(format!(
+                    "Assignment delivery constraint {name} is missing"
                 )));
             }
         }
@@ -14405,6 +14588,7 @@ fn table_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     include!("assignment_tracking_tests.rs");
+    include!("assignment_delivery_tests.rs");
     include!("store_workspace_config_tests.rs");
 
     fn drive_grant_fixture(store: &SqliteWorkspaceStore) -> server_api::DriveGrantResponse {
@@ -16614,6 +16798,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     name: "Ticket open/closed cases and retained routing evidence".to_string()
                 },
                 WorkspaceSchemaMigrationStep {version:92, name:"Ticket-owned assignment tracking".into()},
+                WorkspaceSchemaMigrationStep {version:93, name:"Durable assignment deliveries and source-bound startup fences".into()},
             ]
         );
 
@@ -16716,6 +16901,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (90, "Runtime binding connection configuration and historical verification archive".to_string()),
 (91, "Ticket open/closed cases and retained routing evidence".to_string()),
 (92, "Ticket-owned assignment tracking".to_string()),
+(93, "Durable assignment deliveries and source-bound startup fences".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -19313,9 +19499,9 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .map(|step| step.version)
                 .collect::<Vec<_>>(),
             if version == 89 {
-                vec![90, 91, 92]
+                vec![90, 91, 92, 93]
             } else {
-                vec![91, 92]
+                vec![91, 92, 93]
             }
         );
         drop(conn);
@@ -19330,7 +19516,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 assert_eq!(workspace_schema_migration_history(conn)?.into_iter().filter(|(version, _)| *version >= 90).collect::<Vec<_>>(),
                     vec![(90, "Runtime binding connection configuration and historical verification archive".into()),
                          (91, "Ticket open/closed cases and retained routing evidence".into()),
-                         (92, "Ticket-owned assignment tracking".into())]);
+                         (92, "Ticket-owned assignment tracking".into()),
+                         (93, "Durable assignment deliveries and source-bound startup fences".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }
@@ -20048,7 +20235,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     }
 
     #[tokio::test]
-    async fn pending_claims_fence_all_assignment_writers_and_worker_binding_until_owner_commits() {
+    async fn pending_claims_fence_work_writers_but_allow_delegation_clear() {
         let (_dir, store) = manual_worker_start_store().await;
         seed_manual_start_ticket(&store, "first", "open");
         seed_manual_start_ticket(&store, "second", "open");
@@ -20100,7 +20287,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     "2",
                     None
                 )
-                .is_err()
+                .unwrap()
         );
         assert!(
             store

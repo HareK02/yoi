@@ -1977,6 +1977,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_create_alias(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] runtime_id: String,
         #[body] request: RuntimeWorkerSpawnRequest,
     ) -> Result<RuntimeWorkerSpawnResponse, RepositoryApiError>;
@@ -2006,6 +2007,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_create(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[body] request: RuntimeWorkerSpawnRequest,
@@ -7940,6 +7942,10 @@ pub struct TicketWorkerAttachmentBinding {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct SetTicketRoleAssignmentRequest {
+    /// Observed delegation required for Orchestrator Ticket starts; manual starts omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_assignment_id: Option<String>,
+
     pub operation_id: String,
     pub principal: TicketAssignmentPrincipal,
     pub expected_assignment_id: Option<String>,
@@ -8580,6 +8586,10 @@ pub enum RuntimeWorkerSpawnAcceptanceRequirement {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerTicketAssignmentRequest {
+    /// Observed delegation required for Orchestrator Ticket starts; manual starts omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_assignment_id: Option<String>,
+
     pub ticket_id: String,
     pub operation_id: String,
 }
@@ -9909,6 +9919,10 @@ pub struct BrowserWorkerWorkingDirectorySelection {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct CreateWorkspaceWorkerTicketAssignmentRequest {
+    /// Observed delegation required for Orchestrator Ticket starts; manual starts omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_assignment_id: Option<String>,
+
     pub ticket_id: String,
     pub operation_id: String,
 }

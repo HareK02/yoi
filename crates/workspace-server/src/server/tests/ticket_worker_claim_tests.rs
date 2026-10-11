@@ -448,6 +448,7 @@ async fn pending_manual_worker_claim_reconciles_same_runtime_restore_and_commits
         .unwrap();
     let admitted_content_digest = api.authority.ticket(&ticket_id).unwrap().content_digest;
     let request = server_api::SetTicketRoleAssignmentRequest {
+        orchestrator_assignment_id: None,
         operation_id: "claim-runtime-reconciliation".into(),
         principal: server_api::TicketAssignmentPrincipal::Worker {
             runtime_id: worker.runtime_id.clone(),

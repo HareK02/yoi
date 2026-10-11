@@ -450,6 +450,10 @@ pub struct WorkerSpawnWorkingDirectoryRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerTicketAssignmentRequest {
+    /// Observed delegation required for Orchestrator Ticket starts; manual starts omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_assignment_id: Option<String>,
+
     pub ticket_id: String,
     pub operation_id: String,
 }
@@ -7546,6 +7550,7 @@ mod tests {
     fn worker_spawn_idempotency_fingerprint_covers_canonical_initial_submit() {
         let mut request = embedded_spawn_request();
         request.ticket_assignment = Some(WorkerTicketAssignmentRequest {
+            orchestrator_assignment_id: None,
             ticket_id: "00001KVZSGT0Q".to_string(),
             operation_id: "operation-1".to_string(),
         });
