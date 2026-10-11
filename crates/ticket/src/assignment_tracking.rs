@@ -898,3 +898,53 @@ pub(crate) fn verify_assignment_tracking_schema(conn: &Connection) -> Result<()>
 #[cfg(test)]
 #[path = "assignment_tracking_tests.rs"]
 mod tests;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TicketAssignmentsPage {
+    pub items: Vec<TicketAssignmentTrackingProjection>,
+    pub next_assignment_id: Option<String>,
+}
+
+/// Immutable append-order identities. The cursor must be an identity in this
+/// Ticket/Workspace; timestamps and lexical IDs are not insertion order.
+pub fn sqlite_ticket_assignments_page(
+    conn: &Connection,
+    workspace_id: &str,
+    ticket_id: &str,
+    after_assignment_id: Option<&str>,
+    limit: usize,
+) -> Result<TicketAssignmentsPage> {
+    if !(1..=100).contains(&limit) {
+        return Err(TicketError::Conflict(
+            "Assignment page limit must be 1..100".into(),
+        ));
+    }
+    let after: i64 = match after_assignment_id {
+        None => 0,
+        Some(id) => conn.query_row("SELECT rowid FROM ticket_worker_assignments WHERE workspace_id=?1 AND ticket_id=?2 AND role='orchestrator' AND assignment_id=?3",params![workspace_id,ticket_id,id],|r| r.get(0)).optional().map_err(sqlite_err)?
+            .ok_or_else(|| TicketError::Conflict("Assignment cursor does not belong to this Ticket".into()))?,
+    };
+    let mut stmt = conn.prepare("SELECT assignment_id FROM ticket_worker_assignments WHERE workspace_id=?1 AND ticket_id=?2 AND role='orchestrator' AND rowid>?3 ORDER BY rowid LIMIT ?4").map_err(sqlite_err)?;
+    let mut ids = stmt
+        .query_map(
+            params![workspace_id, ticket_id, after, (limit + 1) as i64],
+            |r| r.get::<_, String>(0),
+        )
+        .map_err(sqlite_err)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(sqlite_err)?;
+    let has_more = ids.len() > limit;
+    ids.truncate(limit);
+    let next_assignment_id = if has_more { ids.last().cloned() } else { None };
+    let items = ids
+        .iter()
+        .map(|id| {
+            sqlite_ticket_assignment_tracking(conn, workspace_id, ticket_id, id)?
+                .ok_or_else(|| TicketError::Conflict("Assignment disappeared while paging".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(TicketAssignmentsPage {
+        items,
+        next_assignment_id,
+    })
+}

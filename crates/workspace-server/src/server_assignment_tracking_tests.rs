@@ -68,9 +68,13 @@ async fn runtime_and_account_assign_retries_return_saved_result_after_clear_and_
         })).unwrap();
         tracking_response(
             app.clone(),
-            Request::builder().method("PUT").uri(&worker_path).header(CONTENT_TYPE, "application/json")
+            Request::builder()
+                .method("PUT")
+                .uri(&worker_path)
+                .header(CONTENT_TYPE, "application/json")
                 .header("authorization", format!("Bearer {token}"))
-                .body(Body::from(worker_input)).unwrap(),
+                .body(Body::from(worker_input))
+                .unwrap(),
             StatusCode::OK,
         )
         .await;
@@ -127,7 +131,10 @@ async fn runtime_and_account_assign_retries_return_saved_result_after_clear_and_
             StatusCode::OK,
         )
         .await;
-        assert_ne!(fresh["assignment"]["assignment_id"].as_str(), Some(assignment));
+        assert_ne!(
+            fresh["assignment"]["assignment_id"].as_str(),
+            Some(assignment)
+        );
         assert_eq!(
             api.store
                 .get_ticket_assignment_tracking(TEST_WORKSPACE_ID, &ticket, assignment)
@@ -146,9 +153,18 @@ async fn runtime_and_account_assign_retries_return_saved_result_after_clear_and_
                 .unwrap(),
             active
         );
-        assert_eq!(api.store.get_current_ticket_role_assignment(TEST_WORKSPACE_ID, &ticket,
-            TicketAssignmentRole::Orchestrator).unwrap().unwrap().assignment_id,
-            fresh["assignment"]["assignment_id"].as_str().unwrap());
+        assert_eq!(
+            api.store
+                .get_current_ticket_role_assignment(
+                    TEST_WORKSPACE_ID,
+                    &ticket,
+                    TicketAssignmentRole::Orchestrator
+                )
+                .unwrap()
+                .unwrap()
+                .assignment_id,
+            fresh["assignment"]["assignment_id"].as_str().unwrap()
+        );
     }
 }
 
@@ -1492,5 +1508,552 @@ async fn assignment_signed_runtime_without_worker_cannot_self_assign_service_rol
             .list_current_ticket_role_assignments(TEST_WORKSPACE_ID, &ticket)
             .unwrap()
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn public_assignment_answer_authenticates_source_replays_saved_result_and_rejects_read_reassign_race()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (api, _, identity, source, ticket) = tracking_fixture(directory.path()).await;
+    let current = assign_tracking(&api, &identity, &source, &ticket).await;
+    let token = seed_test_api_token(api.store.as_ref(), "answer-owner");
+    let app = build_router(api.clone());
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignment-answer");
+    let body = serde_json::json!({"assignment_id":current.assignment_id,"expected_last_event_id":current.last_event_id,"operation_key":"answer-op","body":"Choose the bounded option"});
+    let account_request = |body: &serde_json::Value| {
+        Request::builder()
+            .method("POST")
+            .uri(&path)
+            .header(CONTENT_TYPE, "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    };
+    tracking_response(
+        app.clone(),
+        Request::builder()
+            .method("POST")
+            .uri(&path)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    let saved = tracking_response(app.clone(), account_request(&body), StatusCode::OK).await;
+    assert_eq!(saved["assignment_id"], current.assignment_id);
+    let backend = browser_ticket_backend(&api).unwrap();
+    let authored = backend.show(ticket.clone().into()).unwrap();
+    assert_eq!(
+        authored
+            .events
+            .iter()
+            .filter(|e| e.kind.as_str() == "assignment_answer")
+            .count(),
+        1
+    );
+    let event = authored
+        .events
+        .iter()
+        .find(|e| e.kind.as_str() == "assignment_answer")
+        .unwrap();
+    assert!(
+        event
+            .author
+            .as_deref()
+            .unwrap()
+            .starts_with("workspace-user:")
+    );
+    assert_eq!(event.body.as_str(), "Choose the bounded option");
+    assert_eq!(
+        api.store
+            .get_ticket_assignment_tracking(TEST_WORKSPACE_ID, &ticket, &current.assignment_id)
+            .unwrap()
+            .unwrap(),
+        current
+    );
+    assert_eq!(
+        tracking_response(app.clone(), account_request(&body), StatusCode::OK).await,
+        saved
+    );
+    let mut changed = body.clone();
+    changed["body"] = "Changed payload".into();
+    tracking_response(app.clone(), account_request(&changed), StatusCode::CONFLICT).await;
+    let mut spoof = body.clone();
+    spoof["actor"] = "owner".into();
+    tracking_response(
+        app.clone(),
+        account_request(&spoof),
+        StatusCode::UNPROCESSABLE_ENTITY,
+    )
+    .await;
+    let assignment_path =
+        format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator");
+    tracking_response(app.clone(),runtime_source_request(&identity,Some(&source.worker_id),"PUT",&assignment_path,serde_json::to_vec(&serde_json::json!({"operation_id":"replace-after-read","expected_assignment_id":current.assignment_id,"principal":{"kind":"workspace_agent","agent_key":"workspace-orchestrator"}})).unwrap()),StatusCode::OK).await;
+    let mut stale = body.clone();
+    stale["operation_key"] = "fresh-stale-answer".into();
+    tracking_response(app.clone(), account_request(&stale), StatusCode::CONFLICT).await;
+    assert_eq!(
+        tracking_response(app, account_request(&body), StatusCode::OK).await,
+        saved
+    );
+    assert_eq!(
+        backend
+            .show(ticket.into())
+            .unwrap()
+            .events
+            .iter()
+            .filter(|e| e.kind.as_str() == "assignment_answer")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn public_assignment_pages_and_diagnostics_require_scoped_read_and_reject_foreign_cursors() {
+    let directory = tempfile::tempdir().unwrap();
+    let (api, _, identity, source, ticket) = tracking_fixture(directory.path()).await;
+    let current = assign_tracking(&api, &identity, &source, &ticket).await;
+    let token = seed_test_api_token(api.store.as_ref(), "diagnostics-reader");
+    let app = build_router(api.clone());
+    for prefix in [
+        format!("/api/w/{TEST_WORKSPACE_ID}"),
+        format!("/workspaces/{TEST_WORKSPACE_ID}"),
+    ] {
+        let path = format!("{prefix}/tickets/{ticket}/assignment-tracking/assignments?limit=1");
+        tracking_response(
+            app.clone(),
+            Request::builder().uri(&path).body(Body::empty()).unwrap(),
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        let request = |path: String| {
+            Request::builder()
+                .uri(path)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let page = tracking_response(app.clone(), request(path), StatusCode::OK).await;
+        assert_eq!(page["items"][0]["assignment_id"], current.assignment_id);
+        assert!(page["next_assignment_id"].is_null());
+        let path = format!(
+            "{prefix}/tickets/{ticket}/assignment-diagnostics?assignment_id={}&limit=1",
+            current.assignment_id
+        );
+        let diagnostic =
+            tracking_response(app.clone(), request(path.clone()), StatusCode::OK).await;
+        assert_eq!(diagnostic["assignment_id"], current.assignment_id);
+        assert_eq!(diagnostic["input_origin_known"], true);
+        assert!(diagnostic.get("payload_json").is_none());
+        tracking_response(
+            app.clone(),
+            request(format!("{path}&after_input_event_id=ticket-event:999")),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        tracking_response(app.clone(),request(format!("{prefix}/tickets/{ticket}/assignment-tracking/assignments?after_assignment_id=foreign")),StatusCode::BAD_REQUEST).await;
+        tracking_response(
+            app.clone(),
+            request(format!(
+                "{prefix}/tickets/{ticket}/assignment-diagnostics?assignment_id={}&limit=101",
+                current.assignment_id
+            )),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    let path = format!(
+        "/api/w/another-workspace/tickets/{ticket}/assignment-diagnostics?assignment_id={}",
+        current.assignment_id
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(path)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+}
+
+#[tokio::test]
+async fn ticket_query_principal_and_handling_filter_before_single_item_page_without_worker_inference()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (api, _, identity, source, ticket) = tracking_fixture(directory.path()).await;
+    let current = assign_tracking(&api, &identity, &source, &ticket).await;
+    tracking_response(
+        build_router(api.clone()),
+        signed_tracking_update(
+            &identity,
+            Some(&source.worker_id),
+            &ticket,
+            &tracking_update(&current, "query-done"),
+        ),
+        StatusCode::OK,
+    )
+    .await;
+    let backend = browser_ticket_backend(&api).unwrap();
+    for n in 0..8 {
+        backend
+            .create(ticket::NewTicket::new(format!("Unassigned newer {n}")))
+            .unwrap();
+    }
+    let query:server_api::TicketQueryRequest=serde_json::from_value(serde_json::json!({"handling_status":"done","assigned_principal":{"kind":"workspace_agent","agent_key":"workspace-orchestrator"},"limit":1})).unwrap();
+    let found = api.authority.query_tickets(query).unwrap();
+    assert_eq!(found.items.len(), 1);
+    assert_eq!(found.items[0].id, ticket);
+    let query:server_api::TicketQueryRequest=serde_json::from_value(serde_json::json!({"handling_status":"waiting","assigned_principal":{"kind":"workspace_agent","agent_key":"workspace-orchestrator"},"limit":1})).unwrap();
+    assert!(api.authority.query_tickets(query).unwrap().items.is_empty());
+    let query:server_api::TicketQueryRequest=serde_json::from_value(serde_json::json!({"assigned_principal":{"kind":"worker","runtime_id":source.runtime_id,"worker_id":source.worker_id},"limit":1})).unwrap();
+    assert!(api.authority.query_tickets(query).unwrap().items.is_empty());
+}
+
+#[test]
+fn canonical_assignment_operations_are_explicit_scoped_api_routes_not_static_shell_paths() {
+    for suffix in [
+        "case",
+        "assignment-tracking",
+        "assignment-tracking/history",
+        "assignment-tracking/assignments",
+        "assignment-diagnostics",
+        "assignment-answer",
+    ] {
+        let path = format!("/workspaces/workspace-a/tickets/ticket-a/{suffix}");
+        assert_eq!(
+            canonical_ticket_operation_workspace_id(&path),
+            Some("workspace-a")
+        );
+        assert_eq!(scoped_workspace_id(&path), Some("workspace-a"));
+        assert!(!is_server_static_forward(&path));
+        assert!(!is_server_global_forward(&path));
+        assert!(canonical_ticket_operation_workspace_id(&format!("{path}/extra")).is_none());
+    }
+    for invalid in [
+        "/workspaces//tickets/t/assignment-answer",
+        "/workspaces/w/tickets//assignment-diagnostics",
+        "/workspaces/w/tickets/t",
+        "/workspaces/w/tickets/t/unknown",
+        "/workspaces/w/tickets/t/assignment-tracking/unknown",
+        "/workspaces/w/workers/t/assignment-answer",
+    ] {
+        assert!(
+            canonical_ticket_operation_workspace_id(invalid).is_none(),
+            "{invalid}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn catalog_assignment_routes_apply_cookie_workspace_auth_and_origin_to_browser_and_canonical_paths()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (api, _, identity, source, ticket) = tracking_fixture(directory.path()).await;
+    let current = assign_tracking(&api, &identity, &source, &ticket).await;
+    seed_test_api_token(api.store.as_ref(), "assignment-cookie");
+    api.store
+        .create_browser_session(&BrowserSessionRecord {
+            token_hash: crate::auth::token_hash("assignment-browser-session"),
+            session_id: "assignment-session".into(),
+            user_id: "user-assignment-cookie".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            revoked_at: None,
+        })
+        .unwrap();
+    let AuthConfig::Passkey {
+        origin,
+        cookie_name,
+        ..
+    } = &api.config.auth;
+    let cookie = format!("{cookie_name}=assignment-browser-session");
+    let catalog = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
+    catalog
+        .apis
+        .lock()
+        .await
+        .insert(TEST_WORKSPACE_ID.into(), api.clone());
+    catalog
+        .routers
+        .lock()
+        .await
+        .insert(TEST_WORKSPACE_ID.into(), build_inner_router(api.clone()));
+    let app = workspace_server_router(catalog);
+    let body = serde_json::json!({"assignment_id":current.assignment_id,"expected_last_event_id":current.last_event_id,"operation_key":"cookie-answer","body":"Authorized browser continuation"});
+    let mut receipt = None;
+    for prefix in [
+        format!("/api/w/{TEST_WORKSPACE_ID}"),
+        format!("/workspaces/{TEST_WORKSPACE_ID}"),
+    ] {
+        let identity_path =
+            format!("{prefix}/tickets/{ticket}/assignment-tracking/assignments?limit=1");
+        let diagnostic_path = format!(
+            "{prefix}/tickets/{ticket}/assignment-diagnostics?assignment_id={}",
+            current.assignment_id
+        );
+        for path in [identity_path, diagnostic_path] {
+            tracking_response(
+                app.clone(),
+                Request::builder().uri(&path).body(Body::empty()).unwrap(),
+                StatusCode::UNAUTHORIZED,
+            )
+            .await;
+            tracking_response(
+                app.clone(),
+                Request::builder()
+                    .uri(path)
+                    .header(axum::http::header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+                StatusCode::OK,
+            )
+            .await;
+        }
+        let answer_path = format!("{prefix}/tickets/{ticket}/assignment-answer");
+        let request = |with_origin: bool| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(&answer_path)
+                .header(CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &cookie);
+            if with_origin {
+                request = request.header(ORIGIN, origin);
+            }
+            request
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        tracking_response(app.clone(), request(false), StatusCode::FORBIDDEN).await;
+        let saved = tracking_response(app.clone(), request(true), StatusCode::OK).await;
+        if let Some(previous) = &receipt {
+            assert_eq!(&saved, previous);
+        } else {
+            receipt = Some(saved);
+        }
+        let cross = answer_path.replace(TEST_WORKSPACE_ID, "foreign-workspace");
+        tracking_response(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri(cross)
+                .header(CONTENT_TYPE, "application/json")
+                .header(axum::http::header::COOKIE, &cookie)
+                .header(ORIGIN, origin)
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+    }
+    let events = browser_ticket_backend(&api)
+        .unwrap()
+        .show(ticket.into())
+        .unwrap()
+        .events;
+    let answers = events
+        .iter()
+        .filter(|event| event.kind.as_str() == "assignment_answer")
+        .collect::<Vec<_>>();
+    assert_eq!(answers.len(), 1);
+    assert!(
+        answers[0]
+            .author
+            .as_deref()
+            .unwrap()
+            .contains("account-assignment-cookie")
+    );
+}
+
+#[tokio::test]
+async fn canonical_answer_uses_actual_runtime_binding_and_rejects_tampered_source_or_binding_replay()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (api, _, identity, source, ticket) = tracking_fixture(directory.path()).await;
+    let current = assign_tracking(&api, &identity, &source, &ticket).await;
+    let path = format!("/workspaces/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignment-answer");
+    let input = serde_json::json!({"assignment_id":current.assignment_id,"expected_last_event_id":current.last_event_id,"operation_key":"runtime-answer","body":"Runtime-authenticated continuation"});
+    let request = || {
+        runtime_source_request(
+            &identity,
+            Some(&source.worker_id),
+            "POST",
+            &path,
+            serde_json::to_vec(&input).unwrap(),
+        )
+    };
+    let app = build_router(api.clone());
+    let mut unsigned = request();
+    unsigned
+        .headers_mut()
+        .remove(worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER);
+    tracking_response(app.clone(), unsigned, StatusCode::UNAUTHORIZED).await;
+    let mut tampered = request();
+    *tampered.body_mut() = Body::from("{}");
+    tracking_response(app.clone(), tampered, StatusCode::UNAUTHORIZED).await;
+    let attacker = RuntimeIdentityMaterial::generate(&source.runtime_id).unwrap();
+    tracking_response(
+        app.clone(),
+        runtime_source_request(
+            &attacker,
+            Some(&source.worker_id),
+            "POST",
+            &path,
+            serde_json::to_vec(&input).unwrap(),
+        ),
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    tracking_response(
+        app.clone(),
+        runtime_source_request(
+            &identity,
+            None,
+            "POST",
+            &path,
+            serde_json::to_vec(&input).unwrap(),
+        ),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    let saved = tracking_response(app.clone(), request(), StatusCode::OK).await;
+    assert_eq!(
+        tracking_response(app.clone(), request(), StatusCode::OK).await,
+        saved
+    );
+    let conn = rusqlite::Connection::open(&api.config.database_path).unwrap();
+    let binding:String=conn.query_row("SELECT binding_id FROM workspace_runtime_bindings WHERE workspace_id=?1 AND runtime_id=?2",rusqlite::params![TEST_WORKSPACE_ID,source.runtime_id],|r| r.get(0)).unwrap();
+    let receipt_source:String=conn.query_row("SELECT source_context_json FROM typed_ticket_assignment_tracking_operations WHERE workspace_id=?1 AND operation_key='runtime-answer'",[TEST_WORKSPACE_ID],|r| r.get(0)).unwrap();
+    let receipt_source: serde_json::Value = serde_json::from_str(&receipt_source).unwrap();
+    assert_eq!(
+        receipt_source["source"]["authentication_binding_id"],
+        binding
+    );
+    assert_eq!(receipt_source["source"]["worker_id"], source.worker_id);
+    conn.execute("UPDATE workspace_runtime_bindings SET binding_id='new-answer-binding' WHERE workspace_id=?1 AND runtime_id=?2",rusqlite::params![TEST_WORKSPACE_ID,source.runtime_id]).unwrap();
+    tracking_response(app.clone(), request(), StatusCode::CONFLICT).await;
+    let foreign = path.replace(TEST_WORKSPACE_ID, "foreign-workspace");
+    let response = app
+        .oneshot(runtime_source_request(
+            &identity,
+            Some(&source.worker_id),
+            "POST",
+            &foreign,
+            serde_json::to_vec(&input).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+    assert_eq!(
+        browser_ticket_backend(&api)
+            .unwrap()
+            .show(ticket.into())
+            .unwrap()
+            .events
+            .iter()
+            .filter(|event| event.kind.as_str() == "assignment_answer")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn closure_reason_filter_matches_current_judgment_before_paging_and_text_search_retains_old_reasons()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let api = test_api(directory.path()).await;
+    let backend = browser_ticket_backend(&api).unwrap();
+    let reference = backend
+        .create(ticket::NewTicket::new("Reason classification"))
+        .unwrap();
+    let mutate = |key: &str, action: ticket::TicketCaseAction| {
+        let observed = backend.show(reference.id.clone().into()).unwrap();
+        backend
+            .update_case(
+                &reference.id,
+                ticket::TicketCaseUpdate {
+                    expected_content_digest: ticket::ticket_content_digest(&observed),
+                    expected_state: observed.meta.workflow_state,
+                    expected_closure_operation_key: observed.closure_operation_key,
+                    operation_key: key.into(),
+                    action,
+                    explanation: "Case decision explanation, no reason name here".into(),
+                    references: vec![],
+                    author: Some("human".into()),
+                },
+            )
+            .unwrap();
+    };
+    mutate(
+        "close-not-planned",
+        ticket::TicketCaseAction::Close {
+            reason: ticket::TicketClosureReason::NotPlanned,
+        },
+    );
+    for n in 0..8 {
+        backend
+            .create(ticket::NewTicket::new(format!("Newer unrelated {n}")))
+            .unwrap();
+    }
+    let query = |value: serde_json::Value| {
+        api.authority
+            .query_tickets(serde_json::from_value(value).unwrap())
+            .unwrap()
+    };
+    assert_eq!(
+        query(json!({"closure_reason":"not_planned","limit":1})).items[0].id,
+        reference.id
+    );
+    mutate(
+        "correct-duplicate",
+        ticket::TicketCaseAction::CorrectClosure {
+            reason: ticket::TicketClosureReason::Duplicate,
+        },
+    );
+    assert!(
+        query(json!({"closure_reason":"not_planned","limit":1}))
+            .items
+            .is_empty()
+    );
+    assert_eq!(
+        query(json!({"closure_reason":"duplicate","limit":1})).items[0].id,
+        reference.id
+    );
+    assert_eq!(
+        query(json!({"query":"not_planned","limit":1})).items[0].matched_fields,
+        vec!["closure_reason"]
+    );
+    mutate("reopen", ticket::TicketCaseAction::Reopen);
+    assert!(
+        query(json!({"closure_reason":"duplicate","limit":1}))
+            .items
+            .is_empty()
+    );
+    assert_eq!(
+        query(json!({"query":"duplicate","limit":1})).items[0].id,
+        reference.id
+    );
+    mutate(
+        "close-custom",
+        ticket::TicketCaseAction::Close {
+            reason: ticket::TicketClosureReason::Other("Superseded plan".into()),
+        },
+    );
+    assert_eq!(
+        query(json!({"closure_reason":{"other":"Superseded plan"},"limit":1})).items[0].id,
+        reference.id
+    );
+    assert!(
+        query(json!({"closure_reason":{"other":"Other plan"},"limit":1}))
+            .items
+            .is_empty()
+    );
+    assert_eq!(
+        query(json!({"query":"Superseded plan","limit":1})).items[0].id,
+        reference.id
     );
 }

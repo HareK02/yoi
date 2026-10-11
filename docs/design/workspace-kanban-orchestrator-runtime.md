@@ -1,5 +1,7 @@
 # Workspace Kanban to backend Orchestrator runtime
 
+> Historical design, not current operating instructions. O-19 / T-739–T-743 supersede the state/Queue routing and dependency start gates below. Current Ticket cases are open/closed; Assign starts delegation and initial waiting without ready/Queue, handling is an Orchestrator self-report, and MR integration remains independently guarded. See [current work operations](../development/work-items.md), [assignment tracking](../development/ticket-assignment-tracking.md), and [delivery/start fences](../development/ticket-assignment-delivery.md). The original proposal below is preserved, not rewritten as implementation history.
+
 Workspace Kanban operations are control-plane requests. They may change Ticket state and request orchestration, but they must not directly execute shell, git, filesystem work, or send authority-bearing messages to raw local Worker sockets. The durable boundary is an orchestration event consumed by a backend-internal Orchestrator Worker.
 
 This document records the design boundary for connecting Kanban operations, Tickets, the Workspace backend, `WorkerRuntimeRegistry`, and filesystem-capable Workers. It is intentionally a planning artifact: it does not require the Workspace backend to implement every table, API, remote protocol, or spawn adapter immediately.

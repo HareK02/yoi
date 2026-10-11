@@ -1,5 +1,7 @@
 # Orchestrator worktree and implementation worktree layout
 
+> Historical layout decision and branch report. The Queue/state and mandatory merge→close→cleanup policy below is superseded by [current work operations](../development/work-items.md). Current delegation starts at Assign without ready/Queue; open/closed case judgments, self-reported assignment handling, guarded MR integration, actual work release and Worker/resource cleanup are independent. Respect the requested return path. The original report is preserved below; explicit attached Workdirs and Backend resource authority, not inferred roots, govern current execution.
+
 Yoi can run an Orchestrator from a dedicated orchestration worktree while implementation worktrees still belong under the original workspace root. The runtime must therefore distinguish role execution cwd/workspace from the target repository root used for implementation branches and merge-completion.
 
 This decision records the layout policy for Ticket `00001KTTB479X`.

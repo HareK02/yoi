@@ -866,9 +866,10 @@ mod tests {
             .unwrap();
 
         assert!(server.starts_with("Assigned Tickets have unreceived input:"));
-        // TUI's final operation model is a separate downstream scope; both
-        // renderers still consume the same bounded resource-key projection.
-        assert!(tui.starts_with("Queued Tickets require attention:"));
+        assert!(tui.starts_with("Assigned Tickets have input requiring attention:"));
+        assert!(tui.contains("no ready/Queue step is required"));
+        assert!(tui.contains("were omitted from this notice: 1"));
+        assert!(!tui.contains("T-21"));
         assert!(server.contains("- T-1 — Ticket 1 with control "));
         assert!(!server.contains("T-21"));
         assert!(server.contains("were omitted from this notice: 1"));

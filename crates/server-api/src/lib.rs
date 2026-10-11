@@ -362,6 +362,12 @@ impl_openapi_schema!(
     TicketOrchestrationPlanRecord,
     TicketOrchestrationPlanRecordList,
     TicketOrchestrationPlanSearchRequest,
+    TicketAssignmentsQuery,
+    TicketAssignmentsPage,
+    TicketAssignmentAnswerRequest,
+    TicketAssignmentAnswerResponse,
+    TicketAssignmentDiagnosticsQuery,
+    TicketAssignmentDiagnosticsPage,
     TicketQueryRequest,
     TicketQueryResponse,
     TicketQueueResponse,
@@ -3198,6 +3204,60 @@ pub trait ServerApi {
         #[path] ticket_id: String,
         #[body] request: TicketCaseUpdateRequest,
     ) -> Result<TicketSummary, RepositoryApiError>;
+    #[get("/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking/assignments", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignments_page(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[query] query: TicketAssignmentsQuery,
+    ) -> Result<TicketAssignmentsPage, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/tickets/{ticket_id}/assignment-tracking/assignments", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignments_page_browser(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[query] query: TicketAssignmentsQuery,
+    ) -> Result<TicketAssignmentsPage, RepositoryApiError>;
+
+    #[get("/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-diagnostics", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignment_diagnostics(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[query] query: TicketAssignmentDiagnosticsQuery,
+    ) -> Result<TicketAssignmentDiagnosticsPage, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/tickets/{ticket_id}/assignment-diagnostics", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignment_diagnostics_browser(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[query] query: TicketAssignmentDiagnosticsQuery,
+    ) -> Result<TicketAssignmentDiagnosticsPage, RepositoryApiError>;
+
+    #[post("/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-answer", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignment_answer(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[body] request: TicketAssignmentAnswerRequest,
+    ) -> Result<TicketAssignmentAnswerResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{ticket_id}/assignment-answer", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignment_answer_browser(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[body] request: TicketAssignmentAnswerRequest,
+    ) -> Result<TicketAssignmentAnswerResponse, RepositoryApiError>;
+
     #[get("/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_assignment_tracking_get(
         &self,
@@ -7604,6 +7664,21 @@ impl TicketAttention {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct TicketQueryRequest {
+    /// Exact reason of the current closed-case judgment; reopened/history-only reasons do not match.
+    #[cfg_attr(feature = "typescript", ts(type = "TicketClosureReason | null"))]
+    pub closure_reason: Option<ticket::TicketClosureReason>,
+    /// Exact current assigned principal; retained relationships do not match.
+    #[cfg_attr(
+        feature = "typescript",
+        ts(type = "TicketAssignmentPrincipalSnapshot | null")
+    )]
+    pub assigned_principal: Option<ticket::TicketAssignmentPrincipalSnapshot>,
+    /// Explicit self-reported handling only; never inferred from Worker state.
+    #[cfg_attr(
+        feature = "typescript",
+        ts(type = "TicketAssignmentTrackingStatus | null")
+    )]
+    pub handling_status: Option<ticket::TicketAssignmentTrackingStatus>,
     pub query: Option<String>,
     #[serde(default)]
     #[cfg_attr(feature = "typescript", ts(type = "Array<BrowserTicketState>"))]
@@ -7858,6 +7933,73 @@ pub struct TicketAssignmentTrackingHistoryQuery {
 pub struct TicketAssignmentTrackingHistoryPage {
     pub items: Vec<ticket::TicketAssignmentTrackingHistoryEntry>,
     pub next_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketAssignmentsQuery {
+    pub after_assignment_id: Option<String>,
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<usize>,
+}
+transparent_ticket_dto!(TicketAssignmentsPage, ticket::TicketAssignmentsPage);
+transparent_ticket_dto!(
+    TicketAssignmentAnswerRequest,
+    ticket::TicketAssignmentAnswer
+);
+transparent_ticket_dto!(
+    TicketAssignmentAnswerResponse,
+    ticket::TicketAssignmentAnswerReceipt
+);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketAssignmentDiagnosticsQuery {
+    pub assignment_id: String,
+    pub after_input_event_id: Option<String>,
+    pub after_start_operation_id: Option<String>,
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<usize>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketAssignmentInputDeliveryState {
+    NotReserved,
+    Reserved,
+    RequestPersisted,
+    RuntimeAccepted,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct TicketAssignmentInputDiagnostic {
+    pub input_event_id: String,
+    pub delivery_id: Option<String>,
+    pub notification: TicketAssignmentInputDeliveryState,
+    /// Absence of a Runtime ack is not proof of failed external delivery.
+    pub acceptance_outcome_unknown: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct TicketAssignmentStartDiagnostic {
+    pub operation_id: String,
+    /// Durable start/assignment reservation result, not Worker liveness.
+    pub claim_state: String,
+    pub assignment_id: Option<String>,
+    pub runtime_id: Option<String>,
+    pub worker_id: Option<String>,
+    /// Existing records do not attest that a model processed a particular input.
+    pub actual_processing_unknown: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct TicketAssignmentDiagnosticsPage {
+    pub assignment_id: String,
+    pub current: bool,
+    pub input_origin_known: bool,
+    /// Noncurrent/done/closed/released records are history, not pending work.
+    pub actionable: bool,
+    pub inputs: Vec<TicketAssignmentInputDiagnostic>,
+    pub next_input_event_id: Option<String>,
+    /// Assignment-scoped admission evidence; not attributed to individual input.
+    pub starts: Vec<TicketAssignmentStartDiagnostic>,
+    pub next_start_operation_id: Option<String>,
 }
 
 transparent_ticket_dto!(WorkspaceTicketTagListRequest, ticket::TagListRequest);

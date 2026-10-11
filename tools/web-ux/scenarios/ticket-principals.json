@@ -1,0 +1,123 @@
+{
+  "schemaVersion": 1,
+  "id": "ticket-principals",
+  "title": "Observed assignment and responsibility principal choice",
+  "baseUrl": "http://127.0.0.1:15290",
+  "colorScheme": "light",
+  "reducedMotion": "reduce",
+  "personas": [
+    {
+      "id": "member",
+      "label": "Workspace member, not settings owner",
+      "auth": {
+        "kind": "anonymous"
+      }
+    }
+  ],
+  "viewports": [
+    {
+      "label": "desktop",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "label": "narrow",
+      "width": 768,
+      "height": 900
+    },
+    {
+      "label": "mobile",
+      "width": 390,
+      "height": 844
+    }
+  ],
+  "routes": [
+    {
+      "id": "principal",
+      "label": "Replace responsibility, not Worker liveness",
+      "path": "/w/tickets/tickets/T-2",
+      "goal": "Choose the target for a new observed assignment",
+      "dataState": "Open + waiting with retained prior assignment",
+      "ready": {
+        "kind": "selector",
+        "selector": ".ticket-handling"
+      },
+      "capturePoints": [
+        {
+          "id": "agent",
+          "label": "Default Workspace agent",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": ".assignment-principal summary"
+            }
+          ],
+          "fullPage": true
+        },
+        {
+          "id": "account",
+          "label": "Account target",
+          "interaction": [
+            {
+              "action": "press",
+              "selector": ".assignment-principal select",
+              "key": "Home"
+            },
+            {
+              "action": "press",
+              "selector": ".assignment-principal select",
+              "key": "ArrowDown"
+            },
+            {
+              "action": "press",
+              "selector": ".assignment-principal select",
+              "key": "Enter"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": ".assignment-principal input"
+          },
+          "fullPage": true
+        },
+        {
+          "id": "worker",
+          "label": "Worker principal, separate from actual Orchestrator Worker",
+          "interaction": [
+            {
+              "action": "press",
+              "selector": ".assignment-principal select",
+              "key": "End"
+            },
+            {
+              "action": "press",
+              "selector": ".assignment-principal select",
+              "key": "Enter"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": ".assignment-principal label:has-text(\"Runtime identity\")"
+          },
+          "fullPage": true
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "id": "ticket-fixture",
+      "command": "deno",
+      "cwd": "..",
+      "args": [
+        "run",
+        "--allow-net",
+        "--allow-read",
+        "browser-tests/ticket_fixture_server.ts",
+        "15290",
+        "../../web/workspace/build"
+      ],
+      "readyUrl": "http://127.0.0.1:15290/health"
+    }
+  ]
+}

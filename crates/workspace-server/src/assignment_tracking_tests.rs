@@ -458,7 +458,10 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
                 vec![
                     (91, "workspace schema baseline".into()),
                     (92, "Ticket-owned assignment tracking".into()),
-                    (93, "Durable assignment deliveries and source-bound startup fences".into())
+                    (
+                        93,
+                        "Durable assignment deliveries and source-bound startup fences".into()
+                    )
                 ]
             );
             for (table, rows) in retained.iter().zip(original.iter()) {
@@ -1484,4 +1487,338 @@ async fn orchestrator_clear_receipt_compares_nullable_reason_as_full_payload_not
             )
             .unwrap()
     );
+}
+
+fn assignment_answer_input(key: &str) -> ticket::TicketAssignmentAnswer {
+    ticket::TicketAssignmentAnswer {
+        assignment_id: "answer-a".into(),
+        expected_last_event_id: "event-answer-assign".into(),
+        operation_key: key.into(),
+        body: "Proceed with option B".into(),
+    }
+}
+fn assignment_answer_source() -> TicketOrchestratorAssignmentSourceContext {
+    TicketOrchestratorAssignmentSourceContext::Runtime {
+        runtime_id: "r".into(),
+        worker_id: "worker".into(),
+        agent_key: "workspace-orchestrator".into(),
+        authentication_binding_id: "tracking-binding".into(),
+    }
+}
+
+#[tokio::test]
+async fn assignment_answer_replay_returns_saved_event_without_new_assignment_or_status_change() {
+    let (dir, store) = tracking_store_fixture().await;
+    tracking_store_assign(&store, "answer-a", "answer-assign");
+    let input = assignment_answer_input("answer-key");
+    let before = store
+        .get_ticket_assignment_tracking("w", "tracking", "answer-a")
+        .unwrap()
+        .unwrap();
+    let saved = store
+        .answer_ticket_assignment(
+            "w",
+            "tracking",
+            &input,
+            &assignment_answer_source(),
+            "authenticated-worker:r/worker",
+        )
+        .unwrap();
+    drop(store);
+    let store = SqliteWorkspaceStore::open(dir.path().join("workspace.db")).unwrap();
+    assert_eq!(
+        store
+            .answer_ticket_assignment(
+                "w",
+                "tracking",
+                &input,
+                &assignment_answer_source(),
+                "authenticated-worker:r/worker"
+            )
+            .unwrap(),
+        saved
+    );
+    assert_eq!(
+        store
+            .get_ticket_assignment_tracking("w", "tracking", "answer-a")
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    let mut changed = input.clone();
+    changed.body = "Different answer".into();
+    assert!(
+        store
+            .answer_ticket_assignment(
+                "w",
+                "tracking",
+                &changed,
+                &assignment_answer_source(),
+                "authenticated-worker:r/worker"
+            )
+            .is_err()
+    );
+    let pending = store
+        .list_pending_ticket_assignment_deliveries("w", 100)
+        .unwrap();
+    assert_eq!(pending.len(), 2);
+    assert!(
+        pending
+            .iter()
+            .any(|p| p.input_event_id == saved.input_event_id)
+    );
+    store
+        .with_conn(|conn| {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM typed_ticket_events WHERE kind='assignment_answer'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                1
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT value FROM typed_ticket_event_attributes WHERE key='operation_key'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )?,
+                "answer-key"
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn assignment_answer_receipt_failure_rolls_back_body_audit_and_ticket_touch() {
+    let (_dir, store) = tracking_store_fixture().await;
+    tracking_store_assign(&store, "answer-a", "answer-assign");
+    store.with_conn(|conn| {
+        conn.execute_batch("CREATE TRIGGER reject_answer_receipt BEFORE INSERT ON typed_ticket_assignment_tracking_operations BEGIN SELECT RAISE(ABORT,'receipt failed'); END;")?;
+        Ok(())
+    }).unwrap();
+    let before: String = store
+        .with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT updated_at FROM typed_tickets WHERE ticket_id='tracking'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert!(
+        store
+            .answer_ticket_assignment(
+                "w",
+                "tracking",
+                &assignment_answer_input("failed-key"),
+                &assignment_answer_source(),
+                "authenticated-worker:r/worker"
+            )
+            .is_err()
+    );
+    store
+        .with_conn(|conn| {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM typed_ticket_events WHERE kind='assignment_answer'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                0
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM typed_ticket_event_attributes WHERE key='operation_key'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                0
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT updated_at FROM typed_tickets WHERE ticket_id='tracking'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )?,
+                before
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn assignment_answer_new_input_rejects_replaced_or_changed_handling_but_exact_retry_is_saved()
+{
+    let (_dir, store) = tracking_store_fixture().await;
+    tracking_store_assign(&store, "answer-a", "answer-assign");
+    let input = assignment_answer_input("saved-answer");
+    let saved = store
+        .answer_ticket_assignment(
+            "w",
+            "tracking",
+            &input,
+            &assignment_answer_source(),
+            "actor",
+        )
+        .unwrap();
+    let mut update = tracking_store_input("answer-a", "event-answer-assign", "next-status");
+    update.tracking.status = TicketAssignmentTrackingStatus::Waiting;
+    store
+        .update_ticket_assignment_tracking("w", "tracking", &update, &tracking_store_source())
+        .unwrap();
+    assert!(
+        store
+            .answer_ticket_assignment(
+                "w",
+                "tracking",
+                &assignment_answer_input("stale-answer"),
+                &assignment_answer_source(),
+                "actor"
+            )
+            .is_err()
+    );
+    let mut replacement = manual_worker_assignment("tracking", "answer-b");
+    replacement.role = TicketAssignmentRole::Orchestrator;
+    replacement.principal = TicketAssignmentPrincipal::WorkspaceAgent {
+        agent_key: "workspace-orchestrator".into(),
+    };
+    store
+        .set_current_ticket_role_assignment(
+            &replacement,
+            Some("answer-a"),
+            "replace-answer",
+            "replace-answer-key",
+            true,
+        )
+        .unwrap();
+    assert!(
+        store
+            .answer_ticket_assignment(
+                "w",
+                "tracking",
+                &assignment_answer_input("replaced-answer"),
+                &assignment_answer_source(),
+                "actor"
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .answer_ticket_assignment(
+                "w",
+                "tracking",
+                &input,
+                &assignment_answer_source(),
+                "actor"
+            )
+            .unwrap(),
+        saved
+    );
+    store
+        .with_conn(|conn| {
+            conn.execute(
+                "UPDATE worker_singleton_owners SET worker_id='replacement' WHERE workspace_id='w'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        store
+            .answer_ticket_assignment(
+                "w",
+                "tracking",
+                &input,
+                &assignment_answer_source(),
+                "actor"
+            )
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn assignment_identity_pages_keep_release_and_last_status_separate_and_reject_foreign_cursor()
+{
+    let (_dir, store) = tracking_store_fixture().await;
+    tracking_store_assign(&store, "z-first", "first");
+    let mut replacement = manual_worker_assignment("tracking", "a-second");
+    replacement.role = TicketAssignmentRole::Orchestrator;
+    replacement.principal = TicketAssignmentPrincipal::WorkspaceAgent {
+        agent_key: "workspace-orchestrator".into(),
+    };
+    store
+        .set_current_ticket_role_assignment(
+            &replacement,
+            Some("z-first"),
+            "replacement-event",
+            "replacement-key",
+            true,
+        )
+        .unwrap();
+    let page = store
+        .page_ticket_assignments("w", "tracking", None, 1)
+        .unwrap();
+    assert_eq!(page.next_assignment_id.as_deref(), Some("z-first"));
+    assert!(!page.items[0].current);
+    assert_eq!(
+        page.items[0].tracking.as_ref().unwrap().status,
+        TicketAssignmentTrackingStatus::Waiting
+    );
+    assert_eq!(
+        page.items[0].release.as_ref().unwrap().action,
+        ticket::TicketAssignmentReleaseAction::Replaced
+    );
+    let next = store
+        .page_ticket_assignments("w", "tracking", page.next_assignment_id.as_deref(), 1)
+        .unwrap();
+    assert_eq!(next.items[0].assignment_id, "a-second");
+    assert!(next.items[0].current);
+    assert!(next.next_assignment_id.is_none());
+    assert!(
+        store
+            .page_ticket_assignments("other", "tracking", Some("z-first"), 1)
+            .is_err()
+    );
+    assert!(
+        store
+            .page_ticket_assignments("w", "tracking", None, 101)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn assignment_answer_concurrent_exact_retry_on_two_connections_creates_one_event_and_receipt()
+{
+    let (dir, store) = tracking_store_fixture().await;
+    tracking_store_assign(&store, "answer-a", "answer-assign");
+    let path = dir.path().join("workspace.db");
+    let first = SqliteWorkspaceStore::open(&path).unwrap();
+    let second = SqliteWorkspaceStore::open(&path).unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    let results = std::thread::scope(|scope| {
+        let run = |store: &SqliteWorkspaceStore| {
+            barrier.wait();
+            store
+                .answer_ticket_assignment(
+                    "w",
+                    "tracking",
+                    &assignment_answer_input("concurrent-answer"),
+                    &assignment_answer_source(),
+                    "actor",
+                )
+                .unwrap()
+        };
+        let a = scope.spawn(move || run(&first));
+        let b = scope.spawn(move || run(&second));
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert_eq!(results.0, results.1);
+    store.with_conn(|conn| {
+        assert_eq!(conn.query_row("SELECT count(*) FROM typed_ticket_events WHERE kind='assignment_answer'",[],|r| r.get::<_,i64>(0))?,1);
+        assert_eq!(conn.query_row("SELECT count(*) FROM typed_ticket_assignment_tracking_operations WHERE operation_key='concurrent-answer'",[],|r| r.get::<_,i64>(0))?,1);
+        Ok(())
+    }).unwrap();
 }

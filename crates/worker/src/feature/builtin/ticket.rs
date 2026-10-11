@@ -4,6 +4,7 @@
 //! module binds an authority-scoped Workspace client, declares the built-in
 //! feature, and contributes those tools through the normal registry path.
 
+mod assignment_public;
 mod assignment_tracking;
 mod tags;
 
@@ -134,7 +135,14 @@ enum WorkspaceTicketSort {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct WorkspaceQueryTicketInput {
+    /// Exact current closed-case reason; reopened/history-only reasons do not match.
+    closure_reason: Option<ticket::TicketClosureReason>,
+    /// Exact current assigned principal; retained relationships do not match.
+    assigned_principal: Option<ticket::TicketAssignmentPrincipalSnapshot>,
+    /// Explicit self-reported handling, never inferred from Worker/MR/delivery.
+    handling_status: Option<ticket::TicketAssignmentTrackingStatus>,
     /// Full-text match over Ticket title, item body, and bounded thread excerpts.
     query: Option<String>,
     /// Exact case states (open or closed). Empty means every state.
@@ -444,6 +452,9 @@ fn workspace_ticket_decision_definition(
 fn workspace_ticket_tool_description(name: &str) -> String {
     match name {
         "TicketCaseUpdate" => TICKET_CASE_UPDATE_DESCRIPTION.into(),
+        name if assignment_public::TOOL_NAMES.contains(&name) => {
+            assignment_public::description(name).into()
+        }
         name if assignment_tracking::TOOL_NAMES.contains(&name) => {
             assignment_tracking::description(name).into()
         }
@@ -586,6 +597,17 @@ impl TicketFeatureAccess {
                     .copied()
                     .filter(|name| *name != "TicketAssignmentTrackingUpdate" || self.workflow),
             )
+            .chain(
+                assignment_public::TOOL_NAMES
+                    .iter()
+                    .copied()
+                    .filter(|name| {
+                        assignment_public::READ_TOOL_NAMES.contains(name)
+                            || self.authoring
+                            || self.workflow
+                            || (*name == "TicketAssignmentAnswer" && self.thread)
+                    }),
+            )
             .collect()
     }
 
@@ -597,7 +619,6 @@ impl TicketFeatureAccess {
             || (name == "TicketCaseUpdate" && (self.authoring || self.thread || self.workflow))
             || (self.authoring && AUTHORING_TOOL_NAMES.contains(&name))
             || (self.thread && THREAD_TOOL_NAMES.contains(&name))
-            || (self.intake && INTAKE_TOOL_NAMES.contains(&name))
             || (self.workflow && WORKFLOW_ADDITIONAL_TOOL_NAMES.contains(&name))
     }
 }
@@ -608,21 +629,19 @@ const READ_ONLY_TOOL_NAMES: &[&str] = &[
     "WorkspaceTagList",
     "TicketAssignmentTrackingQuery",
     "TicketAssignmentTrackingHistory",
+    "TicketAssignmentsQuery",
+    "TicketAssignmentDiagnostics",
 ];
 
 const AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketCreate",
     "TicketEditItem",
-    "TicketMarkReady",
-    "TicketQueue",
     "TicketCaseUpdate",
     "TicketRelationRecord",
     "TicketRelationRemove",
 ];
 
 const THREAD_TOOL_NAMES: &[&str] = &["TicketComment"];
-
-const INTAKE_TOOL_NAMES: &[&str] = &["TicketIntakeReady"];
 
 #[cfg(test)]
 const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
@@ -631,8 +650,6 @@ const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "QueryTicket",
     "ShowTicket",
     "TicketComment",
-    "TicketMarkReady",
-    "TicketQueue",
     "TicketCaseUpdate",
     "TicketRelationRecord",
     "TicketRelationRemove",
@@ -643,6 +660,11 @@ const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketTagsSet",
     "TicketAssignmentTrackingQuery",
     "TicketAssignmentTrackingHistory",
+    "TicketOrchestratorAssign",
+    "TicketOrchestratorClear",
+    "TicketAssignmentsQuery",
+    "TicketAssignmentDiagnostics",
+    "TicketAssignmentAnswer",
 ];
 
 #[cfg(test)]
@@ -664,6 +686,11 @@ const WORKFLOW_TOOL_NAMES: &[&str] = &[
     "TicketAssignmentTrackingQuery",
     "TicketAssignmentTrackingHistory",
     "TicketAssignmentTrackingUpdate",
+    "TicketOrchestratorAssign",
+    "TicketOrchestratorClear",
+    "TicketAssignmentsQuery",
+    "TicketAssignmentDiagnostics",
+    "TicketAssignmentAnswer",
 ];
 
 const WORKFLOW_ADDITIONAL_TOOL_NAMES: &[&str] = &[
@@ -1518,20 +1545,32 @@ fn native_ticket_operation(tool_name: &str) -> Option<NativeTicketOperation> {
             identity_field: Some("ticket"),
             mutating: true,
         },
-        "TicketMarkReady" => NativeTicketOperation {
-            operation: "mark_ready",
+        "TicketOrchestratorAssign" => NativeTicketOperation {
+            operation: "orchestrator_assign",
             surface: NativeTicketSurface::Item,
             identity_field: Some("ticket"),
             mutating: true,
         },
-        "TicketIntakeReady" => NativeTicketOperation {
-            operation: "intake_ready",
+        "TicketOrchestratorClear" => NativeTicketOperation {
+            operation: "orchestrator_clear",
             surface: NativeTicketSurface::Item,
             identity_field: Some("ticket"),
             mutating: true,
         },
-        "TicketQueue" => NativeTicketOperation {
-            operation: "queue",
+        "TicketAssignmentsQuery" => NativeTicketOperation {
+            operation: "assignments_query",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: false,
+        },
+        "TicketAssignmentDiagnostics" => NativeTicketOperation {
+            operation: "assignment_diagnostics",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: false,
+        },
+        "TicketAssignmentAnswer" => NativeTicketOperation {
+            operation: "assignment_answer",
             surface: NativeTicketSurface::Item,
             identity_field: Some("ticket"),
             mutating: true,
@@ -1650,6 +1689,17 @@ pub(crate) fn enabled_ticket_definitions(
     ] {
         if allowed.contains(&kind.name()) {
             definitions.push(assignment_tracking::definition(client.clone(), kind));
+        }
+    }
+    for kind in [
+        assignment_public::PublicAssignmentKind::Assign,
+        assignment_public::PublicAssignmentKind::Clear,
+        assignment_public::PublicAssignmentKind::Assignments,
+        assignment_public::PublicAssignmentKind::Diagnostics,
+        assignment_public::PublicAssignmentKind::Answer,
+    ] {
+        if allowed.contains(&kind.name()) {
+            definitions.push(assignment_public::definition(client.clone(), kind));
         }
     }
     definitions
@@ -2133,15 +2183,6 @@ fn record_affected_ticket_mutations(
         .filter(|reference| is_ticket_route_reference(reference))
     {
         affected.insert(target.to_string());
-    }
-    if let Some(queued) = response.get("queued_tickets").and_then(Value::as_array) {
-        affected.extend(
-            queued
-                .iter()
-                .filter_map(Value::as_str)
-                .filter(|reference| is_ticket_route_reference(reference))
-                .map(ToOwned::to_owned),
-        );
     }
     for reference in affected.difference(&subject_references) {
         record_ticket_observation(observations, Some(reference), &Value::Null, true);
@@ -2966,7 +3007,7 @@ mod tests {
     }
 
     #[test]
-    fn related_ticket_mutations_invalidate_target_and_queue_observations() {
+    fn related_ticket_mutation_invalidates_inverse_target_but_not_unrelated_tickets() {
         let observations = Arc::new(Mutex::new(TicketObservationState::default()));
         for ticket in ["T-42", "T-43", "T-44"] {
             record_ticket_observation(
@@ -2983,22 +3024,21 @@ mod tests {
             observations: Arc::clone(&observations),
         };
         let target_v1 = resolver.resolve("T-43").unwrap().object.validator;
-        let queued_v1 = resolver.resolve("T-44").unwrap().object.validator;
+        let unrelated_v1 = resolver.resolve("T-44").unwrap().object.validator;
         record_affected_ticket_mutations(
             &observations,
             "T-42",
             &json!({
                 "ticket": "T-42",
-                "target": "T-43",
-                "queued_tickets": ["T-42", "T-44"]
+                "target": "T-43"
             }),
         );
         assert_ne!(
             target_v1,
             resolver.resolve("T-43").unwrap().object.validator
         );
-        assert_ne!(
-            queued_v1,
+        assert_eq!(
+            unrelated_v1,
             resolver.resolve("T-44").unwrap().object.validator
         );
     }
@@ -3168,7 +3208,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(workspace_tools.contains(&"TicketCreate"));
         assert!(workspace_tools.contains(&"TicketEditItem"));
-        assert!(workspace_tools.contains(&"TicketQueue"));
+        assert!(!workspace_tools.contains(&"TicketQueue"));
         assert!(workspace_tools.contains(&"TicketCaseUpdate"));
 
         let orchestration = workspace_feature(TicketFeatureAccess::workflow());
@@ -3203,6 +3243,57 @@ mod tests {
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
         assert!(!review_tools.contains(&"TicketCaseUpdate"));
+    }
+
+    #[test]
+    fn normal_and_wip_catalogs_exclude_retired_ticket_workflow_operations() {
+        let client: Arc<dyn WorkspaceClient> = Arc::new(
+            crate::worker::TestWorkspaceHttpClient::new("workspace", "http://unused"),
+        );
+        let retired = [
+            "TicketMarkReady",
+            "TicketIntakeReady",
+            "TicketQueue",
+            "TicketWorkflowState",
+            "CompleteTicket",
+            "TicketClose",
+        ];
+        for access in [
+            TicketFeatureAccess::workspace_authoring(),
+            TicketFeatureAccess::intake(),
+            TicketFeatureAccess::workflow(),
+            TicketFeatureAccess::work_report(),
+            TicketFeatureAccess::read_only(),
+            TicketFeatureAccess {
+                authoring: true,
+                thread: true,
+                intake: true,
+                workflow: true,
+            },
+        ] {
+            let normal = enabled_ticket_definitions(client.clone(), access);
+            let native = native_ticket_tools(client.clone(), access).unwrap();
+            for name in retired {
+                assert!(
+                    normal.iter().all(|definition| definition().0.name != name),
+                    "{name}"
+                );
+                assert!(native.iter().all(|tool| tool.name != name), "{name}");
+                assert!(native_ticket_operation(name).is_none(), "{name}");
+            }
+            if access.authoring || access.thread || access.workflow {
+                assert!(
+                    normal
+                        .iter()
+                        .any(|definition| definition().0.name == "TicketCaseUpdate")
+                );
+                assert!(
+                    native
+                        .iter()
+                        .any(|tool| tool.projection.operation == "case_update")
+                );
+            }
+        }
     }
 
     #[test]
@@ -3248,8 +3339,8 @@ mod tests {
         assert_eq!(installed, WORKSPACE_AUTHORING_TOOL_NAMES);
         assert!(installed.iter().any(|tool| *tool == "TicketCreate"));
         assert!(installed.iter().any(|tool| *tool == "TicketEditItem"));
-        assert!(installed.iter().any(|tool| *tool == "TicketQueue"));
-        assert!(installed.iter().any(|tool| *tool == "TicketMarkReady"));
+        assert!(!installed.iter().any(|tool| *tool == "TicketQueue"));
+        assert!(!installed.iter().any(|tool| *tool == "TicketMarkReady"));
         assert!(!installed.iter().any(|tool| *tool == "TicketIntakeReady"));
         assert!(installed.iter().any(|tool| *tool == "TicketCaseUpdate"));
         assert!(

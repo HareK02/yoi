@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod assignment_answer;
+pub use assignment_answer::*;
 mod assignment_tracking;
 pub mod config;
 mod sqlite_schema;

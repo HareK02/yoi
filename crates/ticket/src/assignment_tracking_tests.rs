@@ -728,3 +728,104 @@ fn schema_verification_does_not_normalize_away_case_sensitive_authority_literals
             .contains("differs from canonical schema")
     );
 }
+
+#[test]
+fn assignment_answer_commits_one_audited_input_and_exact_receipt_without_tracking_mutation() {
+    let conn = db();
+    assign(&conn, "a", "assigned-a");
+    let answer = TicketAssignmentAnswer {
+        assignment_id: "a".into(),
+        expected_last_event_id: "assigned-a".into(),
+        operation_key: "answer-a".into(),
+        body: "Continue with B".into(),
+    };
+    let source = serde_json::json!({"kind":"account","account_id":"account","user_id":"human"});
+    let apply = |answer: &TicketAssignmentAnswer| {
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let result = sqlite_answer_ticket_assignment_in_transaction(
+            &conn, "w", "t", answer, &source, "human",
+        );
+        conn.execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" })
+            .unwrap();
+        result
+    };
+    let result = apply(&answer).unwrap();
+    assert_eq!(result.input_event_id, "ticket-event:0");
+    assert_eq!(apply(&answer).unwrap(), result);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM typed_ticket_events", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row("SELECT body FROM typed_ticket_events", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        answer.body
+    );
+    assert_eq!(conn.query_row("SELECT value FROM typed_ticket_event_attributes WHERE key='orchestrator_assignment_id'",[],|r| r.get::<_,String>(0)).unwrap(),"a");
+    assert_eq!(
+        sqlite_ticket_assignment_tracking(&conn, "w", "t", "a")
+            .unwrap()
+            .unwrap()
+            .last_event_id
+            .as_deref(),
+        Some("assigned-a")
+    );
+    let mut altered = answer.clone();
+    altered.body = "Changed".into();
+    assert!(apply(&altered).is_err());
+    assign(&conn, "b", "assigned-b");
+    assert_eq!(apply(&answer).unwrap(), result);
+    altered.operation_key = "fresh-stale".into();
+    assert!(apply(&altered).is_err());
+}
+
+#[test]
+fn assignment_answer_rejects_unbounded_body_and_malformed_identities_without_appending_input() {
+    let conn = db();
+    assign(&conn, "a", "assigned-a");
+    let original = TicketAssignmentAnswer {
+        assignment_id: "a".into(),
+        expected_last_event_id: "assigned-a".into(),
+        operation_key: "answer-a".into(),
+        body: "Answer".into(),
+    };
+    for field in [
+        "body-large",
+        "body-nul",
+        "body-empty",
+        "identity-control",
+        "event-empty",
+    ] {
+        let mut answer = original.clone();
+        match field {
+            "body-large" => answer.body = "a".repeat(16385),
+            "body-nul" => answer.body = "answer\0hidden".into(),
+            "body-empty" => answer.body = "   ".into(),
+            "identity-control" => answer.operation_key = "key\n".into(),
+            _ => answer.expected_last_event_id = "".into(),
+        }
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(
+            sqlite_answer_ticket_assignment_in_transaction(
+                &conn,
+                "w",
+                "t",
+                &answer,
+                &serde_json::json!({"actor":"source"}),
+                "human"
+            )
+            .is_err(),
+            "{field}"
+        );
+        conn.execute_batch("ROLLBACK").unwrap();
+    }
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM typed_ticket_events", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}

@@ -11,6 +11,27 @@ fn delivery_store_external_event(
     }).unwrap();
 }
 
+fn delivery_store_answer(store: &SqliteWorkspaceStore, key: &str) {
+    let current = store
+        .list_current_ticket_assignment_tracking("w", "tracking")
+        .unwrap()
+        .remove(0);
+    store
+        .answer_ticket_assignment(
+            "w",
+            "tracking",
+            &ticket::TicketAssignmentAnswer {
+                assignment_id: current.assignment_id,
+                expected_last_event_id: current.last_event_id.unwrap(),
+                operation_key: key.into(),
+                body: "Explicit continuing answer".into(),
+            },
+            &assignment_answer_source(),
+            "fixture-actor",
+        )
+        .unwrap();
+}
+
 fn delivery_store_reserve_initial(
     store: &SqliteWorkspaceStore,
     source: &TicketAssignmentTrackingSourceContext,
@@ -60,11 +81,18 @@ async fn assignment_delivery_waiting_self_reports_do_not_busy_loop_and_answers_a
         Some("assignment_tracking"),
     );
     delivery_store_external_event(&store, 2, "comment", None);
+    assert!(
+        store
+            .list_pending_ticket_assignment_deliveries("w", 100)
+            .unwrap()
+            .is_empty()
+    );
+    delivery_store_answer(&store, "answer-after-comment");
     let pending = store
         .list_pending_ticket_assignment_deliveries("w", 100)
         .unwrap();
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].input_event_id, "ticket-event:2");
+    assert_eq!(pending[0].input_event_id, "ticket-event:3");
     assert_eq!(
         pending[0].waiting_reason.as_deref(),
         Some("Waiting for owner answer")
@@ -74,7 +102,7 @@ async fn assignment_delivery_waiting_self_reports_do_not_busy_loop_and_answers_a
         Some("Read answer and decide")
     );
     let answer = store
-        .reserve_ticket_assignment_delivery("w", "a", "ticket-event:2", &source)
+        .reserve_ticket_assignment_delivery("w", "a", "ticket-event:3", &source)
         .unwrap();
     store
         .ack_ticket_assignment_delivery("w", &answer.delivery_id, &source)
@@ -85,16 +113,16 @@ async fn assignment_delivery_waiting_self_reports_do_not_busy_loop_and_answers_a
             .unwrap()
             .is_empty()
     );
-    // Typed extension inputs must not disappear merely because they are not
-    // comments; own tracking/history events remain excluded.
-    delivery_store_external_event(&store, 3, "assignment_tracking_updated", None);
-    delivery_store_external_event(&store, 4, "history", None);
-    delivery_store_external_event(&store, 5, "owner_answer", None);
+    // Explicit fenced answers remain inputs; own tracking/history and ordinary
+    // comments remain excluded.
+    delivery_store_external_event(&store, 4, "assignment_tracking_updated", None);
+    delivery_store_external_event(&store, 5, "history", None);
+    delivery_store_answer(&store, "next-explicit-answer");
     let pending = store
         .list_pending_ticket_assignment_deliveries("w", 100)
         .unwrap();
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].input_event_id, "ticket-event:5");
+    assert_eq!(pending[0].input_event_id, "ticket-event:6");
     let saved = store
         .get_ticket_assignment_tracking("w", "tracking", "a")
         .unwrap()
@@ -791,4 +819,217 @@ async fn assignment_startup_unfinished_dependencies_remain_diagnostics_not_store
             Ok(())
         })
         .unwrap();
+}
+
+#[tokio::test]
+async fn assignment_diagnostics_keep_persisted_notification_acceptance_and_history_distinct_without_payload()
+ {
+    let (_dir, store) = tracking_store_fixture().await;
+    tracking_store_assign(&store, "a", "assign-a");
+    let initial = store
+        .list_pending_ticket_assignment_deliveries("w", 10)
+        .unwrap()
+        .remove(0);
+    let page = store
+        .page_ticket_assignment_diagnostics("w", "tracking", "a", None, None, 1)
+        .unwrap();
+    assert!(page.current && page.actionable && page.input_origin_known);
+    assert_eq!(
+        page.inputs[0].notification,
+        server_api::TicketAssignmentInputDeliveryState::NotReserved
+    );
+    let initial = store
+        .reserve_ticket_assignment_delivery(
+            "w",
+            "a",
+            &initial.input_event_id,
+            &tracking_store_source(),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .page_ticket_assignment_diagnostics("w", "tracking", "a", None, None, 1)
+            .unwrap()
+            .inputs[0]
+            .notification,
+        server_api::TicketAssignmentInputDeliveryState::Reserved
+    );
+    store
+        .prepare_ticket_assignment_delivery_content(
+            "w",
+            &initial.delivery_id,
+            "SECRET RENDERED PAYLOAD",
+            &tracking_store_source(),
+        )
+        .unwrap();
+    let pending = store
+        .page_ticket_assignment_diagnostics("w", "tracking", "a", None, None, 1)
+        .unwrap();
+    assert_eq!(
+        pending.inputs[0].notification,
+        server_api::TicketAssignmentInputDeliveryState::RequestPersisted
+    );
+    assert!(pending.inputs[0].acceptance_outcome_unknown);
+    store
+        .ack_ticket_assignment_delivery("w", &initial.delivery_id, &tracking_store_source())
+        .unwrap();
+    delivery_store_answer(&store, "diagnostic-answer");
+    delivery_store_external_event(&store, 1, "history", None);
+    let accepted = store
+        .page_ticket_assignment_diagnostics("w", "tracking", "a", None, None, 1)
+        .unwrap();
+    assert_eq!(
+        accepted.inputs[0].notification,
+        server_api::TicketAssignmentInputDeliveryState::RuntimeAccepted
+    );
+    assert!(!accepted.inputs[0].acceptance_outcome_unknown);
+    assert_eq!(
+        accepted.next_input_event_id.as_deref(),
+        Some(initial.input_event_id.as_str())
+    );
+    let next = store
+        .page_ticket_assignment_diagnostics(
+            "w",
+            "tracking",
+            "a",
+            accepted.next_input_event_id.as_deref(),
+            None,
+            1,
+        )
+        .unwrap();
+    assert_eq!(next.inputs[0].input_event_id, "ticket-event:0");
+    assert!(next.next_input_event_id.is_none());
+    let wire = serde_json::to_string(&accepted).unwrap();
+    for forbidden in [
+        "SECRET",
+        "tracking-binding",
+        "authenticated-worker",
+        "payload_json",
+        "source_json",
+        "content",
+    ] {
+        assert!(!wire.contains(forbidden), "{wire}");
+    }
+    store
+        .update_ticket_assignment_tracking(
+            "w",
+            "tracking",
+            &tracking_store_input("a", "event-assign-a", "done"),
+            &tracking_store_source(),
+        )
+        .unwrap();
+    let history = store
+        .page_ticket_assignment_diagnostics("w", "tracking", "a", None, None, 100)
+        .unwrap();
+    assert!(history.current && !history.actionable);
+    assert_eq!(history.inputs.len(), 2); // retained inputs are history, not fresh work
+    assert_eq!(
+        store
+            .page_ticket_assignment_diagnostics(
+                "w",
+                "tracking",
+                "a",
+                accepted.next_input_event_id.as_deref(),
+                None,
+                100
+            )
+            .unwrap()
+            .inputs[0]
+            .input_event_id,
+        "ticket-event:0"
+    );
+    assert!(
+        store
+            .page_ticket_assignment_diagnostics(
+                "w",
+                "tracking",
+                "a",
+                Some("ticket-event:999"),
+                None,
+                1
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .page_ticket_assignment_diagnostics("other", "tracking", "a", None, None, 1)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn assignment_diagnostics_unknown_retained_relationship_does_not_invent_input_or_acceptance()
+{
+    let (_dir, store) = tracking_store_fixture().await;
+    store.with_conn(|conn| {
+        conn.execute("INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at) VALUES('w','tracking','legacy-unknown','orchestrator','workspace_agent','workspace-orchestrator','legacy','past')",[])?;
+        conn.execute("UPDATE ticket_worker_assignments SET tracking_json=NULL,tracking_updated_at=NULL,tracking_migration_diagnostic='Unknown historical relationship' WHERE assignment_id='legacy-unknown'",[])?;
+        conn.execute("INSERT INTO ticket_current_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,updated_at) VALUES('w','tracking','legacy-unknown','orchestrator','workspace_agent','workspace-orchestrator','past')",[])?;
+        Ok(())
+    }).unwrap();
+    delivery_store_external_event(&store, 0, "comment", None);
+    let page = store
+        .page_ticket_assignment_diagnostics("w", "tracking", "legacy-unknown", None, None, 100)
+        .unwrap();
+    assert!(page.current);
+    assert!(!page.actionable && !page.input_origin_known);
+    assert!(page.inputs.is_empty() && page.starts.is_empty());
+    assert!(
+        store
+            .list_pending_ticket_assignment_deliveries("w", 100)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn assignment_diagnostic_start_cursor_pages_existing_claims_without_input_causality_or_processing_inference()
+ {
+    let (_dir, store) = tracking_store_fixture().await;
+    tracking_store_assign(&store, "a", "assign-a");
+    let source = tracking_store_source();
+    delivery_store_start_reserve(&store, "z-first-start", "a", &source).unwrap();
+    store
+        .fail_ticket_assignment_operation("w", "z-first-start", "External resource refused start")
+        .unwrap();
+    delivery_store_start_reserve(&store, "a-second-start", "a", &source).unwrap();
+    let first = store
+        .page_ticket_assignment_diagnostics("w", "tracking", "a", None, None, 1)
+        .unwrap();
+    assert_eq!(first.starts.len(), 1);
+    assert_eq!(first.starts[0].operation_id, "z-first-start");
+    assert_eq!(first.starts[0].claim_state, "failed");
+    assert!(first.starts[0].actual_processing_unknown);
+    assert_eq!(
+        first.next_start_operation_id.as_deref(),
+        Some("z-first-start")
+    );
+    let second = store
+        .page_ticket_assignment_diagnostics(
+            "w",
+            "tracking",
+            "a",
+            None,
+            first.next_start_operation_id.as_deref(),
+            1,
+        )
+        .unwrap();
+    assert_eq!(second.starts[0].operation_id, "a-second-start");
+    assert_eq!(second.starts[0].claim_state, "pending");
+    assert!(second.starts[0].actual_processing_unknown);
+    assert!(second.next_start_operation_id.is_none());
+    assert!(
+        store
+            .page_ticket_assignment_diagnostics(
+                "w",
+                "tracking",
+                "a",
+                None,
+                Some("foreign-operation"),
+                1
+            )
+            .is_err()
+    );
+    let wire = serde_json::to_string(&first).unwrap();
+    assert!(!wire.contains("tracking-binding") && !wire.contains("External resource"));
 }

@@ -40,7 +40,7 @@ Typical role surfaces are therefore:
 - Reviewer: item `read` and `review`.
 - Orchestrator: item `read`, `check_readiness`, and `complete`.
 
-`CompleteTicket` belongs to the Ticket Feature and route-bound Ticket item `complete`, alongside state and close decisions. It takes current item/state CAS, a replay key, reason, and optional references; it requires neither an MR result set nor a Reviewer approval. The former MR collection `complete_ticket` operation is not published. The review descriptor never contains the injected capability token, and a review item route must exactly match the Merge Request captured by that capability before the ordinary review Tool can run.
+`TicketCaseUpdate` belongs to the Ticket Feature and route-bound Ticket item `case_update`, not this MR provider. Close/reopen/correction judgments take current item/state/nullable closure-key CAS, an exact-retry key, typed reason/explanation and optional references; generic closure requires neither an MR result set nor Reviewer approval. Assignment handling done is an independent self-report and does not close the case, integrate an MR, release actual work or stop a Worker. Explicit user approval conditions remain judgment requirements; MR integration still uses its guarded review path. Historical `CompleteTicket` and former MR collection `complete_ticket` operations are not published. The review descriptor never contains the injected capability token, and a review item route must exactly match the Merge Request captured by that capability before the ordinary review Tool can run.
 
 ## Preserved review and integration gates
 

@@ -124,12 +124,14 @@ WITH eligible AS (
  SELECT a.ticket_id,a.assignment_id,'ticket-event:' || e.event_index,a.tracking_json,e.event_index
  FROM eligible a JOIN typed_ticket_events e ON e.workspace_id=a.workspace_id AND e.ticket_id=a.ticket_id
  WHERE e.event_index>a.after_ticket_event_index
- -- External content/answer inputs, not case/routing/history or own self-report.
- -- Ticket supports typed extension events; an answer need not be named comment.
- AND e.kind NOT IN ('create','close','state_changed','status_changed','history')
+ -- Continuing request intent is explicit: fenced assignment answers or item content edits.
+ -- Ordinary comments and all case/routing/handling history are not new requests.
+ AND e.kind IN ('assignment_answer','item_edit')
+ AND (e.kind<>'assignment_answer' OR EXISTS(SELECT 1 FROM typed_ticket_event_attributes attr WHERE attr.workspace_id=e.workspace_id AND attr.ticket_id=e.ticket_id AND attr.event_index=e.event_index AND attr.key='orchestrator_assignment_id' AND attr.value=a.assignment_id))
  AND e.kind NOT LIKE 'assignment_tracking%'
  AND e.kind NOT LIKE 'assignment_delivery%'
  AND COALESCE(e.state_field,'') NOT IN ('case','routing','assignment_tracking')
+ AND NOT EXISTS(SELECT 1 FROM typed_ticket_event_attributes attr WHERE attr.workspace_id=e.workspace_id AND attr.ticket_id=e.ticket_id AND attr.event_index=e.event_index AND attr.key='orchestrator_assignment_id' AND attr.value<>a.assignment_id)
 )
 SELECT i.ticket_id,i.assignment_id,i.input_event_id,
  json_extract(i.tracking_json,'$.waiting_reason'),json_extract(i.tracking_json,'$.next_action'),d.payload_json
@@ -377,4 +379,86 @@ pub(super) fn save_operation_fence(
         )?;
     }
     Ok(())
+}
+
+// Same input selection as delivery, plus immutable delivered history. Never
+// SELECT payload/source/content into the public diagnostic projection.
+const DIAGNOSTIC_INPUTS_SQL: &str = r#"
+WITH inputs AS (
+ SELECT o.input_event_id,-1 AS input_order FROM ticket_assignment_delivery_origins o
+ WHERE o.workspace_id=?1 AND o.assignment_id=?3
+ UNION
+ SELECT d.input_event_id,CASE WHEN d.input_event_id LIKE 'ticket-event:%' THEN CAST(substr(d.input_event_id,14) AS INTEGER) ELSE -1 END
+ FROM ticket_assignment_deliveries d WHERE d.workspace_id=?1 AND d.assignment_id=?3
+ UNION
+ SELECT 'ticket-event:' || e.event_index,e.event_index
+ FROM ticket_assignment_delivery_origins o JOIN typed_ticket_events e ON e.workspace_id=o.workspace_id AND e.ticket_id=o.ticket_id
+ WHERE o.workspace_id=?1 AND o.ticket_id=?2 AND o.assignment_id=?3 AND e.event_index>o.after_ticket_event_index
+ AND e.kind IN ('assignment_answer','item_edit')
+ AND (e.kind<>'assignment_answer' OR EXISTS(SELECT 1 FROM typed_ticket_event_attributes attr WHERE attr.workspace_id=e.workspace_id AND attr.ticket_id=e.ticket_id AND attr.event_index=e.event_index AND attr.key='orchestrator_assignment_id' AND attr.value=?3))
+ AND e.kind NOT LIKE 'assignment_tracking%' AND e.kind NOT LIKE 'assignment_delivery%'
+ AND COALESCE(e.state_field,'') NOT IN ('case','routing','assignment_tracking')
+ -- Retain historical input identity after done/release. A later delegation's
+ -- origin bounds ordinary events; an explicit answer's attribute is authoritative.
+ AND e.event_index<=COALESCE((SELECT MIN(later.after_ticket_event_index) FROM ticket_assignment_delivery_origins later
+ JOIN ticket_worker_assignments la ON la.workspace_id=later.workspace_id AND la.assignment_id=later.assignment_id
+ JOIN ticket_worker_assignments original ON original.workspace_id=o.workspace_id AND original.assignment_id=o.assignment_id
+ WHERE later.workspace_id=o.workspace_id AND later.ticket_id=o.ticket_id AND la.rowid>original.rowid),9223372036854775807)
+ AND NOT EXISTS(SELECT 1 FROM typed_ticket_event_attributes attr WHERE attr.workspace_id=e.workspace_id AND attr.ticket_id=e.ticket_id AND attr.event_index=e.event_index AND attr.key='orchestrator_assignment_id' AND attr.value<>?3)
+)
+"#;
+
+pub(super) fn diagnostics_page(
+    store: &SqliteWorkspaceStore,
+    workspace_id: &str,
+    ticket_id: &str,
+    assignment_id: &str,
+    after_input_event_id: Option<&str>,
+    after_start_operation_id: Option<&str>,
+    limit: usize,
+) -> Result<server_api::TicketAssignmentDiagnosticsPage> {
+    if !(1..=100).contains(&limit) {
+        return Err(Error::InvalidInput(
+            "Diagnostic page limit must be 1..100".into(),
+        ));
+    }
+    store.with_conn(|conn| {
+        // One read snapshot for current assignment, evidence and cursor validation.
+        let tx = conn.unchecked_transaction()?;
+        let assignment = ticket::sqlite_ticket_assignment_tracking(&tx,workspace_id,ticket_id,assignment_id)
+            .map_err(|e| Error::Store(e.to_string()))?.ok_or_else(|| Error::InvalidInput("Assignment does not belong to this Ticket".into()))?;
+        let known: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_assignment_delivery_origins WHERE workspace_id=?1 AND ticket_id=?2 AND assignment_id=?3)",params![workspace_id,ticket_id,assignment_id],|r| r.get(0))?;
+        let actionable = match require_current(&tx,workspace_id,ticket_id,assignment_id) {
+            Ok(()) => true,
+            Err(Error::TicketAssignmentConflict(_)) => false,
+            Err(error) => return Err(error),
+        };
+        let after = match after_input_event_id {
+            None => -2,
+            Some(id) => tx.query_row(&format!("{DIAGNOSTIC_INPUTS_SQL} SELECT input_order FROM inputs WHERE input_event_id=?5"),params![workspace_id,ticket_id,assignment_id,actionable,id],|r| r.get::<_,i64>(0)).optional()?.ok_or_else(|| Error::InvalidInput("Input cursor does not belong to this assignment".into()))?,
+        };
+        let sql = format!("{DIAGNOSTIC_INPUTS_SQL} SELECT i.input_event_id,d.delivery_id,EXISTS(SELECT 1 FROM ticket_assignment_delivery_requests req WHERE req.workspace_id=?1 AND req.delivery_id=d.delivery_id),EXISTS(SELECT 1 FROM ticket_assignment_delivery_acknowledgements ack WHERE ack.workspace_id=?1 AND ack.delivery_id=d.delivery_id) FROM inputs i LEFT JOIN ticket_assignment_deliveries d ON d.workspace_id=?1 AND d.assignment_id=?3 AND d.input_event_id=i.input_event_id WHERE i.input_order>?5 ORDER BY i.input_order LIMIT ?6");
+        let mut stmt = tx.prepare(&sql)?;
+        let mut inputs = stmt.query_map(params![workspace_id,ticket_id,assignment_id,actionable,after,(limit+1) as i64],|r| {
+            let delivery_id: Option<String> = r.get(1)?;
+            let prepared: bool = r.get(2)?;
+            let ack: bool = r.get(3)?;
+            use server_api::TicketAssignmentInputDeliveryState::*;
+            let notification = if ack { RuntimeAccepted } else if prepared { RequestPersisted } else if delivery_id.is_some() { Reserved } else { NotReserved };
+            Ok(server_api::TicketAssignmentInputDiagnostic { input_event_id:r.get(0)?, delivery_id,notification,acceptance_outcome_unknown:prepared && !ack })
+        })?.collect::<std::result::Result<Vec<_>,_>>()?;
+        let more = inputs.len()>limit;
+        inputs.truncate(limit);
+        let next_input_event_id = if more { inputs.last().map(|i| i.input_event_id.clone()) } else { None };
+        let after_start = match after_start_operation_id {
+            None => 0,
+            Some(id) => tx.query_row("SELECT f.rowid FROM ticket_assignment_operation_fences f JOIN ticket_assignment_operations o ON o.workspace_id=f.workspace_id AND o.operation_id=f.operation_id WHERE f.workspace_id=?1 AND f.orchestrator_assignment_id=?3 AND o.ticket_id=?2 AND f.operation_id=?4",params![workspace_id,ticket_id,assignment_id,id],|r| r.get::<_,i64>(0)).optional()?.ok_or_else(|| Error::InvalidInput("Start cursor does not belong to this assignment".into()))?,
+        };
+        let mut stmt = tx.prepare("SELECT f.operation_id,o.claim_state,o.assignment_id,o.runtime_id,o.worker_id FROM ticket_assignment_operation_fences f JOIN ticket_assignment_operations o ON o.workspace_id=f.workspace_id AND o.operation_id=f.operation_id WHERE f.workspace_id=?1 AND o.ticket_id=?2 AND f.orchestrator_assignment_id=?3 AND f.rowid>?4 ORDER BY f.rowid LIMIT ?5")?;
+        let mut starts = stmt.query_map(params![workspace_id,ticket_id,assignment_id,after_start,(limit+1) as i64],|r| Ok(server_api::TicketAssignmentStartDiagnostic { operation_id:r.get(0)?,claim_state:r.get(1)?,assignment_id:r.get(2)?,runtime_id:r.get(3)?,worker_id:r.get(4)?,actual_processing_unknown:true }))?.collect::<std::result::Result<Vec<_>,_>>()?;
+        let more = starts.len()>limit;
+        starts.truncate(limit);
+        let next_start_operation_id = if more { starts.last().map(|i| i.operation_id.clone()) } else { None };
+        Ok(server_api::TicketAssignmentDiagnosticsPage { assignment_id:assignment_id.into(),current:assignment.current,input_origin_known:known,actionable,inputs,next_input_event_id,starts,next_start_operation_id })
+    })
 }

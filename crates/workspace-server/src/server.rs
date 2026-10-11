@@ -3097,7 +3097,9 @@ fn is_server_global_forward(path: &str) -> bool {
 }
 
 fn is_server_static_forward(path: &str) -> bool {
-    !path.starts_with("/api/") && !path.starts_with("/internal/")
+    !path.starts_with("/api/")
+        && !path.starts_with("/internal/")
+        && canonical_ticket_operation_workspace_id(path).is_none()
 }
 
 async fn serve_server_static_shell(api: &WorkspaceServerApi, path: &str) -> Response {
@@ -3107,7 +3109,7 @@ async fn serve_server_static_shell(api: &WorkspaceServerApi, path: &str) -> Resp
     static_file_or_spa_response(static_root, path).await
 }
 
-// Canonical case/tracking routes are deliberately not /api/w aliases. Recognize
+// Canonical Ticket operation routes are deliberately not /api/w aliases. Recognize
 // only these operations so authentication/scope are identical without exposing CRUD.
 fn canonical_ticket_operation_workspace_id(path: &str) -> Option<&str> {
     let mut segments = path.strip_prefix("/workspaces/")?.split('/');
@@ -3119,10 +3121,10 @@ fn canonical_ticket_operation_workspace_id(path: &str) -> Option<&str> {
         && resource == "tickets"
         && !ticket_id.is_empty()
         && match operation {
-            "case" => segments.next().is_none(),
+            "case" | "assignment-diagnostics" | "assignment-answer" => segments.next().is_none(),
             "assignment-tracking" => match segments.next() {
                 None => true,
-                Some("history") => segments.next().is_none(),
+                Some("history" | "assignments") => segments.next().is_none(),
                 _ => false,
             },
             _ => false,
@@ -6614,6 +6616,18 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::ticket_case_update(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::ticket_assignments_page(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_assignments_page_browser(service.clone()))
+        .merge(server_api::server_api_axum::ticket_assignment_diagnostics(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_assignment_diagnostics_browser(service.clone()))
+        .merge(server_api::server_api_axum::ticket_assignment_answer(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_assignment_answer_browser(service.clone()))
         .merge(server_api::server_api_axum::ticket_assignment_tracking_get(
             service.clone(),
         ))
@@ -10564,6 +10578,132 @@ impl server_api::ServerApi for ServerApiContractService {
         .await
         .map_err(ApiError::into_repository_api_error)?;
         Ok(response)
+    }
+
+    async fn ticket_assignments_page(
+        &self,
+        _context: server_api::ServerRequestContext,
+        workspace_id: String,
+        ticket_id: String,
+        query: server_api::TicketAssignmentsQuery,
+    ) -> std::result::Result<server_api::TicketAssignmentsPage, server_api::RepositoryApiError>
+    {
+        let api = self.workspace_api()?;
+        validate_workspace_scope(api, &workspace_id)
+            .map_err(ApiError::from)
+            .map_err(ApiError::into_repository_api_error)?;
+        let ticket_id = resolve_workspace_ticket_reference(api, &workspace_id, &ticket_id)
+            .map_err(ApiError::from)
+            .map_err(ApiError::into_repository_api_error)?;
+        api.store
+            .page_ticket_assignments(
+                &workspace_id,
+                &ticket_id,
+                query.after_assignment_id.as_deref(),
+                query.limit.unwrap_or(30),
+            )
+            .map(server_api::TicketAssignmentsPage)
+            .map_err(ApiError::from)
+            .map_err(ApiError::into_repository_api_error)
+    }
+    async fn ticket_assignments_page_browser(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        ticket_id: String,
+        query: server_api::TicketAssignmentsQuery,
+    ) -> std::result::Result<server_api::TicketAssignmentsPage, server_api::RepositoryApiError>
+    {
+        self.ticket_assignments_page(context, workspace_id, ticket_id, query)
+            .await
+    }
+    async fn ticket_assignment_diagnostics(
+        &self,
+        _context: server_api::ServerRequestContext,
+        workspace_id: String,
+        ticket_id: String,
+        query: server_api::TicketAssignmentDiagnosticsQuery,
+    ) -> std::result::Result<
+        server_api::TicketAssignmentDiagnosticsPage,
+        server_api::RepositoryApiError,
+    > {
+        let api = self.workspace_api()?;
+        validate_workspace_scope(api, &workspace_id)
+            .map_err(ApiError::from)
+            .map_err(ApiError::into_repository_api_error)?;
+        let ticket_id = resolve_workspace_ticket_reference(api, &workspace_id, &ticket_id)
+            .map_err(ApiError::from)
+            .map_err(ApiError::into_repository_api_error)?;
+        api.store
+            .page_ticket_assignment_diagnostics(
+                &workspace_id,
+                &ticket_id,
+                &query.assignment_id,
+                query.after_input_event_id.as_deref(),
+                query.after_start_operation_id.as_deref(),
+                query.limit.unwrap_or(30),
+            )
+            .map_err(ApiError::from)
+            .map_err(ApiError::into_repository_api_error)
+    }
+    async fn ticket_assignment_diagnostics_browser(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        ticket_id: String,
+        query: server_api::TicketAssignmentDiagnosticsQuery,
+    ) -> std::result::Result<
+        server_api::TicketAssignmentDiagnosticsPage,
+        server_api::RepositoryApiError,
+    > {
+        self.ticket_assignment_diagnostics(context, workspace_id, ticket_id, query)
+            .await
+    }
+    async fn ticket_assignment_answer(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        ticket_id: String,
+        request: server_api::TicketAssignmentAnswerRequest,
+    ) -> std::result::Result<
+        server_api::TicketAssignmentAnswerResponse,
+        server_api::RepositoryApiError,
+    > {
+        let api = self.workspace_api()?;
+        validate_workspace_scope(api, &workspace_id)
+            .map_err(ApiError::from)
+            .map_err(ApiError::into_repository_api_error)?;
+        let ticket_id = resolve_workspace_ticket_reference(api, &workspace_id, &ticket_id)
+            .map_err(ApiError::from)
+            .map_err(ApiError::into_repository_api_error)?;
+        let (actor, source) =
+            authenticated_assignment_source(api, &contract_request_headers(&context)?, &context)
+                .map_err(ApiError::from)
+                .map_err(ApiError::into_repository_api_error)?;
+        let receipt = api
+            .store
+            .answer_ticket_assignment(&workspace_id, &ticket_id, &request.0, &source, &actor)
+            .map_err(ApiError::from)
+            .map_err(ApiError::into_repository_api_error)?;
+        // The entire event/audit/receipt transaction has committed. Response loss
+        // retries the saved receipt; delivery scan deduplicates accepted inputs.
+        if let Some(orchestrator) = find_workspace_orchestrator(api) {
+            dispatch_orchestrator_assignment_attention(api, &orchestrator.worker);
+        }
+        Ok(server_api::TicketAssignmentAnswerResponse(receipt))
+    }
+    async fn ticket_assignment_answer_browser(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        ticket_id: String,
+        request: server_api::TicketAssignmentAnswerRequest,
+    ) -> std::result::Result<
+        server_api::TicketAssignmentAnswerResponse,
+        server_api::RepositoryApiError,
+    > {
+        self.ticket_assignment_answer(context, workspace_id, ticket_id, request)
+            .await
     }
 
     async fn ticket_assignment_tracking_get(
@@ -48195,6 +48335,42 @@ mod tests {
         }
     }
 
+    async fn author_notification_test_answer(api: &WorkspaceApi, ticket_id: &str, key: &str) {
+        let current = api
+            .store
+            .list_current_ticket_assignment_tracking(TEST_WORKSPACE_ID, ticket_id)
+            .unwrap()
+            .remove(0);
+        let response = build_router(api.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket_id}/assignment-answer"
+                    ))
+                    .header(
+                        "authorization",
+                        format!("Bearer api-token-{TEST_WORKSPACE_ID}"),
+                    )
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "assignment_id": current.assignment_id,
+                            "expected_last_event_id": current.last_event_id.unwrap(),
+                            "operation_key": key,
+                            "body": "Explicit continuing input"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    }
+
     #[tokio::test]
     async fn orchestrator_ticket_notifications_project_authoritative_post_mutation_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -48350,8 +48526,15 @@ mod tests {
                 .unwrap();
         }
 
+        assert_eq!(
+            execution.take_inputs().len(),
+            1,
+            "ordinary history must not create unfenced continuing input"
+        );
+        seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+        author_notification_test_answer(&api, &ticket.id, "notification-explicit-answer").await;
         let inputs = execution.take_inputs();
-        assert_eq!(inputs.len(), 4, "Assign input plus three external events");
+        assert_eq!(inputs.len(), 1, "one fenced continuing answer");
         let unique = inputs
             .iter()
             .map(|(_, content)| content.clone())
@@ -50357,11 +50540,13 @@ mod tests {
         assert!(!serialized.contains("queued update"));
         assert!(!serialized.contains("Ticket notification:"));
 
+        seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+        author_notification_test_answer(&api, &ticket_ref.id, "notification-saved-answer").await;
         let notifications = execution.take_inputs();
         assert_eq!(
             notifications.len(),
             2,
-            "initial delegation plus external comment"
+            "initial delegation plus fenced answer; ordinary comment is history"
         );
         assert_eq!(
             notifications[0].0.worker_id.to_string(),
@@ -50406,6 +50591,7 @@ mod tests {
             api.authority.ticket(&ticket_ref.id).unwrap().state.as_str(),
             TicketState::Open.as_str()
         );
+        author_notification_test_answer(&api, &ticket_ref.id, "notification-failed-answer").await;
         let warnings = TICKET_NOTIFICATION_DELIVERY_WARNING_CAPTURE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

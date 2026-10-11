@@ -163,6 +163,41 @@ async fn delivery_self_report(
     serde_json::from_slice(&bytes).unwrap()
 }
 
+async fn delivery_external_answer(api: &WorkspaceApi, ticket: &str, text: &str, key: &str) {
+    let current = api
+        .store
+        .list_current_ticket_assignment_tracking(TEST_WORKSPACE_ID, ticket)
+        .unwrap()
+        .remove(0);
+    delivery_http(api,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignment-answer"),Some(json!({"assignment_id":current.assignment_id,"expected_last_event_id":current.last_event_id,"operation_key":key,"body":text})),StatusCode::OK).await;
+}
+
+fn delivery_commit_answer_without_scan(api: &WorkspaceApi, ticket: &str, text: &str, key: &str) {
+    seed_test_api_token(api.store.as_ref(), "direct-answer");
+    let current = api
+        .store
+        .list_current_ticket_assignment_tracking(TEST_WORKSPACE_ID, ticket)
+        .unwrap()
+        .remove(0);
+    api.store
+        .answer_ticket_assignment(
+            TEST_WORKSPACE_ID,
+            ticket,
+            &ticket::TicketAssignmentAnswer {
+                assignment_id: current.assignment_id,
+                expected_last_event_id: current.last_event_id.unwrap(),
+                operation_key: key.into(),
+                body: text.into(),
+            },
+            &crate::store::TicketOrchestratorAssignmentSourceContext::Account {
+                account_id: "account-direct-answer".into(),
+                user_id: "user-direct-answer".into(),
+            },
+            "fixture-account",
+        )
+        .unwrap();
+}
+
 fn delivery_external_comment(api: &WorkspaceApi, ticket: &str, text: &str) {
     browser_ticket_backend(api)
         .unwrap()
@@ -212,7 +247,18 @@ async fn assignment_waiting_self_report_does_not_loop_but_external_answer_is_del
     );
     let waiting = delivery_tracking(&api, &ticket.id, assignment);
     assert_eq!(serde_json::to_value(&waiting).unwrap(), reported);
-    delivery_external_comment(&api, &ticket.id, "Human answer: choose option B");
+    delivery_external_comment(&api, &ticket.id, "History-only annotation while waiting");
+    assert!(
+        execution.take_inputs().is_empty(),
+        "ordinary waiting comment became fresh work"
+    );
+    delivery_external_answer(
+        &api,
+        &ticket.id,
+        "Human answer: choose option B",
+        "choose-B",
+    )
+    .await;
     let answer = execution.take_inputs();
     assert_eq!(
         answer.len(),
@@ -369,7 +415,10 @@ async fn assignment_clear_and_reassign_discard_old_unknown_delivery_without_stop
         assert!(inputs[0].1.contains(new_assignment));
         let ids = execution.take_input_request_ids();
         assert_eq!(ids.len(), 1);
-        assert_ne!(ids[0], old_ids[0], "new assignment reused stale input identity");
+        assert_ne!(
+            ids[0], old_ids[0],
+            "new assignment reused stale input identity"
+        );
         assert_eq!(
             delivery_assign(&api, &ticket.id, "assign-old").await,
             assigned
@@ -404,7 +453,8 @@ async fn assignment_or_answer_committed_during_empty_scan_is_delivered_without_a
                 &ticket.id,
                 assigned["assignment"]["assignment_id"].as_str().unwrap(),
             );
-            delivery_self_report(&api, &identity, &worker, &current, "waiting", "wait-answer").await;
+            delivery_self_report(&api, &identity, &worker, &current, "waiting", "wait-answer")
+                .await;
             execution.take_inputs();
             execution.take_input_request_ids();
         }
@@ -422,29 +472,33 @@ async fn assignment_or_answer_committed_during_empty_scan_is_delivered_without_a
                     true,
                     |state, pending| {
                         check_orchestrator_assignment_attention(
-                            &caller_api, &caller_worker, state, pending,
+                            &caller_api,
+                            &caller_worker,
+                            state,
+                            pending,
                         );
                         if checks == 0 {
                             // The production scan has read an empty snapshot but
                             // still owns its reservation. Race a real HTTP commit.
                             entered_tx.send(()).unwrap();
-                            release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                            release_rx
+                                .recv_timeout(std::time::Duration::from_secs(5))
+                                .unwrap();
                         }
                         checks += 1;
                     },
                 );
                 assert_eq!(checks, 2, "committed input must defer a scan");
             });
-            entered_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
             if answer {
-                futures::executor::block_on(delivery_http(
+                futures::executor::block_on(delivery_external_answer(
                     &api,
-                    "POST",
-                    &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{}/thread-events", ticket.id),
-                    Some(serde_json::to_value(NewTicketEvent::new(
-                        TicketEventKind::Comment, "Human answer: go ahead",
-                    )).unwrap()),
-                    StatusCode::NO_CONTENT,
+                    &ticket.id,
+                    "Human answer: go ahead",
+                    "racing-answer",
                 ));
             } else {
                 futures::executor::block_on(delivery_assign(&api, &ticket.id, "racing-assign"));
@@ -456,7 +510,11 @@ async fn assignment_or_answer_committed_during_empty_scan_is_delivered_without_a
         });
         let inputs = execution.take_inputs();
         assert_eq!(inputs.len(), 1, "idle Orchestrator was stranded");
-        assert!(inputs[0].1.contains(ticket.resource_key.as_deref().unwrap()));
+        assert!(
+            inputs[0]
+                .1
+                .contains(ticket.resource_key.as_deref().unwrap())
+        );
         if answer {
             assert!(inputs[0].1.contains("Need the human's choice"));
         }
@@ -476,15 +534,26 @@ async fn assignment_failed_delivery_and_its_reentrant_idle_do_not_schedule_retry
     execution.before_input_returns(move |worker| {
         use protocol::subscription::SubscriptionWorkerState as S;
         maybe_dispatch_orchestrator_turn_end(
-            &callback_api, &worker.worker_id.to_string(), Some(S::Running), S::Idle,
+            &callback_api,
+            &worker.worker_id.to_string(),
+            Some(S::Running),
+            S::Idle,
         );
     });
     delivery_assign(&api, &ticket.id, "assign-failed").await;
-    assert_eq!(execution.take_inputs().len(), 2, "idle must not add retries beyond the bounded send");
+    assert_eq!(
+        execution.take_inputs().len(),
+        2,
+        "idle must not add retries beyond the bounded send"
+    );
     let ids = execution.take_input_request_ids();
     assert_eq!(ids.len(), 2);
     assert_eq!(ids[0], ids[1]);
-    assert_eq!(attention_pending(&api).len(), 1, "failure must retain durable input");
+    assert_eq!(
+        attention_pending(&api).len(),
+        1,
+        "failure must retain durable input"
+    );
     delivery_stop(&api, &worker);
 }
 
@@ -796,8 +865,22 @@ async fn delivery_wait_idle(
                 "duplicate canonical delivery: {:?}",
                 delivery_commits(api, worker)
             );
+            let entries = delivery_session_entries(api, worker);
+            let last_notification = entries.iter().rposition(|entry| matches!(
+                entry,
+                LogEntry::AnnotatedSystemItem { entry, .. }
+                    if matches!(entry.item, session_store::SystemItem::Notification { .. })
+            ));
+            let last_completed = entries.iter().rposition(|entry| matches!(entry, LogEntry::RunCompleted { .. }));
+            // Runtime acceptance and the saved notification precede processing.
+            // Initial Idle can therefore be observed before any model request.
+            // Require a committed run outcome after the latest input, not a
+            // guessed delay or Worker liveness as proof of consumption.
+            let processed = last_notification.zip(last_completed)
+                .is_some_and(|(input, completed)| completed > input);
             let summary = api.runtime.worker(worker).unwrap();
             if commits == expected_commits
+                && processed
                 && summary
                     .worker_state
                     .as_ref()
@@ -962,16 +1045,12 @@ async fn assignment_real_worker_response_loss_restore_and_concurrent_scans_commi
         waiting
     );
     let before = execution.attempts.lock().unwrap().len();
-    browser_ticket_backend(&reopened)
-        .unwrap()
-        .add_event(
-            ticket.id.clone().into(),
-            ticket::NewTicketEvent::new(
-                ticket::TicketEventKind::Comment,
-                "External answer after server restart",
-            ),
-        )
-        .unwrap();
+    delivery_commit_answer_without_scan(
+        &reopened,
+        &ticket.id,
+        "External answer after server restart",
+        "answer-after-restart",
+    );
     let barrier = Arc::new(std::sync::Barrier::new(8));
     std::thread::scope(|scope| {
         let joins = (0..8)

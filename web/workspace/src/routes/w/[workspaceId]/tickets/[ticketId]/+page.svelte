@@ -1,5 +1,9 @@
 <script lang="ts">
   import { untrack } from "svelte";
+  import TicketTags from "#lib/workspace/tickets/TicketTags.svelte";
+  import TicketWorkerObservation from "#lib/workspace/tickets/TicketWorkerObservation.svelte";
+  import TicketHandling from "#lib/workspace/tickets/TicketHandling.svelte";
+  import { observeOperation, type ObservedOperation } from "#lib/workspace/api/ticket-operations.ts";
   import RichMarkdown from "#lib/workspace/console/RichMarkdown.svelte";
   import {
     workspaceApiJson,
@@ -8,11 +12,11 @@
   } from "#lib/workspace/api/http.ts";
   import {
     TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
+    parseTicketSummary,
     parseTicketDetail,
-    parseTicketQueueOutcome,
     parseTicketRoleAssignmentMutationResponse,
   } from "#lib/workspace/api/ticket-browser.ts";
-  import { ticketCaseRequest, updateTicketCase } from "#lib/workspace/api/ticket-case.ts";
+  import { ticketCaseRequest } from "#lib/workspace/api/ticket-case.ts";
   import { mergeRequestPagePath } from "#lib/workspace/api/merge-requests.ts";
   import { currentRequirementApprovalStatus, summarySourceReviewStatus } from "#lib/workspace/merge-request-status.ts";
   import {
@@ -86,8 +90,8 @@
   let threadBody = $state("");
   let busy = $state<string | null>(null);
   let errorMessage = $state<string | null>(null);
-  let queueMessage = $state<string | null>(null);
-  let readyOperationKey = $state<string | null>(null);
+  let caseOperation = $state<ObservedOperation | null>(null);
+  let caseSaved = $state(false);
   let manualRuntimeId = $state("");
   let manualWorkerId = $state("");
   let manualBindings = $state<{ alias: string; working_directory_id: string; connection_id: string }[]>([]);
@@ -151,8 +155,8 @@
     threadBody = "";
     busy = null;
     errorMessage = null;
-    queueMessage = null;
-    readyOperationKey = null;
+    caseOperation = null;
+    caseSaved = false;
     manualRuntimeId = "";
     manualWorkerId = "";
     manualBindings = [];
@@ -226,36 +230,11 @@
     }
   }
 
-  async function queueTicket(): Promise<void> {
-    if (busy) return;
+  async function refreshOperationTicket(): Promise<void> {
     const generation = routeGeneration;
-    const path = ticketPath;
-    busy = "queue";
-    errorMessage = null;
-    queueMessage = null;
-    try {
-      const outcome = await workspaceApiJsonWithBody(
-        `${path}/queue`,
-        { method: "POST", body: JSON.stringify({}) },
-        parseTicketQueueOutcome,
-        TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
-      );
-      if (generation !== routeGeneration) return;
-      const updatedTicket = await workspaceApiJson(
-        path,
-        parseTicketDetail,
-        TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
-      );
-      if (generation !== routeGeneration) return;
-      queueMessage = `Queued ${outcome.queued_tickets.length} Ticket(s): ${outcome.queued_tickets.join(", ")}`;
-      applyTicket(updatedTicket);
-    } catch (error) {
-      if (generation === routeGeneration) {
-        errorMessage = ticketMutationError(error);
-      }
-    } finally {
-      if (generation === routeGeneration) busy = null;
-    }
+    const updated = await workspaceApiJson(ticketPath, parseTicketDetail, TICKET_BROWSER_API_MAX_RESPONSE_BYTES);
+    if (generation !== routeGeneration) return;
+    applyTicket(updated);
   }
 
   async function mutateAssignment(
@@ -276,7 +255,7 @@
           body: JSON.stringify({
             operation_id: crypto.randomUUID(),
             principal,
-            expected_assignment_id: null,
+            expected_assignment_id: ticket.assignments.find((row) => row.role === role)?.assignment_id ?? null,
             ...(role === "worker" ? { workdir_bindings: manualBindings } : {}),
           }),
         },
@@ -298,13 +277,6 @@
     } finally {
       if (generation === routeGeneration) busy = null;
     }
-  }
-
-  async function assignOrchestrator(): Promise<void> {
-    await mutateAssignment("assign-orchestrator", "orchestrator", {
-      kind: "workspace_agent",
-      agent_key: "workspace-orchestrator",
-    });
   }
 
   async function assignExistingWorker(event: SubmitEvent): Promise<void> {
@@ -361,34 +333,30 @@
     await mutate("target", "", targetEditBody(), "PATCH");
   }
 
-  async function markReady() {
-    if (ticket.state !== "open" || busy) return;
-    readyOperationKey ??= crypto.randomUUID();
-    if (
-      await mutate("ready", "/ready", {
-        operation_key: readyOperationKey,
-        reason: transitionReason.trim() || null,
-      })
-    ) {
-      readyOperationKey = null;
-      transitionReason = "";
-    }
-  }
-
   function selectedClosureReason(): TicketClosureReason {
     return closureReason === "other" ? { other: otherClosureReason.trim() } : closureReason as TicketClosureReason;
   }
 
   async function caseDecision(action: TicketCaseAction): Promise<void> {
-    if (busy || !transitionReason.trim()) return;
+    if (busy || caseOperation || !transitionReason.trim()) return;
+    const request = ticketCaseRequest(ticket, action, transitionReason, crypto.randomUUID());
+    const path = `/workspaces/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(data.ticketId)}/case`;
+    await runCaseDecision(observeOperation(path, "POST", request));
+  }
+
+  async function runCaseDecision(operation: ObservedOperation): Promise<void> {
+    if (busy) return;
     const generation = routeGeneration;
     const path = ticketPath;
-    const request = ticketCaseRequest(ticket, action, transitionReason, crypto.randomUUID());
-    busy = action.action;
+    busy = "case";
+    caseOperation = operation;
     errorMessage = null;
+    caseSaved = false;
     try {
-      await updateTicketCase(data.workspaceId, data.ticketId, request);
+      await workspaceApiJsonWithBody(operation.path, { method: operation.method, body: operation.body }, parseTicketSummary, TICKET_BROWSER_API_MAX_RESPONSE_BYTES);
       if (generation !== routeGeneration) return;
+      caseOperation = null;
+      caseSaved = true;
       const updated = await workspaceApiJson(path, parseTicketDetail, TICKET_BROWSER_API_MAX_RESPONSE_BYTES);
       if (generation !== routeGeneration) return;
       applyTicket(updated);
@@ -432,9 +400,11 @@
   <header class="ticket-detail-header">
     <div>
       <div class="ticket-detail-kicker">
-        <span class="workspace-status-pill" data-status={ticket.state}>{ticket.state}</span>
+        <span>{ticket.resource_key}</span>
+        <span class="workspace-status-pill" data-status={ticket.state}>Case: {ticket.state}</span>
       </div>
       <h1>{ticket.title}</h1>
+      {#if ticket.state === "closed" && ticket.current_closure}<p><strong>Closure reason:</strong> {closureReasonLabel(ticket.current_closure.reason)}</p>{/if}
       <p>Updated {prettyDate(ticket.updated_at)}</p>
     </div>
     <button class="workspace-secondary-button" type="button" onclick={() => editing = !editing}>
@@ -446,9 +416,6 @@
     <div class="workspace-callout is-error" role="alert"><p>{errorMessage}</p><p>No success or approval is inferred. An uncertain response may already have applied; refresh the current Ticket before retrying.</p><button type="button" class="workspace-secondary-button" disabled={busy !== null} onclick={refreshTicket}>Refresh Ticket status</button></div>
   {/if}
 
-  {#if queueMessage}
-    <div class="workspace-callout" role="status">{queueMessage}</div>
-  {/if}
 
   {#if editing}
     <form class="ticket-editor" onsubmit={saveEdit}>
@@ -471,6 +438,12 @@
         {/if}
       </section>
 
+      {#key JSON.stringify([data.workspaceId, ticket.id])}
+        <TicketTags workspaceId={data.workspaceId} {ticket} refresh={refreshOperationTicket} />
+        <TicketHandling workspaceId={data.workspaceId} {ticket} orchestrator={data.orchestrator.data} refresh={refreshOperationTicket} />
+        <TicketWorkerObservation workspaceId={data.workspaceId} {ticket} />
+      {/key}
+
       <section class="ticket-detail-section">
         <div class="ticket-section-heading">
           <h2>Relations</h2>
@@ -481,7 +454,7 @@
             {#each ticket.relations.blockers as blocker}
               {#if blocker.blocking_resource_key}
                 <a href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(blocker.blocking_resource_key)}`}>
-                  <strong>Blocked by {blocker.blocking_resource_key}</strong>
+                  <strong>Dependency {blocker.blocking_resource_key} remains unresolved</strong>
                   <span>{relationLabel(blocker.relation_kind)} · {blocker.blocking_state}</span>
                 </a>
               {:else}
@@ -550,9 +523,15 @@
     </main>
 
     <aside class="ticket-control-rail">
-      <section class="ticket-control-card">
+      <section class="ticket-control-card ticket-case-card">
         <header><h2>Case decision</h2></header>
         <p class="workspace-empty-copy">Open means the case remains under consideration; closed does not necessarily mean completed. Case decisions do not start or stop Workers, grant access, approve review, merge code, or change tags. Reopening does not resume an old Worker.</p>
+        {#if caseSaved}<p role="status">Case decision saved. This is not handling Done or MR approval.</p>{/if}
+        {#if caseOperation}
+          <p>The case decision may already be saved. The exact observed input and operation key are retained.</p>
+          <button class="workspace-secondary-button" disabled={busy !== null} onclick={() => caseOperation && void runCaseDecision(caseOperation)}>Retry exact case decision</button>
+          <button class="workspace-secondary-button" disabled={busy !== null} onclick={async () => { await refreshTicket(); if (!errorMessage) caseOperation = null; }}>Refresh and reconcile case</button>
+        {/if}
         <form class="ticket-control-form" onsubmit={(event) => { event.preventDefault(); void caseDecision(ticket.state === "open" ? { action: "close", reason: selectedClosureReason() } : { action: "reopen" }); }}>
           <label>Explanation<textarea bind:value={transitionReason} rows="3" required></textarea></label>
           <label>Closure reason
@@ -565,18 +544,13 @@
             </select>
           </label>
           {#if closureReason === "other"}<label>Other reason<input bind:value={otherClosureReason} required={ticket.state === "open"} /></label>{/if}
-          <button class="workspace-secondary-button" type="submit" disabled={busy !== null || !transitionReason.trim() || (ticket.state === "open" && closureReason === "other" && !otherClosureReason.trim())}>
+          <button class="workspace-secondary-button" type="submit" disabled={busy !== null || caseOperation !== null || !transitionReason.trim() || (ticket.state === "open" && closureReason === "other" && !otherClosureReason.trim())}>
             {ticket.state === "open" ? "Close ticket" : "Reopen ticket"}
           </button>
           {#if ticket.state === "closed" && ticket.current_closure}
-            <button class="workspace-secondary-button" type="button" disabled={busy !== null || !transitionReason.trim() || (closureReason === "other" && !otherClosureReason.trim())} onclick={() => void caseDecision({ action: "correct_closure", reason: selectedClosureReason() })}>Correct closure</button>
+            <button class="workspace-secondary-button" type="button" disabled={busy !== null || caseOperation !== null || !transitionReason.trim() || (closureReason === "other" && !otherClosureReason.trim())} onclick={() => void caseDecision({ action: "correct_closure", reason: selectedClosureReason() })}>Correct closure</button>
           {/if}
         </form>
-        {#if ticket.state === "open"}
-          <button class="workspace-secondary-button ticket-queue-button" type="button" disabled={busy !== null} onclick={markReady}>{busy === "ready" ? "Recording readiness…" : "Record routing readiness"}</button>
-        {/if}
-        <button class="workspace-secondary-button ticket-queue-button" type="button" disabled={busy !== null || !ticket.action_eligibility.can_queue} onclick={() => void queueTicket()}>{busy === "queue" ? "Queueing…" : "Request Orchestrator (queue)"}</button>
-        <p class="workspace-empty-copy">Queue requests only this Ticket. Dependencies remain diagnostic information and are not automatically queued.</p>
         {#each ticket.action_eligibility.blockers as blocker}<p class="workspace-callout">{blocker}</p>{/each}
       </section>
 
@@ -602,16 +576,6 @@
           </ul>
         {:else}
           <p class="workspace-empty-copy">No role responsibility recorded.</p>
-        {/if}
-        {#if ticket.action_eligibility.can_assign_orchestrator}
-          <button
-            class="workspace-primary-button"
-            type="button"
-            disabled={busy !== null}
-            onclick={assignOrchestrator}
-          >
-            {busy === "assign-orchestrator" ? "Assigning…" : "Assign Orchestrator"}
-          </button>
         {/if}
         {#if implementationStartEligible}
           <a class="workspace-secondary-button" href={ticketWorkerLaunchHref(data.workspaceId, ticket)}>Start a Ticket Worker</a>

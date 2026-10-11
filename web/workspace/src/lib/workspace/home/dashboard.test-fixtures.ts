@@ -49,6 +49,7 @@ export function fixtureDetail(key = "T-101") {
     artifacts: [],
     artifact_count: 0,
     assignments: [],
+    assignment_tracking: [],
     assignment_diagnostics: [],
     events: [],
     event_count: 0,

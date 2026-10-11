@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "tickets",
-  "title": "Flexible Ticket progress and optional resources",
+  "title": "Ticket cases, classification and independent Orchestrator handling",
   "baseUrl": "http://127.0.0.1:15289",
   "colorScheme": "light",
   "reducedMotion": "reduce",
@@ -50,15 +50,11 @@
         },
         {
           "id": "resolution",
-          "label": "Resolution and MR state",
+          "label": "Reasoned case judgment",
           "interaction": [
             {
               "action": "click",
-              "selector": ".ticket-close-card > summary"
-            },
-            {
-              "action": "click",
-              "selector": ".ticket-close-card textarea"
+              "selector": ".ticket-case-card textarea"
             }
           ],
           "fullPage": true
@@ -83,15 +79,11 @@
         },
         {
           "id": "resolution",
-          "label": "Resolution and MR state",
+          "label": "Reasoned case judgment",
           "interaction": [
             {
               "action": "click",
-              "selector": ".ticket-close-card > summary"
-            },
-            {
-              "action": "click",
-              "selector": ".ticket-close-card textarea"
+              "selector": ".ticket-case-card textarea"
             }
           ],
           "fullPage": true
@@ -116,15 +108,11 @@
         },
         {
           "id": "resolution",
-          "label": "Resolution and MR state",
+          "label": "Reasoned case judgment",
           "interaction": [
             {
               "action": "click",
-              "selector": ".ticket-close-card > summary"
-            },
-            {
-              "action": "click",
-              "selector": ".ticket-close-card textarea"
+              "selector": ".ticket-case-card textarea"
             }
           ],
           "fullPage": true
@@ -153,8 +141,8 @@
       "id": "list",
       "label": "Member creates a repository-free Ticket",
       "path": "/w/tickets/tickets",
-      "goal": "Create work from intent with optional resources, not a fixed delivery pipeline",
-      "dataState": "Three lightweight progress lanes, member normal operations",
+      "goal": "Server-filter open and closed cases by canonical tags and current principal",
+      "dataState": "Open+done, open+waiting, inprogress with MR, closed with history",
       "ready": {
         "kind": "selector",
         "selector": ".ticket-kanban"
@@ -162,7 +150,7 @@
       "capturePoints": [
         {
           "id": "initial",
-          "label": "Progress lanes",
+          "label": "Case list",
           "fullPage": true
         },
         {
@@ -178,6 +166,201 @@
             "kind": "selector",
             "selector": ".ticket-create-form"
           },
+          "fullPage": true
+        },
+        {
+          "id": "last-case",
+          "label": "Closed case and final handling result",
+          "interaction": [
+            {
+              "action": "press",
+              "selector": ".ticket-lane[data-state=closed] .ticket-card",
+              "key": "End"
+            }
+          ],
+          "fullPage": true
+        },
+        {
+          "id": "reason-filter",
+          "label": "Current close reason versus historical reason search",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": ".ticket-panel-controls button:has-text(\"Cancel\")"
+            },
+            {
+              "action": "click",
+              "selector": ".ticket-reason-filter summary"
+            }
+          ],
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "orchestrator",
+      "path": "/w/tickets/orchestrator",
+      "label": "Current self-reported handling",
+      "goal": "Current self-reported handling",
+      "dataState": "Waiting, inprogress and done independent of case",
+      "ready": {
+        "kind": "selector",
+        "selector": ".orchestrator-assignments"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Current self-reported handling",
+          "fullPage": true
+        },
+        {
+          "id": "last-case",
+          "label": "Closed case and final handling result",
+          "interaction": [
+            {
+              "action": "press",
+              "selector": ".orchestrator-assignment:last-child",
+              "key": "End"
+            }
+          ],
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "closed",
+      "path": "/w/tickets/tickets/T-4",
+      "label": "Closed case and retained history",
+      "goal": "Closed case and retained history",
+      "dataState": "Completed closure and replaced/unassigned history",
+      "ready": {
+        "kind": "selector",
+        "selector": ".ticket-detail-header"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Closed case and retained history",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "permission",
+      "path": "/w/tickets-readonly/tickets/T-2",
+      "label": "Read-only assignment",
+      "goal": "Read-only assignment",
+      "dataState": "Backend assignment eligibility denied",
+      "ready": {
+        "kind": "selector",
+        "selector": ".ticket-detail-header"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Read-only assignment",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "long",
+      "path": "/w/tickets-long/tickets",
+      "label": "Long list titles and handling",
+      "goal": "Long list titles and handling",
+      "dataState": "Long titles and multiline results",
+      "ready": {
+        "kind": "selector",
+        "selector": ".ticket-kanban"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Long list titles and handling",
+          "fullPage": true
+        },
+        {
+          "id": "last-case",
+          "label": "Closed case and final handling result",
+          "interaction": [
+            {
+              "action": "press",
+              "selector": ".ticket-lane[data-state=closed] .ticket-card",
+              "key": "End"
+            }
+          ],
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "empty",
+      "path": "/w/tickets-empty/orchestrator",
+      "label": "No current assignments",
+      "goal": "No current assignments",
+      "dataState": "Empty response",
+      "ready": {
+        "kind": "selector",
+        "selector": ".orchestrator-assignments"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "No current assignments",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "error",
+      "path": "/w/tickets-error/tickets",
+      "label": "Query failure recovery",
+      "goal": "Query failure recovery",
+      "dataState": "503 query, scoped errors and retry",
+      "ready": {
+        "kind": "selector",
+        "selector": ".ticket-lane-page-error"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Query failure recovery",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "unknown",
+      "path": "/w/tickets-unknown/orchestrator",
+      "label": "Unknown historical handling",
+      "goal": "Unknown historical handling",
+      "dataState": "Null handling without inference",
+      "ready": {
+        "kind": "selector",
+        "selector": ".orchestrator-assignments"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Unknown historical handling",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "running",
+      "path": "/w/tickets-running/tickets/T-2",
+      "label": "Waiting with running Orchestrator Worker",
+      "goal": "Waiting with running Orchestrator Worker",
+      "dataState": "Waiting remains waiting while Worker is running",
+      "ready": {
+        "kind": "selector",
+        "selector": ".ticket-detail-header"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Waiting with running Orchestrator Worker",
           "fullPage": true
         }
       ]

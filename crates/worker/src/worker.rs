@@ -729,6 +729,28 @@ pub struct WorkspaceWorkerDiscoveryRequest {
 
 #[derive(Debug, Clone)]
 pub enum WorkspaceServerOperation {
+    TicketAssignmentSet {
+        ticket_id: String,
+        role: server_api::TicketAssignmentRole,
+        request: server_api::SetTicketRoleAssignmentRequest,
+    },
+    TicketAssignmentClear {
+        ticket_id: String,
+        role: server_api::TicketAssignmentRole,
+        query: server_api::ClearTicketRoleAssignmentQuery,
+    },
+    TicketAssignmentsPage {
+        ticket_id: String,
+        query: server_api::TicketAssignmentsQuery,
+    },
+    TicketAssignmentDiagnostics {
+        ticket_id: String,
+        query: server_api::TicketAssignmentDiagnosticsQuery,
+    },
+    TicketAssignmentAnswer {
+        ticket_id: String,
+        request: server_api::TicketAssignmentAnswerRequest,
+    },
     WorkerControlList,
     WorkerControlSpawn(server_api::CreateWorkspaceWorkerRequest),
     WorkerControlInput {
@@ -784,6 +806,45 @@ fn encode_workspace_path_segment(value: &str) -> String {
     encoded
 }
 
+fn workspace_server_query_request<T: serde::Serialize>(
+    method: WorkspaceRequestMethod,
+    path: String,
+    query: &T,
+) -> Result<WorkspaceRequest, WorkspaceClientError> {
+    let query = serde_json::to_value(query)
+        .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
+    let fields = query.as_object().ok_or_else(|| {
+        WorkspaceClientError::Request("Workspace query must serialize to an object".into())
+    })?;
+    let mut pairs = Vec::new();
+    for (name, value) in fields {
+        let value = match value {
+            serde_json::Value::Null => continue,
+            serde_json::Value::String(value) => value.clone(),
+            serde_json::Value::Number(value) => value.to_string(),
+            _ => {
+                return Err(WorkspaceClientError::Request(
+                    "Workspace query fields must be scalar".into(),
+                ));
+            }
+        };
+        pairs.push(format!(
+            "{}={}",
+            encode_workspace_path_segment(name),
+            encode_workspace_path_segment(&value)
+        ));
+    }
+    Ok(WorkspaceRequest {
+        method,
+        path: if pairs.is_empty() {
+            path
+        } else {
+            format!("{path}?{}", pairs.join("&"))
+        },
+        body: None,
+    })
+}
+
 fn workspace_server_operation_request(
     workspace_id: &str,
     operation: WorkspaceServerOperation,
@@ -791,6 +852,76 @@ fn workspace_server_operation_request(
     let workspace_id = encode_workspace_path_segment(workspace_id);
     let base = format!("/api/w/{workspace_id}");
     match operation {
+        WorkspaceServerOperation::TicketAssignmentSet {
+            ticket_id,
+            role,
+            request,
+        } => {
+            let role = match role {
+                server_api::TicketAssignmentRole::Orchestrator => "orchestrator",
+                server_api::TicketAssignmentRole::Worker => "worker",
+                server_api::TicketAssignmentRole::Owner => "owner",
+                server_api::TicketAssignmentRole::Contributor => "contributor",
+            };
+            Ok(WorkspaceRequest::json(
+                WorkspaceRequestMethod::Put,
+                format!(
+                    "{base}/tickets/{}/assignments/{role}",
+                    encode_workspace_path_segment(&ticket_id)
+                ),
+                serde_json::to_string(&request)
+                    .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
+            ))
+        }
+        WorkspaceServerOperation::TicketAssignmentClear {
+            ticket_id,
+            role,
+            query,
+        } => {
+            let role = match role {
+                server_api::TicketAssignmentRole::Orchestrator => "orchestrator",
+                server_api::TicketAssignmentRole::Worker => "worker",
+                server_api::TicketAssignmentRole::Owner => "owner",
+                server_api::TicketAssignmentRole::Contributor => "contributor",
+            };
+            workspace_server_query_request(
+                WorkspaceRequestMethod::Delete,
+                format!(
+                    "{base}/tickets/{}/assignments/{role}",
+                    encode_workspace_path_segment(&ticket_id)
+                ),
+                &query,
+            )
+        }
+        WorkspaceServerOperation::TicketAssignmentsPage { ticket_id, query } => {
+            workspace_server_query_request(
+                WorkspaceRequestMethod::Get,
+                format!(
+                    "/workspaces/{workspace_id}/tickets/{}/assignment-tracking/assignments",
+                    encode_workspace_path_segment(&ticket_id)
+                ),
+                &query,
+            )
+        }
+        WorkspaceServerOperation::TicketAssignmentDiagnostics { ticket_id, query } => {
+            workspace_server_query_request(
+                WorkspaceRequestMethod::Get,
+                format!(
+                    "/workspaces/{workspace_id}/tickets/{}/assignment-diagnostics",
+                    encode_workspace_path_segment(&ticket_id)
+                ),
+                &query,
+            )
+        }
+        WorkspaceServerOperation::TicketAssignmentAnswer { ticket_id, request } => {
+            workspace_server_json_request(
+                format!(
+                    "/workspaces/{workspace_id}/tickets/{}/assignment-answer",
+                    encode_workspace_path_segment(&ticket_id)
+                ),
+                &request,
+            )
+        }
         WorkspaceServerOperation::WorkerControlList => Ok(WorkspaceRequest::get(format!(
             "{base}/worker-control/workers"
         ))),

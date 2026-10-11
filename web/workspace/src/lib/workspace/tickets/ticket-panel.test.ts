@@ -1,7 +1,13 @@
 import {
+  closureReasonLabel,
+  currentOrchestratorAssignment,
+  handlingLabel,
+  handlingSummary,
   nextTicketLaneVisibleCount,
+  readTicketFilters,
   TICKET_LANE_PAGE_SIZE,
   ticketLanes,
+  ticketQueryRequest,
   ticketWorkerLaunchHref,
   ticketWorkerMessage,
 } from "./ticket-panel.ts";
@@ -112,44 +118,107 @@ Deno.test("generic Ticket launch carries natural text without role or resource c
   }
 });
 
-Deno.test("ticket detail retains backend queue eligibility and generic Worker assignment actions", async () => {
-  const source = await Deno.readTextFile(
-    new URL(
-      "../../../routes/w/[workspaceId]/tickets/[ticketId]/+page.svelte",
-      import.meta.url,
+Deno.test("case, stable tags and principal filters survive every server-query page", () => {
+  const filters = readTicketFilters(
+    new URLSearchParams(
+      "q=options&case=open&tag=tag-1&tag=tag-2&principal=orchestrator",
     ),
   );
+  for (const cursor of [null, "next-page"]) {
+    const request = JSON.parse(
+      JSON.stringify(ticketQueryRequest(filters, ["open"], cursor)),
+    );
+    assertEquals(request, {
+      query: "options",
+      states: ["open"],
+      tag_ids: ["tag-1", "tag-2"],
+      assigned_principal: {
+        kind: "workspace_agent",
+        agent_key: "workspace-orchestrator",
+      },
+      handling_status: null,
+      sort: "updated_desc",
+      limit: 30,
+      cursor,
+    });
+    const handling = JSON.parse(
+      JSON.stringify(ticketQueryRequest(filters, [], cursor, "done")),
+    );
+    assertEquals(handling.handling_status, "done");
+    assertEquals(handling.states, []);
+  }
+});
 
-  assertEquals(source.includes("ticket.action_eligibility.can_queue"), true);
-  assertEquals(source.includes("ticket.relations.blockers.length > 0"), true);
-  assertEquals(source.includes("outcome.queued_tickets.join"), true);
+Deno.test("current close-reason queries preserve known and custom reasons on every page without changing case intent", () => {
+  for (
+    const [input, expected] of [["completed", "completed"], [
+      "other&reason_text=Superseded%20plan",
+      { other: "Superseded plan" },
+    ]] as const
+  ) {
+    const filters = readTicketFilters(
+      new URLSearchParams(`case=closed&reason=${input}`),
+    );
+    for (const cursor of [null, "next-page"]) {
+      const request = JSON.parse(
+        JSON.stringify(ticketQueryRequest(filters, ["closed"], cursor)),
+      );
+      assertEquals(request.closure_reason, expected);
+      assertEquals(request.states, ["closed"]);
+      assertEquals(request.cursor, cursor);
+    }
+  }
+});
+
+Deno.test("handling summary uses only the current self-report and never Worker or case status", () => {
+  const row = {
+    assignment_id: "a",
+    current: true,
+    role: "orchestrator",
+    tracking: { status: "waiting", waiting_reason: "Awaiting user choice" },
+  } as TicketDetail["assignment_tracking"][number];
+  for (const state of ["open", "closed"] as const) {
+    for (const workerState of ["Running", "Stopped"]) {
+      const value = {
+        state,
+        workerState,
+        assignment_tracking: [{
+          ...row,
+          assignment_id: "released",
+          current: false,
+          tracking: { status: "done" as const, result: "Old result" },
+        }, row],
+      };
+      const current = currentOrchestratorAssignment(value);
+      assertEquals(current?.assignment_id, "a");
+      assertEquals(handlingLabel(current?.tracking?.status), "Waiting");
+      assertEquals(handlingSummary(current), "Awaiting user choice");
+    }
+  }
   assertEquals(
-    source.includes("resolve the listed blockers before Queue"),
-    false,
+    handlingSummary({
+      ...row,
+      tracking: { status: "done", result: "Compared options" },
+    }),
+    "Compared options",
   );
   assertEquals(
-    source.includes("ticket.action_eligibility.can_assign_orchestrator"),
-    true,
+    handlingSummary({
+      ...row,
+      tracking: null,
+      migration_diagnostic: "Unknown historical handling",
+    }),
+    "Unknown historical handling",
   );
+  assertEquals(handlingLabel(null), "Unknown");
   assertEquals(
-    source.includes('mutateAssignment("start-manual", "worker"'),
-    true,
+    currentOrchestratorAssignment({
+      assignment_tracking: [{ ...row, current: false }],
+    }),
+    null,
   );
-  assertEquals(
-    source.includes('mutateAssignment("start-manual", "reviewer"'),
-    false,
-  );
-  assertEquals(source.includes('kind: "workspace_agent"'), true);
-  assertEquals(source.includes('kind: "worker"'), true);
-  assertEquals(source.includes("ticket.assignee"), false);
-  assertEquals(source.includes('action: "set", targets'), true);
-  assertEquals(source.includes("updatedTicket.targets"), true);
-  assertEquals(source.includes("ticket.repository_key"), false);
-  assertEquals(source.includes("ticket.ref_selector"), false);
-  assertEquals(
-    source.includes("(repository.diagnostics ?? []).length > 0"),
-    false,
-  );
+  assertEquals(handlingSummary(null), "Not assigned");
+  assertEquals(closureReasonLabel({ other: "Superseded" }), "Superseded");
 });
 
 Deno.test("Ticket authoring creates the target collection without singular authority", async () => {

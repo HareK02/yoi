@@ -1889,6 +1889,30 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     ) -> Result<Option<TicketRoleAssignmentRecord>>;
     /// Retained responsibility, including ended work and removed principals.
     /// Use the active variants for admission, routing, authorization or removal.
+    fn page_ticket_assignments(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        after_assignment_id: Option<&str>,
+        limit: usize,
+    ) -> Result<ticket::TicketAssignmentsPage>;
+    fn page_ticket_assignment_diagnostics(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        assignment_id: &str,
+        after_input_event_id: Option<&str>,
+        after_start_operation_id: Option<&str>,
+        limit: usize,
+    ) -> Result<server_api::TicketAssignmentDiagnosticsPage>;
+    fn answer_ticket_assignment(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        input: &ticket::TicketAssignmentAnswer,
+        source: &TicketOrchestratorAssignmentSourceContext,
+        actor: &str,
+    ) -> Result<ticket::TicketAssignmentAnswerReceipt>;
     fn update_ticket_assignment_tracking(
         &self,
         workspace_id: &str,
@@ -7872,6 +7896,50 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn page_ticket_assignments(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        after_assignment_id: Option<&str>,
+        limit: usize,
+    ) -> Result<ticket::TicketAssignmentsPage> {
+        assignment_tracking::assignments_page(
+            self,
+            workspace_id,
+            ticket_id,
+            after_assignment_id,
+            limit,
+        )
+    }
+    fn page_ticket_assignment_diagnostics(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        assignment_id: &str,
+        after_input_event_id: Option<&str>,
+        after_start_operation_id: Option<&str>,
+        limit: usize,
+    ) -> Result<server_api::TicketAssignmentDiagnosticsPage> {
+        assignment_delivery::diagnostics_page(
+            self,
+            workspace_id,
+            ticket_id,
+            assignment_id,
+            after_input_event_id,
+            after_start_operation_id,
+            limit,
+        )
+    }
+    fn answer_ticket_assignment(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        input: &ticket::TicketAssignmentAnswer,
+        source: &TicketOrchestratorAssignmentSourceContext,
+        actor: &str,
+    ) -> Result<ticket::TicketAssignmentAnswerReceipt> {
+        assignment_tracking::answer(self, workspace_id, ticket_id, input, source, actor)
+    }
     fn update_ticket_assignment_tracking(
         &self,
         workspace_id: &str,

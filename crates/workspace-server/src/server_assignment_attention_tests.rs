@@ -309,7 +309,11 @@ async fn orchestrator_attention_unknown_response_retry_keeps_id_and_payload() {
         "existing"
     );
     let retry = execution.take_inputs();
-    assert_eq!(retry.len(), 2, "acknowledged retry must also drain the changed backlog");
+    assert_eq!(
+        retry.len(),
+        2,
+        "acknowledged retry must also drain the changed backlog"
+    );
     assert_eq!(retry[0].1, pending.content);
     assert!(retry[1].1.contains("Changed backlog"));
     let ids = execution.take_input_request_ids();
@@ -760,11 +764,27 @@ async fn real_attention_worker_start_restore(lose_response: bool) {
     assert_eq!(receipts().len(), 1);
     assert_eq!(commits(), 1);
     // Only a new external input earns another delivery, not restore itself.
-    browser_ticket_backend(&api)
+    seed_test_api_token(api.store.as_ref(), "attention-answer");
+    let observed = api
+        .store
+        .list_current_ticket_assignment_tracking(TEST_WORKSPACE_ID, &ticket.id)
         .unwrap()
-        .add_event(
-            ticket.id.clone().into(),
-            ticket::NewTicketEvent::new(ticket::TicketEventKind::Comment, "New owner answer"),
+        .remove(0);
+    api.store
+        .answer_ticket_assignment(
+            TEST_WORKSPACE_ID,
+            &ticket.id,
+            &ticket::TicketAssignmentAnswer {
+                assignment_id: observed.assignment_id,
+                expected_last_event_id: observed.last_event_id.unwrap(),
+                operation_key: "attention-owner-answer".into(),
+                body: "New owner answer".into(),
+            },
+            &crate::store::TicketOrchestratorAssignmentSourceContext::Account {
+                account_id: "account-attention-answer".into(),
+                user_id: "user-attention-answer".into(),
+            },
+            "fixture-account",
         )
         .unwrap();
     maybe_dispatch_orchestrator_turn_end(&api, &worker.worker_id, Some(S::Running), S::Idle);

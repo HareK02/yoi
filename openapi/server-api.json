@@ -10607,6 +10607,171 @@
         ],
         "type": "object"
       },
+      "TicketAssignmentAnswer": {
+        "additionalProperties": false,
+        "properties": {
+          "assignment_id": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          },
+          "expected_last_event_id": {
+            "type": "string"
+          },
+          "operation_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "assignment_id",
+          "expected_last_event_id",
+          "operation_key",
+          "body"
+        ],
+        "type": "object"
+      },
+      "TicketAssignmentAnswerReceipt": {
+        "properties": {
+          "assignment_id": {
+            "type": "string"
+          },
+          "event_index": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "input_event_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "assignment_id",
+          "input_event_id",
+          "event_index"
+        ],
+        "type": "object"
+      },
+      "TicketAssignmentDiagnosticsPage": {
+        "properties": {
+          "actionable": {
+            "description": "Noncurrent/done/closed/released records are history, not pending work.",
+            "type": "boolean"
+          },
+          "assignment_id": {
+            "type": "string"
+          },
+          "current": {
+            "type": "boolean"
+          },
+          "input_origin_known": {
+            "type": "boolean"
+          },
+          "inputs": {
+            "items": {
+              "$ref": "#/components/schemas/TicketAssignmentInputDiagnostic"
+            },
+            "type": "array"
+          },
+          "next_input_event_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_start_operation_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "starts": {
+            "description": "Assignment-scoped admission evidence; not attributed to individual input.",
+            "items": {
+              "$ref": "#/components/schemas/TicketAssignmentStartDiagnostic"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "assignment_id",
+          "current",
+          "input_origin_known",
+          "actionable",
+          "inputs",
+          "starts"
+        ],
+        "type": "object"
+      },
+      "TicketAssignmentDiagnosticsQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "after_input_event_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "after_start_operation_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "assignment_id": {
+            "type": "string"
+          },
+          "limit": {
+            "format": "uint",
+            "maximum": 100,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "assignment_id"
+        ],
+        "type": "object"
+      },
+      "TicketAssignmentInputDeliveryState": {
+        "enum": [
+          "not_reserved",
+          "reserved",
+          "request_persisted",
+          "runtime_accepted"
+        ],
+        "type": "string"
+      },
+      "TicketAssignmentInputDiagnostic": {
+        "properties": {
+          "acceptance_outcome_unknown": {
+            "description": "Absence of a Runtime ack is not proof of failed external delivery.",
+            "type": "boolean"
+          },
+          "delivery_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "input_event_id": {
+            "type": "string"
+          },
+          "notification": {
+            "$ref": "#/components/schemas/TicketAssignmentInputDeliveryState"
+          }
+        },
+        "required": [
+          "input_event_id",
+          "notification",
+          "acceptance_outcome_unknown"
+        ],
+        "type": "object"
+      },
       "TicketAssignmentPrincipal": {
         "oneOf": [
           {
@@ -10790,6 +10955,45 @@
           "contributor"
         ],
         "type": "string"
+      },
+      "TicketAssignmentStartDiagnostic": {
+        "properties": {
+          "actual_processing_unknown": {
+            "description": "Existing records do not attest that a model processed a particular input.",
+            "type": "boolean"
+          },
+          "assignment_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "claim_state": {
+            "description": "Durable start/assignment reservation result, not Worker liveness.",
+            "type": "string"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "runtime_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "worker_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "operation_id",
+          "claim_state",
+          "actual_processing_unknown"
+        ],
+        "type": "object"
       },
       "TicketAssignmentSummary": {
         "additionalProperties": false,
@@ -11048,6 +11252,47 @@
           "operation_key",
           "tracking"
         ],
+        "type": "object"
+      },
+      "TicketAssignmentsPage": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/TicketAssignmentTrackingProjection"
+            },
+            "type": "array"
+          },
+          "next_assignment_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "TicketAssignmentsQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "after_assignment_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "uint",
+            "maximum": 100,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "TicketAttention": {
@@ -12821,12 +13066,34 @@
       "TicketQueryRequest": {
         "additionalProperties": false,
         "properties": {
+          "assigned_principal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketAssignmentPrincipalSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Exact current assigned principal; retained relationships do not match."
+          },
           "attention": {
             "default": [],
             "items": {
               "$ref": "#/components/schemas/TicketAttention"
             },
             "type": "array"
+          },
+          "closure_reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketClosureReason"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Exact reason of the current closed-case judgment; reopened/history-only reasons do not match."
           },
           "cursor": {
             "type": [
@@ -12847,6 +13114,17 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "handling_status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketAssignmentTrackingStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Explicit self-reported handling only; never inferred from Worker state."
           },
           "limit": {
             "format": "uint",
@@ -16834,7 +17112,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:8c8254cbe4ca8675f3dfffdf6e0eeecfda1c9213b285f571704648774efa497b"
+    "x-yoi-source-digest": "sha256:6ab084f6f5a2be53d373d869aa0202da571a6ff6a16852683958a23305bce7a9"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -36842,6 +37120,347 @@
         ]
       }
     },
+    "/api/w/{workspace_id}/tickets/{ticket_id}/assignment-answer": {
+      "post": {
+        "operationId": "ticket_assignment_answer_browser",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TicketAssignmentAnswer"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketAssignmentAnswerReceipt"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/tickets/{ticket_id}/assignment-diagnostics": {
+      "get": {
+        "operationId": "ticket_assignment_diagnostics_browser",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TicketAssignmentDiagnosticsQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketAssignmentDiagnosticsPage"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/tickets/{ticket_id}/assignment-tracking/assignments": {
+      "get": {
+        "operationId": "ticket_assignments_page_browser",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TicketAssignmentsQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketAssignmentsPage"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
     "/api/w/{workspace_id}/workers": {
       "get": {
         "operationId": "workspace_worker_list",
@@ -38897,6 +39516,240 @@
         }
       }
     },
+    "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-answer": {
+      "post": {
+        "operationId": "ticket_assignment_answer",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TicketAssignmentAnswer"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketAssignmentAnswerReceipt"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-diagnostics": {
+      "get": {
+        "operationId": "ticket_assignment_diagnostics",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TicketAssignmentDiagnosticsQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketAssignmentDiagnosticsPage"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
     "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking": {
       "get": {
         "operationId": "ticket_assignment_tracking_get",
@@ -39099,6 +39952,113 @@
             "description": "Error response"
           },
           "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking/assignments": {
+      "get": {
+        "operationId": "ticket_assignments_page",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TicketAssignmentsQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketAssignmentsPage"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
             "content": {
               "application/json": {
                 "schema": {

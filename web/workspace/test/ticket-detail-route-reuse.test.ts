@@ -25,12 +25,25 @@ Deno.test("ticket detail synchronizes reused route data", () => {
   }
 });
 
+Deno.test("ticket child operations reset across Workspaces even when the retained Ticket id matches", () => {
+  assertStringIncludes(
+    pageSource,
+    "{#key JSON.stringify([data.workspaceId, ticket.id])}",
+  );
+  const children = pageSource.slice(
+    pageSource.indexOf("{#key JSON.stringify([data.workspaceId, ticket.id])}"),
+    pageSource.indexOf("{/key}"),
+  );
+  assertStringIncludes(children, "<TicketTags");
+  assertStringIncludes(children, "<TicketHandling");
+  assertStringIncludes(children, "<TicketWorkerObservation");
+});
+
 Deno.test("ticket detail fences stale mutation responses", () => {
   for (
     const operation of [
       "async function mutate(",
-      "async function queueTicket(",
-      "async function caseDecision(",
+      "async function runCaseDecision(",
       "async function mutateAssignment(",
     ]
   ) {

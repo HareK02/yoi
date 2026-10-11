@@ -41,6 +41,8 @@ import type {
   TicketListItemSummary,
   TicketListResponse,
   TicketMergeRequestSummary,
+  TicketQueryItem,
+  TicketQueryResponse,
   TicketQueueOutcome,
   TicketRef,
   TicketReference,
@@ -335,7 +337,10 @@ function caseProjection(item: Record<string, unknown>, label: string) {
   };
 }
 
-function parseWorkspaceTag(value: unknown, label: string): WorkspaceTag {
+export function parseWorkspaceTag(
+  value: unknown,
+  label = "Workspace tag",
+): WorkspaceTag {
   const item = object(value, label);
   exact(item, [
     "workspace_id",
@@ -652,7 +657,7 @@ function parseTicketRoleAssignmentRecord(
   };
 }
 
-function parseAssignmentTracking(
+export function parseAssignmentTracking(
   value: unknown,
   label: string,
 ): TicketAssignmentTracking {
@@ -722,7 +727,7 @@ function parseAssignmentRelease(
   };
 }
 
-function parseAssignmentTrackingProjection(
+export function parseAssignmentTrackingProjection(
   value: unknown,
   label: string,
 ): TicketAssignmentTrackingProjection {
@@ -1748,5 +1753,154 @@ export function parseMergeRequestDetailResponse(
     ticket_ids: strings(item.ticket_ids, `${label}.ticket_ids`),
     updated_at: string(item.updated_at, `${label}.updated_at`),
     workspace_id: string(item.workspace_id, `${label}.workspace_id`),
+  };
+}
+
+export function parseTicketQueryResponse(value: unknown): TicketQueryResponse {
+  const label = "Ticket query response";
+  const page = object(value, label);
+  exact(page, ["items", "page", "record_authority"], label);
+  return {
+    page: parseQueryPage(page.page, `${label}.page`),
+    record_authority: string(
+      page.record_authority,
+      `${label}.record_authority`,
+    ),
+    items: array(
+      page.items,
+      `${label}.items`,
+      (value, label): TicketQueryItem => {
+        const item = object(value, label);
+        exact(item, [
+          "assignment_tracking",
+          "blocker_count",
+          "closure_operation_key",
+          "content_digest",
+          "created_at",
+          "current_closure",
+          "current_worker",
+          "evidence",
+          "id",
+          "legacy_handoff",
+          "linked_objective_ids",
+          "linked_objective_keys",
+          "matched_fields",
+          "matching_event",
+          "merge_request",
+          "merge_requests",
+          "priority",
+          "readiness",
+          "relation_count",
+          "resource_key",
+          "snippet",
+          "state",
+          "tags",
+          "title",
+          "unresolved_blocker_count",
+          "unresolved_review_count",
+          "updated_at",
+          "workspace_action_priority",
+        ], label);
+        return {
+          id: string(item.id, `${label}.id`),
+          resource_key: string(item.resource_key, `${label}.resource_key`),
+          title: string(item.title, `${label}.title`),
+          state: parseTicketState(item.state, `${label}.state`),
+          priority: string(item.priority, `${label}.priority`),
+          assignment_tracking: array(
+            item.assignment_tracking,
+            `${label}.assignment_tracking`,
+            parseAssignmentTrackingProjection,
+          ),
+          tags: array(item.tags, `${label}.tags`, parseWorkspaceTag),
+          blocker_count: integer(item.blocker_count, `${label}.blocker_count`),
+          unresolved_blocker_count: integer(
+            item.unresolved_blocker_count,
+            `${label}.unresolved_blocker_count`,
+          ),
+          unresolved_review_count: integer(
+            item.unresolved_review_count,
+            `${label}.unresolved_review_count`,
+          ),
+          relation_count: integer(
+            item.relation_count,
+            `${label}.relation_count`,
+          ),
+          content_digest: string(
+            item.content_digest,
+            `${label}.content_digest`,
+          ),
+          created_at: optionalNullableString(
+            item.created_at,
+            `${label}.created_at`,
+          ),
+          updated_at: optionalNullableString(
+            item.updated_at,
+            `${label}.updated_at`,
+          ),
+          closure_operation_key: optionalNullableString(
+            item.closure_operation_key,
+            `${label}.closure_operation_key`,
+          ),
+          current_closure: item.current_closure == null
+            ? item.current_closure as null | undefined
+            : parseClosure(item.current_closure, `${label}.current_closure`),
+          current_worker: item.current_worker == null
+            ? item.current_worker as null | undefined
+            : parseTicketAssignmentSummary(
+              item.current_worker,
+              `${label}.current_worker`,
+            ),
+          evidence: parseTicketEvidenceSummary(
+            item.evidence,
+            `${label}.evidence`,
+          ),
+          legacy_handoff: item.legacy_handoff == null
+            ? item.legacy_handoff as null | undefined
+            : parseLegacyHandoff(
+              item.legacy_handoff,
+              `${label}.legacy_handoff`,
+            ),
+          linked_objective_ids: strings(
+            item.linked_objective_ids,
+            `${label}.linked_objective_ids`,
+          ),
+          linked_objective_keys: strings(
+            item.linked_objective_keys,
+            `${label}.linked_objective_keys`,
+          ),
+          matched_fields: strings(
+            item.matched_fields,
+            `${label}.matched_fields`,
+          ),
+          matching_event: item.matching_event == null
+            ? item.matching_event as null | undefined
+            : parseTicketEvidenceEvent(
+              item.matching_event,
+              `${label}.matching_event`,
+            ),
+          merge_request: item.merge_request == null
+            ? item.merge_request as null | undefined
+            : parseTicketMergeRequestSummary(
+              item.merge_request,
+              `${label}.merge_request`,
+            ),
+          merge_requests: array(
+            item.merge_requests,
+            `${label}.merge_requests`,
+            parseTicketMergeRequestSummary,
+          ),
+          readiness: optionalNullableString(
+            item.readiness,
+            `${label}.readiness`,
+          ),
+          snippet: optionalNullableString(item.snippet, `${label}.snippet`),
+          workspace_action_priority: string(
+            item.workspace_action_priority,
+            `${label}.workspace_action_priority`,
+          ),
+        };
+      },
+    ),
   };
 }

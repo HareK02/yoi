@@ -392,16 +392,13 @@ Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", as
     "Tickets, Objectives, and Merge Requests should each be a single primary sidebar link",
   );
   assert(
-    ticketsLoad.includes("loadLane(fetch, workspaceId") &&
-      ticketsLoad.includes('limit: "30"') &&
-      ticketsLoad.includes('states: states.join(",")') &&
-      ticketsLoad.includes("/tickets?${search}") &&
-      !ticketsLoad.includes("/tickets/query") &&
+    ticketsLoad.includes("ticketQueryRequest(filters, [state])") &&
+      ticketsLoad.includes("/tickets/query") &&
+      ticketsLoad.includes('method: "POST"') &&
       ticketsPage.includes('class="ticket-kanban"') &&
       ticketsPage.includes("laneState") &&
-      ticketsPage.includes("loadMore(lane.id)") &&
-      ticketsPage.includes("handleLaneScroll(event, lane.id)"),
-    "Tickets list should fetch lightweight paginated summaries for each Kanban lane",
+      ticketsPage.includes("loadMore(lane.id)"),
+    "Tickets list must apply shared server query filters before paging case lanes",
   );
   assert(
     ticketPanelModel.includes('label: "Open"') &&
@@ -428,14 +425,16 @@ Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", as
   assert(
     ticketDetailLoad.includes("/repositories") &&
       ticketDetailPage.includes("ticketCaseRequest(ticket, action") &&
-      ticketDetailPage.includes("async function queueTicket") &&
+      ticketDetailPage.includes("TicketHandling") &&
       ticketDetailPage.includes("const path = ticketPath") &&
-      ticketDetailPage.includes("`${path}/queue`") &&
+      !ticketDetailPage.includes("queueTicket") &&
+      !ticketDetailPage.includes("markReady") &&
       !ticketDetailPage.includes("/merge-request/merge") &&
       ticketDetailPage.includes("mergeRequest.selector_from") &&
       ticketDetailPage.includes("summarySourceReviewStatus(mergeRequest)") &&
       ticketDetailPage.includes("mergeRequestPagePath") &&
-      ticketDetailPage.includes("await updateTicketCase(") &&
+      ticketDetailPage.includes("runCaseDecision") &&
+      ticketDetailPage.includes("TicketTags") &&
       ticketDetailPage.includes("mutateAssignment") &&
       ticketDetailPage.includes("can_start_manual_worker") &&
       ticketDetailPage.includes("ticket.relations.outgoing"),

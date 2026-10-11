@@ -405,6 +405,54 @@ impl SqliteWorkspaceAuthority {
                 .collect::<Vec<_>>();
             predicates.push(format!("t.workflow_state IN ({})", states.join(",")));
         }
+        if let Some(reason) = &query.closure_reason {
+            let encoded =
+                serde_json::to_string(reason).map_err(|e| Error::InvalidInput(e.to_string()))?;
+            let value = bind(SqlValue::Text(encoded));
+            predicates.push(format!("t.workflow_state='closed' AND EXISTS (SELECT 1 FROM typed_ticket_case_metadata m JOIN typed_ticket_case_history h ON h.workspace_id=m.workspace_id AND h.ticket_id=m.ticket_id AND h.operation_key=m.closure_operation_key WHERE m.workspace_id=t.workspace_id AND m.ticket_id=t.ticket_id AND json_extract(h.judgment_json,'$.action.reason')=json_extract({value},'$'))"));
+        }
+        if query.assigned_principal.is_some() || query.handling_status.is_some() {
+            let mut assignment = vec![
+                "a.workspace_id=t.workspace_id".to_string(),
+                "a.ticket_id=t.ticket_id".to_string(),
+            ];
+            if let Some(principal) = &query.assigned_principal {
+                match principal {
+                    ticket::TicketAssignmentPrincipalSnapshot::WorkspaceAgent { agent_key } => {
+                        let value = bind(SqlValue::Text(agent_key.clone()));
+                        assignment.push(format!(
+                            "a.principal_kind='workspace_agent' AND a.principal_id={value}"
+                        ));
+                    }
+                    ticket::TicketAssignmentPrincipalSnapshot::User { account_id } => {
+                        let value = bind(SqlValue::Text(account_id.clone()));
+                        assignment.push(format!(
+                            "a.principal_kind='user' AND a.principal_id={value}"
+                        ));
+                    }
+                    ticket::TicketAssignmentPrincipalSnapshot::Worker {
+                        runtime_id,
+                        worker_id,
+                    } => {
+                        let runtime = bind(SqlValue::Text(runtime_id.clone()));
+                        let worker = bind(SqlValue::Text(worker_id.clone()));
+                        assignment.push(format!("a.principal_kind='worker' AND a.runtime_id={runtime} AND a.worker_id={worker}"));
+                    }
+                }
+            }
+            if let Some(status) = &query.handling_status {
+                let value = match status {
+                    ticket::TicketAssignmentTrackingStatus::Waiting => "waiting",
+                    ticket::TicketAssignmentTrackingStatus::Inprogress => "inprogress",
+                    ticket::TicketAssignmentTrackingStatus::Done => "done",
+                };
+                let value = bind(SqlValue::Text(value.into()));
+                assignment.push(format!(
+                    "a.role='orchestrator' AND json_extract(a.tracking_json,'$.status')={value}"
+                ));
+            }
+            predicates.push(format!("EXISTS (SELECT 1 FROM ticket_current_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.assignment_id=c.assignment_id WHERE {})",assignment.join(" AND ")));
+        }
         for id in &query.tag_ids {
             let id = bind(SqlValue::Text(id.clone()));
             predicates.push(format!("EXISTS (SELECT 1 FROM typed_ticket_tags l JOIN workspace_tags tag ON tag.workspace_id=l.workspace_id AND tag.tag_id=l.tag_id WHERE l.workspace_id=t.workspace_id AND l.ticket_id=t.ticket_id AND l.tag_id={id} AND tag.deleted=0)"));
@@ -426,7 +474,9 @@ impl SqliteWorkspaceAuthority {
                 "(lower(t.title) LIKE {p} OR lower(t.body) LIKE {p} OR EXISTS (
                     SELECT 1 FROM typed_ticket_events e
                     WHERE e.workspace_id=t.workspace_id AND e.ticket_id=t.ticket_id
-                      AND lower(e.body) LIKE {p}))",
+                      AND lower(e.body) LIKE {p}) OR EXISTS (
+                    SELECT 1 FROM typed_ticket_case_history h WHERE h.workspace_id=t.workspace_id AND h.ticket_id=t.ticket_id
+                    AND lower(CAST(json_extract(h.judgment_json,'$.action.reason') AS TEXT)) LIKE {p}))",
                 p = pattern
             ));
         }
@@ -1121,6 +1171,7 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
             let summary = ticket_summary_from_ticket(&authoritative)?;
             let authoritative_body = authoritative.document.body.clone();
             let authoritative_events = authoritative.events.clone();
+            let authoritative_case_history = authoritative.case_history.clone();
             let detail = self.ticket_detail_from_ticket(
                 authoritative,
                 TicketShowRequest {
@@ -1134,6 +1185,7 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
                 &detail,
                 authoritative_body.as_str(),
                 &authoritative_events,
+                &authoritative_case_history,
                 &query,
             );
             let item = ticket_query_item(
@@ -1141,6 +1193,7 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
                 &detail,
                 authoritative_body.as_str(),
                 &authoritative_events,
+                &authoritative_case_history,
                 &query,
             );
             last_scanned_cursor = Some(make_ticket_cursor(&item, sort, &fingerprint));
@@ -1993,6 +2046,33 @@ fn ticket_evidence_summary(
 }
 
 fn validate_ticket_query(query: &TicketQueryRequest) -> Result<()> {
+    if let Some(ticket::TicketClosureReason::Other(text)) = &query.closure_reason
+        && (text.trim().is_empty() || text.len() > 1024 || text.contains('\0'))
+    {
+        return Err(Error::InvalidInput(
+            "Closure reason Other must be nonblank and at most 1024 bytes without NUL".into(),
+        ));
+    }
+    if let Some(principal) = &query.assigned_principal {
+        let ids: Vec<&str> = match principal {
+            ticket::TicketAssignmentPrincipalSnapshot::User { account_id } => vec![account_id],
+            ticket::TicketAssignmentPrincipalSnapshot::WorkspaceAgent { agent_key } => {
+                vec![agent_key]
+            }
+            ticket::TicketAssignmentPrincipalSnapshot::Worker {
+                runtime_id,
+                worker_id,
+            } => vec![runtime_id, worker_id],
+        };
+        if ids
+            .iter()
+            .any(|id| id.trim().is_empty() || id.len() > 1024 || id.chars().any(char::is_control))
+        {
+            return Err(Error::InvalidInput(
+                "Assigned principal requires bounded stable identities".into(),
+            ));
+        }
+    }
     for ids in [&query.tag_ids, &query.tag_ids_any, &query.tag_ids_none] {
         if ids.len() > 100 || ids.iter().any(|id| id.is_empty() || id.len() > 128) {
             return Err(Error::InvalidInput(
@@ -2181,11 +2261,27 @@ fn ticket_attention_matches(
     }
 }
 
+fn closure_reason_text(action: &ticket::TicketCaseAction) -> Option<String> {
+    let reason = match action {
+        ticket::TicketCaseAction::Close { reason }
+        | ticket::TicketCaseAction::CorrectClosure { reason } => reason,
+        ticket::TicketCaseAction::Reopen => return None,
+    };
+    Some(match reason {
+        ticket::TicketClosureReason::Completed => "completed".into(),
+        ticket::TicketClosureReason::NotPlanned => "not_planned".into(),
+        ticket::TicketClosureReason::Duplicate => "duplicate".into(),
+        ticket::TicketClosureReason::Unknown => "unknown".into(),
+        ticket::TicketClosureReason::Other(text) => format!("other {text}"),
+    })
+}
+
 fn ticket_matches_query(
     summary: &TicketSummary,
     detail: &TicketDetail,
     authoritative_body: &str,
     authoritative_events: &[TicketEvent],
+    authoritative_case_history: &[ticket::TicketCaseHistoryEntry],
     query: &TicketQueryRequest,
 ) -> bool {
     let has_tag = |id: &String| detail.tags.iter().any(|tag| &tag.id == id);
@@ -2311,7 +2407,10 @@ fn ticket_matches_query(
     }
     query.query.as_ref().is_none_or(|text| {
         let needle = text.to_lowercase();
-        summary.title.to_lowercase().contains(&needle)
+        authoritative_case_history.iter().any(|entry| {
+            closure_reason_text(&entry.action)
+                .is_some_and(|reason| reason.to_lowercase().contains(&needle))
+        }) || summary.title.to_lowercase().contains(&needle)
             || authoritative_body.to_lowercase().contains(&needle)
             || authoritative_events
                 .iter()
@@ -2324,6 +2423,7 @@ fn ticket_query_item(
     detail: &TicketDetail,
     authoritative_body: &str,
     authoritative_events: &[TicketEvent],
+    authoritative_case_history: &[ticket::TicketCaseHistoryEntry],
     query: &TicketQueryRequest,
 ) -> TicketQueryItem {
     let mut matched_fields = Vec::new();
@@ -2331,6 +2431,14 @@ fn ticket_query_item(
     let mut matching_event = None;
     if let Some(text) = query.query.as_ref() {
         let needle = text.to_lowercase();
+        if let Some(reason) = authoritative_case_history
+            .iter()
+            .filter_map(|entry| closure_reason_text(&entry.action))
+            .find(|reason| reason.to_lowercase().contains(&needle))
+        {
+            matched_fields.push("closure_reason".into());
+            snippet = Some(reason);
+        }
         if summary.title.to_lowercase().contains(&needle) {
             matched_fields.push("title".to_string());
             snippet = Some(summary.title.clone());

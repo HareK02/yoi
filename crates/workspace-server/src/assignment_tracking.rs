@@ -171,3 +171,45 @@ pub(super) fn history_page(
         })
     })
 }
+
+pub(super) fn assignments_page(
+    store: &SqliteWorkspaceStore,
+    workspace_id: &str,
+    ticket_id: &str,
+    after_assignment_id: Option<&str>,
+    limit: usize,
+) -> Result<ticket::TicketAssignmentsPage> {
+    store.with_conn(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        ticket::sqlite_ticket_assignments_page(
+            &tx,
+            workspace_id,
+            ticket_id,
+            after_assignment_id,
+            limit,
+        )
+        .map_err(|e| Error::InvalidInput(e.to_string()))
+    })
+}
+
+pub(super) fn answer(
+    store: &SqliteWorkspaceStore,
+    workspace_id: &str,
+    ticket_id: &str,
+    input: &ticket::TicketAssignmentAnswer,
+    source: &TicketOrchestratorAssignmentSourceContext,
+    actor: &str,
+) -> Result<ticket::TicketAssignmentAnswerReceipt> {
+    store.with_conn_mut(|conn| {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_assignment_source(&tx,workspace_id,source)?;
+        // Replay retains its saved result after assignment replacement; new input
+        // must still be admitted by the exact current operational delegation.
+        let replay: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM typed_ticket_assignment_tracking_operations WHERE workspace_id=?1 AND operation_key=?2)",params![workspace_id,input.operation_key],|r| r.get(0))?;
+        if !replay { assignment_delivery::require_current(&tx,workspace_id,ticket_id,&input.assignment_id)?; }
+        let source = serde_json::to_value(source).map_err(|e| Error::Store(e.to_string()))?;
+        let result = ticket::sqlite_answer_ticket_assignment_in_transaction(&tx,workspace_id,ticket_id,input,&source,actor).map_err(|e| Error::TicketAssignmentConflict(e.to_string()))?;
+        tx.commit()?;
+        Ok(result)
+    })
+}
