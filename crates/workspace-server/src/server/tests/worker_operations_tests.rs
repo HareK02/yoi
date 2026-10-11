@@ -830,7 +830,11 @@ async fn grant_replacement_while_admission_waits_cannot_use_another_grants_lock(
     };
     let admission = handle.set_pinned(&context, true);
     tokio::pin!(admission);
-    // Poll deterministically to the held lock before replacing grant authority.
+    // The first poll can now be waiting for the offloaded authority read, not
+    // the held grant lock. Drain this fixture's actual SQL, then poll its saved
+    // reply to reach admission before replacing authority.
+    assert!(futures::poll!(admission.as_mut()).is_pending());
+    api.store.db_executor().drain().await.unwrap();
     assert!(futures::poll!(admission.as_mut()).is_pending());
     api.store
         .revoke_worker_control_grant(

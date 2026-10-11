@@ -46490,6 +46490,17 @@ mod tests {
                 .iter()
                 .all(|(_, content)| { !content.contains("[Ticket item checker advisory]") })
         );
+        // Terminal SQL state is not actual cleanup completion. Keep this
+        // fixture's Tokio driver alive through accepted Host/cleanup work before
+        // dropping it, so a pending teardown timer cannot run on a dead runtime.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            api.host_executors.host().unwrap().drain().await.unwrap();
+            api.host_executors.cleanup().unwrap().drain().await.unwrap();
+            api.worker_projection.shutdown_async().await;
+            api.store.db_executor().drain().await.unwrap();
+        })
+        .await
+        .expect("checker fixture must finish accepted cleanup before runtime shutdown");
     }
 
     #[tokio::test]
@@ -56837,6 +56848,8 @@ mod tests {
         .unwrap();
         let worker = orchestrator.worker.unwrap();
         let worker = RuntimeWorkerRef::new(worker.runtime_id, worker.worker_id);
+        let mut stop_events = api.worker_projection.subscribe_ordered(10).unwrap();
+        let _ = stop_events.take_snapshot();
         api.runtime
             .stop_worker(
                 &worker,
@@ -56846,6 +56859,25 @@ mod tests {
                 },
             )
             .unwrap();
+        // A synchronous Runtime stop no longer implies that its queued SQL
+        // projection was published. Observe stopped before taking the removal
+        // baseline, rather than mistaking its Upsert for the atomic removal.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let event = stop_events.recv().await.unwrap();
+                if event.changes.iter().any(|change| matches!(
+                    change,
+                    crate::store::WorkerCatalogChange::Upsert(record)
+                        if record.registry.worker == worker
+                            && record.observation.as_ref().is_some_and(|observation|
+                                observation.worker.state == protocol::subscription::SubscriptionWorkerState::Stopped)
+                )) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("stopped Runtime observation must commit before removal baseline");
         let worker_root = workspace
             .path()
             .join(".test-embedded-runtime-store/workers")
