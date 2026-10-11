@@ -14,7 +14,21 @@ nonblocking queue send and a separate actual-job budget (worker count plus queue
 capacity); rejection means the operation was **not accepted**. HTTP maps capacity
 and executor unavailability to 503, not authentication failure or deletion conflict.
 Tests can inject a dedicated executor with explicit limits, without process-global
-settings or environment variables.
+settings or environment variables. Ordinary SQLite fixtures use `open_for_test`,
+`in_memory_for_test`, or `from_connection_for_test`: their clones share their own
+1-worker/32-queued owner, not the production singleton or another fixture's drain.
+Server/Workspace fixture constructors likewise inject a lazy `HostExecutors` owner;
+all child Workspaces and weak retention adapters use that same owner. Host and
+cleanup still have the production 2-worker/16-queued limits. Dropping the final
+sender closes its queue after accepted work finishes; idle fixture threads are
+not kept in a process-global fixture cache.
+
+The restore intent journal and Workspace deletion use
+`with_immediate_transaction`: read authority/journal state only after acquiring
+SQLite write ownership. A DEFERRED read-to-write upgrade can return BUSY without
+invoking SQLite's busy handler when another connection is writing. Moving these
+whole helpers to an offloaded caller must not create an automatic mutation retry.
+
 
 Accepted work is owned by the worker, not the Tokio waiter. Cancelling a waiter:
 
@@ -83,7 +97,11 @@ or reconstruct processing evidence from Worker liveness.
   before/after commit; discarded reply cleanup and retained authority; child jobs.
 - `server::db_execution_tests`: HTTP Ticket writes and cold/warm Subjektiv scope
   opening/mutation under a separate SQLite connection's write lock; overload;
-  cancelled HTTP jobs and Workspace deletion drain.
+  cancelled HTTP jobs and Workspace deletion drain; same-budget fixture isolation,
+  saturated/cancelled Host jobs versus cleanup and paused Tokio time; restore intent
+  contention before the first authority read, with one persisted tuple and no retry.
+  The terminal checker fixture keeps its original Tokio driver alive through accepted cleanup,
+  then shuts down projection producers and drains actual DB jobs.
 - `worker_projection::tests`: real SQL contention, commit/payload publication,
   ordered snapshot registration, and replacement draining a cancelled consumer's
   accepted SQL before applying a new Runtime snapshot.
