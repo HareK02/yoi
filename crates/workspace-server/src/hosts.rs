@@ -1297,8 +1297,8 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
     fn observation_source(
         &self,
         _worker_id: &str,
-    ) -> Option<crate::observation::RuntimeObservationSource> {
-        None
+    ) -> Result<Option<crate::observation::RuntimeObservationSource>, RuntimeDiagnostic> {
+        Ok(None)
     }
 
     fn send_input(&self, worker_id: &str, _request: WorkerInputRequest) -> WorkerInputResult {
@@ -2236,6 +2236,11 @@ impl RuntimeRegistry {
         let runtime = self.runtime(runtime_id)?;
         runtime
             .observation_source(worker_id)
+            .map_err(|diagnostic| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.to_owned(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+            })?
             .ok_or_else(|| RuntimeRegistryError::UnknownWorker {
                 worker: worker.clone(),
             })
@@ -3203,17 +3208,21 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
     fn observation_source(
         &self,
         worker_id: &str,
-    ) -> Option<crate::observation::RuntimeObservationSource> {
-        let worker_ref = self.worker_ref(worker_id)?;
+    ) -> Result<Option<crate::observation::RuntimeObservationSource>, RuntimeDiagnostic> {
+        let Some(worker_ref) = self.worker_ref(worker_id) else {
+            return Ok(None);
+        };
         if self.runtime.worker_detail(&worker_ref).is_err() {
-            return None;
+            return Ok(None);
         }
-        Some(crate::observation::RuntimeObservationSource::embedded(
-            crate::observation::EmbeddedRuntimeObservationSource {
-                worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
-                runtime: self.runtime.clone(),
-                worker_ref,
-            },
+        Ok(Some(
+            crate::observation::RuntimeObservationSource::embedded(
+                crate::observation::EmbeddedRuntimeObservationSource {
+                    worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
+                    runtime: self.runtime.clone(),
+                    worker_ref,
+                },
+            ),
         ))
     }
 
@@ -5324,20 +5333,22 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
     fn observation_source(
         &self,
         worker_id: &str,
-    ) -> Option<crate::observation::RuntimeObservationSource> {
+    ) -> Result<Option<crate::observation::RuntimeObservationSource>, RuntimeDiagnostic> {
         let path = format!("/v1/workers/{worker_id}/protocol/ws");
         let bearer_token = match &self.workspace_authorization {
-            Some(authorization) => authorization
-                .issue("GET", &path, "workers:protocol", Some(worker_id), &[])
-                .ok(),
+            Some(authorization) => {
+                Some(authorization.issue("GET", &path, "workers:protocol", Some(worker_id), &[])?)
+            }
             None => self.bearer_token.clone(),
         };
-        Some(crate::observation::RuntimeObservationSource::remote_ws(
-            crate::observation::RuntimeObservationSourceConfig {
-                worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
-                endpoint: self.ws_endpoint(worker_id),
-                bearer_token,
-            },
+        Ok(Some(
+            crate::observation::RuntimeObservationSource::remote_ws(
+                crate::observation::RuntimeObservationSourceConfig {
+                    worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
+                    endpoint: self.ws_endpoint(worker_id),
+                    bearer_token,
+                },
+            ),
         ))
     }
 

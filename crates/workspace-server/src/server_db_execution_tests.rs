@@ -848,7 +848,70 @@ fn install_remote_fixture(
     binding
 }
 
-
+#[tokio::test(flavor = "current_thread")]
+async fn cold_protocol_source_signing_waits_off_tokio_and_never_falls_back_on_overload_or_revocation()
+ {
+    let fixture = Fixture::new().await;
+    let binding = install_remote_fixture(&fixture, "protocol-runtime", "http://127.0.0.1:9", true);
+    let worker = RuntimeWorkerRef::new(&binding.runtime_id, "source-worker");
+    let (mut busy, waiting) = BusyObservation::install_store(fixture.store.clone());
+    let mut lock = WriteLock::acquire(fixture.api.config.database_path.clone());
+    let writer = fixture.store.clone();
+    fixture
+        .executor
+        .dispatch(move || {
+            writer
+                .mark_api_token_used("missing-token", "2026-01-01T00:00:00Z")
+                .unwrap()
+        })
+        .unwrap();
+    observed(waiting).await.unwrap(); // SQL holds the actual shared connection mutex.
+    let mut source = Box::pin(workspace_worker_protocol_source(&fixture.api, &worker));
+    assert!(futures::poll!(&mut source).is_pending());
+    runtime_progress_while_locked(&lock).await;
+    assert!(futures::poll!(&mut source).is_pending());
+    assert!(
+        matches!(
+            workspace_worker_protocol_source(&fixture.api, &worker).await,
+            Err(Error::DbCapacityExceeded)
+        ),
+        "overload must not return an unsigned or legacy-bearer source"
+    );
+    lock.release();
+    busy.resume();
+    let RuntimeObservationSource::RemoteWs(config) = observed(source).await.unwrap() else {
+        panic!("remote source expected")
+    };
+    let first = config
+        .bearer_token
+        .expect("fresh Workspace capability is required");
+    assert_ne!(first, "must-not-fall-back");
+    let RuntimeObservationSource::RemoteWs(second) =
+        workspace_worker_protocol_source(&fixture.api, &worker)
+            .await
+            .unwrap()
+    else {
+        panic!("remote source expected")
+    };
+    assert_ne!(
+        first,
+        second.bearer_token.unwrap(),
+        "cold lookup must sign a fresh request, not cache authentication success"
+    );
+    fixture
+        .store
+        .revoke_workspace_runtime_binding(WORKSPACE, &binding.runtime_id, "2026-01-02T00:00:00Z")
+        .unwrap();
+    let error = workspace_worker_protocol_source(&fixture.api, &worker)
+        .await
+        .err()
+        .expect("revoked authority cannot produce any source");
+    assert!(
+        matches!(error, Error::RuntimeOperationFailed { ref code, .. } if code == "workspace_runtime_authorization_stale"),
+        "{error:?}"
+    );
+    fixture.executor.drain().await.unwrap();
+}
 
 // Loopback fake at the Session/Worker Runtime HTTP boundary. It owns one reply,
 // released by an explicit event; Drop unblocks accept/read and joins on failure.

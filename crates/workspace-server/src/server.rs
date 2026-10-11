@@ -31468,20 +31468,7 @@ pub(crate) async fn connect_workspace_worker_protocol(
     worker: &RuntimeWorkerRef,
     input_source: Option<&protocol::AuthenticatedInputSource>,
 ) -> Result<WorkspaceWorkerProtocolConnection> {
-    let source = match api.observation_proxy.source(worker) {
-        Ok(source) => source,
-        Err(ObservationProxyError::WorkerNotFound(_)) => api
-            .runtime
-            .observation_source(worker)
-            .map_err(|error| error.into_error())?,
-        Err(error) => {
-            return Err(Error::RuntimeOperationFailed {
-                runtime_id: worker.runtime_id.clone(),
-                code: error.code().to_string(),
-                message: error.message().to_string(),
-            });
-        }
-    };
+    let source = workspace_worker_protocol_source(api, worker).await?;
     match source {
         RuntimeObservationSource::RemoteWs(config) => {
             connect_remote_worker_protocol(config, input_source).await
@@ -31492,6 +31479,37 @@ pub(crate) async fn connect_workspace_worker_protocol(
             connect_embedded_worker_protocol(source, scope).await
         }
     }
+}
+
+// Cold source discovery includes live authority/signing reads. Keep the whole
+// synchronous callback on its admitted DB owner, not the Tokio WS task.
+async fn workspace_worker_protocol_source(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+) -> Result<RuntimeObservationSource> {
+    let source = match api.observation_proxy.source(worker) {
+        Ok(source) => source,
+        Err(ObservationProxyError::WorkerNotFound(_)) => {
+            let runtime = api.runtime.clone();
+            let worker = worker.clone();
+            api.store
+                .db_executor()
+                .run(move || {
+                    runtime
+                        .observation_source(&worker)
+                        .map_err(|error| error.into_error())
+                })
+                .await?
+        }
+        Err(error) => {
+            return Err(Error::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: error.code().to_string(),
+                message: error.message().to_string(),
+            });
+        }
+    };
+    Ok(source)
 }
 
 fn insert_authenticated_input_source_header(
