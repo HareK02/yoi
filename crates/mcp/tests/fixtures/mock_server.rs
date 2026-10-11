@@ -6,8 +6,11 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 fn main() {
-    let mode = env::var("YOI_MCP_MOCK_MODE").unwrap_or_else(|_| "success".to_string());
+    let mode = env::args()
+        .nth(1)
+        .unwrap_or_else(|| env::var("YOI_MCP_MOCK_MODE").unwrap_or_else(|_| "success".to_string()));
     match mode.as_str() {
+        "stdin-unread" => stdin_unread(),
         "success" => success(),
         "tools" => tools_list(),
         "tools-call-normal" => tools_call_normal(),
@@ -19,6 +22,20 @@ fn main() {
         "list-changed-all" => list_changed_all(),
         "shutdown-hang" => shutdown_hang(),
         other => panic!("unknown mock mode: {other}"),
+    }
+}
+
+fn stdin_unread() {
+    let init = read_json();
+    assert_eq!(init["method"], "initialize");
+    write_json(json!({"jsonrpc": "2.0", "id": init["id"], "result": initialize_result()}));
+    assert_eq!(read_json()["method"], "notifications/initialized");
+    // Protocol barrier: the host only writes its oversized call after this ack.
+    let ready = read_json();
+    assert_eq!(ready["method"], "fixture/ready");
+    write_json(json!({"jsonrpc": "2.0", "id": ready["id"], "result": {"ready": true}}));
+    loop {
+        thread::park();
     }
 }
 

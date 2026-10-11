@@ -278,3 +278,48 @@ async fn sampling_requests_fail_closed_and_are_not_advertised() {
     let shutdown = client.shutdown().await.expect("shutdown succeeds");
     assert!(shutdown.exit_status.is_some_and(|status| status.success()));
 }
+
+#[tokio::test]
+async fn unread_stdin_request_times_out_during_write_and_closes_before_reuse() {
+    let limits = McpStdioLimits {
+        request_timeout: Duration::from_millis(100),
+        ..tight_limits()
+    };
+    let spec = McpStdioServerSpec::new("unread-stdin", env!("CARGO_BIN_EXE_mcp-stdio-mock-server"))
+        .arg("stdin-unread");
+    let mut client = McpStdioClient::connect(spec, limits).await.unwrap();
+    let ready: serde_json::Value = client
+        .request(McpPhase::Running, "fixture/ready", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(ready["ready"], true);
+    // Far beyond OS pipe capacity, but inside the existing protocol bound.
+    let call = CallToolRequest::new(
+        "write-blocked",
+        serde_json::json!({"payload": "x".repeat(768 * 1024)}),
+    );
+    let err = tokio::time::timeout(Duration::from_secs(1), client.call_tool(call))
+        .await
+        .expect("the whole request, not only response wait, is bounded")
+        .unwrap_err();
+    assert!(
+        matches!(err.kind, McpErrorKind::Timeout { ref operation, .. } if operation == "tools/call")
+    );
+    assert_eq!(
+        err.request_stage(),
+        Some(mcp::stdio::McpRequestStage::WritingFrame)
+    );
+    // The fixture barrier and reported stage establish actual write backpressure;
+    // the separate controlled fixture also verifies the exact partial bytes.
+    let next = client
+        .request::<serde_json::Value>(McpPhase::Running, "fixture/next", serde_json::json!({}))
+        .await
+        .unwrap_err();
+    assert!(next.to_string().contains("stdin is closed"));
+    let report = tokio::time::timeout(Duration::from_secs(1), client.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(report.terminated || report.killed);
+    assert!(report.exit_status.is_some());
+}
