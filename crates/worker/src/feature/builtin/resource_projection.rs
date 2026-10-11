@@ -17,6 +17,7 @@ struct ModelTicketQueryItem {
     closure_operation_key: Option<String>,
     current_closure: Option<ticket::TicketClosureJudgment>,
     legacy_handoff: Option<ticket::TicketLegacyWorkflowSnapshot>,
+    assignment_tracking: Vec<ModelAssignmentTracking>,
     tags: Vec<ticket::WorkspaceTag>,
     readiness: Option<String>,
     priority: Option<String>,
@@ -46,6 +47,7 @@ pub(super) struct ModelTicketDetail {
     closure_operation_key: Option<String>,
     current_closure: Option<ticket::TicketClosureJudgment>,
     legacy_handoff: Option<ticket::TicketLegacyWorkflowSnapshot>,
+    assignment_tracking: Vec<ModelAssignmentTracking>,
     tags: Vec<ticket::WorkspaceTag>,
     readiness: Option<String>,
     priority: Option<String>,
@@ -96,6 +98,21 @@ pub(super) struct ModelObjectiveDetail {
     linked_tickets: Vec<ModelTicketSummary>,
     events: Vec<ModelObjectiveEvent>,
     event_page: ModelObjectiveEventPage,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelAssignmentTracking {
+    assignment_id: String,
+    role: String,
+    principal: ticket::TicketAssignmentPrincipalSnapshot,
+    assigned_by: String,
+    assigned_at: String,
+    release: Option<ticket::TicketAssignmentRelease>,
+    current: bool,
+    tracking: Option<ticket::TicketAssignmentTracking>,
+    last_event_id: Option<String>,
+    updated_at: Option<String>,
+    migration_diagnostic: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -266,6 +283,7 @@ fn project_ticket_query_item(value: &Value) -> Result<ModelTicketQueryItem, Stri
         closure_operation_key: typed_field(item, "closure_operation_key")?,
         current_closure: typed_field(item, "current_closure")?,
         legacy_handoff: typed_field(item, "legacy_handoff")?,
+        assignment_tracking: project_assignment_tracking(item)?,
         tags: project_tags(item)?,
         readiness: optional_string(item, "readiness")?,
         priority: optional_string(item, "priority")?,
@@ -322,6 +340,7 @@ pub(super) fn project_ticket_detail(value: Value) -> Result<ModelTicketDetail, S
         current_closure: typed_field(root, "current_closure")?,
         legacy_handoff: typed_field(root, "legacy_handoff")?,
         closure_history: typed_field(root, "closure_history")?,
+        assignment_tracking: project_assignment_tracking(root)?,
         tags: project_tags(root)?,
         readiness: optional_string(root, "readiness")?,
         priority: optional_string(root, "priority")?,
@@ -672,6 +691,36 @@ fn object_field<'a>(
         .ok_or_else(|| format!("missing or invalid {key}"))
 }
 
+fn project_assignment_tracking(
+    object: &Map<String, Value>,
+) -> Result<Vec<ModelAssignmentTracking>, String> {
+    let values = array_field(object, "assignment_tracking")?;
+    if values.len() > 1 {
+        return Err("Ticket has more than one current Orchestrator delegation".into());
+    }
+    values
+        .iter()
+        .map(|value| {
+            let projection: ticket::TicketAssignmentTrackingProjection =
+                serde_json::from_value(value.clone())
+                    .map_err(|error| format!("invalid assignment tracking: {error}"))?;
+            Ok(ModelAssignmentTracking {
+                assignment_id: projection.assignment_id,
+                role: projection.role,
+                principal: projection.principal,
+                assigned_by: projection.assigned_by,
+                assigned_at: projection.assigned_at,
+                release: projection.release,
+                current: projection.current,
+                tracking: projection.tracking,
+                last_event_id: projection.last_event_id,
+                updated_at: projection.updated_at,
+                migration_diagnostic: projection.migration_diagnostic,
+            })
+        })
+        .collect()
+}
+
 fn project_tags(object: &Map<String, Value>) -> Result<Vec<ticket::WorkspaceTag>, String> {
     let values = array_field(object, "tags")?;
     if values.len() > 100 {
@@ -770,7 +819,7 @@ mod tests {
     fn mrless_evidence_is_inapplicable_not_missing_or_vacuously_approved() {
         for state in ["open", "closed"] {
             let projected = project_ticket_detail(json!({
-                "resource_key": "T-718", "tags": [], "content_digest": "rev-1", "title": "No Git required", "body": "Decision",
+                "resource_key": "T-718", "assignment_tracking": [], "tags": [], "content_digest": "rev-1", "title": "No Git required", "body": "Decision",
                 "closure_operation_key": null, "current_closure": null, "closure_history": [], "legacy_handoff": null,
                 "state": state, "events": [{"sequence": 1, "kind": "completed", "body": "No Git needed"}],
                 "linked_objectives": [], "assignments": [], "implementation_reports": [],
@@ -812,7 +861,7 @@ mod tests {
             "queued_by": "workspace-user:alice", "queued_at": "2025-12-31T00:00:00Z", "resolution": null
         });
         let response = json!({
-            "tags": [{"workspace_id":"ws", "id":"tag-1", "name":"closed", "last_operation_key":"tag-create", "deleted":false}],
+            "assignment_tracking": [], "tags": [{"workspace_id":"ws", "id":"tag-1", "name":"closed", "last_operation_key":"tag-create", "deleted":false}],
             "resource_key": "T-739", "content_digest": "content-digest", "title": "Case", "body": "Requirements",
             "state": "open", "closure_operation_key": "close-1", "current_closure": null,
             "closure_history": history, "legacy_handoff": legacy,
@@ -857,7 +906,7 @@ mod tests {
             "linked_tickets": ["00001M0E82D1V"],
             "linked_ticket_summaries": [{
                 "id": "00001M0E82D1V",
-                "resource_key": "T-496", "tags": [],
+                "resource_key": "T-496", "assignment_tracking": [], "tags": [],
                 "title": "Ticket",
                 "state": "closed",
                 "updated_at": "2026-01-02T00:00:00Z"
@@ -888,7 +937,7 @@ mod tests {
             "record_authority": "workspace_sqlite",
             "items": [{
                 "id": "00001TICKETINTERNAL",
-                "resource_key": "T-543", "tags": [],
+                "resource_key": "T-543", "assignment_tracking": [], "tags": [],
                 "title": "Ticket",
                 "state": "open",
                 "closure_operation_key": null, "current_closure": null, "legacy_handoff": null,
@@ -960,7 +1009,7 @@ mod tests {
     fn ticket_detail_projection_accepts_current_blocker_shape() {
         let projected = project_ticket_detail(json!({
             "id": "internal-ticket",
-            "resource_key": "T-588", "tags": [],
+            "resource_key": "T-588", "assignment_tracking": [], "tags": [],
             "content_digest": "ticket-content-digest",
                 "closure_operation_key": null, "current_closure": null, "closure_history": [], "legacy_handoff": null,
             "title": "Queued Submit",
@@ -1064,7 +1113,7 @@ mod tests {
                 "review_excerpt": "Reviewed source"
             });
             let projected = project_ticket_detail(json!({
-                "resource_key": "T-716", "tags": [],
+                "resource_key": "T-716", "assignment_tracking": [], "tags": [],
                 "content_digest": "current-ticket-content-digest",
                 "closure_operation_key": null, "current_closure": null, "closure_history": [], "legacy_handoff": null,
                 "title": "Source evidence",
@@ -1246,13 +1295,14 @@ mod tests {
         assert!(error.contains("W-"));
     }
     #[test]
-    fn ticket_query_and_detail_preserve_classification_separately_from_closure_judgment() {
+    fn ticket_query_and_detail_preserve_case_classification_and_delegation_independently() {
+        let tracking = json!({"workspace_id":"ws", "ticket_id":"internal-id", "assignment_id":"delegation", "role":"orchestrator", "principal":{"kind":"workspace_agent","agent_key":"workspace-orchestrator"}, "assigned_by":"workspace-user:alice", "assigned_at":"2026-01-01T00:00:00Z", "release":null, "current":true, "last_event_id":"reported", "updated_at":"2026-01-01T00:00:00Z", "migration_diagnostic":null, "tracking":{"status":"waiting", "waiting_reason":"Human answer", "progress":null, "next_action":"Compare the response", "result":null}});
         let tag = json!({"workspace_id":"ws", "id":"tag-1", "name":"closed", "last_operation_key":"tag-create", "deleted":false});
         let closure = json!({"operation_key":"close-1", "reason":"not_planned", "explanation":"Not proceeding", "references":[{"kind":"ticket", "target":"T-12"}], "author":"workspace-user:alice", "at":"2026-01-01T00:00:00Z"});
         let history = json!([{"operation_key":"close-1", "previous_closure_operation_key":null, "action":{"action":"close", "reason":"not_planned"}, "explanation":"Not proceeding", "references":[{"kind":"ticket", "target":"T-12"}], "author":"workspace-user:alice", "at":"2026-01-01T00:00:00Z"}]);
         let detail = json!({
             "resource_key":"T-739", "title":"Case", "body":"Requirements", "content_digest":"content-1",
-            "state":"closed", "tags":[tag], "closure_operation_key":"close-1", "current_closure":closure,
+            "state":"closed", "assignment_tracking": [tracking], "tags":[tag], "closure_operation_key":"close-1", "current_closure":closure,
             "legacy_handoff":null, "closure_history":history, "events":[], "linked_objectives":[], "assignments":[], "implementation_reports":[], "merge_requests":[]
         });
         let mut item = detail.clone();
@@ -1287,6 +1337,14 @@ mod tests {
                 projected_query["tickets"][0][field], detail[field],
                 "query {field}"
             );
+        }
+        for projected in [&projected_detail, &projected_query["tickets"][0]] {
+            let actual = &projected["assignment_tracking"][0];
+            assert_eq!(actual["assignment_id"], "delegation");
+            assert_eq!(actual["last_event_id"], "reported");
+            assert_eq!(actual["tracking"], tracking["tracking"]);
+            assert!(actual.get("workspace_id").is_none());
+            assert!(actual.get("ticket_id").is_none());
         }
         assert_eq!(projected_detail["closure_history"], history);
         assert_eq!(projected_detail["content_digest"], "content-1");

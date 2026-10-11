@@ -4,6 +4,7 @@
 //! module binds an authority-scoped Workspace client, declares the built-in
 //! feature, and contributes those tools through the normal registry path.
 
+mod assignment_tracking;
 mod tags;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -443,6 +444,9 @@ fn workspace_ticket_decision_definition(
 fn workspace_ticket_tool_description(name: &str) -> String {
     match name {
         "TicketCaseUpdate" => TICKET_CASE_UPDATE_DESCRIPTION.into(),
+        name if assignment_tracking::TOOL_NAMES.contains(&name) => {
+            assignment_tracking::description(name).into()
+        }
         name if tags::TAG_TOOL_NAMES.contains(&name) => tags::description(name).into(),
         _ => ticket_tool_description(name, None),
     }
@@ -576,6 +580,12 @@ impl TicketFeatureAccess {
             .chain(tags::TAG_TOOL_NAMES.iter().copied().filter(|name| {
                 *name == "WorkspaceTagList" || self.authoring || self.workflow || self.thread
             }))
+            .chain(
+                assignment_tracking::TOOL_NAMES
+                    .iter()
+                    .copied()
+                    .filter(|name| *name != "TicketAssignmentTrackingUpdate" || self.workflow),
+            )
             .collect()
     }
 
@@ -592,7 +602,13 @@ impl TicketFeatureAccess {
     }
 }
 
-const READ_ONLY_TOOL_NAMES: &[&str] = &["QueryTicket", "ShowTicket", "WorkspaceTagList"];
+const READ_ONLY_TOOL_NAMES: &[&str] = &[
+    "QueryTicket",
+    "ShowTicket",
+    "WorkspaceTagList",
+    "TicketAssignmentTrackingQuery",
+    "TicketAssignmentTrackingHistory",
+];
 
 const AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketCreate",
@@ -625,6 +641,8 @@ const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "WorkspaceTagRename",
     "WorkspaceTagDelete",
     "TicketTagsSet",
+    "TicketAssignmentTrackingQuery",
+    "TicketAssignmentTrackingHistory",
 ];
 
 #[cfg(test)]
@@ -643,6 +661,9 @@ const WORKFLOW_TOOL_NAMES: &[&str] = &[
     "WorkspaceTagRename",
     "WorkspaceTagDelete",
     "TicketTagsSet",
+    "TicketAssignmentTrackingQuery",
+    "TicketAssignmentTrackingHistory",
+    "TicketAssignmentTrackingUpdate",
 ];
 
 const WORKFLOW_ADDITIONAL_TOOL_NAMES: &[&str] = &[
@@ -1515,6 +1536,24 @@ fn native_ticket_operation(tool_name: &str) -> Option<NativeTicketOperation> {
             identity_field: Some("ticket"),
             mutating: true,
         },
+        "TicketAssignmentTrackingQuery" => NativeTicketOperation {
+            operation: "assignment_tracking_query",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: false,
+        },
+        "TicketAssignmentTrackingHistory" => NativeTicketOperation {
+            operation: "assignment_tracking_history",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: false,
+        },
+        "TicketAssignmentTrackingUpdate" => NativeTicketOperation {
+            operation: "assignment_tracking_update",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: true,
+        },
         "TicketCaseUpdate" => NativeTicketOperation {
             operation: "case_update",
             surface: NativeTicketSurface::Item,
@@ -1602,6 +1641,15 @@ pub(crate) fn enabled_ticket_definitions(
     ] {
         if allowed.contains(&kind.name()) {
             definitions.push(tags::definition(client.clone(), kind));
+        }
+    }
+    for kind in [
+        assignment_tracking::TrackingToolKind::Query,
+        assignment_tracking::TrackingToolKind::History,
+        assignment_tracking::TrackingToolKind::Update,
+    ] {
+        if allowed.contains(&kind.name()) {
+            definitions.push(assignment_tracking::definition(client.clone(), kind));
         }
     }
     definitions
@@ -2700,23 +2748,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             authoring_operations,
-            [
-                "create",
-                "edit",
-                "query",
-                "read",
-                "comment",
-                "mark_ready",
-                "queue",
-                "case_update",
-                "record_relation",
-                "remove_relation",
-                "tag_list",
-                "tag_create",
-                "tag_rename",
-                "tag_delete",
-                "tags_set",
-            ]
+            WORKSPACE_AUTHORING_TOOL_NAMES
+                .iter()
+                .map(|name| native_ticket_operation(name).unwrap().operation)
+                .collect::<Vec<_>>()
         );
         let item = ticket_descriptor(
             &authoring
@@ -2753,22 +2788,10 @@ mod tests {
                 .iter()
                 .map(|tool| tool.projection.operation)
                 .collect::<Vec<_>>(),
-            [
-                "query",
-                "read",
-                "comment",
-                "case_update",
-                "dependency_check",
-                "record_relation",
-                "remove_relation",
-                "record_orchestration_plan",
-                "query_orchestration_plans",
-                "tag_list",
-                "tag_create",
-                "tag_rename",
-                "tag_delete",
-                "tags_set",
-            ]
+            WORKFLOW_TOOL_NAMES
+                .iter()
+                .map(|name| native_ticket_operation(name).unwrap().operation)
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             native_ticket_tools(client, TicketFeatureAccess::review())
@@ -2776,7 +2799,10 @@ mod tests {
                 .iter()
                 .map(|tool| tool.projection.operation)
                 .collect::<Vec<_>>(),
-            ["query", "read", "tag_list"]
+            READ_ONLY_TOOL_NAMES
+                .iter()
+                .map(|name| native_ticket_operation(name).unwrap().operation)
+                .collect::<Vec<_>>()
         );
     }
 

@@ -501,6 +501,27 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketSummary")],
         },
         OperationContract {
+            path: "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking",
+            method: "get",
+            operation_id: "ticket_assignment_tracking_get",
+            request: None,
+            successes: &[("200", "Array_of_TicketAssignmentTrackingProjection")],
+        },
+        OperationContract {
+            path: "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking",
+            method: "post",
+            operation_id: "ticket_assignment_tracking_update",
+            request: Some("TicketAssignmentTrackingUpdate"),
+            successes: &[("200", "TicketAssignmentTrackingProjection")],
+        },
+        OperationContract {
+            path: "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking/history",
+            method: "get",
+            operation_id: "ticket_assignment_tracking_history",
+            request: None,
+            successes: &[("200", "TicketAssignmentTrackingHistoryPage")],
+        },
+        OperationContract {
             path: "/api/w/{workspace_id}/tickets/{id}/ready",
             method: "post",
             operation_id: "ticket_ready",

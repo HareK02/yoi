@@ -139,6 +139,7 @@ function ticketDetailFixture() {
     artifact_count: 0,
     artifacts: [],
     assignment_diagnostics: [],
+    assignment_tracking: [],
     assignments: [],
     closure_history: [],
     closure_operation_key: null,
@@ -194,6 +195,52 @@ function ticketDetailFixture() {
     title: "Ticket",
   };
 }
+
+Deno.test("Ticket Browser keeps self-reported delegation independent of case and Worker state", () => {
+  const tracking = {
+    workspace_id: "workspace-a",
+    ticket_id: "ticket-id",
+    assignment_id: "delegation",
+    role: "orchestrator",
+    principal: { kind: "workspace_agent", agent_key: "workspace-orchestrator" },
+    assigned_by: "workspace-user:alice",
+    assigned_at: "2026-01-01T00:00:00Z",
+    release: null,
+    current: true,
+    last_event_id: "report-event",
+    updated_at: null,
+    migration_diagnostic: null,
+    tracking: {
+      status: "done",
+      waiting_reason: null,
+      progress: "Investigated",
+      next_action: "Human decision",
+      result: "Alternatives returned",
+    },
+  };
+  for (const state of ["open", "closed"]) {
+    const parsed = parseTicketDetail({
+      ...ticketDetailFixture(),
+      state,
+      assignment_tracking: [tracking],
+    });
+    assertEquals(parsed.assignment_tracking[0]?.tracking?.status, "done");
+    assertEquals(parsed.assignment_tracking[0]?.last_event_id, "report-event");
+    assertEquals(parsed.state, state);
+    assertEquals(parsed.current_worker, null);
+  }
+  assertThrows(
+    () =>
+      parseTicketDetail({
+        ...ticketDetailFixture(),
+        assignment_tracking: [{
+          ...tracking,
+          tracking: { ...tracking.tracking, status: "running" },
+        }],
+      }),
+    ".status is invalid",
+  );
+});
 
 Deno.test("Ticket Browser parser accepts target collections and rejects singular target authority", () => {
   const fixture = ticketDetailFixture();

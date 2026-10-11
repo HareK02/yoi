@@ -53,6 +53,7 @@ fn context(worker: &RuntimeWorkerRef) -> server_api::ServerRequestContext {
         runtime_source: Some(server_api::ServerRuntimeSource {
             runtime_id: worker.runtime_id.clone(),
             worker_id: Some(worker.worker_id.clone()),
+            authentication_binding_id: "fixture-binding".into(),
         }),
         origin: None,
         transport_headers: vec![],

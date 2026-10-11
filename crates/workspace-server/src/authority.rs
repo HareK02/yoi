@@ -238,6 +238,20 @@ impl SqliteWorkspaceAuthority {
         })
     }
 
+    /// Assignment self-report enrichment is a separate projection so retained
+    /// responsibility and existing Ticket constructors stay distinct from status.
+    pub fn ticket_assignment_tracking(
+        &self,
+        reference: &str,
+    ) -> Result<Vec<ticket::TicketAssignmentTrackingProjection>> {
+        let ticket = self
+            .ticket_backend
+            .show(TicketIdOrSlug::from(reference))
+            .map_err(Error::from)?;
+        self.store
+            .list_current_ticket_assignment_tracking(&self.workspace_id, &ticket.meta.id)
+    }
+
     pub fn with_source_commit_resolver(
         mut self,
         source_commit_resolver: Arc<dyn TicketSourceCommitResolver>,
@@ -905,7 +919,11 @@ impl SqliteWorkspaceAuthority {
                 &blocker.blocking_ticket,
             )?;
         }
+        let assignment_tracking = self
+            .store
+            .list_current_ticket_assignment_tracking(&self.workspace_id, &ticket.meta.id)?;
         Ok(TicketDetail {
+            assignment_tracking,
             id: ticket.meta.id,
             resource_key,
             title: ticket.meta.title,
@@ -2330,6 +2348,7 @@ fn ticket_query_item(
         }
     }
     TicketQueryItem {
+        assignment_tracking: detail.assignment_tracking.clone(),
         id: summary.id,
         resource_key: summary.resource_key,
         title: summary.title,
