@@ -154,7 +154,7 @@ async fn orchestrator_attention_barrier_callers_share_unsent_reservation() {
 }
 
 #[tokio::test]
-async fn orchestrator_attention_restore_rechecks_reserved_noop_before_and_after_comparison() {
+async fn orchestrator_attention_input_rechecks_reserved_noop_before_and_after_comparison() {
     for pause_before_comparison in [true, false] {
         let (_dir, api, execution) = attention_test_api().await;
         let started = start_attention_test_orchestrator(&api).await;
@@ -187,6 +187,7 @@ async fn orchestrator_attention_restore_rechecks_reserved_noop_before_and_after_
                 with_orchestrator_attention_reservation(
                     &api_for_caller,
                     &worker_for_caller,
+                    true,
                     |state, pending| {
                         if checks == 0 && pause_before_comparison {
                             entered_tx.send(()).unwrap();
@@ -224,7 +225,7 @@ async fn orchestrator_attention_restore_rechecks_reserved_noop_before_and_after_
             assert!(state.lock().unwrap().sending);
             let restored = futures::executor::block_on(start_attention_test_orchestrator(&api));
             assert_eq!(restored.disposition, "restored");
-            let deferred = state.lock().unwrap().restore_recheck;
+            let deferred = state.lock().unwrap().input_recheck;
             let old_retired = state.lock().unwrap().accepted.is_none();
             let inputs_before_release = execution.take_inputs();
             release_tx.send(()).unwrap();
@@ -239,7 +240,7 @@ async fn orchestrator_attention_restore_rechecks_reserved_noop_before_and_after_
         let state = state.lock().unwrap();
         assert!(state.accepted.is_none());
         assert!(!state.sending);
-        assert!(!state.restore_recheck);
+        assert!(!state.input_recheck);
     }
 }
 
@@ -308,19 +309,19 @@ async fn orchestrator_attention_unknown_response_retry_keeps_id_and_payload() {
         "existing"
     );
     let retry = execution.take_inputs();
-    assert_eq!(retry.len(), 1);
+    assert_eq!(retry.len(), 2, "acknowledged retry must also drain the changed backlog");
     assert_eq!(retry[0].1, pending.content);
-    assert_eq!(
-        execution.take_input_request_ids(),
-        vec![Some(pending.request_id)]
-    );
+    assert!(retry[1].1.contains("Changed backlog"));
+    let ids = execution.take_input_request_ids();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0], Some(pending.request_id));
+    assert_ne!(ids[1], ids[0]);
     assert!(state.lock().unwrap().pending.is_none());
     assert!(state.lock().unwrap().accepted.is_some());
+    assert!(attention_pending(&api).is_empty());
     use protocol::subscription::SubscriptionWorkerState as S;
     maybe_dispatch_orchestrator_turn_end(&api, &worker.worker_id, Some(S::Running), S::Idle);
-    let changed = execution.take_inputs();
-    assert_eq!(changed.len(), 1);
-    assert!(changed[0].1.contains("Changed backlog"));
+    assert!(execution.take_inputs().is_empty());
 }
 
 #[tokio::test]

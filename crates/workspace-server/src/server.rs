@@ -1528,7 +1528,7 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
 #[derive(Default)]
 struct OrchestratorAttentionState {
     sending: bool,
-    restore_recheck: bool,
+    input_recheck: bool,
     accepted: Option<OrchestratorAttentionDelivery>,
     pending: Option<OrchestratorAttentionDelivery>,
 }
@@ -1547,10 +1547,11 @@ impl OrchestratorAttentionReservation {
     fn complete(mut self) -> bool {
         let state = self.0.take().expect("active attention reservation");
         let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
-        // Release and take deferred work atomically. A Restore arriving after
-        // release can reserve its own check; one arriving before is ours to drain.
+        // Release and take deferred input checks atomically. A committed input or
+        // Restore arriving before release is ours to drain; one after release
+        // can reserve its own check.
         state.sending = false;
-        std::mem::take(&mut state.restore_recheck)
+        std::mem::take(&mut state.input_recheck)
     }
 }
 
@@ -18865,12 +18866,22 @@ fn maybe_dispatch_orchestrator_turn_end(
     if orchestrator.worker.runtime_id == EMBEDDED_WORKER_RUNTIME_ID
         && orchestrator.worker.worker_id == worker_id
     {
-        dispatch_orchestrator_assignment_attention(api, &orchestrator.worker);
+        // Idle can be a reentrant consequence of this very Runtime send. It is
+        // not evidence of a new input and must not retry a failed send forever.
+        // Concurrent committed-input notifications independently defer a check.
+        with_orchestrator_attention_reservation(
+            api,
+            &orchestrator.worker,
+            false,
+            |state, pending| {
+                check_orchestrator_assignment_attention(api, &orchestrator.worker, state, pending);
+            },
+        );
     }
 }
 
 fn dispatch_orchestrator_assignment_attention(api: &WorkspaceApi, worker: &RuntimeWorkerRef) {
-    with_orchestrator_attention_reservation(api, worker, |state, pending| {
+    with_orchestrator_attention_reservation(api, worker, true, |state, pending| {
         check_orchestrator_assignment_attention(api, worker, state, pending);
     });
 }
@@ -18878,6 +18889,7 @@ fn dispatch_orchestrator_assignment_attention(api: &WorkspaceApi, worker: &Runti
 fn with_orchestrator_attention_reservation(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
+    defer_input_check_if_reserved: bool,
     mut check: impl FnMut(
         &Arc<Mutex<OrchestratorAttentionState>>,
         Option<OrchestratorAttentionDelivery>,
@@ -18888,6 +18900,9 @@ fn with_orchestrator_attention_reservation(
         let pending = {
             let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
             if state.sending {
+                // A no-op scan may already have read its empty snapshot. Retain
+                // committed input/startup/Restore triggers until its completion.
+                state.input_recheck |= defer_input_check_if_reserved;
                 return;
             }
             state.sending = true;
@@ -18898,8 +18913,8 @@ fn with_orchestrator_attention_reservation(
         if !reservation.complete() {
             return;
         }
-        // Accepted Restore is an explicit durable-input recheck even when the
-        // current check was a no-op. A local cache is never backlog authority.
+        // Drain coalesced input triggers even when the first scan was a no-op.
+        // No recheck is created by a failed send or its own idle observation.
     }
 }
 
@@ -18951,10 +18966,19 @@ fn check_orchestrator_assignment_attention(
             .is_ok()
         {
             send_orchestrator_attention(api, worker, state, delivery);
+            if state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pending
+                .is_some()
+            {
+                return; // Unknown/failed acceptance needs an explicit later trigger.
+            }
         } else {
             state.lock().unwrap_or_else(|p| p.into_inner()).pending = None;
         }
-        return;
+        // Discarding or acknowledging an old retry must not consume this new-
+        // input trigger. Continue the common scan in the same reservation.
     }
     let Ok(inputs) = api
         .store
@@ -22968,11 +22992,6 @@ async fn scoped_start_workspace_orchestrator(
                     && attention.accepted.as_ref().map(|d| &d.request_id) == before_restore.as_ref()
                 {
                     attention.accepted = None;
-                }
-                // A reserved caller may already have decided not to send. Carry
-                // the explicit Restore check through its completion in that case.
-                if attention.sending {
-                    attention.restore_recheck = true;
                 }
             }
             drop(_guard);

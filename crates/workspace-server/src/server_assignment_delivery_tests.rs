@@ -36,7 +36,11 @@ async fn delivery_http(
         "{method} {path}: {}",
         String::from_utf8_lossy(&bytes)
     );
-    serde_json::from_slice(&bytes).unwrap()
+    if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    }
 }
 
 async fn delivery_assign(api: &WorkspaceApi, ticket: &str, key: &str) -> Value {
@@ -330,65 +334,157 @@ async fn assignment_done_historical_inputs_do_not_restart_work_but_reissue_is_ne
 
 #[tokio::test]
 async fn assignment_clear_and_reassign_discard_old_unknown_delivery_without_stopping_worker() {
+    for clear_first in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, execution, worker, _) = delivery_recording_fixture(dir.path()).await;
+        let ticket = delivery_ticket(&api, "Fence old delivery");
+        execution.reject_inputs("unknown acceptance response");
+        let assigned = delivery_assign(&api, &ticket.id, "assign-old").await;
+        let assignment = assigned["assignment"]["assignment_id"].as_str().unwrap();
+        let old_attempts = execution.take_inputs();
+        let old_ids = execution.take_input_request_ids();
+        assert!(!old_attempts.is_empty());
+        assert!(old_ids.iter().all(|id| id == &old_ids[0]));
+        if clear_first {
+            delivery_http(
+                &api,
+                "DELETE",
+                &format!(
+                    "{}?assignment_id={assignment}&operation_id=clear-old",
+                    delivery_assignment_path(&ticket.id)
+                ),
+                None,
+                StatusCode::OK,
+            )
+            .await;
+        }
+        *execution.input_failure.lock().unwrap() = None;
+        // No extra scan, old-operation retry, or synthetic turn end between
+        // clearing/reissuing the failed input and this committed new Assign.
+        let reassigned = delivery_assign(&api, &ticket.id, "assign-new").await;
+        let new_assignment = reassigned["assignment"]["assignment_id"].as_str().unwrap();
+        assert_ne!(new_assignment, assignment);
+        let inputs = execution.take_inputs();
+        assert_eq!(inputs.len(), 1, "new Assign must not need another scan");
+        assert!(inputs[0].1.contains(new_assignment));
+        let ids = execution.take_input_request_ids();
+        assert_eq!(ids.len(), 1);
+        assert_ne!(ids[0], old_ids[0], "new assignment reused stale input identity");
+        assert_eq!(
+            delivery_assign(&api, &ticket.id, "assign-old").await,
+            assigned
+        );
+        assert!(execution.take_inputs().is_empty(), "old retry revived work");
+        let old = delivery_tracking(&api, &ticket.id, assignment);
+        assert!(!old.current);
+        assert_eq!(
+            old.tracking.unwrap().status,
+            ticket::TicketAssignmentTrackingStatus::Waiting,
+            "clear/reissue must not rewrite the old status to done"
+        );
+        assert_eq!(
+            find_workspace_orchestrator(&api).unwrap().worker,
+            worker,
+            "clear/reassign are not Worker stop or replacement"
+        );
+        delivery_stop(&api, &worker);
+    }
+}
+
+#[tokio::test]
+async fn assignment_or_answer_committed_during_empty_scan_is_delivered_without_another_trigger() {
+    for answer in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, execution, worker, identity) = delivery_recording_fixture(dir.path()).await;
+        let ticket = delivery_ticket(&api, "Input racing an empty scan");
+        if answer {
+            let assigned = delivery_assign(&api, &ticket.id, "initial-assign").await;
+            let current = delivery_tracking(
+                &api,
+                &ticket.id,
+                assigned["assignment"]["assignment_id"].as_str().unwrap(),
+            );
+            delivery_self_report(&api, &identity, &worker, &current, "waiting", "wait-answer").await;
+            execution.take_inputs();
+            execution.take_input_request_ids();
+        }
+        assert!(attention_pending(&api).is_empty());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let caller_api = api.clone();
+            let caller_worker = worker.clone();
+            let caller = scope.spawn(move || {
+                let mut checks = 0;
+                with_orchestrator_attention_reservation(
+                    &caller_api,
+                    &caller_worker,
+                    true,
+                    |state, pending| {
+                        check_orchestrator_assignment_attention(
+                            &caller_api, &caller_worker, state, pending,
+                        );
+                        if checks == 0 {
+                            // The production scan has read an empty snapshot but
+                            // still owns its reservation. Race a real HTTP commit.
+                            entered_tx.send(()).unwrap();
+                            release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                        }
+                        checks += 1;
+                    },
+                );
+                assert_eq!(checks, 2, "committed input must defer a scan");
+            });
+            entered_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            if answer {
+                futures::executor::block_on(delivery_http(
+                    &api,
+                    "POST",
+                    &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{}/thread-events", ticket.id),
+                    Some(serde_json::to_value(NewTicketEvent::new(
+                        TicketEventKind::Comment, "Human answer: go ahead",
+                    )).unwrap()),
+                    StatusCode::NO_CONTENT,
+                ));
+            } else {
+                futures::executor::block_on(delivery_assign(&api, &ticket.id, "racing-assign"));
+            }
+            // No manual dispatch, Restore, or synthetic Running -> Idle.
+            assert!(execution.take_inputs().is_empty());
+            release_tx.send(()).unwrap();
+            caller.join().unwrap();
+        });
+        let inputs = execution.take_inputs();
+        assert_eq!(inputs.len(), 1, "idle Orchestrator was stranded");
+        assert!(inputs[0].1.contains(ticket.resource_key.as_deref().unwrap()));
+        if answer {
+            assert!(inputs[0].1.contains("Need the human's choice"));
+        }
+        assert_eq!(execution.take_input_request_ids().len(), 1);
+        assert!(attention_pending(&api).is_empty());
+        delivery_stop(&api, &worker);
+    }
+}
+
+#[tokio::test]
+async fn assignment_failed_delivery_and_its_reentrant_idle_do_not_schedule_retry_loop() {
     let dir = tempfile::tempdir().unwrap();
     let (api, execution, worker, _) = delivery_recording_fixture(dir.path()).await;
-    let ticket = delivery_ticket(&api, "Fence old delivery");
-    execution.reject_inputs("unknown acceptance response");
-    let assigned = delivery_assign(&api, &ticket.id, "assign-old").await;
-    let assignment = assigned["assignment"]["assignment_id"].as_str().unwrap();
-    let old_attempts = execution.take_inputs();
-    let old_ids = execution.take_input_request_ids();
-    assert!(!old_attempts.is_empty());
-    assert!(old_ids.iter().all(|id| id == &old_ids[0]));
-    delivery_http(
-        &api,
-        "DELETE",
-        &format!(
-            "{}?assignment_id={assignment}&operation_id=clear-old",
-            delivery_assignment_path(&ticket.id)
-        ),
-        None,
-        StatusCode::OK,
-    )
-    .await;
-    *execution.input_failure.lock().unwrap() = None;
-    notify_ticket_recipients(&api, TEST_WORKSPACE_ID, &ticket.id, "open", "open", None);
-    delivery_scan(&api, &worker);
-    assert!(
-        execution.take_inputs().is_empty(),
-        "cleared reservation was sent as new work"
-    );
-    assert_eq!(
-        delivery_assign(&api, &ticket.id, "assign-old").await,
-        assigned
-    );
-    delivery_scan(&api, &worker);
-    assert!(
-        execution.take_inputs().is_empty(),
-        "old operation retry revived cleared work"
-    );
-    let reassigned = delivery_assign(&api, &ticket.id, "assign-new").await;
-    let new_assignment = reassigned["assignment"]["assignment_id"].as_str().unwrap();
-    assert_ne!(new_assignment, assignment);
-    assert_eq!(execution.take_inputs().len(), 1);
+    let ticket = delivery_ticket(&api, "No failed-delivery busy loop");
+    execution.reject_inputs("Runtime currently cannot accept notifications");
+    let callback_api = api.clone();
+    execution.before_input_returns(move |worker| {
+        use protocol::subscription::SubscriptionWorkerState as S;
+        maybe_dispatch_orchestrator_turn_end(
+            &callback_api, &worker.worker_id.to_string(), Some(S::Running), S::Idle,
+        );
+    });
+    delivery_assign(&api, &ticket.id, "assign-failed").await;
+    assert_eq!(execution.take_inputs().len(), 2, "idle must not add retries beyond the bounded send");
     let ids = execution.take_input_request_ids();
-    assert_eq!(ids.len(), 1);
-    assert_ne!(
-        ids[0], old_ids[0],
-        "new assignment reused stale input identity"
-    );
-    let old = delivery_tracking(&api, &ticket.id, assignment);
-    assert!(!old.current);
-    assert_eq!(
-        old.tracking.unwrap().status,
-        ticket::TicketAssignmentTrackingStatus::Waiting,
-        "clear must not rewrite the old status to done"
-    );
-    assert_eq!(
-        find_workspace_orchestrator(&api).unwrap().worker,
-        worker,
-        "clear/reassign are not Worker stop or replacement"
-    );
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0], ids[1]);
+    assert_eq!(attention_pending(&api).len(), 1, "failure must retain durable input");
     delivery_stop(&api, &worker);
 }
 

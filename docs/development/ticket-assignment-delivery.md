@@ -24,7 +24,7 @@ Delivery order:
 4. Send the saved content with the saved `request_id`, outside the transaction. Response loss retains the same request/payload. Concurrent reservations converge on the same identity, and Runtime request receipts deduplicate actual acceptance.
 5. Acknowledge accepted delivery under another IMMEDIATE transaction after rechecking current authority. The acknowledgement never changes handling.
 
-Process-local attention locks prevent concurrent/reentrant send loops; they are not backlog authority. Losing that cache does not lose a delegation or resend acknowledged input. Replacement does not create assignment rows; only pending, unacknowledged inputs are recovered. Accepted history is not replayed into new work merely because a Worker was exchanged.
+Process-local attention locks prevent concurrent/reentrant send loops; they are not backlog authority. A committed-input/startup/Restore trigger arriving during a reserved scan is coalesced into an input recheck and drained on reservation release, including when that scan read an empty snapshot. Discarding or acknowledging a pending retry continues the common scan in the same reservation; a successful retry cannot consume the trigger for newer input. Reentrant idle observations caused by a send do not schedule another retry of a failed send. These liveness repairs change no DB transaction or public API boundary. Losing that cache does not lose a delegation or resend acknowledged input. Replacement does not create assignment rows; only pending, unacknowledged inputs are recovered. Accepted history is not replayed into new work merely because a Worker was exchanged.
 
 ## Public start/action handoff for T-743
 
