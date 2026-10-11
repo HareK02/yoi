@@ -2873,3 +2873,576 @@ async fn post_tool_stop_terminalizes_started_parallel_siblings_before_returning(
         assert!(matches!(next, EngineRunExit::Finished));
     }
 }
+
+// The same policy barrier is exercised through the real response-complete,
+// provider fallback, interceptor fallback, and early-dispatch engine paths.
+#[derive(Clone, Copy, Debug)]
+enum PolicyRoute {
+    AfterResponse,
+    ProviderFallback,
+    InterceptorFallback,
+    Early,
+}
+
+impl PolicyRoute {
+    fn completion_support(self) -> ToolCallCompletionSupport {
+        match self {
+            Self::ProviderFallback => ToolCallCompletionSupport::ResponseComplete,
+            _ => ToolCallCompletionSupport::PerBlock,
+        }
+    }
+
+    fn configure(self, engine: &mut Engine<ControlledStreamClient>) {
+        engine.set_max_turns(Some(1));
+        if matches!(self, Self::AfterResponse) {
+            engine.set_tool_call_dispatch_mode(ToolCallDispatchMode::AfterResponse);
+        }
+    }
+}
+
+struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+#[derive(Clone)]
+struct PolicyBarrier {
+    phase: InterceptorPhase,
+    early_compatible: bool,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    invocations: Arc<AtomicUsize>,
+    continues: Arc<AtomicUsize>,
+    retired: Arc<tokio::sync::Notify>,
+    // Enqueue from the policy's final poll, after select has polled signals.
+    // This deterministically exercises the policy-completion/ownership race.
+    signal_on_continue: Option<tokio::sync::mpsc::Sender<()>>,
+}
+
+impl PolicyBarrier {
+    fn new(phase: InterceptorPhase, route: PolicyRoute) -> Self {
+        Self {
+            phase,
+            early_compatible: !matches!(route, PolicyRoute::InterceptorFallback),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            invocations: Arc::new(AtomicUsize::new(0)),
+            continues: Arc::new(AtomicUsize::new(0)),
+            retired: Arc::new(tokio::sync::Notify::new()),
+            signal_on_continue: None,
+        }
+    }
+
+    async fn wait(&self) {
+        let _retired = NotifyOnDrop(self.retired.clone());
+        self.invocations.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_one();
+        self.release.notified().await;
+        if let Some(signal) = &self.signal_on_continue {
+            signal.try_send(()).unwrap();
+        }
+        self.continues.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl Interceptor for PolicyBarrier {
+    fn supports_early_tool_dispatch(&self) -> bool {
+        self.early_compatible
+    }
+
+    async fn pre_tool_call(
+        &self,
+        _info: &mut ToolCallInfo<'_>,
+    ) -> InterceptorResult<PreToolAction> {
+        if self.phase == InterceptorPhase::PreToolCall {
+            self.wait().await;
+        }
+        Ok(PreToolAction::Continue)
+    }
+
+    async fn on_assistant_turn_end(
+        &self,
+        _context: AssistantTurnEndContext<'_>,
+    ) -> InterceptorResult<TurnEndAction> {
+        if self.phase == InterceptorPhase::AssistantTurnEnd {
+            self.wait().await;
+        }
+        Ok(TurnEndAction::Finish)
+    }
+}
+
+fn send_policy_response(tx: &tokio::sync::mpsc::UnboundedSender<Result<Event, ClientError>>) {
+    for event in [
+        Event::tool_use_start(0, "policy_call", "policy_tool"),
+        Event::tool_input_delta(0, "{}"),
+        Event::tool_use_stop(0),
+        Event::usage(10, 3),
+        Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ] {
+        tx.send(Ok(event)).unwrap();
+    }
+}
+
+fn assert_policy_interruption(exit: &EngineRunExit, pause: bool) {
+    if pause {
+        assert!(matches!(exit, EngineRunExit::Paused), "{exit:?}");
+    } else {
+        assert!(
+            matches!(
+                exit,
+                EngineRunExit::Interrupted(RunInterruptionReason::Cancelled)
+            ),
+            "{exit:?}"
+        );
+    }
+}
+
+fn call_and_result_count(history: &History) -> (usize, usize) {
+    (
+        history
+            .items()
+            .filter(
+                |item| matches!(item, Item::ToolCall { call_id, .. } if call_id == "policy_call"),
+            )
+            .count(),
+        history
+            .items()
+            .filter(
+                |item| matches!(item, Item::ToolResult { call_id, .. } if call_id == "policy_call"),
+            )
+            .count(),
+    )
+}
+
+#[tokio::test]
+async fn response_complete_pending_policies_interrupt_before_release_and_preserve_not_started() {
+    for route in [
+        PolicyRoute::AfterResponse,
+        PolicyRoute::ProviderFallback,
+        PolicyRoute::InterceptorFallback,
+    ] {
+        for phase in [
+            InterceptorPhase::PreToolCall,
+            InterceptorPhase::AssistantTurnEnd,
+        ] {
+            for pause in [false, true] {
+                let (client, tx) = ControlledStreamClient::new(route.completion_support());
+                let mut engine = Engine::new(client);
+                route.configure(&mut engine);
+                let policy = PolicyBarrier::new(phase, route);
+                let probe = policy.clone();
+                engine.set_interceptor(policy);
+                let tool = SlowTool::new("policy_tool", 0);
+                engine.register_tool(tool.definition());
+                let usage = Arc::new(AtomicUsize::new(0));
+                let usage_probe = usage.clone();
+                engine.on_usage(move |_| {
+                    usage_probe.fetch_add(1, Ordering::SeqCst);
+                });
+                let signal = if pause {
+                    engine.pause_sender()
+                } else {
+                    engine.cancel_sender()
+                };
+                let run = tokio::spawn(async move {
+                    let mut history = History::new();
+                    let output = engine.run(&mut history, "run").await;
+                    (output, history)
+                });
+                send_policy_response(&tx);
+                drop(tx);
+                tokio::time::timeout(Duration::from_secs(2), probe.entered.notified())
+                    .await
+                    .expect("policy entered");
+                signal.send(()).await.unwrap();
+                let (output, history) = tokio::time::timeout(Duration::from_secs(2), run).await
+                    .unwrap_or_else(|_| panic!("{route:?}/{phase:?}/pause={pause}: interruption waited for policy release"))
+                    .unwrap();
+                assert_policy_interruption(&output.result, pause);
+                assert_eq!(tool.call_count(), 0);
+                assert_eq!(call_and_result_count(&history), (1, 0));
+                assert!(history.items().any(|item| matches!(
+                    item,
+                    Item::ToolCall {
+                        execution_id: None,
+                        status: None | Some(agen::llm_client::ItemStatus::Completed),
+                        ..
+                    }
+                )));
+                assert_eq!(usage.load(Ordering::SeqCst), 1);
+                assert_eq!(probe.invocations.load(Ordering::SeqCst), 1);
+                probe.release.notify_one(); // late permission cannot create a task
+                assert_eq!(probe.continues.load(Ordering::SeqCst), 0);
+                assert_eq!(tool.call_count(), 0);
+
+                // Recreate both history and engine as a restore boundary. Only
+                // proven NotStarted is allowed to run, with normal pre-tool policy.
+                let mut restored_history: History =
+                    serde_json::from_str(&serde_json::to_string(&history).unwrap()).unwrap();
+                let mut restored =
+                    Engine::new(MockLlmClient::new(vec![Event::Status(StatusEvent {
+                        status: ResponseStatus::Completed,
+                    })]));
+                restored.set_max_turns(Some(1));
+                restored.register_tool(tool.definition());
+                let _ = restored.resume(&mut restored_history).await;
+                assert_eq!(tool.call_count(), 1);
+                assert_eq!(call_and_result_count(&restored_history), (1, 1));
+                assert_eq!(usage.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn policy_final_poll_signal_prevents_provider_ownership_even_with_continue() {
+    for route in [
+        PolicyRoute::AfterResponse,
+        PolicyRoute::ProviderFallback,
+        PolicyRoute::InterceptorFallback,
+        PolicyRoute::Early,
+    ] {
+        for pause in [false, true] {
+            let (client, tx) = ControlledStreamClient::new(route.completion_support());
+            let mut engine = Engine::new(client);
+            route.configure(&mut engine);
+            let mut policy = PolicyBarrier::new(InterceptorPhase::PreToolCall, route);
+            policy.signal_on_continue = Some(if pause {
+                engine.pause_sender()
+            } else {
+                engine.cancel_sender()
+            });
+            let probe = policy.clone();
+            engine.set_interceptor(policy);
+            let tool = SlowTool::new("policy_tool", 0);
+            engine.register_tool(tool.definition());
+            let run = tokio::spawn(async move {
+                let mut history = History::new();
+                let output = engine.run(&mut history, "run").await;
+                (output, history)
+            });
+            send_policy_response(&tx);
+            drop(tx);
+            tokio::time::timeout(Duration::from_secs(2), probe.entered.notified())
+                .await
+                .expect("policy entered");
+            probe.release.notify_one();
+            let (output, history) = tokio::time::timeout(Duration::from_secs(2), run)
+                .await
+                .expect("final-poll signal processed")
+                .unwrap();
+            assert_policy_interruption(&output.result, pause);
+            assert_eq!(probe.continues.load(Ordering::SeqCst), 1);
+            assert_eq!(probe.invocations.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                tool.call_count(),
+                0,
+                "{route:?}/pause={pause}: Continue bypassed queued interruption"
+            );
+            assert_eq!(call_and_result_count(&history), (1, 0));
+        }
+    }
+}
+
+// Provider owns the terminal channel. Cancel acknowledges receipt but does not
+// manufacture a result, so tests can release a real terminal output or deliver
+// it after the engine's confirmation deadline (without a live side effect).
+#[derive(Clone)]
+struct PolicyOwnedTool {
+    starts: Arc<AtomicUsize>,
+    started: Arc<tokio::sync::Notify>,
+    cancel_requested: Arc<tokio::sync::Notify>,
+    terminal: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<ToolOutput>>>>,
+    retired: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Tool for PolicyOwnedTool {
+    async fn execute(&self, _: &str, _: ToolExecutionContext) -> Result<ToolOutput, ToolError> {
+        let _retired = NotifyOnDrop(self.retired.clone());
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        self.started.notify_one();
+        Ok(self.terminal.lock().await.take().unwrap().await.unwrap())
+    }
+    async fn cancel(&self, _: &str) -> Result<(), ToolError> {
+        self.cancel_requested.notify_one();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn pending_turn_end_interrupts_drain_owned_early_attempt_and_fence_late_result_on_restore() {
+    for pause in [false, true] {
+        for late in [false, true] {
+            let (client, tx) = ControlledStreamClient::new(ToolCallCompletionSupport::PerBlock);
+            let mut engine = Engine::new(client);
+            PolicyRoute::Early.configure(&mut engine);
+            engine.set_tool_execution_policy(ToolExecutionPolicy {
+                pause_safe_boundary_timeout: Duration::ZERO,
+                cancellation_request_timeout: Duration::from_secs(1),
+                terminal_confirmation_timeout: if late {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(2)
+                },
+            });
+            let policy = PolicyBarrier::new(InterceptorPhase::AssistantTurnEnd, PolicyRoute::Early);
+            let probe = policy.clone();
+            engine.set_interceptor(policy);
+            let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+            let tool = PolicyOwnedTool {
+                starts: Arc::new(AtomicUsize::new(0)),
+                started: Arc::new(tokio::sync::Notify::new()),
+                cancel_requested: Arc::new(tokio::sync::Notify::new()),
+                terminal: Arc::new(tokio::sync::Mutex::new(Some(terminal_rx))),
+                retired: Arc::new(tokio::sync::Notify::new()),
+            };
+            let definition: ToolDefinition = {
+                let tool = tool.clone();
+                Arc::new(move || {
+                    (
+                        ToolMeta::new("policy_tool")
+                            .input_schema(serde_json::json!({"type":"object"})),
+                        Arc::new(tool.clone()) as Arc<dyn Tool>,
+                    )
+                })
+            };
+            engine.register_tool(definition.clone());
+            let committed = Arc::new(AtomicUsize::new(0));
+            let commit_probe = committed.clone();
+            engine.on_history_append(move |item| {
+                if matches!(item, Item::ToolResult { .. }) {
+                    commit_probe.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            });
+            let published = Arc::new(AtomicUsize::new(0));
+            let publish_probe = published.clone();
+            let commit_probe = committed.clone();
+            engine.on_tool_result(move |_| {
+                assert_eq!(
+                    commit_probe.load(Ordering::SeqCst),
+                    1,
+                    "commit before publication"
+                );
+                publish_probe.fetch_add(1, Ordering::SeqCst);
+            });
+            let usage = Arc::new(AtomicUsize::new(0));
+            let usage_probe = usage.clone();
+            engine.on_usage(move |_| {
+                usage_probe.fetch_add(1, Ordering::SeqCst);
+            });
+            let signal = if pause {
+                engine.pause_sender()
+            } else {
+                engine.cancel_sender()
+            };
+            let run = tokio::spawn(async move {
+                let mut history = History::new();
+                let output = engine.run(&mut history, "run").await;
+                (output, history)
+            });
+            // Wait for ownership before completing the assistant response.
+            for event in [
+                Event::tool_use_start(0, "policy_call", "policy_tool"),
+                Event::tool_input_delta(0, "{}"),
+                Event::tool_use_stop(0),
+            ] {
+                tx.send(Ok(event)).unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(2), tool.started.notified())
+                .await
+                .expect("early provider started");
+            tx.send(Ok(Event::usage(10, 3))).unwrap();
+            tx.send(Ok(Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            })))
+            .unwrap();
+            drop(tx);
+            tokio::time::timeout(Duration::from_secs(2), probe.entered.notified())
+                .await
+                .expect("turn-end policy pending");
+            signal.send(()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), tool.cancel_requested.notified())
+                .await
+                .expect("owned provider cancellation progresses before policy release");
+            let terminal_tx = if late {
+                Some(terminal_tx)
+            } else {
+                terminal_tx
+                    .send(ToolOutput::from("confirmed after interruption".to_string()))
+                    .unwrap();
+                None
+            };
+            let (output, history) = tokio::time::timeout(Duration::from_secs(2), run)
+                .await
+                .expect("terminalization does not await turn-end policy")
+                .unwrap();
+            assert_policy_interruption(&output.result, pause);
+            assert_eq!(call_and_result_count(&history), (1, 1));
+            assert_eq!(committed.load(Ordering::SeqCst), 1);
+            assert_eq!(published.load(Ordering::SeqCst), 1);
+            assert_eq!(usage.load(Ordering::SeqCst), 1);
+            assert!(history.items().any(|item| matches!(
+                item,
+                Item::ToolCall {
+                    execution_id: Some(_),
+                    status: Some(agen::llm_client::ItemStatus::InProgress),
+                    ..
+                }
+            )));
+            assert!(history.items().any(|item| matches!(item, Item::ToolResult { disposition, .. } if *disposition == if late { ToolResultDisposition::OutcomeUnknown } else { ToolResultDisposition::Success })));
+            if let Some(terminal_tx) = terminal_tx {
+                tokio::time::timeout(Duration::from_secs(2), tool.retired.notified())
+                    .await
+                    .expect("forced-close retired the owned receiver");
+                // Force-close retires the receiver; a provider's late completion
+                // cannot reenter history or replace OutcomeUnknown.
+                assert!(
+                    terminal_tx
+                        .send(ToolOutput::from("late completion".to_string()))
+                        .is_err()
+                );
+            }
+            probe.release.notify_one();
+            assert_eq!(probe.continues.load(Ordering::SeqCst), 0);
+            let original_items = history.items().cloned().collect::<Vec<_>>();
+            let mut resumed_history = history.clone();
+            let mut resumed_engine = output.engine;
+            let _ = resumed_engine.resume(&mut resumed_history).await;
+            assert_eq!(
+                tool.starts.load(Ordering::SeqCst),
+                1,
+                "same-engine resume cannot rerun a terminal attempt"
+            );
+            assert_eq!(call_and_result_count(&resumed_history), (1, 1));
+            let mut restored_history: History =
+                serde_json::from_str(&serde_json::to_string(&history).unwrap()).unwrap();
+            let restored_client = MockLlmClient::new(vec![Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            })]);
+            let request_probe = restored_client.clone();
+            let mut restored = Engine::new(restored_client);
+            restored.register_tool(definition);
+            restored.set_max_turns(Some(1));
+            let _ = restored.resume(&mut restored_history).await;
+            let requests = request_probe.requests();
+            assert_eq!(requests.len(), 1);
+            let replay = requests[0]
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::ToolCall { call_id, .. } => Some(format!("call:{call_id}")),
+                    Item::ToolResult { call_id, .. } => Some(format!("result:{call_id}")),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(replay, ["call:policy_call", "result:policy_call"]);
+            assert_eq!(tool.starts.load(Ordering::SeqCst), 1);
+            assert_eq!(call_and_result_count(&restored_history), (1, 1));
+            assert_eq!(
+                restored_history
+                    .items()
+                    .take(original_items.len())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                original_items,
+                "restore must not rewrite original history"
+            );
+            assert_eq!(published.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn pending_turn_end_pause_preserves_natural_safe_boundary_without_cancelling_started_tool() {
+    let (client, tx) = ControlledStreamClient::new(ToolCallCompletionSupport::PerBlock);
+    let mut engine = Engine::new(client);
+    PolicyRoute::Early.configure(&mut engine);
+    engine.set_tool_execution_policy(ToolExecutionPolicy {
+        pause_safe_boundary_timeout: Duration::from_secs(2),
+        ..ToolExecutionPolicy::default()
+    });
+    let policy = PolicyBarrier::new(InterceptorPhase::AssistantTurnEnd, PolicyRoute::Early);
+    let probe = policy.clone();
+    engine.set_interceptor(policy);
+    let tool = SafePauseTool::new();
+    // Use this tool's actual public name in the stream fixture.
+    engine.register_tool(tool.definition());
+    let pause = engine.pause_sender();
+    let run = tokio::spawn(async move {
+        let mut history = History::new();
+        let output = engine.run(&mut history, "run").await;
+        (output, history)
+    });
+    for event in [
+        Event::tool_use_start(0, "policy_call", "safe_pause"),
+        Event::tool_input_delta(0, "{}"),
+        Event::tool_use_stop(0),
+        Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ] {
+        tx.send(Ok(event)).unwrap();
+    }
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs(2), probe.entered.notified())
+        .await
+        .expect("turn-end entered");
+    pause.send(()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), probe.retired.notified())
+        .await
+        .expect("pending policy interrupted before tool release");
+    tool.release.notify_one();
+    let (output, history) = tokio::time::timeout(Duration::from_secs(2), run)
+        .await
+        .expect("safe boundary collected")
+        .unwrap();
+    assert_policy_interruption(&output.result, true);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(tool.cancellations.load(Ordering::SeqCst), 0);
+    assert_eq!(call_and_result_count(&history), (1, 1));
+    probe.release.notify_one();
+    assert_eq!(probe.continues.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn turn_end_final_poll_signal_wins_over_finish_without_tools() {
+    for pause in [false, true] {
+        let (client, tx) = ControlledStreamClient::new(ToolCallCompletionSupport::PerBlock);
+        let mut engine = Engine::new(client);
+        let mut policy = PolicyBarrier::new(InterceptorPhase::AssistantTurnEnd, PolicyRoute::Early);
+        policy.signal_on_continue = Some(if pause {
+            engine.pause_sender()
+        } else {
+            engine.cancel_sender()
+        });
+        let probe = policy.clone();
+        engine.set_interceptor(policy);
+        let run = tokio::spawn(async move {
+            let mut history = History::new();
+            engine.run(&mut history, "run").await
+        });
+        tx.send(Ok(Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        })))
+        .unwrap();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), probe.entered.notified())
+            .await
+            .expect("turn-end entered");
+        probe.release.notify_one();
+        let output = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("final-poll signal processed")
+            .unwrap();
+        assert_policy_interruption(&output.result, pause);
+        assert_eq!(probe.continues.load(Ordering::SeqCst), 1);
+    }
+}
