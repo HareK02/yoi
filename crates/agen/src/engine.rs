@@ -105,6 +105,29 @@ async fn await_tool_policy<T>(
     result.map_err(|error| InterceptorFailure::new(phase, error).into())
 }
 
+/// A consumed Pause still bounds post-policy processing while owned tools drain.
+/// Terminal history and publication happen before this wait, so expiring it
+/// cannot discard the result or reopen the execution attempt.
+#[derive(Clone, Copy)]
+enum PostToolPolicyWait {
+    Skip,
+    Interruptible,
+    UntilPauseSafeBoundary(TokioInstant),
+}
+
+impl PostToolPolicyWait {
+    fn for_pause_deadline(deadline: Option<TokioInstant>) -> Self {
+        deadline.map_or(Self::Interruptible, Self::UntilPauseSafeBoundary)
+    }
+
+    fn pause_deadline(self) -> Option<TokioInstant> {
+        match self {
+            Self::UntilPauseSafeBoundary(deadline) => Some(deadline),
+            _ => None,
+        }
+    }
+}
+
 /// Tool registration error
 #[derive(Debug, thiserror::Error)]
 pub enum ToolRegistryError {
@@ -1723,7 +1746,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 result,
                 None,
                 batch.turn_id,
-                true,
+                PostToolPolicyWait::Interruptible,
                 &batch.call_info_map,
                 &mut batch.attempt_fence,
                 &mut batch.terminal_call_ids,
@@ -1750,7 +1773,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     result,
                     None,
                     batch.turn_id,
-                    false,
+                    PostToolPolicyWait::Skip,
                     &batch.call_info_map,
                     &mut batch.attempt_fence,
                     &mut batch.terminal_call_ids,
@@ -1798,7 +1821,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                         result,
                         Some(&attempt_id),
                         batch.turn_id,
-                        false,
+                        PostToolPolicyWait::Skip,
                         &batch.call_info_map,
                         &mut batch.attempt_fence,
                         &mut batch.terminal_call_ids,
@@ -1821,7 +1844,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                         ToolResult::outcome_unknown(call_id),
                         Some(attempt_id),
                         batch.turn_id,
-                        false,
+                        PostToolPolicyWait::Skip,
                         &batch.call_info_map,
                         &mut batch.attempt_fence,
                         &mut batch.terminal_call_ids,
@@ -1844,28 +1867,6 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         force_cancel: bool,
         initial_pause_requested: bool,
     ) -> Result<ToolExecutionResult, EngineError> {
-        while let Some(result) = batch.synthetic_results.pop_front() {
-            if let Err(error) = self
-                .finalize_and_commit_tool_result(
-                    history,
-                    annotate,
-                    result,
-                    None,
-                    batch.turn_id,
-                    true,
-                    &batch.call_info_map,
-                    &mut batch.attempt_fence,
-                    &mut batch.terminal_call_ids,
-                )
-                .await
-            {
-                let cleanup_error = self
-                    .cancel_and_terminalize_early_batch(history, annotate, &mut batch)
-                    .await;
-                return Err(cleanup_error.unwrap_or(error));
-            }
-        }
-
         if force_cancel {
             if let Some(error) = self
                 .cancel_and_terminalize_early_batch(history, annotate, &mut batch)
@@ -1879,6 +1880,28 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         let mut pause_requested = initial_pause_requested;
         let mut pause_deadline = initial_pause_requested
             .then(|| TokioInstant::now() + self.tool_execution_policy.pause_safe_boundary_timeout);
+        while let Some(result) = batch.synthetic_results.pop_front() {
+            if let Err(error) = self
+                .finalize_and_commit_tool_result(
+                    history,
+                    annotate,
+                    result,
+                    None,
+                    batch.turn_id,
+                    PostToolPolicyWait::for_pause_deadline(pause_deadline),
+                    &batch.call_info_map,
+                    &mut batch.attempt_fence,
+                    &mut batch.terminal_call_ids,
+                )
+                .await
+            {
+                let cleanup_error = self
+                    .cancel_and_terminalize_early_batch(history, annotate, &mut batch)
+                    .await;
+                return Err(cleanup_error.unwrap_or(error));
+            }
+        }
+
         while !batch.futures.is_empty() {
             tokio::select! {
                 biased;
@@ -1890,7 +1913,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                         result,
                         Some(&attempt_id),
                         batch.turn_id,
-                        true,
+                        PostToolPolicyWait::for_pause_deadline(pause_deadline),
                         &batch.call_info_map,
                         &mut batch.attempt_fence,
                         &mut batch.terminal_call_ids,
@@ -2156,7 +2179,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     result,
                     None,
                     turn_id,
-                    true,
+                    PostToolPolicyWait::Interruptible,
                     &call_info_map,
                     &mut attempt_fence,
                     &mut terminal_call_ids,
@@ -2188,7 +2211,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                         result,
                         Some(&attempt_id),
                         turn_id,
-                        true,
+                        PostToolPolicyWait::for_pause_deadline(pause_deadline),
                         &call_info_map,
                         &mut attempt_fence,
                         &mut terminal_call_ids,
@@ -2269,7 +2292,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                     result,
                                     Some(&attempt_id),
                                     turn_id,
-                                    false,
+                                    PostToolPolicyWait::Skip,
                                     &call_info_map,
                                     &mut attempt_fence,
                                     &mut terminal_call_ids,
@@ -2297,7 +2320,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                 ToolResult::outcome_unknown(call_id),
                                 Some(attempt_id),
                                 turn_id,
-                                false,
+                                PostToolPolicyWait::Skip,
                                 &call_info_map,
                                 &mut attempt_fence,
                                 &mut terminal_call_ids,
@@ -2347,7 +2370,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         mut tool_result: ToolResult,
         execution_attempt_id: Option<&str>,
         turn_id: usize,
-        invoke_post_hook: bool,
+        post_policy_wait: PostToolPolicyWait,
         call_info_map: &HashMap<
             String,
             (
@@ -2432,7 +2455,9 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         );
         self.emit_tool_result(&tool_result);
 
-        if invoke_post_hook && let Some((tool_call, meta, tool, context)) = call_info {
+        if !matches!(post_policy_wait, PostToolPolicyWait::Skip)
+            && let Some((tool_call, meta, tool, context)) = call_info
+        {
             let invocation = self.interceptor_invocation(
                 InterceptorPhase::PostToolCall,
                 Some(turn_id),
@@ -2448,27 +2473,20 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 tool: tool.clone(),
                 context: context.clone(),
             };
+            let pause_deadline = post_policy_wait.pause_deadline();
             let post_tool_action = tokio::select! {
-                result = self.interceptor.post_tool_call(&info) => {
-                    result.map_err(|error| {
-                        EngineError::from(InterceptorFailure::new(
-                            InterceptorPhase::PostToolCall,
-                            error,
-                        ))
-                    })?
-                }
-                pause = self.pause_rx.recv() => {
-                    if pause.is_some() {
-                        info!(call_id = %tool_call.id, "Paused while awaiting post-tool policy");
-                    }
+                biased;
+                // Poll the existing safe-boundary deadline even when the Pause
+                // that established it was consumed by an outer policy gate.
+                _ = tokio::time::sleep_until(pause_deadline.unwrap_or_else(TokioInstant::now)), if pause_deadline.is_some() => {
                     return Err(EngineError::PauseRequested);
                 }
-                cancel = self.cancel_rx.recv() => {
-                    if cancel.is_some() {
-                        info!(call_id = %tool_call.id, "Cancelled while awaiting post-tool policy");
-                    }
-                    return Err(EngineError::Cancelled);
-                }
+                result = await_tool_policy(
+                    self.interceptor.post_tool_call(&info),
+                    InterceptorPhase::PostToolCall,
+                    &mut self.cancel_rx,
+                    &mut self.pause_rx,
+                ) => result?,
             };
             if let PostToolAction::Abort(reason) = post_tool_action {
                 return Err(EngineError::Aborted(reason));
@@ -2506,7 +2524,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     ToolResult::outcome_unknown(&call_id),
                     None,
                     self.turn_count,
-                    false,
+                    PostToolPolicyWait::Skip,
                     &call_info_map,
                     &mut attempt_fence,
                     &mut terminal_call_ids,
@@ -3556,7 +3574,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                             result,
                             Some(&attempt_id),
                             batch.turn_id,
-                            true,
+                            PostToolPolicyWait::Interruptible,
                             &batch.call_info_map,
                             &mut batch.attempt_fence,
                             &mut batch.terminal_call_ids,

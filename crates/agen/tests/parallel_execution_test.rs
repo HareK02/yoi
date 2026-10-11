@@ -3446,3 +3446,164 @@ async fn turn_end_final_poll_signal_wins_over_finish_without_tools() {
         assert_eq!(probe.continues.load(Ordering::SeqCst), 1);
     }
 }
+
+#[tokio::test]
+async fn turn_end_pause_deadline_reclaims_started_sibling_while_post_policy_is_pending() {
+    struct TurnAndPostBarrier {
+        turn: PolicyBarrier,
+        post: PolicyBarrier,
+    }
+    #[async_trait]
+    impl Interceptor for TurnAndPostBarrier {
+        fn supports_early_tool_dispatch(&self) -> bool {
+            true
+        }
+        async fn on_assistant_turn_end(
+            &self,
+            _: AssistantTurnEndContext<'_>,
+        ) -> InterceptorResult<TurnEndAction> {
+            self.turn.wait().await;
+            Ok(TurnEndAction::Finish)
+        }
+        async fn post_tool_call(
+            &self,
+            _: &ToolResultInfo<'_>,
+        ) -> InterceptorResult<PostToolAction> {
+            self.post.wait().await;
+            Ok(PostToolAction::Continue)
+        }
+    }
+
+    let (client, tx) = ControlledStreamClient::new(ToolCallCompletionSupport::PerBlock);
+    let mut engine = Engine::new(client);
+    engine.set_tool_execution_policy(ToolExecutionPolicy {
+        pause_safe_boundary_timeout: Duration::from_millis(500),
+        cancellation_request_timeout: Duration::from_secs(1),
+        terminal_confirmation_timeout: Duration::from_secs(2),
+    });
+    let turn = PolicyBarrier::new(InterceptorPhase::AssistantTurnEnd, PolicyRoute::Early);
+    let post = PolicyBarrier::new(InterceptorPhase::PostToolCall, PolicyRoute::Early);
+    engine.set_interceptor(TurnAndPostBarrier {
+        turn: turn.clone(),
+        post: post.clone(),
+    });
+    let completed = BarrierTool::new("completed_before_pause");
+    engine.register_tool(completed.definition());
+    let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+    let sibling = PolicyOwnedTool {
+        starts: Arc::new(AtomicUsize::new(0)),
+        started: Arc::new(tokio::sync::Notify::new()),
+        cancel_requested: Arc::new(tokio::sync::Notify::new()),
+        terminal: Arc::new(tokio::sync::Mutex::new(Some(terminal_rx))),
+        retired: Arc::new(tokio::sync::Notify::new()),
+    };
+    let definition: ToolDefinition = {
+        let sibling = sibling.clone();
+        Arc::new(move || {
+            (
+                ToolMeta::new("pending_sibling").input_schema(serde_json::json!({"type":"object"})),
+                Arc::new(sibling.clone()) as Arc<dyn Tool>,
+            )
+        })
+    };
+    engine.register_tool(definition.clone());
+    let committed = Arc::new(AtomicUsize::new(0));
+    let commit_probe = committed.clone();
+    engine.on_history_append(move |item| {
+        if matches!(item, Item::ToolResult { .. }) {
+            commit_probe.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    });
+    let published = Arc::new(AtomicUsize::new(0));
+    let publish_probe = published.clone();
+    let commit_probe = committed.clone();
+    engine.on_tool_result(move |_| {
+        let n = publish_probe.fetch_add(1, Ordering::SeqCst) + 1;
+        assert_eq!(commit_probe.load(Ordering::SeqCst), n);
+    });
+    let pause = engine.pause_sender();
+    let run = tokio::spawn(async move {
+        let mut history = History::new();
+        let output = engine.run(&mut history, "run").await;
+        (output, history)
+    });
+    for (index, id, name) in [
+        (0, "policy_call", "completed_before_pause"),
+        (1, "sibling_call", "pending_sibling"),
+    ] {
+        for event in [
+            Event::tool_use_start(index, id, name),
+            Event::tool_input_delta(index, "{}"),
+            Event::tool_use_stop(index),
+        ] {
+            tx.send(Ok(event)).unwrap();
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(2), completed.started.notified())
+        .await
+        .expect("first provider owned");
+    tokio::time::timeout(Duration::from_secs(2), sibling.started.notified())
+        .await
+        .expect("sibling provider owned");
+    tx.send(Ok(Event::Status(StatusEvent {
+        status: ResponseStatus::Completed,
+    })))
+    .unwrap();
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs(2), turn.entered.notified())
+        .await
+        .expect("turn-end pending");
+    pause.send(()).await.unwrap(); // only one interruption signal
+    tokio::time::timeout(Duration::from_secs(2), turn.retired.notified())
+        .await
+        .expect("turn-end interrupted");
+    completed.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), post.entered.notified())
+        .await
+        .expect("completed result's post policy pending");
+    assert_eq!(committed.load(Ordering::SeqCst), 1);
+    assert_eq!(published.load(Ordering::SeqCst), 1);
+    tokio::time::timeout(Duration::from_secs(2), sibling.cancel_requested.notified()).await.expect("original Pause deadline must reach sibling cancellation without releasing either policy");
+    terminal_tx
+        .send(ToolOutput::from("confirmed sibling terminal".to_string()))
+        .unwrap();
+    let (output, history) = tokio::time::timeout(Duration::from_secs(2), run)
+        .await
+        .expect("all owned tools reclaimed")
+        .unwrap();
+    assert_policy_interruption(&output.result, true);
+    assert_eq!(committed.load(Ordering::SeqCst), 2);
+    assert_eq!(published.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        history
+            .items()
+            .filter(|item| matches!(item, Item::ToolResult { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(completed.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(sibling.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(post.invocations.load(Ordering::SeqCst), 1);
+    assert_eq!(post.continues.load(Ordering::SeqCst), 0);
+    turn.release.notify_one();
+    post.release.notify_one();
+    let mut restored_history: History =
+        serde_json::from_str(&serde_json::to_string(&history).unwrap()).unwrap();
+    let mut restored = Engine::new(MockLlmClient::new(vec![Event::Status(StatusEvent {
+        status: ResponseStatus::Completed,
+    })]));
+    restored.register_tool(completed.definition());
+    restored.register_tool(definition);
+    restored.set_max_turns(Some(1));
+    let _ = restored.resume(&mut restored_history).await;
+    assert_eq!(completed.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(sibling.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        restored_history
+            .items()
+            .filter(|item| matches!(item, Item::ToolResult { .. }))
+            .count(),
+        2
+    );
+}
