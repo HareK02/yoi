@@ -533,6 +533,7 @@ mod existing_workspace_provisioning {
         // This fixture contains only the schema-87 cutover authorities, not the
         // unrelated full Server schema. Exercise the real service/store methods.
         Arc::new(SqliteWorkspaceStore {
+            db_executor: crate::db_executor::DbExecutor::shared(),
             conn: Arc::new(Mutex::new(conn)),
         })
     }
@@ -644,6 +645,7 @@ mod existing_workspace_provisioning {
         drop(service);
         drop(store);
         let store = Arc::new(SqliteWorkspaceStore {
+            db_executor: crate::db_executor::DbExecutor::shared(),
             conn: Arc::new(Mutex::new(Connection::open(&path).unwrap())),
         });
         let service = WorkspaceSigningIdentityService::new(

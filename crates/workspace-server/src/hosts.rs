@@ -23,7 +23,10 @@ use std::{
 };
 use workdir::{
     Workdir, WorkdirError, WorkdirSessionHandle,
-    http::{OpenWorkdirSessionRequest, RemoteWorkdirSession, WorkdirHttpAuthorization},
+    http::{
+        OpenWorkdirSessionRequest, RemoteWorkdirSession, WorkdirHttpAuthorization,
+        WorkdirHttpAuthorizationFuture,
+    },
 };
 use worker_runtime::RuntimeWorkspaceScope;
 use worker_runtime::catalog::{
@@ -3473,6 +3476,38 @@ impl WorkspaceRuntimeAuthorization {
         }
     }
 
+    /// Offload the complete live-binding check and request signing operation.
+    /// Claims are minted inside the bounded job, not cached before admission.
+    pub(crate) async fn issue_async(
+        &self,
+        method: String,
+        path_and_query: String,
+        operation: String,
+        worker_id: Option<String>,
+        body: Vec<u8>,
+    ) -> Result<String, RuntimeDiagnostic> {
+        let executor = self.store.db_executor();
+        let authorization = self.clone();
+        executor
+            .run(move || {
+                Ok::<_, Error>(authorization.issue(
+                    &method,
+                    &path_and_query,
+                    &operation,
+                    worker_id.as_deref(),
+                    &body,
+                ))
+            })
+            .await
+            .map_err(|error| {
+                diagnostic(
+                    "workspace_runtime_authorization_unavailable",
+                    HostDiagnosticSeverity::Error,
+                    error.to_string(),
+                )
+            })?
+    }
+
     pub(crate) fn issue(
         &self,
         method: &str,
@@ -3645,25 +3680,24 @@ impl std::fmt::Debug for RemoteWorkdirAuthorization {
 impl WorkdirHttpAuthorization for RemoteWorkdirAuthorization {
     fn bearer_token(
         &self,
-        method: &str,
-        path_and_query: &str,
-        body: &[u8],
-    ) -> Result<String, WorkdirError> {
-        if let Some(authorization) = &self.workspace_authorization {
-            return authorization
-                .issue(
-                    method,
-                    path_and_query,
-                    workspace_runtime_operation(method, path_and_query),
-                    None,
-                    body,
+        method: String,
+        path_and_query: String,
+        body: Vec<u8>,
+    ) -> WorkdirHttpAuthorizationFuture {
+        let authorization = self.clone();
+        Box::pin(async move {
+            if let Some(authorizer) = &authorization.workspace_authorization {
+                let operation = workspace_runtime_operation(&method, &path_and_query).to_string();
+                return authorizer
+                    .issue_async(method, path_and_query, operation, None, body)
+                    .await
+                    .map_err(|error| WorkdirError::Unavailable(error.message));
+            }
+            authorization.fallback_bearer_token.ok_or_else(|| {
+                WorkdirError::Unavailable(
+                    "remote Runtime does not have bearer authorization configured".to_string(),
                 )
-                .map_err(|error| WorkdirError::Unavailable(error.message));
-        }
-        self.fallback_bearer_token.clone().ok_or_else(|| {
-            WorkdirError::Unavailable(
-                "remote Runtime does not have bearer authorization configured".to_string(),
-            )
+            })
         })
     }
 }
@@ -6343,6 +6377,79 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    #[tokio::test]
+    async fn async_workdir_authorization_uses_store_capacity_without_bearer_fallback() {
+        use crate::db_executor::{DbExecutor, DbExecutorLimits};
+        use crate::store::{SqliteWorkspaceStore, WorkspaceRuntimeBinding};
+        use crate::workspace_signing_identity::InMemoryWorkspaceSigningMaterialStore;
+
+        let executor = DbExecutor::new(DbExecutorLimits {
+            workers: std::num::NonZeroUsize::new(1).unwrap(),
+            queued: std::num::NonZeroUsize::new(1).unwrap(),
+        })
+        .unwrap();
+        let store = Arc::new(
+            SqliteWorkspaceStore::in_memory()
+                .unwrap()
+                .with_db_executor(executor.clone()),
+        );
+        let service = WorkspaceSigningIdentityService::new(
+            store.clone(),
+            Arc::new(InMemoryWorkspaceSigningMaterialStore::default()),
+        );
+        let authorization = RemoteWorkdirAuthorization {
+            workspace_authorization: Some(WorkspaceRuntimeAuthorization::new(
+                store,
+                service,
+                "https://backend.test",
+                WorkspaceRuntimeBinding {
+                    workspace_id: "workspace".into(),
+                    runtime_id: "runtime".into(),
+                    display_name: "Runtime".into(),
+                    base_url: "https://runtime.test".into(),
+                    public_key_fingerprint: "unused".into(),
+                    public_key: "unused".into(),
+                    binding_id: "binding".into(),
+                    authentication_mode: WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity,
+                    created_at: "1".into(),
+                    updated_at: "1".into(),
+                    revoked_at: None,
+                },
+            )),
+            fallback_bearer_token: Some("must-not-be-used".into()),
+        };
+
+        // Hold the running slot and fill the only queue slot. The callback must
+        // reject admission, not run inline or silently switch authentication.
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (started, running) = tokio::sync::oneshot::channel();
+        executor
+            .dispatch(move || {
+                let _ = started.send(());
+                let _ = wait.recv_timeout(Duration::from_secs(5));
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        executor.dispatch(|| {}).unwrap();
+        let error = authorization
+            .bearer_token(
+                "POST".into(),
+                "/v1/workdir-sessions/s/operations".into(),
+                b"{}".to_vec(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WorkdirError::Unavailable(message) if message == Error::DbCapacityExceeded.to_string()
+        ));
+        drop(release);
+        executor.drain().await.unwrap();
+    }
 
     #[test]
     fn ticket_worker_spawn_intent_uses_worker_wire_role() {

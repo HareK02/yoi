@@ -443,6 +443,7 @@ fn content_cutover_reserved_only_releases_resource_but_uncertain_dispatch_keeps_
         migrate_content_state_v85_to_v86(&conn).unwrap();
         drop(conn);
         let store = SqliteWorkspaceStore {
+            db_executor: crate::db_executor::DbExecutor::shared(),
             conn: Arc::new(Mutex::new(Connection::open(path).unwrap())),
         };
         let job = store
@@ -491,6 +492,7 @@ fn content_cutover_completed_result_cleanup_and_replay_remain_unchanged() {
     migrate_content_state_v85_to_v86(&conn).unwrap();
     drop(conn);
     let store = SqliteWorkspaceStore {
+        db_executor: crate::db_executor::DbExecutor::shared(),
         conn: Arc::new(Mutex::new(Connection::open(path).unwrap())),
     };
     let job = store

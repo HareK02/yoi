@@ -318,7 +318,7 @@ async fn runtime_proof_setup_failure_logs_no_internal_error_and_bounds_request_m
             &error,
         )
     });
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(
         to_bytes(response.into_body(), usize::MAX)
             .await

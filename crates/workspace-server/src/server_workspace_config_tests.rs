@@ -803,9 +803,9 @@ mod workspace_config_integration {
                 .supports(workdir::WorkdirSessionCapability::Command)
         );
         let lock = current_worker_session_lock(api, &fixture.worker);
-        let _guard = lock.lock().await;
+        let _guard = Arc::new(lock.lock_owned().await);
         assert!(
-            open_current_worker_workdir_session_locked(api, &fixture.worker, &link)
+            open_current_worker_workdir_session_locked(api, &fixture.worker, &link, &_guard)
                 .await
                 .is_err()
         );
