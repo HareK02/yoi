@@ -18,7 +18,7 @@ use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{Command, execute};
 use protocol::{Event, Method, Segment, UploadedFileRef, WorkerStatus};
 #[cfg(feature = "e2e-test")]
-use protocol::{Greeting, RewindSummary, RewindTarget, RewindTargetId};
+use protocol::{Greeting, RewindSummary};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use standalone::{StandaloneHost, StandaloneLaunchConfig};
@@ -758,10 +758,10 @@ async fn run_e2e_rewind_fixture(
     });
 
     let (_reader, mut term_rx) = TerminalEventReader::spawn()?;
-    let target_id = RewindTargetId {
-        segment_id: uuid::Uuid::from_u128(1),
-        user_input_entry_index: 1,
-    };
+    app.handle_worker_event(Event::UserMessage {
+        entry_id: Some("rewind-fixture-input".into()),
+        segments: vec![Segment::text("candidate rewind target")],
+    });
     let mut rewind_submit_count = 0usize;
     let mut pending_apply: Option<std::time::Instant> = None;
     let apply_delay = Duration::from_millis(400);
@@ -803,45 +803,25 @@ async fn run_e2e_rewind_fixture(
                         .as_ref()
                         .map(|picker| picker.applying)
                         .unwrap_or(false);
-                if let Some(method) = handle_key(&mut app, key) {
+                let was_open = app.rewind_picker.is_some();
+                let method = handle_key(&mut app, key);
+                if !was_open && app.rewind_picker.is_some() {
+                    crate::e2e_observer::emit(
+                        "single_worker",
+                        "rewind_picker_opened",
+                        serde_json::json!({"targets": 1, "selected_preview": "candidate rewind target"}),
+                    );
+                }
+                if let Some(method) = method {
                     match method {
-                        Method::ListRewindTargets => {
-                            app.handle_worker_event(Event::RewindTargets {
-                                head_entries: 3,
-                                targets: vec![RewindTarget {
-                                    id: target_id.clone(),
-                                    expected_head_entries: 3,
-                                    truncate_entries: 1,
-                                    turn_index: 1,
-                                    timestamp_ms: Some(1),
-                                    preview: "candidate rewind target".to_string(),
-                                    eligible: true,
-                                    disabled_reason: None,
-                                    warning: None,
-                                }],
-                            });
-                            crate::e2e_observer::emit(
-                                "single_worker",
-                                "rewind_picker_opened",
-                                serde_json::json!({
-                                    "targets": 1,
-                                    "selected_preview": "candidate rewind target",
-                                }),
-                            );
-                        }
-                        Method::RewindTo {
-                            target,
-                            expected_head_entries,
-                        } => {
+                        Method::RewindTo { entry_id } => {
                             rewind_submit_count += 1;
                             pending_apply = Some(std::time::Instant::now());
                             crate::e2e_observer::emit(
                                 "single_worker",
                                 "rewind_submit_sent",
                                 serde_json::json!({
-                                    "segment_id": target.segment_id.to_string(),
-                                    "user_input_entry_index": target.user_input_entry_index,
-                                    "expected_head_entries": expected_head_entries,
+                                    "entry_id": entry_id,
                                     "submit_count": rewind_submit_count,
                                 }),
                             );
@@ -1725,10 +1705,7 @@ mod tests {
     use super::*;
     use crate::text_selection::{HistoryViewport, SelectionRow};
     use async_trait::async_trait;
-    use protocol::{
-        Event, RewindTarget, RewindTargetId, Segment, UploadedFileAvailability, UploadedFileRef,
-        WorkerStatus,
-    };
+    use protocol::{Event, Segment, UploadedFileAvailability, UploadedFileRef, WorkerStatus};
 
     #[test]
     fn standalone_console_starts_with_in_process_connection_ready() {
@@ -3119,14 +3096,17 @@ mod tests {
             &mut app,
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
         );
-        assert!(matches!(idle, Some(Method::ListRewindTargets)));
+        assert!(idle.is_none());
+        assert!(app.rewind_picker.is_some());
+        app.close_rewind_picker();
 
         app.set_worker_status(WorkerStatus::Paused);
         let paused = handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
         );
-        assert!(matches!(paused, Some(Method::ListRewindTargets)));
+        assert!(paused.is_none());
+        assert!(app.rewind_picker.is_some());
     }
 
     #[test]
@@ -3148,21 +3128,13 @@ mod tests {
     fn rewind_picker_close_returns_to_history_view() {
         let mut app = App::new("agent".to_string());
         app.connected = true;
-        app.handle_worker_event(Event::RewindTargets {
-            head_entries: 1,
-            targets: vec![],
-        });
         assert!(app.rewind_picker.is_none());
 
         let method = handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
         );
-        assert!(matches!(method, Some(Method::ListRewindTargets)));
-        app.handle_worker_event(Event::RewindTargets {
-            head_entries: 1,
-            targets: vec![],
-        });
+        assert!(method.is_none());
         assert!(app.rewind_picker.is_some());
 
         let method = handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -3244,13 +3216,13 @@ mod tests {
     #[test]
     fn rewind_apply_rejects_non_empty_composer_and_paused_status() {
         let mut app = App::new("agent".to_string());
-        app.rewind_picker = Some(crate::app::RewindPickerState::new(1, vec![rewind_target()]));
+        app.rewind_picker = Some(crate::app::RewindPickerState::new(vec![rewind_target()]));
         type_keys(&mut app, "draft");
         assert!(app.submit_rewind_picker().is_none());
         assert!(has_alert(&app, "composer is not empty"));
 
         let mut app = App::new("agent".to_string());
-        app.rewind_picker = Some(crate::app::RewindPickerState::new(1, vec![rewind_target()]));
+        app.rewind_picker = Some(crate::app::RewindPickerState::new(vec![rewind_target()]));
         app.set_worker_status(WorkerStatus::Paused);
         assert!(app.submit_rewind_picker().is_none());
         assert!(has_alert(
@@ -3265,7 +3237,7 @@ mod tests {
         app.scroll.top_offset = 3;
         app.scroll.turn_starts = vec![0, 5, 9];
         app.scroll.total_lines = 42;
-        app.rewind_picker = Some(crate::app::RewindPickerState::new(1, vec![rewind_target()]));
+        app.rewind_picker = Some(crate::app::RewindPickerState::new(vec![rewind_target()]));
         let original_top_offset = app.scroll.top_offset;
         let original_turn_starts = app.scroll.turn_starts.clone();
         let original_total_lines = app.scroll.total_lines;
@@ -3282,20 +3254,10 @@ mod tests {
         assert_eq!(app.scroll.total_lines, original_total_lines);
     }
 
-    fn rewind_target() -> RewindTarget {
-        RewindTarget {
-            id: RewindTargetId {
-                segment_id: uuid::Uuid::nil(),
-                user_input_entry_index: 0,
-            },
-            expected_head_entries: 1,
-            truncate_entries: 0,
-            turn_index: 1,
-            timestamp_ms: Some(1),
-            preview: "retry this".into(),
-            eligible: true,
-            disabled_reason: None,
-            warning: None,
+    fn rewind_target() -> crate::app::RewindEntry {
+        crate::app::RewindEntry {
+            entry_id: "user-1".into(),
+            preview: "test input".into(),
         }
     }
 

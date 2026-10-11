@@ -17,7 +17,7 @@ Deno.test("compact and rewind remain explicit Composer commands", () => {
     ok: true, request: { kind: "compact", content: "" }, notice: "compact requested",
   });
   assertEquals(buildComposerRequest(":rewind"), {
-    ok: true, request: { kind: "list_rewind_targets", content: "" }, notice: "rewind targets requested",
+    ok: true, action: "rewind",
   });
 });
 

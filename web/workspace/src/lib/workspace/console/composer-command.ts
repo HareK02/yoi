@@ -5,7 +5,6 @@ export type WorkerConsoleInputKind =
   | "user"
   | "notify"
   | "compact"
-  | "list_rewind_targets"
   | "register_peer";
 
 export type WorkerConsoleInputRequest = {
@@ -15,7 +14,7 @@ export type WorkerConsoleInputRequest = {
 };
 
 export type ComposerCommandResult =
-  | { ok: true; request?: WorkerConsoleInputRequest; notice?: string }
+  | { ok: true; request?: WorkerConsoleInputRequest; action?: "rewind"; notice?: string }
   | { ok: false; message: string };
 
 type CommandSpec = {
@@ -43,7 +42,7 @@ export const COMMANDS: Record<string, CommandSpec> = {
   },
   rewind: {
     usage: ":rewind",
-    description: "Ask the Worker for rewind targets.",
+    description: "Select a user input in Console history with ↑/↓, then Enter to rewind.",
   },
   rollback: {
     usage: ":rollback",
@@ -200,8 +199,7 @@ function buildColonCommand(commandLine: string): ComposerCommandResult {
       }
       return {
         ok: true,
-        request: { kind: "list_rewind_targets", content: "" },
-        notice: "rewind targets requested",
+        action: "rewind",
       };
     case "peer":
       if (argv.length !== 1) {

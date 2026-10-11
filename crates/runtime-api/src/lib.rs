@@ -401,7 +401,6 @@ pub enum WorkerInputKind {
     UserIfIdle,
     Notify,
     Compact,
-    ListRewindTargets,
     RegisterPeer,
 }
 

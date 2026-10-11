@@ -44,7 +44,6 @@
         Event as ProtocolEvent,
         Method as ProtocolMethod,
         PendingSubmissionsSnapshot,
-        RewindTarget,
         Segment,
         SessionHistoryPage,
         SessionToolAttachment,
@@ -176,8 +175,9 @@
             reportComposerError(error instanceof Error ? error.message : String(error));
         }
     }
-    let rewindTargets = $state<RewindTarget[]>([]);
-    let rewindHeadEntries = $state(0);
+    let rewindEntryId = $state<string | null>(null);
+    let rewindApplying = $state(false);
+    let rewindLoadingEarlier = false;
     let protocolState = $state<"connecting" | "open" | "closed" | "error">(
         "connecting",
     );
@@ -305,6 +305,7 @@
     const turnNavigationItems = $derived(
         conversationTurnPreviewsFromLines(lines),
     );
+    const rewindEntries = $derived(lines.filter((line) => line.kind === "user" && line.entryId));
     const tasks = $derived(selectedConsoleProjection.tasks);
     const diagnostics = $derived(
         mergeDiagnostics(worker?.diagnostics ?? [], streamDiagnostics),
@@ -314,7 +315,7 @@
     );
     const workerRunning = $derived(workerState === "running");
     const workerPaused = $derived(workerState === "paused");
-    const canSendComposerControl = $derived(protocolState === "open" && !sending);
+    const canSendComposerControl = $derived(protocolState === "open" && !sending && !rewindApplying);
     const canUploadAttachments = $derived(consoleTarget !== null);
     const draftHasText = $derived(draft.content.trim().length > 0);
     const draftHasAttachments = $derived(
@@ -325,7 +326,7 @@
             delivery: "submit",
             workerState,
             protocolOpen: protocolState === "open",
-            sending,
+            sending: sending || rewindApplying,
             hasText: draftHasText,
             hasAttachments: draftHasAttachments,
         }),
@@ -335,7 +336,7 @@
             delivery: "queue",
             workerState,
             protocolOpen: protocolState === "open",
-            sending,
+            sending: sending || rewindApplying,
             hasText: draftHasText,
             hasAttachments: draftHasAttachments,
         }),
@@ -345,14 +346,14 @@
             delivery: "notify",
             workerState,
             protocolOpen: protocolState === "open",
-            sending,
+            sending: sending || rewindApplying,
             hasText: draftHasText,
             hasAttachments: draftHasAttachments,
         }),
     );
     const canStopFromComposer = $derived(workerRunning && canSendComposerControl);
     const composerSubmitDisabled = $derived(
-        workerRunning ? !canStopFromComposer : !canSubmitDraft,
+        rewindEntryId ? !canSendComposerControl : workerRunning ? !canStopFromComposer : !canSubmitDraft,
     );
 
     async function getJson<T>(path: string): Promise<T> {
@@ -773,6 +774,8 @@
     ) {
         handleProtocolCommandEvent(payload);
         if (payload.event === "rewind_applied") {
+            rewindApplying = false;
+            rewindEntryId = null;
             if (draft.segments.length === 0 && attachments.length === 0) {
                 composerInputElement?.restoreSegments(payload.data.input);
             } else {
@@ -824,6 +827,7 @@
     }
 
     function handleComposerKeydown(event: KeyboardEvent) {
+        if (handleRewindKeydown(event)) return;
         if (event.key === "PageUp" || event.key === "PageDown") {
             event.preventDefault();
             scrollConsoleByPage(event.key === "PageDown" ? 1 : -1);
@@ -934,17 +938,88 @@
         sendWorkerControl(command);
     }
 
-    function rewindTo(target: RewindTarget) {
-        sendControl(
-            {
-                method: "rewind_to",
-                params: {
-                    target: target.id,
-                    expected_head_entries: rewindHeadEntries,
-                },
-            },
-            `Rewind to ${target.preview || "target"}`,
-        );
+    async function startRewindSelection(): Promise<void> {
+        if (rewindApplying) return;
+        const targetKey = activeComposerTargetKey;
+        await selectConsoleWorkerView(null);
+        if (activeComposerTargetKey !== targetKey) return;
+        const target = rewindEntries.at(-1);
+        if (!target?.entryId) {
+            reportComposerError("No user input is loaded. Load earlier conversation to select a rewind point.");
+            return;
+        }
+        composerInputElement?.clear();
+        rewindEntryId = target.entryId;
+        autoFollowConsole = false;
+        await tick();
+        if (rewindEntryId !== target.entryId) return;
+        selectConsoleTurn(target.id);
+        autoFollowConsole = false;
+        composerInputElement?.focus();
+    }
+
+    async function moveRewindSelection(direction: -1 | 1): Promise<void> {
+        if (!rewindEntryId || rewindApplying || rewindLoadingEarlier) return;
+        const targetKey = activeComposerTargetKey;
+        const selected = rewindEntryId;
+        let index = rewindEntries.findIndex((entry) => entry.entryId === selected);
+        if (index === 0 && direction === -1 && selectedHistory.hasMore && selectedHistory.cursor && consoleTarget) {
+            rewindLoadingEarlier = true;
+            try {
+                await requestHistoryPage(consoleTarget, selectedHistoryKey, selectedHistory.cursor, reloadToken);
+                await tick();
+            } finally { rewindLoadingEarlier = false; }
+            if (activeComposerTargetKey !== targetKey || rewindEntryId !== selected) return;
+            index = rewindEntries.findIndex((entry) => entry.entryId === selected);
+        }
+        if (index < 0) { rewindEntryId = null; return; }
+        const target = rewindEntries[Math.max(0, Math.min(rewindEntries.length - 1, index + direction))];
+        rewindEntryId = target.entryId!;
+        await tick();
+        if (rewindEntryId !== target.entryId) return;
+        selectConsoleTurn(target.id);
+        autoFollowConsole = false;
+    }
+
+    function applySelectedRewind(): void {
+        if (!rewindEntryId || rewindApplying) return;
+        if (!canSendComposerControl) {
+            reportComposerError("Cannot send rewind while disconnected or another input is awaiting admission.");
+            return;
+        }
+        if (!rewindEntries.some((entry) => entry.entryId === rewindEntryId)) {
+            reportComposerError("The selected input is no longer in the displayed history.");
+            rewindEntryId = null;
+            return;
+        }
+        rewindApplying = true;
+        try {
+            sendProtocolMethod({ method: "rewind_to", params: { entry_id: rewindEntryId } });
+        } catch (error) {
+            rewindApplying = false;
+            reportComposerError(error instanceof Error ? error.message : String(error));
+        }
+    }
+
+    function handleRewindKeydown(event: KeyboardEvent): boolean {
+        if (!rewindEntryId || event.isComposing || event.keyCode === 229 ||
+            event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return false;
+        if (["ArrowUp", "ArrowDown", "Enter", "Escape"].includes(event.key)) {
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.key === "Escape") rewindEntryId = null;
+            else if (event.key === "Enter") { if (!event.repeat) applySelectedRewind(); }
+            else void moveRewindSelection(event.key === "ArrowUp" ? -1 : 1);
+            return true;
+        }
+        // Typing resumes normal draft editing without disabling the composer.
+        if (event.key.length === 1 || event.key === "Backspace" || event.key === "Delete") rewindEntryId = null;
+        return false;
+    }
+
+    function handleConsoleKeydown(event: KeyboardEvent): void {
+        if (!event.defaultPrevented && !isEditableTarget(event.target) && handleRewindKeydown(event)) return;
+        handleWorkerControlShortcut(event);
     }
 
     function composerRequestToProtocolMethod(
@@ -974,8 +1049,6 @@
                 if (!method) throw new Error("Worker state snapshot is not available");
                 return method;
             }
-            case "list_rewind_targets":
-                return { method: "list_rewind_targets" };
             case "register_peer":
                 return {
                     method: "register_peer",
@@ -992,6 +1065,7 @@
     }
 
     function handleComposerChange(snapshot: ComposerDraftSnapshot) {
+        if (snapshot.document !== draft.document) rewindEntryId = null;
         draft = snapshot;
         composerDrafts.set(activeComposerTargetKey, cachedComposerDraft(snapshot));
     }
@@ -1057,13 +1131,14 @@
     }
 
     function handleComposerSubmit() {
-        if (!canSendComposerControl) return;
+        if (rewindEntryId) { applySelectedRewind(); return; }
         const value = composerSnapshotOrReport();
         if (!value) return;
         if (value.document.trimStart().startsWith(":")) {
             handleComposerCommand();
             return;
         }
+        if (!canSendComposerControl) return;
         if (workerRunning) {
             sendWorkerControl("cancel");
             return;
@@ -1275,6 +1350,11 @@
             reportComposerError(command.message);
             return;
         }
+        if (command.action === "rewind") {
+            if (delivery !== "submit") { reportComposerError("Rewind is a local Console action, not queued input or a notification."); return; }
+            await startRewindSelection();
+            return;
+        }
         if (!command.request) {
             if (command.notice) pushWorkspaceAlert("info", command.notice, { title: "Console command" });
             composerInputElement?.clear();
@@ -1284,7 +1364,7 @@
             delivery,
             workerState,
             protocolOpen: protocolState === "open",
-            sending,
+            sending: sending || rewindApplying,
             hasText: value.content.trim().length > 0,
             hasAttachments: attachments.length > 0 ||
                 value.segments.some((segment) => segment.kind === "uploaded_file"),
@@ -1622,19 +1702,11 @@
             }
             return;
         }
-        if (event.event === "rewind_targets") {
-            rewindHeadEntries = event.data.head_entries;
-            rewindTargets = event.data.targets;
-            pushWorkspaceAlert(
-                "info",
-                event.data.targets.length === 0
-                    ? "No rewind targets are available."
-                    : `Loaded ${event.data.targets.length} rewind target(s).`,
-                { id: controlAlertId, title: "Rewind targets" },
-            );
-            return;
-        }
         if (event.event === "error") {
+            if (rewindApplying) {
+                rewindApplying = false;
+                reportComposerError(event.data.message);
+            }
             const error = new Error(event.data.message);
             if (
                 fileCompletions.pending || featureCompletions.pending ||
@@ -1655,6 +1727,8 @@
 
     function rejectPendingCompletion(error: Error, targetKey = activeComposerTargetKey) {
         admissionDisconnected(targetKey);
+        rewindEntryId = null;
+        rewindApplying = false;
         // Invalidate suggestions on disconnect without locking the draft.
         composerInputElement?.closeCompletion();
         fileCompletions.close(error);
@@ -1693,6 +1767,7 @@
         rememberCurrent = true,
     ) {
         if (sessionId === selectedWorkerViewSessionId) return;
+        rewindEntryId = null;
         const generation = ++workerViewSelectionGeneration;
         if (rememberCurrent) rememberConsoleWorkerViewScroll();
         const target = workerViews.find((view) => view.sessionId === sessionId) ??
@@ -1799,6 +1874,8 @@
         const target = consoleTarget;
         const targetWorker = data.worker;
         const targetWorkerError = data.workerError;
+        rewindEntryId = null;
+        rewindApplying = false;
         workerViewSelectionGeneration += 1;
         selectedWorkerViewSessionId = null;
         consoleViewScroll.clear();
@@ -1854,7 +1931,7 @@
     });
 </script>
 
-<svelte:window onkeydown={handleWorkerControlShortcut} />
+<svelte:window onkeydown={handleConsoleKeydown} />
 
 <svelte:head>
     <title>Worker Console · Yoi Workspace</title>
@@ -1865,28 +1942,6 @@
 </svelte:head>
 
 <div class="console-shell worker-console-shell">
-    {#if rewindTargets.length > 0}
-        <section class="card rewind-targets" aria-label="Rewind targets">
-            <h3>Rewind targets</h3>
-            <div class="rewind-target-list">
-                {#each rewindTargets as target (JSON.stringify(target.id))}
-                    <button
-                        type="button"
-                        class="secondary-button"
-                        disabled={protocolState !== "open" || !target.eligible}
-                        title={target.disabled_reason ?? target.warning ?? undefined}
-                        onclick={() => rewindTo(target)}
-                    >
-                        {target.preview || `${target.turn_index}`}
-                        {#if target.warning || target.disabled_reason}
-                            <span>{target.warning ?? target.disabled_reason}</span>
-                        {/if}
-                    </button>
-                {/each}
-            </div>
-        </section>
-    {/if}
-
     {#key selectedHistoryKey}
     <svelte:boundary onerror={(error) => console.error("Console transcript rendering failed", error)}>
     <div class:with-task-pane={taskPaneOpen} class="console-history">
@@ -1932,7 +1987,7 @@
                 {#if (consoleDisplayState.kind === "ready" || consoleDisplayState.kind === "stale") && lines.length > 0}
                     <ol class="console-log">
                         {#each lines as item (item.id)}
-                            <ConsoleLineItem {item} {attachmentUrl} />
+                            <ConsoleLineItem {item} {attachmentUrl} rewindSelected={rewindEntryId !== null && item.entryId === rewindEntryId} />
                         {/each}
                     </ol>
                 {/if}
@@ -2151,6 +2206,12 @@
                 accept="text/*,application/json,application/pdf,image/png,image/jpeg,image/gif,image/webp"
                 onchange={handleFileInput}
             />
+            {#if rewindEntryId || rewindApplying}
+                <div class="rewind-status" role="status">
+                    {rewindApplying ? "Applying rewind…" : "Rewind · ↑↓ select input · Enter apply · Esc cancel"}
+                    <span>Rewinds to before the selected input. Tool side effects are not undone.</span>
+                </div>
+            {/if}
             <ComposerInput
                 bind:this={composerInputElement}
                 historyScope={workspaceId}
@@ -2268,16 +2329,18 @@
                     {/if}
                     <button
                         class="composer-send-button"
-                        class:stop={workerRunning}
+                        class:stop={workerRunning && !rewindEntryId}
                         type="submit"
-                        aria-label={workerRunning
+                        aria-label={rewindEntryId ? "Rewind to selected input" : workerRunning
                             ? "Stop Worker"
                             : sending
                               ? "Sending message"
                               : "Send message"}
                         disabled={composerSubmitDisabled}
                     >
-                        {#if workerRunning}
+                        {#if rewindEntryId}
+                            <svg class="composer-send-icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M9 5L3 11L9 17M3 11H15A5 5 0 0 1 15 21" /></svg>
+                        {:else if workerRunning}
                             <svg
                                 class="composer-send-icon"
                                 aria-hidden="true"
@@ -2325,6 +2388,9 @@
 </div>
 
 <style>
+    .rewind-status { font-size: var(--font-size-compact); color: var(--text-muted); }
+    .rewind-status span { display: block; }
+
     .console-shell {
         width: 100%;
         max-width: 920px;
@@ -2409,28 +2475,7 @@
         transform: translateX(10px);
     }
 
-    .rewind-targets {
-        display: flex;
-        align-items: center;
-        gap: var(--space-3);
-        padding: var(--space-3);
-    }
 
-    .rewind-targets h3 {
-        margin: 0;
-        font-size: var(--font-size-body);
-    }
-
-    .rewind-target-list {
-        display: flex;
-        flex-wrap: wrap;
-        gap: var(--space-2);
-    }
-
-    .rewind-target-list span {
-        margin-left: var(--space-2);
-        color: var(--text-muted);
-    }
 
     .console-history {
         display: grid;

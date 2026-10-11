@@ -1325,7 +1325,6 @@ export function applyProtocolEvent(
       break;
     case "memory_worker":
     case "completions":
-    case "rewind_targets":
     case "workers_listed":
     case "worker_restored":
     case "peer_registered":

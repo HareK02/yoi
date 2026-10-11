@@ -531,8 +531,8 @@ use crate::skill::{SkillActivationResponse, SkillClientError};
 use async_trait::async_trait;
 use protocol::{
     AlertLevel, AlertSource, CompactionLifecycle, CompactionLifecycleState, CompactionPhase,
-    CompactionTrigger, ErrorCode, Event, InFlightCompaction, RewindSummary, RewindTarget,
-    RewindTargetId, RunFailureKind, RunResumeSource, RunYieldReason, Segment,
+    CompactionTrigger, ErrorCode, Event, InFlightCompaction, RewindSummary, RunFailureKind,
+    RunResumeSource, RunYieldReason, Segment,
 };
 use tokio::net::UnixStream;
 use tokio::sync::broadcast;
@@ -3714,22 +3714,15 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         &self.store
     }
 
-    /// List user-submitted turns in newest-first order for the manual rewind picker.
-    pub fn list_rewind_targets(&self) -> Result<(usize, Vec<RewindTarget>), RewindError> {
+    /// Rewind the current segment to just before the specified public user input.
+    pub async fn rewind_to(&mut self, entry_id: String) -> Result<RewindAppliedState, RewindError> {
+        // Reject invalid targets before invoking rewrite hooks or quiescing tasks.
+        // Resolve again under the append lock after the asynchronous barrier.
         let loc = self.segment_state.location();
-        let entries = self.store.read_all(loc.session_id, loc.segment_id)?;
-        Ok((
-            entries.len(),
-            build_rewind_targets(loc.segment_id, &entries),
-        ))
-    }
-
-    /// Truncate the current segment to just before a previously listed user input.
-    pub async fn rewind_to(
-        &mut self,
-        target: RewindTargetId,
-        expected_head_entries: usize,
-    ) -> Result<RewindAppliedState, RewindError> {
+        resolve_rewind_input(
+            &self.store.read_all(loc.session_id, loc.segment_id)?,
+            &entry_id,
+        )?;
         let _rewrite_guard = self
             .prepare_session_rewrite(SessionRewriteKind::Rewind)
             .await
@@ -3742,29 +3735,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .lock()
             .expect("segment append lock poisoned");
         let loc = self.segment_state.location();
-        if target.segment_id != loc.segment_id {
-            return Err(RewindError::Invalid(
-                "rewind target belongs to a different segment".into(),
-            ));
-        }
-
         let entries = self.store.read_all(loc.session_id, loc.segment_id)?;
-        if entries.len() != expected_head_entries {
-            return Err(RewindError::Invalid(format!(
-                "session head changed since picker opened (expected {expected_head_entries}, current {})",
-                entries.len()
-            )));
-        }
-
-        let input = match entries.get(target.user_input_entry_index) {
-            Some(LogEntry::AnnotatedUserInput { segments, .. }) => segments.clone(),
-            _ => {
-                return Err(RewindError::Invalid(
-                    "rewind target is no longer a user message".into(),
-                ));
-            }
-        };
-        let truncate_entries = rewind_truncate_entries(&entries, target.user_input_entry_index);
+        let (entry_index, input) = resolve_rewind_input(&entries, &entry_id)?;
+        let truncate_entries = rewind_truncate_entries(&entries, entry_index);
         let retained = entries[..truncate_entries].to_vec();
         let tool_side_effect_warning = suffix_has_tool_side_effects(&entries[truncate_entries..]);
         let state = segment_log::collect_state(&retained);
@@ -8994,37 +8967,21 @@ pub struct RewindAppliedState {
     pub summary: RewindSummary,
 }
 
-fn build_rewind_targets(segment_id: uuid::Uuid, entries: &[LogEntry]) -> Vec<RewindTarget> {
-    let head_entries = entries.len();
-    let mut turn_index = 0usize;
-    let mut targets = Vec::new();
-    for (entry_index, entry) in entries.iter().enumerate() {
-        let (segments, ts) = match entry {
-            LogEntry::AnnotatedUserInput { segments, ts, .. } => (segments, ts),
-            _ => continue,
-        };
-        turn_index += 1;
-        let truncate_entries = rewind_truncate_entries(entries, entry_index);
-        let tool_warning = suffix_has_tool_side_effects(&entries[truncate_entries..]);
-        targets.push(RewindTarget {
-            id: RewindTargetId {
-                segment_id,
-                user_input_entry_index: entry_index,
-            },
-            expected_head_entries: head_entries,
-            truncate_entries,
-            turn_index,
-            timestamp_ms: Some(*ts),
-            preview: preview_segments(segments),
-            eligible: true,
-            disabled_reason: None,
-            warning: tool_warning.then(|| {
-                "history suffix will be discarded; tool side effects are not undone".into()
-            }),
-        });
-    }
-    targets.reverse();
-    targets
+fn resolve_rewind_input(
+    entries: &[LogEntry],
+    entry_id: &str,
+) -> Result<(usize, Vec<Segment>), RewindError> {
+    // Resolve only actual user submissions in this segment, never seeded
+    // ancestor history or a display position inferred from matching text.
+    entries.iter().enumerate().find_map(|(index, entry)| {
+            let LogEntry::AnnotatedUserInput { history, segments, .. } = entry else { return None; };
+            let user = history.iter().find(|entry| matches!(&entry.item,
+                session_store::LoggedItem::Message { role: session_store::LoggedRole::User, .. }
+            ))?;
+            (user.metadata.entry_id.0 == entry_id).then(|| (index, segments.clone()))
+        }).ok_or_else(|| RewindError::Invalid(
+            "rewind entry is not a user input in the current segment; it may have been removed or belong to another history".into()
+        ))
 }
 
 fn rewind_truncate_entries(entries: &[LogEntry], user_input_entry_index: usize) -> usize {
@@ -9052,6 +9009,7 @@ fn logged_item_is_tool_call(item: &session_store::LoggedItem) -> bool {
     matches!(item, session_store::LoggedItem::ToolCall { .. })
 }
 
+#[cfg(test)]
 fn preview_segments(segments: &[Segment]) -> String {
     let mut preview = String::new();
     for segment in segments {
@@ -12305,48 +12263,139 @@ mod build_summary_prompt_tests {
         );
     }
 
+    fn rewind_test_inputs<C: LlmClient + 'static, St: Store>(
+        worker: &Worker<C, St>,
+    ) -> Vec<(String, usize)> {
+        let loc = worker.segment_state.location();
+        let entries = worker
+            .store
+            .read_all(loc.session_id, loc.segment_id)
+            .unwrap();
+        let public = session_store::public_snapshot::project_current_session_snapshot(&entries);
+        public
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                if !matches!(
+                    entry.data,
+                    protocol::SessionSnapshotEntryData::UserInput { .. }
+                ) {
+                    return None;
+                }
+                let index = entries.iter().position(|log| {
+                    matches!(log, LogEntry::AnnotatedUserInput { history, .. }
+                if history.iter().any(|h| h.metadata.entry_id.0 == entry.entry_id))
+                })?;
+                Some((
+                    entry.entry_id.clone(),
+                    rewind_truncate_entries(&entries, index),
+                ))
+            })
+            .rev()
+            .collect()
+    }
+
     #[tokio::test]
-    async fn rewind_target_listing_is_newest_first_and_warns_on_tool_suffix() {
-        let (_dir, worker) = rewind_test_worker().await;
-        append_user_turn(&worker, 10, "first message");
-        append_user_turn(&worker, 20, "second message");
+    async fn rewind_resolves_duplicate_text_by_public_entry_identity() {
+        let (_dir, mut worker) = rewind_test_worker().await;
+        append_user_turn(&worker, 10, "same input");
+        append_user_turn(&worker, 20, "same input");
+        let inputs = rewind_test_inputs(&worker);
+        assert_ne!(inputs[0].0, inputs[1].0);
+        worker.rewind_to(inputs[0].0.clone()).await.unwrap();
+        assert_eq!(rewind_test_inputs(&worker), vec![inputs[1].clone()]);
+    }
+
+    #[tokio::test]
+    async fn rewind_rejects_unknown_foreign_and_non_user_ids_without_changing_log() {
+        let (_dir, mut worker) = rewind_test_worker().await;
+        let (_other_dir, other) = rewind_test_worker().await;
+        append_user_turn(&worker, 10, "same input");
+        append_user_turn(&other, 10, "same input");
+        let assistant =
+            crate::session_history::test_logged_history_entry(session_store::LoggedItem::Message {
+                role: session_store::LoggedRole::Assistant,
+                content: vec![session_store::LoggedContentPart::Text {
+                    text: "answer".into(),
+                }],
+            });
+        let assistant_id = assistant.metadata.entry_id.0.clone();
         append_test_entry(
             &worker,
-            LogEntry::AnnotatedToolResult {
-                ts: 30,
-                entry: crate::session_history::test_logged_history_entry(
-                    session_store::LoggedItem::ToolResult {
-                        call_id: "call-1".into(),
-                        summary: "wrote a file".into(),
-                        content: None,
-                        attachments: Vec::new(),
-                        disposition: Default::default(),
-                        is_error: false,
-                    },
-                ),
+            LogEntry::AnnotatedAssistantItem {
+                ts: 12,
+                entry: assistant,
             },
         );
-
-        let (head_entries, targets) = worker.list_rewind_targets().unwrap();
         let loc = worker.segment_state.location();
+        let before = worker
+            .store
+            .read_all(loc.session_id, loc.segment_id)
+            .unwrap();
+        for id in [
+            String::new(),
+            "missing-entry".into(),
+            rewind_test_inputs(&other)[0].0.clone(),
+            assistant_id,
+        ] {
+            assert!(
+                worker
+                    .rewind_to(id)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not a user input")
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    worker
+                        .store
+                        .read_all(loc.session_id, loc.segment_id)
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+        }
+    }
 
-        assert_eq!(
-            head_entries,
-            worker
-                .store
-                .read_all(loc.session_id, loc.segment_id)
-                .unwrap()
-                .len()
+    #[tokio::test]
+    async fn rewind_rejects_user_input_from_seeded_ancestor_history() {
+        let (_dir, mut worker) = rewind_test_worker().await;
+        let input = crate::session_history::test_logged_history_entry(
+            session_store::LoggedItem::from(agen::Item::user_message("ancestor input")),
         );
-        assert_eq!(targets.len(), 2);
-        assert_eq!(targets[0].preview, "second message");
-        assert_eq!(targets[1].preview, "first message");
+        let id = input.metadata.entry_id.0.clone();
+        let loc = worker.segment_state.location();
+        let mut entries = worker
+            .store
+            .read_all(loc.session_id, loc.segment_id)
+            .unwrap();
+        let LogEntry::AnnotatedSegmentStart { history, .. } = &mut entries[0] else {
+            panic!("segment start");
+        };
+        history.push(input);
+        worker
+            .store
+            .create_segment(loc.session_id, loc.segment_id, &entries)
+            .unwrap();
         assert!(
-            targets[0]
-                .warning
-                .as_ref()
-                .unwrap()
-                .contains("tool side effects")
+            worker
+                .rewind_to(id)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("current segment")
+        );
+        assert_eq!(
+            serde_json::to_value(
+                worker
+                    .store
+                    .read_all(loc.session_id, loc.segment_id)
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(entries).unwrap()
         );
     }
 
@@ -12371,11 +12420,11 @@ mod build_summary_prompt_tests {
                 ),
             },
         );
-        let (head_entries, targets) = worker.list_rewind_targets().unwrap();
-        let expected_truncate_entries = targets[0].truncate_entries;
-        let target = targets[0].id.clone();
+        let targets = rewind_test_inputs(&worker);
+        let expected_truncate_entries = targets[0].1;
+        let target = targets[0].0.clone();
 
-        let applied = worker.rewind_to(target, head_entries).await.unwrap();
+        let applied = worker.rewind_to(target).await.unwrap();
 
         assert_eq!(preview_segments(&applied.input), "second message");
         assert_eq!(
@@ -12405,10 +12454,10 @@ mod build_summary_prompt_tests {
             .pending_submission_handle()
             .accept_notification("notification-1".into(), "keep me".into())
             .unwrap();
-        let (head_entries, targets) = worker.list_rewind_targets().unwrap();
+        let targets = rewind_test_inputs(&worker);
 
         worker
-            .rewind_to(targets.last().unwrap().id.clone(), head_entries)
+            .rewind_to(targets.last().unwrap().0.clone())
             .await
             .unwrap();
 
@@ -12465,16 +12514,11 @@ mod build_summary_prompt_tests {
             },
         );
 
-        let (head_entries, targets) = worker.list_rewind_targets().unwrap();
+        let targets = rewind_test_inputs(&worker);
         assert_eq!(targets.len(), 2);
-        assert_eq!(targets[0].preview, "second message");
-        assert!(targets[0].truncate_entries > 0);
-        assert!(targets[0].warning.is_some());
+        assert!(targets[0].1 > 0);
 
-        let applied = worker
-            .rewind_to(targets[0].id.clone(), head_entries)
-            .await
-            .unwrap();
+        let applied = worker.rewind_to(targets[0].0.clone()).await.unwrap();
         assert_eq!(applied.summary.truncated_to_entries, 5);
         assert!(matches!(
             applied.entries.first(),
@@ -12539,19 +12583,20 @@ mod build_summary_prompt_tests {
     }
 
     #[tokio::test]
-    async fn rewind_apply_rejects_stale_head() {
+    async fn rewind_by_entry_id_includes_history_appended_after_selection() {
         let (_dir, mut worker) = rewind_test_worker().await;
         append_user_turn(&worker, 10, "first message");
-        let (head_entries, targets) = worker.list_rewind_targets().unwrap();
+        let targets = rewind_test_inputs(&worker);
         append_user_turn(&worker, 20, "newer message");
 
-        let err = worker
-            .rewind_to(targets[0].id.clone(), head_entries)
-            .await
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("session head changed"));
+        let applied = worker.rewind_to(targets[0].0.clone()).await.unwrap();
+        assert_eq!(preview_segments(&applied.input), "first message");
+        assert!(rewind_test_inputs(&worker).is_empty());
+        let err = worker.rewind_to(targets[0].0.clone()).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not a user input in the current segment")
+        );
     }
 
     #[tokio::test]
@@ -15421,7 +15466,7 @@ permission = "write"
                         assert!(pending.pending_notifications.is_empty());
                         assert!(pending.activating_notifications.is_empty());
                     }
-                    let (head, targets) = original.list_rewind_targets().unwrap();
+                    let targets = rewind_test_inputs(&original);
                     let target = targets.last().unwrap();
                     let old = store
                         .read_all(original.session_id(), original.segment_id())
@@ -15431,7 +15476,7 @@ permission = "write"
                     store
                         .invocation_failure
                         .store(replacement_fault, Ordering::SeqCst);
-                    let applied = original.rewind_to(target.id.clone(), head).await;
+                    let applied = original.rewind_to(target.0.clone()).await;
                     let disk = store
                         .read_all(original.session_id(), original.segment_id())
                         .unwrap();
@@ -15456,15 +15501,9 @@ permission = "write"
                                 replacement_fault
                             );
                             let applied = applied.unwrap();
-                            assert_eq!(
-                                applied.summary.truncated_to_entries,
-                                target.truncate_entries
-                            );
-                            assert_eq!(
-                                applied.summary.discarded_entries,
-                                head - target.truncate_entries
-                            );
-                            assert_eq!(applied.entries.len(), target.truncate_entries);
+                            assert_eq!(applied.summary.truncated_to_entries, target.1);
+                            assert_eq!(applied.summary.discarded_entries, old.len() - target.1);
+                            assert_eq!(applied.entries.len(), target.1);
                             assert_eq!(original.segment_state.entries_written(), disk.len());
                             assert_eq!(
                                 serde_json::to_value(original.sink.subscribe_with_snapshot().0)
@@ -15474,10 +15513,10 @@ permission = "write"
                         } else {
                             assert!(applied.is_err());
                         }
-                        assert_eq!(disk.len(), target.truncate_entries + 1);
+                        assert_eq!(disk.len(), target.1 + 1);
                         assert_eq!(
-                            serde_json::to_value(&disk[..target.truncate_entries]).unwrap(),
-                            serde_json::to_value(&old[..target.truncate_entries]).unwrap()
+                            serde_json::to_value(&disk[..target.1]).unwrap(),
+                            serde_json::to_value(&old[..target.1]).unwrap()
                         );
                         let LogEntry::Extension {
                             domain, payload, ..

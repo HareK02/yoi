@@ -705,7 +705,6 @@ pub enum WorkerInputKind {
     UserIfIdle,
     Notify,
     Compact,
-    ListRewindTargets,
     RegisterPeer,
 }
 
@@ -3271,7 +3270,6 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 WorkerInputKind::UserIfIdle => EmbeddedWorkerInputKind::UserIfIdle,
                 WorkerInputKind::Notify => EmbeddedWorkerInputKind::Notify,
                 WorkerInputKind::Compact => EmbeddedWorkerInputKind::Compact,
-                WorkerInputKind::ListRewindTargets => EmbeddedWorkerInputKind::ListRewindTargets,
                 WorkerInputKind::RegisterPeer => EmbeddedWorkerInputKind::RegisterPeer,
             },
             content: request.content,
@@ -5310,7 +5308,6 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 WorkerInputKind::UserIfIdle => EmbeddedWorkerInputKind::UserIfIdle,
                 WorkerInputKind::Notify => EmbeddedWorkerInputKind::Notify,
                 WorkerInputKind::Compact => EmbeddedWorkerInputKind::Compact,
-                WorkerInputKind::ListRewindTargets => EmbeddedWorkerInputKind::ListRewindTargets,
                 WorkerInputKind::RegisterPeer => EmbeddedWorkerInputKind::RegisterPeer,
             },
             content: request.content,
@@ -6748,7 +6745,6 @@ mod tests {
             EmbeddedWorkerInputKind::UserIfIdle,
             EmbeddedWorkerInputKind::Notify,
             EmbeddedWorkerInputKind::Compact,
-            EmbeddedWorkerInputKind::ListRewindTargets,
             EmbeddedWorkerInputKind::RegisterPeer,
         ] {
             let input = EmbeddedWorkerInput {

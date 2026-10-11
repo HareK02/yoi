@@ -6930,7 +6930,6 @@ fn worker_input_request_from_api(
         "user" => WorkerInputKind::User,
         "notify" => WorkerInputKind::Notify,
         "compact" => WorkerInputKind::Compact,
-        "list_rewind_targets" => WorkerInputKind::ListRewindTargets,
         "register_peer" => WorkerInputKind::RegisterPeer,
         value => {
             return Err(Error::InvalidInput(format!(
@@ -29168,7 +29167,6 @@ pub(crate) fn authorize_browser_worker_method(
         | protocol::Method::Cancel { .. }
         | protocol::Method::Pause { .. }
         | protocol::Method::Compact { .. }
-        | protocol::Method::ListRewindTargets
         | protocol::Method::RewindTo { .. }
         | protocol::Method::Shutdown { .. }
         | protocol::Method::ListCompletions { .. }

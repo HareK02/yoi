@@ -6752,16 +6752,16 @@ fn input_protocol_event(input: &WorkerInput) -> Option<protocol::Event> {
         // Submit is projected only after the Worker commits UserInput. Queued
         // payloads must never become model- or client-visible history early.
         WorkerInputKind::User | WorkerInputKind::UserIfIdle | WorkerInputKind::Notify => None,
-        WorkerInputKind::Compact
-        | WorkerInputKind::ListRewindTargets
-        | WorkerInputKind::RegisterPeer => Some(protocol::Event::SystemItem {
-            entry_id: None,
-            item: serde_json::json!({
-                "kind": "embedded_worker_command_input",
-                "command": input.kind,
-                "content": input.content.clone(),
-            }),
-        }),
+        WorkerInputKind::Compact | WorkerInputKind::RegisterPeer => {
+            Some(protocol::Event::SystemItem {
+                entry_id: None,
+                item: serde_json::json!({
+                    "kind": "embedded_worker_command_input",
+                    "command": input.kind,
+                    "content": input.content.clone(),
+                }),
+            })
+        }
     }
 }
 

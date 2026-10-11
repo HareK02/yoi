@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use protocol::{
     AlertLevel, AlertSource, CompletionEntry, CompletionKind, ErrorCode, Event, InFlightBlock,
     InFlightSnapshot, InFlightToolCallState, InternalWorkerRef, InternalWorkerSnapshot, Method,
-    RewindTarget, RunResult, Segment, WorkerCommandEnvelope, WorkerStateSnapshot, WorkerStatus,
+    RunResult, Segment, WorkerCommandEnvelope, WorkerStateSnapshot, WorkerStatus,
 };
 
 use crate::block::{
@@ -91,9 +91,14 @@ pub struct RewindPickerScroll {
 }
 
 #[derive(Debug, Clone)]
+pub struct RewindEntry {
+    pub entry_id: String,
+    pub preview: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct RewindPickerState {
-    pub head_entries: usize,
-    pub targets: Vec<RewindTarget>,
+    pub targets: Vec<RewindEntry>,
     pub selected: usize,
     pub scroll: RewindPickerScroll,
     /// True after Enter submitted an authoritative `RewindTo` and before the
@@ -104,10 +109,9 @@ pub struct RewindPickerState {
 }
 
 impl RewindPickerState {
-    pub fn new(head_entries: usize, targets: Vec<RewindTarget>) -> Self {
-        let selected = targets.iter().position(|t| t.eligible).unwrap_or(0);
+    pub fn new(targets: Vec<RewindEntry>) -> Self {
+        let selected = 0;
         Self {
-            head_entries,
             targets,
             selected,
             scroll: RewindPickerScroll::default(),
@@ -115,7 +119,7 @@ impl RewindPickerState {
         }
     }
 
-    pub fn selected_target(&self) -> Option<&RewindTarget> {
+    pub fn selected_target(&self) -> Option<&RewindEntry> {
         self.targets.get(self.selected)
     }
 }
@@ -334,7 +338,7 @@ pub struct App {
     completion_target: String,
     /// Dedicated main-view rewind picker state.
     pub rewind_picker: Option<RewindPickerState>,
-    rewind_request_pending: bool,
+    rewind_entries: Vec<RewindEntry>,
     /// After a successful rewind restore, ignore any queued live-update events
     /// until the authoritative Worker status/snapshot catches up. This prevents
     /// old stream tail events that were already in transit from re-polluting the
@@ -419,7 +423,7 @@ impl App {
             pending_feature_edit: None,
             completion_target: protocol::new_submission_request_id(),
             rewind_picker: None,
-            rewind_request_pending: false,
+            rewind_entries: Vec::new(),
             rewind_refresh_fence: false,
             greeting: None,
             task_store: TaskStore::new(),
@@ -1529,7 +1533,19 @@ impl App {
             Event::PendingSubmissionsChanged { pending } => {
                 self.pending_submissions = pending;
             }
-            Event::UserMessage { segments, .. } => {
+            Event::UserMessage { segments, entry_id } => {
+                if let Some(entry_id) = entry_id {
+                    if !self
+                        .rewind_entries
+                        .iter()
+                        .any(|entry| entry.entry_id == entry_id)
+                    {
+                        self.rewind_entries.push(RewindEntry {
+                            entry_id,
+                            preview: Segment::flatten_to_text(&segments),
+                        });
+                    }
+                }
                 self.turn_index += 1;
                 self.blocks.push(Block::TurnHeader {
                     turn: self.turn_index,
@@ -2038,15 +2054,6 @@ impl App {
                     state.selected = 0;
                 }
             }
-            Event::RewindTargets {
-                head_entries,
-                targets,
-            } => {
-                if self.rewind_request_pending {
-                    self.rewind_request_pending = false;
-                    self.rewind_picker = Some(RewindPickerState::new(head_entries, targets));
-                }
-            }
             Event::RewindApplied {
                 session,
                 input,
@@ -2467,14 +2474,14 @@ impl App {
             return None;
         }
         self.completion = None;
-        self.rewind_picker = None;
-        self.rewind_request_pending = true;
-        Some(Method::ListRewindTargets)
+        self.rewind_picker = Some(RewindPickerState::new(
+            self.rewind_entries.iter().rev().cloned().collect(),
+        ));
+        None
     }
 
     pub fn close_rewind_picker(&mut self) {
         self.rewind_picker = None;
-        self.rewind_request_pending = false;
     }
 
     pub fn cancel_rewind_picker(&mut self) {
@@ -2539,17 +2546,8 @@ impl App {
             );
             return None;
         }
-        let (target_id, expected_head_entries) = match picker.selected_target() {
-            Some(target) if target.eligible => (target.id.clone(), target.expected_head_entries),
-            Some(target) => {
-                self.push_command_diagnostic(
-                    target
-                        .disabled_reason
-                        .clone()
-                        .unwrap_or_else(|| "rewind target is disabled".into()),
-                );
-                return None;
-            }
+        let entry_id = match picker.selected_target() {
+            Some(target) => target.entry_id.clone(),
             None => {
                 self.push_command_diagnostic("no rewind target is available");
                 return None;
@@ -2558,10 +2556,7 @@ impl App {
         if let Some(picker) = self.rewind_picker.as_mut() {
             picker.applying = true;
         }
-        Some(Method::RewindTo {
-            target: target_id,
-            expected_head_entries,
-        })
+        Some(Method::RewindTo { entry_id })
     }
 
     fn command_environment(&self) -> CommandEnvironment {
@@ -2597,10 +2592,8 @@ impl App {
                 command: self.next_command_envelope(),
             });
         }
-        if let Some(Method::ListRewindTargets) = method.as_ref() {
-            self.completion = None;
-            self.rewind_picker = None;
-            self.rewind_request_pending = true;
+        if result.open_rewind_picker {
+            return self.request_rewind_picker();
         }
         method
     }
@@ -2913,10 +2906,15 @@ impl App {
         }
         self.assistant_streaming = false;
 
+        self.rewind_entries.clear();
         for entry in &session.entries {
             use protocol::{SessionContentPart, SessionMessageRole, SessionSnapshotEntryData};
             match &entry.data {
                 SessionSnapshotEntryData::UserInput { segments } => {
+                    self.rewind_entries.push(RewindEntry {
+                        entry_id: entry.entry_id.clone(),
+                        preview: Segment::flatten_to_text(segments),
+                    });
                     self.turn_index += 1;
                     self.blocks.push(Block::TurnHeader {
                         turn: self.turn_index,
@@ -3364,23 +3362,10 @@ mod rewind_refresh_tests {
     fn app_with_rewind_picker() -> App {
         let mut app = App::new("test".into());
         app.connected = true;
-        app.rewind_picker = Some(RewindPickerState::new(
-            5,
-            vec![RewindTarget {
-                id: protocol::RewindTargetId {
-                    segment_id: uuid::Uuid::nil(),
-                    user_input_entry_index: 1,
-                },
-                expected_head_entries: 5,
-                truncate_entries: 2,
-                turn_index: 1,
-                timestamp_ms: None,
-                preview: "rewind target".into(),
-                eligible: true,
-                disabled_reason: None,
-                warning: None,
-            }],
-        ));
+        app.rewind_picker = Some(RewindPickerState::new(vec![RewindEntry {
+            entry_id: "user-1".into(),
+            preview: "test input".into(),
+        }]));
         app
     }
 

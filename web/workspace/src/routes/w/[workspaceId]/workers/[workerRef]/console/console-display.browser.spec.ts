@@ -947,11 +947,15 @@ test.each(["idle", "running", "paused"] as const)("Composer completion executes 
     method: "compact", params: { command: expect.objectContaining({ command_id: 1 }) },
   }));
   await waitFor(() => expect(cm.state.doc.toString()).toBe(""));
+  protocolEvent({ event: "user_message", data: { entry_id: "rewind-user", segments: [{ kind: "text", content: "rewind input" }] } });
+  await screen.findByText("rewind input");
+  const callsBeforeRewind = multiplexer.sendWorkerMethod.mock.calls.length;
   cm.dispatch({ changes: { from: 0, insert: ":rew" }, selection: { anchor: 4 } });
   const option = await screen.findByRole("option");
   await fireEvent.pointerDown(option);
   await fireEvent.click(option);
-  await waitFor(() => expect(multiplexer.sendWorkerMethod).toHaveBeenCalledWith({ method: "list_rewind_targets" }));
+  await waitFor(() => expect(view.container.querySelector(".rewind-selected")?.textContent).toContain("rewind input"));
+  expect(multiplexer.sendWorkerMethod).toHaveBeenCalledTimes(callsBeforeRewind);
   expect(multiplexer.sendWorkerMethod.mock.calls.every(([method]) => method.method !== "submit" && method.method !== "cancel")).toBe(true);
 });
 
@@ -1700,4 +1704,120 @@ test("pending groups independently follow authoritative changes, including zero 
   session.pending_submissions.notification_count = 0;
   latestListener().onFrame(subscribedFrame(session));
   await waitFor(() => expect(screen.queryByRole("region", { name: "Pending activations" })).toBeNull());
+});
+
+
+async function enterRewind(cm: EditorView, form: HTMLFormElement) {
+  cm.focus();
+  cm.dispatch({ changes: { from: 0, to: cm.state.doc.length, insert: ":rewind" }, selection: { anchor: 7 } });
+  await fireEvent.submit(form);
+  await waitFor(() => expect(document.querySelector(".rewind-selected")).not.toBeNull());
+}
+
+function rewindSession(): SessionSnapshot {
+  return { ...emptySession(), entries: ["first", "second"].map((id) => ({
+    kind: "user_input", entry_id: id, timestamp: 1, provenance: "human_input", derived_from: [],
+    segments: [{ kind: "text", content: "identical input" }],
+  })) };
+}
+
+test("rewind selects existing history by ID, follows arrows, tolerates appended history and suppresses repeated Enter", async () => {
+  const { cm, form, view } = await liveComposer();
+  latestListener().onFrame(subscribedFrame(rewindSession()));
+  await waitFor(() => expect(view.container.querySelectorAll(".console-line.user")).toHaveLength(2));
+  const rows = () => [...view.container.querySelectorAll(".console-line.user")];
+  await enterRewind(cm, form);
+  expect(multiplexer.sendWorkerMethod).not.toHaveBeenCalled();
+  expect(rows()[1].classList.contains("rewind-selected")).toBe(true);
+  await fireEvent.keyDown(cm.contentDOM, { key: "ArrowUp" });
+  expect(rows()[0].classList.contains("rewind-selected")).toBe(true);
+  expect(cm.state.doc.toString()).toBe("");
+  await fireEvent.keyDown(cm.contentDOM, { key: "ArrowDown" });
+  expect(rows()[1].classList.contains("rewind-selected")).toBe(true);
+  protocolEvent({ event: "user_message", data: { entry_id: "third", segments: [{ kind: "text", content: "newly appended" }] } });
+  await screen.findByText("newly appended");
+  expect(rows()[1].classList.contains("rewind-selected")).toBe(true);
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter", repeat: true });
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  expect(multiplexer.sendWorkerMethod).toHaveBeenCalledExactlyOnceWith({ method: "rewind_to", params: { entry_id: "second" } });
+  expect(cm.state.readOnly).toBe(false);
+  protocolEvent({ event: "rewind_applied", data: { session: { ...rewindSession(), entries: rewindSession().entries.slice(0, 1) }, input: [{ kind: "text", content: "identical input" }], summary: { truncated_to_entries: 1, discarded_entries: 2, tool_side_effect_warning: true } } });
+  await waitFor(() => expect(cm.state.doc.toString()).toBe("identical input"));
+  expect(view.container.querySelector(".rewind-selected")).toBeNull();
+  expect(cm.hasFocus).toBe(true);
+});
+
+test("rewind Escape and draft editing leave selection without sending; rejection keeps it available", async () => {
+  const alert = vi.spyOn(alerts, "pushWorkspaceAlert");
+  const { cm, form, view } = await liveComposer();
+  latestListener().onFrame(subscribedFrame(rewindSession()));
+  await waitFor(() => expect(view.container.querySelectorAll(".console-line.user")).toHaveLength(2));
+  await enterRewind(cm, form);
+  await fireEvent.keyDown(cm.contentDOM, { key: "Escape" });
+  expect(view.container.querySelector(".rewind-selected")).toBeNull();
+  expect(multiplexer.sendWorkerMethod).not.toHaveBeenCalled();
+  await enterRewind(cm, form);
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  protocolEvent({ event: "error", data: { code: "invalid_request", message: "Target is outside current segment" } });
+  await waitFor(() => expect(alert).toHaveBeenCalledWith("error", "Target is outside current segment", expect.any(Object)));
+  expect(view.container.querySelector(".rewind-selected")).not.toBeNull();
+  expect((screen.getByRole("button", { name: "Rewind to selected input" }) as HTMLButtonElement).disabled).toBe(false);
+  await fireEvent.paste(cm.contentDOM, { clipboardData: { getData: () => "new draft" } });
+  expect(cm.state.doc.toString()).toBe("new draft");
+  expect(view.container.querySelector(".rewind-selected")).toBeNull();
+  expect(multiplexer.sendWorkerMethod).toHaveBeenCalledTimes(1);
+});
+
+test("rewind reply preserves draft edits made while applying and selection is cleared on target change", async () => {
+  const { cm, form, view } = await liveComposer();
+  latestListener().onFrame(subscribedFrame(rewindSession()));
+  await waitFor(() => expect(view.container.querySelectorAll(".console-line.user")).toHaveLength(2));
+  await enterRewind(cm, form);
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  await fireEvent.paste(cm.contentDOM, { clipboardData: { getData: () => "keep this edit" } });
+  protocolEvent({ event: "rewind_applied", data: { session: rewindSession(), input: [{ kind: "text", content: "old input" }], summary: { truncated_to_entries: 1, discarded_entries: 1, tool_side_effect_warning: false } } });
+  await settleMicrotasks();
+  expect(cm.state.doc.toString()).toBe("keep this edit");
+  await enterRewind(cm, form);
+  latestListener().onStatus?.("closed", { kind: "transport", message: "disconnected" });
+  await waitFor(() => expect(view.container.querySelector(".rewind-selected")).toBeNull());
+  expect(cm.state.readOnly).toBe(false);
+  latestListener().onFrame(subscribedFrame(rewindSession()));
+  await enterRewind(cm, form);
+  await view.rerender({ data: pageData("worker-b", "runtime-b") });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledTimes(2));
+  expect(view.container.querySelector(".rewind-selected")).toBeNull();
+});
+
+test("rewind Up loads the next history page and selects its nearest user input", async () => {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    return Response.json(!url.includes("/session/history") ? { availability: "live_protocol" }
+      : url.includes("cursor=") ? historyPage([1], null) : historyPage([2], "older-2"));
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const view = render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  latestListener().onFrame(subscribedFrame());
+  await waitFor(() => expect(view.container.querySelector(".console-line.user")?.textContent).toContain("question 2"));
+  const cm = EditorView.findFromDOM(view.container.querySelector(".cm-editor") as HTMLElement)!;
+  await enterRewind(cm, view.container.querySelector(".console-composer") as HTMLFormElement);
+  await fireEvent.keyDown(cm.contentDOM, { key: "ArrowUp" });
+  await waitFor(() => expect(view.container.querySelector(".rewind-selected")?.textContent).toContain("question 1"));
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  expect(multiplexer.sendWorkerMethod).toHaveBeenCalledExactlyOnceWith({ method: "rewind_to", params: { entry_id: "user-1" } });
+});
+
+
+test("rewind does not confirm an IME Enter", async () => {
+  const { cm, form, view } = await liveComposer();
+  latestListener().onFrame(subscribedFrame(rewindSession()));
+  await waitFor(() => expect(view.container.querySelectorAll(".console-line.user")).toHaveLength(2));
+  await enterRewind(cm, form);
+  await fireEvent.compositionStart(cm.contentDOM);
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter", isComposing: true, keyCode: 229 });
+  expect(multiplexer.sendWorkerMethod).not.toHaveBeenCalled();
+  expect(cm.state.readOnly).toBe(false);
+  await fireEvent.compositionEnd(cm.contentDOM);
 });

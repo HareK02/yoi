@@ -913,7 +913,7 @@ Deno.test("Worker Console removes redundant chrome and uses shared alerts", asyn
       !page.includes("margin-inline: calc(-1 * var(--space-6))") &&
       page.includes("import { pushWorkspaceAlert }") &&
       page.includes('title: "Worker control"') &&
-      page.includes('title: "Rewind targets"') &&
+      !page.includes('aria-label="Rewind targets"') &&
       page.includes('pushWorkspaceAlert("error"') &&
       !page.includes("controlNotice") &&
       !page.includes("console-notice") &&
@@ -1271,7 +1271,7 @@ Deno.test("Worker Console route resolves logical Worker authority before Runtime
       'const workerRunning = $derived(workerState === "running");',
     ) &&
       consolePage.includes(
-        'const canSendComposerControl = $derived(protocolState === "open" && !sending);',
+        'const canSendComposerControl = $derived(protocolState === "open" && !sending && !rewindApplying);',
       ) &&
       consolePage.includes('sendWorkerControl("cancel")') &&
       consolePage.includes("lifecycleMethod(command)") &&
@@ -1280,7 +1280,7 @@ Deno.test("Worker Console route resolves logical Worker authority before Runtime
       consolePage.includes("onsubmit={handleComposerSubmit}") &&
       !consolePage.includes("disabled={!composerEditable}") &&
       consolePage.includes("if (!canSendComposerControl) return;") &&
-      consolePage.includes("class:stop={workerRunning}") &&
+      consolePage.includes("class:stop={workerRunning && !rewindEntryId}") &&
       consolePage.includes('"Stop Worker"') &&
       consolePage.includes("disabled={composerSubmitDisabled}") &&
       !consolePage.includes("disabled={!inputReady || sending}") &&

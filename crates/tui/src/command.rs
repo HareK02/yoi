@@ -52,6 +52,7 @@ pub struct CommandEnvironment {
 #[derive(Debug, Clone)]
 pub struct CommandExecution {
     pub method: Option<Method>,
+    pub open_rewind_picker: bool,
     pub diagnostics: Vec<CommandDiagnostic>,
     pub exit_command_mode: bool,
     pub clear_input: bool,
@@ -60,6 +61,7 @@ pub struct CommandExecution {
 impl CommandExecution {
     pub fn diagnostic(message: impl Into<String>) -> Self {
         Self {
+            open_rewind_picker: false,
             method: None,
             diagnostics: vec![CommandDiagnostic::new(message)],
             exit_command_mode: false,
@@ -69,6 +71,7 @@ impl CommandExecution {
 
     pub fn notice(message: impl Into<String>) -> Self {
         Self {
+            open_rewind_picker: false,
             method: None,
             diagnostics: vec![CommandDiagnostic::new(message)],
             exit_command_mode: true,
@@ -409,6 +412,7 @@ fn compact_command(invocation: CommandInvocation<'_>) -> CommandExecution {
     let _ = invocation.environment;
     let _ = invocation.args.raw();
     CommandExecution {
+        open_rewind_picker: false,
         method: Some(Method::Compact {
             command: protocol::WorkerCommandEnvelope::new(0),
         }),
@@ -423,7 +427,8 @@ fn rewind_command(invocation: CommandInvocation<'_>) -> CommandExecution {
     let _ = invocation.environment;
     let _ = invocation.args.raw();
     CommandExecution {
-        method: Some(Method::ListRewindTargets),
+        open_rewind_picker: true,
+        method: None,
         diagnostics: vec![CommandDiagnostic::new("rewind picker requested")],
         exit_command_mode: true,
         clear_input: true,
@@ -435,6 +440,7 @@ fn peer_command(invocation: CommandInvocation<'_>) -> CommandExecution {
     let _ = invocation.environment;
     let name = invocation.args.argv()[0].clone();
     CommandExecution {
+        open_rewind_picker: false,
         method: Some(Method::RegisterPeer { name: name.clone() }),
         diagnostics: vec![CommandDiagnostic::new(format!(
             "peer metadata registration requested with `{name}`"
@@ -521,7 +527,8 @@ mod tests {
         let registry = CommandRegistry::builtins();
         for command in ["rewind", "rollback"] {
             let result = registry.dispatch(command, &env());
-            assert!(matches!(result.method, Some(Method::ListRewindTargets)));
+            assert!(result.method.is_none());
+            assert!(result.open_rewind_picker);
             assert!(result.exit_command_mode);
             assert!(result.clear_input);
             assert!(result.diagnostics[0].message.contains("rewind picker"));
@@ -549,7 +556,8 @@ mod tests {
         let mut paused = env();
         paused.paused = true;
         let result = registry.dispatch("rewind", &paused);
-        assert!(matches!(result.method, Some(Method::ListRewindTargets)));
+        assert!(result.method.is_none());
+        assert!(result.open_rewind_picker);
     }
 
     #[test]

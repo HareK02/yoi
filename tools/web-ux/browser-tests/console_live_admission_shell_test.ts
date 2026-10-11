@@ -19,6 +19,7 @@ type State = {
     params?: {
       input?: import("../../../web/workspace/src/lib/generated/protocol.ts").Segment[];
       submission_request_id?: string;
+      entry_id?: string;
     };
   }[];
   events: { event: string }[];
@@ -502,3 +503,50 @@ Deno.test("production selected invocation preserves multiple positional typed ar
       JSON.stringify({ status: "pass", fixture: await state(base), errors }, null, 2),
     );
   }));
+
+
+Deno.test("production rewind selects transcript rows locally and sends only entry_id on Enter", () =>
+  fixture(async (page, base, errors, caseOutput) => {
+    await control(base, { seed_rewind_history: true });
+    await page.reload();
+    await page.getByText("Ready. Choose a Feature", { exact: false }).waitFor();
+    await draft(page, ":rewind");
+    await page.keyboard.press("Enter");
+    const selected = page.locator(".rewind-selected");
+    await selected.waitFor();
+    assert((await selected.innerText()).includes("Review the release notes"));
+    assertEquals((await state(base)).methods, [], "selection must not request a candidate list");
+    assertEquals(await page.locator(".rewind-targets").count(), 0);
+    await page.keyboard.press("ArrowUp");
+    assert((await selected.innerText()).includes("Earlier rewind input"));
+    await page.keyboard.press("ArrowDown");
+    assert((await selected.innerText()).includes("Review the release notes"));
+    assert(await page.locator(".cm-content").evaluate((node) => node === document.activeElement));
+    await page.screenshot({ path: join(caseOutput, "rewind-selection.png") });
+    await page.keyboard.press("Escape");
+    assertEquals(await selected.count(), 0);
+    assertEquals((await state(base)).methods, []);
+    await draft(page, ":rewind");
+    await page.keyboard.press("Enter");
+    await selected.waitFor();
+    await control(base, { rewind: "reject" });
+    await page.keyboard.press("Enter");
+    await page.getByText("Synthetic rewind rejection", { exact: true }).first().waitFor();
+    await selected.waitFor();
+    await control(base, { rewind: "hold" });
+    await page.keyboard.press("Enter");
+    await page.keyboard.press("Enter");
+    const sent = await eventually(base, (value) => value.methods.filter((method) => method.method === "rewind_to").length === 2);
+    assertEquals(sent.methods, [
+      { method: "rewind_to", params: { entry_id: "user-1" } },
+      { method: "rewind_to", params: { entry_id: "user-1" } },
+    ]);
+    await control(base, { apply_rewind: true });
+    await page.waitForFunction(() => document.querySelector(".cm-content")?.textContent === "Review the release notes before sending.");
+    assertEquals(await selected.count(), 0);
+    assertEquals(await page.locator(".cm-content").getAttribute("contenteditable"), "true");
+    await page.keyboard.type(" edited");
+    assertEquals(await page.locator(".cm-content").textContent(), "Review the release notes before sending. edited");
+    assertEquals(errors, []);
+    await page.screenshot({ path: join(caseOutput, "rewind-applied.png") });
+  }, true));

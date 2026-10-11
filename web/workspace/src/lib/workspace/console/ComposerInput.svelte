@@ -738,7 +738,10 @@
       state: EditorState.create({
         extensions: editorExtensions = [
           history(),
-          Prec.highest(EditorView.domEventHandlers({ keydown: completionKeydown })),
+          Prec.highest(EditorView.domEventHandlers({ keydown(event) {
+            onkeydown?.(event);
+            return event.defaultPrevented || completionKeydown(event);
+          } })),
           Prec.highest(keymap.of([
             {
               key: "ArrowUp",
@@ -851,8 +854,6 @@
               return true;
             },
             keydown(event) {
-              onkeydown?.(event);
-              if (event.defaultPrevented) return true;
               if (
                 shouldSubmitChatKey(event, {
                   mode: "mod-enter",

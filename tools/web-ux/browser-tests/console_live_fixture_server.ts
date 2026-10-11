@@ -144,6 +144,8 @@ const events: unknown[] = [];
 let submitMode: "accept" | "reject" | "hold" = "accept";
 let uploadMode: "normal" | "fail" | "hold" = "normal";
 const pendingAcceptances: (() => void)[] = [];
+let rewindMode: "accept" | "reject" | "hold" = "accept";
+const pendingRewinds: (() => void)[] = [];
 const cancelledUploads = new Set<string>();
 const heldUploads = new Map<string, (response: Response) => void>();
 const releaseHeldUploads = new Map<string, () => void>();
@@ -197,6 +199,12 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
     const control = await request.json();
     if (["accept", "reject", "hold"].includes(control.submit)) submitMode = control.submit;
     if (["normal", "fail", "hold"].includes(control.upload)) uploadMode = control.upload;
+    if (["accept", "reject", "hold"].includes(control.rewind)) rewindMode = control.rewind;
+    if (control.seed_rewind_history) {
+      entries.unshift({ ...entries[0], entry_id: "user-older", content: [{ kind: "text", text: "Earlier rewind input" }] },
+        { ...entries[1], entry_id: "assistant-older", content: [{ kind: "text", text: "Earlier reply" }] });
+    }
+    if (control.apply_rewind) { for (const apply of pendingRewinds.splice(0)) apply(); }
     if (control.accept_pending) { for (const accept of pendingAcceptances.splice(0)) accept(); }
     if (control.release_uploads) {
       for (const release of [...releaseHeldUploads.values()]) release();
@@ -365,6 +373,21 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
         methods.push(method);
         const subscription_id = frame.message.subscription_id;
         if (subscriptions.get(subscription_id) !== "worker_protocol") return;
+        const emit = (event: unknown) => {
+          events.push(event);
+          if (socket.readyState !== WebSocket.OPEN) return;
+          send({
+            protocol_version: 2,
+            frame: "event",
+            message: {
+              event: "event",
+              data: {
+                subscription_id,
+                payload: { event: "worker_protocol", data: { worker_id: workerId, event } },
+              },
+            },
+          });
+        };
         if (method.method === "list_completions") {
           const { kind, prefix, request_id, context } = method.params;
           let candidates: unknown[] = [];
@@ -424,24 +447,24 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
               },
             },
           });
+        } else if (method.method === "rewind_to") {
+          const index = entries.findIndex((entry) => entry.entry_id === method.params.entry_id && entry.role === "user");
+          if (rewindMode === "reject" || index < 0) {
+            emit({ event: "error", data: { code: "invalid_request", message: "Synthetic rewind rejection" } });
+          } else {
+            const apply = () => {
+              const input = entries[index].content.map((part) => ({ kind: "text", content: part.text }));
+              const discarded_entries = entries.length - index;
+              entries.splice(index);
+              emit({ event: "rewind_applied", data: { session, input, summary: {
+                truncated_to_entries: index, discarded_entries, tool_side_effect_warning: true,
+              } } });
+            };
+            if (rewindMode === "hold") pendingRewinds.push(apply); else apply();
+          }
         } else if (method.method === "submit") {
-          const emit = (event: unknown) => {
-            events.push(event);
-            if (socket.readyState !== WebSocket.OPEN) return;
-            send({
-              protocol_version: 2,
-              frame: "event",
-              message: {
-                event: "event",
-                data: {
-                  subscription_id,
-                  payload: { event: "worker_protocol", data: { worker_id: workerId, event } },
-                },
-              },
-            });
-          };
           const submission_request_id = method.params.submission_request_id;
-          const accept = () =>
+          const accept = () => {
             emit({
               event: "submission_accepted",
               data: {
@@ -450,6 +473,20 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
                 disposition: "started",
               },
             });
+            // A held admission models an in-flight run; immediate fixture runs
+            // finish synchronously. Publish authoritative state, not only an ack.
+            emit({
+              event: "worker_state",
+              data: {
+                snapshot: {
+                  last_command_id: 0,
+                  state: submitMode === "hold"
+                    ? { kind: "busy", state: { kind: "run", state: "running" } }
+                    : { kind: "idle" },
+                },
+              },
+            });
+          };
           if (submitMode === "reject") {
             emit({
               event: "submission_rejected",

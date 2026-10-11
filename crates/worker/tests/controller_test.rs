@@ -2730,7 +2730,7 @@ async fn shutdown_closes_method_admission_before_terminal_confirmation() {
         loop {
             tokio::select! {
                 biased;
-                result = handle.send(Method::ListRewindTargets) => {
+                result = handle.send(Method::ListWorkers) => {
                     if result.is_err() {
                         break;
                     }

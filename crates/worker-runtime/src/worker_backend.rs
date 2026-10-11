@@ -4255,7 +4255,6 @@ where
                 unreachable!("Notify input is dispatched before ordinary input mapping")
             }
             WorkerInputKind::Compact => unreachable!("compact input is dispatched above"),
-            WorkerInputKind::ListRewindTargets => (Method::ListRewindTargets, None),
             WorkerInputKind::RegisterPeer => (
                 Method::RegisterPeer {
                     name: input.content.trim().to_string(),
@@ -7884,7 +7883,7 @@ mod tests {
         ));
         let old_send = backend.run_on_adapter_runtime(async move {
             old_handle
-                .send(Method::ListRewindTargets)
+                .send(Method::ListWorkers)
                 .await
                 .map_err(|error| error.to_string())
         });

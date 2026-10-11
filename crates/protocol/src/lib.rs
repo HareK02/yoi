@@ -349,13 +349,11 @@ pub enum Method {
     Compact {
         command: WorkerCommandEnvelope,
     },
-    /// Ask the Worker to list valid rewind targets from its authoritative session log.
-    ListRewindTargets,
-    /// Truncate the current session back to the selected rewind target and
-    /// return the selected user input to the client composer.
+    /// Rewind to just before a user input identified by its public Session entry ID.
+    /// Validate the target against the current segment at execution time.
+    /// Later appended history is discarded too; tool side effects are not undone.
     RewindTo {
-        target: RewindTargetId,
-        expected_head_entries: usize,
+        entry_id: String,
     },
     Shutdown {
         command: WorkerCommandEnvelope,
@@ -1421,12 +1419,6 @@ pub enum Event {
         context: Option<CompletionContext>,
         entries: Vec<CompletionEntry>,
     },
-    /// Reply to `Method::ListRewindTargets`. Clients should only open a picker
-    /// in response to their own pending request; the event may be broadcast.
-    RewindTargets {
-        head_entries: usize,
-        targets: Vec<RewindTarget>,
-    },
     /// A rewind has truncated the authoritative session. `session` is the
     /// retained canonical snapshot clients should use to reseed display state.
     RewindApplied {
@@ -1567,33 +1559,6 @@ pub struct CompletionEntry {
     pub usage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation: Option<FeatureInvocationDescriptor>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-pub struct RewindTargetId {
-    #[cfg_attr(feature = "typescript", ts(type = "string"))]
-    #[cfg_attr(feature = "json-schema", schemars(with = "String"))]
-    pub segment_id: uuid::Uuid,
-    pub user_input_entry_index: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-pub struct RewindTarget {
-    pub id: RewindTargetId,
-    pub expected_head_entries: usize,
-    pub truncate_entries: usize,
-    pub turn_index: usize,
-    pub timestamp_ms: Option<u64>,
-    pub preview: String,
-    pub eligible: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disabled_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1997,6 +1962,23 @@ pub enum Permission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewind_uses_public_entry_id_without_candidate_or_head_token() {
+        let method = Method::RewindTo {
+            entry_id: "user-entry".into(),
+        };
+        let wire = serde_json::json!({"method": "rewind_to", "params": {"entry_id": "user-entry"}});
+        assert_eq!(serde_json::to_value(&method).unwrap(), wire);
+        assert!(
+            matches!(serde_json::from_value::<Method>(wire).unwrap(), Method::RewindTo { entry_id } if entry_id == "user-entry")
+        );
+        assert!(
+            serde_json::from_value::<Method>(serde_json::json!({"method": "list_rewind_targets"}))
+                .is_err()
+        );
+        assert!(serde_json::from_value::<Method>(serde_json::json!({"method": "rewind_to", "params": {"target": {"segment_id": uuid::Uuid::nil(), "user_input_entry_index": 1}, "expected_head_entries": 3}})).is_err());
+    }
 
     #[test]
     fn scope_rule_defaults_to_resolved_symlink_policy() {

@@ -728,7 +728,7 @@ fn draw_rewind_picker(
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!("  head={} ", picker.head_entries)),
+        Span::raw("  "),
     ];
     header.extend(action_spans);
     logical.push(Line::from(header));
@@ -751,38 +751,13 @@ fn draw_rewind_picker(
                 Style::default()
                     .bg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD)
-            } else if target.eligible {
-                Style::default()
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default()
             };
-            let ts = target
-                .timestamp_ms
-                .map(|ts| format!("{}", ts))
-                .unwrap_or_else(|| "-".into());
             logical.push(Line::from(vec![
                 Span::styled(marker.to_owned(), base_style),
-                Span::styled(
-                    format!(
-                        " turn {}  idx {}  ts {}  ",
-                        target.turn_index, target.id.user_input_entry_index, ts
-                    ),
-                    base_style,
-                ),
                 Span::styled(target.preview.clone(), base_style),
             ]));
-            if let Some(warning) = target.warning.as_ref() {
-                logical.push(Line::from(Span::styled(
-                    format!("  warning: {warning}"),
-                    Style::default().fg(Color::Yellow),
-                )));
-            }
-            if let Some(reason) = target.disabled_reason.as_ref() {
-                logical.push(Line::from(Span::styled(
-                    format!("  disabled: {reason}"),
-                    Style::default().fg(Color::Red),
-                )));
-            }
         }
     }
 

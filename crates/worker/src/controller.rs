@@ -32,8 +32,8 @@ use protocol::{
     AlertLevel, AlertSource, CommandEvent as ProtocolCommandEvent,
     CommandSnapshot as ProtocolCommandSnapshot, CommandStatus as ProtocolCommandStatus,
     CommandStream as ProtocolCommandStream, CommandStreamSlice as ProtocolCommandStreamSlice,
-    ErrorCode, Event, Method, RewindTargetId, RunResult, TurnResult, UploadedFileRef,
-    WorkerBusyState, WorkerCommandAcknowledgement, WorkerCommandDisposition, WorkerCommandEnvelope,
+    ErrorCode, Event, Method, RunResult, TurnResult, UploadedFileRef, WorkerBusyState,
+    WorkerCommandAcknowledgement, WorkerCommandDisposition, WorkerCommandEnvelope,
     WorkerCommandKind, WorkerMaintenanceState, WorkerRunState, WorkerState, WorkerStatus,
 };
 use workdir::{
@@ -2971,32 +2971,9 @@ async fn controller_loop<C, St>(
                 }
             }
 
-            Method::ListRewindTargets => match shared_state.catalog_status() {
-                WorkerStatus::Idle | WorkerStatus::Paused => {
-                    emit_rewind_targets(&worker, &working_event_tx)
-                }
-                WorkerStatus::Running | WorkerStatus::Stopped => {
-                    let _ = working_event_tx.send(Event::Error {
-                        code: ErrorCode::AlreadyRunning,
-                        message: "Worker is already executing a turn; rewind can only run while idle or paused"
-                            .into(),
-                    });
-                }
-            },
-
-            Method::RewindTo {
-                target,
-                expected_head_entries,
-            } => match shared_state.catalog_status() {
+            Method::RewindTo { entry_id } => match shared_state.catalog_status() {
                 WorkerStatus::Idle => {
-                    if apply_rewind(
-                        &mut worker,
-                        &working_event_tx,
-                        target,
-                        expected_head_entries,
-                    )
-                    .await
-                    {
+                    if apply_rewind(&mut worker, &working_event_tx, entry_id).await {
                         worker.clear_in_flight_events();
                         publish_context_usage(
                             &shared_state,
@@ -3018,8 +2995,9 @@ async fn controller_loop<C, St>(
                 WorkerStatus::Running | WorkerStatus::Stopped => {
                     let _ = working_event_tx.send(Event::Error {
                         code: ErrorCode::AlreadyRunning,
-                        message: "Worker is already executing a turn; rewind can only run while idle or paused"
-                            .into(),
+                        message:
+                            "Worker is already executing a turn; rewind can only run while idle"
+                                .into(),
                     });
                 }
             },
@@ -3668,10 +3646,10 @@ where
                             );
                         }
                     }
-                    Some(Method::ListRewindTargets | Method::RewindTo { .. }) => {
+                    Some(Method::RewindTo { .. }) => {
                         let _ = working_event_tx.send(Event::Error {
                             code: ErrorCode::AlreadyRunning,
-                            message: "Worker is already executing a turn; rewind/compact can only run while idle or paused"
+                            message: "Worker is already executing a turn; rewind/compact can only run while idle"
                                 .into(),
                         });
                     }
@@ -3749,38 +3727,16 @@ where
     }
 }
 
-fn emit_rewind_targets<C, St>(worker: &Worker<C, St>, working_event_tx: &broadcast::Sender<Event>)
-where
-    C: LlmClient + 'static,
-    St: Store,
-{
-    match worker.list_rewind_targets() {
-        Ok((head_entries, targets)) => {
-            let _ = working_event_tx.send(Event::RewindTargets {
-                head_entries,
-                targets,
-            });
-        }
-        Err(err) => {
-            let _ = working_event_tx.send(Event::Error {
-                code: ErrorCode::Internal,
-                message: err.to_string(),
-            });
-        }
-    }
-}
-
 async fn apply_rewind<C, St>(
     worker: &mut Worker<C, St>,
     working_event_tx: &broadcast::Sender<Event>,
-    target: RewindTargetId,
-    expected_head_entries: usize,
+    entry_id: String,
 ) -> bool
 where
     C: LlmClient + 'static,
     St: Store,
 {
-    match worker.rewind_to(target, expected_head_entries).await {
+    match worker.rewind_to(entry_id).await {
         Ok(applied) => {
             let session =
                 session_store::public_snapshot::project_current_session_snapshot(&applied.entries);

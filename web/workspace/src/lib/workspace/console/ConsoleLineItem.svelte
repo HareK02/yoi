@@ -7,10 +7,11 @@
 
   type Props = {
     item: ConsoleLine;
+    rewindSelected?: boolean;
     attachmentUrl?: (attachment: SessionToolAttachment) => string | null;
   };
 
-  let { item, attachmentUrl = () => null }: Props = $props();
+  let { item, rewindSelected = false, attachmentUrl = () => null }: Props = $props();
   let detailOpen = $state(false);
   let nowMs = $state(Date.now());
 
@@ -83,6 +84,8 @@
 <li
   class={`console-line ${lineClass(item)} ${toolClass(item)}`}
   class:error-line={item.error}
+  class:rewind-selected={rewindSelected}
+  aria-current={rewindSelected ? "true" : undefined}
   data-console-line-id={item.id}
 >
   {#if item.compaction}
@@ -165,6 +168,12 @@
 </li>
 
 <style>
+  .rewind-selected {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+
   .console-line {
     min-width: 0;
     padding: var(--space-1) 0;

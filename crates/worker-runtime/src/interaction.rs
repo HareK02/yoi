@@ -12,13 +12,12 @@ pub enum WorkerInputKind {
     UserIfIdle,
     Notify,
     Compact,
-    ListRewindTargets,
     RegisterPeer,
 }
 
 impl WorkerInputKind {
     pub fn is_empty_content_allowed(&self) -> bool {
-        matches!(self, Self::Compact | Self::ListRewindTargets)
+        matches!(self, Self::Compact)
     }
 }
 
