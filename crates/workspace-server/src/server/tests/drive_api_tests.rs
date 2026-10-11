@@ -721,6 +721,7 @@ async fn drive_verified_upload_revoked_during_reception_cannot_commit_or_replay(
                 token_id_hash: None,
                 runtime_id: workers[0].runtime_id.clone(),
                 worker_id: Some(workers[0].worker_id.clone()),
+                authentication_binding_id: "fixture-binding".into(),
             },
         ));
     let response = app
@@ -867,6 +868,7 @@ async fn drive_read_entrypoints_use_current_grants_and_cannot_fallback_to_browse
     context.runtime_source = Some(ServerRuntimeSource {
         runtime_id: workers[0].runtime_id.clone(),
         worker_id: Some(workers[1].worker_id.clone()),
+        authentication_binding_id: "fixture-binding".into(),
     });
     assert_eq!(
         drive::root(&api, &context, TEST_WORKSPACE_ID)

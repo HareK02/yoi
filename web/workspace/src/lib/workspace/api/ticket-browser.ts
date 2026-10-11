@@ -20,7 +20,10 @@ import type {
   ReviewFinding,
   TicketActionEligibility,
   TicketAssignmentPrincipal,
+  TicketAssignmentRelease,
   TicketAssignmentSummary,
+  TicketAssignmentTracking,
+  TicketAssignmentTrackingProjection,
   TicketCaseAction,
   TicketCaseHistoryEntry,
   TicketClosureJudgment,
@@ -649,6 +652,130 @@ function parseTicketRoleAssignmentRecord(
   };
 }
 
+function parseAssignmentTracking(
+  value: unknown,
+  label: string,
+): TicketAssignmentTracking {
+  const item = object(value, label);
+  exact(
+    item,
+    ["status", "waiting_reason", "progress", "next_action", "result"],
+    label,
+  );
+  const status = string(item.status, `${label}.status`);
+  if (status !== "waiting" && status !== "inprogress" && status !== "done") {
+    throw new Error(`${label}.status is invalid`);
+  }
+  return {
+    status,
+    waiting_reason: optionalNullableString(
+      item.waiting_reason,
+      `${label}.waiting_reason`,
+    ),
+    progress: optionalNullableString(item.progress, `${label}.progress`),
+    next_action: optionalNullableString(
+      item.next_action,
+      `${label}.next_action`,
+    ),
+    result: optionalNullableString(item.result, `${label}.result`),
+  };
+}
+
+function parseAssignmentRelease(
+  value: unknown,
+  label: string,
+): TicketAssignmentRelease {
+  const item = object(value, label);
+  exact(item, [
+    "action",
+    "event_id",
+    "operation_key",
+    "actor",
+    "at",
+    "reason",
+    "replacement_assignment_id",
+    "last_tracking",
+  ], label);
+  const action = string(item.action, `${label}.action`);
+  if (action !== "unassigned" && action !== "replaced") {
+    throw new Error(`${label}.action is invalid`);
+  }
+  return {
+    action,
+    event_id: string(item.event_id, `${label}.event_id`),
+    operation_key: optionalNullableString(
+      item.operation_key,
+      `${label}.operation_key`,
+    ),
+    actor: string(item.actor, `${label}.actor`),
+    at: string(item.at, `${label}.at`),
+    reason: optionalNullableString(item.reason, `${label}.reason`),
+    replacement_assignment_id: optionalNullableString(
+      item.replacement_assignment_id,
+      `${label}.replacement_assignment_id`,
+    ),
+    last_tracking: item.last_tracking === undefined
+      ? undefined
+      : item.last_tracking === null
+      ? null
+      : parseAssignmentTracking(item.last_tracking, `${label}.last_tracking`),
+  };
+}
+
+function parseAssignmentTrackingProjection(
+  value: unknown,
+  label: string,
+): TicketAssignmentTrackingProjection {
+  const item = object(value, label);
+  exact(item, [
+    "workspace_id",
+    "ticket_id",
+    "assignment_id",
+    "role",
+    "principal",
+    "assigned_by",
+    "assigned_at",
+    "release",
+    "current",
+    "tracking",
+    "last_event_id",
+    "updated_at",
+    "migration_diagnostic",
+  ], label);
+  return {
+    workspace_id: string(item.workspace_id, `${label}.workspace_id`),
+    ticket_id: string(item.ticket_id, `${label}.ticket_id`),
+    assignment_id: string(item.assignment_id, `${label}.assignment_id`),
+    role: string(item.role, `${label}.role`),
+    principal: parseTicketAssignmentPrincipal(
+      item.principal,
+      `${label}.principal`,
+    ),
+    assigned_by: string(item.assigned_by, `${label}.assigned_by`),
+    assigned_at: string(item.assigned_at, `${label}.assigned_at`),
+    release: item.release === undefined
+      ? undefined
+      : item.release === null
+      ? null
+      : parseAssignmentRelease(item.release, `${label}.release`),
+    current: boolean(item.current, `${label}.current`),
+    tracking: item.tracking === undefined
+      ? undefined
+      : item.tracking === null
+      ? null
+      : parseAssignmentTracking(item.tracking, `${label}.tracking`),
+    last_event_id: optionalNullableString(
+      item.last_event_id,
+      `${label}.last_event_id`,
+    ),
+    updated_at: optionalNullableString(item.updated_at, `${label}.updated_at`),
+    migration_diagnostic: optionalNullableString(
+      item.migration_diagnostic,
+      `${label}.migration_diagnostic`,
+    ),
+  };
+}
+
 function parseActionEligibility(
   value: unknown,
   label: string,
@@ -961,6 +1088,7 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     "artifact_count",
     "artifacts",
     "assignment_diagnostics",
+    "assignment_tracking",
     "assignments",
     "closure_history",
     "body",
@@ -1011,6 +1139,11 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     assignment_diagnostics: strings(
       item.assignment_diagnostics,
       `${label}.assignment_diagnostics`,
+    ),
+    assignment_tracking: array(
+      item.assignment_tracking,
+      `${label}.assignment_tracking`,
+      parseAssignmentTrackingProjection,
     ),
     assignments: array(
       item.assignments,

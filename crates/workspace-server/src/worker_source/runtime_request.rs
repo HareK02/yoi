@@ -12,6 +12,9 @@ use crate::store::ControlPlaneStore;
 pub struct VerifiedRuntimeRequestSource {
     pub runtime_id: String,
     pub worker_id: Option<String>,
+    /// The binding actually used for signature verification. Mutation boundaries
+    /// compare this identity with current trust inside their write transaction.
+    pub authentication_binding_id: String,
     /// Existing proof JTI correlation, retained only as a fixed-length diagnostic fingerprint.
     pub token_id_hash: Option<String>,
 }
@@ -273,5 +276,6 @@ pub(crate) async fn verify_runtime_request_source_proof_with_clock(
         token_id_hash: Some(diagnostic_id_hash(&claims.jti)),
         runtime_id: claims.iss,
         worker_id: claims.worker_id,
+        authentication_binding_id: trusted.binding_id,
     })
 }

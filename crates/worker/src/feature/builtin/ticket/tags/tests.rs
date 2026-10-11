@@ -110,7 +110,7 @@ async fn classification_tool_schemas_require_observations_and_reject_actor_claim
 
 #[tokio::test]
 async fn classification_reads_forward_id_filters_and_preserve_tag_observations() {
-    let item = json!({"resource_key":"T-740", "title":"Classify", "state":"open", "closure_operation_key":null, "current_closure":null, "legacy_handoff":null, "closure_history":[], "tags":[tag()], "matched_fields":[], "linked_objective_keys":[], "relation_count":0, "blocker_count":0, "unresolved_blocker_count":0, "unresolved_review_count":0, "merge_requests":[]});
+    let item = json!({"resource_key":"T-740", "title":"Classify", "state":"open", "closure_operation_key":null, "current_closure":null, "legacy_handoff":null, "closure_history":[], "assignment_tracking":[], "tags":[tag()], "matched_fields":[], "linked_objective_keys":[], "relation_count":0, "blocker_count":0, "unresolved_blocker_count":0, "unresolved_review_count":0, "merge_requests":[]});
     let client = recording(json!({"items":[item], "page":{"has_more":false, "next_cursor":null}}));
     let (meta, tool) =
         workspace_ticket_read_definition(client.clone(), WorkspaceTicketReadKind::Query)();
@@ -139,7 +139,7 @@ async fn classification_reads_forward_id_filters_and_preserve_tag_observations()
             assert_eq!(body[field], input[field]);
         }
     }
-    let detail = json!({"resource_key":"T-740", "content_digest":"content-1", "title":"Classify", "body":"Body", "state":"open", "closure_operation_key":null, "current_closure":null, "legacy_handoff":null, "closure_history":[], "tags":[tag()], "events":[], "linked_objectives":[], "assignments":[], "implementation_reports":[], "merge_requests":[]});
+    let detail = json!({"resource_key":"T-740", "content_digest":"content-1", "title":"Classify", "body":"Body", "state":"open", "closure_operation_key":null, "current_closure":null, "legacy_handoff":null, "closure_history":[], "assignment_tracking":[], "tags":[tag()], "events":[], "linked_objectives":[], "assignments":[], "implementation_reports":[], "merge_requests":[]});
     let client = recording(detail);
     let (_, tool) =
         workspace_ticket_read_definition(client.clone(), WorkspaceTicketReadKind::Show)();

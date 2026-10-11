@@ -20,9 +20,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod assignment_tracking;
 pub mod config;
 mod sqlite_schema;
 mod tags;
+pub use assignment_tracking::*;
 pub use tags::{
     TagListRequest, TicketTagSetRequest, WorkspaceTag, WorkspaceTagAction, WorkspaceTagMutation,
 };

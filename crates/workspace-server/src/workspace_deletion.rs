@@ -52,6 +52,8 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "ticket_current_worker_assignments",
     "ticket_worker_assignment_events",
     "ticket_worker_assignments",
+    "typed_ticket_assignment_tracking_history",
+    "typed_ticket_assignment_tracking_operations",
     "typed_ticket_case_history",
     "typed_ticket_case_metadata",
     "typed_ticket_legacy_workflow_snapshot",
@@ -464,15 +466,21 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
             }
             let workspace_id = operation.response.workspace_id.clone();
 
-            // Case judgments and legacy snapshots are immutable under ordinary
-            // Ticket operations, including Ticket deletion and FK cascades. Only
-            // this owner-authorized whole-Workspace purge may discard them.
+            // Ticket case/assignment judgments and their operation receipts are
+            // immutable under ordinary domain operations, including Ticket
+            // deletion and FK cascades. Only this owner-authorized whole-Workspace
+            // purge may discard them.
             // SQLite transactional DDL holds the writer lock: no concurrent writer
             // can observe the suspended guards, and any error rolls back both
             // data and schema. Restore the exact schema-owned definitions before
             // commit; update guards remain installed throughout.
-            let mut case_delete_guards = Vec::new();
+            let mut ticket_delete_guards = Vec::new();
             for (table, trigger) in [
+                ("ticket_worker_assignments", "typed_ticket_assignment_identity_no_delete"),
+                ("ticket_worker_assignment_events", "typed_ticket_assignment_events_no_delete"),
+                ("ticket_assignment_operations", "typed_ticket_assignment_receipt_no_delete"),
+                ("typed_ticket_assignment_tracking_history", "typed_ticket_assignment_tracking_history_no_delete"),
+                ("typed_ticket_assignment_tracking_operations", "typed_ticket_assignment_tracking_operations_no_delete"),
                 ("typed_ticket_case_history", "typed_ticket_case_history_no_delete"),
                 ("typed_ticket_legacy_workflow_snapshot", "typed_ticket_legacy_workflow_no_delete"),
             ] {
@@ -482,7 +490,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                     |row| row.get(0),
                 )?;
                 tx.execute_batch(&format!("DROP TRIGGER \"{trigger}\";"))?;
-                case_delete_guards.push(definition);
+                ticket_delete_guards.push(definition);
             }
             for table in WORKSPACE_DELETION_PURGE_TABLES {
                 tx.execute(
@@ -499,7 +507,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                     "Workspace disappeared before deletion finalized".to_string(),
                 ));
             }
-            for definition in case_delete_guards {
+            for definition in ticket_delete_guards {
                 tx.execute_batch(&definition)?;
             }
             let now = Utc::now().to_rfc3339();
@@ -978,6 +986,57 @@ mod tests {
                     .create_with_snapshot(ticket::NewTicket::new("Case evidence"))
                     .unwrap()
                     .1;
+                let assignment_id = format!("delegation-{workspace}");
+                store
+                    .set_current_ticket_role_assignment(
+                        &crate::store::TicketRoleAssignmentRecord {
+                            workspace_id: workspace.into(),
+                            ticket_id: initial.meta.id.clone(),
+                            assignment_id: assignment_id.clone(),
+                            role: crate::store::TicketAssignmentRole::Orchestrator,
+                            principal: crate::store::TicketAssignmentPrincipal::WorkspaceAgent {
+                                agent_key: "workspace-orchestrator".into(),
+                            },
+                            assigned_by: "owner".into(),
+                            assigned_at: "2026-01-01T00:00:00Z".into(),
+                        },
+                        None,
+                        "assigned",
+                        "assign",
+                        false,
+                    )
+                    .unwrap();
+                // Seed domain handling evidence under a transaction. This fixture
+                // exercises owner purge, not singleton authentication or delivery.
+                store
+                    .with_transaction(|tx| {
+                        ticket::sqlite_update_ticket_assignment_tracking_in_transaction(
+                            tx,
+                            workspace,
+                            &initial.meta.id,
+                            &ticket::TicketAssignmentTrackingUpdate {
+                                assignment_id: assignment_id.clone(),
+                                expected_last_event_id: "assigned".into(),
+                                operation_key: "reported".into(),
+                                tracking: ticket::TicketAssignmentTracking {
+                                    status: ticket::TicketAssignmentTrackingStatus::Done,
+                                    waiting_reason: None,
+                                    progress: None,
+                                    next_action: None,
+                                    result: Some("Returned result".into()),
+                                },
+                            },
+                            &ticket::TicketAssignmentTrackingSourceContext {
+                                actor: "orchestrator".into(),
+                                runtime_id: "fixture-runtime".into(),
+                                worker_id: "fixture-worker".into(),
+                                agent_key: "workspace-orchestrator".into(),
+                                authentication_binding_id: "fixture-binding".into(),
+                            },
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
                 backend
                     .update_case(
                         &initial.meta.id,
@@ -1022,7 +1081,7 @@ mod tests {
             }
             let assert_immutable = |workspace: &str| {
                 store.with_conn(|conn| {
-                    for table in ["typed_ticket_case_history", "typed_ticket_legacy_workflow_snapshot"] {
+                    for table in ["typed_ticket_case_history", "typed_ticket_legacy_workflow_snapshot", "ticket_worker_assignment_events", "typed_ticket_assignment_tracking_history", "typed_ticket_assignment_tracking_operations", "ticket_assignment_operations"] {
                         assert!(conn.execute(&format!("DELETE FROM {table} WHERE workspace_id=?1"), [workspace]).is_err());
                         assert!(conn.execute(&format!("UPDATE {table} SET ticket_id=ticket_id WHERE workspace_id=?1"), [workspace]).is_err());
                     }
@@ -1052,8 +1111,13 @@ mod tests {
                 "typed_ticket_case_history",
                 "typed_ticket_case_metadata",
                 "typed_ticket_legacy_workflow_snapshot",
+                "ticket_worker_assignments",
+                "ticket_worker_assignment_events",
+                "ticket_assignment_operations",
+                "typed_ticket_assignment_tracking_history",
+                "typed_ticket_assignment_tracking_operations",
             ];
-            let other_before: Vec<String> = store
+            let other_before: Vec<Option<String>> = store
                 .with_conn(|conn| {
                     tables
                         .iter()
@@ -1095,7 +1159,12 @@ mod tests {
                                 [],
                                 |row| row.get(0),
                             )?;
-                            assert_eq!(count, 1, "rollback must restore {table}");
+                            let expected = if table == "typed_ticket_assignment_tracking_history" {
+                                2
+                            } else {
+                                1
+                            };
+                            assert_eq!(count, expected, "rollback must restore {table}");
                         }
                         conn.execute_batch("DROP TRIGGER reject_workspace_purge;")?;
                         Ok(())
@@ -1132,7 +1201,7 @@ mod tests {
                             |row| row.get(0),
                         )?;
                         assert_eq!(count, 0, "purge must remove {table}");
-                        let after: String = conn.query_row(
+                        let after: Option<String> = conn.query_row(
                             &format!("SELECT * FROM {table} WHERE workspace_id='workspace-b'"),
                             [],
                             |row| row.get(row.as_ref().column_count() - 1),

@@ -347,6 +347,12 @@ impl_openapi_schema!(
     TicketDependencyCheckResponse,
     TicketDetail,
     TicketCaseUpdateRequest,
+    TicketAssignmentTrackingUpdateRequest,
+    TicketAssignmentTrackingRecord,
+    TicketAssignmentTrackingList,
+    TicketAssignmentTrackingQuery,
+    TicketAssignmentTrackingHistoryQuery,
+    TicketAssignmentTrackingHistoryPage,
     TicketSummary,
     TicketDoctorResponse,
     TicketIntakeSummaryRequest,
@@ -3190,6 +3196,30 @@ pub trait ServerApi {
         #[path] ticket_id: String,
         #[body] request: TicketCaseUpdateRequest,
     ) -> Result<TicketSummary, RepositoryApiError>;
+    #[get("/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignment_tracking_get(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[query] query: TicketAssignmentTrackingQuery,
+    ) -> Result<TicketAssignmentTrackingList, RepositoryApiError>;
+    #[post("/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignment_tracking_update(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[body] request: TicketAssignmentTrackingUpdateRequest,
+    ) -> Result<TicketAssignmentTrackingRecord, RepositoryApiError>;
+    #[get("/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking/history", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignment_tracking_history(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[query] query: TicketAssignmentTrackingHistoryQuery,
+    ) -> Result<TicketAssignmentTrackingHistoryPage, RepositoryApiError>;
     #[get("/api/w/{workspace_id}/tickets/{id}/relation-view", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_relation_view(
         &self,
@@ -3254,6 +3284,7 @@ pub trait ServerApi {
     #[put("/api/w/{workspace_id}/tickets/{id}/assignments/{role}", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_assignment_set(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
         #[path] role: String,
@@ -3263,6 +3294,7 @@ pub trait ServerApi {
     #[delete("/api/w/{workspace_id}/tickets/{id}/assignments/{role}", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_assignment_clear(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
         #[path] role: String,
@@ -3571,6 +3603,9 @@ pub struct ServerWorkerSource {
 pub struct ServerRuntimeSource {
     pub runtime_id: String,
     pub worker_id: Option<String>,
+    /// Binding whose public key authenticated this request. Retain the verified
+    /// identity through mutation CAS/replay checks; a later lookup is not proof.
+    pub authentication_binding_id: String,
 }
 
 #[derive(Clone)]
@@ -7631,6 +7666,11 @@ pub struct TicketQueryItem {
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub unresolved_review_count: usize,
+    #[cfg_attr(
+        feature = "typescript",
+        ts(type = "Array<TicketAssignmentTrackingProjection>")
+    )]
+    pub assignment_tracking: Vec<ticket::TicketAssignmentTrackingProjection>,
     pub evidence: TicketEvidenceSummary,
     pub merge_requests: Vec<TicketMergeRequestSummary>,
     pub merge_request: Option<TicketMergeRequestSummary>,
@@ -7700,6 +7740,11 @@ pub struct TicketDetail {
     pub linked_objectives: Vec<ObjectiveLinkSummary>,
     pub implementation_reports: Vec<TicketEvidenceEvent>,
     pub assignments: Vec<TicketRoleAssignmentSummary>,
+    #[cfg_attr(
+        feature = "typescript",
+        ts(type = "Array<TicketAssignmentTrackingProjection>")
+    )]
+    pub assignment_tracking: Vec<ticket::TicketAssignmentTrackingProjection>,
     pub current_worker: Option<TicketAssignmentSummary>,
     pub assignment_diagnostics: Vec<String>,
     pub action_eligibility: TicketActionEligibility,
@@ -7777,6 +7822,42 @@ pub struct TicketCaseUpdateRequest {
     #[serde(default)]
     pub references: Vec<ticket::TicketReference>,
 }
+transparent_ticket_dto!(
+    TicketAssignmentTrackingUpdateRequest,
+    ticket::TicketAssignmentTrackingUpdate
+);
+transparent_ticket_dto!(
+    TicketAssignmentTrackingRecord,
+    ticket::TicketAssignmentTrackingProjection
+);
+transparent_ticket_dto!(
+    TicketAssignmentTrackingList,
+    Vec<ticket::TicketAssignmentTrackingProjection>
+);
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketAssignmentTrackingQuery {
+    /// Omit for the current delegation; provide to inspect a retained assignment.
+    pub assignment_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketAssignmentTrackingHistoryQuery {
+    pub assignment_id: String,
+    pub after_event_id: Option<String>,
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketAssignmentTrackingHistoryPage {
+    pub items: Vec<ticket::TicketAssignmentTrackingHistoryEntry>,
+    pub next_event_id: Option<String>,
+}
+
 transparent_ticket_dto!(WorkspaceTicketTagListRequest, ticket::TagListRequest);
 transparent_ticket_dto!(
     WorkspaceTicketTagMutationRequest,
@@ -13019,6 +13100,50 @@ mod tests {
             });
             let parsed: TicketCaseUpdateRequest = serde_json::from_value(request.clone()).unwrap();
             assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+        }
+    }
+
+    #[test]
+    fn ticket_assignment_tracking_wire_has_explicit_event_cas_without_actor_claims() {
+        for status in ["waiting", "inprogress", "done"] {
+            let input = serde_json::json!({"assignment_id":"delegation", "expected_last_event_id":"observed-event", "operation_key":"handling", "tracking":{"status":status, "waiting_reason":null, "progress":"Investigated", "next_action":null, "result":null}});
+            let request: TicketAssignmentTrackingUpdateRequest =
+                serde_json::from_value(input.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), input);
+            for field in [
+                "assignment_id",
+                "expected_last_event_id",
+                "operation_key",
+                "tracking",
+            ] {
+                let mut missing = input.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                assert!(
+                    serde_json::from_value::<TicketAssignmentTrackingUpdateRequest>(missing)
+                        .is_err(),
+                    "{field}"
+                );
+            }
+            for field in [
+                "author",
+                "role",
+                "source_context",
+                "runtime_id",
+                "worker_id",
+            ] {
+                let mut invalid = input.clone();
+                invalid[field] = serde_json::json!("orchestrator");
+                assert!(
+                    serde_json::from_value::<TicketAssignmentTrackingUpdateRequest>(invalid)
+                        .is_err(),
+                    "{field}"
+                );
+            }
+            let mut invalid = input.clone();
+            invalid["tracking"]["status"] = serde_json::json!("running");
+            assert!(
+                serde_json::from_value::<TicketAssignmentTrackingUpdateRequest>(invalid).is_err()
+            );
         }
     }
 

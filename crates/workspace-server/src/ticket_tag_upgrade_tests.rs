@@ -265,10 +265,20 @@ fn assert_retained_classification_upgrade(workspace_version: i64, component: i64
     drop(conn);
     let store = SqliteWorkspaceStore::open(&path).unwrap();
     store.with_conn(|conn| {
-        assert_eq!(current_schema_version(conn)?,91);
-        assert_eq!(conn.query_row("SELECT MAX(version) FROM ticket_schema_migrations",[],|row|row.get::<_,i64>(0))?,10);
+        assert_eq!(current_schema_version(conn)?,92);
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM ticket_schema_migrations",[],|row|row.get::<_,i64>(0))?,11);
         assert_eq!(fixture_auth_rows(conn),auth_before);
-        for (table, rows) in preserved_tables.iter().zip(&preserved) { assert_eq!(&stored_fixture_rows(conn,table),rows,"preserve {table}"); }
+        for (table, rows) in preserved_tables.iter().zip(&preserved) {
+            let mut migrated = stored_fixture_rows(conn, table);
+            if *table == "ticket_worker_assignments" {
+                // Component 11 adds handling columns to the same identity row.
+                // Compare the ten retained identity/principal/Assign columns,
+                // and separately prove the historical Worker acquired no tracking.
+                for row in &mut migrated { row.truncate(10); }
+                assert_eq!(conn.query_row("SELECT COUNT(*) FROM ticket_worker_assignments WHERE tracking_json IS NOT NULL", [], |row| row.get::<_,i64>(0))?, 0);
+            }
+            assert_eq!(&migrated, rows, "preserve {table}");
+        }
         if let Some(rows)=&tags_before {assert_eq!(&classification_rows(conn),rows);}
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM ticket_assignment_work_releases WHERE assignment_id='assignment'",[],|row|row.get::<_,i64>(0))?,1);
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check",[],|row|row.get::<_,i64>(0))?,0);
@@ -483,14 +493,14 @@ fn workspace90_cases9_add_classification_without_reinterpreting_reasoned_history
     let store = SqliteWorkspaceStore::open(&path).unwrap();
     store
         .with_conn(|conn| {
-            assert_eq!(current_schema_version(conn)?, 91);
+            assert_eq!(current_schema_version(conn)?, 92);
             assert_eq!(
                 conn.query_row(
                     "SELECT MAX(version) FROM ticket_schema_migrations",
                     [],
                     |row| row.get::<_, i64>(0)
                 )?,
-                10
+                11
             );
             assert_eq!(
                 stored_fixture_rows(conn, "typed_ticket_case_history"),

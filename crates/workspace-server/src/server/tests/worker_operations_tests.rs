@@ -632,12 +632,14 @@ async fn request_context_uses_verified_subject_not_headers_or_account_fallback()
     assert!(WorkerOperationContext::from_request(&api, &headers_only).is_err());
     let mut runtime_only = operation_request_context(Some(server_api::ServerRuntimeSource {
         runtime_id: "runtime-a".into(),
+        authentication_binding_id: "fixture-binding".into(),
         worker_id: None,
     }));
     runtime_only.actor = Some(test_browser_request_actor());
     assert!(WorkerOperationContext::from_request(&api, &runtime_only).is_err());
     let mut mismatched = operation_request_context(Some(server_api::ServerRuntimeSource {
         runtime_id: "runtime-a".into(),
+        authentication_binding_id: "fixture-binding".into(),
         worker_id: Some("controller-a".into()),
     }));
     mismatched.actor = Some(test_browser_request_actor());
@@ -646,6 +648,7 @@ async fn request_context_uses_verified_subject_not_headers_or_account_fallback()
     seed_worker_source_member(&api, "runtime-a", "controller-a");
     let context = operation_request_context(Some(server_api::ServerRuntimeSource {
         runtime_id: "runtime-a".into(),
+        authentication_binding_id: "fixture-binding".into(),
         worker_id: Some("controller-a".into()),
     }));
     assert!(
@@ -665,6 +668,7 @@ async fn generic_management_aliases_cannot_bypass_worker_grants_or_target_bound_
     let context = || {
         operation_request_context(Some(server_api::ServerRuntimeSource {
             runtime_id: "offline-runtime".into(),
+            authentication_binding_id: "fixture-binding".into(),
             worker_id: Some("controller".into()),
         }))
     };
