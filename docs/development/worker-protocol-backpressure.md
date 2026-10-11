@@ -109,4 +109,3 @@ only the changed Runtime file with its exact `98023b98` content produced the sam
 error groups in all three probes. These configurations are not claimed validated;
 this patch does not repair their unrelated feature wiring. The normal
 `ws-server,fs-store` configuration is covered by root check and whole-crate tests.
-
