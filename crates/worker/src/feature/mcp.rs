@@ -1082,11 +1082,21 @@ impl Tool for McpStdioTool {
         input_json: &str,
         _ctx: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
+        self.execute_with_limits(input_json, McpStdioLimits::default())
+            .await
+    }
+}
+
+impl McpStdioTool {
+    async fn execute_with_limits(
+        &self,
+        input_json: &str,
+        limits: McpStdioLimits,
+    ) -> Result<ToolOutput, ToolError> {
         let arguments = parse_tool_arguments(input_json)?;
-        let mut client =
-            McpStdioClient::connect(self.server_spec.clone(), McpStdioLimits::default())
-                .await
-                .map_err(|err| ToolError::ExecutionFailed(mcp_call_error_message(&err)))?;
+        let mut client = McpStdioClient::connect(self.server_spec.clone(), limits)
+            .await
+            .map_err(|err| ToolError::ExecutionFailed(mcp_call_error_message(&err)))?;
 
         let call_result = client
             .call_tool(CallToolRequest::new(self.mcp_tool_name.clone(), arguments))
@@ -2206,6 +2216,64 @@ read exit_notification || true
             err.to_string()
                 .contains("MCP tools/call JSON-RPC protocol error")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_tool_request_timeout_reports_unknown_execution_without_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("frames.jsonl");
+        // Frame capture is observed only after shutdown has waited for process
+        // exit. No guessed sleep or process-global test-control variable.
+        let script = r#"
+printf '%s\n' 'connection' >> "$1"
+read -r init || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"timeout-fixture","version":"1"}}}'
+read -r initialized || exit 1
+while IFS= read -r frame; do
+    printf '%s\n' "$frame" >> "$1"
+done
+"#;
+        let tool = McpStdioTool {
+            server_spec: McpStdioServerSpec::new("timeout-fixture", "/bin/sh").args([
+                "-c".to_string(),
+                script.to_string(),
+                "fixture".to_string(),
+                log.to_str().unwrap().to_string(),
+            ]),
+            mcp_tool_name: "demo-tool".to_string(),
+        };
+        let limits = McpStdioLimits {
+            request_timeout: std::time::Duration::from_millis(100),
+            shutdown_timeout: std::time::Duration::from_millis(100),
+            kill_timeout: std::time::Duration::from_millis(100),
+            ..Default::default()
+        };
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tool.execute_with_limits("{}", limits),
+        )
+        .await
+        .unwrap()
+        .expect_err("response intentionally withheld");
+        let message = err.to_string();
+        assert!(
+            message.contains("tools/call transport/protocol failure"),
+            "{message}"
+        );
+        assert!(message.contains("timed out during tools/call"), "{message}");
+        assert!(
+            message.contains("frame flushed; execution unknown; do not retry"),
+            "{message}"
+        );
+        let capture = std::fs::read_to_string(log).unwrap();
+        let mut lines = capture.lines();
+        assert_eq!(lines.next(), Some("connection"));
+        let frames: Vec<Value> = lines
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(frames.len(), 1, "must not reconnect or replay: {capture}");
+        assert_eq!(frames[0]["method"], "tools/call");
     }
 
     #[test]
