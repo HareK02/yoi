@@ -29,6 +29,8 @@ struct Fixture {
     server: WorkspaceServerApi,
     api: WorkspaceApi,
     executor: DbExecutor,
+    host_executor: DbExecutor,
+    store: Arc<SqliteWorkspaceStore>,
     _dir: tempfile::TempDir,
 }
 
@@ -90,10 +92,22 @@ impl Fixture {
                 revoked_at: None,
             })
             .unwrap();
-        let api = WorkspaceApi::new_for_test(config.clone(), store.clone())
-            .await
-            .unwrap();
-        let server = WorkspaceServerApi::new_for_test(config, store);
+        // Explicit small Host budget proves the actual mixed mutation owner;
+        // the production/default fixture limits remain 2 workers/16 queued.
+        let host_executor = DbExecutor::new(DbExecutorLimits {
+            workers: NonZeroUsize::new(1).unwrap(),
+            queued: NonZeroUsize::new(1).unwrap(),
+        })
+        .unwrap();
+        let host_executors = HostExecutors {
+            host: Arc::new(std::sync::OnceLock::from(Some(host_executor.clone()))),
+            ..Default::default()
+        };
+        let api =
+            WorkspaceApi::new_with_host_executors(config.clone(), store.clone(), host_executors)
+                .await
+                .unwrap();
+        let server = WorkspaceServerApi::new_for_test(config, store.clone());
         // Cache only the real inner router; avoid starting the unrelated hook.
         server
             .apis
@@ -110,6 +124,8 @@ impl Fixture {
             server,
             api,
             executor,
+            host_executor,
+            store,
             _dir: dir,
         }
     }
@@ -527,9 +543,9 @@ async fn authenticated_subjektiv_mutation_waits_for_commit_before_response() {
     assert_eq!(body["role"], "locked-subject", "{body}");
     assert!(
         body["memory_fingerprint"].is_string(),
-        "response assembly must finish in the DB operation: {body}"
+        "response assembly must finish in the admitted mutation operation: {body}"
     );
-    fixture.executor.drain().await.unwrap();
+    fixture.host_executor.drain().await.unwrap();
     assert_eq!(subject_count(&path, "locked-subject"), 1);
 }
 
@@ -556,7 +572,7 @@ async fn cancelled_http_waiter_keeps_deletion_pending_until_sql_finishes() {
     assert_eq!(subject_count(&path, "cancelled-subject"), 0);
     lock.release();
     busy.resume();
-    fixture.executor.drain().await.unwrap();
+    fixture.host_executor.drain().await.unwrap();
     let deletion = observed(deletion).await;
     assert_eq!(
         subject_count(&path, "cancelled-subject"),
@@ -603,7 +619,7 @@ async fn cancelled_queued_http_mutation_keeps_capacity_until_commit_and_drain() 
     );
     assert_eq!(subject_count(&path, "queued-subject"), 0);
     assert_eq!(subject_count(&path, "rejected-subject"), 0);
-    let mut drained = Box::pin(fixture.executor.drain());
+    let mut drained = Box::pin(fixture.host_executor.drain());
     assert!(futures::poll!(&mut drained).is_pending());
     lock.release();
     busy.resume();
@@ -621,7 +637,7 @@ async fn cancelled_queued_http_mutation_keeps_capacity_until_commit_and_drain() 
     );
     let retry = fixture.dispatch(Fixture::subject_request("after-drain"));
     response_json(observed(retry).await.unwrap(), StatusCode::CREATED).await;
-    fixture.executor.drain().await.unwrap();
+    fixture.host_executor.drain().await.unwrap();
     assert_eq!(
         subject_count(&path, "after-drain"),
         1,
@@ -766,4 +782,340 @@ async fn restore_intent_pins_once_after_write_ownership_without_a_deferred_read_
         count, 1,
         "one admitted intent must persist exactly once, with no operation retry"
     );
+}
+
+fn install_remote_fixture(
+    fixture: &Fixture,
+    runtime_id: &str,
+    base_url: &str,
+    signed: bool,
+) -> crate::store::WorkspaceRuntimeBinding {
+    let identity = worker_runtime::auth::RuntimeIdentityMaterial::generate(runtime_id).unwrap();
+    fixture
+        .store
+        .upsert_workspace_runtime_binding(
+            crate::store::WorkspaceRuntimeBinding {
+                workspace_id: WORKSPACE.into(),
+                runtime_id: runtime_id.into(),
+                display_name: "Held Runtime".into(),
+                base_url: base_url.into(),
+                public_key: identity.public_key,
+                public_key_fingerprint: String::new(),
+                binding_id: String::new(),
+                authentication_mode: if signed {
+                    crate::store::WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity
+                } else {
+                    crate::store::WorkspaceRuntimeAuthenticationMode::LegacyServerIssuer
+                },
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+                revoked_at: None,
+            },
+            false,
+        )
+        .unwrap();
+    let binding = fixture
+        .store
+        .get_workspace_runtime_binding(WORKSPACE, runtime_id)
+        .unwrap()
+        .unwrap();
+    // This narrow fixture exercises the provider's own live authority callback;
+    // it does not start the unrelated subscription/projection reconnect producer.
+    fixture.api.runtime.set_runtime_binding_gate(|_| true);
+    let mut config = crate::hosts::RemoteRuntimeConfig::new(
+        runtime_id,
+        "Held Runtime",
+        base_url,
+        Some("must-not-fall-back".into()),
+    )
+    .with_timeout(WATCHDOG);
+    if signed {
+        fixture
+            .api
+            .signing_identities
+            .provision_existing(WORKSPACE, &format!("account-{WORKSPACE}"))
+            .unwrap();
+        config.workspace_authorization = Some(WorkspaceRuntimeAuthorization::new(
+            fixture.store.clone(),
+            fixture.api.signing_identities.clone(),
+            "http://localhost:8787",
+            binding.clone(),
+        ));
+    }
+    fixture.api.runtime.register_or_replace(
+        RemoteWorkerRuntime::new(config, WORKSPACE.into(), "http://localhost:8787".into()).unwrap(),
+    );
+    binding
+}
+
+
+
+// Loopback fake at the Session/Worker Runtime HTTP boundary. It owns one reply,
+// released by an explicit event; Drop unblocks accept/read and joins on failure.
+struct HeldRuntimeReply {
+    address: std::net::SocketAddr,
+    entered: Option<oneshot::Receiver<String>>,
+    release: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+impl HeldRuntimeReply {
+    fn new() -> Self {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (entered, received) = oneshot::channel();
+        let (release, permit) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            stream.set_read_timeout(Some(WATCHDOG)).unwrap();
+            let mut buf = [0; 4096];
+            let Ok(n) = stream.read(&mut buf) else { return };
+            if n == 0 {
+                return;
+            }
+            let _ = entered.send(
+                String::from_utf8_lossy(&buf[..n])
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_owned(),
+            );
+            let _ = permit.recv_timeout(WATCHDOG);
+            let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        Self {
+            address,
+            entered: Some(received),
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+    fn finish(&mut self) {
+        self.release.take();
+        let _ = std::net::TcpStream::connect(self.address);
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
+    }
+}
+impl Drop for HeldRuntimeReply {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+struct CountJobLifetime(Arc<std::sync::atomic::AtomicUsize>);
+struct CountJobLease(Arc<std::sync::atomic::AtomicUsize>);
+impl DbOperationLifetime for CountJobLifetime {
+    fn retain(&self) -> Box<dyn Send> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::new(CountJobLease(self.0.clone()))
+    }
+}
+impl Drop for CountJobLease {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn subjektiv_runtime_waits_leave_db_and_control_free_and_cancel_retains_the_actual_host_lease()
+ {
+    // Different mixed helpers carry this rule: Session Read/Search, subject
+    // projection, and legacy consolidation scope authorization (even refusal).
+    for kind in ["read", "search", "subject", "legacy_scope"] {
+        let fixture = Fixture::new().await;
+        let mut reply = HeldRuntimeReply::new();
+        install_remote_fixture(
+            &fixture,
+            "subject-runtime",
+            &format!("http://{}", reply.address),
+            false,
+        );
+        let Json(subject) = scoped_create_subjektiv_subject(
+            State(fixture.api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: WORKSPACE.into(),
+            }),
+            Json(server_api::SubjektivSubjectCreateRequest {
+                role: "network subject".into(),
+                behavior_md: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .1;
+        let singleton = if kind == "legacy_scope" {
+            format!("{SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX}{}", subject.id)
+        } else {
+            crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap()
+        };
+        let memory = fixture
+            .store
+            .get_workspace_memory_settings(WORKSPACE)
+            .unwrap();
+        let reservation = fixture
+            .store
+            .reserve_worker_create(
+                WORKSPACE,
+                "subject-runtime",
+                "network-fixture",
+                "network-fixture-fingerprint",
+                Some(&singleton),
+                &memory,
+            )
+            .unwrap();
+        let worker = RuntimeWorkerRef::new("subject-runtime", reservation.worker_id.to_string());
+        fixture
+            .store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: WORKSPACE.into(),
+                worker: worker.clone(),
+                display_name: "network fixture".into(),
+                profile: None,
+                retention_state: "normal".into(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            })
+            .unwrap();
+        fixture
+            .store
+            .complete_worker_create_reservation(WORKSPACE, reservation.worker_id)
+            .unwrap();
+        open_subjektiv_store(&fixture.api)
+            .unwrap()
+            .record_session_attribution(
+                crate::subjektiv::SubjectSessionAttribution::new(
+                    subject.id.clone(),
+                    worker.runtime_id.clone(),
+                    worker.worker_id.clone(),
+                    "session",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        fixture
+            .store
+            .create_worker_control_grant(&WorkerControlGrantRecord {
+                workspace_id: WORKSPACE.into(),
+                grant_id: "session-observe".into(),
+                controller: worker.clone(),
+                subject: worker.clone(),
+                relation: "subject_session".into(),
+                origin: "test".into(),
+                permissions: vec!["observe".into()],
+                operation_id: "session-observe".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                revoked_at: None,
+            })
+            .unwrap();
+        let context = server_api::ServerRequestContext {
+            actor: None,
+            worker_source: None,
+            runtime_source: Some(server_api::ServerRuntimeSource {
+                authentication_binding_id: "fixture-binding".into(),
+                runtime_id: worker.runtime_id,
+                worker_id: Some(worker.worker_id),
+            }),
+            origin: None,
+            transport_headers: Vec::new(),
+        };
+        let counts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lifetime = Arc::new(CountJobLifetime(counts.clone()));
+        let api = fixture.api.clone();
+        let task = tokio::spawn(crate::db_executor::with_operation_lifetime(
+            lifetime,
+            async move {
+                if kind == "subject" {
+                    scoped_get_subjektiv_subject(
+                        State(api),
+                        AxumPath(ScopedSubjektivSubjectPath {
+                            workspace_id: WORKSPACE.into(),
+                            subject_id: subject.id,
+                        }),
+                    )
+                    .await
+                    .map(|_| ())
+                } else {
+                    let operation = match kind {
+                        "read" => server_api::SubjektivSessionBackendOperation::Read(
+                            server_api::SubjektivSessionReadRequest {
+                                session_id: "session".into(),
+                                segment_id: "segment".into(),
+                                entry_ref: "E1".into(),
+                                mode: Default::default(),
+                                cursor: None,
+                            },
+                        ),
+                        "search" => server_api::SubjektivSessionBackendOperation::Search(
+                            serde_json::from_value(
+                                serde_json::json!({"session_id":"session","query":"needle"}),
+                            )
+                            .unwrap(),
+                        ),
+                        _ => server_api::SubjektivSessionBackendOperation::List(
+                            serde_json::from_value(serde_json::json!({})).unwrap(),
+                        ),
+                    };
+                    scoped_subjektiv_session_backend(
+                        State(api),
+                        AxumPath(ScopedWorkspacePath {
+                            workspace_id: WORKSPACE.into(),
+                        }),
+                        context,
+                        Json(server_api::SubjektivSessionBackendRequest { operation }),
+                    )
+                    .await
+                    .map(|_| ())
+                }
+            },
+        ));
+        let request = observed(reply.entered.take().unwrap()).await.unwrap();
+        assert!(
+            request.contains(if kind == "read" || kind == "search" {
+                "/v1/session-public/"
+            } else {
+                "/v1/workers/"
+            }),
+            "{kind}: {request}"
+        );
+        let read_store = fixture.store.clone();
+        observed(
+            fixture
+                .executor
+                .run(move || read_store.get_workspace_memory_settings(WORKSPACE)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            observed(tokio::spawn(async { "control" })).await.unwrap(),
+            "control"
+        );
+        observed(tokio::time::sleep(StdDuration::from_millis(1))).await; // timer contract, not a wait guess
+        assert!(
+            !task.is_finished(),
+            "{kind} completed before upstream release"
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            counts.load(Ordering::SeqCst),
+            1,
+            "{kind}: cancellation lost actual Host authority"
+        );
+        reply.finish();
+        observed(fixture.host_executor.drain()).await.unwrap();
+        assert_eq!(
+            counts.load(Ordering::SeqCst),
+            0,
+            "{kind}: completed Host job leaked its lease"
+        );
+        fixture.executor.drain().await.unwrap();
+    }
 }

@@ -20521,8 +20521,8 @@ async fn scoped_create_subjektiv_subject(
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     Json(request): Json<server_api::SubjektivSubjectCreateRequest>,
 ) -> ApiResult<(StatusCode, Json<server_api::SubjektivSubjectResponse>)> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let role = crate::subjektiv::SubjectRole::new(request.role)
@@ -20553,8 +20553,8 @@ async fn scoped_list_subjektiv_subjects(
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     Query(query): Query<server_api::SubjektivSubjectListQuery>,
 ) -> ApiResult<Json<server_api::SubjektivSubjectListResponse>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let limit = query.limit.unwrap_or(20);
@@ -20622,8 +20622,8 @@ async fn scoped_get_subjektiv_subject(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedSubjektivSubjectPath>,
 ) -> ApiResult<Json<server_api::SubjektivSubjectResponse>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let subject = open_subjektiv_store(&api)?
@@ -20640,8 +20640,8 @@ async fn scoped_update_subjektiv_subject_behavior(
     AxumPath(path): AxumPath<ScopedSubjektivSubjectPath>,
     Json(request): Json<server_api::SubjektivSubjectBehaviorUpdateRequest>,
 ) -> ApiResult<Json<server_api::SubjektivSubjectResponse>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             crate::subjektiv::validate_subject_behavior(&request.behavior_md)
@@ -20800,8 +20800,8 @@ async fn scoped_retire_subjektiv_subject(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedSubjektivSubjectPath>,
 ) -> ApiResult<Json<server_api::SubjektivSubjectResponse>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let subject = open_subjektiv_store(&api)?
@@ -20820,8 +20820,8 @@ async fn scoped_stage_subjektiv_candidate(
     context: server_api::ServerRequestContext,
     Json(mut request): Json<server_api::SubjektivStageCandidateRequest>,
 ) -> ApiResult<Json<server_api::SubjektivStageCandidateResponse>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let attribution = require_existing_subjektiv_session_attribution(
@@ -20885,8 +20885,8 @@ async fn scoped_record_subjektiv_session(
     context: server_api::ServerRequestContext,
     Json(request): Json<server_api::SubjektivRecordSessionRequest>,
 ) -> ApiResult<Json<server_api::SubjektivRecordSessionResponse>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let attribution = if request.create_if_missing {
@@ -21006,8 +21006,8 @@ async fn scoped_subjektiv_session_backend(
     context: server_api::ServerRequestContext,
     Json(request): Json<server_api::SubjektivSessionBackendRequest>,
 ) -> ApiResult<Json<server_api::SubjektivSessionBackendResponse>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let (subject_id, controller, authority) =
@@ -22251,8 +22251,8 @@ async fn scoped_subjektiv_memory_backend(
     context: server_api::ServerRequestContext,
     Json(request): Json<server_api::SubjektivMemoryBackendRequest>,
 ) -> ApiResult<Json<server_api::SubjektivMemoryBackendResponse>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let (subject_id, source_worker, authority) =
@@ -22402,13 +22402,22 @@ async fn scoped_subjektiv_memory_consolidation(
     context: server_api::ServerRequestContext,
     Json(operation): Json<MemoryConsolidateStagingOperation>,
 ) -> ApiResult<Json<MemoryConsolidationOutput>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    let (subject_id, _, authority) = subjektiv_subject_scope(&api, &path.workspace_id, &context)?;
-    require_subjektiv_worker_authority(
-        authority,
-        SubjektivWorkerAuthority::Subject,
-        "consolidation request",
-    )?;
+    let scope_api = api.clone();
+    let subject_id = api
+        .host_executors
+        .host()?
+        .run(move || {
+            validate_workspace_scope(&scope_api, &path.workspace_id)?;
+            let (subject_id, _, authority) =
+                subjektiv_subject_scope(&scope_api, &path.workspace_id, &context)?;
+            require_subjektiv_worker_authority(
+                authority,
+                SubjektivWorkerAuthority::Subject,
+                "consolidation request",
+            )?;
+            Ok::<_, ApiError>(subject_id)
+        })
+        .await?;
     Ok(Json(
         start_subjektiv_staging_consolidation(api, &subject_id, operation).await?,
     ))
