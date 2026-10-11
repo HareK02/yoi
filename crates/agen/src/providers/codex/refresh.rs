@@ -10,7 +10,26 @@ use super::error::{CodexAuthError, PermanentReason};
 
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
-pub const DEFAULT_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Limits cover send, both response bodies, and decode, not auth file I/O.
+/// OAuth responses contain only a few tokens; 64 KiB leaves ample JWT headroom.
+#[derive(Clone)]
+pub(super) struct RefreshLimits {
+    pub timeout: Duration,
+    pub max_body_bytes: usize,
+    #[cfg(test)]
+    pub body_started: Option<std::sync::Arc<tokio::sync::Notify>>,
+}
+
+impl Default for RefreshLimits {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+            max_body_bytes: 64 * 1024,
+            #[cfg(test)]
+            body_started: None,
+        }
+    }
+}
 
 #[derive(Serialize)]
 struct RefreshRequest<'a> {
@@ -37,54 +56,94 @@ pub async fn request_refresh(
     client: &reqwest::Client,
     endpoint: &str,
     refresh_token: &str,
+    limits: &RefreshLimits,
+) -> Result<RefreshResponse, CodexAuthError> {
+    let deadline = tokio::time::Instant::now() + limits.timeout;
+    let result = tokio::time::timeout_at(
+        deadline,
+        request_refresh_bounded(client, endpoint, refresh_token, limits),
+    )
+    .await;
+    // JSON decode is synchronous. The byte bound limits its work, and this
+    // post-check prevents a decode that crosses the deadline from being persisted.
+    if tokio::time::Instant::now() >= deadline {
+        return Err(CodexAuthError::RefreshTransient(
+            "oauth_token_refresh timed out".into(),
+        ));
+    }
+    result.map_err(|_| CodexAuthError::RefreshTransient("oauth_token_refresh timed out".into()))?
+}
+
+async fn request_refresh_bounded(
+    client: &reqwest::Client,
+    endpoint: &str,
+    refresh_token: &str,
+    limits: &RefreshLimits,
 ) -> Result<RefreshResponse, CodexAuthError> {
     let body = RefreshRequest {
         client_id: CLIENT_ID,
         grant_type: "refresh_token",
         refresh_token,
     };
-    let response = response_with_timeout(
-        client
-            .post(endpoint)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send(),
-        DEFAULT_REFRESH_TIMEOUT,
-    )
-    .await?;
+    let mut response = client
+        .post(endpoint)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| CodexAuthError::RefreshTransient("send failed".into()))?;
 
     let status = response.status();
-    if status.is_success() {
-        response
-            .json::<RefreshResponse>()
-            .await
-            .map_err(|e| CodexAuthError::RefreshTransient(format!("parse response: {e}")))
-    } else {
-        let body = response.text().await.unwrap_or_default();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            let (reason, message) = classify_permanent(&body);
-            Err(CodexAuthError::RefreshPermanent { reason, message })
-        } else {
-            Err(CodexAuthError::RefreshTransient(format!(
-                "{status}: {body}"
-            )))
+    if response
+        .content_length()
+        .is_some_and(|len| len > limits.max_body_bytes as u64)
+    {
+        return Err(body_too_large());
+    }
+    #[cfg(test)]
+    if let Some(started) = &limits.body_started {
+        started.notify_one();
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| CodexAuthError::RefreshTransient("read response body failed".into()))?
+    {
+        // Content-Length can be absent or untrustworthy. Bound actual bytes too,
+        // before copying a chunk into the accumulated body.
+        if chunk.len() > limits.max_body_bytes.saturating_sub(bytes.len()) {
+            return Err(body_too_large());
         }
+        bytes.extend_from_slice(&chunk);
+    }
+    if status.is_success() {
+        let tokens: RefreshResponse = serde_json::from_slice(&bytes).map_err(|_| {
+            // Do not expose untrusted body values (which can contain secrets).
+            CodexAuthError::RefreshTransient("decode response failed".into())
+        })?;
+        if tokens.access_token.as_deref().is_none_or(str::is_empty)
+            || tokens.id_token.as_deref().is_some_and(str::is_empty)
+            || tokens.refresh_token.as_deref().is_some_and(str::is_empty)
+        {
+            return Err(CodexAuthError::RefreshTransient(
+                "incomplete token response".into(),
+            ));
+        }
+        Ok(tokens)
+    } else if status == reqwest::StatusCode::UNAUTHORIZED {
+        let (reason, message) = classify_permanent(&String::from_utf8_lossy(&bytes));
+        Err(CodexAuthError::RefreshPermanent { reason, message })
+    } else {
+        // Error bodies are consumed within the same limits but never echoed.
+        Err(CodexAuthError::RefreshTransient(format!(
+            "refresh endpoint returned {status}"
+        )))
     }
 }
 
-async fn response_with_timeout(
-    future: impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
-    timeout: Duration,
-) -> Result<reqwest::Response, CodexAuthError> {
-    tokio::time::timeout(timeout, future)
-        .await
-        .map_err(|_| {
-            CodexAuthError::RefreshTransient(format!(
-                "oauth_token_refresh timed out after {}s",
-                timeout.as_secs()
-            ))
-        })?
-        .map_err(|e| CodexAuthError::RefreshTransient(format!("send: {e}")))
+fn body_too_large() -> CodexAuthError {
+    CodexAuthError::RefreshTransient("response body exceeds size limit".into())
 }
 
 fn classify_permanent(body: &str) -> (PermanentReason, String) {
@@ -99,7 +158,7 @@ fn classify_permanent(body: &str) -> (PermanentReason, String) {
         PermanentReason::Expired => "Your refresh token has expired".to_string(),
         PermanentReason::Reused => "Your refresh token was already used".to_string(),
         PermanentReason::Revoked => "Your refresh token was revoked".to_string(),
-        PermanentReason::Other => format!("Unknown 401 from refresh endpoint: {body}"),
+        PermanentReason::Other => "Unknown 401 from refresh endpoint".to_string(),
     };
     (reason, message)
 }
@@ -125,23 +184,6 @@ fn extract_error_code(body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn refresh_response_timeout_is_transient() {
-        let err = match response_with_timeout(
-            std::future::pending::<Result<reqwest::Response, reqwest::Error>>(),
-            Duration::from_millis(5),
-        )
-        .await
-        {
-            Ok(_) => panic!("expected refresh timeout"),
-            Err(err) => err,
-        };
-
-        assert!(
-            matches!(err, CodexAuthError::RefreshTransient(message) if message.contains("timed out"))
-        );
-    }
 
     #[test]
     fn classify_expired() {

@@ -17,6 +17,8 @@ mod auth_json;
 mod error;
 mod jwt;
 mod refresh;
+#[cfg(test)]
+mod refresh_tests;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,6 +42,9 @@ pub struct CodexAuthProvider {
     auth_path: PathBuf,
     refresh_endpoint: String,
     http: reqwest::Client,
+    refresh_limits: refresh::RefreshLimits,
+    #[cfg(test)]
+    before_guarded_reload: Option<Arc<tokio::sync::Barrier>>,
     state: Arc<Mutex<State>>,
 }
 
@@ -76,6 +81,9 @@ impl CodexAuthProvider {
             auth_path: codex_home.join("auth.json"),
             refresh_endpoint: refresh::REFRESH_URL.to_string(),
             http: reqwest::Client::new(),
+            refresh_limits: refresh::RefreshLimits::default(),
+            #[cfg(test)]
+            before_guarded_reload: None,
             state: Arc::new(Mutex::new(State::default())),
         }
     }
@@ -108,6 +116,11 @@ impl CodexAuthProvider {
 
         // 3. Refresh 直前に再 load し account_id 一致を確認（guarded reload）。
         //    一致しなければ他プロセスが先に更新済 → 自分は refresh しない
+        #[cfg(test)]
+        if let Some(barrier) = &self.before_guarded_reload {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
         let pre_refresh = auth_json::load(&self.auth_path).await?;
         if !is_stale(&pre_refresh) {
             state.cached = Some(pre_refresh.clone());
@@ -124,12 +137,14 @@ impl CodexAuthProvider {
             &self.http,
             &self.refresh_endpoint,
             &pre_refresh.refresh_token,
+            &self.refresh_limits,
         )
         .await?;
 
         // 5. 書き戻し（書込前に再 load + merge は persist_refreshed 内で実施）
         let new_snap = auth_json::persist_refreshed(
             &self.auth_path,
+            &pre_refresh,
             refreshed.id_token,
             refreshed.access_token,
             refreshed.refresh_token,
@@ -210,13 +225,18 @@ mod tests {
     use wiremock::matchers::{method, path as url_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn make_jwt(payload: serde_json::Value) -> String {
+    pub(super) fn make_jwt(payload: serde_json::Value) -> String {
         let p = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&payload).unwrap());
         format!("h.{p}.s")
     }
 
-    fn write_auth(dir: &std::path::Path, exp: i64, fedramp: bool, refresh: &str) -> PathBuf {
+    pub(super) fn write_auth(
+        dir: &std::path::Path,
+        exp: i64,
+        fedramp: bool,
+        refresh: &str,
+    ) -> PathBuf {
         let id_token = make_jwt(json!({
             "https://api.openai.com/auth": {
                 "chatgpt_account_id": "acc-xyz",

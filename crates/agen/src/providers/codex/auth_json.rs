@@ -108,13 +108,21 @@ pub async fn load(path: &Path) -> Result<AuthSnapshot, CodexAuthError> {
 ///
 /// 並行する Codex CLI / 別プロセスが先に refresh していた場合の
 /// fields を保護するため、書込前に再 load して merge する。
+/// Account / refresh token must still match the request's input: unrelated
+/// fields can be merged, but another login or token rotation must not be overwritten.
 pub async fn persist_refreshed(
     path: &Path,
+    refresh_input: &AuthSnapshot,
     new_id_token: Option<String>,
     new_access_token: Option<String>,
     new_refresh_token: Option<String>,
 ) -> Result<AuthSnapshot, CodexAuthError> {
     let mut current = load(path).await?;
+    if current.account_id != refresh_input.account_id
+        || current.refresh_token != refresh_input.refresh_token
+    {
+        return Ok(current);
+    }
     let raw = &mut current.raw;
     let tokens = raw
         .get_mut("tokens")
@@ -243,10 +251,16 @@ mod tests {
               "agent_identity":{"workspace_id":"w","agent_runtime_id":"r","agent_private_key":"k","registered_at":"x"}
             }"#,
         );
-        let updated =
-            persist_refreshed(&path, None, Some("new-acc".into()), Some("new-ref".into()))
-                .await
-                .unwrap();
+        let input = load(&path).await.unwrap();
+        let updated = persist_refreshed(
+            &path,
+            &input,
+            None,
+            Some("new-acc".into()),
+            Some("new-ref".into()),
+        )
+        .await
+        .unwrap();
         assert_eq!(updated.access_token, "new-acc");
         assert_eq!(updated.refresh_token, "new-ref");
         // 未知フィールド agent_identity が保たれる
@@ -266,7 +280,8 @@ mod tests {
         );
         // 既存ファイルを 644 に変えてから persist → 600 に直るか
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        persist_refreshed(&path, None, Some("a2".into()), None)
+        let input = load(&path).await.unwrap();
+        persist_refreshed(&path, &input, None, Some("a2".into()), None)
             .await
             .unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
