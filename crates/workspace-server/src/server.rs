@@ -13853,21 +13853,6 @@ async fn apply_set_ticket_assignment(
     };
     let assignment = match role {
         TicketAssignmentRole::Orchestrator => {
-            if api
-                .store
-                .get_active_ticket_role_assignment(
-                    &workspace_id,
-                    &ticket.id,
-                    TicketAssignmentRole::Worker,
-                )?
-                .is_some()
-            {
-                return Err(Error::TicketAssignmentConflict(
-                    "Orchestrator assignment conflicts with an active Worker assignment"
-                        .to_string(),
-                )
-                .into());
-            }
             if let Some(source) = source.as_ref() {
                 api.store.set_current_ticket_orchestrator_assignment(
                     &record,
@@ -48321,8 +48306,10 @@ mod tests {
         input.workflow_state = Some(TicketState::Open);
         set_test_ticket_target(&mut input, "test-repository", "develop");
         let ticket = browser_ticket_backend(&api).unwrap().create(input).unwrap();
-        let old_coder = seed_live_test_coder_assignment(&api, &ticket.id, "old-coder").await;
+        // The retained delegation precedes actual Coder work. A new Assign
+        // during that work would be a different operation and must be refused.
         assign_test_orchestrator(&api, &ticket.id);
+        let old_coder = seed_live_test_coder_assignment(&api, &ticket.id, "old-coder").await;
         let old_orchestrator_id = format!("orchestrator-{}", ticket.id);
         let Json(started) = scoped_start_workspace_orchestrator(
             State(api.clone()),
@@ -49147,6 +49134,9 @@ mod tests {
             assigned_by: "test-user".to_string(),
             assigned_at: TEST_CREATED_AT.to_string(),
         };
+        // Seed an existing delegation before starting the Worker; both may
+        // remain current, but a fresh delegation during Worker work is guarded.
+        assign_test_orchestrator(&api, &ticket_id);
         api.store
             .set_current_ticket_worker_assignment(
                 &assignment,
@@ -49156,7 +49146,6 @@ mod tests {
                 false,
             )
             .unwrap();
-        assign_test_orchestrator(&api, &ticket_id);
         let path = || ScopedRecordPath {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             id: ticket_id.clone(),

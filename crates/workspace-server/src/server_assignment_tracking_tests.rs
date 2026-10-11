@@ -1,5 +1,162 @@
 use super::*;
 
+#[tokio::test]
+async fn runtime_and_account_assign_retries_return_saved_result_after_clear_and_coder_start() {
+    for runtime_source in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let (api, _, identity, source, ticket) = tracking_fixture(directory.path()).await;
+        let token = seed_test_api_token(api.store.as_ref(), "assign-replay-owner");
+        let request = |method: &str, path: &str, body: Vec<u8>| {
+            if runtime_source {
+                runtime_source_request(&identity, Some(&source.worker_id), method, path, body)
+            } else {
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(body))
+                    .unwrap()
+            }
+        };
+        let app = build_router(api.clone());
+        let path = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator");
+        let input = |key: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "operation_id": key,
+                "principal": {"kind":"workspace_agent","agent_key":"workspace-orchestrator"}
+            }))
+            .unwrap()
+        };
+        let saved = tracking_response(
+            app.clone(),
+            request("PUT", &path, input("saved-assign")),
+            StatusCode::OK,
+        )
+        .await;
+        let assignment = saved["assignment"]["assignment_id"].as_str().unwrap();
+        tracking_response(
+            app.clone(),
+            request(
+                "DELETE",
+                &assignment_clear_path(&ticket, assignment, "clear-before-coder"),
+                Vec::new(),
+            ),
+            StatusCode::OK,
+        )
+        .await;
+        let Json(candidate) = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: source.runtime_id.clone(),
+                display_name: "Coder candidate".into(),
+                singleton_key: None,
+                profile: Some("builtin:coder".into()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachments: Vec::new(),
+                feature_connections: Default::default(),
+                control_operation_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let worker_path = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/worker");
+        let worker_input = serde_json::to_vec(&serde_json::json!({
+            "operation_id":"start-coder", "principal":{"kind":"worker", "runtime_id":candidate.runtime_id, "worker_id":candidate.worker_id}
+        })).unwrap();
+        tracking_response(
+            app.clone(),
+            request("PUT", &worker_path, worker_input),
+            StatusCode::OK,
+        )
+        .await;
+        let active = api
+            .store
+            .get_active_ticket_role_assignment(
+                TEST_WORKSPACE_ID,
+                &ticket,
+                TicketAssignmentRole::Worker,
+            )
+            .unwrap()
+            .unwrap();
+        let retained = api
+            .store
+            .get_ticket_assignment_tracking(TEST_WORKSPACE_ID, &ticket, assignment)
+            .unwrap()
+            .unwrap();
+        assert!(!retained.current);
+        let counts = || {
+            let conn = rusqlite::Connection::open(&api.config.database_path).unwrap();
+            [
+                "ticket_worker_assignments",
+                "ticket_current_worker_assignments",
+                "ticket_worker_assignment_events",
+                "ticket_assignment_operations",
+                "typed_ticket_assignment_tracking_history",
+                "typed_ticket_assignment_tracking_operations",
+                "ticket_assignment_work_releases",
+            ]
+            .map(|table| {
+                conn.query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE workspace_id=?1"),
+                    [TEST_WORKSPACE_ID],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+            })
+        };
+        let before = counts();
+        assert_eq!(
+            tracking_response(
+                app.clone(),
+                request("PUT", &path, input("saved-assign")),
+                StatusCode::OK
+            )
+            .await,
+            saved
+        );
+        // Only a genuinely new operation is refused; a receipt never restores
+        // the cleared current pointer, initializes tracking, or starts work.
+        tracking_response(
+            app,
+            request("PUT", &path, input("new-assign")),
+            StatusCode::CONFLICT,
+        )
+        .await;
+        assert_eq!(counts(), before);
+        assert_eq!(
+            api.store
+                .get_ticket_assignment_tracking(TEST_WORKSPACE_ID, &ticket, assignment)
+                .unwrap()
+                .unwrap(),
+            retained
+        );
+        assert_eq!(
+            api.store
+                .get_active_ticket_role_assignment(
+                    TEST_WORKSPACE_ID,
+                    &ticket,
+                    TicketAssignmentRole::Worker
+                )
+                .unwrap()
+                .unwrap(),
+            active
+        );
+        assert!(
+            api.store
+                .get_current_ticket_role_assignment(
+                    TEST_WORKSPACE_ID,
+                    &ticket,
+                    TicketAssignmentRole::Orchestrator
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
 fn tracking_path(ticket: &str) -> String {
     format!("/workspaces/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignment-tracking")
 }

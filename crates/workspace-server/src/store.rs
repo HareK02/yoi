@@ -11456,6 +11456,22 @@ impl SqliteWorkspaceStore {
                 return Ok(persisted);
             }
 
+            // This is a constraint on a new delegation, not on a saved result.
+            // Authenticate the source and resolve its full-input receipt first;
+            // work that began after the original Assign must not block replay.
+            if record.role == TicketAssignmentRole::Orchestrator {
+                let active_worker: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments
+                     WHERE workspace_id=?1 AND ticket_id=?2 AND role='worker')",
+                    params![record.workspace_id, record.ticket_id],
+                    |row| row.get(0),
+                )?;
+                if active_worker {
+                    return Err(Error::TicketAssignmentConflict(
+                        "Orchestrator assignment conflicts with an active Worker assignment".into(),
+                    ));
+                }
+            }
             ensure_no_competing_ticket_claim(&tx, &record.workspace_id, &record.ticket_id,
                 record.principal.worker().as_ref(), operation_id)?;
             let current_sql = ticket_role_assignment_select_sql(
