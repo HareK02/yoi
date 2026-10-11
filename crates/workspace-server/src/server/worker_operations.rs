@@ -470,10 +470,11 @@ impl WorkspaceWorker {
         let connection =
             connect_workspace_worker_protocol(&self.api, &self.identity, source).await?;
         Ok(WorkspaceWorkerConnection {
-            sender: WorkspaceWorkerMethodSender {
-                worker: self.clone(),
-                methods: connection.methods,
-            },
+            sender: WorkspaceWorkerMethodSender::new(
+                self.clone(),
+                connection.methods,
+                connection.termination,
+            ),
             events: connection.events,
         })
     }
@@ -485,12 +486,27 @@ impl WorkspaceWorker {
 pub(crate) struct WorkspaceWorkerMethodSender {
     worker: WorkspaceWorker,
     methods: tokio::sync::mpsc::Sender<protocol::Method>,
+    pub(super) termination: WorkerProtocolTermination,
 }
 pub(crate) struct WorkspaceWorkerConnection {
     pub(crate) sender: WorkspaceWorkerMethodSender,
     pub(crate) events: tokio::sync::mpsc::Receiver<protocol::Event>,
 }
 impl WorkspaceWorkerMethodSender {
+    pub(crate) fn end_status(&self) -> tokio::sync::watch::Receiver<Option<WorkerProtocolEnd>> {
+        self.termination.subscribe()
+    }
+    pub(super) fn new(
+        worker: WorkspaceWorker,
+        methods: tokio::sync::mpsc::Sender<protocol::Method>,
+        termination: WorkerProtocolTermination,
+    ) -> Self {
+        Self {
+            worker,
+            methods,
+            termination,
+        }
+    }
     pub(crate) async fn send(
         &self,
         context: &WorkerOperationContext,
@@ -604,15 +620,25 @@ impl WorkspaceWorkerMethodSender {
         };
         let method = authorize_browser_worker_method(method, source)
             .map_err(|message| Error::InvalidInput(message.into()))?;
-        self.methods.send(method).await.map_err(|_| {
+        // Session exclusion fences attach/stop only through admission, never delivery.
+        let result = if self.termination.reason().is_some() {
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(method))
+        } else {
+            self.methods.try_send(method)
+        };
+        result.map_err(|error| {
+            let (code, message) = match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    self.termination.terminate(WorkerProtocolEnd::MethodOverflow);
+                    ("worker_protocol_overflow", "Worker method queue overflow; this method was not admitted. Earlier pending methods may have unknown delivery; reconnect with a fresh snapshot, no automatic retry")
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) =>
+                    ("worker_protocol_closed", "Worker connection closed; pending delivery may be unknown; no implicit Restore or retry was performed"),
+            };
             Error::RuntimeOperationFailed {
                 runtime_id: self.worker.identity.runtime_id.clone(),
-                code: "worker_protocol_closed".into(),
-                message:
-                    "Worker execution connection closed; no implicit Restore or retry was performed"
-                        .into(),
-            }
-            .into()
+                code: code.into(), message: message.into(),
+            }.into()
         })
     }
 }

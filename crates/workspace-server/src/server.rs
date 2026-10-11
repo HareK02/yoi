@@ -2,9 +2,12 @@ use subjektiv::api::*;
 mod backend_job_profile;
 mod subjektiv_job;
 mod worker_operations;
+mod worker_protocol;
 pub(crate) use worker_operations::{
     WorkerOperationContext, WorkspaceWorker, WorkspaceWorkerMethodSender,
 };
+pub(crate) use worker_protocol::WorkerProtocolEnd;
+use worker_protocol::*;
 
 #[path = "server_drive.rs"]
 mod drive;
@@ -29083,49 +29086,17 @@ async fn worker_protocol_ws(
         match worker.connect_protocol(&context).await {
             Ok(connection) => workspace_worker_protocol_session(connection, socket, context).await,
             Err(error) => {
-                let _ = send_protocol_event(&mut socket, &protocol_error_event(error.to_string()))
-                    .await;
-                let _ = socket.send(WsMessage::Close(None)).await;
+                let _ = tokio::time::timeout(WORKER_PROTOCOL_TRANSPORT_TIMEOUT, async {
+                    let _ =
+                        send_protocol_event(&mut socket, &protocol_error_event(error.to_string()))
+                            .await;
+                    let _ = socket.send(WsMessage::Close(None)).await;
+                })
+                .await;
             }
         }
     })
     .into_response()
-}
-
-async fn workspace_worker_protocol_session(
-    mut connection: worker_operations::WorkspaceWorkerConnection,
-    mut socket: WebSocket,
-    context: WorkerOperationContext,
-) {
-    loop {
-        tokio::select! {
-            inbound = socket.next() => match inbound {
-                Some(Ok(WsMessage::Text(text))) => {
-                    let result = match decode_method(&text) {
-                        Ok(method) => connection.sender.send(&context, method).await.map_err(|error| error.to_string()),
-                        Err(error) => Err(error.to_string()),
-                    };
-                    if let Err(error) = result {
-                        if !send_protocol_event(&mut socket, &protocol_error_event(error)).await { break; }
-                    }
-                }
-                Some(Ok(WsMessage::Ping(value))) => { if socket.send(WsMessage::Pong(value)).await.is_err() { break; } }
-                Some(Ok(WsMessage::Pong(_))) => {}
-                _ => break,
-            },
-            event = connection.events.recv() => {
-                let Some(event) = event else { break; };
-                let shutdown = matches!(event, protocol::Event::Shutdown);
-                if !send_protocol_event(&mut socket, &event).await || shutdown { break; }
-            }
-        }
-    }
-    let _ = socket.send(WsMessage::Close(None)).await;
-}
-
-pub(crate) struct WorkspaceWorkerProtocolConnection {
-    pub(crate) methods: tokio::sync::mpsc::Sender<protocol::Method>,
-    pub(crate) events: tokio::sync::mpsc::Receiver<protocol::Event>,
 }
 
 pub(crate) async fn connect_workspace_worker_protocol(
@@ -29199,39 +29170,21 @@ async fn connect_remote_worker_protocol(
     }
     insert_authenticated_input_source_header(request.headers_mut(), input_source)?;
     let (socket, _) =
-        connect_async(request)
+        tokio::time::timeout(WORKER_PROTOCOL_TRANSPORT_TIMEOUT, connect_async(request))
             .await
+            .map_err(|_| Error::RuntimeOperationFailed {
+                runtime_id: config.worker.runtime_id.clone(),
+                code: "worker_protocol_connect_timeout".into(),
+                message: "Worker protocol connection handshake timed out; no method was admitted"
+                    .into(),
+            })?
             .map_err(|error| Error::RuntimeOperationFailed {
                 runtime_id: config.worker.runtime_id.clone(),
-                code: "worker_protocol_connect_failed".to_string(),
+                code: "worker_protocol_connect_failed".into(),
                 message: error.to_string(),
             })?;
-    let (mut sink, mut stream) = socket.split();
-    let (methods, mut method_receiver) = tokio::sync::mpsc::channel(256);
-    let (event_sender, events) = tokio::sync::mpsc::channel(512);
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                method = method_receiver.recv() => {
-                    let Some(method) = method else { break };
-                    let Ok(text) = protocol::stream::encode_method(&method) else { break };
-                    if sink.send(TungsteniteMessage::Text(text.into())).await.is_err() { break; }
-                }
-                message = stream.next() => match message {
-                    Some(Ok(TungsteniteMessage::Text(text))) => {
-                        let Ok(event) = protocol::stream::decode_event(text.as_ref()) else { break; };
-                        if event_sender.send(event).await.is_err() { break; }
-                    }
-                    Some(Ok(TungsteniteMessage::Ping(value))) => {
-                        if sink.send(TungsteniteMessage::Pong(value)).await.is_err() { break; }
-                    }
-                    Some(Ok(TungsteniteMessage::Pong(_))) => {}
-                    _ => break,
-                }
-            }
-        }
-    });
-    Ok(WorkspaceWorkerProtocolConnection { methods, events })
+    let (sink, stream) = socket.split();
+    Ok(remote_worker_protocol_bridge(sink, stream))
 }
 
 async fn connect_embedded_worker_protocol(
@@ -29249,47 +29202,48 @@ async fn connect_embedded_worker_protocol(
             code: "embedded_worker_protocol_connect_failed".to_string(),
             message: error.to_string(),
         })?;
-    let (methods, mut method_receiver) = tokio::sync::mpsc::channel(256);
-    let (event_sender, events) = tokio::sync::mpsc::channel(512);
-    tokio::spawn(async move {
-        if event_sender.send(transport.snapshot.clone()).await.is_err() {
-            return;
-        }
-        loop {
-            tokio::select! {
-                _ = event_sender.closed() => break,
-                method = method_receiver.recv() => {
-                    let Some(method) = method else { break };
-                    let shutdown = matches!(&method, protocol::Method::Shutdown { .. });
-                    match source.runtime.send_connected_protocol_method_scoped(
-                        &scope, &source.worker_ref, &transport, method,
-                    ) {
-                        Ok(direct_events) => {
-                            for event in direct_events {
-                                let terminal = matches!(event, protocol::Event::Shutdown);
-                                if event_sender.send(event).await.is_err() || terminal { return; }
+    Ok(spawn_worker_protocol_pump(
+        move |mut methods, events| async move {
+            if let Err(reason) = enqueue_worker_protocol_event(&events, transport.snapshot.clone())
+            {
+                return reason;
+            }
+            loop {
+                tokio::select! {
+                    method = methods.recv() => {
+                        let Some(method) = method else { return WorkerProtocolEnd::Disconnected; };
+                        let shutdown = matches!(&method, protocol::Method::Shutdown { .. });
+                        match source.runtime.send_connected_protocol_method_scoped(
+                            &scope, &source.worker_ref, &transport, method,
+                        ) {
+                            Ok(direct_events) => {
+                                for event in direct_events {
+                                    let terminal = matches!(event, protocol::Event::Shutdown);
+                                    if let Err(reason) = enqueue_worker_protocol_event(&events, event) { return reason; }
+                                    if terminal { return WorkerProtocolEnd::Disconnected; }
+                                }
+                            }
+                            Err(error) => {
+                                let terminal = embedded_protocol_dispatch_is_terminal(&error, &transport);
+                                if let Err(reason) = enqueue_worker_protocol_event(&events, protocol_error_event(error.to_string())) { return reason; }
+                                if terminal { return WorkerProtocolEnd::Disconnected; }
                             }
                         }
-                        Err(error) => {
-                            let terminal = embedded_protocol_dispatch_is_terminal(&error, &transport);
-                            if event_sender.send(protocol_error_event(error.to_string())).await.is_err() || terminal { return; }
+                        if shutdown { return WorkerProtocolEnd::Disconnected; }
+                    }
+                    event = transport.events.recv() => match event {
+                        Some(event) => {
+                            let terminal = matches!(event, protocol::Event::Shutdown);
+                            if let Err(reason) = enqueue_worker_protocol_event(&events, event) { return reason; }
+                            if terminal { return WorkerProtocolEnd::Disconnected; }
                         }
+                        // Stop, disconnect and upstream lag never cause an implicit reattach.
+                        None => return WorkerProtocolEnd::Disconnected,
                     }
-                    if shutdown { break; }
-                }
-                event = transport.events.recv() => match event {
-                    Some(event) => {
-                        let terminal = matches!(event, protocol::Event::Shutdown);
-                        if event_sender.send(event).await.is_err() || terminal { break; }
-                    }
-                    // The execution relay closes on Stop, disconnect or lag.
-                    // Uncertain streams are terminal, never grounds to reattach.
-                    None => break,
                 }
             }
-        }
-    });
-    Ok(WorkspaceWorkerProtocolConnection { methods, events })
+        },
+    ))
 }
 
 fn embedded_protocol_dispatch_is_terminal(
@@ -32502,6 +32456,7 @@ mod tests {
     mod drive_tests;
     mod drive_web_roundtrip_tests;
     mod external_checkout_tests;
+    mod protocol_backpressure_tests;
     mod subject_spawn_tests;
     mod subjektiv_jobs_tests;
     mod ticket_evidence_tests;
@@ -32511,7 +32466,9 @@ mod tests {
     mod workdir_delegation_tests;
     mod worker_drive_tests;
     mod worker_operations_tests;
+    mod worker_protocol_tests;
     mod workspace_admission_tests;
+    mod workspace_protocol_backpressure_tests;
     include!("server_workspace_config_tests.rs");
     use super::*;
     use axum::body::{Body, to_bytes};

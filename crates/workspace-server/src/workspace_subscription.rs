@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use axum::extract::ws::{Message as WsMessage, WebSocket};
+use axum::extract::ws::Message as WsMessage;
 use futures::{SinkExt, StreamExt};
 use protocol::subscription::{
     EventSubscriptionSelector, SubscriptionEvent, SubscriptionEventPayload, SubscriptionFrame,
@@ -12,27 +12,43 @@ use worker_runtime::identity::RuntimeWorkerRef;
 
 use crate::runtime_subscription::RuntimeSubscriptionBroker;
 use crate::server::{
-    WorkerOperationContext, WorkspaceApi, WorkspaceWorker, WorkspaceWorkerMethodSender,
+    WorkerOperationContext, WorkerProtocolEnd, WorkspaceApi, WorkspaceWorker,
+    WorkspaceWorkerMethodSender,
 };
 
 const OUTBOUND_CAPACITY: usize = 256;
 const WORKER_PROTOCOL_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+// Every spawned writer/subscription is connection-owned, including caller cancellation.
+struct SubscriptionTask(tokio::task::JoinHandle<()>);
+impl Drop for SubscriptionTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 struct ActiveSubscription {
-    task: tokio::task::JoinHandle<()>,
+    task: SubscriptionTask,
     methods: Option<WorkspaceWorkerMethodSender>,
 }
 
-pub(crate) async fn serve_workspace_subscription(
+pub(crate) async fn serve_workspace_subscription<S>(
     api: WorkspaceApi,
-    socket: WebSocket,
+    socket: S,
     context: WorkerOperationContext,
-) {
+) where
+    S: futures::Stream<Item = Result<WsMessage, axum::Error>>
+        + futures::Sink<WsMessage>
+        + Unpin
+        + Send
+        + 'static,
+    S::Error: Send,
+{
     let broker = api.runtime_subscription_broker().clone();
     let (mut socket_sender, mut socket_receiver) = socket.split();
     let (control_outbound, mut control_receiver) = mpsc::channel::<WsMessage>(OUTBOUND_CAPACITY);
     let (protocol_outbound, mut protocol_receiver) = mpsc::channel::<WsMessage>(OUTBOUND_CAPACITY);
-    let writer = tokio::spawn(async move {
+    let (writer_done, finished) = tokio::sync::oneshot::channel();
+    let mut writer = SubscriptionTask(tokio::spawn(async move {
         loop {
             let message = tokio::select! {
                 biased;
@@ -40,160 +56,179 @@ pub(crate) async fn serve_workspace_subscription(
                 message = protocol_receiver.recv() => message,
             };
             let Some(message) = message else { break };
-            if socket_sender.send(message).await.is_err() {
+            if !matches!(
+                tokio::time::timeout(
+                    WORKER_PROTOCOL_SNAPSHOT_TIMEOUT,
+                    socket_sender.send(message)
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
                 break;
             }
         }
-    });
+        let _ = writer_done.send(());
+    }));
     let mut next_subscription_id = 1_u64;
     let mut subscriptions = HashMap::<SubscriptionId, ActiveSubscription>::new();
 
-    while let Some(message) = socket_receiver.next().await {
-        let Ok(message) = message else { break };
-        match message {
-            WsMessage::Text(text) => {
-                let Ok(frame) = serde_json::from_str::<SubscriptionFrame>(text.as_str()) else {
-                    break;
-                };
-                if frame.validate().is_err() {
-                    break;
-                }
-                subscriptions.retain(|_, subscription| !subscription.task.is_finished());
-                match frame.payload {
-                    SubscriptionFramePayload::Request(SubscriptionRequest::SubscribeEvents {
-                        request_id,
-                        selector,
-                    }) => {
-                        let subscription_id = SubscriptionId::new(format!(
-                            "workspace-subscription-{next_subscription_id}"
-                        ))
-                        .expect("generated Workspace subscription id is valid");
-                        next_subscription_id = next_subscription_id.saturating_add(1);
-                        match selector {
-                            EventSubscriptionSelector::WorkspaceWorkers => {
-                                let task = tokio::spawn(run_workspace_workers(
-                                    api.clone(),
-                                    broker.clone(),
-                                    request_id,
-                                    subscription_id.clone(),
-                                    control_outbound.clone(),
-                                ));
-                                subscriptions.insert(
-                                    subscription_id,
-                                    ActiveSubscription {
-                                        task,
-                                        methods: None,
-                                    },
-                                );
-                            }
-                            EventSubscriptionSelector::WorkerProtocol {
-                                worker_id,
-                                runtime_id: Some(runtime_id),
-                            } => {
-                                let connection = match WorkspaceWorker::resolve(
-                                    &api,
-                                    &runtime_id,
-                                    worker_id.as_str(),
-                                ) {
-                                    Ok(worker) => worker
-                                        .connect_protocol(&context)
-                                        .await
-                                        .map_err(|error| error.to_string()),
-                                    Err(error) => Err(error.to_string()),
-                                };
-                                match connection {
-                                    Ok(connection) => {
-                                        let methods = connection.sender.clone();
-                                        let task = tokio::spawn(run_worker_protocol(
-                                            request_id,
-                                            subscription_id.clone(),
-                                            runtime_id,
-                                            worker_id,
-                                            connection.events,
-                                            control_outbound.clone(),
-                                            protocol_outbound.clone(),
-                                        ));
-                                        subscriptions.insert(
-                                            subscription_id,
-                                            ActiveSubscription {
-                                                task,
-                                                methods: Some(methods),
-                                            },
-                                        );
-                                    }
-                                    Err(error) => {
-                                        let _ = send_rejected(
-                                            &control_outbound,
-                                            request_id,
-                                            SubscriptionRejectionCode::ResourceNotFound,
-                                            error.to_string(),
-                                        )
-                                        .await;
+    let receiving = async {
+        while let Some(message) = socket_receiver.next().await {
+            let Ok(message) = message else { break };
+            match message {
+                WsMessage::Text(text) => {
+                    let Ok(frame) = serde_json::from_str::<SubscriptionFrame>(text.as_str()) else {
+                        break;
+                    };
+                    if frame.validate().is_err() {
+                        break;
+                    }
+                    subscriptions.retain(|_, subscription| !subscription.task.0.is_finished());
+                    match frame.payload {
+                        SubscriptionFramePayload::Request(
+                            SubscriptionRequest::SubscribeEvents {
+                                request_id,
+                                selector,
+                            },
+                        ) => {
+                            let subscription_id = SubscriptionId::new(format!(
+                                "workspace-subscription-{next_subscription_id}"
+                            ))
+                            .expect("generated Workspace subscription id is valid");
+                            next_subscription_id = next_subscription_id.saturating_add(1);
+                            match selector {
+                                EventSubscriptionSelector::WorkspaceWorkers => {
+                                    let task = tokio::spawn(run_workspace_workers(
+                                        api.clone(),
+                                        broker.clone(),
+                                        request_id,
+                                        subscription_id.clone(),
+                                        control_outbound.clone(),
+                                    ));
+                                    subscriptions.insert(
+                                        subscription_id,
+                                        ActiveSubscription {
+                                            task: SubscriptionTask(task),
+                                            methods: None,
+                                        },
+                                    );
+                                }
+                                EventSubscriptionSelector::WorkerProtocol {
+                                    worker_id,
+                                    runtime_id: Some(runtime_id),
+                                } => {
+                                    let connection = match WorkspaceWorker::resolve(
+                                        &api,
+                                        &runtime_id,
+                                        worker_id.as_str(),
+                                    ) {
+                                        Ok(worker) => worker
+                                            .connect_protocol(&context)
+                                            .await
+                                            .map_err(|error| error.to_string()),
+                                        Err(error) => Err(error.to_string()),
+                                    };
+                                    match connection {
+                                        Ok(connection) => {
+                                            let methods = connection.sender.clone();
+                                            let task = tokio::spawn(run_worker_protocol(
+                                                request_id,
+                                                subscription_id.clone(),
+                                                runtime_id,
+                                                worker_id,
+                                                connection.events,
+                                                methods.end_status(),
+                                                control_outbound.clone(),
+                                                protocol_outbound.clone(),
+                                            ));
+                                            subscriptions.insert(
+                                                subscription_id,
+                                                ActiveSubscription {
+                                                    task: SubscriptionTask(task),
+                                                    methods: Some(methods),
+                                                },
+                                            );
+                                        }
+                                        Err(error) => {
+                                            let _ = send_rejected(
+                                                &control_outbound,
+                                                request_id,
+                                                SubscriptionRejectionCode::ResourceNotFound,
+                                                error.to_string(),
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
-                            }
-                            _ => {
-                                let _ = send_rejected(
+                                _ => {
+                                    let _ = send_rejected(
                                     &control_outbound, request_id, SubscriptionRejectionCode::UnsupportedSelector,
                                     "Workspace clients may subscribe only to workspace_workers or a runtime-scoped worker_protocol selector".to_string(),
                                 ).await;
+                                }
                             }
                         }
-                    }
-                    SubscriptionFramePayload::Request(SubscriptionRequest::UnsubscribeEvents {
-                        request_id,
-                        subscription_id,
-                    }) => {
-                        if let Some(subscription) = subscriptions.remove(&subscription_id) {
-                            subscription.task.abort();
+                        SubscriptionFramePayload::Request(
+                            SubscriptionRequest::UnsubscribeEvents {
+                                request_id,
+                                subscription_id,
+                            },
+                        ) => {
+                            if let Some(mut subscription) = subscriptions.remove(&subscription_id) {
+                                subscription.task.0.abort();
+                                let _ = (&mut subscription.task.0).await;
+                            }
+                            if send_frame(
+                                &control_outbound,
+                                SubscriptionFrame::new(SubscriptionFramePayload::Response(
+                                    SubscriptionResponse::Unsubscribed {
+                                        request_id,
+                                        subscription_id,
+                                    },
+                                )),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break;
+                            }
                         }
-                        if send_frame(
-                            &control_outbound,
-                            SubscriptionFrame::new(SubscriptionFramePayload::Response(
-                                SubscriptionResponse::Unsubscribed {
-                                    request_id,
-                                    subscription_id,
-                                },
-                            )),
-                        )
-                        .await
-                        .is_err()
-                        {
+                        SubscriptionFramePayload::WorkerProtocol(message) => {
+                            let Some(methods) = subscriptions
+                                .get(&message.subscription_id)
+                                .and_then(|value| value.methods.clone())
+                            else {
+                                break;
+                            };
+                            if methods.send(&context, message.method).await.is_err() {
+                                break;
+                            }
+                        }
+                        SubscriptionFramePayload::Response(_)
+                        | SubscriptionFramePayload::Event(_) => {
                             break;
                         }
                     }
-                    SubscriptionFramePayload::WorkerProtocol(message) => {
-                        let Some(methods) = subscriptions
-                            .get(&message.subscription_id)
-                            .and_then(|value| value.methods.clone())
-                        else {
-                            break;
-                        };
-                        if methods.send(&context, message.method).await.is_err() {
-                            break;
-                        }
-                    }
-                    SubscriptionFramePayload::Response(_) | SubscriptionFramePayload::Event(_) => {
+                }
+                WsMessage::Ping(value) => {
+                    if control_outbound.send(WsMessage::Pong(value)).await.is_err() {
                         break;
                     }
                 }
+                WsMessage::Pong(_) => {}
+                WsMessage::Close(_) | WsMessage::Binary(_) => break,
             }
-            WsMessage::Ping(value) => {
-                if control_outbound.send(WsMessage::Pong(value)).await.is_err() {
-                    break;
-                }
-            }
-            WsMessage::Pong(_) => {}
-            WsMessage::Close(_) | WsMessage::Binary(_) => break,
         }
+    };
+    // Writer termination also preempts method authorization/control queue waits.
+    tokio::select! { _ = receiving => {}, _ = finished => {} }
+    for (_, mut subscription) in subscriptions {
+        subscription.task.0.abort();
+        let _ = (&mut subscription.task.0).await;
     }
-
-    for (_, subscription) in subscriptions {
-        subscription.task.abort();
-    }
-    drop(control_outbound);
-    drop(protocol_outbound);
-    let _ = writer.await;
+    // Never wait for a congested writer to drain after disconnect or admission failure.
+    writer.0.abort();
+    let _ = (&mut writer.0).await;
 }
 
 async fn send_rejected(
@@ -222,6 +257,7 @@ async fn run_worker_protocol(
     runtime_id: String,
     worker_id: protocol::subscription::SubscriptionWorkerId,
     mut events: mpsc::Receiver<protocol::Event>,
+    end_status: tokio::sync::watch::Receiver<Option<WorkerProtocolEnd>>,
     control_outbound: mpsc::Sender<WsMessage>,
     protocol_outbound: mpsc::Sender<WsMessage>,
 ) {
@@ -313,8 +349,8 @@ async fn run_worker_protocol(
         SubscriptionFrame::new(SubscriptionFramePayload::Event(
             SubscriptionEvent::SubscriptionClosed {
                 subscription_id,
-                code: SubscriptionTerminationCode::ResourceGone,
-                message: "Worker protocol stream closed".to_string(),
+                code: if matches!(*end_status.borrow(), Some(WorkerProtocolEnd::EventOverflow | WorkerProtocolEnd::MethodOverflow)) { SubscriptionTerminationCode::Lagged } else { SubscriptionTerminationCode::ResourceGone },
+                message: "Worker protocol stream ended; pending method delivery may be unknown; resubscribe with a fresh snapshot, no automatic retry".to_string(),
             },
         )),
     )
@@ -646,6 +682,7 @@ mod tests {
             "runtime-1".to_string(),
             worker_id(),
             events,
+            tokio::sync::watch::channel(None).1,
             control_outbound,
             protocol_outbound,
         )
@@ -658,6 +695,81 @@ mod tests {
             panic!("expected subscription response");
         };
         response
+    }
+
+    #[tokio::test]
+    async fn worker_bridge_overflow_is_serialized_as_lagged_not_resource_disappearance() {
+        for (reason, expected) in [
+            (
+                WorkerProtocolEnd::EventOverflow,
+                SubscriptionTerminationCode::Lagged,
+            ),
+            (
+                WorkerProtocolEnd::MethodOverflow,
+                SubscriptionTerminationCode::Lagged,
+            ),
+            (
+                WorkerProtocolEnd::Disconnected,
+                SubscriptionTerminationCode::ResourceGone,
+            ),
+        ] {
+            let (event_sender, events) = mpsc::channel(1);
+            event_sender
+                .try_send(protocol::Event::Snapshot {
+                    session: protocol::SessionSnapshot {
+                        entries: vec![],
+                        pending_submissions: Default::default(),
+                    },
+                    greeting: protocol::Greeting {
+                        worker_name: "worker-1".into(),
+                        cwd: String::new(),
+                        provider: "fixture".into(),
+                        model: "fixture".into(),
+                        reasoning: None,
+                        scope_summary: String::new(),
+                        tools: vec![],
+                        context_window: 0,
+                        context_tokens: 0,
+                        context_usage: None,
+                    },
+                    state: protocol::WorkerStateSnapshot::initial(),
+                    in_flight: Default::default(),
+                    internal_workers: vec![],
+                })
+                .unwrap();
+            drop(event_sender);
+            let (control, mut receiver) = mpsc::channel(2);
+            let (protocol, _events) = mpsc::channel(1);
+            run_worker_protocol(
+                request_id(),
+                subscription_id(),
+                "runtime-1".into(),
+                worker_id(),
+                events,
+                tokio::sync::watch::channel(Some(reason)).1,
+                control,
+                protocol,
+            )
+            .await;
+            let WsMessage::Text(snapshot) = receiver.recv().await.unwrap() else {
+                panic!("expected snapshot response");
+            };
+            let snapshot: SubscriptionFrame = serde_json::from_str(snapshot.as_str()).unwrap();
+            assert!(matches!(
+                snapshot.payload,
+                SubscriptionFramePayload::Response(SubscriptionResponse::Subscribed { .. })
+            ));
+            let WsMessage::Text(closed) = receiver.recv().await.unwrap() else {
+                panic!("expected terminal control frame");
+            };
+            let frame: SubscriptionFrame = serde_json::from_str(closed.as_str()).unwrap();
+            frame.validate().unwrap();
+            assert!(
+                matches!(frame.payload, SubscriptionFramePayload::Event(SubscriptionEvent::SubscriptionClosed { code, message, .. })
+                if code == expected && message.contains("unknown") && message.contains("fresh snapshot")),
+                "{closed}"
+            );
+        }
     }
 
     #[tokio::test]
