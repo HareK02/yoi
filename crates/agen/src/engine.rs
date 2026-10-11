@@ -71,6 +71,40 @@ pub enum EngineError {
     ToolAttemptFence(String),
 }
 
+/// Policy completion is not permission to start work when an interruption was
+/// queued during its final poll. Cancel wins when both requests are observed.
+fn check_policy_interruption(
+    cancel_rx: &mut mpsc::Receiver<()>,
+    pause_rx: &mut mpsc::Receiver<()>,
+) -> Result<(), EngineError> {
+    if cancel_rx.try_recv().is_ok() {
+        return Err(EngineError::Cancelled);
+    }
+    if pause_rx.try_recv().is_ok() {
+        return Err(EngineError::PauseRequested);
+    }
+    Ok(())
+}
+
+/// Poll one policy invocation, never a second copy of its side effects. Dropping
+/// a pending policy stops admission, not any already-owned tool execution; the
+/// caller must drain that execution through its original attempt fence.
+async fn await_tool_policy<T>(
+    policy: impl Future<Output = Result<T, InterceptorError>>,
+    phase: InterceptorPhase,
+    cancel_rx: &mut mpsc::Receiver<()>,
+    pause_rx: &mut mpsc::Receiver<()>,
+) -> Result<T, EngineError> {
+    let result = tokio::select! {
+        biased;
+        Some(()) = cancel_rx.recv() => return Err(EngineError::Cancelled),
+        Some(()) = pause_rx.recv() => return Err(EngineError::PauseRequested),
+        result = policy => result,
+    };
+    check_policy_interruption(cancel_rx, pause_rx)?;
+    result.map_err(|error| InterceptorFailure::new(phase, error).into())
+}
+
 /// Tool registration error
 #[derive(Debug, thiserror::Error)]
 pub enum ToolRegistryError {
@@ -745,14 +779,6 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
             Ok(()) => true,
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => true,
-        }
-    }
-
-    fn try_paused(&mut self) -> bool {
-        use tokio::sync::mpsc::error::TryRecvError;
-        match self.pause_rx.try_recv() {
-            Ok(()) => true,
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => false,
         }
     }
 
@@ -1531,43 +1557,24 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 tool,
                 context,
             };
-            let action = tokio::select! {
-                result = self.interceptor.pre_tool_call(&mut info) => {
-                    result.map_err(|error| {
-                        EngineError::from(InterceptorFailure::new(
-                            InterceptorPhase::PreToolCall,
-                            error,
-                        ))
-                    })?
-                }
-                pause = self.pause_rx.recv() => {
-                    if pause.is_some() {
-                        info!(call_id = %expected_tool_use_id, "Paused while awaiting pre-tool policy");
-                    }
-                    self.append_early_tool_call(
-                        history,
-                        annotate,
-                        &tool_call,
-                        call_index,
-                        None,
-                    )?;
+            let action = await_tool_policy(
+                self.interceptor.pre_tool_call(&mut info),
+                InterceptorPhase::PreToolCall,
+                &mut self.cancel_rx,
+                &mut self.pause_rx,
+            )
+            .await;
+            let action = match action {
+                Ok(action) => action,
+                Err(error @ (EngineError::PauseRequested | EngineError::Cancelled)) => {
+                    self.append_early_tool_call(history, annotate, &tool_call, call_index, None)?;
                     batch.dispatched_any = true;
-                    return Ok(EarlyToolAdmission::Pause);
+                    return match error {
+                        EngineError::PauseRequested => Ok(EarlyToolAdmission::Pause),
+                        _ => Err(error),
+                    };
                 }
-                cancel = self.cancel_rx.recv() => {
-                    if cancel.is_some() {
-                        info!(call_id = %expected_tool_use_id, "Cancelled while awaiting pre-tool policy");
-                    }
-                    self.append_early_tool_call(
-                        history,
-                        annotate,
-                        &tool_call,
-                        call_index,
-                        None,
-                    )?;
-                    batch.dispatched_any = true;
-                    return Err(EngineError::Cancelled);
-                }
+                Err(error) => return Err(error),
             };
             if info.call.id != expected_tool_use_id {
                 return Err(InterceptorFailure::new(
@@ -1945,8 +1952,10 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
 
         // A pause observed before provider ownership starts leaves every call
         // NotStarted and therefore eligible for an explicit later retry.
-        if self.try_paused() {
-            return Ok(ToolExecutionResult::Paused);
+        match check_policy_interruption(&mut self.cancel_rx, &mut self.pause_rx) {
+            Ok(()) => {}
+            Err(EngineError::PauseRequested) => return Ok(ToolExecutionResult::Paused),
+            Err(error) => return Err(error),
         }
 
         // Map from tool call ID to (ToolCall, Meta, Tool, Context)
@@ -1985,16 +1994,18 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     context,
                 };
 
-                let pre_tool_action =
-                    self.interceptor
-                        .pre_tool_call(&mut info)
-                        .await
-                        .map_err(|error| {
-                            EngineError::from(InterceptorFailure::new(
-                                InterceptorPhase::PreToolCall,
-                                error,
-                            ))
-                        })?;
+                let pre_tool_action = match await_tool_policy(
+                    self.interceptor.pre_tool_call(&mut info),
+                    InterceptorPhase::PreToolCall,
+                    &mut self.cancel_rx,
+                    &mut self.pause_rx,
+                )
+                .await
+                {
+                    Ok(action) => action,
+                    Err(EngineError::PauseRequested) => return Ok(ToolExecutionResult::Paused),
+                    Err(error) => return Err(error),
+                };
                 if info.call.id != expected_tool_use_id {
                     return Err(InterceptorFailure::new(
                         InterceptorPhase::PreToolCall,
@@ -2059,6 +2070,14 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 let context = ToolExecutionContext::new(&tool_call.id, &batch_id, call_index);
                 approved_calls.push((tool_call, context, None));
             }
+        }
+
+        // Recheck after all policies and immediately before provider ownership.
+        // No tool task exists yet: these calls remain proven NotStarted.
+        match check_policy_interruption(&mut self.cancel_rx, &mut self.pause_rx) {
+            Ok(()) => {}
+            Err(EngineError::PauseRequested) => return Ok(ToolExecutionResult::Paused),
+            Err(error) => return Err(error),
         }
 
         // Phase 2: Execute approved tools in parallel. FuturesUnordered yields
@@ -2949,22 +2968,29 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 )),
                 0,
             );
-            let assistant_turn_action = self
-                .interceptor
-                .on_assistant_turn_end(AssistantTurnEndContext {
-                    invocation: assistant_invocation,
-                    assistant_entries: &history.entries()[assistant_start..],
-                    history: history.entries(),
-                    tool_calls: &tool_calls,
-                })
-                .await;
+            let assistant_turn_action = await_tool_policy(
+                self.interceptor
+                    .on_assistant_turn_end(AssistantTurnEndContext {
+                        invocation: assistant_invocation,
+                        assistant_entries: &history.entries()[assistant_start..],
+                        history: history.entries(),
+                        tool_calls: &tool_calls,
+                    }),
+                InterceptorPhase::AssistantTurnEnd,
+                &mut self.cancel_rx,
+                &mut self.pause_rx,
+            )
+            .await;
             let assistant_turn_action = match assistant_turn_action {
                 Ok(action) => action,
+                Err(EngineError::PauseRequested) => {
+                    if let Some(batch) = early_tools.take() {
+                        self.drain_early_tool_batch(history, annotate, batch, false, true)
+                            .await?;
+                    }
+                    return Ok(EngineResult::Paused);
+                }
                 Err(error) => {
-                    let error = EngineError::from(InterceptorFailure::new(
-                        InterceptorPhase::AssistantTurnEnd,
-                        error,
-                    ));
                     if let Some(batch) = early_tools.take()
                         && let Err(cleanup_error) = self
                             .drain_early_tool_batch(history, annotate, batch, true, false)
