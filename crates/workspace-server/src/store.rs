@@ -2341,12 +2341,16 @@ impl SqliteWorkspaceStore {
         f(&mut conn)
     }
 
-    pub(crate) fn with_transaction<T>(
+    pub(crate) fn with_immediate_transaction<T>(
         &self,
         f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
         self.with_conn_mut(|conn| {
-            let tx = conn.transaction()?;
+            // These callers read authority/journal state before mutating it.
+            // Acquire write ownership before the first read: a DEFERRED read
+            // upgrade against another connection's writer can return BUSY
+            // without invoking the busy handler. Never retry the domain mutation.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let value = f(&tx)?;
             tx.commit()?;
             Ok(value)
@@ -2407,7 +2411,7 @@ impl SqliteWorkspaceStore {
         observed_token: Option<&str>,
         explicit_request_id: Option<&str>,
     ) -> Result<server_api::WorkerRestoreRequest> {
-        self.with_transaction(|tx| {
+        self.with_immediate_transaction(|tx| {
             let existing: Option<(String, String)> = if let Some(id) = explicit_request_id {
                 tx.query_row("SELECT request_id, expected_token FROM worker_restore_intents WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND request_id=?4",
                     params![workspace_id, worker.runtime_id, worker.worker_id, id], |row| Ok((row.get(0)?, row.get(1)?))).optional()?

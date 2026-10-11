@@ -236,7 +236,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 "Workspace deletion request exceeds bounded field limits".to_string(),
             ));
         }
-        self.with_transaction(|tx| {
+        self.with_immediate_transaction(|tx| {
             if let Some(existing) = read_operation(tx, &request.operation_id)? {
                 if existing.actor_account_id != actor_account_id {
                     return Err(Error::WorkspacePermissionDenied(
@@ -369,7 +369,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
         child_operation_id: &str,
     ) -> Result<WorkspaceDeletionOperationResponse> {
         validate_operation_id(child_operation_id)?;
-        self.with_transaction(|tx| {
+        self.with_immediate_transaction(|tx| {
             let operation = read_operation(tx, operation_id)?
                 .ok_or_else(|| Error::InvalidInput("Workspace deletion operation".to_string()))?
                 .response;
@@ -411,7 +411,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
         failure_category: Option<&str>,
     ) -> Result<WorkspaceDeletionOperationResponse> {
         validate_operation_projection(child_operation_ids, blockers)?;
-        self.with_transaction(|tx| {
+        self.with_immediate_transaction(|tx| {
             let current = read_operation(tx, operation_id)?
                 .ok_or_else(|| Error::InvalidInput("Workspace deletion operation".to_string()))?
                 .response;
@@ -462,7 +462,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
         &self,
         operation_id: &str,
     ) -> Result<WorkspaceDeletionOperationResponse> {
-        self.with_transaction(|tx| {
+        self.with_immediate_transaction(|tx| {
             tx.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
             let operation = read_operation(tx, operation_id)?
                 .ok_or_else(|| Error::InvalidInput("Workspace deletion operation".to_string()))?;
@@ -1019,7 +1019,7 @@ mod tests {
                 // Seed domain handling evidence under a transaction. This fixture
                 // exercises owner purge, not singleton authentication or delivery.
                 store
-                    .with_transaction(|tx| {
+                    .with_immediate_transaction(|tx| {
                         ticket::sqlite_update_ticket_assignment_tracking_in_transaction(
                             tx,
                             workspace,

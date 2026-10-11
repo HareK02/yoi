@@ -226,13 +226,41 @@ struct BusyGate {
 
 /// rusqlite's fn-pointer busy_handler cannot capture a fixture. SQLite's
 /// userdata API can, without process globals or changing production hooks.
+enum BusyDatabase {
+    Feature(crate::FeatureDatabase),
+    Store(Arc<SqliteWorkspaceStore>),
+}
+impl BusyDatabase {
+    fn access(&self, access: impl FnOnce(&Connection)) {
+        match self {
+            Self::Feature(database) => database
+                .with_connection(|conn| {
+                    access(conn);
+                    Ok(())
+                })
+                .unwrap(),
+            Self::Store(store) => store
+                .with_conn(|conn| {
+                    access(conn);
+                    Ok(())
+                })
+                .unwrap(),
+        }
+    }
+}
 struct BusyObservation {
-    database: crate::FeatureDatabase,
+    database: BusyDatabase,
     gate: Box<BusyGate>,
     resume: Option<mpsc::Sender<()>>,
 }
 impl BusyObservation {
     fn install(database: crate::FeatureDatabase) -> (Self, oneshot::Receiver<()>) {
+        Self::install_on(BusyDatabase::Feature(database))
+    }
+    fn install_store(store: Arc<SqliteWorkspaceStore>) -> (Self, oneshot::Receiver<()>) {
+        Self::install_on(BusyDatabase::Store(store))
+    }
+    fn install_on(database: BusyDatabase) -> (Self, oneshot::Receiver<()>) {
         unsafe extern "C" fn busy(context: *mut c_void, _: i32) -> i32 {
             // SAFETY: owned Box remains registered until Drop unregisters it,
             // serialized by the managed connection mutex.
@@ -249,20 +277,17 @@ impl BusyObservation {
             entered: Some(entered),
             resume: permit,
         });
-        database
-            .with_connection(|conn| {
-                // SAFETY: handle belongs to this connection; the Box is stable.
-                let code = unsafe {
-                    ffi::sqlite3_busy_handler(
-                        conn.handle(),
-                        Some(busy),
-                        (&mut *gate as *mut BusyGate).cast(),
-                    )
-                };
-                assert_eq!(code, ffi::SQLITE_OK);
-                Ok(())
-            })
-            .unwrap();
+        database.access(|conn| {
+            // SAFETY: handle belongs to this connection; the Box is stable.
+            let code = unsafe {
+                ffi::sqlite3_busy_handler(
+                    conn.handle(),
+                    Some(busy),
+                    (&mut *gate as *mut BusyGate).cast(),
+                )
+            };
+            assert_eq!(code, ffi::SQLITE_OK);
+        });
         (
             Self {
                 database,
@@ -281,15 +306,12 @@ impl BusyObservation {
 impl Drop for BusyObservation {
     fn drop(&mut self) {
         self.resume();
-        self.database
-            .with_connection(|conn| {
-                // SAFETY: unregister before the boxed userdata is freed.
-                unsafe {
-                    ffi::sqlite3_busy_handler(conn.handle(), None, std::ptr::null_mut());
-                }
-                Ok(())
-            })
-            .unwrap();
+        self.database.access(|conn| {
+            // SAFETY: unregister before the boxed userdata is freed.
+            unsafe {
+                ffi::sqlite3_busy_handler(conn.handle(), None, std::ptr::null_mut());
+            }
+        });
         let _ = &self.gate;
     }
 }
@@ -688,4 +710,60 @@ async fn saturated_cancelled_host_jobs_keep_their_budget_but_not_other_fixture_o
     assert_eq!(completed.load(Ordering::SeqCst), 18);
     host.run(|| Ok::<_, Error>(())).await.unwrap();
     host.drain().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restore_intent_pins_once_after_write_ownership_without_a_deferred_read_upgrade() {
+    let fixture = Fixture::new().await;
+    let store = fixture.api.config_store.clone();
+    let (mut busy, waiting) = BusyObservation::install_store(store.clone());
+    let mut lock = WriteLock::acquire(fixture.api.config.database_path.clone());
+    let worker = RuntimeWorkerRef::new("restore-runtime", "restore-worker");
+    let pin_store = store.clone();
+    let pin_worker = worker.clone();
+    let mut pinned = Box::pin(fixture.executor.run(move || {
+        pin_store.pin_internal_worker_restore_intent(
+            WORKSPACE,
+            &pin_worker,
+            "restore-domain",
+            Some("observed-before-dispatch"),
+            Some("restore-request"),
+        )
+    }));
+    tokio::select! {
+        result = &mut pinned => panic!("restore intent must wait for write ownership before reading, not fail a deferred read upgrade: {result:?}"),
+        arrived = observed(waiting) => arrived.unwrap(),
+    }
+    runtime_progress_while_locked(&lock).await;
+    assert!(futures::poll!(&mut pinned).is_pending());
+    lock.release();
+    busy.resume();
+    let request = observed(pinned).await.unwrap();
+    assert_eq!(request.request_id, "restore-request");
+    assert_eq!(
+        request.expected_observation_token,
+        "observed-before-dispatch"
+    );
+    fixture.executor.drain().await.unwrap();
+    let saved = store
+        .get_internal_worker_restore_intent(WORKSPACE, &worker, &request.request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.request_id, request.request_id);
+    assert_eq!(
+        saved.expected_observation_token,
+        request.expected_observation_token
+    );
+    let count: i64 = store
+        .with_conn(|conn| {
+            Ok(conn.query_row(
+        "SELECT count(*) FROM worker_restore_intents WHERE workspace_id=?1 AND request_id=?2",
+        rusqlite::params![WORKSPACE, request.request_id], |row| row.get(0)
+    )?)
+        })
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "one admitted intent must persist exactly once, with no operation retry"
+    );
 }
