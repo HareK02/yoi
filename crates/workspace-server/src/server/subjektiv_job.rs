@@ -65,85 +65,70 @@ pub(super) fn require_candidate_grant(
 /// candidate decision. Once Idle is confirmed, stop cancels any legacy surface
 /// background work; the new Job regenerates it and does not infer surface success.
 pub(super) async fn retire_legacy_worker(api: &WorkspaceApi, subject_id: &str) -> ApiResult<bool> {
-    let job_api = api.clone();
-    let subject_id = subject_id.to_owned();
     let key = format!("{SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX}{subject_id}");
-    let (worker, complete) = api
-        .host_executors
-        .host()?
-        .run(move || {
-            let api = &job_api;
-            let key = format!("{SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX}{subject_id}");
-            let Some(owner) = api
-                .store
-                .current_worker_singleton_owner(api.workspace_id(), &key)?
-            else {
-                return Ok((None, true));
-            };
-            let mut summary = api
-                .runtime
-                .worker(&owner.worker)
-                .map_err(|e| e.into_error())?;
-            summary.singleton_key = Some(owner.key.clone());
-            require_dedicated_subjektiv_consolidation_worker(&summary, api.workspace_id(), &key)?;
-            let stopped = summary.state.eq_ignore_ascii_case("stopped");
-            let idle = summary.state.eq_ignore_ascii_case("idle")
-                && summary
-                    .worker_state
-                    .as_ref()
-                    .is_some_and(|s| s.state == protocol::WorkerState::Idle);
-            if !stopped && !idle {
-                return Ok((None, false));
-            }
-            if api
-                .store
-                .current_worker_singleton_owner(api.workspace_id(), &key)?
-                .as_ref()
-                .map(|o| &o.worker)
-                != Some(&owner.worker)
-            {
-                return Err(Error::RepositoryConflict(
-                    "legacy consolidation owner moved during cutover".into(),
-                )
-                .into());
-            }
-            if !summary.state.eq_ignore_ascii_case("stopped") {
-                let stopped = api
-                    .runtime
-                    .stop_worker(
-                        &owner.worker,
-                        WorkerLifecycleRequest {
-                            reason: Some(
-                                "Retire legacy subjektiv consolidator after foreground completion"
-                                    .into(),
-                            ),
-                            ticket_assignment: None,
-                        },
-                    )
-                    .map_err(|e| e.into_error())?;
-                if stopped.state != InternalWorkerOperationState::Accepted {
-                    return Ok((None, false));
-                }
-            }
-            if !api
-                .runtime
-                .worker(&owner.worker)
-                .map_err(|e| e.into_error())?
-                .state
-                .eq_ignore_ascii_case("stopped")
-            {
-                return Ok((None, false));
-            }
-            Ok::<_, ApiError>((Some(owner.worker), false))
-        })
-        .await?;
-    let Some(worker) = worker else {
-        return Ok(complete);
+    let Some(owner) = api
+        .store
+        .current_worker_singleton_owner(api.workspace_id(), &key)?
+    else {
+        return Ok(true);
     };
+    let mut summary = api
+        .runtime
+        .worker(&owner.worker)
+        .map_err(|e| e.into_error())?;
+    summary.singleton_key = Some(owner.key.clone());
+    require_dedicated_subjektiv_consolidation_worker(&summary, api.workspace_id(), &key)?;
+    let stopped = summary.state.eq_ignore_ascii_case("stopped");
+    let idle = summary.state.eq_ignore_ascii_case("idle")
+        && summary
+            .worker_state
+            .as_ref()
+            .is_some_and(|s| s.state == protocol::WorkerState::Idle);
+    if !stopped && !idle {
+        return Ok(false);
+    }
+    if api
+        .store
+        .current_worker_singleton_owner(api.workspace_id(), &key)?
+        .as_ref()
+        .map(|o| &o.worker)
+        != Some(&owner.worker)
+    {
+        return Err(Error::RepositoryConflict(
+            "legacy consolidation owner moved during cutover".into(),
+        )
+        .into());
+    }
+    if !summary.state.eq_ignore_ascii_case("stopped") {
+        let stopped = api
+            .runtime
+            .stop_worker(
+                &owner.worker,
+                WorkerLifecycleRequest {
+                    reason: Some(
+                        "Retire legacy subjektiv consolidator after foreground completion".into(),
+                    ),
+                    ticket_assignment: None,
+                },
+            )
+            .map_err(|e| e.into_error())?;
+        if stopped.state != InternalWorkerOperationState::Accepted {
+            return Ok(false);
+        }
+    }
+    if !api
+        .runtime
+        .worker(&owner.worker)
+        .map_err(|e| e.into_error())?
+        .state
+        .eq_ignore_ascii_case("stopped")
+    {
+        return Ok(false);
+    }
     let removal = WorkerRemovalService::new(api)
         .execute_target_removal(
             api.runtime.as_ref(),
-            &worker,
+            &owner.worker,
             "subjektiv consolidation Job cutover",
             None,
         )
@@ -156,17 +141,10 @@ pub(super) async fn retire_legacy_worker(api: &WorkspaceApi, subject_id: &str) -
         ))
         .into());
     }
-    let store = api.store.clone();
-    let workspace_id = api.workspace_id().to_owned();
-    api.store
-        .db_executor()
-        .run(move || {
-            store
-                .current_worker_singleton_owner(&workspace_id, &key)
-                .map(|owner| owner.is_none())
-                .map_err(ApiError::from)
-        })
-        .await
+    Ok(api
+        .store
+        .current_worker_singleton_owner(api.workspace_id(), &key)?
+        .is_none())
 }
 
 fn bounded_candidate_batch(

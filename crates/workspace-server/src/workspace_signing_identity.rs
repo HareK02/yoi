@@ -780,7 +780,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let database_path = temp.path().join("server.db");
-        let store = Arc::new(SqliteWorkspaceStore::open_for_test(&database_path).unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::open(&database_path).unwrap());
         store
             .upsert_account(&AccountRecord {
                 account_id: "account-1".to_string(),
@@ -833,7 +833,7 @@ mod tests {
 
         drop(failing_service);
         drop(store);
-        let store = Arc::new(SqliteWorkspaceStore::open_for_test(&database_path).unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::open(&database_path).unwrap());
         let service = WorkspaceSigningIdentityService::new(store.clone(), materials.clone());
         let provisioned = service
             .provision_existing("workspace-1", "account-1")
@@ -962,7 +962,7 @@ mod tests {
         );
         drop(service);
         drop(store);
-        let store = Arc::new(SqliteWorkspaceStore::open_for_test(&database_path).unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::open(&database_path).unwrap());
         let restarted = WorkspaceSigningIdentityService::new(store.clone(), materials.clone());
         let recovered = restarted
             .provision_existing("workspace-2", "account-1")

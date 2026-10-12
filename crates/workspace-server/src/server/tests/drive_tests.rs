@@ -40,7 +40,7 @@ async fn cached_drive_handle_rejects_mutation_after_deletion_reservation() {
         })
         .await
         .unwrap();
-    let api = WorkspaceApi::new_for_test(config.clone(), store.clone())
+    let api = WorkspaceApi::new(config.clone(), store.clone())
         .await
         .unwrap();
     let cached = api.drive().await.unwrap();
@@ -104,7 +104,7 @@ async fn deleting_workspace_reopens_fenced_drive_and_purges_blobs_before_feature
     // Use a separate embedded-runtime namespace for the first API: this test
     // reconstructs Drive authority in-process rather than spawning/restarting
     // product processes (runtime observers may retain their namespace).
-    let first_api = WorkspaceApi::new_for_test(config.clone(), store.clone())
+    let first_api = WorkspaceApi::new(config.clone(), store.clone())
         .await
         .unwrap();
     // Merely constructing a Workspace API must not create blob storage.
@@ -160,7 +160,7 @@ async fn deleting_workspace_reopens_fenced_drive_and_purges_blobs_before_feature
         .unwrap()
         .unwrap();
     drop(first_api);
-    let recovered = WorkspaceServerApi::new_for_test(config.clone(), store.clone());
+    let recovered = WorkspaceServerApi::new(config.clone(), store.clone());
     let api = recovered
         .api_for_workspace(&config.workspace_id)
         .await

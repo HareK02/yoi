@@ -70,22 +70,8 @@ pub enum WorkerMutationSourceProofError {
     Replay,
     #[error("source Worker is not a current member of this Workspace Runtime catalog")]
     WorkerCatalogMembership,
-    #[error("source proof authority is unavailable")]
-    Unavailable,
     #[error("source proof authority failed: {0}")]
     Authority(String),
-}
-
-impl From<crate::Error> for WorkerMutationSourceProofError {
-    fn from(error: crate::Error) -> Self {
-        match error {
-            crate::Error::DbCapacityExceeded
-            | crate::Error::DbExecutorUnavailable
-            | crate::Error::DbOperationOutcomeUnknown
-            | crate::Error::Sqlite(_) => Self::Unavailable,
-            other => Self::Authority(other.to_string()),
-        }
-    }
 }
 
 pub async fn verify_worker_remove_source(
@@ -121,7 +107,7 @@ async fn verify_worker_remove_source_with(
             let trusted = store
                 .get_workspace_runtime_binding(&config.workspace_id, &unverified.iss)
                 .await
-                .map_err(WorkerMutationSourceProofError::from)?
+                .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?
                 .filter(|record| record.revoked_at.is_none())
                 .ok_or(WorkerMutationSourceProofError::RevokedRuntimeTrust)?;
             let public_key = trusted.public_key.as_str();
@@ -165,23 +151,15 @@ async fn verify_worker_remove_source_with(
         runtime_id: claims.iss.clone(),
         worker_id: claims.worker_id.clone(),
     };
-    let workspace_id = config.workspace_id.clone();
-    let catalog_store = Arc::clone(store);
+    let member = store
+        .get_worker_registry(&config.workspace_id, &worker)
+        .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?;
+    if member.is_none() {
+        return Err(WorkerMutationSourceProofError::WorkerCatalogMembership);
+    }
     store
-        .db_executor()
-        .run(move || {
-            let member = catalog_store
-                .get_worker_registry(&workspace_id, &worker)
-                .map_err(WorkerMutationSourceProofError::from)?;
-            if member.is_none() {
-                return Err(WorkerMutationSourceProofError::WorkerCatalogMembership);
-            }
-            catalog_store
-                .require_current_worker_singleton_owner(&workspace_id, &worker)
-                .map_err(WorkerMutationSourceProofError::from)?;
-            Ok(())
-        })
-        .await?;
+        .require_current_worker_singleton_owner(&config.workspace_id, &worker)
+        .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?;
 
     let consumed_at = chrono::Utc::now().to_rfc3339();
     let consumed = store
@@ -194,7 +172,7 @@ async fn verify_worker_remove_source_with(
             &consumed_at,
         )
         .await
-        .map_err(WorkerMutationSourceProofError::from)?;
+        .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?;
     if !consumed {
         return Err(WorkerMutationSourceProofError::Replay);
     }

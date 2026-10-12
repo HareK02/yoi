@@ -800,7 +800,7 @@ async fn workspace_config_actual_remote_and_embedded_clients_use_authenticated_w
     let base = format!("http://{addr}");
     let mut config = test_server_config(root.path());
     config.backend_base_url = Some("server-test".into());
-    let store = Arc::new(SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap());
+    let store = Arc::new(SqliteWorkspaceStore::open(&config.database_path).unwrap());
     let captured = Arc::new(Mutex::new(None));
     let abort = Arc::new(Mutex::new(None));
     let factory = ConfigCaptureFactory {

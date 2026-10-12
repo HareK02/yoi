@@ -32,7 +32,7 @@ fn opening_schema_84_with_uncertain_removal_preserves_old_server_recovery() {
         drop(conn);
         for attempt in 0..3 {
             let error = match attempt {
-                0 => SqliteWorkspaceStore::open_for_test(&path).err().unwrap(),
+                0 => SqliteWorkspaceStore::open(&path).err().unwrap(),
                 1 => SqliteWorkspaceStore::migration_plan(&path).unwrap_err(),
                 _ => SqliteWorkspaceStore::migrate_database(&path).unwrap_err(),
             };
@@ -62,7 +62,7 @@ fn opening_schema_84_with_uncertain_removal_preserves_old_server_recovery() {
         )
         .unwrap();
         drop(conn);
-        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
         store.with_conn(|conn| {
             assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
             assert_eq!(conn.query_row("SELECT input_fingerprint FROM worker_removal_operations WHERE operation_id='removal'",[],|r|r.get::<_,String>(0))?,"legacy-receipt");
@@ -109,7 +109,7 @@ fn migration_dry_run_and_apply_share_the_original_repository_secret_authority() 
     assert!(!table_exists(&conn, "server_secret_objects").unwrap());
     drop(conn);
     assert_eq!(SqliteWorkspaceStore::migrate_database(&path).unwrap(), plan);
-    let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+    let store = SqliteWorkspaceStore::open(&path).unwrap();
     store.with_conn(|conn| {
         assert_eq!(current_schema_version(conn)?,LATEST_SCHEMA_VERSION);
         let (nonce, mut sealed): (Vec<u8>,Vec<u8>) = conn.query_row(

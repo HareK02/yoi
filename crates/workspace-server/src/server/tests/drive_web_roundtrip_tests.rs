@@ -39,10 +39,10 @@ impl RealDriveFixture {
         let temp = tempfile::tempdir().unwrap();
         let mut config = test_server_config(temp.path());
         config.repositories.clear();
-        let store = Arc::new(SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::open(&config.database_path).unwrap());
         let owner = seed_test_api_token(store.as_ref(), "drive-web-owner");
         let second = seed_test_api_token(store.as_ref(), "drive-web-second");
-        let server_api = WorkspaceServerApi::new_for_test(config, store.clone());
+        let server_api = WorkspaceServerApi::new(config, store.clone());
         let server = LoopbackServer::start(workspace_server_router(server_api.clone())).await;
         // Exercise T-717's real repositoryless Workspace bootstrap, not a
         // pre-existing test Workspace with its repository merely hidden in UI.

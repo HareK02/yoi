@@ -144,7 +144,7 @@ impl LaunchFixture {
     async fn new(remote: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let config = test_server_config(temp.path());
-        let store = SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
+        let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
         let backend = Arc::new(LaunchExecutionBackend::default());
         let api =
             WorkspaceApi::new_with_execution_backend(config, Arc::new(store), backend.clone())

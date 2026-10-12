@@ -24,10 +24,7 @@ pub(super) fn pre_error(error: impl Into<ApiError>) -> DriveApiError {
     })
 }
 fn mutation_error(error: Error) -> DriveApiError {
-    if matches!(
-        error,
-        Error::Sqlite(_) | Error::Store(_) | Error::DbOperationOutcomeUnknown
-    ) {
+    if matches!(error, Error::Sqlite(_) | Error::Store(_)) {
         fail(DriveApiErrorCode::OutcomeUnknown)
     } else {
         pre_error(error)
@@ -100,27 +97,23 @@ pub(super) async fn authorized_drive(
     };
     // Reject missing/read-only grants before upload body reception. This check
     // is admission only: every later operation rechecks under its own lock.
-    api.store
-        .db_executor()
-        .run(move || {
-            Ok::<_, Error>((|| {
-                drive.check_authorized(write)?;
-                Ok::<_, workspace_drive::Error>(drive)
-            })())
+    tokio::task::spawn_blocking(move || {
+        drive.check_authorized(write)?;
+        Ok::<_, workspace_drive::Error>(drive)
+    })
+    .await
+    .map_err(|_| fail(DriveApiErrorCode::StorageUnavailable))?
+    .map_err(|error| {
+        fail(match error {
+            workspace_drive::Error::Denied => DriveApiErrorCode::Denied,
+            workspace_drive::Error::Fenced | workspace_drive::Error::Conflict => {
+                DriveApiErrorCode::Conflict
+            }
+            workspace_drive::Error::NotFound => DriveApiErrorCode::NotFound,
+            workspace_drive::Error::Invalid(_) => DriveApiErrorCode::Invalid,
+            _ => DriveApiErrorCode::StorageUnavailable,
         })
-        .await
-        .map_err(|_| fail(DriveApiErrorCode::StorageUnavailable))?
-        .map_err(|error| {
-            fail(match error {
-                workspace_drive::Error::Denied => DriveApiErrorCode::Denied,
-                workspace_drive::Error::Fenced | workspace_drive::Error::Conflict => {
-                    DriveApiErrorCode::Conflict
-                }
-                workspace_drive::Error::NotFound => DriveApiErrorCode::NotFound,
-                workspace_drive::Error::Invalid(_) => DriveApiErrorCode::Invalid,
-                _ => DriveApiErrorCode::StorageUnavailable,
-            })
-        })
+    })
 }
 
 pub(super) async fn create_grant(
@@ -159,10 +152,9 @@ pub(super) async fn create_grant(
         revoked_at: None,
     };
     let store = api.store.clone();
-    api.store
-        .db_executor()
-        .run(move || store.create_workspace_drive_grant(&grant))
+    tokio::task::spawn_blocking(move || store.create_workspace_drive_grant(&grant))
         .await
+        .map_err(|_| fail(DriveApiErrorCode::OutcomeUnknown))?
         .map_err(mutation_error)
 }
 
@@ -183,12 +175,13 @@ pub(super) async fn revoke_grant(
         actor.account_id.clone(),
     );
     let store = api.store.clone();
-    api.store
-        .db_executor()
-        .run(move || store.revoke_workspace_drive_grant(&workspace, &grant, &actor))
-        .await
-        .map_err(mutation_error)?
-        .ok_or_else(|| fail(DriveApiErrorCode::NotFound))
+    tokio::task::spawn_blocking(move || {
+        store.revoke_workspace_drive_grant(&workspace, &grant, &actor)
+    })
+    .await
+    .map_err(|_| fail(DriveApiErrorCode::OutcomeUnknown))?
+    .map_err(mutation_error)?
+    .ok_or_else(|| fail(DriveApiErrorCode::NotFound))
 }
 
 fn validate_grant_id(id: &str) -> DriveResult<()> {
@@ -219,14 +212,12 @@ pub(super) async fn list_grants(
     }
     let workspace = workspace_id.to_owned();
     let store = api.store.clone();
-    let mut grants = api
-        .store
-        .db_executor()
-        .run(move || {
-            store.list_workspace_drive_grants(&workspace, limit + 1, query.after.as_deref())
-        })
-        .await
-        .map_err(pre_error)?;
+    let mut grants = tokio::task::spawn_blocking(move || {
+        store.list_workspace_drive_grants(&workspace, limit + 1, query.after.as_deref())
+    })
+    .await
+    .map_err(|_| fail(DriveApiErrorCode::StorageUnavailable))?
+    .map_err(pre_error)?;
     let more = grants.len() > limit;
     grants.truncate(limit);
     let next_after = if more {

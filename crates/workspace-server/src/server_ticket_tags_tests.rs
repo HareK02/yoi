@@ -529,7 +529,7 @@ async fn runtime_tag_mutations_reject_invalid_proofs_and_changed_binding_authori
         *tampered.body_mut() = Body::from(format!("{} ", input));
         runtime_tag_response(app.clone(), tampered, StatusCode::UNAUTHORIZED).await;
     }
-    let store = SqliteWorkspaceStore::open_for_test(&api.config.database_path).unwrap();
+    let store = SqliteWorkspaceStore::open(&api.config.database_path).unwrap();
     let original = api
         .store
         .get_workspace_runtime_binding(TEST_WORKSPACE_ID, "runtime-tags")

@@ -767,9 +767,6 @@ async fn assert_stalled_browser_output_reclaimed(explicit_termination: bool) {
         std::time::Duration::from_secs(if explicit_termination { 10 } else { 20 })
     );
     assert!(execution.protocol_methods().is_empty());
-    // SQLite jobs run on external threads; paused Tokio time cannot observe their
-    // progress and may auto-advance a reconnect timeout before SQL completes.
-    tokio::time::resume();
     assert_same_worker_reconnect_and_stop(&worker, &context).await;
 }
 
@@ -847,7 +844,7 @@ async fn embedded_disconnect_and_last_owner_drop_release_the_execution_event_sub
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stalled_remote_bridge_browser_cancel_overflow_reclaims_wire_and_allows_same_worker_progress()
  {
     let workspace = tempfile::tempdir().unwrap();

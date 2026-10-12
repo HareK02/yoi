@@ -89,30 +89,12 @@ pub fn parse_cookie(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
     })
 }
 
-pub async fn resolve_request_actor(
-    store: std::sync::Arc<dyn ControlPlaneStore>,
+pub async fn resolve_request_actor<S: ControlPlaneStore + ?Sized>(
+    store: &S,
     headers: &HeaderMap,
     cookie_name: &str,
 ) -> Result<Option<RequestActor>> {
-    let bearer = parse_bearer(headers);
-    let session = parse_cookie(headers, cookie_name);
-    if bearer.is_none() && session.is_none() {
-        return Ok(None);
-    }
-    let executor = store.db_executor();
-    executor
-        .run(move || resolve_request_actor_sync(store.as_ref(), bearer, session))
-        .await
-}
-
-// One owned synchronous stage includes token usage marking and the user read.
-// Do not call async store wrappers here: they use the same executor themselves.
-fn resolve_request_actor_sync(
-    store: &dyn ControlPlaneStore,
-    bearer: Option<String>,
-    session: Option<String>,
-) -> Result<Option<RequestActor>> {
-    if let Some(token) = bearer {
+    if let Some(token) = parse_bearer(headers) {
         let token_hash = token_hash(&token);
         if let Some(api_token) = store.resolve_api_token(&token_hash)? {
             if api_token
@@ -127,7 +109,7 @@ fn resolve_request_actor_sync(
         }
     }
 
-    if let Some(session_token) = session {
+    if let Some(session_token) = parse_cookie(headers, cookie_name) {
         if let Some(session) = store.resolve_browser_session(&token_hash(&session_token))? {
             if is_expired(&session.expires_at) {
                 return Ok(None);
@@ -191,182 +173,6 @@ pub fn auth_error(code: &str, message: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{
-        AccountRecord, ApiTokenRecord, BrowserSessionRecord, SqliteWorkspaceStore, UserRecord,
-    };
-    use std::sync::Arc;
-
-    fn seeded_store() -> Arc<SqliteWorkspaceStore> {
-        let executor = crate::db_executor::DbExecutor::new(crate::db_executor::DbExecutorLimits {
-            workers: std::num::NonZeroUsize::new(1).unwrap(),
-            queued: std::num::NonZeroUsize::new(1).unwrap(),
-        })
-        .unwrap();
-        let store = Arc::new(
-            SqliteWorkspaceStore::in_memory_for_test()
-                .unwrap()
-                .with_db_executor(executor),
-        );
-        store
-            .upsert_account(&AccountRecord {
-                account_id: "account-auth".into(),
-                kind: "user".into(),
-                handle: "auth".into(),
-                display_name: "Auth".into(),
-                created_at: "1".into(),
-                updated_at: "1".into(),
-            })
-            .unwrap();
-        store
-            .upsert_user(&UserRecord {
-                user_id: "user-auth".into(),
-                account_id: "account-auth".into(),
-                handle: "auth".into(),
-                display_name: "Auth".into(),
-                created_at: "1".into(),
-                updated_at: "1".into(),
-            })
-            .unwrap();
-        store
-            .create_browser_session(&BrowserSessionRecord {
-                session_id: "session-auth".into(),
-                token_hash: token_hash("session-secret"),
-                user_id: "user-auth".into(),
-                created_at: "1".into(),
-                expires_at: "9999-01-01T00:00:00Z".into(),
-                revoked_at: None,
-            })
-            .unwrap();
-        store
-    }
-
-    #[tokio::test]
-    async fn api_token_auth_marks_usage_and_takes_precedence_over_cookie() {
-        let store = seeded_store();
-        let hash = token_hash("api-secret");
-        store
-            .create_api_token(&ApiTokenRecord {
-                token_id: "token-auth".into(),
-                token_hash: hash.clone(),
-                user_id: "user-auth".into(),
-                label: "Auth".into(),
-                created_at: "1".into(),
-                expires_at: None,
-                revoked_at: None,
-                last_used_at: None,
-            })
-            .unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, "Bearer api-secret".parse().unwrap());
-        headers.insert(header::COOKIE, "session=session-secret".parse().unwrap());
-        let actor = resolve_request_actor(store.clone(), &headers, "session")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(actor.user_id, "user-auth");
-        assert_eq!(actor.auth_method, ActorAuthMethod::ApiToken);
-        assert!(
-            store
-                .resolve_api_token(&hash)
-                .unwrap()
-                .unwrap()
-                .last_used_at
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn expired_api_token_does_not_fall_back_to_valid_browser_session() {
-        let store = seeded_store();
-        let hash = token_hash("expired-secret");
-        store
-            .create_api_token(&ApiTokenRecord {
-                token_id: "token-auth".into(),
-                token_hash: hash.clone(),
-                user_id: "user-auth".into(),
-                label: "Auth".into(),
-                created_at: "1".into(),
-                expires_at: Some("2000-01-01T00:00:00Z".into()),
-                revoked_at: None,
-                last_used_at: None,
-            })
-            .unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            "Bearer expired-secret".parse().unwrap(),
-        );
-        headers.insert(header::COOKIE, "session=session-secret".parse().unwrap());
-        assert!(
-            resolve_request_actor(store.clone(), &headers, "session")
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .resolve_api_token(&hash)
-                .unwrap()
-                .unwrap()
-                .last_used_at
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn unknown_bearer_can_fall_back_to_valid_browser_session() {
-        let store = seeded_store();
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            "Bearer unknown-secret".parse().unwrap(),
-        );
-        headers.insert(header::COOKIE, "session=session-secret".parse().unwrap());
-        let actor = resolve_request_actor(store, &headers, "session")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(actor.user_id, "user-auth");
-        assert_eq!(actor.auth_method, ActorAuthMethod::BrowserSession);
-    }
-
-    #[tokio::test]
-    async fn saturated_actor_lookup_returns_capacity_error_not_anonymous_actor() {
-        let store = seeded_store();
-        let executor = store.db_executor();
-        let (started, started_rx) = tokio::sync::oneshot::channel();
-        let (release, release_rx) = std::sync::mpsc::channel();
-        let blocker_executor = executor.clone();
-        let blocker = tokio::spawn(async move {
-            blocker_executor
-                .run(move || -> Result<()> {
-                    let _ = started.send(());
-                    release_rx.recv().unwrap();
-                    Ok(())
-                })
-                .await
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(1), started_rx)
-            .await
-            .unwrap()
-            .unwrap();
-        let mut queued = Box::pin(executor.run(|| -> Result<()> { Ok(()) }));
-        assert!(futures::poll!(queued.as_mut()).is_pending());
-        let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, "session=session-secret".parse().unwrap());
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            resolve_request_actor(store, &headers, "session"),
-        )
-        .await;
-        release.send(()).unwrap();
-        blocker.await.unwrap().unwrap();
-        queued.await.unwrap();
-        assert!(matches!(
-            result.expect("capacity rejection must not wait for queued SQL"),
-            Err(Error::DbCapacityExceeded)
-        ));
-    }
 
     #[test]
     fn user_code_uses_the_uuid_random_tail() {

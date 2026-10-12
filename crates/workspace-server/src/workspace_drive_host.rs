@@ -58,13 +58,10 @@ pub(crate) struct WorkspaceDriveHost {
 impl WorkspaceDriveHost {
     pub(crate) async fn new(storage: &WorkspaceFeatureStorage) -> Result<Self> {
         let storage = storage.clone();
-        let registration = crate::db_executor::DbExecutor::shared()
-            .run(move || {
-                Drive::register(&storage).map_err(|error| {
-                    Error::Store(format!("failed to register Drive storage: {error}"))
-                })
-            })
-            .await?;
+        let registration = tokio::task::spawn_blocking(move || Drive::register(&storage))
+            .await
+            .map_err(|error| Error::Store(format!("Drive registration task failed: {error}")))?
+            .map_err(|error| Error::Store(format!("failed to register Drive storage: {error}")))?;
         Ok(Self {
             registration,
             purged: AtomicBool::new(false),
@@ -83,21 +80,21 @@ impl WorkspaceDriveHost {
         }
         let storage = storage.clone();
         let registration = self.registration.clone();
-        let drive = crate::db_executor::DbExecutor::shared()
-            .run(move || {
-                reject_symlink_ancestors(&root)?;
-                // Domain IMMEDIATE transactions lock the attached server authority
-                // as well as Drive metadata. Deletion reservation and cached-handle
-                // operations therefore serialize with other server DB writes.
-                Drive::open_with_workspace_authority(
-                    &storage,
-                    &registration,
-                    &root,
-                    &authority_database,
-                )
-                .map_err(Error::from)
-            })
-            .await?;
+        let drive = tokio::task::spawn_blocking(move || {
+            reject_symlink_ancestors(&root)?;
+            // Domain IMMEDIATE transactions lock the attached server authority
+            // as well as Drive metadata. Deletion reservation and cached-handle
+            // operations therefore serialize with other server DB writes.
+            Drive::open_with_workspace_authority(
+                &storage,
+                &registration,
+                &root,
+                &authority_database,
+            )
+            .map_err(Error::from)
+        })
+        .await
+        .map_err(|error| Error::Store(format!("Drive open task failed: {error}")))??;
         *cached = Some(drive.clone());
         Ok(drive)
     }
@@ -112,9 +109,9 @@ impl WorkspaceDriveHost {
             return Ok(());
         }
         let drive = self.open(storage, root, authority_database).await?;
-        crate::db_executor::DbExecutor::shared()
-            .run(move || drive.fence().map_err(Error::from))
+        tokio::task::spawn_blocking(move || drive.fence().map_err(Error::from))
             .await
+            .map_err(|error| Error::Store(format!("Drive fence task failed: {error}")))?
     }
 
     pub(crate) async fn purge(
@@ -127,20 +124,20 @@ impl WorkspaceDriveHost {
             return Ok(());
         }
         let drive = self.open(storage, root.clone(), authority_database).await?;
-        crate::db_executor::DbExecutor::shared()
-            .run(move || -> Result<()> {
-                reject_symlink_ancestors(&root)?;
-                // Domain purge persists its tombstone before removing blobs/nodes/receipts.
-                drive.purge()?;
-                // Remove the empty blob root, never the data root or another Workspace.
-                // Missing roots are successful retries; other failures retain FeatureStorage.
-                match std::fs::remove_dir_all(&root) {
-                    Ok(()) => Ok(()),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(error) => Err(error.into()),
-                }
-            })
-            .await?;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            reject_symlink_ancestors(&root)?;
+            // Domain purge persists its tombstone before removing blobs/nodes/receipts.
+            drive.purge()?;
+            // Remove the empty blob root, never the data root or another Workspace.
+            // Missing roots are successful retries; other failures retain FeatureStorage.
+            match std::fs::remove_dir_all(&root) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        })
+        .await
+        .map_err(|error| Error::Store(format!("Drive purge task failed: {error}")))??;
         // A later signing-material/finalization failure can retry after the
         // feature DB has been closed and removed by FeatureStorage.delete.
         self.purged.store(true, Ordering::Release);

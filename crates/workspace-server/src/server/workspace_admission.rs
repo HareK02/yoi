@@ -72,28 +72,6 @@ pub(super) struct RequestLease {
     callback: bool,
 }
 
-impl crate::db_executor::DbOperationLifetime for RequestLease {
-    fn retain(&self) -> Box<dyn Send> {
-        // This is continuation of an already admitted request, not fresh admission.
-        // Retain its drain responsibility before transferring work to the DB owner;
-        // dropping/aborting the HTTP waiter must not allow deletion past live SQL.
-        let mut state = self
-            .gate
-            .state
-            .lock()
-            .expect("Workspace admission poisoned");
-        if self.callback {
-            state.callbacks += 1;
-        } else {
-            state.requests += 1;
-        }
-        Box::new(RequestLease {
-            gate: self.gate.clone(),
-            callback: self.callback,
-        })
-    }
-}
-
 impl Drop for RequestLease {
     fn drop(&mut self) {
         let mut state = self

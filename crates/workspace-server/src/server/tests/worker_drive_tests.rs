@@ -151,7 +151,7 @@ impl Fixture {
         let temp = tempfile::tempdir().unwrap();
         let mut config = test_server_config(temp.path());
         config.repositories.clear();
-        let store = Arc::new(SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::open(&config.database_path).unwrap());
         let mut api = WorkspaceApi::new_with_execution_backend(
             config,
             store,

@@ -432,23 +432,16 @@ mod client {
     use super::*;
     use crate::{Workdir, WorkdirSession};
 
-    /// An owned, Send authorization future that can offload synchronous authority
-    /// work without borrowing request data or the authorization provider.
-    pub type WorkdirHttpAuthorizationFuture = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<String, WorkdirError>> + Send + 'static>,
-    >;
-
-    /// Provides a fresh bearer token asynchronously for each Runtime request.
-    /// Backend implementations can mint short-lived capability tokens without
-    /// making a Worker-bound session expire with the token used to open it.
-    /// Blocking DB/signing work must be offloaded by the implementation.
+    /// Provides a fresh bearer token for each Runtime request. Backend
+    /// implementations can mint short-lived capability tokens without making a
+    /// Worker-bound session expire with the token used to open it.
     pub trait WorkdirHttpAuthorization: std::fmt::Debug + Send + Sync {
         fn bearer_token(
             &self,
-            method: String,
-            path_and_query: String,
-            body: Vec<u8>,
-        ) -> WorkdirHttpAuthorizationFuture;
+            method: &str,
+            path_and_query: &str,
+            body: &[u8],
+        ) -> Result<String, WorkdirError>;
     }
 
     struct FixedBearerToken(Arc<str>);
@@ -462,12 +455,11 @@ mod client {
     impl WorkdirHttpAuthorization for FixedBearerToken {
         fn bearer_token(
             &self,
-            _method: String,
-            _path_and_query: String,
-            _body: Vec<u8>,
-        ) -> WorkdirHttpAuthorizationFuture {
-            let token = self.0.clone();
-            Box::pin(async move { Ok(token.to_string()) })
+            _method: &str,
+            _path_and_query: &str,
+            _body: &[u8],
+        ) -> Result<String, WorkdirError> {
+            Ok(self.0.to_string())
         }
     }
 
@@ -517,9 +509,7 @@ mod client {
             )?;
             let body = serde_json::to_vec(&request)
                 .map_err(|error| WorkdirError::Unavailable(error.to_string()))?;
-            let token = authorization
-                .bearer_token("POST".to_string(), url.path().to_string(), body.clone())
-                .await?;
+            let token = authorization.bearer_token("POST", url.path(), &body)?;
             let response = client
                 .post(url)
                 .bearer_auth(token)
@@ -570,10 +560,7 @@ mod client {
             let operation = WorkdirSessionOperationRequest { operation };
             let body = serde_json::to_vec(&operation)
                 .map_err(|error| WorkdirError::Unavailable(error.to_string()))?;
-            let token = self
-                .authorization
-                .bearer_token("POST".to_string(), url.path().to_string(), body.clone())
-                .await?;
+            let token = self.authorization.bearer_token("POST", url.path(), &body)?;
             let response = self
                 .client
                 .post(url)
@@ -877,10 +864,7 @@ mod client {
                 &self.base_url,
                 &["v1", "workdir-sessions", self.session_id.as_str()],
             )?;
-            let token = self
-                .authorization
-                .bearer_token("DELETE".to_string(), url.path().to_string(), Vec::new())
-                .await?;
+            let token = self.authorization.bearer_token("DELETE", url.path(), &[])?;
             let response = self
                 .client
                 .delete(url)
@@ -934,124 +918,11 @@ mod client {
         WorkdirError::Transport("Runtime Workdir HTTP request failed".to_string())
     }
 
-    #[cfg(test)]
-    mod authorization_tests {
-        use super::*;
-        use std::sync::Mutex;
-
-        #[derive(Debug, Default)]
-        struct RejectAuthorization {
-            requests: Arc<Mutex<Vec<(String, String, Vec<u8>)>>>,
-        }
-
-        impl WorkdirHttpAuthorization for RejectAuthorization {
-            fn bearer_token(
-                &self,
-                method: String,
-                path_and_query: String,
-                body: Vec<u8>,
-            ) -> WorkdirHttpAuthorizationFuture {
-                let requests = self.requests.clone();
-                Box::pin(async move {
-                    tokio::task::yield_now().await;
-                    let mut requests = requests.lock().unwrap();
-                    requests.push((method, path_and_query, body));
-                    Err(WorkdirError::Unavailable(format!(
-                        "authorization rejected request {}",
-                        requests.len()
-                    )))
-                })
-            }
-        }
-
-        #[tokio::test]
-        async fn open_operate_close_await_fresh_authorization_and_do_not_send_when_rejected() {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let base_url: Url = format!("http://{}", listener.local_addr().unwrap())
-                .parse()
-                .unwrap();
-            let client = Client::builder().no_proxy().build().unwrap();
-            let authorization = Arc::new(RejectAuthorization::default());
-            let workdir = Workdir::new("w");
-            let open_request = OpenWorkdirSessionRequest {
-                owner_worker_id: Some("worker".to_string()),
-            };
-            let error = RemoteWorkdirSession::open_with_authorization(
-                client.clone(),
-                base_url.clone(),
-                authorization.clone(),
-                workdir.id().clone(),
-                open_request.clone(),
-            )
-            .await
-            .unwrap_err();
-            assert!(matches!(
-                error,
-                WorkdirError::Unavailable(message) if message == "authorization rejected request 1"
-            ));
-
-            // Seed an already-open session to exercise the public operation and
-            // close boundaries independently of the rejected open request.
-            let remote = RemoteWorkdirSession {
-                client,
-                base_url,
-                authorization: authorization.clone(),
-                workdir,
-                session_id: WorkdirSessionId::new("s").unwrap(),
-                capabilities: WorkdirSessionCapabilities::EMPTY,
-                closed: AtomicBool::new(false),
-            };
-            let stat = StatRequest {
-                path: crate::WorkdirPath::new("file").unwrap(),
-            };
-            let error = remote.stat(stat.clone()).await.unwrap_err();
-            assert!(matches!(
-                error,
-                WorkdirError::Unavailable(message) if message == "authorization rejected request 2"
-            ));
-            let error = remote.close().await.unwrap_err();
-            assert!(matches!(
-                error,
-                WorkdirError::Unavailable(message) if message == "authorization rejected request 3"
-            ));
-            assert_eq!(
-                *authorization.requests.lock().unwrap(),
-                vec![
-                    (
-                        "POST".to_string(),
-                        "/v1/working-directories/w/sessions".to_string(),
-                        serde_json::to_vec(&open_request).unwrap(),
-                    ),
-                    (
-                        "POST".to_string(),
-                        "/v1/workdir-sessions/s/operations".to_string(),
-                        serde_json::to_vec(&WorkdirSessionOperationRequest {
-                            operation: WorkdirSessionOperation::Stat(stat),
-                        })
-                        .unwrap(),
-                    ),
-                    (
-                        "DELETE".to_string(),
-                        "/v1/workdir-sessions/s".to_string(),
-                        Vec::new(),
-                    ),
-                ]
-            );
-            assert_eq!(
-                listener.accept().unwrap_err().kind(),
-                std::io::ErrorKind::WouldBlock
-            );
-        }
-    }
-
     pub use self::RemoteWorkdirSession as ClientSession;
 }
 
 #[cfg(feature = "http-client")]
-pub use client::{
-    ClientSession as RemoteWorkdirSession, WorkdirHttpAuthorization, WorkdirHttpAuthorizationFuture,
-};
+pub use client::{ClientSession as RemoteWorkdirSession, WorkdirHttpAuthorization};
 
 #[cfg(test)]
 mod tests {

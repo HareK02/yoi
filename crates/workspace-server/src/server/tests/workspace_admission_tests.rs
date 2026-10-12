@@ -56,7 +56,7 @@ impl Fixture {
         api.runtime.register_or_replace(runtime);
         let now = Arc::new(AtomicI64::new(START));
         let clock = now.clone();
-        let mut server = WorkspaceServerApi::new_for_test(api.config.clone(), api.store.clone());
+        let mut server = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
         server.proof_clock = Arc::new(move || clock.load(Ordering::SeqCst));
         server
             .apis
@@ -330,38 +330,9 @@ async fn same_worker_session_stays_exclusive_but_proof_is_verified_before_waitin
     let f = Fixture::new().await;
     let mut a = f.attach("1");
     let (first, reply) = f.start_read("1", &mut a).await;
-    let request = f.operation("1");
-    let proof = request
-        .headers()
-        .get(worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER)
-        .unwrap()
-        .to_str()
-        .unwrap();
-    let jti = worker_runtime::auth::decode_runtime_request_source_claims(proof)
-        .unwrap()
-        .jti;
-    let mut second = Box::pin(f.app.clone().oneshot(request));
-    // DB auth is now genuinely asynchronous. Observe durable proof consumption,
-    // not a guessed number of polls, before advancing the injected proof clock.
-    let connection = rusqlite::Connection::open(&f.api.config.database_path).unwrap();
-    tokio::time::timeout(BOUND, async {
-        loop {
-            assert!(futures::poll!(&mut second).is_pending());
-            let consumed: bool = connection
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM worker_mutation_source_proof_jtis WHERE jti=?1)",
-                    [&jti],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            if consumed {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("second request never authenticated before resource wait");
+    let mut second = Box::pin(f.app.clone().oneshot(f.operation("1")));
+    // Poll through dispatch/auth until the handler waits on its resource lock.
+    assert!(futures::poll!(&mut second).is_pending());
     assert!(
         a.try_recv().is_err(),
         "same session read escaped resource exclusion"
@@ -371,12 +342,7 @@ async fn same_worker_session_stays_exclusive_but_proof_is_verified_before_waitin
     assert_json(first.await.unwrap(), StatusCode::OK).await;
     assert!(futures::poll!(&mut second).is_pending());
     let Some(ExternalProviderCommand::Operation { response, .. }) =
-        tokio::time::timeout(BOUND, async {
-            tokio::select! {
-                command = a.recv() => command,
-                result = second.as_mut() => panic!("second read ended before provider dispatch: {:?}", result.unwrap().status()),
-            }
-        }).await.unwrap()
+        tokio::time::timeout(BOUND, a.recv()).await.unwrap()
     else {
         panic!("expected second read")
     };
@@ -882,18 +848,12 @@ async fn create_and_restore_session_callbacks_finish_while_deletion_start_waits(
             }),
         );
         let mut deletion = Box::pin(f.app.clone().oneshot(request));
+        assert!(futures::poll!(&mut deletion).is_pending());
         let gate = f.server.admission_for_workspace(TEST_WORKSPACE_ID).await;
-        tokio::time::timeout(BOUND, async {
-            loop {
-                assert!(futures::poll!(&mut deletion).is_pending());
-                if gate.admit(false).is_none() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("deletion start did not fence admission after async authentication");
+        assert!(
+            gate.admit(false).is_none(),
+            "deletion start did not fence admission"
+        );
         let session_id = session_store::new_session_id().to_string();
         let callback_path = format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/sessions");
         let callback = f.request(

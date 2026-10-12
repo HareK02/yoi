@@ -51,13 +51,14 @@ async fn blocking<T: Send + 'static>(
     mutation: bool,
     action: impl FnOnce() -> workspace_drive::Result<T> + Send + 'static,
 ) -> DriveResult<T> {
-    crate::db_executor::DbExecutor::shared()
-        .run(move || Ok::<_, Error>(action()))
+    tokio::task::spawn_blocking(action)
         .await
-        .map_err(|error| match error {
-            Error::DbCapacityExceeded | Error::DbExecutorUnavailable => failure(503),
-            _ if mutation => DriveApiError::new(DriveApiErrorCode::OutcomeUnknown),
-            _ => failure(503),
+        .map_err(|_| {
+            if mutation {
+                DriveApiError::new(DriveApiErrorCode::OutcomeUnknown)
+            } else {
+                failure(503)
+            }
         })?
         .map_err(|error| domain_error(error, mutation))
 }

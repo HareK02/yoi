@@ -769,7 +769,7 @@ async fn delivery_real_fixture(
     DeliveryScriptedClient,
 ) {
     let config = test_server_config(root);
-    let store = Arc::new(SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap());
+    let store = Arc::new(SqliteWorkspaceStore::open(&config.database_path).unwrap());
     seed_test_registered_workspace(store.as_ref(), &config)
         .await
         .unwrap();
@@ -1007,7 +1007,7 @@ async fn assignment_real_worker_response_loss_restore_and_concurrent_scans_commi
     tokio::task::yield_now().await;
     let reopened = WorkspaceApi::new_with_execution_backend(
         config.clone(),
-        Arc::new(SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap()),
+        Arc::new(SqliteWorkspaceStore::open(&config.database_path).unwrap()),
         execution.clone(),
     )
     .await

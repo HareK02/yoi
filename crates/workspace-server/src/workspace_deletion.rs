@@ -236,7 +236,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 "Workspace deletion request exceeds bounded field limits".to_string(),
             ));
         }
-        self.with_immediate_transaction(|tx| {
+        self.with_transaction(|tx| {
             if let Some(existing) = read_operation(tx, &request.operation_id)? {
                 if existing.actor_account_id != actor_account_id {
                     return Err(Error::WorkspacePermissionDenied(
@@ -369,7 +369,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
         child_operation_id: &str,
     ) -> Result<WorkspaceDeletionOperationResponse> {
         validate_operation_id(child_operation_id)?;
-        self.with_immediate_transaction(|tx| {
+        self.with_transaction(|tx| {
             let operation = read_operation(tx, operation_id)?
                 .ok_or_else(|| Error::InvalidInput("Workspace deletion operation".to_string()))?
                 .response;
@@ -411,7 +411,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
         failure_category: Option<&str>,
     ) -> Result<WorkspaceDeletionOperationResponse> {
         validate_operation_projection(child_operation_ids, blockers)?;
-        self.with_immediate_transaction(|tx| {
+        self.with_transaction(|tx| {
             let current = read_operation(tx, operation_id)?
                 .ok_or_else(|| Error::InvalidInput("Workspace deletion operation".to_string()))?
                 .response;
@@ -462,7 +462,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
         &self,
         operation_id: &str,
     ) -> Result<WorkspaceDeletionOperationResponse> {
-        self.with_immediate_transaction(|tx| {
+        self.with_transaction(|tx| {
             tx.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
             let operation = read_operation(tx, operation_id)?
                 .ok_or_else(|| Error::InvalidInput("Workspace deletion operation".to_string()))?;
@@ -922,7 +922,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn setup() -> (SqliteWorkspaceStore, String, String) {
-        seed_workspaces(SqliteWorkspaceStore::in_memory_for_test().expect("store"))
+        seed_workspaces(SqliteWorkspaceStore::in_memory().expect("store"))
     }
 
     fn seed_workspaces(store: SqliteWorkspaceStore) -> (SqliteWorkspaceStore, String, String) {
@@ -989,7 +989,7 @@ mod tests {
             let dir = tempdir().expect("tempdir");
             let path = dir.path().join("server.db");
             let (store, owner, workspace_id) =
-                seed_workspaces(SqliteWorkspaceStore::open_for_test(&path).expect("store"));
+                seed_workspaces(SqliteWorkspaceStore::open(&path).expect("store"));
             for workspace in ["workspace-a", "workspace-b"] {
                 let backend = ticket::SqliteTicketBackend::open_verified(&path, workspace).unwrap();
                 let initial = backend
@@ -1019,7 +1019,7 @@ mod tests {
                 // Seed domain handling evidence under a transaction. This fixture
                 // exercises owner purge, not singleton authentication or delivery.
                 store
-                    .with_immediate_transaction(|tx| {
+                    .with_transaction(|tx| {
                         ticket::sqlite_update_ticket_assignment_tracking_in_transaction(
                             tx,
                             workspace,
