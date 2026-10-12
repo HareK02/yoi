@@ -430,8 +430,12 @@ panic diagnostics appeared, and no retained test/repro processes were observed.
 Workdir default153/http-client156, fmt/diff and naming558/0/0 passed. All Cargo
 checks/tests use the isolated candidate cache. Logs:
 `target/t748-revoke-{root-check,full-suite,workdir-default,workdir-http,fmt,names}.log`.
-The following documentation-only publication changes no tested code and needs a
-fresh exact-source independent verdict before an approved handoff.
+Docs-only source `ebce7ab7` changed no tested code. MR seq13 independently confirmed
+the revoke ownership fix and repeated the full checks, but requested changes for
+Ticket cancellation, selector repair and post-restore projection's async callers.
+The current uncommitted follow-up and the requested comprehensive caller audit
+are tracked in [the caller inventory](2026-10-12-t748-caller-inventory.md).
+Successful suites are not evidence that uninspected caller boundaries are safe.
 
 No latency benchmark, production incident measurement, target integration,
 Ticket conclusion, or running-environment update is claimed. T743 has now

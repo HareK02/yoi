@@ -64,8 +64,9 @@ pub(super) async fn authorized_drive(
         // incomplete, or inconsistent with its transport identity.
         let headers = current_worker_contract_headers(context)
             .map_err(|_| fail(DriveApiErrorCode::Denied))?;
-        let worker = current_worker_identity(api, workspace_id, &headers)
-            .map_err(|_| fail(DriveApiErrorCode::Denied))?;
+        let worker = authenticate_worker_mutation_source_owned(api, workspace_id, &headers)
+            .await
+            .map_err(pre_error)?;
         if context.worker_source.as_ref().is_some_and(|source| {
             source.runtime_id != worker.runtime_id || source.worker_id != worker.worker_id
         }) {
@@ -139,9 +140,14 @@ pub(super) async fn create_grant(
         }
     }
     let worker = RuntimeWorkerRef::new(&request.runtime_id, &request.worker_id);
+    let operation_api = api.clone();
     let summary = api
-        .runtime
-        .worker(&worker)
+        .host_executors
+        .host()
+        .map_err(pre_error)?
+        .run(move || Ok::<_, Error>(operation_api.runtime.worker(&worker)))
+        .await
+        .map_err(pre_error)?
         .map_err(|_| fail(DriveApiErrorCode::NotFound))?;
     if summary.workspace.workspace_id.as_deref() != Some(workspace_id) {
         return Err(fail(DriveApiErrorCode::Denied));

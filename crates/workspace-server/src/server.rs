@@ -8699,16 +8699,28 @@ impl server_api::ServerApi for ServerApiContractService {
             ));
         }
         let worker = RuntimeWorkerRef::new(runtime_id.clone(), worker_id.clone());
-        let observation = api
-            .runtime
-            .worker_session(&workspace_id, &worker)
-            .map_err(|_error| {
-                runtime_api::RuntimeApiError::new(
-                    StatusCode::BAD_GATEWAY.as_u16(),
-                    "worker_session_observation_failed",
-                    "Worker Session observation failed",
+        let operation_api = api.clone();
+        let operation_workspace = workspace_id.clone();
+        let runtime_result = api
+            .host_executors
+            .host()
+            .map_err(runtime_execution_error)?
+            .run(move || {
+                Ok::<_, Error>(
+                    operation_api
+                        .runtime
+                        .worker_session(&operation_workspace, &worker),
                 )
-            })?;
+            })
+            .await
+            .map_err(runtime_execution_error)?;
+        let observation = runtime_result.map_err(|_error| {
+            runtime_api::RuntimeApiError::new(
+                StatusCode::BAD_GATEWAY.as_u16(),
+                "worker_session_observation_failed",
+                "Worker Session observation failed",
+            )
+        })?;
         Ok(server_api::WorkspaceWorkerSessionResponse {
             subject: server_api::WorkspaceWorkerSubject::RuntimeWorker {
                 runtime_id,
@@ -8743,16 +8755,29 @@ impl server_api::ServerApi for ServerApiContractService {
             ));
         }
         let worker = RuntimeWorkerRef::new(runtime_id.clone(), worker_id.clone());
-        let observation = api
-            .runtime
-            .worker_session_history(&workspace_id, &worker, query.cursor, query.limit)
-            .map_err(|_error| {
-                runtime_api::RuntimeApiError::new(
-                    StatusCode::BAD_GATEWAY.as_u16(),
-                    "worker_session_history_failed",
-                    "Worker Session history request failed",
-                )
-            })?;
+        let operation_api = api.clone();
+        let operation_workspace = workspace_id.clone();
+        let runtime_result = api
+            .host_executors
+            .host()
+            .map_err(runtime_execution_error)?
+            .run(move || {
+                Ok::<_, Error>(operation_api.runtime.worker_session_history(
+                    &operation_workspace,
+                    &worker,
+                    query.cursor,
+                    query.limit,
+                ))
+            })
+            .await
+            .map_err(runtime_execution_error)?;
+        let observation = runtime_result.map_err(|_error| {
+            runtime_api::RuntimeApiError::new(
+                StatusCode::BAD_GATEWAY.as_u16(),
+                "worker_session_history_failed",
+                "Worker Session history request failed",
+            )
+        })?;
         Ok(server_api::WorkspaceWorkerSessionHistoryResponse {
             subject: server_api::WorkspaceWorkerSubject::RuntimeWorker {
                 runtime_id,
@@ -11624,7 +11649,7 @@ impl server_api::ServerApi for ServerApiContractService {
         let api = self.workspace_api().map_err(|_| {
             workspace_config::pre_error(Error::Store("Workspace unavailable".into()))
         })?;
-        let worker = workspace_config::identity(api, &context, &workspace_id)?;
+        let worker = workspace_config::identity(api, &context, &workspace_id).await?;
         workspace_config::get(api, &worker)
             .await
             .map(server_api::WorkspaceConfigCurrentResponse)
@@ -11641,7 +11666,7 @@ impl server_api::ServerApi for ServerApiContractService {
         let api = self.workspace_api().map_err(|_| {
             workspace_config::pre_error(Error::Store("Workspace unavailable".into()))
         })?;
-        let worker = workspace_config::identity(api, &context, &workspace_id)?;
+        let worker = workspace_config::identity(api, &context, &workspace_id).await?;
         workspace_config::attach(api, &worker, request).await
     }
     async fn current_worker_workspace_config_observe(
@@ -11656,7 +11681,7 @@ impl server_api::ServerApi for ServerApiContractService {
         let api = self.workspace_api().map_err(|_| {
             workspace_config::pre_error(Error::Store("Workspace unavailable".into()))
         })?;
-        let worker = workspace_config::identity(api, &context, &workspace_id)?;
+        let worker = workspace_config::identity(api, &context, &workspace_id).await?;
         workspace_config::observe(api, &worker, request).await
     }
     async fn current_worker_workspace_config_read(
@@ -11671,7 +11696,7 @@ impl server_api::ServerApi for ServerApiContractService {
         let api = self.workspace_api().map_err(|_| {
             workspace_config::pre_error(Error::Store("Workspace unavailable".into()))
         })?;
-        let worker = workspace_config::identity(api, &context, &workspace_id)?;
+        let worker = workspace_config::identity(api, &context, &workspace_id).await?;
         workspace_config::read(api, &worker, request).await
     }
     async fn current_worker_workspace_config_commit(
@@ -11686,7 +11711,7 @@ impl server_api::ServerApi for ServerApiContractService {
         let api = self.workspace_api().map_err(|_| {
             workspace_config::pre_error(Error::Store("Workspace unavailable".into()))
         })?;
-        let worker = workspace_config::identity(api, &context, &workspace_id)?;
+        let worker = workspace_config::identity(api, &context, &workspace_id).await?;
         workspace_config::commit(api, &worker, request).await
     }
     async fn workspace_config_grant_create(
@@ -11999,6 +12024,16 @@ impl server_api::ServerApi for ServerApiContractService {
     }
 }
 
+fn runtime_execution_error(error: Error) -> runtime_api::RuntimeApiError {
+    let code = match &error {
+        Error::DbCapacityExceeded => "db_capacity_exceeded",
+        Error::DbExecutorUnavailable => "db_executor_unavailable",
+        Error::DbOperationOutcomeUnknown => "db_operation_outcome_unknown",
+        _ => "backend_execution_failed",
+    };
+    runtime_api::RuntimeApiError::new(api_error_status(&error).as_u16(), code, error.to_string())
+}
+
 async fn scoped_worker_session_attachment(
     State(api): State<WorkspaceApi>,
     AxumPath((workspace_id, runtime_id, worker_id, session_id, attachment_id)): AxumPath<(
@@ -12018,10 +12053,25 @@ async fn scoped_worker_session_attachment(
             .into_response();
     }
     let worker = RuntimeWorkerRef::new(runtime_id, worker_id);
-    match api
-        .runtime
-        .worker_session_attachment(&workspace_id, &worker, &session_id, &attachment_id)
-    {
+    let executor = match api.host_executors.host() {
+        Ok(value) => value,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+    let fetched = executor
+        .run(move || {
+            Ok::<_, Error>(api.runtime.worker_session_attachment(
+                &workspace_id,
+                &worker,
+                &session_id,
+                &attachment_id,
+            ))
+        })
+        .await;
+    let fetched = match fetched {
+        Ok(value) => value,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+    match fetched {
         Ok(attachment) => {
             let Ok(content_type) = HeaderValue::from_str(&attachment.media_type) else {
                 return (
@@ -12941,10 +12991,15 @@ async fn scoped_get_repository_access_projection(
     Extension(actor): Extension<RequestActor>,
 ) -> ApiResult<Json<RepositoryAccessProjection>> {
     require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
-    Ok(Json(active_repository_access_projection(
-        &api,
-        &path.workspace_id,
-    )?))
+    api.store
+        .db_executor()
+        .run(move || {
+            Ok(Json(active_repository_access_projection(
+                &api,
+                &path.workspace_id,
+            )?))
+        })
+        .await
 }
 
 async fn scoped_list_repository_ssh_credentials(
@@ -12953,13 +13008,18 @@ async fn scoped_list_repository_ssh_credentials(
     Extension(actor): Extension<RequestActor>,
 ) -> ApiResult<Json<Vec<RepositorySshCredential>>> {
     require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
-    api.repository_secrets
-        .ensure_workspace_default_credential(&path.workspace_id)?;
-    let projection = active_repository_access_projection(&api, &path.workspace_id)?;
-    Ok(Json(
-        api.repository_secrets
-            .list_credentials(&path.workspace_id, &projection)?,
-    ))
+    api.store
+        .db_executor()
+        .run(move || {
+            api.repository_secrets
+                .ensure_workspace_default_credential(&path.workspace_id)?;
+            let projection = active_repository_access_projection(&api, &path.workspace_id)?;
+            Ok(Json(
+                api.repository_secrets
+                    .list_credentials(&path.workspace_id, &projection)?,
+            ))
+        })
+        .await
 }
 
 async fn scoped_get_repository_ssh_credential(
@@ -12968,14 +13028,19 @@ async fn scoped_get_repository_ssh_credential(
     Extension(actor): Extension<RequestActor>,
 ) -> ApiResult<Json<RepositorySshCredential>> {
     require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
-    let projection = active_repository_access_projection(&api, &path.workspace_id)?;
-    let credential = api
-        .repository_secrets
-        .list_credentials(&path.workspace_id, &projection)?
-        .into_iter()
-        .find(|credential| credential.credential_id == path.credential_id)
-        .ok_or_else(|| Error::InvalidRecordId(path.credential_id.clone()))?;
-    Ok(Json(credential))
+    api.store
+        .db_executor()
+        .run(move || {
+            let projection = active_repository_access_projection(&api, &path.workspace_id)?;
+            let credential = api
+                .repository_secrets
+                .list_credentials(&path.workspace_id, &projection)?
+                .into_iter()
+                .find(|credential| credential.credential_id == path.credential_id)
+                .ok_or_else(|| Error::InvalidRecordId(path.credential_id.clone()))?;
+            Ok(Json(credential))
+        })
+        .await
 }
 
 async fn scoped_get_repository_ssh_public_key(
@@ -12984,11 +13049,16 @@ async fn scoped_get_repository_ssh_public_key(
     Extension(actor): Extension<RequestActor>,
 ) -> ApiResult<Json<RepositorySshPublicKey>> {
     require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
-    let public_key = api
-        .repository_secrets
-        .credential_public_key(&path.workspace_id, &path.credential_id)?
-        .ok_or_else(|| Error::InvalidRecordId(path.credential_id.clone()))?;
-    Ok(Json(public_key))
+    api.store
+        .db_executor()
+        .run(move || {
+            let public_key = api
+                .repository_secrets
+                .credential_public_key(&path.workspace_id, &path.credential_id)?
+                .ok_or_else(|| Error::InvalidRecordId(path.credential_id.clone()))?;
+            Ok(Json(public_key))
+        })
+        .await
 }
 
 async fn scoped_create_repository_ssh_credential(
@@ -12998,18 +13068,25 @@ async fn scoped_create_repository_ssh_credential(
     Json(request): Json<CreateRepositorySshCredentialRequest>,
 ) -> ApiResult<(StatusCode, Json<RepositorySshCredential>)> {
     require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
-    if request.credential_id
-        == crate::repository_access::WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID
-    {
-        return Err(Error::InvalidInput(
-            "Workspace default SSH credential id is reserved".to_string(),
-        )
-        .into());
-    }
-    let credential =
-        api.repository_secrets
-            .create_credential(&path.workspace_id, request, &actor.account_id)?;
-    Ok((StatusCode::CREATED, Json(credential)))
+    api.store
+        .db_executor()
+        .run(move || {
+            if request.credential_id
+                == crate::repository_access::WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID
+            {
+                return Err(Error::InvalidInput(
+                    "Workspace default SSH credential id is reserved".to_string(),
+                )
+                .into());
+            }
+            let credential = api.repository_secrets.create_credential(
+                &path.workspace_id,
+                request,
+                &actor.account_id,
+            )?;
+            Ok((StatusCode::CREATED, Json(credential)))
+        })
+        .await
 }
 
 async fn scoped_generate_repository_ssh_credential(
@@ -13019,20 +13096,25 @@ async fn scoped_generate_repository_ssh_credential(
     Json(request): Json<GenerateRepositorySshCredentialRequest>,
 ) -> ApiResult<(StatusCode, Json<RepositorySshCredential>)> {
     require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
-    if request.credential_id
-        == crate::repository_access::WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID
-    {
-        return Err(Error::InvalidInput(
-            "Workspace default SSH credential id is reserved".to_string(),
-        )
-        .into());
-    }
-    let credential = api.repository_secrets.generate_credential(
-        &path.workspace_id,
-        request,
-        &actor.account_id,
-    )?;
-    Ok((StatusCode::CREATED, Json(credential)))
+    api.store
+        .db_executor()
+        .run(move || {
+            if request.credential_id
+                == crate::repository_access::WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID
+            {
+                return Err(Error::InvalidInput(
+                    "Workspace default SSH credential id is reserved".to_string(),
+                )
+                .into());
+            }
+            let credential = api.repository_secrets.generate_credential(
+                &path.workspace_id,
+                request,
+                &actor.account_id,
+            )?;
+            Ok((StatusCode::CREATED, Json(credential)))
+        })
+        .await
 }
 
 async fn scoped_rotate_repository_ssh_credential(
@@ -13042,12 +13124,17 @@ async fn scoped_rotate_repository_ssh_credential(
     Json(request): Json<RotateRepositorySshCredentialRequest>,
 ) -> ApiResult<Json<RepositorySshCredential>> {
     require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
-    Ok(Json(api.repository_secrets.rotate_credential(
-        &path.workspace_id,
-        &path.credential_id,
-        request,
-        &actor.account_id,
-    )?))
+    api.store
+        .db_executor()
+        .run(move || {
+            Ok(Json(api.repository_secrets.rotate_credential(
+                &path.workspace_id,
+                &path.credential_id,
+                request,
+                &actor.account_id,
+            )?))
+        })
+        .await
 }
 
 async fn scoped_delete_repository_ssh_credential(
@@ -13057,15 +13144,20 @@ async fn scoped_delete_repository_ssh_credential(
     Json(request): Json<DeleteRepositorySshCredentialRequest>,
 ) -> ApiResult<StatusCode> {
     require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
-    let projection = active_repository_access_projection(&api, &path.workspace_id)?;
-    api.repository_secrets.delete_credential(
-        &path.workspace_id,
-        &path.credential_id,
-        request,
-        &actor.account_id,
-        &projection,
-    )?;
-    Ok(StatusCode::NO_CONTENT)
+    api.store
+        .db_executor()
+        .run(move || {
+            let projection = active_repository_access_projection(&api, &path.workspace_id)?;
+            api.repository_secrets.delete_credential(
+                &path.workspace_id,
+                &path.credential_id,
+                request,
+                &actor.account_id,
+                &projection,
+            )?;
+            Ok(StatusCode::NO_CONTENT)
+        })
+        .await
 }
 
 async fn scoped_list_repository_ssh_host_trusts(
@@ -13074,11 +13166,16 @@ async fn scoped_list_repository_ssh_host_trusts(
     Extension(actor): Extension<RequestActor>,
 ) -> ApiResult<Json<Vec<RepositorySshHostTrust>>> {
     require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
-    let projection = active_repository_access_projection(&api, &path.workspace_id)?;
-    Ok(Json(
-        api.repository_secrets
-            .list_host_trusts(&path.workspace_id, &projection)?,
-    ))
+    api.store
+        .db_executor()
+        .run(move || {
+            let projection = active_repository_access_projection(&api, &path.workspace_id)?;
+            Ok(Json(
+                api.repository_secrets
+                    .list_host_trusts(&path.workspace_id, &projection)?,
+            ))
+        })
+        .await
 }
 
 async fn scoped_get_repository_ssh_host_trust(
@@ -13087,14 +13184,19 @@ async fn scoped_get_repository_ssh_host_trust(
     Extension(actor): Extension<RequestActor>,
 ) -> ApiResult<Json<RepositorySshHostTrust>> {
     require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
-    let projection = active_repository_access_projection(&api, &path.workspace_id)?;
-    let host_trust = api
-        .repository_secrets
-        .list_host_trusts(&path.workspace_id, &projection)?
-        .into_iter()
-        .find(|host_trust| host_trust.host_trust_id == path.host_trust_id)
-        .ok_or_else(|| Error::InvalidRecordId(path.host_trust_id.clone()))?;
-    Ok(Json(host_trust))
+    api.store
+        .db_executor()
+        .run(move || {
+            let projection = active_repository_access_projection(&api, &path.workspace_id)?;
+            let host_trust = api
+                .repository_secrets
+                .list_host_trusts(&path.workspace_id, &projection)?
+                .into_iter()
+                .find(|host_trust| host_trust.host_trust_id == path.host_trust_id)
+                .ok_or_else(|| Error::InvalidRecordId(path.host_trust_id.clone()))?;
+            Ok(Json(host_trust))
+        })
+        .await
 }
 
 async fn scoped_put_repository_ssh_host_trust(
@@ -13104,15 +13206,22 @@ async fn scoped_put_repository_ssh_host_trust(
     Json(request): Json<PutRepositorySshHostTrustRequest>,
 ) -> ApiResult<(StatusCode, Json<RepositorySshHostTrust>)> {
     require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
-    let status = if request.expected_fingerprint.is_some() {
-        StatusCode::OK
-    } else {
-        StatusCode::CREATED
-    };
-    let host_trust =
-        api.repository_secrets
-            .put_host_trust(&path.workspace_id, request, &actor.account_id)?;
-    Ok((status, Json(host_trust)))
+    api.store
+        .db_executor()
+        .run(move || {
+            let status = if request.expected_fingerprint.is_some() {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            };
+            let host_trust = api.repository_secrets.put_host_trust(
+                &path.workspace_id,
+                request,
+                &actor.account_id,
+            )?;
+            Ok((status, Json(host_trust)))
+        })
+        .await
 }
 
 async fn scoped_delete_repository_ssh_host_trust(
@@ -13122,15 +13231,20 @@ async fn scoped_delete_repository_ssh_host_trust(
     Json(request): Json<DeleteRepositorySshHostTrustRequest>,
 ) -> ApiResult<StatusCode> {
     require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
-    let projection = active_repository_access_projection(&api, &path.workspace_id)?;
-    api.repository_secrets.delete_host_trust(
-        &path.workspace_id,
-        &path.host_trust_id,
-        request,
-        &actor.account_id,
-        &projection,
-    )?;
-    Ok(StatusCode::NO_CONTENT)
+    api.store
+        .db_executor()
+        .run(move || {
+            let projection = active_repository_access_projection(&api, &path.workspace_id)?;
+            api.repository_secrets.delete_host_trust(
+                &path.workspace_id,
+                &path.host_trust_id,
+                request,
+                &actor.account_id,
+                &projection,
+            )?;
+            Ok(StatusCode::NO_CONTENT)
+        })
+        .await
 }
 
 fn config_content_type_to_api(
@@ -13450,8 +13564,8 @@ async fn scoped_commit_workspace_config_tree(
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     Json(request): Json<server_api::ConfigCommitRequest>,
 ) -> ApiResult<(StatusCode, Json<server_api::WorkspaceConfigTreeResponse>)> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             let request = config_commit_request_from_api(request)?;
             validate_workspace_scope(&api, &path.workspace_id)?;
@@ -23165,56 +23279,61 @@ async fn scoped_create_repository(
     Json(request): Json<CreateWorkspaceRepositoryRequest>,
 ) -> ApiResult<(StatusCode, Json<CreateWorkspaceRepositoryResponse>)> {
     require_workspace_owner(&api, &path.workspace_id, &actor, "ManageRepositories").await?;
+    api.store
+        .db_executor()
+        .run(move || {
+            server_api::validate_repository_key(&request.repository_key)
+                .map_err(|error| Error::InvalidInput(format!("invalid Repository key: {error}")))?;
+            let repository_key = request.repository_key;
+            let default_ref = request
+                .default_ref
+                .as_deref()
+                .map(|value| normalize_repository_text(value, "default_ref", 512))
+                .transpose()?;
+            let source = parse_repository_source(&request.source).map_err(|error| {
+                Error::InvalidInput(format!("invalid repository source: {error}"))
+            })?;
+            let now = Utc::now().to_rfc3339();
+            let record = RepositoryRecord {
+                workspace_id: path.workspace_id.clone(),
+                repository_id: Uuid::now_v7().to_string(),
+                repository_key: repository_key.clone(),
+                kind: "git".to_string(),
+                provider: Some("git".to_string()),
+                source_fingerprint: repository_source_fingerprint(&source),
+                source,
+                default_ref,
+                observed_status: server_api::RepositoryObservedStatus::Unverified,
+                observed_at: None,
+                created_at: now.clone(),
+                updated_at: now,
+            };
 
-    server_api::validate_repository_key(&request.repository_key)
-        .map_err(|error| Error::InvalidInput(format!("invalid Repository key: {error}")))?;
-    let repository_key = request.repository_key;
-    let default_ref = request
-        .default_ref
-        .as_deref()
-        .map(|value| normalize_repository_text(value, "default_ref", 512))
-        .transpose()?;
-    let source = parse_repository_source(&request.source)
-        .map_err(|error| Error::InvalidInput(format!("invalid repository source: {error}")))?;
-    let now = Utc::now().to_rfc3339();
-    let record = RepositoryRecord {
-        workspace_id: path.workspace_id.clone(),
-        repository_id: Uuid::now_v7().to_string(),
-        repository_key: repository_key.clone(),
-        kind: "git".to_string(),
-        provider: Some("git".to_string()),
-        source_fingerprint: repository_source_fingerprint(&source),
-        source,
-        default_ref,
-        observed_status: server_api::RepositoryObservedStatus::Unverified,
-        observed_at: None,
-        created_at: now.clone(),
-        updated_at: now,
-    };
-
-    let (status, replayed) = match api.config_store.insert_repository(&record)? {
-        RepositoryInsertOutcome::Created => (StatusCode::CREATED, false),
-        RepositoryInsertOutcome::Existing(existing)
-            if repository_create_intent_matches(&existing, &record) =>
-        {
-            (StatusCode::OK, true)
-        }
-        RepositoryInsertOutcome::Existing(_) => {
-            return Err(Error::RepositoryConflict(format!(
+            let (status, replayed) = match api.config_store.insert_repository(&record)? {
+                RepositoryInsertOutcome::Created => (StatusCode::CREATED, false),
+                RepositoryInsertOutcome::Existing(existing)
+                    if repository_create_intent_matches(&existing, &record) =>
+                {
+                    (StatusCode::OK, true)
+                }
+                RepositoryInsertOutcome::Existing(_) => {
+                    return Err(Error::RepositoryConflict(format!(
                 "Repository key {repository_key} already exists with different registration intent"
             ))
             .into());
-        }
-    };
+                }
+            };
 
-    Ok((
-        status,
-        Json(CreateWorkspaceRepositoryResponse {
-            workspace_id: path.workspace_id,
-            repository_key,
-            replayed,
-        }),
-    ))
+            Ok((
+                status,
+                Json(CreateWorkspaceRepositoryResponse {
+                    workspace_id: path.workspace_id,
+                    repository_key,
+                    replayed,
+                }),
+            ))
+        })
+        .await
 }
 
 fn normalize_repository_text(value: &str, field: &str, max_len: usize) -> Result<String> {
@@ -23256,7 +23375,10 @@ async fn scoped_probe_repository_ssh_connection(
 ) -> ApiResult<Json<RepositorySshConnectionProbeResponse>> {
     require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
     require_active_workspace_runtime_binding(&api, &request.runtime_id).await?;
-    probe_repository_ssh_connection(&api, &path, &request.runtime_id).map(Json)
+    api.host_executors
+        .host()?
+        .run(move || probe_repository_ssh_connection(&api, &path, &request.runtime_id).map(Json))
+        .await
 }
 
 async fn scoped_confirm_repository_ssh_host_trust(
@@ -23267,35 +23389,40 @@ async fn scoped_confirm_repository_ssh_host_trust(
 ) -> ApiResult<Json<RepositorySshHostTrust>> {
     require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
     require_active_workspace_runtime_binding(&api, &request.runtime_id).await?;
-    let probe = probe_repository_ssh_connection(&api, &path, &request.runtime_id)?;
-    let candidate = probe
-        .candidates
-        .iter()
-        .find(|candidate| candidate.host_key == request.host_key)
-        .ok_or_else(|| {
-            settings_bad_request(
-                "repository_ssh_host_key_not_observed",
-                "Selected SSH host key was not presented by the target Runtime",
-            )
-        })?;
-    if request.expected_host_key_fingerprint != probe.expected_host_key_fingerprint {
-        return Err(ApiError::from(Error::WorkspaceConfigConflict(
-            "SSH host trust fingerprint changed after the connection test".to_string(),
-        )));
-    }
-    let host_trust = api.repository_secrets.put_host_trust(
-        &path.workspace_id,
-        PutRepositorySshHostTrustRequest {
-            operation_id: request.operation_id,
-            host_trust_id: probe.host_trust_id,
-            hostname: probe.hostname,
-            port: probe.port,
-            host_key: candidate.host_key.clone(),
-            expected_fingerprint: probe.expected_host_key_fingerprint,
-        },
-        &actor.account_id,
-    )?;
-    Ok(Json(host_trust))
+    api.host_executors
+        .host()?
+        .run(move || {
+            let probe = probe_repository_ssh_connection(&api, &path, &request.runtime_id)?;
+            let candidate = probe
+                .candidates
+                .iter()
+                .find(|candidate| candidate.host_key == request.host_key)
+                .ok_or_else(|| {
+                    settings_bad_request(
+                        "repository_ssh_host_key_not_observed",
+                        "Selected SSH host key was not presented by the target Runtime",
+                    )
+                })?;
+            if request.expected_host_key_fingerprint != probe.expected_host_key_fingerprint {
+                return Err(ApiError::from(Error::WorkspaceConfigConflict(
+                    "SSH host trust fingerprint changed after the connection test".to_string(),
+                )));
+            }
+            let host_trust = api.repository_secrets.put_host_trust(
+                &path.workspace_id,
+                PutRepositorySshHostTrustRequest {
+                    operation_id: request.operation_id,
+                    host_trust_id: probe.host_trust_id,
+                    hostname: probe.hostname,
+                    port: probe.port,
+                    host_key: candidate.host_key.clone(),
+                    expected_fingerprint: probe.expected_host_key_fingerprint,
+                },
+                &actor.account_id,
+            )?;
+            Ok(Json(host_trust))
+        })
+        .await
 }
 
 fn repository_ssh_connection_trust_state(
@@ -25948,8 +26075,8 @@ async fn scoped_list_working_directories(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
 ) -> ApiResult<Json<BrowserWorkingDirectoryListResponse>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let (items, diagnostics) = working_directory_summaries(&api)?;
@@ -28085,75 +28212,84 @@ async fn upload_runtime_worker_file_contract(
     path: ScopedAttachmentUploadPath,
     body: &[u8],
 ) -> ApiResult<WorkerFileUploadResponse> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    let body_sha256 = attachment_body_sha256(body);
-    let grant = {
-        let mut grants = api
-            .attachment_upload_grants
-            .lock()
-            .map_err(|_| Error::Store("attachment upload grant lock is poisoned".into()))?;
-        let grant = grants
-            .get_mut(&path.upload_id)
-            .ok_or_else(|| Error::InvalidInput("attachment upload grant is unknown".into()))?;
-        if let Some(file) = grant
-            .claim(
-                &path.workspace_id,
-                &path.runtime_id,
-                &path.worker_id,
-                &actor.account_id,
-                attachment_upload_now_ms()?,
-                &body_sha256,
-            )
-            .map_err(ApiError::from)?
-        {
-            return Ok(WorkerFileUploadResponse { file });
-        }
-        grant.clone()
-    };
+    let body = body.to_vec();
+    api.host_executors
+        .host()?
+        .run(move || {
+            validate_workspace_scope(&api, &path.workspace_id)?;
+            let body_sha256 = attachment_body_sha256(&body);
+            let grant = {
+                let mut grants = api
+                    .attachment_upload_grants
+                    .lock()
+                    .map_err(|_| Error::Store("attachment upload grant lock is poisoned".into()))?;
+                let grant = grants.get_mut(&path.upload_id).ok_or_else(|| {
+                    Error::InvalidInput("attachment upload grant is unknown".into())
+                })?;
+                if let Some(file) = grant
+                    .claim(
+                        &path.workspace_id,
+                        &path.runtime_id,
+                        &path.worker_id,
+                        &actor.account_id,
+                        attachment_upload_now_ms()?,
+                        &body_sha256,
+                    )
+                    .map_err(ApiError::from)?
+                {
+                    return Ok(WorkerFileUploadResponse { file });
+                }
+                grant.clone()
+            };
 
-    let worker = resolve_workspace_worker_reference(&api, &path.runtime_id, &path.worker_id)?;
-    let upload_context = worker_runtime::UploadedFileUploadContext {
-        upload_id: path.upload_id.clone(),
-        principal_id: grant.account_id.clone(),
-        workspace_id: grant.workspace_id.clone(),
-        runtime_id: grant.runtime_id.clone(),
-        worker_id: grant.worker_id.clone(),
-    };
-    let uploaded = api.runtime.upload_worker_file(
-        &worker,
-        &grant.file_name,
-        &grant.media_type,
-        body,
-        Some(&upload_context),
-    );
-    let mut grants = api
-        .attachment_upload_grants
-        .lock()
-        .map_err(|_| Error::Store("attachment upload grant lock is poisoned".into()))?;
-    let current = grants
-        .get_mut(&path.upload_id)
-        .ok_or_else(|| Error::RepositoryConflict("attachment upload grant disappeared".into()))?;
-    if matches!(current.state, AttachmentUploadGrantState::Cancelled) {
-        let uploaded_file = uploaded.ok();
-        grants.remove(&path.upload_id);
-        drop(grants);
-        if let Some(file) = uploaded_file {
-            api.runtime
-                .delete_worker_uploaded_file(&worker, &file.artifact_id)
-                .map_err(|error| error.into_error())?;
-        }
-        return Err(Error::RepositoryConflict("attachment upload was cancelled".into()).into());
-    }
-    match uploaded {
-        Ok(file) => {
-            current.state = AttachmentUploadGrantState::Completed(file.clone());
-            Ok(WorkerFileUploadResponse { file })
-        }
-        Err(error) => {
-            current.state = AttachmentUploadGrantState::Pending;
-            Err(error.into_error().into())
-        }
-    }
+            let worker =
+                resolve_workspace_worker_reference(&api, &path.runtime_id, &path.worker_id)?;
+            let upload_context = worker_runtime::UploadedFileUploadContext {
+                upload_id: path.upload_id.clone(),
+                principal_id: grant.account_id.clone(),
+                workspace_id: grant.workspace_id.clone(),
+                runtime_id: grant.runtime_id.clone(),
+                worker_id: grant.worker_id.clone(),
+            };
+            let uploaded = api.runtime.upload_worker_file(
+                &worker,
+                &grant.file_name,
+                &grant.media_type,
+                &body,
+                Some(&upload_context),
+            );
+            let mut grants = api
+                .attachment_upload_grants
+                .lock()
+                .map_err(|_| Error::Store("attachment upload grant lock is poisoned".into()))?;
+            let current = grants.get_mut(&path.upload_id).ok_or_else(|| {
+                Error::RepositoryConflict("attachment upload grant disappeared".into())
+            })?;
+            if matches!(current.state, AttachmentUploadGrantState::Cancelled) {
+                let uploaded_file = uploaded.ok();
+                grants.remove(&path.upload_id);
+                drop(grants);
+                if let Some(file) = uploaded_file {
+                    api.runtime
+                        .delete_worker_uploaded_file(&worker, &file.artifact_id)
+                        .map_err(|error| error.into_error())?;
+                }
+                return Err(
+                    Error::RepositoryConflict("attachment upload was cancelled".into()).into(),
+                );
+            }
+            match uploaded {
+                Ok(file) => {
+                    current.state = AttachmentUploadGrantState::Completed(file.clone());
+                    Ok(WorkerFileUploadResponse { file })
+                }
+                Err(error) => {
+                    current.state = AttachmentUploadGrantState::Pending;
+                    Err(error.into_error().into())
+                }
+            }
+        })
+        .await
 }
 
 async fn scoped_cancel_attachment_upload(
@@ -29112,8 +29248,8 @@ async fn get_objective(
 async fn list_repositories(
     State(api): State<WorkspaceApi>,
 ) -> ApiResult<Json<RepositoryListResponse>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             let RepositoryListProjection { items, diagnostics } =
                 api.live_repository_reader()?.list();
@@ -29131,8 +29267,8 @@ async fn repository_detail(
     State(api): State<WorkspaceApi>,
     AxumPath(repository_key): AxumPath<String>,
 ) -> ApiResult<Json<RepositoryDetailResponse>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             server_api::validate_repository_key(&repository_key).map_err(|error| {
                 ApiError::from(Error::InvalidInput(format!(
@@ -29157,8 +29293,8 @@ async fn repository_log(
     AxumPath(repository_key): AxumPath<String>,
     Query(query): Query<LogQuery>,
 ) -> ApiResult<Json<RepositoryLogResponse>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             server_api::validate_repository_key(&repository_key).map_err(|error| {
                 ApiError::from(Error::InvalidInput(format!(
@@ -37568,6 +37704,7 @@ mod tests {
             Arc<Mutex<Vec<worker_runtime::catalog::WorkingDirectoryRepositoryAccessRequest>>>,
         reject_repository_access: Arc<Mutex<bool>>,
         lifecycle_callback: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+        stop_callback: Option<Arc<dyn Fn() + Send + Sync>>,
         next_restore_outcome: Arc<Mutex<Option<server_api::WorkerRestoreState>>>,
         restore_attempts: Arc<Mutex<usize>>,
     }
@@ -37874,6 +38011,9 @@ mod tests {
             worker_id: &str,
             _request: WorkerLifecycleRequest,
         ) -> WorkerLifecycleResult {
+            if let Some(callback) = &self.stop_callback {
+                callback();
+            }
             WorkerLifecycleResult {
                 state: InternalWorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(Self::RUNTIME_ID, worker_id),
@@ -38545,6 +38685,112 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(error.error, "Payload Too Large");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn accepted_stop_closes_sessions_even_when_its_waiter_is_cancelled() {
+        let directory = tempfile::tempdir().unwrap();
+        let api = test_api(directory.path()).await;
+        api.worker_projection.shutdown_async().await;
+        api.store.db_executor().drain().await.unwrap();
+        register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
+        let stopped = Arc::new(tokio::sync::Notify::new());
+        let notification = stopped.clone();
+        let runtime = WorkdirlessFixtureRuntime {
+            stop_callback: Some(Arc::new(move || notification.notify_one())),
+            ..Default::default()
+        };
+        api.runtime.register_or_replace(runtime.clone());
+        let identity = RuntimeWorkerRef::new(
+            WorkdirlessFixtureRuntime::RUNTIME_ID,
+            Uuid::now_v7().to_string(),
+        );
+        api.store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                worker: identity.clone(),
+                display_name: "stop owner fixture".into(),
+                profile: None,
+                retention_state: "normal".into(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            })
+            .unwrap();
+        runtime
+            .workers
+            .lock()
+            .unwrap()
+            .push(worker_summary_from_registry(
+                &api.store
+                    .get_worker_registry(TEST_WORKSPACE_ID, &identity)
+                    .unwrap()
+                    .unwrap(),
+            ));
+        let session: WorkdirSessionHandle = Arc::new(workdir::LocalWorkdirSession::new(
+            manifest::Scope::writable(directory.path()).unwrap(),
+            directory.path().to_path_buf(),
+        ));
+        api.workdir_sessions
+            .lock()
+            .unwrap()
+            .insert_attachment(identity.clone(), session);
+        // An actual session fence prevents cleanup until after cancellation;
+        // the Runtime receipt is the synchronization event, not an elapsed delay.
+        let session_guard = current_worker_session_lock(&api, &identity)
+            .lock_owned()
+            .await;
+        let worker =
+            WorkspaceWorker::resolve(&api, &identity.runtime_id, &identity.worker_id).unwrap();
+        let waiter = tokio::spawn(async move {
+            worker
+                .stop(
+                    &WorkerOperationContext::Backend,
+                    WorkerLifecycleRequest {
+                        reason: None,
+                        ticket_assignment: None,
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), stopped.notified())
+            .await
+            .unwrap();
+        assert_eq!(tokio::spawn(async { "control" }).await.unwrap(), "control");
+        api.store
+            .db_executor()
+            .run(|| Ok::<_, Error>(()))
+            .await
+            .unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(
+            api.workdir_sessions
+                .lock()
+                .unwrap()
+                .attachments
+                .contains_key(&identity)
+        );
+        drop(session_guard);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            api.host_executors.host().unwrap().drain(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        api.store.db_executor().drain().await.unwrap();
+        assert!(
+            !api.workdir_sessions
+                .lock()
+                .unwrap()
+                .attachments
+                .contains_key(&identity),
+            "accepted Runtime stop must own session cleanup after the waiter disappears"
+        );
     }
 
     #[tokio::test]

@@ -561,7 +561,14 @@ async fn ticket_source_ref_reads_and_ready_publication_leave_sql_and_tokio_free(
             },
         ));
         assert!(futures::poll!(&mut response).is_pending());
-        let request = observed(reply.entered.take().unwrap()).await.unwrap();
+        // Ready reaches the source POST only after mutation and best-effort
+        // notification. Bound this multi-stage setup with the fixture watchdog,
+        // not the shorter budget used below to prove timer/independent control
+        // progress while the actual provider request is held.
+        let request = tokio::select! {
+            request = tokio::time::timeout(WATCHDOG, reply.entered.take().unwrap()) => request.expect("source observation setup did not reach the provider").unwrap(),
+            result = &mut response => panic!("{operation} returned before the held source observation: {result:?}"),
+        };
         assert!(
             request.contains("/v1/repository-refs/observe"),
             "{operation}: {request}"
@@ -901,4 +908,474 @@ async fn cancelled_feature_shutdown_keeps_sql_close_owned_without_blocking_contr
         database.with_connection(|_| Ok(())).is_err(),
         "accepted shutdown must fence later use"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_workdir_and_upload_callers_keep_provider_waits_off_sql_and_tokio() {
+    use server_api::ServerApi;
+    for operation in ["session", "history", "attachment", "workdirs", "upload"] {
+        let fixture = fixture().await;
+        let mut reply = HeldRuntimeReply::new();
+        install_remote_fixture(
+            &fixture,
+            "caller-runtime",
+            &format!("http://{}", reply.address),
+            false,
+        );
+        let worker_id = Uuid::now_v7().to_string();
+        fixture
+            .store
+            .upsert_worker_registry(&registry_record(RuntimeWorkerRef::new(
+                "caller-runtime",
+                &worker_id,
+            )))
+            .unwrap();
+        let actor = RequestActor {
+            user_id: "fixture-user".into(),
+            account_id: format!("account-{WORKSPACE}"),
+            handle: "fixture-user".into(),
+            display_name: "Fixture user".into(),
+            auth_method: ActorAuthMethod::BrowserSession,
+        };
+        fixture.api.attachment_upload_grants.lock().unwrap().insert(
+            "caller-upload".into(),
+            AttachmentUploadGrant {
+                workspace_id: WORKSPACE.into(),
+                runtime_id: "caller-runtime".into(),
+                worker_id: worker_id.clone(),
+                account_id: actor.account_id.clone(),
+                file_name: "notes.txt".into(),
+                media_type: "text/plain".into(),
+                expires_at_ms: u64::MAX,
+                state: AttachmentUploadGrantState::Pending,
+            },
+        );
+        let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let api = fixture.api.clone();
+        let task = tokio::spawn(crate::db_executor::with_operation_lifetime(
+            Arc::new(CountJobLifetime(leases.clone())),
+            async move {
+                let service = ServerApiContractService::Workspace(api.clone());
+                match operation {
+                    "session" => {
+                        let _ = service
+                            .worker_session(WORKSPACE.into(), "caller-runtime".into(), worker_id)
+                            .await;
+                    }
+                    "history" => {
+                        let _ = service
+                            .worker_session_history(
+                                WORKSPACE.into(),
+                                "caller-runtime".into(),
+                                worker_id,
+                                server_api::WorkspaceWorkerSessionHistoryQuery {
+                                    cursor: None,
+                                    limit: Some(1),
+                                },
+                            )
+                            .await;
+                    }
+                    "attachment" => {
+                        let _ = scoped_worker_session_attachment(
+                            State(api),
+                            AxumPath((
+                                WORKSPACE.into(),
+                                "caller-runtime".into(),
+                                worker_id,
+                                "session".into(),
+                                "attachment".into(),
+                            )),
+                            Extension(actor),
+                        )
+                        .await;
+                    }
+                    "workdirs" => {
+                        let _ = scoped_list_working_directories(
+                            State(api),
+                            AxumPath(ScopedWorkspacePath {
+                                workspace_id: WORKSPACE.into(),
+                            }),
+                        )
+                        .await;
+                    }
+                    "upload" => {
+                        let _ = upload_runtime_worker_file_contract(
+                            api,
+                            actor,
+                            ScopedAttachmentUploadPath {
+                                workspace_id: WORKSPACE.into(),
+                                runtime_id: "caller-runtime".into(),
+                                worker_id,
+                                upload_id: "caller-upload".into(),
+                            },
+                            b"notes",
+                        )
+                        .await;
+                    }
+                    _ => unreachable!(),
+                }
+            },
+        ));
+        let request = observed(reply.entered.take().unwrap()).await.unwrap();
+        assert!(request.contains("/v1/"), "{operation}: {request}");
+        assert!(
+            !reply.upstream_released.load(Ordering::SeqCst),
+            "{operation}: watchdog release is not executor progress"
+        );
+        let store = fixture.store.clone();
+        observed(
+            fixture
+                .executor
+                .run(move || store.get_workspace_memory_settings(WORKSPACE)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            observed(tokio::spawn(async { "control" })).await.unwrap(),
+            "control"
+        );
+        observed(tokio::time::sleep(StdDuration::from_millis(1))).await;
+        let mut queued = Box::pin(fixture.host_executor.run(|| Ok::<_, Error>(())));
+        assert!(futures::poll!(&mut queued).is_pending());
+        let error = scoped_list_working_directories(
+            State(fixture.api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: WORKSPACE.into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        response_json(error.into_response(), StatusCode::SERVICE_UNAVAILABLE).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            leases.load(Ordering::SeqCst),
+            1,
+            "{operation}: lost provider owner"
+        );
+        reply.finish();
+        observed(queued).await.unwrap();
+        observed(fixture.host_executor.drain()).await.unwrap();
+        observed(fixture.executor.drain()).await.unwrap();
+        assert_eq!(
+            leases.load(Ordering::SeqCst),
+            0,
+            "{operation}: retained owner after completion"
+        );
+        if operation == "upload" {
+            assert!(
+                matches!(
+                    fixture
+                        .api
+                        .attachment_upload_grants
+                        .lock()
+                        .unwrap()
+                        .get("caller-upload")
+                        .unwrap()
+                        .state,
+                    AttachmentUploadGrantState::Pending
+                ),
+                "failed Runtime lookup must finish the accepted grant claim even with a cancelled waiter"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn repository_create_keeps_cancelled_sql_commit_owned_and_replays_one_intent() {
+    let fixture = fixture().await;
+    let (mut busy, waiting) = BusyObservation::install_store(fixture.api.config_store.clone());
+    let mut lock = WriteLock::acquire(fixture.api.config.database_path.clone());
+    let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let request = || {
+        Fixture::request(
+            "POST",
+            &format!("/api/w/{WORKSPACE}/repositories"),
+            serde_json::json!({ "repository_key": "owned-repository", "source": "https://example.invalid/repo.git", "default_ref": "main" }),
+        )
+    };
+    let mut response = Box::pin(crate::db_executor::with_operation_lifetime(
+        Arc::new(CountJobLifetime(leases.clone())),
+        fixture.inner_router().oneshot(request()),
+    ));
+    tokio::select! {
+        result = &mut response => panic!("repository must wait for its write transaction: {:?}", result.unwrap().status()),
+        reached = observed(waiting) => reached.unwrap(),
+    }
+    runtime_progress_while_locked(&lock).await;
+    assert_eq!(
+        observed(fixture.host_executor.run(|| Ok::<_, Error>("control")))
+            .await
+            .unwrap(),
+        "control"
+    );
+    drop(response);
+    assert_eq!(leases.load(Ordering::SeqCst), 1);
+    lock.release();
+    busy.resume();
+    observed(fixture.executor.drain()).await.unwrap();
+    assert_eq!(leases.load(Ordering::SeqCst), 0);
+    let rows = fixture.store.list_repositories(WORKSPACE).unwrap();
+    assert_eq!(
+        rows.iter()
+            .filter(|record| record.repository_key == "owned-repository")
+            .count(),
+        1
+    );
+    let replay = observed(fixture.inner_router().oneshot(request()))
+        .await
+        .unwrap();
+    let body = response_json(replay, StatusCode::OK).await;
+    assert_eq!(body["replayed"], true);
+    assert_eq!(
+        fixture.store.list_repositories(WORKSPACE).unwrap().len(),
+        rows.len()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn drive_and_config_preflight_keep_live_authority_owned_and_report_overload_as_availability()
+{
+    async fn preflight(
+        api: &WorkspaceApi,
+        context: &server_api::ServerRequestContext,
+        operation: &str,
+    ) -> u16 {
+        match operation {
+            "config" => {
+                workspace_config::identity(api, context, WORKSPACE)
+                    .await
+                    .err()
+                    .unwrap()
+                    .status
+            }
+            "drive" => api_macros::HttpError::status_code(
+                &drive_grants::authorized_drive(api, context, WORKSPACE, false)
+                    .await
+                    .err()
+                    .unwrap(),
+            ),
+            "grant" => api_macros::HttpError::status_code(
+                &drive_grants::create_grant(
+                    api,
+                    context,
+                    WORKSPACE,
+                    server_api::DriveGrantCreateRequest {
+                        runtime_id: "preflight-runtime".into(),
+                        worker_id: "target-worker".into(),
+                        access: server_api::DriveAccess::ReadOnly,
+                    },
+                )
+                .await
+                .err()
+                .unwrap(),
+            ),
+            _ => unreachable!(),
+        }
+    }
+    for operation in ["config", "drive", "grant"] {
+        let fixture = fixture().await;
+        let mut reply = HeldRuntimeReply::new();
+        install_remote_fixture(
+            &fixture,
+            "preflight-runtime",
+            &format!("http://{}", reply.address),
+            false,
+        );
+        let context = server_api::ServerRequestContext {
+            actor: if operation == "grant" {
+                Some(RequestActor {
+                    user_id: "fixture-user".into(),
+                    account_id: format!("account-{WORKSPACE}"),
+                    handle: "fixture-user".into(),
+                    display_name: "Fixture user".into(),
+                    auth_method: ActorAuthMethod::BrowserSession,
+                })
+            } else {
+                None
+            },
+            worker_source: None,
+            runtime_source: if operation == "grant" {
+                None
+            } else {
+                Some(server_api::ServerRuntimeSource {
+                    authentication_binding_id: "fixture-binding".into(),
+                    runtime_id: "preflight-runtime".into(),
+                    worker_id: Some("source-worker".into()),
+                })
+            },
+            origin: None,
+            transport_headers: Vec::new(),
+        };
+        let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let api = fixture.api.clone();
+        let request_context = context.clone();
+        let task = tokio::spawn(crate::db_executor::with_operation_lifetime(
+            Arc::new(CountJobLifetime(leases.clone())),
+            async move { preflight(&api, &request_context, operation).await },
+        ));
+        let request = observed(reply.entered.take().unwrap()).await.unwrap();
+        assert!(request.contains("/v1/workers/"), "{operation}: {request}");
+        let store = fixture.store.clone();
+        observed(
+            fixture
+                .executor
+                .run(move || store.get_workspace_memory_settings(WORKSPACE)),
+        )
+        .await
+        .unwrap();
+        observed(tokio::time::sleep(StdDuration::from_millis(1))).await;
+        assert_eq!(
+            observed(tokio::spawn(async { "control" })).await.unwrap(),
+            "control"
+        );
+        assert!(!reply.upstream_released.load(Ordering::SeqCst));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(leases.load(Ordering::SeqCst), 1);
+        fixture.host_executor.dispatch(|| {}).unwrap();
+        assert_eq!(
+            observed(preflight(&fixture.api, &context, operation)).await,
+            503,
+            "{operation}: overload must not be authority denial"
+        );
+        reply.finish();
+        observed(fixture.host_executor.drain()).await.unwrap();
+        observed(fixture.executor.drain()).await.unwrap();
+        assert_eq!(leases.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ui_config_commit_publishes_after_commit_without_holding_the_sql_lane() {
+    let fixture = fixture().await;
+    let current = fixture
+        .api
+        .config_store
+        .load_workspace_config(WORKSPACE)
+        .unwrap()
+        .unwrap();
+    let mut reply = HeldRuntimeReply::new();
+    install_remote_fixture(
+        &fixture,
+        "prompt-runtime",
+        &format!("http://{}", reply.address),
+        false,
+    );
+    let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut commit = Box::pin(crate::db_executor::with_operation_lifetime(
+        Arc::new(CountJobLifetime(leases.clone())),
+        scoped_commit_workspace_config_tree(
+            State(fixture.api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: WORKSPACE.into(),
+            }),
+            Json(server_api::ConfigCommitRequest {
+                base_digest: current.snapshot.digest.clone(),
+                entrypoints: current
+                    .contract
+                    .entrypoints
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                changes: vec![server_api::ConfigTreeChange::Create {
+                    path: "notes/owned-publication.txt".into(),
+                    content_type: server_api::ConfigContentType::Text,
+                    content: "committed before prompt publication".into(),
+                }],
+            }),
+        ),
+    ));
+    assert!(futures::poll!(&mut commit).is_pending());
+    let request = observed(reply.entered.take().unwrap()).await.unwrap();
+    assert!(
+        request.starts_with("POST "),
+        "prompt publication: {request}"
+    );
+    let config_store = fixture.api.config_store.clone();
+    let state = observed(
+        fixture
+            .executor
+            .run(move || config_store.load_workspace_config(WORKSPACE)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_ne!(
+        state.snapshot.digest, current.snapshot.digest,
+        "publication must observe the committed tree"
+    );
+    assert!(
+        state
+            .snapshot
+            .entries
+            .keys()
+            .any(|path| path.to_string() == "notes/owned-publication.txt")
+    );
+    observed(tokio::time::sleep(StdDuration::from_millis(1))).await;
+    assert_eq!(
+        observed(tokio::spawn(async { "control" })).await.unwrap(),
+        "control"
+    );
+    assert!(!reply.upstream_released.load(Ordering::SeqCst));
+    drop(commit);
+    assert_eq!(leases.load(Ordering::SeqCst), 1);
+    reply.finish();
+    observed(fixture.host_executor.drain()).await.unwrap();
+    observed(fixture.executor.drain()).await.unwrap();
+    assert_eq!(leases.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .api
+            .config_store
+            .load_workspace_config(WORKSPACE)
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .digest,
+        state.snapshot.digest,
+        "failed best-effort publication must not repeat or roll back the commit"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn repository_provider_reads_do_not_consume_the_sql_execution_queue() {
+    let fixture = fixture().await;
+    let (entered, waiting) = oneshot::channel();
+    let (release, permit) = mpsc::channel();
+    fixture
+        .executor
+        .dispatch(move || {
+            let _ = entered.send(());
+            let _ = permit.recv_timeout(WATCHDOG);
+        })
+        .unwrap();
+    observed(waiting).await.unwrap();
+    fixture.executor.dispatch(|| {}).unwrap();
+    let probe = fixture.executor.run(|| Ok::<_, Error>(())).await;
+    assert!(matches!(probe, Err(Error::DbCapacityExceeded)));
+    // Empty catalog / absent key are deliberate boundary inputs: provider
+    // reads keep their ordinary response even when SQL job admission is full.
+    let list = observed(list_repositories(State(fixture.api.clone())))
+        .await
+        .unwrap();
+    assert!(list.0.items.is_empty());
+    let detail = observed(repository_detail(
+        State(fixture.api.clone()),
+        AxumPath("missing".into()),
+    ))
+    .await
+    .unwrap_err();
+    response_json(detail.into_response(), StatusCode::NOT_FOUND).await;
+    let log = observed(repository_log(
+        State(fixture.api.clone()),
+        AxumPath("missing".into()),
+        Query(LogQuery { limit: Some(1) }),
+    ))
+    .await
+    .unwrap_err();
+    response_json(log.into_response(), StatusCode::NOT_FOUND).await;
+    let _ = release.send(());
+    observed(fixture.executor.drain()).await.unwrap();
+    observed(fixture.host_executor.drain()).await.unwrap();
 }

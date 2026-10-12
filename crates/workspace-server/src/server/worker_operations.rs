@@ -383,46 +383,38 @@ impl WorkspaceWorker {
     ) -> ApiResult<WorkerLifecycleResult> {
         let guard = self.authorize_operation(context, "stop").await?;
         let worker = self.clone();
-        let (result, guard) = self
-            .api
-            .host_executors
-            .host()?
-            .run(move || -> ApiResult<_> {
-                let result = worker
-                    .api
-                    .runtime
-                    .stop_worker(&worker.identity, request)
-                    .map_err(|e| e.into_error())?;
-                Ok((result, guard))
-            })
-            .await?;
-        if result.state != InternalWorkerOperationState::Accepted {
-            return Ok(result);
-        }
-        parse_runtime_worker_id_for_registry(&self.identity.worker_id)?;
-        let session_lock = current_worker_session_lock(&self.api, &self.identity);
-        let session_guard = session_lock.lock_owned().await;
-        close_current_worker_session_locked(&self.api, &self.identity).await?;
-        let worker = self.clone();
-        self.api
-            .host_executors
-            .host()?
-            .run(move || -> ApiResult<_> {
-                let (_control, _session) = (guard, session_guard);
-                if let Some(record) = worker
-                    .api
-                    .store
-                    .get_worker_registry(worker.api.workspace_id(), &worker.identity)?
-                {
-                    sync_linked_workdir_after_worker_stop(
-                        &worker.api,
-                        &worker.identity.runtime_id,
-                        &record,
-                    )?;
-                }
-                Ok(result)
-            })
-            .await
+        // Once admitted, Runtime stop, session close and linked Workdir
+        // publication have one owner. Never hand an accepted stop's guards
+        // back to its cancellable waiter or acquire this Host lane again.
+        run_host_workflow(self.api.host_executors.host()?, async move {
+            let _control = guard;
+            let result = worker
+                .api
+                .runtime
+                .stop_worker(&worker.identity, request)
+                .map_err(|error| error.into_error())?;
+            if result.state != InternalWorkerOperationState::Accepted {
+                return Ok(result);
+            }
+            parse_runtime_worker_id_for_registry(&worker.identity.worker_id)?;
+            let _session = current_worker_session_lock(&worker.api, &worker.identity)
+                .lock_owned()
+                .await;
+            close_current_worker_session_locked(&worker.api, &worker.identity).await?;
+            if let Some(record) = worker
+                .api
+                .store
+                .get_worker_registry(worker.api.workspace_id(), &worker.identity)?
+            {
+                sync_linked_workdir_after_worker_stop(
+                    &worker.api,
+                    &worker.identity.runtime_id,
+                    &record,
+                )?;
+            }
+            Ok(result)
+        })
+        .await
     }
 
     pub(super) async fn cancel(

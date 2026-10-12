@@ -20,10 +20,16 @@ const SUBJECTS: &str = "/api/w/db-execution/subjektiv/subjects";
 const OBSERVE_LIMIT: StdDuration = StdDuration::from_secs(2);
 const WATCHDOG: StdDuration = StdDuration::from_secs(5);
 
-async fn observed<T>(future: impl Future<Output = T>) -> T {
-    tokio::time::timeout(OBSERVE_LIMIT, future)
-        .await
-        .expect("request did not reach the expected DB/lifecycle state")
+#[track_caller]
+fn observed<T>(future: impl Future<Output = T>) -> impl Future<Output = T> {
+    let caller = std::panic::Location::caller();
+    async move {
+        tokio::time::timeout(OBSERVE_LIMIT, future)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("request did not reach the expected DB/lifecycle state at {caller}")
+            })
+    }
 }
 
 struct Fixture {
@@ -954,7 +960,7 @@ impl HeldRuntimeReply {
         Self::with_held_path(Some(path.to_owned()))
     }
     fn with_held_path(path: Option<String>) -> Self {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (entered, received) = oneshot::channel();
@@ -967,16 +973,9 @@ impl HeldRuntimeReply {
                     return;
                 };
                 stream.set_read_timeout(Some(WATCHDOG)).unwrap();
-                let mut buf = [0; 4096];
-                let Ok(n) = stream.read(&mut buf) else { return };
-                if n == 0 {
+                let Ok(Some(request)) = read_runtime_fixture_request(&mut stream) else {
                     return;
-                }
-                let request = String::from_utf8_lossy(&buf[..n])
-                    .lines()
-                    .next()
-                    .unwrap()
-                    .to_owned();
+                };
                 if path.as_ref().is_some_and(|path| !request.contains(path)) {
                     // Ready's best-effort notification lookup precedes its detail
                     // source observation. Deny it promptly; hold only the named stage.
@@ -1010,6 +1009,76 @@ impl Drop for HeldRuntimeReply {
     fn drop(&mut self) {
         self.finish();
     }
+}
+
+// Read one complete request before selecting a held path or denying a prior
+// notification. TCP reads are not HTTP frame boundaries; replying while a POST
+// body remains unread can also reset the connection instead of delivering 503.
+fn read_runtime_fixture_request(reader: impl std::io::Read) -> std::io::Result<Option<String>> {
+    use std::io::{BufRead, Read};
+    let mut reader = std::io::BufReader::new(reader);
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Ok(None);
+    }
+    let request = line.trim_end().to_owned();
+    let mut header_bytes = line.len();
+    let mut body_len = 0;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        header_bytes += line.len();
+        if header_bytes > 16384 {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        if line == "\r\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                body_len = value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| std::io::ErrorKind::InvalidData)?;
+                if body_len > 1024 * 1024 {
+                    return Err(std::io::ErrorKind::InvalidData.into());
+                }
+            }
+            if name.eq_ignore_ascii_case("transfer-encoding") {
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
+        }
+    }
+    let mut body = vec![0; body_len];
+    reader.read_exact(&mut body)?;
+    Ok(Some(request))
+}
+
+#[test]
+fn held_runtime_fixture_consumes_fragmented_headers_and_body_before_selecting_the_path() {
+    struct Fragmented(std::io::Cursor<Vec<u8>>);
+    impl std::io::Read for Fragmented {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let length = buffer.len().min(2);
+            std::io::Read::read(&mut self.0, &mut buffer[..length])
+        }
+    }
+    let request = b"POST /v1/repository-refs/observe HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nnotes";
+    let mut reader = Fragmented(std::io::Cursor::new(request.to_vec()));
+    assert_eq!(
+        read_runtime_fixture_request(&mut reader)
+            .unwrap()
+            .as_deref(),
+        Some("POST /v1/repository-refs/observe HTTP/1.1")
+    );
+    assert_eq!(reader.0.position(), request.len() as u64);
+    let truncated = &request[..request.len() - 1];
+    assert_eq!(
+        read_runtime_fixture_request(truncated).unwrap_err().kind(),
+        std::io::ErrorKind::UnexpectedEof
+    );
 }
 
 struct CountJobLifetime(Arc<std::sync::atomic::AtomicUsize>);
@@ -1538,6 +1607,31 @@ async fn cancelled_runtime_key_revoke_commits_audit_and_removes_broker_registrat
             protocol::subscription::EventSubscriptionSelector::RuntimeWorkers,
         )
         .unwrap();
+    // Broker registration starts an independent cold signing DB job. Observe
+    // its actual handshake before occupying SQL for revoke: otherwise this
+    // fixture races that producer against HTTP auth in its 1+1 DB budget.
+    // Keep the handshake pending so downstream shutdown is still exercised.
+    let (mut upstream, _) = observed(listener.accept()).await.unwrap();
+    let handshake = observed(async {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            let mut chunk = [0; 1024];
+            let count = upstream.read(&mut chunk).await.unwrap();
+            assert_ne!(count, 0, "broker closed before sending its handshake");
+            bytes.extend_from_slice(&chunk[..count]);
+            assert!(bytes.len() <= 8192, "unexpectedly large handshake");
+        }
+        String::from_utf8(bytes).unwrap()
+    })
+    .await;
+    assert!(handshake.starts_with("GET /v1/protocol/ws "));
+    assert!(
+        handshake
+            .to_ascii_lowercase()
+            .contains("authorization: bearer ")
+    );
+    observed(fixture.executor.drain()).await.unwrap();
     let (mut busy, waiting) = BusyObservation::install_store(fixture.store.clone());
     let mut lock = WriteLock::acquire(fixture.api.config.database_path.clone());
     let server = fixture.server.clone();
@@ -1546,9 +1640,17 @@ async fn cancelled_runtime_key_revoke_commits_audit_and_removes_broker_registrat
         "/api/w/db-execution/runtimes/revoke-runtime/trust-key",
         serde_json::json!({"expected_binding_id": binding.binding_id}),
     );
-    let revoke =
+    let mut revoke =
         tokio::spawn(async move { dispatch_workspace_request(State(server), request).await });
-    observed(waiting).await.unwrap(); // Actual authenticated revoke reached BEGIN IMMEDIATE.
+    tokio::select! {
+        reached = observed(waiting) => reached.unwrap(), // Actual authenticated BEGIN IMMEDIATE.
+        response = &mut revoke => {
+            let response = response.unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+            panic!("revoke returned before its SQLite wait: {status}: {}", String::from_utf8_lossy(&body));
+        }
+    }
     runtime_progress_while_locked(&lock).await;
     revoke.abort();
     assert!(revoke.await.unwrap_err().is_cancelled());

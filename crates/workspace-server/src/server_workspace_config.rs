@@ -62,7 +62,7 @@ fn unknown() -> Failure {
         ..fail(500, "outcome_unknown")
     }
 }
-pub(super) fn identity(
+pub(super) async fn identity(
     api: &WorkspaceApi,
     context: &server_api::ServerRequestContext,
     workspace_id: &str,
@@ -70,7 +70,9 @@ pub(super) fn identity(
     validate_workspace_scope(api, workspace_id).map_err(pre_error)?;
     let headers =
         current_worker_contract_headers(context).map_err(|_| fail(403, "access_denied"))?;
-    current_worker_identity(api, workspace_id, &headers).map_err(pre_error)
+    authenticate_worker_mutation_source_owned(api, workspace_id, &headers)
+        .await
+        .map_err(pre_error)
 }
 async fn lock(
     api: &WorkspaceApi,
