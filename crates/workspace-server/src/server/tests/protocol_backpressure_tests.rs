@@ -11,6 +11,7 @@ async fn embedded_event_overflow_terminates_without_losing_the_admitted_prefix()
     let mut connection = connect_embedded_worker_protocol(
         embedded_protocol_test_source(&runtime, &worker_ref),
         embedded_protocol_test_scope(),
+        HostExecutors::default().host().unwrap(),
     )
     .await
     .unwrap();
@@ -69,6 +70,7 @@ async fn embedded_protocol_delivers_snapshot_then_ordered_replies_and_live_event
     let mut connection = connect_embedded_worker_protocol(
         embedded_protocol_test_source(&runtime, &worker_ref),
         embedded_protocol_test_scope(),
+        HostExecutors::default().host().unwrap(),
     )
     .await
     .unwrap();
@@ -105,9 +107,13 @@ async fn embedded_protocol_delivers_snapshot_then_ordered_replies_and_live_event
 async fn embedded_overflow_requires_explicit_reconnect_and_stop_ends_the_new_connection() {
     let (runtime, worker_ref, execution) = runtime_with_worker_backend();
     let source = embedded_protocol_test_source(&runtime, &worker_ref);
-    let mut old = connect_embedded_worker_protocol(source.clone(), embedded_protocol_test_scope())
-        .await
-        .unwrap();
+    let mut old = connect_embedded_worker_protocol(
+        source.clone(),
+        embedded_protocol_test_scope(),
+        HostExecutors::default().host().unwrap(),
+    )
+    .await
+    .unwrap();
     assert_embedded_protocol_snapshot(next_embedded_protocol_event(&mut old).await, &worker_ref);
     tokio::time::timeout(PROTOCOL_TEST_TIMEOUT, async {
         for index in 0..=WORKER_PROTOCOL_EVENT_CAPACITY {
@@ -127,9 +133,13 @@ async fn embedded_overflow_requires_explicit_reconnect_and_stop_ends_the_new_con
 
     // Overflow ends only the attached connection, not its Worker. Reconnection
     // is explicit and starts from a fresh execution snapshot, not old backlog.
-    let mut fresh = connect_embedded_worker_protocol(source, embedded_protocol_test_scope())
-        .await
-        .unwrap();
+    let mut fresh = connect_embedded_worker_protocol(
+        source,
+        embedded_protocol_test_scope(),
+        HostExecutors::default().host().unwrap(),
+    )
+    .await
+    .unwrap();
     assert_embedded_protocol_snapshot(next_embedded_protocol_event(&mut fresh).await, &worker_ref);
     fresh
         .methods
@@ -797,6 +807,7 @@ async fn embedded_disconnect_and_last_owner_drop_release_the_execution_event_sub
         let mut connection = connect_embedded_worker_protocol(
             embedded_protocol_test_source(&runtime, &worker_ref),
             embedded_protocol_test_scope(),
+            HostExecutors::default().host().unwrap(),
         )
         .await
         .unwrap();

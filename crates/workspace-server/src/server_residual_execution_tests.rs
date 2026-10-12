@@ -841,3 +841,64 @@ async fn ticket_tracking_and_case_authority_runtime_lookup_leave_db_and_tokio_fr
         );
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_feature_shutdown_keeps_sql_close_owned_without_blocking_control() {
+    let fixture = fixture().await;
+    let (database, _) = fixture.feature_database();
+    let mutation = database.clone();
+    let (entered, waiting) = oneshot::channel();
+    let (release, permit) = mpsc::channel();
+    let released = Arc::new(AtomicBool::new(false));
+    let flag = released.clone();
+    let thread = std::thread::spawn(move || {
+        mutation
+            .with_connection(|conn| {
+                conn.execute_batch("BEGIN IMMEDIATE; CREATE TABLE close_owner_probe(id INTEGER)")?;
+                let _ = entered.send(());
+                let _ = permit.recv_timeout(WATCHDOG);
+                flag.store(true, Ordering::SeqCst);
+                conn.execute_batch("ROLLBACK")?;
+                Ok(())
+            })
+            .unwrap();
+    });
+    let mut lock = WriteLock {
+        release: Some(release),
+        thread: Some(thread),
+        released,
+    };
+    observed(waiting).await.unwrap(); // actual SQL transaction owns the Feature connection
+    let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut close = Box::pin(crate::db_executor::with_operation_lifetime(
+        Arc::new(CountJobLifetime(leases.clone())),
+        shutdown_workspace_feature_storage(&fixture.api),
+    ));
+    assert!(
+        futures::poll!(&mut close).is_pending(),
+        "Feature connection close must not wait on Tokio"
+    );
+    runtime_progress_while_locked(&lock).await;
+    assert_eq!(
+        observed(fixture.host_executor.run(|| Ok::<_, Error>("control")))
+            .await
+            .unwrap(),
+        "control"
+    );
+    fixture.executor.dispatch(|| {}).unwrap();
+    assert!(matches!(
+        shutdown_workspace_feature_storage(&fixture.api)
+            .await
+            .unwrap_err(),
+        Error::DbCapacityExceeded
+    ));
+    drop(close);
+    assert_eq!(leases.load(Ordering::SeqCst), 1);
+    lock.release();
+    observed(fixture.executor.drain()).await.unwrap();
+    assert_eq!(leases.load(Ordering::SeqCst), 0);
+    assert!(
+        database.with_connection(|_| Ok(())).is_err(),
+        "accepted shutdown must fence later use"
+    );
+}

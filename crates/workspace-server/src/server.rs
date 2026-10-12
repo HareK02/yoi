@@ -2651,16 +2651,7 @@ impl WorkspaceServerApi {
     async fn shutdown_feature_storage(&self) -> Result<()> {
         let apis = self.apis.lock().await.values().cloned().collect::<Vec<_>>();
         for api in apis {
-            api.worker_projection.shutdown_async().await;
-            let storage = api.feature_storage.clone();
-            api.store
-                .db_executor()
-                .run(move || {
-                    storage.shutdown().map_err(|error| {
-                        Error::Store(format!("failed to shut down Feature storage: {error}"))
-                    })
-                })
-                .await?;
+            shutdown_workspace_feature_storage(&api).await?;
         }
         Ok(())
     }
@@ -12271,13 +12262,26 @@ pub async fn serve(
     let orchestrator_hook = tokio::spawn(run_orchestrator_turn_end_hook(api.clone()));
     let result = axum::serve(listener, build_router(api.clone())).await;
     orchestrator_hook.abort();
-    let storage_result = api
-        .feature_storage
-        .shutdown()
-        .map_err(|error| Error::Store(format!("failed to shut down Feature storage: {error}")));
+    let _ = orchestrator_hook.await;
+    let storage_result = shutdown_workspace_feature_storage(&api).await;
     result?;
     storage_result?;
     Ok(())
+}
+
+// Feature shutdown fences new operations and waits for synchronous connection
+// holders. Accepted close retains ownership after its async waiter disappears.
+async fn shutdown_workspace_feature_storage(api: &WorkspaceApi) -> Result<()> {
+    api.worker_projection.shutdown_async().await;
+    let storage = api.feature_storage.clone();
+    api.store
+        .db_executor()
+        .run(move || {
+            storage.shutdown().map_err(|error| {
+                Error::Store(format!("failed to shut down Feature storage: {error}"))
+            })
+        })
+        .await
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31749,7 +31753,7 @@ pub(crate) async fn connect_workspace_worker_protocol(
         RuntimeObservationSource::Embedded(source) => {
             let scope =
                 worker_runtime::RuntimeWorkspaceScope::new(api.workspace_id(), "embedded-backend");
-            connect_embedded_worker_protocol(source, scope).await
+            connect_embedded_worker_protocol(source, scope, api.host_executors.host()?).await
         }
     }
 }
@@ -31845,18 +31849,25 @@ async fn connect_remote_worker_protocol(
 async fn connect_embedded_worker_protocol(
     source: crate::observation::EmbeddedRuntimeObservationSource,
     scope: worker_runtime::RuntimeWorkspaceScope,
+    executor: crate::db_executor::DbExecutor,
 ) -> Result<WorkspaceWorkerProtocolConnection> {
-    // Capture one real execution endpoint, including its greeting/snapshot.
-    // The WorkerRef-wide Workspace observation bus is a separate catalogue
-    // channel and must not reconnect this operational session after Restore.
-    let mut transport = source
-        .runtime
-        .attach_worker_protocol_scoped(&scope, &source.worker_ref)
-        .map_err(|error| Error::RuntimeOperationFailed {
-            runtime_id: source.worker.runtime_id.clone(),
-            code: "embedded_worker_protocol_connect_failed".to_string(),
-            message: error.to_string(),
-        })?;
+    // Endpoint capture takes Runtime operation/state locks. Keep it, and each
+    // intact method (including fs-store commit/publication), off Tokio and the
+    // sole DB lane. A discarded reply retains the endpoint until cleanup.
+    let capture_source = source.clone();
+    let capture_scope = scope.clone();
+    let mut transport = executor
+        .run(move || {
+            capture_source
+                .runtime
+                .attach_worker_protocol_scoped(&capture_scope, &capture_source.worker_ref)
+                .map_err(|error| Error::RuntimeOperationFailed {
+                    runtime_id: capture_source.worker.runtime_id.clone(),
+                    code: "embedded_worker_protocol_connect_failed".to_string(),
+                    message: error.to_string(),
+                })
+        })
+        .await?;
     Ok(spawn_worker_protocol_pump(
         move |mut methods, events| async move {
             if let Err(reason) = enqueue_worker_protocol_event(&events, transport.snapshot.clone())
@@ -31868,9 +31879,26 @@ async fn connect_embedded_worker_protocol(
                     method = methods.recv() => {
                         let Some(method) = method else { return WorkerProtocolEnd::Disconnected; };
                         let shutdown = matches!(&method, protocol::Method::Shutdown { .. });
-                        match source.runtime.send_connected_protocol_method_scoped(
-                            &scope, &source.worker_ref, &transport, method,
-                        ) {
+                        let method_source = source.clone();
+                        let method_scope = scope.clone();
+                        let owned = executor.run(move || {
+                            let result = method_source.runtime.send_connected_protocol_method_scoped(
+                                &method_scope, &method_source.worker_ref, &transport, method,
+                            );
+                            // Endpoint validation is synchronous too.
+                            let terminal = result.as_ref().err().is_some_and(|error|
+                                embedded_protocol_dispatch_is_terminal(error, &transport));
+                            Ok::<_, Error>((transport, result, terminal))
+                        }).await;
+                        let (returned, result, terminal) = match owned {
+                            Ok(value) => value,
+                            Err(error) => {
+                                let _ = enqueue_worker_protocol_event(&events, protocol_error_event(error.to_string()));
+                                return WorkerProtocolEnd::Disconnected;
+                            }
+                        };
+                        transport = returned;
+                        match result {
                             Ok(direct_events) => {
                                 for event in direct_events {
                                     let terminal = matches!(event, protocol::Event::Shutdown);
@@ -31879,7 +31907,6 @@ async fn connect_embedded_worker_protocol(
                                 }
                             }
                             Err(error) => {
-                                let terminal = embedded_protocol_dispatch_is_terminal(&error, &transport);
                                 if let Err(reason) = enqueue_worker_protocol_event(&events, protocol_error_event(error.to_string())) { return reason; }
                                 if terminal { return WorkerProtocolEnd::Disconnected; }
                             }
@@ -31892,7 +31919,6 @@ async fn connect_embedded_worker_protocol(
                             if let Err(reason) = enqueue_worker_protocol_event(&events, event) { return reason; }
                             if terminal { return WorkerProtocolEnd::Disconnected; }
                         }
-                        // Stop, disconnect and upstream lag never cause an implicit reattach.
                         None => return WorkerProtocolEnd::Disconnected,
                     }
                 }
@@ -35184,6 +35210,7 @@ mod tests {
     mod drive_api_tests;
     mod drive_tests;
     mod drive_web_roundtrip_tests;
+    mod embedded_owned_execution_tests;
     mod external_checkout_tests;
     mod protocol_backpressure_tests;
     mod subject_spawn_tests;
@@ -45338,6 +45365,7 @@ mod tests {
     // The receiver belongs to one mock execution, not to a Runtime WorkerRecord.
     // Bound protocol senders become terminal when Stop drops this execution.
     struct DeterministicWorkerExecution {
+        dispatch_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
         context: worker_runtime::execution::WorkerExecutionContext,
         state: std::sync::Mutex<protocol::WorkerStateSnapshot>,
         method_tx: tokio::sync::mpsc::Sender<protocol::Method>,
@@ -45357,6 +45385,7 @@ mod tests {
             let (method_tx, method_rx) = tokio::sync::mpsc::channel(32);
             let (events, _) = tokio::sync::broadcast::channel(32);
             Self {
+                dispatch_hook: std::sync::Mutex::new(None),
                 context,
                 state: std::sync::Mutex::new(protocol::WorkerStateSnapshot::initial()),
                 method_tx,
@@ -45380,6 +45409,9 @@ mod tests {
             Vec<protocol::Event>,
             worker_runtime::execution::WorkerExecutionResult,
         > {
+            if let Some(hook) = self.dispatch_hook.lock().unwrap().take() {
+                hook();
+            }
             // Drive the actual mock receiver synchronously; no method is routed
             // through a WorkerRef lookup after a protocol connection is attached.
             let mut receiver = self.method_rx.lock().unwrap();
@@ -61492,10 +61524,13 @@ mod tests {
         for delayed in delayed_protocol_test_methods() {
             let (runtime, worker_ref, execution) = runtime_with_worker_backend();
             let source = embedded_protocol_test_source(&runtime, &worker_ref);
-            let mut old =
-                connect_embedded_worker_protocol(source.clone(), embedded_protocol_test_scope())
-                    .await
-                    .unwrap();
+            let mut old = connect_embedded_worker_protocol(
+                source.clone(),
+                embedded_protocol_test_scope(),
+                HostExecutors::default().host().unwrap(),
+            )
+            .await
+            .unwrap();
             assert_embedded_protocol_snapshot(
                 next_embedded_protocol_event(&mut old).await,
                 &worker_ref,
@@ -61559,10 +61594,13 @@ mod tests {
                 &[worker_ref.clone()]
             );
 
-            let mut current =
-                connect_embedded_worker_protocol(source, embedded_protocol_test_scope())
-                    .await
-                    .unwrap();
+            let mut current = connect_embedded_worker_protocol(
+                source,
+                embedded_protocol_test_scope(),
+                HostExecutors::default().host().unwrap(),
+            )
+            .await
+            .unwrap();
             assert_embedded_protocol_snapshot(
                 next_embedded_protocol_event(&mut current).await,
                 &worker_ref,
@@ -61710,10 +61748,13 @@ mod tests {
         for lagged in [false, true] {
             let (runtime, worker_ref, execution) = runtime_with_worker_backend();
             let source = embedded_protocol_test_source(&runtime, &worker_ref);
-            let mut bridge =
-                connect_embedded_worker_protocol(source.clone(), embedded_protocol_test_scope())
-                    .await
-                    .unwrap();
+            let mut bridge = connect_embedded_worker_protocol(
+                source.clone(),
+                embedded_protocol_test_scope(),
+                HostExecutors::default().host().unwrap(),
+            )
+            .await
+            .unwrap();
             assert_embedded_protocol_snapshot(
                 next_embedded_protocol_event(&mut bridge).await,
                 &worker_ref,
@@ -61755,6 +61796,7 @@ mod tests {
         let mut bridge = connect_embedded_worker_protocol(
             embedded_protocol_test_source(&runtime, &worker_ref),
             embedded_protocol_test_scope(),
+            HostExecutors::default().host().unwrap(),
         )
         .await
         .unwrap();
@@ -61815,9 +61857,13 @@ mod tests {
         let wrong_scope =
             worker_runtime::RuntimeWorkspaceScope::new("other-workspace", "local-token");
         assert!(
-            connect_embedded_worker_protocol(source.clone(), wrong_scope.clone())
-                .await
-                .is_err()
+            connect_embedded_worker_protocol(
+                source.clone(),
+                wrong_scope.clone(),
+                HostExecutors::default().host().unwrap()
+            )
+            .await
+            .is_err()
         );
         let (mut socket, server) =
             spawn_embedded_protocol_test_ws(source.clone(), wrong_scope, false).await;
