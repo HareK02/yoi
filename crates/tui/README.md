@@ -4,7 +4,5 @@
 
 ## Implementation entry points
 
-- [`launch`] / [`LaunchMode`] — typed launch requests and terminal restoration.
-- `src/app.rs`: display state built from protocol snapshots and events.
-- `src/input.rs` / `src/composer_history.rs`: typed input and local editing history.
-- `src/console/`: connection, input-event, and attachment-staging management.
+- [`launch`] — Console and Dashboard execution with terminal restoration.
+- [`LaunchOptions`] / [`LaunchMode`] — typed connection and launch requests.

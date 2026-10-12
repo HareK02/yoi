@@ -4,4 +4,4 @@
 
 ## Main entry points
 
-- [`stdio`](src/stdio.rs): Server launch configuration resolution, bounded responses, diagnostics, and shutdown.
+- [`stdio`]: Server launch configuration resolution, bounded responses, diagnostics, and shutdown.

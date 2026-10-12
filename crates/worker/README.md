@@ -4,8 +4,8 @@
 
 ## Main entry points
 
-- [`Worker`](src/worker.rs): Input admission, execution, and Session restoration.
-- [`controller`](src/controller.rs): Worker control and protocol intake.
-- [`feature`](src/feature.rs): Feature declarations, registration, and structured invocation.
-- [`wip`](src/wip.rs): WIP namespaces, native/compatibility projections, and the Client/Host boundary.
-- [`spawn`](src/spawn/mod.rs): Delegation and control of parent-owned Internal SubWorkers.
+- [`Worker`]: Input admission, execution, and Session restoration.
+- [`controller`]: Worker control and protocol intake.
+- [`feature`]: Feature declarations, registration, and structured invocation.
+- [`wip`]: WIP namespaces, native/compatibility projections, and the Client/Host boundary.
+- [`spawn`]: Delegation and control of parent-owned Internal SubWorkers.

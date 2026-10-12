@@ -7,7 +7,7 @@
 - `principle/`：複数の実装に共通する設計原則。判断が競合したときの基準と、その理由を書く。個別の処理手順やデータ構造は置かない。
 - `development/`：テスト設計、検証、レビューなど、開発を続けるための規則。製品の操作手順や環境設定の説明は置かない。
 - `report/`：問題発生時の報告。試みた操作、観測した事実、影響、原因の確度、未解決事項を記録する。過去の報告は現行仕様の根拠にせず、当時の記録として蓄積できる。
-- Rustのcrate README：責務と非責務を短く示し、主要moduleへの参照を置く。各crateの`lib.rs`は`#![doc = include_str!("../README.md")]`でREADMEをcrateドキュメントとして使う。
+- Rustのcrate README：責務と非責務を短く示し、主要moduleへの参照を置く。各crateの`lib.rs`は`#![doc = include_str!("../README.md")]`でREADMEをcrateドキュメントとして使い、参照はrustdocのintra-doc linkに統一する。リンク先は公開ドキュメントに存在するmodule・itemとし、リンクのために実装の公開範囲を広げない。
 - Rustのmodule・itemドキュメント：所有境界、状態遷移、失敗時の保証と限界、非自明な判断理由を書く。API一覧や実装の逐語説明は繰り返さない。
 
 WebなどRust以外の実装に固有の理由は、そのソースのmodule・型・処理に付くコメントで管理する。無関係なRust crateへ移さず、実装説明の別冊も増やさない。複数の画面・部品の設計判断に使うDesign LanguageやUX規則は文書として維持し、個別実装の説明と区別する。

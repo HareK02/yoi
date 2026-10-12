@@ -4,7 +4,7 @@ Manages Worker creation, stopping, and Restore, execution connections within the
 
 ## Reference index
 
-- [`Runtime`](crate::Runtime): lifecycle operation acceptance, Workspace boundaries, and execution connections.
+- [`Runtime`]: lifecycle operation acceptance, Workspace boundaries, and execution connections.
 - [`execution`] — execution backends and operation-specific results.
 - [`working_directory`] — repository materialization, session resources, and safe deletion.
 - [`workspace_issuer`] — Workspace signature verification and replay prevention.

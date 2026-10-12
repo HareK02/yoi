@@ -4,7 +4,7 @@
 
 ## Main entry points
 
-- [`core_builtin_tools`](src/lib.rs) / [`routed_builtin_tools`](src/lib.rs): registration by provider capability and connection resolution.
-- [`checkout`](src/checkout.rs): shared handling for route-bound native operations and regular Tools.
-- [`tracker`](src/tracker.rs): read hashes and change tracking per connection generation.
-- [`view_image`](src/view_image.rs): bounded byte retrieval and image detection.
+- [`core_builtin_tools`] / [`routed_builtin_tools`]: registration by provider capability and connection resolution.
+- [`checkout`]: shared handling for route-bound native operations and regular Tools.
+- [`tracker`]: read hashes and change tracking per connection generation.
+- [`view_image`]: bounded byte retrieval and image detection.

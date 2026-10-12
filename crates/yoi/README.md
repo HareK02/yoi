@@ -4,7 +4,6 @@
 
 ## Implementation entry points
 
-- `src/main.rs`: product command parsing and dispatch to launch targets.
-- `src/cli_connection.rs`: per-command connection requirements and target resolution.
-- `src/workspace_bootstrap.rs`: Workspace creation and Backend routing records.
+Command dispatch, connection selection, and Workspace bootstrap are binary-internal. The library exposes:
+
 - [`workdir_share`] — sharing existing Workdirs.

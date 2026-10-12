@@ -15,7 +15,7 @@ cargo test -p <crate> --lib <test-or-module-filter>
 cargo test -p <crate> --test <test-target> <test-filter>
 ```
 
-完了前は[AGENTS.md](../../AGENTS.md)に従ってrootのcompile closureと変更crate全体を確認する。
+完了前にはworkspace rootで必ず`cargo check`を実行し、TUI・Serverを含む通常のcompile closureと変更crate全体を確認する。公開型の変更ごとにreverse dependencyを推測して`-p`を列挙する運用にはしない。
 
 ```sh
 cargo check
@@ -27,6 +27,14 @@ git diff --check HEAD
 単体・コンポーネント・結合は通常のテストに含める。SQLite、loopback、隔離子プロセスを使うtargetも省略しない。影響する製品feature、test-only target、別crateが所有する結合suiteを追加する。`cargo check`はテストを実行せず、`--lib`だけでは外部integration-test targetを実行しない。
 
 Workspace全体、`--all-targets`、Nix/Dockerなどの重い検証は、変更した境界を狭い検証では確認できない場合か、明示的に求められた場合に選ぶ。既存の無関係なformat差分を混ぜない。公開APIや生成元を変えた場合は、所有する生成処理と差分検査で生成物との一致を確認する。
+
+## 状態契約の命名検査
+
+完了前に次を実行する。例外一覧を機械的に増やして合格させず、必要な保存互換・検証・禁止規則の記述だけを理由付きで扱う。
+
+```sh
+env -u LD_LIBRARY_PATH deno run --allow-read --allow-run=git tools/check-state-contract-names.ts
+```
 
 ## Webとレビュー
 
