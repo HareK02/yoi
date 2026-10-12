@@ -20372,11 +20372,26 @@ fn require_dedicated_subjektiv_consolidation_worker(
     }
 }
 
-fn subjektiv_subject_scope(
+// Store-only authority discovery. A mandatory Session attribution callback must
+// reject consolidation roles without consulting Runtime: its create/restore parent
+// can already hold a Host worker while Runtime waits for that callback to finish.
+enum SubjektivStoredScopeAuthority {
+    Subject,
+    JobConsolidation,
+    LegacyConsolidation { singleton_key: String },
+}
+
+struct SubjektivStoredWorkerScope {
+    subject_id: String,
+    worker: RuntimeWorkerRef,
+    authority: SubjektivStoredScopeAuthority,
+}
+
+fn subjektiv_worker_scope_from_store(
     api: &WorkspaceApi,
     workspace_id: &str,
     context: &server_api::ServerRequestContext,
-) -> ApiResult<(String, RuntimeWorkerRef, SubjektivWorkerAuthority)> {
+) -> ApiResult<SubjektivStoredWorkerScope> {
     let source = context.runtime_source.as_ref().ok_or_else(|| {
         Error::WorkspacePermissionDenied(
             "subjektiv operations require authenticated Runtime-owned source authority".to_string(),
@@ -20389,11 +20404,11 @@ fn subjektiv_subject_scope(
     })?;
     let worker = RuntimeWorkerRef::new(&source.runtime_id, worker_id);
     if let Some(grant) = subjektiv_job::active_grant(api, workspace_id, &worker)? {
-        return Ok((
-            grant.subject_id,
+        return Ok(SubjektivStoredWorkerScope {
+            subject_id: grant.subject_id,
             worker,
-            SubjektivWorkerAuthority::Consolidation,
-        ));
+            authority: SubjektivStoredScopeAuthority::JobConsolidation,
+        });
     }
     let lease = api
         .store
@@ -20404,15 +20419,47 @@ fn subjektiv_subject_scope(
             )
         })?;
     let (subject_id, authority) = subjektiv_scope_from_singleton_key(&lease.key)?;
-    if authority == SubjektivWorkerAuthority::Consolidation {
-        let mut summary = api
-            .runtime
-            .worker(&worker)
-            .map_err(|error| error.into_error())?;
-        summary.singleton_key = Some(lease.key.clone());
-        require_dedicated_subjektiv_consolidation_worker(&summary, workspace_id, &lease.key)?;
-    }
-    Ok((subject_id.to_string(), worker, authority))
+    let authority = match authority {
+        SubjektivWorkerAuthority::Subject => SubjektivStoredScopeAuthority::Subject,
+        SubjektivWorkerAuthority::Consolidation => {
+            SubjektivStoredScopeAuthority::LegacyConsolidation {
+                singleton_key: lease.key.clone(),
+            }
+        }
+    };
+    Ok(SubjektivStoredWorkerScope {
+        subject_id: subject_id.to_owned(),
+        worker,
+        authority,
+    })
+}
+
+// Mixed callers run this complete policy boundary on Host. Only legacy
+// consolidation authority needs synchronous Runtime profile/tag verification.
+fn subjektiv_subject_scope(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    context: &server_api::ServerRequestContext,
+) -> ApiResult<(String, RuntimeWorkerRef, SubjektivWorkerAuthority)> {
+    let scope = subjektiv_worker_scope_from_store(api, workspace_id, context)?;
+    let authority = match scope.authority {
+        SubjektivStoredScopeAuthority::Subject => SubjektivWorkerAuthority::Subject,
+        SubjektivStoredScopeAuthority::JobConsolidation => SubjektivWorkerAuthority::Consolidation,
+        SubjektivStoredScopeAuthority::LegacyConsolidation { singleton_key } => {
+            let mut summary = api
+                .runtime
+                .worker(&scope.worker)
+                .map_err(|error| error.into_error())?;
+            summary.singleton_key = Some(singleton_key.clone());
+            require_dedicated_subjektiv_consolidation_worker(
+                &summary,
+                workspace_id,
+                &singleton_key,
+            )?;
+            SubjektivWorkerAuthority::Consolidation
+        }
+    };
+    Ok((scope.subject_id, scope.worker, authority))
 }
 
 fn require_subjektiv_worker_authority(
@@ -20436,8 +20483,8 @@ fn subjektiv_session_attribution(
     context: &server_api::ServerRequestContext,
     session_id: &str,
 ) -> ApiResult<crate::subjektiv::SubjectSessionAttribution> {
-    let (subject_id, worker, authority) = subjektiv_subject_scope(api, workspace_id, context)?;
-    if authority != SubjektivWorkerAuthority::Subject {
+    let scope = subjektiv_worker_scope_from_store(api, workspace_id, context)?;
+    if !matches!(scope.authority, SubjektivStoredScopeAuthority::Subject) {
         return Err(Error::WorkspacePermissionDenied(
             "subject Session attribution requires the current subject Worker".into(),
         )
@@ -20448,9 +20495,9 @@ fn subjektiv_session_attribution(
         return Err(Error::InvalidInput("committed session_id is invalid".to_string()).into());
     }
     crate::subjektiv::SubjectSessionAttribution::new(
-        subject_id,
-        worker.runtime_id,
-        worker.worker_id,
+        scope.subject_id,
+        scope.worker.runtime_id,
+        scope.worker.worker_id,
         session_id,
     )
     .map_err(|error| Error::InvalidInput(error.to_string()).into())
@@ -20885,8 +20932,11 @@ async fn scoped_record_subjektiv_session(
     context: server_api::ServerRequestContext,
     Json(request): Json<server_api::SubjektivRecordSessionRequest>,
 ) -> ApiResult<Json<server_api::SubjektivRecordSessionResponse>> {
-    api.host_executors
-        .host()?
+    // Runtime create/restore waits for this mandatory callback while holding
+    // Host capacity. Its Subject-only authority and whole attribution SQL must
+    // use the independent DB lane, never the parent's waiting Host lane.
+    api.store
+        .db_executor()
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let attribution = if request.create_if_missing {
@@ -22251,63 +22301,86 @@ async fn scoped_subjektiv_memory_backend(
     context: server_api::ServerRequestContext,
     Json(request): Json<server_api::SubjektivMemoryBackendRequest>,
 ) -> ApiResult<Json<server_api::SubjektivMemoryBackendResponse>> {
-    api.host_executors
-        .host()?
+    use server_api::SubjektivMemoryBackendOperation as Op;
+    // Subject-only operations are complete DB boundaries. This includes resident
+    // context callbacks during Runtime create/restore; they must not queue behind
+    // the Host parents waiting for them. Other roles can need legacy Runtime checks.
+    let (expected, label) = match &request.operation {
+        Op::ResidentSummary(_) => (
+            Some(SubjektivWorkerAuthority::Subject),
+            "resident surface read",
+        ),
+        Op::ResidentContext(_) => (
+            Some(SubjektivWorkerAuthority::Subject),
+            "resident subject context read",
+        ),
+        Op::ValidateProposal(_) => (
+            Some(SubjektivWorkerAuthority::Subject),
+            "Memory proposal validation",
+        ),
+        Op::ReceiptStatus(_) => (
+            Some(SubjektivWorkerAuthority::Subject),
+            "explicit candidate receipt lookup",
+        ),
+        Op::StageExplicit(_) => (
+            Some(SubjektivWorkerAuthority::Subject),
+            "explicit candidate staging",
+        ),
+        Op::ListCandidates(_) => (
+            Some(SubjektivWorkerAuthority::Consolidation),
+            "candidate listing",
+        ),
+        Op::ReadCandidate(_) => (
+            Some(SubjektivWorkerAuthority::Consolidation),
+            "candidate read",
+        ),
+        Op::DecideCandidate(_) => (
+            Some(SubjektivWorkerAuthority::Consolidation),
+            "candidate decision",
+        ),
+        Op::PrepareSurface(_) => (
+            Some(SubjektivWorkerAuthority::Consolidation),
+            "surface generation preparation",
+        ),
+        Op::PublishSurface(_) => (
+            Some(SubjektivWorkerAuthority::Consolidation),
+            "surface publication",
+        ),
+        Op::FailSurface(_) => (
+            Some(SubjektivWorkerAuthority::Consolidation),
+            "surface generation failure",
+        ),
+        Op::Query(_) | Op::Read(_) | Op::ListChanges(_) => (None, "recall"),
+    };
+    let executor = if expected == Some(SubjektivWorkerAuthority::Subject) {
+        api.store.db_executor()
+    } else {
+        api.host_executors.host()?
+    };
+    executor
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
-            let (subject_id, source_worker, authority) =
-                subjektiv_subject_scope(&api, &path.workspace_id, &context)?;
+            let (subject_id, source_worker, authority) = if expected
+                == Some(SubjektivWorkerAuthority::Subject)
+            {
+                let scope = subjektiv_worker_scope_from_store(&api, &path.workspace_id, &context)?;
+                if !matches!(scope.authority, SubjektivStoredScopeAuthority::Subject) {
+                    return Err(Error::WorkspacePermissionDenied(format!(
+                        "subjektiv {label} is not authorized for this Worker role"
+                    ))
+                    .into());
+                }
+                (
+                    scope.subject_id,
+                    scope.worker,
+                    SubjektivWorkerAuthority::Subject,
+                )
+            } else {
+                subjektiv_subject_scope(&api, &path.workspace_id, &context)?
+            };
             let store = open_subjektiv_store(&api)?;
-            use server_api::SubjektivMemoryBackendOperation as Op;
             // Authentication, live Worker/Job authority and committed Session provenance
             // remain Backend-owned. Only the domain operation/projection is shared.
-            let (expected, label) = match &request.operation {
-                Op::ResidentSummary(_) => (
-                    Some(SubjektivWorkerAuthority::Subject),
-                    "resident surface read",
-                ),
-                Op::ResidentContext(_) => (
-                    Some(SubjektivWorkerAuthority::Subject),
-                    "resident subject context read",
-                ),
-                Op::ValidateProposal(_) => (
-                    Some(SubjektivWorkerAuthority::Subject),
-                    "Memory proposal validation",
-                ),
-                Op::ReceiptStatus(_) => (
-                    Some(SubjektivWorkerAuthority::Subject),
-                    "explicit candidate receipt lookup",
-                ),
-                Op::StageExplicit(_) => (
-                    Some(SubjektivWorkerAuthority::Subject),
-                    "explicit candidate staging",
-                ),
-                Op::ListCandidates(_) => (
-                    Some(SubjektivWorkerAuthority::Consolidation),
-                    "candidate listing",
-                ),
-                Op::ReadCandidate(_) => (
-                    Some(SubjektivWorkerAuthority::Consolidation),
-                    "candidate read",
-                ),
-                Op::DecideCandidate(_) => (
-                    Some(SubjektivWorkerAuthority::Consolidation),
-                    "candidate decision",
-                ),
-                Op::PrepareSurface(_) => (
-                    Some(SubjektivWorkerAuthority::Consolidation),
-                    "surface generation preparation",
-                ),
-                Op::PublishSurface(_) => (
-                    Some(SubjektivWorkerAuthority::Consolidation),
-                    "surface publication",
-                ),
-                Op::FailSurface(_) => (
-                    Some(SubjektivWorkerAuthority::Consolidation),
-                    "surface generation failure",
-                ),
-                Op::Query(_) | Op::Read(_) | Op::ListChanges(_) => (None, "recall"),
-            };
             if let Some(expected) = expected {
                 require_subjektiv_worker_authority(authority, expected, label)?;
             }

@@ -1,34 +1,45 @@
 use super::*;
 
-#[tokio::test]
-async fn subject_session_callback_completes_while_create_and_deletion_are_waiting() {
+#[tokio::test(flavor = "current_thread")]
+async fn subject_callbacks_finish_before_waiting_host_parents_release_capacity() {
     let workspace = tempfile::tempdir().unwrap();
     let mut api = test_api(workspace.path()).await;
     let identity = RuntimeIdentityMaterial::generate("runtime-test").unwrap();
     configure_runtime_request_auth(&mut api, &identity, "runtime-test");
     let subjektiv = open_subjektiv_store(&api).unwrap();
-    let subject = subjektiv
-        .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
-        .unwrap();
-    let singleton_key = crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap();
     let memory = api
         .config_store
         .get_workspace_memory_settings(TEST_WORKSPACE_ID)
         .unwrap();
-    let reserved = api
-        .config_store
-        .reserve_worker_create(
-            TEST_WORKSPACE_ID,
-            "runtime-test",
-            "subject-start",
-            &"f".repeat(64),
-            Some(&singleton_key),
-            &memory,
-        )
-        .unwrap();
-    let worker_id = reserved.worker_id.to_string();
+    let mut callbacks = Vec::new();
+    for index in 0..2 {
+        let subject = subjektiv
+            .create_subject(
+                crate::subjektiv::SubjectRole::new(format!("companion-{index}")).unwrap(),
+            )
+            .unwrap();
+        let singleton_key = crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap();
+        let reserved = api
+            .config_store
+            .reserve_worker_create(
+                TEST_WORKSPACE_ID,
+                "runtime-test",
+                &format!("subject-start-{index}"),
+                &"f".repeat(64),
+                Some(&singleton_key),
+                &memory,
+            )
+            .unwrap();
+        callbacks.push((
+            subject.id,
+            reserved.worker_id.to_string(),
+            session_store::new_session_id().to_string(),
+        ));
+    }
     let server = WorkspaceServerApi::new_for_test(api.config.clone(), api.store.clone());
-    // Reuse the fixture API, but exercise the real outer dispatcher and both auth layers.
+    // Real dispatcher, source proof authentication, live singleton authority and
+    // attribution SQL. Only Runtime's create/restore wait is modeled below; no
+    // product process or complete create endpoint is spawned by this route test.
     server
         .apis
         .lock()
@@ -39,59 +50,208 @@ async fn subject_session_callback_completes_while_create_and_deletion_are_waitin
         build_inner_router(api.clone()),
     );
     let gate = server.admission_for_workspace(TEST_WORKSPACE_ID).await;
-    let create = gate.admit(false).unwrap();
-    let mut deletion = Box::pin(gate.lock_deletion());
-    assert!(futures::poll!(&mut deletion).is_pending());
+    let host = api.host_executors.host().unwrap(); // production 2 workers/16 queued
+    let mut parents = Vec::new();
+    let mut finish_callbacks = Vec::new();
+    for _ in 0..2 {
+        let create = gate.admit(false).unwrap();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (finish_callback, callback_reply) = std::sync::mpsc::channel();
+        finish_callbacks.push(finish_callback);
+        parents.push(tokio::spawn(run_host_workflow(host.clone(), async move {
+            let _create = create;
+            entered.send(()).unwrap();
+            // The actual Host parent cannot finish until its mandatory callbacks
+            // return. Timeout/disconnection is failure cleanup, never success.
+            callback_reply
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| {
+                    Error::InvalidInput(format!("Runtime callback did not complete: {error}"))
+                })?;
+            Ok::<_, Error>(())
+        })));
+        tokio::time::timeout(std::time::Duration::from_secs(2), ready)
+            .await
+            .unwrap()
+            .unwrap();
+    }
     let app = workspace_server_router(server);
     let path = format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/sessions");
-    let session_id = session_store::new_session_id().to_string();
-    let body = serde_json::to_vec(&json!({ "session_id": session_id, "create_if_missing": true }))
-        .unwrap();
-    let response = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        app.clone().oneshot(runtime_source_request(
-            &identity,
-            Some(&worker_id),
-            "POST",
-            &path,
-            body.clone(),
-        )),
-    )
-    .await
-    .expect("Session attribution must not wait for its own Worker creation")
-    .unwrap();
-    let status = response.status();
-    let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    assert_eq!(status, StatusCode::OK, "{response_body:?}");
-    let response: Value = serde_json::from_slice(&response_body).unwrap();
-    assert_eq!(response["subject_id"], subject.id);
-    assert_eq!(response["session_id"], session_id);
-    let stored = subjektiv.session_attribution(&session_id).unwrap().unwrap();
-    assert_eq!(stored.worker_id, worker_id);
-    assert_eq!(stored.subject_id, subject.id);
-
-    // The callback lane does not bypass authentication.
-    let response = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        app.clone().oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(&path)
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(body))
+    let memory_path = format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/memory");
+    for (_, worker_id, _) in &callbacks {
+        // Resident context is also a pure Subject callback used by Runtime
+        // bootstrap/restore. It must not reenter the waiting Host lane either.
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            app.clone().oneshot(runtime_source_request(
+                &identity,
+                Some(worker_id),
+                "POST",
+                &memory_path,
+                serde_json::to_vec(&server_api::SubjektivMemoryBackendRequest {
+                    operation: server_api::SubjektivMemoryBackendOperation::ResidentContext(
+                        Default::default(),
+                    ),
+                })
                 .unwrap(),
-        ),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            )),
+        )
+        .await
+        .expect("resident context must not wait for its Host parents")
+        .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        let resident: server_api::SubjektivMemoryBackendResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(matches!(
+            resident,
+            server_api::SubjektivMemoryBackendResponse::ResidentContext(_)
+        ));
+    }
+    // Resident memory is not an allowed deletion-drain callback. Preserve that
+    // admission fence; only the exact Session attribution route reenters below.
+    let mut deletion = Box::pin(gate.lock_deletion());
     assert!(futures::poll!(&mut deletion).is_pending());
-    drop(create);
+    for (subject_id, worker_id, session_id) in &callbacks {
+        let body =
+            serde_json::to_vec(&json!({ "session_id": session_id, "create_if_missing": true }))
+                .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            app.clone().oneshot(runtime_source_request(
+                &identity,
+                Some(worker_id),
+                "POST",
+                &path,
+                body,
+            )),
+        )
+        .await
+        .expect("Session attribution must not wait for its Host parents")
+        .unwrap();
+        let status = response.status();
+        let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{response_body:?}");
+        let response: Value = serde_json::from_slice(&response_body).unwrap();
+        assert_eq!(response["subject_id"], *subject_id);
+        assert_eq!(response["session_id"], *session_id);
+        let stored = subjektiv.session_attribution(session_id).unwrap().unwrap();
+        assert_eq!(stored.worker_id, *worker_id);
+        assert_eq!(stored.subject_id, *subject_id);
+    }
+    // Neither actual parent nor its admission lease was released to make these
+    // callbacks succeed. Only durable attribution completion releases them.
+    assert!(parents.iter().all(|parent| !parent.is_finished()));
+    assert!(futures::poll!(&mut deletion).is_pending());
+    for finish_callback in finish_callbacks {
+        finish_callback.send(()).unwrap();
+    }
+    for parent in parents {
+        parent.await.unwrap().unwrap();
+    }
+    host.drain().await.unwrap();
+    api.store.db_executor().drain().await.unwrap();
     let _deletion = tokio::time::timeout(std::time::Duration::from_secs(2), deletion)
         .await
         .unwrap();
     assert!(gate.admit(true).is_none());
+}
+
+#[tokio::test]
+async fn consolidation_subject_callbacks_are_denied_without_runtime_lookup() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut api = test_api(workspace.path()).await;
+    let identity = RuntimeIdentityMaterial::generate("runtime-test").unwrap();
+    configure_runtime_request_auth(&mut api, &identity, "runtime-test");
+    let subjektiv = open_subjektiv_store(&api).unwrap();
+    let subject = subjektiv
+        .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
+        .unwrap();
+    let key = format!("{SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX}{}", subject.id);
+    let memory = api
+        .config_store
+        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
+        .unwrap();
+    let reservation = api
+        .config_store
+        .reserve_worker_create(
+            TEST_WORKSPACE_ID,
+            "runtime-test",
+            "consolidation-start",
+            &"f".repeat(64),
+            Some(&key),
+            &memory,
+        )
+        .unwrap();
+    // runtime-test has no Worker adapter: authority denial must not try to look
+    // up its profile/tags through Runtime before rejecting this disallowed role.
+    let server = WorkspaceServerApi::new_for_test(api.config.clone(), api.store.clone());
+    server
+        .apis
+        .lock()
+        .await
+        .insert(TEST_WORKSPACE_ID.into(), api.clone());
+    server
+        .routers
+        .lock()
+        .await
+        .insert(TEST_WORKSPACE_ID.into(), build_inner_router(api.clone()));
+    let app = workspace_server_router(server);
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/sessions");
+    let worker_id = reservation.worker_id.to_string();
+    let session_id = session_store::new_session_id().to_string();
+    for (callback_path, callback_body) in [
+        (
+            path.clone(),
+            serde_json::to_vec(&json!({"session_id": session_id, "create_if_missing": true}))
+                .unwrap(),
+        ),
+        (
+            format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/memory"),
+            serde_json::to_vec(&server_api::SubjektivMemoryBackendRequest {
+                operation: server_api::SubjektivMemoryBackendOperation::ResidentContext(
+                    Default::default(),
+                ),
+            })
+            .unwrap(),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(runtime_source_request(
+                &identity,
+                Some(&worker_id),
+                "POST",
+                &callback_path,
+                callback_body,
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(status, StatusCode::FORBIDDEN, "{callback_path}: {body:?}");
+    }
+    assert!(
+        subjektiv
+            .session_attribution(&session_id)
+            .unwrap()
+            .is_none()
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"session_id": session_id, "create_if_missing": true}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
