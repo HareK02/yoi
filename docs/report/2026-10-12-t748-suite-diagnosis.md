@@ -198,9 +198,67 @@ Workdir default (153) and `http-client` (156) full suites, format/diff checks an
 state-contract naming (558 matching lines, zero unapproved, zero stale) passed.
 All used the isolated `target/t748-candidate-build` artifact directory. Logs:
 `target/t748-review-fix-{root-check,full-suite,workdir-default,workdir-http,format,names}.log`.
-The following documentation-only commit does not change that tested code.
-Fresh independent review of the normally advanced same MR source is still
-required; previous `request_changes` evidence is not approval of this fix.
+The documentation-only publication `b10b7315` did not change that tested code.
+MR seq5 independently confirmed the two old fixes and repeated the checks above,
+but requested changes for a new mandatory-callback cycle; see the next section.
+
+## Mandatory callback must be independent of its waiting Host parent
+
+MR seq5 finding `T748-HOST-CALLBACK-CYCLE` traced Host create/restore -> Runtime
+bootstrap -> mandatory Session attribution -> the same finite Host lane. Two
+waiting parents could consume both workers while successfully admitted callbacks
+could not run. Cancelling a waiter correctly retains the actual parent, so it is
+not a solution. The Reviewer's compiled executor artifact proved this placement
+cycle, not a complete create endpoint/E2E reproduction.
+
+Fix `a2487b57` separates store-only scope discovery into typed Subject, current
+Job consolidation and legacy consolidation authority. Session attribution accepts
+only Subject authority and executes its whole existing SQL operation on the
+independent DB lane. It rejects consolidation roles without calling Runtime.
+Mixed read/search, subject projections and allowed legacy consolidation operations
+keep their Runtime checks on Host; the previous DB/network fix is not undone.
+
+The same dependency audit identified Subject resident context reads used by
+Runtime bootstrap/restore. All Subject-only memory operations use store-only
+Subject authority and DB ownership too (resident summary/context, proposal
+validation, receipt lookup, explicit staging). Other memory operations retain
+Host ownership because legacy authority can require synchronous Runtime lookup.
+No transaction is split across an await and no production budget is increased.
+
+The strengthened signed route regression holds both actual production-sized Host
+workers (2/16) in `run_host_workflow` parents and retains their create admission
+leases until callbacks finish. Resident and attribution routes authenticate real
+Runtime source proofs, check current singleton ownership, respond successfully,
+and persist both distinct Subject session attributions **before** either parent
+releases capacity. It also preserves Session callback reentry during deletion
+drain. Runtime's wait is modeled at this policy boundary; no product process or
+complete create endpoint is spawned. Separate denial coverage proves legacy
+consolidation callbacks return 403 without Runtime lookup, leave no attribution,
+and do not bypass authentication (401).
+
+Only Session attribution is an allowed deletion-drain callback; that endpoint
+allowlist was not expanded. An initial fixture sent resident reads during deletion
+and correctly received 409. The fixture now tests those reads before deletion,
+then Session attribution while deletion waits. This is alignment with the existing
+fence, not a relaxed product gate or success-picking retry. A diagnostic Python
+invocation was unavailable before making any source change; only the subsequent
+Deno lane-restoration runs are causal red evidence.
+
+Restoring just Session's old Host placement fails at its expected callback
+watchdog; restoring just resident memory's old Host placement fails at its own
+watchdog. Fixed placement succeeds without parent bailout. Evidence:
+`target/t748-callback-old-{session,resident}-placement-red.log`,
+`target/t748-callback-restored-green.log`. Final focused signed callback tests (5),
+DB boundaries (10), and Subjektiv regressions (25) passed.
+
+Exact code `a2487b575df1f348251214c53da61595860fcb40` passed root `cargo check` and
+original default-parallel Server **963 passed / 0 failed / 1 existing ignored**,
+11 binary tests; library duration **173.01 seconds**. Only the three intentional
+executor panics appeared, with no residual test processes. Workdir default153 /
+http-client156, fmt/diff and naming558/0/0 passed. The isolated candidate cache
+remains in use. Logs: `target/t748-callback-{root-check,full-suite,workdir-default,workdir-http}.log`.
+The following docs-only publication changes no tested code. Its exact normally
+advanced MR source still needs a fresh independent verdict; seq5 is not approval.
 
 No latency benchmark, production incident measurement, target integration,
 Ticket conclusion, or running-environment update is claimed. T743 has now

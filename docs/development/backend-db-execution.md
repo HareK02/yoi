@@ -58,11 +58,23 @@ owned workflow needs async resource locks, `run_host_workflow` polls it on a Hos
 worker using the original Tokio handle; do not build a replacement runtime for
 cached services and do not submit to and await the Host lane from inside itself.
 Control/session guards needed by an accepted mutation belong to that actual job.
-Subjektiv session Read/Search, subject response projection, memory staging and
-legacy consolidation-scope helpers also use Host ownership: they can synchronously
-call Runtime/network services outside their SQL transactions. Pure DB-resident
-Subjektiv scope and memory projection helpers stay on the DB lane. Host admission
-must not be acquired again from an already-owned Host workflow.
+Subjektiv session Read/Search, subject response projection, general memory staging
+and legacy consolidation-scope helpers also use Host ownership: they can
+synchronously call Runtime/network services outside their SQL transactions.
+Pure DB-resident Subjektiv scope and memory projection helpers stay on the DB lane.
+Host admission must not be acquired again from an already-owned Host workflow,
+including indirectly through a Runtime's mandatory Backend callback.
+
+Mandatory Session attribution has Subject-only authority and whole attribution
+SQL on the independent DB lane. Store-only scope discovery distinguishes Subject,
+current Job consolidation, and legacy consolidation authority; attribution rejects
+both consolidation roles **before** any Runtime profile/tag lookup. Legacy
+consolidation checks for mixed callers remain on Host. Subject-only memory
+operations (resident context/summary, proposal validation, receipt lookup, explicit
+staging) use the same store-only authority boundary and DB ownership. Runtime
+bootstrap/restore can request resident context while its Host parent is waiting.
+This is not permission to bypass Workspace deletion admission: only the already
+allowed exact callback endpoints may reenter deletion drain.
 
 Backend Job cleanup has a third finite lane (two workers, 16 queued jobs), so a
 long Run teardown wait cannot starve ordinary Host control/stop requests. It is
