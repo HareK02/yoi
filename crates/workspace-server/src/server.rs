@@ -23710,7 +23710,11 @@ async fn discover_workspace_workers(
             "invalid_workspace_worker_discovery_cursor".to_string(),
         ))
     })?;
-    let workers = workers_response(api)?;
+    let workers = api
+        .store
+        .db_executor()
+        .run(move || workers_response(api))
+        .await?;
     Ok(workspace_worker_discovery_page(
         workers.items,
         query,
@@ -32159,7 +32163,12 @@ async fn workspace_runtime_resources_response(
     workspace_id: &str,
 ) -> ApiResult<server_api::WorkspaceRuntimeListResponse> {
     let limit = api.config.max_records.min(200);
-    let runtimes = api.runtime.list_runtimes(limit);
+    let runtime = api.runtime.clone();
+    let runtimes = api
+        .host_executors
+        .host()?
+        .run(move || Ok::<_, ApiError>(runtime.list_runtimes(limit)))
+        .await?;
     let bindings = api
         .store
         .list_workspace_runtime_bindings(workspace_id, true)

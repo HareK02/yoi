@@ -919,6 +919,7 @@ struct HeldRuntimeReply {
     address: std::net::SocketAddr,
     entered: Option<oneshot::Receiver<String>>,
     release: Option<mpsc::Sender<()>>,
+    upstream_released: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 impl HeldRuntimeReply {
@@ -928,6 +929,8 @@ impl HeldRuntimeReply {
         let address = listener.local_addr().unwrap();
         let (entered, received) = oneshot::channel();
         let (release, permit) = mpsc::channel();
+        let upstream_released = Arc::new(AtomicBool::new(false));
+        let flag = upstream_released.clone();
         let thread = std::thread::spawn(move || {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
@@ -946,12 +949,14 @@ impl HeldRuntimeReply {
                     .to_owned(),
             );
             let _ = permit.recv_timeout(WATCHDOG);
+            flag.store(true, Ordering::SeqCst);
             let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         });
         Self {
             address,
             entered: Some(received),
             release: Some(release),
+            upstream_released,
             thread: Some(thread),
         }
     }
@@ -1180,5 +1185,148 @@ async fn subjektiv_runtime_waits_leave_db_and_control_free_and_cancel_retains_th
             "{kind}: completed Host job leaked its lease"
         );
         fixture.executor.drain().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_resource_summary_waits_off_tokio_and_db_and_retains_cancelled_host_ownership() {
+    let fixture = Fixture::new().await;
+    let mut reply = HeldRuntimeReply::new();
+    install_remote_fixture(
+        &fixture,
+        "summary-runtime",
+        &format!("http://{}", reply.address),
+        true,
+    );
+    let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let api = fixture.api.clone();
+    let task = tokio::spawn(crate::db_executor::with_operation_lifetime(
+        Arc::new(CountJobLifetime(leases.clone())),
+        async move { workspace_runtime_resources_response(&api, WORKSPACE).await },
+    ));
+    let request = observed(reply.entered.take().unwrap()).await.unwrap();
+    assert!(request.contains("/v1/runtime"), "{request}");
+    assert!(
+        !reply.upstream_released.load(Ordering::SeqCst),
+        "upstream watchdog released before Tokio could observe the request"
+    );
+    let read_store = fixture.store.clone();
+    observed(
+        fixture
+            .executor
+            .run(move || read_store.get_workspace_memory_settings(WORKSPACE)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        observed(tokio::spawn(async { "control" })).await.unwrap(),
+        "control"
+    );
+    observed(tokio::time::sleep(StdDuration::from_millis(1))).await; // timer contract only
+    assert!(!reply.upstream_released.load(Ordering::SeqCst));
+    assert!(!task.is_finished());
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        leases.load(Ordering::SeqCst),
+        1,
+        "cancel released actual Runtime summary owner"
+    );
+    reply.finish();
+    observed(fixture.host_executor.drain()).await.unwrap();
+    assert_eq!(leases.load(Ordering::SeqCst), 0);
+    fixture.executor.drain().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn worker_discovery_sql_waits_off_tokio_and_keeps_admission_until_actual_cleanup() {
+    // Exercise the exact post-auth handler boundary: signed source verification
+    // has separate route coverage. Auth itself also awaits DB and would otherwise
+    // hide a handler's direct mutex acquisition until after the writer is released.
+    for cancel_waiter in [false, true] {
+        let fixture = Fixture::new().await;
+        let (mut busy, waiting) = BusyObservation::install_store(fixture.store.clone());
+        let mut lock = WriteLock::acquire(fixture.api.config.database_path.clone());
+        let writer = fixture.store.clone();
+        fixture
+            .executor
+            .dispatch(move || {
+                writer
+                    .mark_api_token_used("missing-token", "2026-01-01T00:00:00Z")
+                    .unwrap();
+            })
+            .unwrap();
+        observed(waiting).await.unwrap(); // Actual SQL writer holds shared connection mutex.
+        let query = || server_api::WorkspaceWorkerDiscoveryQuery {
+            limit: Some(1),
+            cursor: None,
+            query: Some("missing-peer".into()),
+        };
+        let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lifetime = Arc::new(CountJobLifetime(leases.clone()));
+        let mut discovery = Box::pin(crate::db_executor::with_operation_lifetime(
+            lifetime,
+            discover_workspace_workers(fixture.api.clone(), WORKSPACE.into(), query(), true),
+        ));
+        assert!(
+            futures::poll!(&mut discovery).is_pending(),
+            "discovery must queue, not synchronously wait for the SQL mutex"
+        );
+        assert_eq!(leases.load(Ordering::SeqCst), 1);
+        runtime_progress_while_locked(&lock).await;
+        assert_eq!(
+            observed(fixture.host_executor.run(|| Ok::<_, Error>("Host control")))
+                .await
+                .unwrap(),
+            "Host control"
+        );
+        assert!(futures::poll!(&mut discovery).is_pending());
+        let rejected =
+            discover_workspace_workers(fixture.api.clone(), WORKSPACE.into(), query(), true)
+                .await
+                .unwrap_err()
+                .into_response();
+        let body = response_json(rejected, StatusCode::SERVICE_UNAVAILABLE).await;
+        assert!(body.to_string().contains("db_capacity_exceeded"), "{body}");
+        let denied =
+            discover_workspace_workers(fixture.api.clone(), WORKSPACE.into(), query(), false)
+                .await
+                .unwrap_err()
+                .into_response();
+        response_json(denied, StatusCode::FORBIDDEN).await;
+        // Failure cleanup never makes the progress assertions above true.
+        assert!(!lock.released.load(Ordering::SeqCst));
+        if cancel_waiter {
+            drop(discovery);
+            assert_eq!(
+                leases.load(Ordering::SeqCst),
+                1,
+                "cancel released accepted discovery authority"
+            );
+            let rejected =
+                discover_workspace_workers(fixture.api.clone(), WORKSPACE.into(), query(), true)
+                    .await
+                    .unwrap_err()
+                    .into_response();
+            response_json(rejected, StatusCode::SERVICE_UNAVAILABLE).await;
+            lock.release();
+            busy.resume();
+        } else {
+            lock.release();
+            busy.resume();
+            let page = observed(discovery).await.unwrap();
+            assert!(
+                page.workers.is_empty(),
+                "empty filtered projection must remain empty"
+            );
+            assert!(page.next_cursor.is_none());
+        }
+        observed(fixture.executor.drain()).await.unwrap();
+        assert_eq!(
+            leases.load(Ordering::SeqCst),
+            0,
+            "actual discovery cleanup leaked its lease"
+        );
+        fixture.host_executor.drain().await.unwrap();
     }
 }
