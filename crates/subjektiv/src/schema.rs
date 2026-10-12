@@ -1,4 +1,8 @@
-//! Current schema creation. Frozen data conversion lives with the old migrations.
+//! Creates the current schema and connects frozen migrations.
+//!
+//! Foreign keys for Memory history and candidate/derivation/surface references include the Subject,
+//! rejecting cross-Subject references. Seals/triggers prevent adding references after immutable JSON and edges commit;
+//! retention triggers reject deletion of history and referenced records. The repository updates current projections and search columns together.
 use super::*;
 
 pub(super) fn migrate(tx: &Transaction<'_>) -> feature_storage::Result<()> {

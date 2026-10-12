@@ -1,31 +1,32 @@
-//! OpenAI Chat Completions API スキーマ
+//! OpenAI Chat Completions API scheme.
 //!
-//! - リクエストJSON生成
-//! - SSEイベントパース → Event変換
+//! - Request JSON generation.
+//! - SSE event parsing → Event conversion.
 
 pub(crate) mod capability;
 mod events;
 mod request;
 mod scheme_impl;
 
-/// OpenAIスキーマ
+/// OpenAI scheme.
 ///
-/// OpenAI Chat Completions API (および互換API) のリクエスト/レスポンス変換を担当
+/// Handles request/response conversion for the OpenAI Chat Completions API
+/// (and compatible APIs).
 #[derive(Debug, Clone, Default)]
 pub struct OpenAIScheme {
-    /// モデル名 (リクエスト時に指定されるが、デフォルト値として保持も可能)
+    /// Model name (supplied per request, but may also be stored as a default).
     pub model: Option<String>,
-    /// レガシーなmax_tokensを使用するか (Ollama互換用)
+    /// Whether to use legacy max_tokens (for Ollama compatibility).
     pub use_legacy_max_tokens: bool,
 }
 
 impl OpenAIScheme {
-    /// 新しいスキーマを作成
+    /// Create a new scheme.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// レガシーなmax_tokensを使用するか設定
+    /// Set whether to use legacy max_tokens.
     pub fn with_legacy_max_tokens(mut self, use_legacy: bool) -> Self {
         self.use_legacy_max_tokens = use_legacy;
         self

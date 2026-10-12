@@ -220,6 +220,13 @@ struct GrepParams {
     offset: Option<usize>,
 }
 
+/// Bounded Grep reading content within provider scope.
+///
+/// Typed result paths come from reports retained after offset/limit, never reverse-parsed from
+/// rendered filenames. Descriptor providers read only authorized ignore sources and apply .gitignore
+/// without requiring .git markers. Unlike Glob, unavailable/symlinked ignore opens retain existing
+/// explicit errors. Scope-denied sources are skipped before opening; global/ambient configuration
+/// is not searched. Search is request-time traversal, not a snapshot.
 pub fn run_grep(
     root: &Path,
     base: PathBuf,

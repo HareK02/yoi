@@ -1,8 +1,8 @@
-//! Memory candidate extraction domain types and Worker tool boundary.
+//! Boundary for Memory extraction candidates and Worker-facing operations.
 //!
-//! Worker-side extraction produces typed candidates that are submitted to the
-//! Workspace backend. Staging persistence is owned by that backend; this module
-//! does not write repository-local files.
+//! Extraction creates typed candidates and passes them to Host storage. Saving candidates and
+//! committing the extraction pointer are separate responsibilities; generating candidates alone does not update committed Memory.
+//! This module does not store data in Repository files.
 
 mod input;
 mod payload;
@@ -17,6 +17,6 @@ pub use payload::{
 pub use pointer::{ExtractPointerPayload, fold_pointer};
 pub use tool::{ExtractWorkerContext, write_extracted_tool};
 
-/// session-store `LogEntry::Extension` で使う domain 名。
-/// pointer の永続化と読み出しはこの定数を使う側が一致している必要がある。
+/// Domain name used in session-store `LogEntry::Extension`.
+/// Callers persisting and reading pointers must agree on this constant.
 pub const EXTRACT_DOMAIN: &str = "memory.extract";

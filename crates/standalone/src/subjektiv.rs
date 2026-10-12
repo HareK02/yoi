@@ -1,5 +1,19 @@
-//! Operator-managed local Subject storage and explicit Host capabilities.
-//! Profile policy, identifiers and repository files are never execution grants.
+//! Subjects in operator-managed state scopes and explicit Host capabilities.
+//!
+//! Issues durable storage-scope identity in a private state directory; the shared domain issues
+//! Subject IDs. Cwd, Worker names, and Profiles are not sharing boundaries. Rejects symlinks and
+//! non-private nodes; delegates schema/migration to `subjektiv` and connection policy to `feature-storage`.
+//!
+//! The Host holds each selected Subject's exclusive kernel lease through body execution and
+//! confirmed delegated Job cleanup. Process death releases kernel locks; uncertain in-process
+//! cleanup retains leases. Restore validates saved Subject/storage bindings and reacquires the
+//! same Subject. Launches without a selected Subject do not implicitly connect this store.
+//!
+//! The selected Subject's Job store is shared across Workers; the generic Jobs service owns execution
+//! and cleanup. Consolidation grants allow only immutable candidate batches and limited operations,
+//! not body leases or parent filesystems. Startup pending processing follows Host connections.
+//! Unknown attempts are not rerun; delivery failures for accepted results do not trigger model
+//! reexecution. Memory application and surface repair use shared-domain CAS/receipts.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;

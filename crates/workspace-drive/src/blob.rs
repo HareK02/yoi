@@ -1,10 +1,12 @@
-//! Synchronous, immutable local blobs for the SQLite drive authority.
+//! Synchronous, immutable local blobs for SQLite Drive authority.
 //!
-//! Call these methods on blocking threads, while holding the authority's SQLite
-//! IMMEDIATE transaction. That transaction, not this adapter, serializes reads,
-//! uploads and GC across processes. The root and its ancestors must be owned by
-//! trusted workspace code: path checks reject existing symlinks, but the
-//! path-based LocalFileSystem API cannot prevent hostile concurrent replacement.
+//! The caller's IMMEDIATE transaction, not this adapter, provides inter-process exclusion for readers, uploads, and GC.
+//! `LocalFileSystem` Create publication alone does not guarantee file/directory sync. Sync the published file,
+//! then its directory, before returning success to the metadata transaction. Unreferenced blobs left by failures are eligible for GC.
+//!
+//! The Host protects the root and ancestors. Existing symlinks are rejected, but this path-based API is not
+//! a sandbox against concurrent path replacement by a hostile local actor. Requires a local persistent filesystem
+//! with working file/directory sync and SQLite WAL locks; sync failures never silently weaken durability.
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};

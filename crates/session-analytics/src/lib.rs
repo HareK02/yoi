@@ -1,10 +1,4 @@
-//! Read-only analytics for Yoi session JSONL logs.
-//!
-//! This crate intentionally parses the persisted JSON shape tolerantly with
-//! `serde_json::Value` rather than depending on Worker runtime or TUI crates. The
-//! report contains counts, paths, sizes, line/turn indexes, and bounded
-//! diagnostics; raw user messages, tool arguments, and tool output snippets are
-//! not emitted.
+#![doc = include_str!("../README.md")]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
@@ -34,11 +28,24 @@ pub enum AnalyzeError {
     Metadata { path: PathBuf, source: io::Error },
 }
 
-/// Analyze one explicit session JSONL path.
+/// Aggregates usage from the specified Session JSONL.
+///
+/// Reads JSON as `serde_json::Value`, independent of Worker and TUI.
+/// Counts unknown formats and invalid lines as diagnostics while continuing to
+/// analyze readable records. This API does not verify correct history replay.
 pub fn analyze_session(path: impl AsRef<Path>) -> Result<SessionReport, AnalyzeError> {
     Analyzer::analyze(path.as_ref())
 }
 
+/// Usage summaries and diagnostics without message bodies.
+///
+/// Retains paths, sizes, and line/turn positions, but omits raw user messages and
+/// tool arguments/results. The diagnostic count is capped.
+///
+/// Excludes initial history from per-response aggregation because its original
+/// response boundaries are unknown. Repeated reads/execution after context changes
+/// indicate correlation, not causation. Repeated edits are observations, not proof
+/// that they could be batched.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionReport {
     pub input: InputSummary,

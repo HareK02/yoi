@@ -10,12 +10,6 @@ Deno.test("Bevel draws a plain selectable border around semantic children", asyn
   const appCss = await Deno.readTextFile(
     new URL("../src/app.css", import.meta.url),
   );
-  const designLanguage = await Deno.readTextFile(
-    new URL(
-      "../../../docs/development/ui-ux/design-language.md",
-      import.meta.url,
-    ),
-  );
 
   for (
     const contract of [
@@ -72,14 +66,6 @@ Deno.test("Bevel draws a plain selectable border around semantic children", asyn
       !source.includes("background-color:") &&
       source.includes("button, input, select, textarea"),
     "Bevel must not own surface color and must keep semantic controls as children",
-  );
-  assert(
-    designLanguage.includes("1pxの単色borderを描くvisual wrapper") &&
-      designLanguage.includes(
-        "照明、raised／inset、ridge／grooveを表現しない",
-      ) &&
-      designLanguage.includes("text/content areaへ適用する"),
-    "The design language must define Bevel as a plain border without surface ownership",
   );
 });
 

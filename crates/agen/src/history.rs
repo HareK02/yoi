@@ -1,9 +1,8 @@
-//! Typed conversation history containers.
+//! History that pairs model input with host-owned annotations.
 //!
-//! Agen keeps provider-visible [`Item`](crate::Item) values separate from any
-//! host-domain provenance. The host chooses the annotation type `A`, while Agen
-//! preserves each item and annotation as one entry for clone/truncate/restore
-//! style history operations.
+//! Only [`Item`] is projected to providers; annotation `A` holds storage identifiers
+//! and input provenance. Cloning, truncation, and restoration keep each pair together.
+//! The caller's append callback owns persistence; this container does not.
 
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +39,13 @@ impl HistoryEntry<()> {
     }
 }
 
-/// Conversation history with one annotation per item.
+/// Ordered history of model input and host-owned annotations.
+///
+/// [`History::append_with`] runs the callback before adding an item. A host that
+/// persists in that callback keeps failed writes out of subsequent model requests.
+/// Batch appends commit one item at a time; later failures do not roll back earlier
+/// items. Direct append and replacement APIs do not persist, so the host must
+/// distinguish restoration from normal appends.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct History<A = ()> {
     entries: Vec<HistoryEntry<A>>,

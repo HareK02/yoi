@@ -45,7 +45,7 @@ impl Scheme for OpenAIScheme {
         data: &str,
         _state: &mut Self::State,
     ) -> Result<Vec<Event>, ClientError> {
-        // `data: [DONE]` は終端マーカー
+        // `data: [DONE]` is a terminal marker.
         if data.trim() == "[DONE]" {
             return Ok(Vec::new());
         }
@@ -58,7 +58,7 @@ impl Scheme for OpenAIScheme {
 
     fn validate_config(&self, config: &RequestConfig) -> Vec<ConfigWarning> {
         let mut warnings = Vec::new();
-        // OpenAI Chat Completions API は top_k を受け付けない
+        // The OpenAI Chat Completions API does not accept top_k.
         if config.top_k.is_some() {
             warnings.push(ConfigWarning::unsupported("top_k", "OpenAI Chat"));
         }

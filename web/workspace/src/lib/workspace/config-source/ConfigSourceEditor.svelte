@@ -1,4 +1,9 @@
 <script lang="ts">
+  // commitの条件は保存したbase_digestと各entryのexpected_digest。時刻や要求順では
+  // 編集元の内容を特定できないため、成功時だけ返されたsnapshotを新しいbaseにする。
+  // Server拒否時はdraftを残し、reload／reapplyを明示的な判断にする。
+  // 診断は非abortかつ解析対象tree digest一致の場合だけ表示する。content条件と
+  // 非同期requestの有効性は別に検査し、遅い解析を現在のsourceの診断として出さない。
   import { onMount } from "svelte";
   import DecodalSourceEditor from "#lib/workspace/settings/DecodalSourceEditor.svelte";
   import {

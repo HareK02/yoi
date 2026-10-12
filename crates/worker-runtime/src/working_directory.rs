@@ -1,3 +1,20 @@
+//! Ownership of Runtime-local repository materialization and session resources.
+//!
+//! Independently of Backend inventory, Runtime checks duplicate primary Workdir ownership and
+//! current bindings. Usability depends on materialization identity, current state, and occupancy,
+//! not creation provenance alone. Per-target provider leases exclude competing creation, access,
+//! and cleanup; the admission bookkeeping mutex is not held during filesystem work.
+//! Fresh roots are created exclusively; failures do not delete another creator's tree.
+//!
+//! Binding clones are passive; only activating session resources inhibits cleanup.
+//! Resource clones held by sessions and commands maintain that protection. Deletion invalidates
+//! the materialization generation, so recreating the same ID cannot activate old bindings.
+//!
+//! Deletion is a provider operation checking current identity, mounts, and remaining content.
+//! Partial-deletion witnesses are stored outside the tree. CleanupPending/unknown inventory status
+//! does not guarantee current cleanliness. Detailed inspection and remaining-content checks
+//! are limited to cleanup retries.
+
 use crate::catalog::{
     MaterializerKind, RepositoryRefObservation, RepositoryRefObservationRequest,
     RepositorySshMaterializationAccess, WorkingDirectoryCleanupTarget,

@@ -3,8 +3,8 @@ use server_api::{
     SubjektivMemoryBackendOperation as Op, SubjektivMemoryBackendResponse as Response,
 };
 
-/// Executes the same domain operations and bounded projections for every Host.
-/// The caller authenticates and validates evidence before issuing `context`.
+/// Executes the same domain operations and bounded projections on each Host.
+/// The caller validates authentication/evidence and issues context; this function checks its scope and operation kind.
 pub fn execute(
     store: &crate::SubjektivStore,
     context: &HostOperationContext,

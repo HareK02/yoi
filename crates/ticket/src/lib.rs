@@ -1,8 +1,4 @@
-//! Ticket domain types and SQLite Workspace authority backend.
-//!
-//! Repository-local Ticket trees are not an authority. Runtime Workers access
-//! Tickets through the Workspace API, whose control-plane implementation uses
-//! the SQLite backend defined here.
+#![doc = include_str!("../README.md")]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -516,10 +512,9 @@ impl From<TicketCompletion> for TicketStateUpdate {
     }
 }
 
-/// SHA-256 of the actual editable Ticket requirements: identity, title, body,
-/// and ordered repository targets. Comments, timestamps, workflow state, and
-/// event order are not requirements. Restoring identical content restores its
-/// digest; state CAS and operation receipts are independent preconditions.
+/// SHA-256 digest comparing Ticket identity, title, body, and ordered Repository targets.
+/// Comments, timestamps, workflow state, and event order are not requirement content.
+/// Returning to identical content restores the digest, so state comparison conditions and operation receipts remain separately necessary.
 pub fn ticket_content_digest(ticket: &Ticket) -> String {
     content_digest(
         &ticket.meta.id,
@@ -1804,11 +1799,23 @@ pub trait TicketBackend {
         change: TicketStateChange,
     ) -> Result<()>;
     fn set_workflow_state(&self, id: TicketIdOrSlug, change: TicketStateChange) -> Result<()>;
+    /// State update comparing requirement content and workflow state in the same write transaction.
+    /// Compares both even when only requirements change, preventing late decisions based on old content from committing.
+    /// Saves state, status, resolution, and the audit event together; the event is an immutable operation receipt.
+    ///
+    /// Exact replay returns the current Ticket even after later edits or reopening.
+    /// Does not reapply past state or append events. Rejects different input with the same operation key.
+    /// Updating to Closed also stores the reason as resolution. Reopening updates Ticket metadata;
+    /// it does not revive released work identities.
     fn update_state(&self, _ticket: &str, _request: TicketStateUpdate) -> Result<Ticket> {
         Err(TicketError::Conflict(
             "backend does not support audited state updates".to_owned(),
         ))
     }
+    /// Ticket completion decision with a reason and references, independent of Repository integration.
+    /// Uses the same content/state comparison conditions and operation receipts as [`Self::update_state`].
+    /// Requires neither MR nor Reviewer approval; completion neither creates nor changes their evidence.
+    /// Missing MR evidence on the read side is not grounds to revoke a recorded completion decision.
     fn complete(&self, ticket: &str, request: TicketCompletion) -> Result<Ticket> {
         self.update_state(ticket, request.into())
     }
@@ -2058,6 +2065,9 @@ pub struct SqliteTicketMutationEvent {
 pub type SqliteTicketMutationHook =
     dyn Fn(&Connection, &SqliteTicketMutationEvent) -> Result<()> + Send + Sync;
 
+/// SQLite persistence implementation for per-Workspace Ticket records.
+/// Uses rows in the specified Workspace as authoritative, without searching Repository Ticket trees.
+/// The Host supplies authenticated operation context; this implementation commits state changes and audit in one transaction.
 #[derive(Clone)]
 pub struct SqliteTicketBackend {
     db_path: PathBuf,

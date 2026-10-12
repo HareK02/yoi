@@ -1,32 +1,21 @@
-# Validation
+# 変更の検証
 
-Validation should match the change. Do not run expensive broad checks just to look thorough, but do not skip checks that prove the changed boundary still works.
+変更した契約を確認できる検証を選び、実行した範囲と未確認の範囲を区別する。広いcheckの成功で、変更した境界のテストを代替しない。
 
-## Docs-only changes
+## 文書とrustdoc
 
-Minimum checks:
+文書だけの変更では`git diff --check HEAD`に加え、移動・削除したファイルへのリンク、ソースのinclude、テストや生成処理の参照を確認する。crate READMEやrustdocを変えた場合は、対象crateのドキュメント生成とdoctestも確認する。通常無効のfeatureでだけ存在するitemへのリンクは、その構成でも検証する。
 
-```sh
-git diff --check HEAD
-```
+## Rustコード
 
-Useful stale-surface sweeps:
-
-```sh
-STALE_DOC_PATTERN='TODO[.]md|obsolete doc dirs|old ticket surface'
-rg -n "$STALE_DOC_PATTERN" README.md docs crates/*/README.md --glob '!docs/report/**'
-```
-
-## Code changes
-
-Follow `AGENTS.md` and the [test strategy](rust-testing-strategy.md). Start with the smallest target/filter that proves the changed contract:
+[テスト設計規則](rust-testing-strategy.md)に従い、開発中は変更を証明する最小のtarget・filterを使う。
 
 ```sh
 cargo test -p <crate> --lib <test-or-module-filter>
 cargo test -p <crate> --test <test-target> <test-filter>
 ```
 
-Before completion, run the root compile check and the changed crate's full tests, plus formatting and diff checks:
+完了前は[AGENTS.md](../../AGENTS.md)に従ってrootのcompile closureと変更crate全体を確認する。
 
 ```sh
 cargo check
@@ -35,49 +24,26 @@ cargo fmt --all -- --check
 git diff --check HEAD
 ```
 
-Unit, component, and integration suites are ordinary tests. Do not exclude a named integration target merely because it uses temporary SQLite, loopback/IPC, or an isolated child process. Include affected product features and cross-crate integration suites beyond the changed crate when they own the connection being changed. `cargo check` does not execute tests, and `--lib` alone does not run external integration-test targets.
+単体・コンポーネント・結合は通常のテストに含める。SQLite、loopback、隔離子プロセスを使うtargetも省略しない。影響する製品feature、test-only target、別crateが所有する結合suiteを追加する。`cargo check`はテストを実行せず、`--lib`だけでは外部integration-test targetを実行しない。
 
-Workspace-wide tests and heavyweight builds are selected when the changed boundary requires them, not as a substitute for identifying the relevant suites. Avoid repository-wide formatting churn when a validation failure is caused by pre-existing unrelated formatting.
+Workspace全体、`--all-targets`、Nix/Dockerなどの重い検証は、変更した境界を狭い検証では確認できない場合か、明示的に求められた場合に選ぶ。既存の無関係なformat差分を混ぜない。公開APIや生成元を変えた場合は、所有する生成処理と差分検査で生成物との一致を確認する。
 
-## Web UI changes
+## Webとレビュー
 
-Rendered Web UI changes require implementer-owned visual review in addition to type check, linter, and test. Follow [`ui-ux/visual-review.md`](ui-ux/visual-review.md).
+描画結果が変わるWeb UI変更には、type check・testに加えて実装者自身の[目視確認](ui-ux/visual-review.md)を必要とする。画像の生成、HTTP成功、後段Reviewerへの委託だけでは代替できない。
 
-Minimum evidence includes:
+Ticketに対するレビューでは、差分のもっともらしさだけでなく、現行の要求と受入条件を満たすかを確認する。レビュー判断と実行可能な検証は互いの代替にしない。
 
-- before/after capture under the relevant persona, viewport, theme, and data state;
-- the implementer’s own inspection of grouping, separator meaning, spacing, wrapping, overflow, responsive order, and visible errors;
-- `review-context.json` inspection;
-- disposition of every observed problem;
-- artifact paths and a final `pass | fail` result.
+## E2EとCI
 
-A successful capture command, HTTP 200, screenshot generation, or later Reviewer inspection does not replace this validation.
-
-## Work item checks
-
-Use the authorized Ticket tools and boundaries described in `AGENTS.md`. Work item review verifies that the implementation satisfies the Ticket, not only that the diff looks plausible; it does not replace executable tests.
-
-## E2E validation
-
-Product-assembly journeys belong to the workspace `tests/e2e` package and use its shared harness. Add or extend these tests for an explicitly selected journey that ordinary component/integration tests cannot prove. A crate-local test using an isolated child process is not E2E merely because it crosses a process boundary.
-
-E2E has a dedicated opt-in entry point:
+製品を組み立てる利用場面の検証は、`tests/e2e`の共有harnessを使う。必要なbinary・製品feature、隔離・回収、timeout、診断をsuiteに明記する。稼働中の開発環境を借りたり、crateごとに別の製品起動基盤を作ったりしない。
 
 ```sh
 cargo test -p yoi-e2e --features e2e --test <target> <test-filter>
 ```
 
-Select the target for the affected journey. Its suite documentation must describe required binaries/build features, runtime prerequisites, isolation and cleanup, timeouts, and diagnostic artifacts. Do not substitute a live developer deployment or create a second product-launch harness in an individual crate.
+このpackageは`default-members`に含まれず、対象には`e2e` featureが必要である。通常のroot実行やfeatureなしのWorkspace実行をE2E成功として報告しない。選んだ利用場面と実結果、または未実行を記録する。
 
-The package is outside workspace `default-members`, and its test targets require the `e2e` feature. An ordinary root test run does not execute these targets; even a workspace-wide test run without the feature does not prove E2E behavior. Record the selected target and actual result, or state that E2E was not run.
+通常suiteのCI jobは、主張する結合targetと製品featureを実際に選択する。E2Eは専用jobとし、必須になる変更、手動・定期実行の条件を定める。特殊なplatform・tool・権限が必要なsuiteも適切なjobを持ち、可搬なテストまで例外扱いしない。
 
-## CI execution policy
-
-Suite ownership includes execution selection, not only source placement:
-
-- Ordinary unit/component/integration suites belong in normal validation jobs. Jobs must include named integration targets and the product-feature configurations they claim to validate; a `--lib` job is not whole-crate coverage.
-- E2E belongs in a separate job that explicitly selects the package, feature, and journey targets. State its trigger policy: which changes require it and whether it also runs manually or on a schedule. Opt-in locally must not mean an unowned suite that is never exercised.
-- Suites with special platform, tool, or privilege requirements need a suitable job and an explicit selection rule. Keep the portable portion in normal validation rather than hiding an entire suite behind the exceptional case.
-- Timeouts, concurrency limits, resource cleanup, and failure artifacts belong to the shared harness/runner configuration. Do not rely on undocumented local setup.
-
-When adding or changing a suite, identify the job that executes it and update its selection if needed. If execution is not yet wired, record that gap; a policy statement or a successful local command is not evidence that CI runs the suite.
+suiteの追加・変更時は実行するjobを確認し、選択条件を更新する。未配線なら不足として記録する。CI方針の記載やローカルの成功だけから、CIで実行済みと判断しない。

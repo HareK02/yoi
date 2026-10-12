@@ -1,4 +1,4 @@
-//! OpenAI SSEイベントパース
+//! OpenAI SSE event parsing.
 
 use crate::llm_client::{
     ClientError,
@@ -61,10 +61,10 @@ pub(crate) struct ChunkUsage {
 }
 
 impl OpenAIScheme {
-    /// SSEデータのパースとEventへの変換
+    /// Parse SSE data and convert it to Event.
     ///
-    /// OpenAI APIはBlockStartイベントを明示的に送信しない。
-    /// Timeline層が暗黙的なBlockStartを処理する。
+    /// The OpenAI API does not explicitly send BlockStart events.
+    /// The Timeline layer handles implicit BlockStart.
     pub fn parse_event(&self, data: &str) -> Result<Option<Vec<Event>>, ClientError> {
         if data == "[DONE]" {
             return Ok(None);
@@ -94,8 +94,8 @@ impl OpenAIScheme {
         for choice in chunk.choices {
             // Text Content Delta
             if let Some(content) = choice.delta.content {
-                // OpenAI APIはBlockStartを送らないため、デルタのみを発行
-                // Timeline層が暗黙的なBlockStartを処理する
+                // Emit only deltas because the OpenAI API sends no BlockStart.
+                // The Timeline layer handles implicit BlockStart.
                 events.push(Event::text_delta(choice.index, content));
             }
 
@@ -136,11 +136,11 @@ impl OpenAIScheme {
                     finish_reason == "tool_calls" || finish_reason == "function_call";
 
                 if is_tool_finish {
-                    // ツール呼び出し終了
-                    // Note: OpenAIはどのツールが終了したか明示しないため、
-                    // Timeline層で適切に処理する必要がある
+                    // Tool call ended.
+                    // Note: OpenAI does not specify which tool ended, so the
+                    // Timeline layer must handle this appropriately.
                 } else {
-                    // テキスト終了
+                    // Text ended.
                     events.push(Event::text_block_stop(choice.index, stop_reason));
                 }
             }
@@ -165,7 +165,7 @@ mod tests {
         let data = r#"{"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#;
 
         let events = scheme.parse_event(data).unwrap().unwrap();
-        // OpenAIはBlockStartを発行しないため、デルタのみ
+        // Deltas only, since OpenAI does not emit BlockStart.
         assert_eq!(events.len(), 1);
 
         if let Event::BlockDelta(delta) = &events[0] {

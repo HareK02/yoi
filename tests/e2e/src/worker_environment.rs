@@ -207,6 +207,10 @@ pub struct WorkerEnvironmentCleanupReport {
     pub report_path: PathBuf,
 }
 
+/// 隔離したHOME／XDG領域と実Backend／Runtime subprocessを所有するfixture。
+///
+/// HTTP clientはproxyとredirectを使わず、テスト対象の接続先を明示する。
+/// 終了時に所有processと一時領域を片付け、artifactとcleanup結果を残す。
 #[derive(Debug)]
 pub struct WorkerE2eEnvironment {
     temp_root: Option<tempfile::TempDir>,

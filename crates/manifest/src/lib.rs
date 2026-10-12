@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 mod builtin_profile;
 mod config;
 pub mod defaults;
@@ -40,12 +42,14 @@ use std::path::PathBuf;
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
-/// Declarative configuration for a Worker.
+/// Resolved execution contract for creating and restoring a Worker.
 ///
-/// Parsed from a TOML manifest file. Describes the model, system prompt,
-/// and directory scope (required). The Worker's working directory is **not**
-/// part of the manifest — it is the process's `std::env::current_dir()`
-/// at construction time.
+/// Separate from reusable Profiles and partial configuration, this includes
+/// launch-time identity, paths, permissions, and prompt references. Persisting
+/// resolved values lets restoration reuse the original contract without resolving
+/// current configuration or Profiles again. Workdir attachments and their operation
+/// authority belong to a separate execution boundary; this value does not pin the
+/// process cwd.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerManifest {
@@ -890,10 +894,13 @@ pub struct SessionConfig {
     pub record_event_trace: bool,
 }
 
-/// Manifest-level pattern-based tool permission policy.
+/// Pattern-based permission policy for tool calls.
 ///
-/// Presence of `[permissions]` enables this layer. Rules are evaluated
-/// in declaration order; if none match, [`Self::default_action`] is used.
+/// Evaluates rules in declaration order, using [`Self::default_action`] if none
+/// match. This is separate from [`Scope`] path authority: allowing a tool does not
+/// guarantee access to its target path. `Ask` defers permission; current callers
+/// fail closed because there is no approval/resume protocol. The Worker owns
+/// enforcement.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolPermissionConfig {
     pub default_action: ToolPermissionAction,

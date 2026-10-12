@@ -1,11 +1,19 @@
-//! Adapter from `worker-runtime` execution backend boundary to the real
-//! `worker` crate controller/run lifecycle.
+//! Adapter connecting Runtime execution contracts to the existing Worker controller.
 //!
-//! The adapter intentionally owns real `WorkerHandle`s internally and exposes
-//! operations addressed by `WorkerRef` to callers. Browser/API
-//! projections therefore keep the existing runtime redaction boundary: no raw
-//! socket paths, session paths, manifests, credentials, or handles leave this
-//! module.
+//! Separates durable Worker/Session identity from a single controller launch. Fresh runs use unique
+//! IDs; Restore runs use lifecycle operation IDs. Reuses registered controllers for the same Restore
+//! operation. Even after restart, exclusive creation of operation-bound run directories prevents
+//! overwriting existing runs. Run artifacts or sockets alone prove neither controller liveness nor cleanup.
+//!
+//! Opens Session and metadata stores within the aggregate through trusted WorkerRef, with no
+//! process-global root fallback. Restore preserves identity while rebuilding Workspace connections
+//! and Workdir bindings. Candidate controller observation registration waits for activation after
+//! catalog commit. Cleanup checks the actual controller and session resources, deleting only
+//! operation-owned disposable run artifacts. It implies neither Session/metadata deletion nor
+//! retention of all past runs.
+//!
+//! WorkerHandle is owned internally; external operations take WorkerRef. Socket/session paths,
+//! Manifests, credentials, and handles are not passed to browser/API projections.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;

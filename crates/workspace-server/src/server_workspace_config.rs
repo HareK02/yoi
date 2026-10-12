@@ -3,6 +3,12 @@
 //! Files support read/edit/write and non-entrypoint deletion; directories support
 //! create, with atomic change sets (including non-entrypoint renames) on the root.
 //! The canonical main.dcdl entrypoint cannot be deleted or renamed.
+//!
+//! Worker operations reread unrevoked grants and current attachment connection IDs after acquiring
+//! the session lock. Observation validators bind to grant, effective access, connection, config
+//! content, and schema, rejecting stale observations or writes after grant replacement.
+//! Write permission is the intersection of grant and attachment permissions; authorization at
+//! handle acquisition is not ongoing authority.
 use super::*;
 use server_api::{
     WorkspaceConfigAccess as Access, WorkspaceConfigApiError as Failure,

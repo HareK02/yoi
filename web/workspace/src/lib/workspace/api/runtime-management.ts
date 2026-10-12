@@ -1,3 +1,9 @@
+/** Runtime管理ではbinding_idを観測した登録条件として送る。
+ * fingerprintはkey bytesの識別であり、bindingの再登録を識別する条件には使わない。
+ * revoke adapterは確認値とcurrentFingerprintの一致を検査するが、Serverへの条件は
+ * expected_binding_idである。画面は現在のfingerprintを両引数へ渡す。
+ * 接続テストの表示条件は呼出側の画面が現在bindingと照合する。
+ */
 import type {
   CreateRemoteRuntimeRequest,
   Diagnostic,

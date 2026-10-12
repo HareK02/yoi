@@ -1,3 +1,17 @@
+//! Projects Workspace Tickets, Objectives, and Memory from domain records to API resources.
+//!
+//! Normal Backend reads use Workspace-scoped SQLite/domain authority, not a Ticket backend
+//! chosen from Worker cwd or legacy repository file layouts. The ticket crate owns Ticket state,
+//! relations, and content; the Workspace store owns assignments and Runtime Worker links.
+//! Builds bounded detail, thread, relation, assignment, and evidence projections, not full
+//! execution sessions as substitute records for domain decisions.
+//!
+//! Unobservable open MR sources are unknown; past review refs do not imply current commits.
+//! Evidence filters use current projections excluding closed MRs: commit requires a settled source;
+//! approved_review requires approval tied to the current Ticket content digest and all target MR
+//! sources/results. Merged MRs use stored integration evidence, so provider outages alone do not
+//! invalidate approval.
+
 use std::{path::PathBuf, sync::Arc};
 
 #[cfg(test)]

@@ -1,3 +1,11 @@
+//! Builds terminal display state from Worker protocol snapshots and events.
+//!
+//! WorkerStateSnapshot updates current run state; connection state and streaming
+//! display do not replace it. Input and run control still target the parent Worker
+//! when a SubWorker view is selected. Completion replies apply only when request_id,
+//! input watch, connection target, and displayed target match. Editing cancels the
+//! watch, so returning to the same text does not revive stale replies.
+
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant};

@@ -473,6 +473,17 @@ fn list_entry_bytes(entry: &ListEntry) -> usize {
     entry.path.as_str().len().saturating_add(64)
 }
 
+/// Bounded live pagination of direct children.
+///
+/// Sorts directories first, then logical paths within each group. Cursors are exclusive ordering
+/// keys and need not still exist. List applies provider read/enumeration scope, not ignore/dotfile
+/// filters. The full scan retains only limit+1 candidates within an aggregate path-byte limit.
+/// Enumeration order is unspecified, so a full page does not end scanning. Totals describe current
+/// visible entries, including those before the cursor.
+///
+/// No cross-page snapshot: insertions, removals, renames, and kind changes may omit or duplicate entries.
+/// Cancellation and traversal ceilings apply even to excluded entries; resource exhaustion is not
+/// converted into silent success.
 pub fn run_list(
     root: &Path,
     request: ListRequest,

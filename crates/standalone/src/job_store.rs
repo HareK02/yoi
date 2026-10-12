@@ -1,9 +1,18 @@
-//! Host-owned durable Jobs. Opening performs recovery and therefore requires the
-//! StandaloneHost's Worker lease; this is not a user-facing database constructor.
+//! Persistence of Job intents, attempts, and results under a Host lease.
 //!
-//! A result is committed here before the service releases its Internal Worker.
-//! Worker termination, final prose, and consumer acknowledgement are not success
-//! authority. The service owns the connection mutex and live-resource cleanup.
+//! Opening performs recovery, so the Worker lease (Subject lease for Subject-shared stores)
+//! is held for the connection lifetime. SQLite transactions and immutability constraints fix
+//! requests and results; the service's connection mutex serializes operations.
+//! Job state is not stored in Memory or interactive Sessions.
+//!
+//! Identical intent under the same ID returns the current snapshot; changes conflict.
+//! Only known failures can create new attempts through explicit retry. Reopening preserves
+//! Reserved and makes unaccepted Dispatched attempts Unknown. Unknown does not prove no effects;
+//! cancellation does not erase that attempt's uncertainty or serialization fence.
+//!
+//! Results commit before releasing the Internal Worker. Replaying the same result is idempotent;
+//! different results and stale attempts are rejected. Later cancellation/execution failure does
+//! not erase accepted results; consumer acknowledgement is persisted independently.
 
 use std::path::Path;
 

@@ -1,4 +1,19 @@
-//! Host-provided local Jobs. No Runtime registry, Workspace client or dialog-session state.
+//! Host-owned local Job execution service.
+//!
+//! Each attempt uses an existing private Internal Worker, separate from interactive Sessions
+//! and model-created SubWorkers. Profile names do not grant result/domain authority.
+//! The shared runner validates Profile requirements; the Host supplies a sink bound to the
+//! Job, attempt, input digest, and deadline, plus limited domain grants when needed.
+//! Parent filesystem and Workspace connections are not implicitly inherited.
+//!
+//! Success rests on the structured result's SQLite commit, not final prose or `wait` completion.
+//! Concurrency slots and serialization keys stay held after result acceptance until cleanup.
+//! Dropping a wait future does not release Host cancel/cleanup ownership. Consumer acknowledgement
+//! is separate from result lifetime; delivery failures never trigger model reexecution.
+//!
+//! Timeout/shutdown makes unaccepted attempts Unknown before cancellation. Unconfirmed cleanup
+//! keeps Host leases held. Clones cannot reopen the store after service closure or carry
+//! authority over to another Host.
 #[cfg(test)]
 mod tests;
 use std::collections::HashMap;

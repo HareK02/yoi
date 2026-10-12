@@ -1,10 +1,4 @@
-//! Partial-form of [`crate::WorkerManifest`] used as cascade layers.
-//!
-//! `WorkerManifestConfig` mirrors `WorkerManifest` but every field is optional
-//! so individual layers (builtin defaults, user manifest, project
-//! manifest, programmatic overlay) can be partial. Layers are combined
-//! via [`WorkerManifestConfig::merge`] and the final config is converted to
-//! a validated [`WorkerManifest`] via `TryFrom`.
+//! Partial configuration merging and validation.
 
 use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroU32;
@@ -25,17 +19,21 @@ use crate::{
     WorkerManifest, WorkerMeta,
 };
 
-/// Partial-form Worker manifest. Every field is optional; one or more
-/// instances merge via [`WorkerManifestConfig::merge`] before being
-/// converted to a validated [`WorkerManifest`] via `TryFrom`.
+/// Merges partial configuration into a validated [`crate::WorkerManifest`].
+///
+/// [`WorkerManifestConfig`] preserves omitted values. Resolve each input's relative
+/// paths with [`WorkerManifestConfig::resolve_paths`] before merging; do not later
+/// reinterpret them against another input's base. [`WorkerManifestConfig::merge`]
+/// handles explicit merging; final conversion validates required fields and
+/// semantics. This type does not imply implicit discovery or merging of user/project
+/// Manifest files during normal startup.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkerManifestConfig {
     #[serde(default)]
     pub worker: WorkerMetaConfig,
-    /// `[model]` セクションは partial でも完成形でも同じ
-    /// [`ModelManifest`] を使う。ref / inline の両形を受け入れるための
-    /// 全 Optional 構造なので、カスケード層と最終マニフェストで型を
-    /// 分ける必要がない。
+    /// Partial and final `[model]` sections share [`ModelManifest`]. All fields
+    /// are optional to support both ref and inline forms, so cascade layers and
+    /// final manifests need no separate types.
     #[serde(default)]
     pub model: ModelManifest,
     #[serde(default)]
@@ -911,10 +909,12 @@ impl WorkerManifestConfig {
         self
     }
 
-    /// Merge `upper` into `self`. Fields present in `upper` override
-    /// fields from `self`. Map entries merge key-wise with `upper`
-    /// winning on conflict. Scope rules from both layers accumulate
-    /// (see [`ScopeConfig`] semantics).
+    /// Merges explicit upper-layer values, retaining lower-layer values when omitted.
+    ///
+    /// Maps prefer upper values per key; scope rules and Skills directories accumulate.
+    /// Resolve each input's paths before merging so relative paths from different
+    /// inputs are not mistaken for sharing a base. This merge guarantees neither
+    /// authority containment checks nor persistence CAS.
     pub fn merge(self, upper: WorkerManifestConfig) -> Self {
         Self {
             worker: self.worker.merge(upper.worker),
@@ -1135,16 +1135,16 @@ fn ensure_absolute(field: &'static str, path: &Path) -> Result<(), ResolveError>
     }
 }
 
-/// `AuthRef::ApiKey { file }` が相対パスのとき `base` を前置する。
+/// Prepends `base` to relative `AuthRef::ApiKey { file }` paths.
 fn resolve_auth_file(auth: &mut Option<AuthRef>, base: &Path) {
     if let Some(AuthRef::ApiKey { file: Some(p), .. }) = auth.as_mut() {
         *p = join_if_relative(base, p);
     }
 }
 
-/// モデル宣言に含まれる `auth.file` が絶対パスであることを検証する。
-/// ref / scheme / model_id 等の論理的な有効性（ref があるか、inline が
-/// 揃っているか）の検証は [`crate::model_catalog`] で行う。
+/// Validates that model declarations use absolute `auth.file` paths.
+/// [`crate::model_catalog`] validates logical ref / scheme / model_id requirements,
+/// such as the presence of a ref or complete inline fields.
 fn validate_model_paths(model: &ModelManifest, field: &'static str) -> Result<(), ResolveError> {
     if let Some(AuthRef::ApiKey { file: Some(p), .. }) = &model.auth {
         ensure_absolute(field, p)?;

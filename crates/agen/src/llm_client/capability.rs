@@ -1,16 +1,16 @@
-//! モデル能力メタデータ
+//! Model capability metadata.
 //!
-//! `ModelCapability` はモデルが持つ機能差を表現する。scheme は同じでも
-//! モデルごとに reasoning 可否や prompt caching 方式が違うため、scheme
-//! から分離して保持する。
+//! `ModelCapability` represents differences in model features. Reasoning support
+//! and prompt caching strategies may vary even within one scheme, so this
+//! metadata is kept separate from the scheme.
 //!
-//! 値の供給経路は 2 通り:
-//! 1. scheme 実装側の `model_id → ModelCapability` 静的テーブル（既知モデル）
-//! 2. `ModelConfig::capability` での明示 override（未知モデル、または上書き）
+//! The client construction layer supplies model-specific capabilities and overrides.
+//! Schemes provide only wire-level defaults through `Scheme::default_capability`;
+//! this module does not own a model registry or application configuration format.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// モデル能力メタデータ
+/// Model capability metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelCapability {
     pub tool_calling: ToolCallingSupport,
@@ -23,7 +23,7 @@ pub struct ModelCapability {
 }
 
 impl ModelCapability {
-    /// 何もサポートしない安全側デフォルト。未知モデルのフォールバック用。
+    /// Conservative default with no supported features, used for unknown models.
     pub const fn minimal() -> Self {
         Self {
             tool_calling: ToolCallingSupport::None,
@@ -35,55 +35,55 @@ impl ModelCapability {
     }
 }
 
-/// ツール呼び出しサポート
+/// Tool calling support.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCallingSupport {
-    /// 非サポート
+    /// Unsupported.
     None,
-    /// 1 回のレスポンスで 1 ツールのみ
+    /// Only one tool per response.
     Sequential,
-    /// 1 回のレスポンスで複数ツール並行
+    /// Multiple parallel tools per response.
     Parallel,
 }
 
-/// Structured output サポート
+/// Structured output support.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuredOutput {
     None,
-    /// `json_object` モード（スキーマなし JSON 強制）
+    /// `json_object` mode (enforces JSON without a schema).
     JsonObject,
-    /// JSON Schema 指定で構造化出力
+    /// Structured output with a JSON Schema.
     JsonSchema,
 }
 
-/// Reasoning（extended thinking）サポート
+/// Reasoning (extended thinking) support.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningSupport {
-    /// OpenAI 形式: `reasoning.effort` (low/medium/high)
+    /// OpenAI format: `reasoning.effort` (low/medium/high).
     Effort,
-    /// Anthropic 形式: `thinking.budget_tokens`
+    /// Anthropic format: `thinking.budget_tokens`.
     BudgetTokens,
-    /// 両対応（内部では共通 `ReasoningControl` として扱い、各 scheme で投影）
+    /// Both (handled internally as shared `ReasoningControl`, projected by each scheme).
     Both,
 }
 
-/// Prompt caching 戦略
+/// Prompt caching strategy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CacheStrategy {
-    /// Anthropic: `cache_control` マーカーを明示挿入
+    /// Anthropic: insert explicit `cache_control` markers.
     Explicit { max_breakpoints: u8 },
-    /// それ以外: サーバ側自動 prefix、または未サポート
+    /// Other providers: automatic server-side prefix caching, or unsupported.
     Auto,
 }
 
-/// Reasoning 制御（共通型、scheme 側で各社形式に投影）。
+/// Shared reasoning control, projected into each provider's format by the scheme.
 ///
-/// 文字列は provider-native な effort label、数値は provider-native な
-/// thinking budget token として扱う。どちらか一方だけを型で表現する。
+/// Strings are provider-native effort labels; numbers are provider-native
+/// thinking token budgets. The type represents only one at a time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum ReasoningControl {

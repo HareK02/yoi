@@ -1,72 +1,69 @@
-//! LLM モデル宣言型
+//! LLM model declaration types.
 //!
-//! Worker マニフェストの `[model]` セクションで記述する型。`ref`（プロバイダ
-//! とモデルを両方指し示す短縮形）と inline 指定（`scheme` / `model_id`
-//! 直書き）の両方を受け入れるため、すべてのフィールドを `Option` として
-//! 持つ 1 つの型 [`ModelManifest`] に統合している。実解決（ref をプロバイダ
-//! カタログ / モデルカタログから引いて `scheme` や `model_id` を埋める）
-//! は [`crate::model_catalog`] の責務で、本モジュールはデータ表現のみを提供する。
+//! The Worker manifest's `[model]` section uses one [`ModelManifest`] with all
+//! fields optional to support both `ref` (a provider/model shorthand) and inline
+//! `scheme` / `model_id` declarations. [`crate::model_catalog`] resolves refs via
+//! provider/model catalogs and fills in `scheme`, `model_id`, and other fields;
+//! this module provides only the data representation.
 //!
-//! 同じ型を partial（カスケード層）と完成形（最終マニフェスト）の両方で
-//! 使うことで、merge と最終変換の重複を避ける。
+//! Sharing the type between partial cascade layers and final manifests avoids
+//! duplicate merging and final conversion logic.
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-// `ModelCapability` は `agen` 側に定義される runtime 構造だが、
-// マニフェストで任意に override できるよう型だけ再エクスポートする。
+// `ModelCapability` is a runtime type defined in `agen`; re-export only the type
+// to allow optional manifest overrides.
 pub use agen::llm_client::capability::{ModelCapability, ReasoningControl, ReasoningEffort};
 
-/// Worker マニフェストの `[model]` セクション。
+/// The Worker manifest's `[model]` section.
 ///
-/// - ref だけ書く: `[model] ref = "anthropic/claude-sonnet-4-6"`
-/// - ref + 一部 override: ref で基底を引き、`auth` 等だけ書き換え
-/// - 完全 inline: `ref` を省略して `scheme` / `model_id` / `auth` を直書き
+/// - Ref only: `[model] ref = "anthropic/claude-sonnet-4-6"`
+/// - Ref with overrides: use ref as a base and override fields such as `auth`.
+/// - Fully inline: omit `ref` and specify `scheme` / `model_id` / `auth` directly.
 ///
-/// どの形が有効かの判定は [`crate::model_catalog::resolve_model_manifest`] が担う。
-/// 本クレートは「どこから取るか」を表現するだけで、未設定かどうかを
-/// 理由にした hard error は出さない。
+/// [`crate::model_catalog::resolve_model_manifest`] determines which forms are valid.
+/// This crate only represents configuration sources; it does not raise hard errors
+/// merely because fields are unset.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ModelManifest {
-    /// `<provider_id>/<model_id_in_ref>` 形式のカタログ参照。`/` の
-    /// 最初の 1 文字目で split し provider カタログを引く。
-    /// OpenRouter の `anthropic/claude-sonnet-4` のように `/` を含む
-    /// model_id は `openrouter/anthropic/claude-sonnet-4` と書く
-    /// （provider 側で最初の `/` のみ split するため）。
+    /// Catalog reference in `<provider_id>/<model_id_in_ref>` form. Splits at
+    /// the first `/` to look up the provider catalog. For model IDs containing
+    /// `/`, such as OpenRouter's `anthropic/claude-sonnet-4`, use
+    /// `openrouter/anthropic/claude-sonnet-4`; only the first `/` is split.
     #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
     pub ref_: Option<String>,
-    /// wire format の明示指定。ref 未指定時は必須、ref 指定時は override。
+    /// Explicit wire format. Required without ref; an override with ref.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheme: Option<SchemeKind>,
-    /// API のベース URL。scheme の既定値を override する。
+    /// API base URL, overriding the scheme default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    /// プロバイダが受け付けるモデル ID。ref 未指定時は必須。
+    /// Provider-accepted model ID. Required without ref.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
-    /// 認証方式。ref 未指定時は必須、ref 指定時は override。
+    /// Authentication method. Required without ref; an override with ref.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthRef>,
-    /// モデル能力の明示指定。未指定時はモデルカタログ → provider
-    /// `default_capability` → scheme 既定の順で解決される。
+    /// Explicit model capabilities. If omitted, resolves in order: model catalog,
+    /// provider `default_capability`, then scheme default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability: Option<ModelCapability>,
-    /// モデルの希望コンテキストウィンドウ（tokens）。カタログ未掲載 / inline
-    /// モデルでもここで明示 override できる。実効値は `max_context_window`
-    /// またはカタログ上の backend maximum で clamp される。
+    /// Desired model context window in tokens. Can explicitly override uncataloged
+    /// or inline models. The effective value is clamped by `max_context_window`
+    /// or the catalog's backend maximum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
-    /// backend が実際に受け付けるコンテキストウィンドウ上限（tokens）。
-    /// 表示・安全判定に使う実効 context window は `context_window` とこの値の
-    /// 小さい方になる。
+    /// Maximum context window in tokens actually accepted by the backend.
+    /// The effective window used for display and safety checks is the smaller
+    /// of `context_window` and this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_context_window: Option<u64>,
 }
 
 impl ModelManifest {
-    /// `upper` を `self` に上書きマージする。マニフェスト cascade 向け
-    /// （builtin → user → project → overlay の優先順位で呼ばれる）。
+    /// Merges explicit `upper` values over `self`, retaining lower values when omitted.
     pub fn merge(self, upper: Self) -> Self {
         Self {
             ref_: upper.ref_.or(self.ref_),
@@ -81,39 +78,39 @@ impl ModelManifest {
     }
 }
 
-/// サポートする wire scheme の種類。
+/// Supported wire scheme kinds.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SchemeKind {
-    /// Anthropic Messages API (`/v1/messages`)。Ollama `/v1/messages` もこれで扱う
+    /// Anthropic Messages API (`/v1/messages`), also used for Ollama `/v1/messages`.
     Anthropic,
-    /// OpenAI Chat Completions (`/v1/chat/completions`)。OpenAI 互換ルーター共通枠
+    /// OpenAI Chat Completions (`/v1/chat/completions`), shared by compatible routers.
     OpenaiChat,
-    /// OpenAI Responses API (`/v1/responses`)。別チケットで scheme 新設予定
+    /// OpenAI Responses API (`/v1/responses`).
     OpenaiResponses,
     /// Google Gemini (`/v1beta/models/...:streamGenerateContent`)
     Gemini,
 }
 
-/// 認証の参照。
+/// Authentication reference.
 ///
-/// 実際のトークン値の解決（local secret store / file 読取、OAuth refresh 等）は
-/// worker-side factory で行う。ここはあくまで「どこから取るか」の宣言。
+/// A worker-side factory resolves actual tokens (local secret store / file reads,
+/// OAuth refresh, etc.). This is only a declaration of where to obtain them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuthRef {
-    /// 認証不要（ローカル Ollama 等）
+    /// No authentication required (e.g. local Ollama).
     #[default]
     None,
     /// API key file reference. Prefer [`AuthRef::SecretRef`] for normal
     /// provider credentials; this remains an explicit file source for low-level
     /// manifests and tests.
     ApiKey {
-        /// key を書き込んだファイル（絶対パス）
+        /// File containing the key (absolute path).
         #[serde(default)]
         file: Option<PathBuf>,
     },
-    /// ChatGPT OAuth（`~/.codex/auth.json`）。
+    /// ChatGPT OAuth (`~/.codex/auth.json`).
     #[serde(rename = "codex_oauth")]
     CodexOAuth,
     /// Typed local secret-store reference. The profile resolver preserves this

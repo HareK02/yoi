@@ -1,28 +1,29 @@
-//! `LogEntry::Extension { domain: "memory.extract", payload }` の payload 形式と
-//! restore 時の fold ヘルパー。memory crate がドメインを所有するので、
-//! session-store / Worker は payload 構造を知らない。
+//! Payload format for `LogEntry::Extension { domain: "memory.extract", payload }`
+//! and fold helper for restore. The memory crate owns the domain, so
+//! session-store / Worker do not know the payload structure.
 
 use serde::{Deserialize, Serialize};
 
 use super::EXTRACT_DOMAIN;
 
-/// extract 完了境界の永続化 payload。session log の Extension entry
-/// として 1 回ずつ書かれ、最新の 1 件が現行 pointer として有効になる。
+/// Payload recording an extraction completion boundary as a Session Extension entry.
+/// Only the latest entry is the current pointer; the Host lifecycle checks storage completion conditions.
+/// This commits separately from candidate storage, so saved candidates may remain even without a committed pointer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExtractPointerPayload {
-    /// 直近 extract が処理した最後の session-store LogEntry の index。
-    /// 次回の `source.range.start` はこの値 + 1。
+    /// Index of the last session-store LogEntry processed by the latest extraction.
+    /// The next `source.range.start` is this value + 1.
     pub processed_through_entry: usize,
-    /// 直近 extract 時点の `history.len()`。次回入力は
-    /// `history[processed_through_history_len..]` を切り出す。
+    /// `history.len()` at the latest extraction. The next input slices
+    /// `history[processed_through_history_len..]`.
     pub processed_through_history_len: usize,
-    /// 書き出した staging file の UUIDv7 文字列。LLM が空 payload を返した
-    /// 場合は staging file を作らず空文字列で記録する（pointer は前進する）。
+    /// Staging record ID returned by storage. Completion without candidates may use an empty value.
+    /// Does not denote a local file's existence or storage path.
     pub staging_id: String,
 }
 
-/// `RestoredState.extensions` から最新の extract pointer を取り出す。
-/// 未抽出セッションでは `None`。
+/// Returns the latest extraction pointer, or `None` if absent or the latest payload is invalid.
+/// No fallback: ignoring a corrupt latest entry and using an older pointer would yield the wrong re-extraction range.
 pub fn fold_pointer(extensions: &[(String, serde_json::Value)]) -> Option<ExtractPointerPayload> {
     extensions
         .iter()
@@ -74,8 +75,8 @@ mod tests {
             EXTRACT_DOMAIN.to_string(),
             serde_json::json!({ "wrong_shape": true }),
         )];
-        // 現状は最新を取り出して JSON 不一致なら None。古いものに fallback
-        // しないのは、壊れた最新を黙って無視すると意図しない再抽出を招くため。
+        // Takes the latest entry and returns None if its JSON does not match.
+        // No fallback: silently ignoring a corrupt latest entry could cause unintended re-extraction.
         assert!(fold_pointer(&exts).is_none());
     }
 }

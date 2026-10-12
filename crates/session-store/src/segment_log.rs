@@ -1,13 +1,13 @@
-//! Segment log types for append-only JSONL persistence.
+//! Replays Segment state from append-only JSONL.
 //!
-//! Each [`LogEntry`] represents a single state transition within one
-//! segment, serialized as one line in a `.jsonl` file. Reading all
-//! entries and collecting them via [`collect_state`] reconstructs the
-//! full [`Engine`] state at that segment.
+//! [`collect_state`] restores model input, configuration, and execution interruption
+//! state from [`LogEntry`] position order and initial history. Fork/compaction seeds
+//! retain lineage to the old Segment and history item IDs and provenance.
 //!
-//! The on-disk format is one `LogEntry` per line — entries are positionally
-//! ordered. Fork lineage references between segments use turn-number indices
-//! (`SegmentOrigin.at_turn_index`) rather than per-entry hashes.
+//! An execution-start record alone does not imply success. Runs without terminal
+//! records restore as interrupted; uncommitted tool execution is not treated as
+//! successful. Yield/resume records mark intermediate logical-Run boundaries,
+//! preserving the turn budget even when resuming after compaction.
 
 use agen::llm_client::types::{Item, RequestConfig};
 use agen::{EngineResult, UsageRecord};
@@ -17,20 +17,10 @@ use serde::{Deserialize, Serialize};
 use crate::history::{LoggedHistoryEntry, LoggedSystemHistoryEntry};
 use crate::logged_item::LoggedItem;
 
-/// A single segment log entry, serialized as one JSONL line.
+/// Host-owned extension data.
 ///
-/// Variants correspond to specific mutation points in `Engine`:
-/// - `SegmentStart` — always the first entry; captures initial state
-/// - `Invoke` — IDLE → active marker (start of a new self-driving cycle)
-/// - `UserInput` / `AssistantItem` / `ToolResult` / `SystemItem` — history appends
-/// - `TurnEnd` — AgentTurn boundary marker; carries the post-increment
-///   `turn_count`. With retry unimplemented today this fires once per
-///   `run()`/`resume()` (current callers persist a single TurnEnd at
-///   run completion); the fork-point seq for `at_turn_index` is the
-///   preceding `Invoke` entry, not the TurnEnd.
-/// - `RunCompleted` / `RunCancelled` / `RunErrored` — terminal run outcomes
-/// - `PausedTurnAbandoned` — explicit abandon/cancel of a paused interrupted turn
-/// - `ConfigChanged` — `RequestConfig` mutation
+/// Excluded from public conversation-history projections; interpreted by
+/// dedicated domain readers, such as metrics readers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionExtension {
     pub domain: String,
@@ -46,6 +36,11 @@ impl SessionExtension {
     }
 }
 
+/// JSONL record of history additions and state transitions within a Segment.
+///
+/// History items and provenance commit in the same record, separately from execution
+/// boundaries and extension data. These records do not establish current Worker
+/// catalog state or process liveness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LogEntry {
@@ -123,7 +118,7 @@ pub enum LogEntry {
     /// Turn boundary. Records the turn count after increment.
     TurnEnd { ts: u64, turn_count: usize },
 
-    /// `run()` / `resume()` が `EngineResult` で正常終了した。
+    /// `run()` / `resume()` returned normally with an `EngineResult`.
     /// Replay restores both interruption state and any resumable logical-run
     /// turn budget.
     RunCompleted {
@@ -172,9 +167,9 @@ pub enum LogEntry {
         entry_id: Option<crate::LoggedSessionHistoryEntryId>,
     },
 
-    /// `run()` / `resume()` が `EngineError` で終了した。
-    /// `EngineError` は `Serialize` 不可なので `message` のみ lossy 保持する。
-    /// Audit-only metadata: replay は `interrupted` のみ反映する。
+    /// `run()` / `resume()` ended with an `EngineError`.
+    /// `EngineError` is not `Serialize`, so only `message` is retained lossily.
+    /// Audit-only metadata: replay applies only `interrupted`.
     RunErrored {
         ts: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -204,19 +199,19 @@ pub enum LogEntry {
     /// `RequestConfig` changed.
     ConfigChanged { ts: u64, config: RequestConfig },
 
-    /// LLM リクエスト 1 件分の Usage スナップショット。
+    /// Usage snapshot for one LLM request.
     ///
-    /// `history_len` は送信時の `history.len()`。`input_total_tokens` は
-    /// その prefix をプロバイダが実測した占有量（プロンプト全長）。
-    /// このリクエスト 1 件で新しく追加された分ではない。
+    /// `history_len` is `history.len()` at send time. `input_total_tokens` is the
+    /// provider-measured size of that prefix (the full prompt), not the amount
+    /// newly added by this request.
     ///
-    /// プロバイダ別の正規化（呼び出し側で行う想定）:
+    /// Provider-specific normalization (expected from the caller):
     ///   - Anthropic: `input_tokens + cache_read + cache_creation`
     ///   - OpenAI:    `prompt_tokens`
     ///   - Gemini:    `promptTokenCount`
     ///   - Ollama:    `prompt_eval_count`
     ///
-    /// `cache_read_tokens` / `cache_write_tokens` は上記の内訳で、料金会計用。
+    /// `cache_read_tokens` / `cache_write_tokens` break down the above for billing.
     LlmUsage {
         ts: u64,
         history_len: usize,
@@ -226,14 +221,13 @@ pub enum LogEntry {
         output_tokens: u64,
     },
 
-    /// 汎用拡張点。ドメイン名で名前空間を切って任意 JSON を載せる。
-    /// session-store は payload を不透明扱いし、replay 時は
-    /// `RestoredState.extensions` に `(domain, payload)` を順に積むだけ。
-    /// 各ドメイン側が自前で fold して最新値を取り出す前提。
+    /// Generic extension point for arbitrary JSON namespaced by domain.
+    /// session-store treats payloads as opaque; replay only appends
+    /// `(domain, payload)` to `RestoredState.extensions` in order.
+    /// Each domain folds its own records to obtain the latest value.
     ///
-    /// 想定用途: memory subsystem の extract 処理境界 pointer 等、
-    /// 「session 寿命に縛りたいが session-store の型を汚したくない」
-    /// メタデータ。
+    /// Intended for metadata tied to the Session lifetime without adding
+    /// session-store types, such as memory extraction boundary pointers.
     Extension {
         ts: u64,
         domain: String,
@@ -317,12 +311,12 @@ pub struct RestoredState {
     /// Writers track their own append count via the same counter so
     /// `ensure_head_or_fork` can compare it with the on-disk count.
     pub entries_count: usize,
-    /// LLM リクエストごとの Usage スナップショット時系列。
-    /// `LogEntry::LlmUsage` を replay して時系列順に積まれる。
-    /// 任意位置のトークン数推定に使う。
+    /// Per-request usage snapshots in chronological order.
+    /// Populated by replaying `LogEntry::LlmUsage`.
+    /// Used to estimate token counts at arbitrary positions.
     pub usage_history: Vec<UsageRecord>,
-    /// `LogEntry::Extension` を replay 順に積んだもの。`(domain, payload)`。
-    /// session-store は domain を不透明扱いし、各ドメインが自前で fold する。
+    /// `(domain, payload)` values from `LogEntry::Extension` in replay order.
+    /// session-store treats domains as opaque; each domain folds its own records.
     pub extensions: Vec<(String, serde_json::Value)>,
     /// User submissions in original typed form, in submit order.
     /// One entry per `LogEntry::AnnotatedUserInput`; the K-th entry corresponds to
@@ -766,9 +760,9 @@ mod tests {
                 output_tokens: 5,
             },
         ]);
-        // history は LlmUsage で変化しない
+        // LlmUsage does not change history.
         assert_eq!(state.history.len(), 2);
-        // usage_history は時系列順
+        // usage_history is in chronological order.
         assert_eq!(state.usage_history.len(), 2);
         assert_eq!(state.usage_history[0].history_len, 1);
         assert_eq!(state.usage_history[0].input_total_tokens, 50);
@@ -1114,7 +1108,7 @@ mod tests {
                 payload: serde_json::json!({ "x": 1 }),
             },
         ]);
-        // 順序保持で全件積まれる。fold は呼び出し側の責務。
+        // All records retain their order. Folding is the caller's responsibility.
         assert_eq!(state.extensions.len(), 3);
         assert_eq!(state.extensions[0].0, "memory.extract");
         assert_eq!(state.extensions[1].1["processed_through_entry"], 12);

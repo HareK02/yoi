@@ -1,10 +1,4 @@
-//! Embedded Runtime domain API for Worker management.
-//!
-//! `worker-runtime` owns the Runtime authority surface and, for the standalone
-//! process, wires that Runtime to the real Worker host. Filesystem persistence is
-//! available only through the optional `fs-store` feature, and the REST/WebSocket
-//! server is available only through the optional `http-server` / `ws-server`
-//! features.
+#![doc = include_str!("../README.md")]
 
 pub mod auth;
 pub mod catalog;

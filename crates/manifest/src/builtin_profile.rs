@@ -1,3 +1,10 @@
+//! Converts an explicit builtin source set into Decodal values.
+//!
+//! Selects a catalog entry point and loads only relative imports within that catalog.
+//! Does not fall back to OS paths or Workspace sources, and distinguishes undefined
+//! entry points from evaluation failures. Launching or restoring values already
+//! evaluated by the Workspace is owned separately from this reevaluation.
+
 use std::collections::BTreeMap;
 
 use decodal::{Data, Engine, ImportLoader, LoadedImport};

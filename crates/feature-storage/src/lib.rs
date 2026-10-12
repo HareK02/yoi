@@ -1,9 +1,4 @@
-//! Host-owned SQLite storage for trusted Features.
-//!
-//! The Host owns database placement, connection configuration, migrations, and
-//! operational lifecycle. A Feature owns its schema and only receives a scoped
-//! [`FeatureDatabase`] after trusted registration; Worker/model inputs never
-//! select a path or receive a SQL surface.
+#![doc = include_str!("../README.md")]
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -79,6 +74,9 @@ impl FeatureStorageError {
     }
 }
 
+/// Feature-owned schema changes. Commits pending changes and history in one IMMEDIATE transaction.
+/// Failure rolls back both changes and history, allowing retry on the next open.
+/// Rejects stored versions/names that differ from the plan and schemas newer than the plan.
 #[derive(Clone, Copy)]
 pub struct FeatureMigration {
     version: u32,
@@ -135,6 +133,12 @@ impl RegisteredFeature {
     }
 }
 
+/// Manages physical layout, connections, migrations, and shutdown within a trusted Host.
+///
+/// Features own schemas and domain transactions; the Host owns authentication before calls.
+/// This separation is an in-process API boundary, not a sandbox for arbitrary native code.
+/// The constructing Host owns state-root protection, path validation, and execution leases.
+/// Registration alone creates no database and does not delete existing data for disabled Features.
 #[derive(Clone)]
 pub struct FeatureStorage {
     inner: Arc<FeatureStorageInner>,
@@ -155,8 +159,8 @@ struct FeatureStorageState {
 }
 
 impl FeatureStorage {
-    /// Creates a lazy manager. No directories or databases are created until a
-    /// registered Feature is opened, restored, or explicitly backed up.
+    /// Lazy manager. Creates no directories or databases until a registered
+    /// Feature is opened, restored, or backed up.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             inner: Arc::new(FeatureStorageInner {
@@ -184,8 +188,9 @@ impl FeatureStorage {
         Ok(Self::new(parent.join("feature-storage")))
     }
 
-    /// Binds trusted storage to a Host-issued opaque scope. This is a storage
-    /// isolation key, not a Workspace record or model authorization credential.
+    /// Restricts storage to a Host-issued scope.
+    /// A scope is a physical sharing boundary; it creates no Workspace record or model authorization credentials.
+    /// The same API supports Backend Workspace IDs and persistent local Host scope IDs.
     pub fn scope(&self, scope_id: &str) -> Result<ScopedFeatureStorage> {
         Ok(ScopedFeatureStorage {
             manager: self.clone(),
@@ -198,6 +203,8 @@ impl FeatureStorage {
         self.scope(scope_id)
     }
 
+    /// Registers a schema once per manager. The returned registration is reusable across scopes.
+    /// Rejects duplicate and foreign-manager registrations, fixing the migration plan used on open.
     pub fn register(&self, registration: FeatureRegistration) -> Result<RegisteredFeature> {
         let feature_id = validate_identifier("Feature", registration.feature_id)?.to_string();
         validate_migrations(&feature_id, registration.migrations)?;
@@ -215,8 +222,8 @@ impl FeatureStorage {
         })
     }
 
-    /// Closes every managed connection after any operation currently holding a
-    /// connection lock completes. New opens and operations then fail.
+    /// Stops admission, waits for operations holding connection locks, and closes all managed connections.
+    /// Retained handles also fail thereafter, so writes after shutdown cannot be treated as successful.
     pub fn shutdown(&self) -> Result<()> {
         let connections = {
             let mut state = self.lock_state()?;
@@ -471,6 +478,7 @@ impl Drop for FeatureStorageInner {
     }
 }
 
+/// Feature storage restricted to a Host scope. Scope identity denotes only a storage boundary.
 #[derive(Clone)]
 pub struct ScopedFeatureStorage {
     manager: FeatureStorage,
@@ -494,26 +502,33 @@ impl ScopedFeatureStorage {
         self.manager.register(registration)
     }
 
+    /// Reuses a managed connection, validating and applying migrations on first open.
+    /// Serializes concurrent opens within a manager; SQLite serializes migration writers across managers.
+    /// Syncs metadata-directory ancestors before opening SQLite. DB/WAL sync alone cannot
+    /// persist links to newly created ancestors, so a sync failure prevents connection registration.
     pub fn open(&self, registration: &RegisteredFeature) -> Result<FeatureDatabase> {
         self.manager.open(&self.scope_id, registration)
     }
 
-    /// Creates a consistent online SQLite snapshot of every Feature database,
-    /// including data for Features that are currently disabled/unregistered.
+    /// Backs up each Feature DB, including disabled/unregistered ones, using SQLite online backup.
+    /// Avoids file copies that omit WAL; checks integrity and foreign keys before publishing by rename.
+    /// Each DB is internally consistent, but no common-point snapshot across DBs or Host authority is guaranteed.
+    /// Blobs outside the DB are not saved, so this is not a complete Drive backup.
     pub fn backup(&self, destination: impl AsRef<Path>) -> Result<()> {
         self.manager
             .backup_scope(&self.scope_id, destination.as_ref())
     }
 
-    /// Restores a snapshot only into an absent scope storage directory and
-    /// only while no Feature database for this scope is open.
+    /// Restores a snapshot only into an uncreated scope with no connections.
+    /// Rejects scope mismatches and corrupt DBs; publishes the validated temporary directory by rename.
     pub fn restore(&self, snapshot: impl AsRef<Path>) -> Result<()> {
         self.manager
             .restore_scope(&self.scope_id, snapshot.as_ref())
     }
 
-    /// Closes this scope's Feature connections and removes only its scoped
-    /// storage tree. This is the operation used by Workspace deletion.
+    /// Closes connections in the scope and deletes only its storage tree. Retries are idempotent.
+    /// Keeps the same manager's admission fence after physical deletion, preventing cached tasks
+    /// from recreating databases before the Host finalizes deletion. Host deletion reservation is a separate responsibility.
     pub fn delete(&self) -> Result<()> {
         self.manager.delete_scope(&self.scope_id)
     }
@@ -523,6 +538,9 @@ impl ScopedFeatureStorage {
     }
 }
 
+/// Host-managed synchronous SQLite connection. Async callers use a blocking executor.
+/// Domain repositories retain this handle and never pass connections or SQL to Workers/Runtimes.
+/// Locks serialize operations and shutdown on each connection; deletion/shutdown fences are checked before and after locking.
 #[derive(Clone)]
 pub struct FeatureDatabase {
     inner: Arc<FeatureDatabaseInner>,
@@ -584,8 +602,9 @@ impl FeatureDatabase {
         operation(connection)
     }
 
-    /// Executes a Feature-owned multi-table operation atomically. Returning an
-    /// error rolls the transaction back; successful return commits it.
+    /// Updates multiple tables within one Feature DB in an IMMEDIATE transaction.
+    /// Commits after the closure succeeds; closure or commit failures never return success.
+    /// Does not guarantee atomic writes with the Host control-plane DB or other Feature DBs.
     pub fn transaction<T>(
         &self,
         operation: impl FnOnce(&Transaction<'_>) -> Result<T>,
@@ -593,8 +612,8 @@ impl FeatureDatabase {
         self.try_transaction(operation)
     }
 
-    /// Variant of [`Self::transaction`] that preserves a Feature repository's
-    /// typed domain errors while still rolling every failure back atomically.
+    /// Preserves the rollback, connection ownership, and fences of [`Self::transaction`],
+    /// returning typed Feature domain errors without converting them to storage strings.
     pub fn try_transaction<T, E>(
         &self,
         operation: impl FnOnce(&Transaction<'_>) -> std::result::Result<T, E>,
@@ -742,11 +761,10 @@ fn sync_directory(path: &Path) -> std::io::Result<()> {
     fs::File::open(path)?.sync_all()
 }
 
-/// Applies the common durable Host SQLite connection policy: five-second busy
-/// timeout, foreign keys, WAL, and FULL synchronous commits. Call immediately
-/// after opening a file-backed database, before transactions or migrations.
-/// WAL initialization retries lock contention within the same bounded timeout.
-/// This does not grant path authority or select a database schema.
+/// Applies the shared SQLite connection policy before migrations or transactions.
+/// Enables foreign keys, WAL, and FULL synchronous commits, with bounded lock-contention waits.
+/// Retries WAL initialization within the same wait limit and rejects silent fallback to another journal mode.
+/// Grants neither path-selection authority nor domain schemas.
 pub fn configure_connection(connection: &Connection) -> Result<()> {
     connection.busy_timeout(BUSY_TIMEOUT)?;
     connection.execute_batch(

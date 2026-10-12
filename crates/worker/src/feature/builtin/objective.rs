@@ -1,9 +1,21 @@
+//! Objective Tools and native WIP projection through the scoped Workspace API.
 //!
-//! Objective tool registration backed by Workspace API authority.
+//! Worker cannot assume Backend-local storage paths, so the Workspace API owns Objective reference
+//! resolution, state, audit, and linked Ticket validation. The native projection accepts `/objectives`
+//! and immediate canonical `O-*` or internal IDs, binding the subject `id` from the route.
+//! Linked Tickets remain separate reference inputs, requiring neither Ticket projection nor its
+//! permissions. [`crate::wip`] owns shared reference, permission, Client-lifetime, and unknown-outcome
+//! contracts.
 //!
-//! Objectives are project-level planning context. Runtime Workers may not know
-//! local `.yoi/objectives` paths, so model-visible Objective tools go through
-//! the scoped Workspace API.
+//! # Fixed contracts and current content
+//!
+//! Objects/Interfaces expose operation contracts, not mutable Objective bodies. Content edits thus
+//! do not invalidate fixed signatures; there is no content cache or mutation generation. Each call
+//! fetches a current bounded response through the same Backend adapter; the Backend also evaluates
+//! conditions such as edit's `old_string`. Host validators protect routes and Interface contracts.
+//! Native operations evaluate permission under regular Tool names and invoke the same business
+//! logic. Query/detail uses canonical references and bounded bodies/events, omitting internal
+//! storage IDs from output.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

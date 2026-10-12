@@ -1,5 +1,9 @@
 //! Authorized Workspace document API. Storage, CAS and receipts stay in workspace-drive.
 //! HTTP upload consumes frames with a hard bound; DB publication occurs only after validation.
+//!
+//! HTTP errors and stream failures use fixed public representations, without Host storage paths
+//! or raw diagnostics. Unknown mutation outcomes are OutcomeUnknown; response failure does not
+//! prove the mutation was uncommitted.
 use super::*;
 use futures::StreamExt;
 use server_api::*;

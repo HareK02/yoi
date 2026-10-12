@@ -1,16 +1,19 @@
-//! Durable Worker-name metadata/state persistence.
+//! Stores current Worker restoration data separately from Session history.
 //!
-//! This crate owns the name-keyed Worker state surface under a Worker-state root,
-//! e.g. `{data_dir}/workers/{worker_name}/metadata.json`. Session JSONL replay stays
-//! in `session-store`; Worker metadata may point at a `(SessionId, SegmentId)` but
-//! does not own or replay session logs.
+//! [`WorkerAggregateStore`] handles metadata for one Runtime-selected Worker.
+//! The active Segment, resolved manifest, and child/peer visibility are current
+//! state, separate from state replayed from past conversation. Session model input
+//! is restored from Segment-log initial history and appended records.
 //!
-//! `resolved_manifest_snapshot` is authority only for Worker-name restore before
-//! loading the session log. Existing segment replay still uses `SegmentStart`
-//! entries from `session-store`. `spawned_children` is durable current parent
-//! Worker state for child registry/reclaim; child lifecycle messages shown to the
-//! model remain session JSONL history. Socket and callback paths are last-known
-//! runtime hints, not proof of liveness.
+//! Active-reference compare-and-swap replaces only a matching source Segment.
+//! Updates preserve unrelated metadata and prevent stale compaction results from
+//! overwriting newer references. Callers coordinate switching with append targets
+//! and allocation.
+//!
+//! Child delegation/reclamation state is current restoration data; model-facing
+//! child notifications are recorded separately in Session history. Peer registration
+//! includes no delegated scope. Stored socket/callback locations are last-known
+//! execution data, not proof of liveness.
 
 use crate::{SegmentId, SessionId};
 use serde::{Deserialize, Serialize};

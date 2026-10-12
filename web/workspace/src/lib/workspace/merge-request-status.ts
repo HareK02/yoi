@@ -1,3 +1,8 @@
+/** reviewの有効性はsubject_refと現在source refの一致で判断する。
+ * 取消し済みreviewを除き、Serverが渡したthread順で有効なeventを選ぶ。
+ * 新しい応答やtarget移動だけでは別sourceへの承認にならない。merged表示は
+ * Backendが検証したimmutable integration evidenceを使い、新しいlive観測で上書きしない。
+ */
 import type {
   TicketEvidenceSummary,
   TicketMergeRequestSummary,

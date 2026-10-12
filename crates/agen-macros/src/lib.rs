@@ -1,9 +1,4 @@
-//! Procedural macros for declaring [`agen`](https://docs.rs/agen) tools.
-//!
-//! [`tool_registry`] expands methods marked with `#[tool]` into `agen::tool::Tool`
-//! implementations and tool definitions. Applications normally use the re-exports from
-//! `agen`; this companion crate exists so those macros can be published and versioned
-//! independently.
+#![doc = include_str!("../README.md")]
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -12,30 +7,16 @@ use syn::{
     spanned::Spanned,
 };
 
-/// Generates tools for methods marked with `#[tool]` in an `impl` block.
+/// Validates tool declarations and generates JSON Schema and `agen` execution wrappers.
 ///
-/// Method doc comments become the tool description. An argument can use
-/// `#[description = "..."]` to supply its JSON Schema description.
+/// Method doc comments and argument `description` attributes provide schema descriptions.
+/// Invalid attributes, duplicate markers, and non-identifier argument patterns produce
+/// `compile_error!` diagnostics rather than panicking during macro expansion.
 ///
-/// ```ignore
-/// #[derive(Clone)]
-/// struct MyApp;
-///
-/// #[agen::tool_registry]
-/// impl MyApp {
-///     /// Retrieves a user by ID.
-///     #[tool]
-///     async fn get_user(
-///         &self,
-///         #[description = "The user ID"] user_id: String,
-///     ) -> Result<String, std::io::Error> {
-///         todo!()
-///     }
-/// }
-/// ```
-///
-/// This generates a `ToolGetUser` wrapper, a `GetUserArgs` schema type, and
-/// `MyApp::get_user_definition()`.
+/// Generated code references helper dependencies through `::agen::__private` so
+/// downstream crates do not need to depend on implementation details directly.
+/// The expansion uses the canonical `::agen` path and does not resolve renamed dependencies.
+/// `ToolExecutionContext` is supplied by the executor and excluded from model input schemas.
 #[proc_macro_attribute]
 pub fn tool_registry(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attr = proc_macro2::TokenStream::from(attr);

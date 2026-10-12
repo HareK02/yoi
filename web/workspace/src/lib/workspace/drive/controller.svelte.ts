@@ -1,3 +1,12 @@
+/** Drive page session内のdraftとreceiptをWorkspace／node単位で保持する。
+ * 選択世代で遅延応答を除外し、A→B→Aでも過去の応答で表示や保存先を変えない。
+ * draftは読取時のlast_mutation_idを保持し、競合でも自動rebase・再送をしない。
+ * mutation IDは実際の確定要求を識別する。rename／moveや同じbytesへの復帰を区別するため、
+ * content digestで代替しない。選択世代はlocal応答の有効性だけを表し、Serverの変更条件ではない。
+ * 保存確認は送信後の編集を残す。結果不明のreceiptがあるentryへの新規変更は止める。
+ * 不明結果は同じrequest IDで照会する。新しいIDでの再送は確定済みの副作用を重複させうる。
+ * receipt照会のuncommittedは未確定であり、失敗の証明ではない。browser reloadでの保持はしない。
+ */
 import type { DriveMutationResponse } from "#lib/generated/drive-api.ts";
 import {
   createDriveClient,
@@ -66,10 +75,7 @@ function message(error: unknown): string {
     ? error.message
     : "Drive request could not be completed";
 }
-/** A subscribable snapshot store; Svelte consumers may use `$controller` directly.
- * All asynchronous publication is fenced by selection generation. Aborting a
- * write does not establish failure: its receipt is retained for reconciliation.
- */
+/** Svelte側からも購読できる状態store。 */
 export class DriveController {
   private value = empty();
   private listeners = new Set<(state: DriveControllerState) => void>();

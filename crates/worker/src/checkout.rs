@@ -1,5 +1,22 @@
-//! Provider-owned request-time checkout projection. No filesystem path is opened
-//! by the Worker: every observation and operation goes through the live router.
+//! Provider-owned, request-time checkout projection entered through current attachments.
+//!
+//! Worker delegates observation and execution to the live router and WorkdirSession without opening
+//! host pathnames. This surface is separate from Repository/Workdir inventory; it neither copies
+//! file trees nor maintains resident registrations. Only `/checkouts` and attachment entrances are
+//! indexable; descendants are merely addressable. Deeper observation does not List content, and
+//! empty children mean "no indexable children", not "empty directory". List/Glob/Grep discover
+//! content; Inspect checks selected coordinates.
+//!
+//! Interfaces/validators bind the projection incarnation, attachment generation, and provider state
+//! so alias reuse after restore or detach cannot transfer old observations to a new connection.
+//! Publication also checks the generation recorded at acquisition. Possessing an Interface grants
+//! no authority: route-reconstructed permission inputs and current provider capability/scope are
+//! rechecked, as are the existing Write/Edit prior-Read and content-hash preconditions.
+//!
+//! Search-result entry coordinates come from typed provider paths without reobserving every result,
+//! so later disappearance does not undo successful discovery. Losing the connection after a
+//! successful Write/Edit/Create, or exceeding a mutation deadline, can leave the outcome unknown.
+//! Interrupting a future does not roll back side effects.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

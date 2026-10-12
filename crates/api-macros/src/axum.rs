@@ -1,9 +1,8 @@
-//! Axum support used by routers generated with `#[api(axum)]`.
+//! Transport boundary for generated routers.
 //!
-//! Generated operation routers contain only transport extraction, typed service invocation, and
-//! response mapping. Authentication/authorization context, body-limit policy, timeout policy, and
-//! other application state remain explicit outer Axum layers. Each operation is also exposed as a
-//! separate router so route-specific layers can be applied before routers are merged.
+//! Routers only extract inputs, call typed services, and convert responses.
+//! Outer layers retain authentication, authorization, body limits, timeouts, and application state.
+//! Per-operation routers allow route-specific constraints to be applied before merging.
 
 use std::{fmt, str::FromStr};
 

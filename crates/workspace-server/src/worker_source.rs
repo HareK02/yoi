@@ -1,3 +1,15 @@
+//! Backend boundary verifying Runtime-origin requests and WorkerRemove source proofs.
+//!
+//! Runtime signatures are verified against current Workspace bindings and the Backend audience.
+//! Hint headers such as Worker IDs do not authenticate. General request proofs and target-bound
+//! WorkerRemove proofs are separate contracts; removal services recheck control grants/retention
+//! after verification. Embedded removal also consumes Runtime-generated in-process proofs,
+//! without falling back to hints.
+//!
+//! Signature/request/time checks alone do not admit proofs: JTI consumption and current Worker
+//! registration, reservations, and singleton ownership are checked too. Diagnostic verification
+//! stages show progress, not an authenticated principal.
+
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 

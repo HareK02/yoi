@@ -1,3 +1,13 @@
+//! Runtime Worker operations and observation through the Backend.
+//!
+//! Targets are Workspace/Runtime/Worker tuples sent to scoped Backend APIs. Runtime endpoints
+//! and display names do not confer execution authority on the client. HTTP management reuses
+//! server-api DTOs; protocol connections carry Method/Event messages over Backend WS.
+//!
+//! Restore sends the caller's fixed observation token/request ID unchanged. Response loss does
+//! not imply rollback; there is no token replacement, automatic Restore, or reconnection to
+//! the next execution. Initial snapshots and notices are observations, not input admission.
+
 use crate::transport::websocket::{Socket as WebSocket, SocketError as WebSocketError};
 use crate::{BackendApiClient, BackendApiClientError, Client};
 pub use server_api::{

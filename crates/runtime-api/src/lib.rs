@@ -1,8 +1,4 @@
-//! Typed Worker Runtime management HTTP contract.
-//!
-//! This crate owns the public REST DTOs and generated client/server adapters only. Runtime domain
-//! state, authorization, body limits, and operation permission policy remain in their existing
-//! authorities.
+#![doc = include_str!("../README.md")]
 
 use std::collections::BTreeMap;
 
@@ -340,8 +336,10 @@ pub struct WorkingDirectoryRequest {
     pub materialization: Option<RepositoryMaterializationContext>,
 }
 
-/// Workspace-authoritative alias-to-Workdir mapping, independent of any
-/// Runtime-local materialized binding.
+/// Workspace-defined alias-to-Workdir mapping, independent of Runtime materialized bindings.
+///
+/// Logical aliases and session capabilities are stored as Workspace attachments; Runtime resolves
+/// host paths and provider sessions. Workdir write scope alone does not grant command execution.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LogicalWorkdirAttachment {
     /// Stable Worker-local routing key. This is not a Workdir id or display name.
@@ -414,7 +412,10 @@ pub struct WorkerInput {
     pub segments: Option<Vec<Segment>>,
 }
 
-/// Host-authored Job/attempt identity, independent of Profile selection.
+/// Job/attempt identity fixed by the Host at creation or Restore.
+///
+/// Profile, instruction, and display name do not imply Job authority. The Backend accepts structured
+/// results by matching the submitting Worker and this binding's current attempt and input digest.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendJobExecutionBinding {
@@ -494,8 +495,11 @@ pub struct WorkerResponse {
     pub worker: WorkerDetail,
 }
 
-/// Explicit observed Restore intent. Preparation is authored by the Workspace
-/// Backend, not browser/Tool JSON, and applied only after Runtime admission.
+/// Restore intent with a fixed observation token and request ID.
+///
+/// Replay and recovery use the same pair; Runtime owns the durable operation and its settlement.
+/// preparation is created by the Workspace Backend, not chosen as browser/Tool input.
+/// Preparation side effects must not run before Runtime admission.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerRestoreRequest {
@@ -526,6 +530,11 @@ pub struct RepositoryAccessWorkdirReference {
     pub working_directory_id: String,
 }
 
+/// Request tying Restore admission and Workspace preparation to the same Runtime operation.
+///
+/// Queries without preparation only recover an existing owner/result; they admit no new intent.
+/// Prepared requests verify and bind the observation token to the owner, retaining the original
+/// preparation on replay.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerRestoreCoordinationRequest {
@@ -550,8 +559,11 @@ pub struct WorkingDirectoryRepositoryAccessRequest {
     pub materialization: RepositoryMaterializationContext,
 }
 
-/// Explicit restore outcome returned for every reachable Runtime restore attempt,
-/// including preflight rejection and uncertain post-side-effect reconciliation.
+/// Explicit result of a Restore attempt that could be reached.
+///
+/// Distinguishes preflight rejection from outcomes requiring state checks after side effects.
+/// HTTP response loss does not imply rollback; check the Runtime-owned receipt/reconciliation
+/// using the same Restore intent.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerRestoreResponse {
     pub state: WorkerRestoreState,

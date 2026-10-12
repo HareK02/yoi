@@ -1,3 +1,14 @@
+//! Credentials and HTTP/WS requests bound to a Backend origin.
+//!
+//! BackendOrigin normalizes scheme/host/port and rejects inputs with a path, query, fragment,
+//! or userinfo. Stored tokens are selected by origin; cross-origin redirects are rejected
+//! to prevent credential leaks. WS requests use the same origin and bearer token.
+//!
+//! This client uses human Backend API tokens, not Workspace signing capabilities or Runtime
+//! source proofs. It returns 401/403 as authentication/authorization failures without falling
+//! back to a local Runtime or another token. Callers interpret typed results; transport success
+//! does not imply completion of a domain operation.
+
 use chrono::{DateTime, Utc};
 use reqwest::{Method, StatusCode, Url, redirect};
 use serde::{Deserialize, Serialize};

@@ -1,12 +1,15 @@
-//! Scope-aware filesystem primitive.
+//! Local sessions retaining scope and provider resources.
 //!
-//! `LocalWorkdirSession` is the write/read gate layered on top of a [`manifest::Scope`]
-//! and a Worker's working directory. The scope decides which paths are
-//! readable and writable; the cwd is carried alongside for convenience
-//! (Glob/Grep default their search base to it).
+//! Scope determines read/write bounds; cwd is the reference for searches and operations.
+//! Clones share resources, but Tools own per-attachment read history. Checked observe/execute/search
+//! and regular trait Read/Write/Edit share a nonqueueing session lock, serializing validator
+//! comparison through I/O. This does not exclude other sessions/processes or external editors.
 //!
-//! `LocalWorkdirSession` is cheap to clone (`Arc` inside). Tool-specific session
-//! state, such as read-before-edit tracking, remains owned by the tool layer.
+//! Checkout uses Linux openat2 and /proc/self/fd, rejecting symlinks, special files, mount crossings,
+//! absolute/traversal paths, and missing primitives. It does not implicitly expand regular Tools'
+//! explicit symlink policies. Hashes bounded sources and uses shared fs-operation engines for
+//! editing and temporary-file saves. Cooperative deadlines cannot forcibly interrupt kernel I/O,
+//! so they provide no hard wall-time guarantee for hung storage.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
@@ -670,12 +673,11 @@ impl Drop for LocalWorkdirSessionInner {
 pub trait WorkdirSessionResource: Debug + Send + Sync {}
 impl<T> WorkdirSessionResource for T where T: Debug + Send + Sync {}
 
-/// An atomically validated, descriptor-pinned External Workdir root.
+/// External provider root with identity checked and retained before approval.
 ///
-/// Pinning compares the selected path identity with the opened descriptor, so
-/// a rename or replacement between approval and open fails closed. The
-/// descriptor, rather than the pathname, remains the filesystem authority for
-/// the lifetime of every session created from this root.
+/// Compares selected-path metadata with the opened descriptor, rejecting renames/replacements
+/// during acquisition. Sessions from this root use the descriptor as filesystem authority;
+/// replacing the ambient pathname after approval does not transfer authority to another tree.
 #[derive(Debug, Clone)]
 pub struct ExternalWorkdirRoot {
     canonical_path: PathBuf,

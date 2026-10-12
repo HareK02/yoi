@@ -1,14 +1,14 @@
-//! OpenAI Chat Completions scheme の wire-level 既定 capability。
+//! Wire-level default capability for the OpenAI Chat Completions scheme.
 //!
-//! モデル ID 固有のテーブル(`gpt-5` 系など)は client construction layer
-//! の責務。ここでは wire の保守的 default のみ。
+//! Model ID tables (e.g. the `gpt-5` family) belong to the client construction
+//! layer. This module provides only conservative wire defaults.
 
 use crate::llm_client::capability::{
     CacheStrategy, ModelCapability, StructuredOutput, ToolCallingSupport,
 };
 
-/// Scheme 既定の capability。OpenAI 互換ルーター系(xAI / Groq / OpenRouter 等)
-/// で未知モデル ID を受けたときのフォールバックに使う。
+/// Scheme default capability, used as a fallback for unknown model IDs on
+/// OpenAI-compatible routers (xAI / Groq / OpenRouter, etc.).
 pub(crate) fn default_capability() -> ModelCapability {
     ModelCapability {
         tool_calling: ToolCallingSupport::Parallel,

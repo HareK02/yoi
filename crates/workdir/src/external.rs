@@ -1,9 +1,15 @@
-//! Versioned websocket DTOs for a client-hosted External Workdir provider.
+//! Bounded WebSocket DTOs for client-hosted External providers.
 //!
-//! Authentication belongs to the websocket upgrade and Backend grant
-//! authority. These frames intentionally contain only opaque identities,
-//! logical Workdir operations, generation fences, and bounded control data.
-//! They must never carry a provider host path, credential, or tunnel token.
+//! Upgrade/Backend owns authentication and grant issuance. Frames contain only opaque identities,
+//! logical operations, and generations, not host paths, credentials, or tunnel tokens. Reconnection
+//! creates a new generation; old handles/results do not enter the new connection's command namespace.
+//! Provider free-text errors are not forwarded; only closed codes/reasons are used.
+//!
+//! External grants follow COMMAND ⇒ WRITE ⇒ READ. WRITE includes READ for previously read hashes;
+//! COMMAND remains separate explicit authority. General session capability intersections may form
+//! subsets independently of this grant hierarchy; the codec never implicitly expands nonhierarchical
+//! grants. Commands run with the shared host's OS permissions, not a sandbox confining processes
+//! to a directory. Output is bounded and inline; provider-local spill paths are not exposed.
 
 use std::path::{Component, Path};
 

@@ -1,3 +1,8 @@
+/** Rust契約に従うconfig treeの通信と応答検査。
+ * tree digestはsource、projection digestは評価結果、contract fingerprintはtoolchain条件を指す。
+ * ConfigProjectionValidatorはstatic template catalogの検査方針であり、鮮度tokenではない。
+ * Browserの解析成功はServerのcommit受理を代替しない。
+ */
 import type {
   ConfigCommitRequest,
   ConfigContentType,

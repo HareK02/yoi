@@ -1,7 +1,13 @@
-//! Conservative JSON-shape-preserving types for the compatibility `input` value.
-//! The original JSON Schema remains authoritative and visible in Inspect.
-//! In particular, open records and JSON unions must not become closed records
-//! or WIP's tagged unions: that would reject/change valid original tool inputs.
+//! Projects compatibility Tool `input` into WIP types without changing JSON shape.
+//!
+//! Conservatively represents only closed records, homogeneous lists, primitives, and string enums.
+//! Local JSON Pointer expansion has depth/node limits; cycles, unsupported syntax, open records,
+//! and mixed unions remain `Json`. Replacing them with WIP closed records or tagged unions would
+//! reject inputs valid for the original Tool or change their shape.
+//!
+//! Original JSON Schema also stays in Inspect-visible parameter summaries for execution validation.
+//! Type projection does not replace schema constraints, rename fields, insert defaults, or add union
+//! wrappers. The parent WIP Host connects display and original schemas to execution.
 use super::{Documentation, Json, TypeExpr};
 use wip_protocol::{EnumCase, FieldDeclaration};
 

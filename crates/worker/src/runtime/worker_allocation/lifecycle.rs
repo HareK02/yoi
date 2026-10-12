@@ -229,7 +229,7 @@ pub(crate) fn install_top_level_at_for_test(
 /// a spawning Worker.
 ///
 /// The spawning flow is two-stage: the spawner calls
-/// [`crate::delegate_scope`] (with its own pid as a live placeholder,
+/// [`super::delegate_scope`] (with its own pid as a live placeholder,
 /// `segment_id = None`), then exec's the child; the child, once
 /// running, calls this function to rewrite the allocation's pid +
 /// segment_id to its own and claim the [`ScopeAllocationGuard`] so

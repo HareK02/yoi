@@ -1,11 +1,4 @@
-//! Runtime representation of a Worker's access scope.
-//!
-//! Built from [`crate::ScopeConfig`] via [`Scope::from_config`]. Every
-//! rule `target` must already be an absolute path — per-layer path
-//! resolution runs earlier, inside [`crate::WorkerManifestConfig::resolve_paths`].
-//! All rule targets retain both their lexically normalized logical identity and
-//! their provider-resolved identity. Allow rules select one identity explicitly;
-//! deny rules always inspect both so aliases cannot bypass a restriction.
+//! Path authority and delegation scope checks.
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -15,10 +8,25 @@ use arc_swap::{ArcSwap, Guard};
 
 use crate::{Permission, ScopeConfig, ScopeRule, SymlinkPolicy};
 
-/// Parsed, pwd-resolved set of allow/deny rules for a Worker.
+/// Checks Worker path authority and authority delegable to children.
 ///
-/// Read/write access decisions are pure functions of the path being
-/// queried and these rules — see [`Scope::permission_at`].
+/// Rule targets must already be absolute paths resolved by
+/// [`crate::WorkerManifestConfig::resolve_paths`]. Each rule retains a lexically
+/// normalized logical identity and a symlink-resolved identity. Allows default to
+/// `resolved`; explicit `logical` rules allow logical paths even when link targets
+/// lie outside the logical subtree. Denies check both identities, preventing aliases
+/// or symlinks from bypassing restrictions.
+///
+/// [`Scope`] grants direct access; [`DelegationScope`] grants authority transferable
+/// to children. Direct access alone does not permit delegation. Delegated rules must
+/// fit existing allows, including permission, recursion, and symlink policy, and
+/// must not overlap denies. A `resolved` allow cannot expand into a `logical` rule.
+///
+/// Parent write restrictions during delegation can be additional denies. On return,
+/// remove added rules one at a time by exact match, without lifting preexisting
+/// denies in the same region. [`SharedScope`] serializes mutations and exposes the
+/// same latest scope to checks. File-operation path validation and reclaiming
+/// authority when children stop remain with their respective owners.
 #[derive(Debug, Clone)]
 pub struct Scope {
     allow: Vec<ResolvedRule>,

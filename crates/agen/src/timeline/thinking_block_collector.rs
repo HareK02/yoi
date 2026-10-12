@@ -20,13 +20,13 @@ impl ThinkingBlockCollector {
         Self::default()
     }
 
-    /// 収集済み item を取り出してクリア
+    /// Take the collected items and clear the collection.
     pub fn take_collected(&self) -> Vec<ReasoningBlockData> {
         let mut guard = self.collected.lock().unwrap();
         std::mem::take(&mut *guard)
     }
 
-    /// 収集をクリア
+    /// Clear the collection.
     pub fn clear(&self) {
         self.collected.lock().unwrap().clear();
     }
@@ -107,7 +107,7 @@ mod tests {
         assert_eq!(items[0].signature.as_deref(), Some("sig1"));
         assert_eq!(items[1].text.as_deref(), Some("second"));
 
-        // take は drain なので 2 度目は空
+        // Taking drains the collection, so the second call is empty.
         assert!(collector.take_collected().is_empty());
     }
 

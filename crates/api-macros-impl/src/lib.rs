@@ -1,4 +1,4 @@
-//! Implementation of `api-macros`.
+#![doc = include_str!("../README.md")]
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,6 +15,13 @@ use syn::{
     spanned::Spanned,
 };
 
+/// Macro boundary that normalizes a trait before generating each output.
+///
+/// Validate routes, operation IDs, and body/response constraints before generation.
+/// Generate HTTP, WebSocket, and OpenAPI from one normalized model rather than interpreting
+/// them independently, reducing differences between adapters for the same declaration.
+/// Validation failures are compile errors; unsupported wire shapes are not implicitly
+/// accepted as JSON.
 #[proc_macro_attribute]
 pub fn api(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attr = proc_macro2::TokenStream::from(attr);

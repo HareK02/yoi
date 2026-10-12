@@ -1,15 +1,13 @@
 //! Prune integration — wires the Engine's prune projection to the Worker's
 //! usage-history-backed token accounting.
 //!
-//! Engine 自身がコンテキスト射影を行う（`worker.rs` の `request_context` 構築
-//! 直後）。Engine は usage 履歴を知らないので、`min_savings` 判定に使う savings
-//! の見積もりはコールバックで外部から注入する。このモジュールはそのコールバック
-//! を組み立てて Engine に差し込むための `impl Worker` を提供する。
+//! The Engine projects context itself, immediately after constructing `request_context` in
+//! `worker.rs`. Since it has no usage history, a callback supplies the savings estimate used
+//! to evaluate `min_savings`. This module provides `impl Worker` to assemble and install it.
 //!
-//! 同じ経路で `PruneObserver` も install し、評価のたびに `prune.fire` /
-//! `prune.skip` metric を `MetricsTracker` に積む。`Fired` 時は uuid を
-//! `UsageTracker` にも stash しておき、後続の `LlmUsage` と組で
-//! `prune.post_request` を吐けるようにする。
+//! The same path installs a `PruneObserver` that adds `prune.fire` / `prune.skip` metrics to
+//! `MetricsTracker` on each evaluation. On `Fired`, it also stashes a uuid in `UsageTracker`
+//! to pair with the subsequent `LlmUsage` and emit `prune.post_request`.
 
 use agen::Item;
 use agen::llm_client::client::LlmClient;
@@ -42,9 +40,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// prevents the prune projection from firing until usage data exists.
     ///
     /// Also installs a [`PruneObserver`] that pushes `prune.fire` /
-    /// `prune.skip` metrics into the shared [`MetricsTracker`]. On `Fired`
+    /// `prune.skip` metrics into the shared `MetricsTracker`. On `Fired`
     /// the observer additionally stashes a fresh correlation_id in
-    /// [`UsageTracker`] so the next `LlmUsage` can be paired with a
+    /// `UsageTracker` so the next `LlmUsage` can be paired with a
     /// `prune.post_request` metric carrying the same id.
     pub fn attach_prune(&mut self, config: PruneConfig) {
         let usage_history_for_tokens = self.usage_history_handle();

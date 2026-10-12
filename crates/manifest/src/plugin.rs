@@ -1,3 +1,19 @@
+//! Offline reading, validation, and writing of the `.yoi-plugin` format.
+//!
+//! Inspects only explicitly supplied directories or archives; does not implicitly
+//! discover catalogs, register with Workers, or instantiate components. Validating
+//! the format grants no execution authority. Worker Manifests/Profiles reject dynamic
+//! Plugin configuration; package declarations and local paths do not grant Worker
+//! capabilities.
+//!
+//! Archives use a restricted stored-ZIP subset. Unsafe paths, links, unsupported
+//! entries, size/count limit violations, and inconsistent headers are rejected;
+//! the file set is digested in order. Directory inputs also reject internal links
+//! and undergo the same validation, so distribution formats share the package
+//! contract. Component Model metadata is required; legacy core-Wasm runtime
+//! declarations are rejected. Validation covers the offline format, not safety
+//! established by running components.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -398,12 +414,11 @@ impl PluginPackageManifest {
 
 const LEGACY_PLUGIN_RUNTIME_WASM_KIND: &str = "wasm";
 const LEGACY_PLUGIN_RUNTIME_WASM_ABI: &str = "yoi-plugin-wasm-1";
-/// Manifest runtime kind for current WebAssembly Component Model packages.
+/// Component Model declaration kind accepted in offline packages.
 ///
-/// Component runtime manifests must set `component` to the packaged component
-/// artifact path and `world` to [`PLUGIN_COMPONENT_TOOL_WORLD`] or
-/// [`PLUGIN_COMPONENT_INSTANCE_WORLD`]. Legacy raw core-Wasm manifests are
-/// intentionally rejected by validation; `wasm-component` is the public runtime.
+/// Validates component paths and corresponding worlds; rejects legacy core-Wasm
+/// declarations. This constant implies neither runtime registration nor verified
+/// component execution.
 pub const PLUGIN_RUNTIME_COMPONENT_KIND: &str = "wasm-component";
 pub const PLUGIN_COMPONENT_TOOL_WORLD: &str = "yoi:plugin/tool@1.0.0";
 pub const PLUGIN_COMPONENT_INSTANCE_WORLD: &str = "yoi:plugin/instance@1.0.0";

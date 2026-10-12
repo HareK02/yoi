@@ -1,4 +1,6 @@
 <script lang="ts">
+  // 認証不要のstatic fixtureでもroot shellとnested overrideのlifecycleを再利用する。
+  // live resource一覧だけを同じscopeのfixtureへ置き換え、独自shellやscope切替controlは作らない。
   import { page } from '$app/state';
   import { setContext } from 'svelte';
   import HeaderOverride from '#lib/workspace/header/HeaderOverride.svelte';

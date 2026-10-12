@@ -1,8 +1,8 @@
-//! `HttpTransport<S: Scheme>`: すべての LLM wire scheme を共通の 1 本の
-//! HTTP クライアントで扱う。
+//! `HttpTransport<S: Scheme>` handles all LLM wire schemes with one shared
+//! HTTP client.
 //!
-//! scheme 固有の差分は [`Scheme`] trait 実装に委譲し、backend 固有の
-//! HTTP policy は [`TransportPolicy`] で明示的に差し込む。
+//! Scheme-specific differences are delegated to [`Scheme`] implementations;
+//! backend-specific HTTP policy is explicitly injected via [`TransportPolicy`].
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -28,11 +28,11 @@ use super::types::{Request, RequestConfig};
 pub const DEFAULT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 pub const DEFAULT_FIRST_STREAM_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 認証設定をリクエスト時に使える形へ解決したランタイム表現。
+/// Runtime representation of authentication resolved for use in requests.
 ///
-/// - `None`: 認証ヘッダを送らない（Ollama 等の opt-out）
-/// - `ApiKey`: 静的な API key 文字列
-/// - `Custom`: リクエスト毎に動的にヘッダを組み立てる
+/// - `None`: send no authentication headers (opt-out for Ollama, etc.).
+/// - `ApiKey`: static API key string.
+/// - `Custom`: build headers dynamically for each request.
 #[derive(Debug, Clone)]
 pub enum ResolvedAuth {
     None,
@@ -41,13 +41,13 @@ pub enum ResolvedAuth {
 }
 
 impl ResolvedAuth {
-    /// 認証要件と実際の解決値が噛み合うか検査する。構築時検証用。
+    /// Check whether resolved authentication matches the requirement at construction.
     ///
-    /// - `ResolvedAuth::None` は認証を付けない宣言なので、どの
-    ///   `AuthRequirement` でも受け入れる（Ollama の Anthropic scheme
-    ///   流用は `required_auth = XApiKey` だが認証ヘッダなしで動く）
-    /// - `ResolvedAuth::Custom` は「ヘッダ組立を全部こちらで行う」
-    ///   宣言なので、scheme が要求する形式によらず受け入れる
+    /// - `ResolvedAuth::None` declares no authentication, so any `AuthRequirement`
+    ///   is accepted (Ollama reuses the Anthropic scheme with
+    ///   `required_auth = XApiKey`, but works without authentication headers).
+    /// - `ResolvedAuth::Custom` declares that all header construction is handled
+    ///   externally, so it is accepted regardless of the scheme's required format.
     pub fn matches(&self, req: AuthRequirement) -> bool {
         match (self, req) {
             (Self::None, _) => true,
@@ -177,7 +177,7 @@ fn sse_error_context(status: u16, headers: &serde_json::Value, source: &str) -> 
     )
 }
 
-/// scheme 共通の HTTP 通信層。
+/// Shared HTTP transport layer for schemes.
 pub struct HttpTransport<S: Scheme> {
     http_client: reqwest::Client,
     scheme: S,
@@ -189,8 +189,8 @@ pub struct HttpTransport<S: Scheme> {
 }
 
 impl<S: Scheme> HttpTransport<S> {
-    /// 新しい transport を作る。`base_url` は末尾スラッシュの有無を
-    /// どちらでも受け付ける（内部で正規化）。
+    /// Create a transport. `base_url` accepts an optional trailing slash
+    /// (normalized internally).
     pub fn new(
         scheme: S,
         model_id: impl Into<String>,
@@ -217,7 +217,7 @@ impl<S: Scheme> HttpTransport<S> {
         self
     }
 
-    /// カスタム HTTP クライアントを差し込む（テスト等）。
+    /// Inject a custom HTTP client (e.g. for tests).
     pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = client;
         self
@@ -226,7 +226,7 @@ impl<S: Scheme> HttpTransport<S> {
     fn build_url(&self) -> String {
         let path = self.scheme.path(&self.model_id);
         let url = format!("{}{}", self.base_url, path);
-        // Gemini のようにクエリパラメータで認証する場合は URL にキーを追記する
+        // Append the key to the URL for query-parameter authentication, as in Gemini.
         if let (AuthRequirement::QueryParam { name }, ResolvedAuth::ApiKey(key)) =
             (self.scheme.required_auth(), &self.auth)
         {
@@ -262,11 +262,11 @@ impl<S: Scheme> HttpTransport<S> {
                 headers.insert("x-api-key", val);
             }
             (_, AuthRequirement::QueryParam { .. }) => {
-                // クエリパラメータは `build_url` で付与済み
+                // Query parameters were already added by `build_url`.
             }
             (ResolvedAuth::ApiKey(_), AuthRequirement::Custom) => {
-                // scheme が Custom を要求する組合せに ApiKey は流れてこない想定
-                // （`matches()` で弾かれる）。安全側で何もしない
+                // ApiKey should never reach a scheme requiring Custom (`matches()`
+                // rejects it). Do nothing as a conservative fallback.
             }
         }
 
@@ -459,7 +459,7 @@ impl<S: Scheme + Clone> Clone for HttpTransport<S> {
     }
 }
 
-/// エラーレスポンスを `ClientError::Api` に変換する。
+/// Convert an error response to `ClientError::Api`.
 async fn classify_error_response(resp: reqwest::Response) -> ClientError {
     let status = resp.status().as_u16();
     let retry_after = resp
@@ -713,7 +713,7 @@ impl<S: Scheme + Clone + 'static> LlmClient for HttpTransport<S> {
         let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
         let event_stream = byte_stream.eventsource();
 
-        // scheme 固有のパース状態をストリーム単位で保持する
+        // Keep scheme-specific parsing state for each stream.
         let mut state = <S::State as Default>::default();
 
         let stream = event_stream

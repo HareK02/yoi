@@ -1,7 +1,7 @@
-//! Anthropic Messages API スキーマ
+//! Anthropic Messages API scheme.
 //!
-//! - リクエストJSON生成
-//! - SSEイベントパース → Event変換
+//! - Request JSON generation.
+//! - SSE event parsing → Event conversion.
 
 mod capability;
 mod events;
@@ -10,14 +10,14 @@ mod scheme_impl;
 
 pub use scheme_impl::AnthropicState;
 
-/// Anthropicスキーマ
+/// Anthropic scheme.
 ///
-/// Anthropic Messages APIのリクエスト/レスポンス変換を担当
+/// Handles request/response conversion for the Anthropic Messages API.
 #[derive(Debug, Clone)]
 pub struct AnthropicScheme {
-    /// APIバージョン
+    /// API version.
     pub api_version: String,
-    /// 細粒度ツールストリーミングを有効にするか
+    /// Whether to enable fine-grained tool streaming.
     pub fine_grained_tool_streaming: bool,
 }
 
@@ -31,12 +31,12 @@ impl Default for AnthropicScheme {
 }
 
 impl AnthropicScheme {
-    /// 新しいスキーマを作成
+    /// Create a new scheme.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 細粒度ツールストリーミングを有効/無効にする
+    /// Enable or disable fine-grained tool streaming.
     pub fn with_fine_grained_tool_streaming(mut self, enabled: bool) -> Self {
         self.fine_grained_tool_streaming = enabled;
         self

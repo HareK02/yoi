@@ -1,9 +1,8 @@
-//! `write_extracted` ツール実装と sub-Engine 用 context。
+//! Temporary storage receiving `write_extracted` results for the legacy extraction engine.
 //!
-//! sub-Engine からは extract worker が出した [`ExtractedPayload`] を
-//! 受け取って `Mutex` 越しに [`ExtractWorkerContext`] に置くだけ。
-//! Worker 側はランループ完了後に `take_payload()` で取り出して
-//! [`super::staging::write_staging`] に渡す。
+//! Validates [`ExtractedPayload`] and holds it in [`ExtractWorkerContext`]'s Mutex.
+//! Callers retrieve the result with [`ExtractWorkerContext::take_payload`].
+//! This module neither persists candidates nor decides whether to adopt them.
 
 use std::sync::{Arc, Mutex};
 
@@ -17,12 +16,12 @@ Pass an object with a `candidates` array. Each candidate must have `kind`, `clai
 `staleness` and `evidence_ids` are optional. Call this exactly once and end the turn. Do not include \
 record ids, source anchors, session metadata, or free-form prose — the wrapper attaches staging metadata mechanically.";
 
-/// extract sub-Engine の出力受け口。`ExtractedPayload` 1 件をホストする。
+/// Output receiver for the extract sub-Engine. Holds one `ExtractedPayload`.
 #[derive(Debug, Default)]
 pub struct ExtractWorkerContext {
     payload: Mutex<Option<ExtractedPayload>>,
-    /// `write_extracted` が複数回呼ばれた回数（debug 用）。
-    /// 後勝ちで上書きするが、Worker 側で warn を出したい場合に参照する。
+    /// Count of `write_extracted` calls (for debugging).
+    /// Later calls overwrite earlier payloads; Workers can use this to emit a warning.
     call_count: Mutex<usize>,
 }
 
@@ -31,8 +30,8 @@ impl ExtractWorkerContext {
         Self::default()
     }
 
-    /// sub-Engine 終了後に Worker が呼んで payload を取り出す。
-    /// 一度も `write_extracted` が呼ばれなければ `None`。
+    /// Called by the Worker after the sub-Engine exits to retrieve the payload.
+    /// Returns `None` if `write_extracted` was never called.
     pub fn take_payload(&self) -> Option<ExtractedPayload> {
         self.payload
             .lock()
@@ -90,7 +89,7 @@ impl Tool for WriteExtractedTool {
     }
 }
 
-/// sub-Engine に register する `write_extracted` ツール定義を返す。
+/// Returns the `write_extracted` tool definition to register with the sub-Engine.
 pub fn write_extracted_tool(ctx: Arc<ExtractWorkerContext>) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(ExtractedPayload);

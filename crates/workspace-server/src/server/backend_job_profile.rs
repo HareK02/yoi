@@ -1,4 +1,11 @@
-//! Profile recipes are selected by the caller. Execution grants remain Host owned.
+//! Backend Job Profile selection and explicit grant checks.
+//!
+//! Resolves the caller's registry Profile from the Workspace virtual config bundle and Prompt
+//! projection, using public catalog recipes separately from browser launch filtering. Raw sources
+//! and path selectors are rejected; instructions/features are not replaced with another default
+//! recipe. Recipes requiring Workspace mutation, Memory, child/peer, Workdir, Flow, or MCP authority
+//! absent from the Job are rejected. subjektiv also checks explicit consolidation grants and feature
+//! requirements; Profile selection alone creates no domain authority.
 use super::*;
 
 impl WorkspaceApi {

@@ -5,7 +5,13 @@ use ignore::WalkBuilder;
 
 use crate::{FsAccessPolicy, FsError, FsPath, GlobRequest, GlobResult};
 
-/// Execute a bounded glob entirely inside the provider process.
+/// Bounded Glob within the provider process.
+///
+/// Descriptor providers check scope before reading ignore rules and prune denied directories
+/// before descent. .ignore takes precedence over Git rules; Git rules require an authorized .git
+/// marker. Unavailable rule sources are skipped; byte limit or cancellation violations yield errors.
+/// Does not follow ambient/global configuration or linked-worktree management pointers.
+/// Separate from configuration discovery in regular path-backed walkers.
 pub fn run_glob(
     root: &Path,
     base: &Path,

@@ -1,4 +1,5 @@
 <script lang="ts">
+  // 本文の共有parserを使い、表示別rendererでもraw HTML拒否とリンク検査を上書きできない。
   import SvelteMarkdown, {
     buildUnsupportedHTML,
     type Renderers,

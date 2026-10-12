@@ -41,7 +41,7 @@ pub(crate) struct AnthropicRequest {
     pub thinking: Option<AnthropicThinking>,
 }
 
-/// Anthropic extended thinking 指示。
+/// Anthropic extended thinking instructions.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum AnthropicThinking {
@@ -90,8 +90,7 @@ pub(crate) enum AnthropicContentPart {
     },
     #[serde(rename = "redacted_thinking")]
     RedactedThinking {
-        /// 暗号化済み reasoning blob。`Item::Reasoning::encrypted_content`
-        /// から渡る。
+        /// Encrypted reasoning blob from `Item::Reasoning::encrypted_content`.
         data: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
@@ -181,9 +180,9 @@ pub(crate) struct AnthropicTool {
 impl AnthropicScheme {
     /// Build Anthropic request from Request.
     ///
-    /// `capability.prompt_caching` が [`CacheStrategy::Auto`] のときは
-    /// `cache_control` マーカーを一切挿入しない（Ollama の `/v1/messages`
-    /// 流用時など、サーバ側が `cache_control` を受け付けないケース）。
+    /// No `cache_control` markers are inserted when `capability.prompt_caching`
+    /// is [`CacheStrategy::Auto`] (e.g. servers that reject `cache_control`,
+    /// such as Ollama when reusing `/v1/messages`).
     pub(crate) fn build_request(
         &self,
         model: &str,
@@ -198,9 +197,8 @@ impl AnthropicScheme {
         let messages = self.convert_items_to_messages(&request.items, &breakpoints);
         let tools = request.tools.iter().map(|t| self.convert_tool(t)).collect();
 
-        // Reasoning の投影: capability が BudgetTokens / Both をサポート
-        // していて、request 側で budget_tokens が指定されているときだけ
-        // thinking フィールドを付ける。
+        // Project reasoning: add the thinking field only when the capability
+        // supports BudgetTokens / Both and the request specifies budget_tokens.
         let supports_budget_tokens = matches!(
             capability.reasoning,
             Some(ReasoningSupport::BudgetTokens | ReasoningSupport::Both),
@@ -361,23 +359,23 @@ impl AnthropicScheme {
                     ..
                 } => {
                     flush_pending(&mut messages, &mut pending_user, "user", &mut locations);
-                    // Anthropic はアシスタントターン中の `thinking` /
-                    // `redacted_thinking` ブロックを必ず assistant role の
-                    // content_part として送り返す必要がある。
+                    // Anthropic requires `thinking` / `redacted_thinking` blocks
+                    // from an assistant turn to be sent back as assistant-role
+                    // content_parts.
                     //
-                    // - signature あり: `thinking` content_part を投影
-                    // - signature 無し + encrypted_content あり:
-                    //   `redacted_thinking` content_part を投影
-                    // - どちらも無い: 他 scheme（OpenAI 等）から流入した
-                    //   素の reasoning text。Anthropic に投げる意味も
-                    //   round-trip の根拠も無いので drop。
+                    // - With signature: project a `thinking` content_part.
+                    // - No signature, but encrypted_content present:
+                    //   project a `redacted_thinking` content_part.
+                    // - Neither: plain reasoning text from another scheme
+                    //   (e.g. OpenAI). Drop it: there is no reason to send it to
+                    //   Anthropic and no basis for round-tripping it.
                     if let Some(sig) = signature.clone() {
                         pending_assistant
                             .push((i, AnthropicContentPart::thinking(text.clone(), sig)));
                     } else if let Some(data) = encrypted_content.clone() {
                         pending_assistant.push((i, AnthropicContentPart::redacted_thinking(data)));
                     }
-                    // どちらも None なら何も pend せず、本 item は無視。
+                    // If both are None, queue nothing and ignore this item.
                 }
             }
         }
@@ -486,7 +484,7 @@ mod tests {
         CacheStrategy, ReasoningEffort, StructuredOutput, ToolCallingSupport,
     };
 
-    /// cache_control が有効になる既定の capability。
+    /// Default capability with cache_control enabled.
     fn cap_explicit() -> ModelCapability {
         ModelCapability {
             tool_calling: ToolCallingSupport::Parallel,
@@ -497,7 +495,7 @@ mod tests {
         }
     }
 
-    /// cache_control を送らない capability（Ollama 等）。
+    /// Capability that does not send cache_control (e.g. Ollama).
     fn cap_auto() -> ModelCapability {
         ModelCapability {
             prompt_caching: CacheStrategy::Auto,
@@ -901,8 +899,8 @@ mod tests {
 
     #[test]
     fn cache_auto_does_not_add_cache_control() {
-        // Ollama のように `CacheStrategy::Auto` のときは cache_control
-        // マーカーを一切付けない。breakpoint 計算も走らないこと。
+        // With `CacheStrategy::Auto` (e.g. Ollama), add no cache_control markers.
+        // Breakpoint calculation must not run either.
         let scheme = AnthropicScheme::new();
         let mut request = Request::new().user("hello");
         request.cache_anchor = Some(0);
@@ -933,8 +931,8 @@ mod tests {
 
     #[test]
     fn reasoning_with_signature_projects_thinking_part() {
-        // Item::Reasoning に signature があれば assistant role の
-        // `thinking` content_part として送る。
+        // Send Item::Reasoning with a signature as an assistant-role
+        // `thinking` content_part.
         let scheme = AnthropicScheme::new();
         let request = Request::new()
             .user("hi")
@@ -976,21 +974,21 @@ mod tests {
 
     #[test]
     fn reasoning_without_signature_or_encrypted_is_dropped() {
-        // 他 scheme から流入した素の reasoning は Anthropic に投げない。
+        // Do not send plain reasoning from other schemes to Anthropic.
         let scheme = AnthropicScheme::new();
         let request = Request::new()
             .user("hi")
             .item(Item::reasoning("plain text"))
             .item(Item::assistant_message("done"));
         let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
-        // thinking part は 1 つも乗らない
+        // No thinking parts are included.
         assert!(collect_assistant_thinking_parts(&req).is_empty());
     }
 
     #[test]
     fn thinking_part_lands_in_assistant_role_message() {
-        // wire 構造の position 検証: thinking part は assistant role の
-        // message 配列に並ぶ（user role には絶対に入らない）。
+        // Verify wire positions: thinking parts belong in the assistant-role
+        // message array (never in the user role).
         let scheme = AnthropicScheme::new();
         let request = Request::new()
             .user("question?")
@@ -1000,7 +998,7 @@ mod tests {
             .user("follow up");
         let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
 
-        // 全 thinking part が assistant role の message に存在すること
+        // All thinking parts must be in assistant-role messages.
         let mut thinking_msg_indices = Vec::new();
         for (i, msg) in req.messages.iter().enumerate() {
             if let AnthropicContent::Parts(parts) = &msg.content {
@@ -1023,9 +1021,9 @@ mod tests {
             req.messages,
         );
 
-        // thinking part を含む assistant message は、それに続く tool_use を含む
-        // assistant message より前 (= 先頭側) に位置すること
-        // (Anthropic 仕様: 同一論理ターン内で thinking → tool_use の順)
+        // Assistant messages containing thinking parts must precede the
+        // subsequent assistant messages containing tool_use.
+        // (Anthropic requires thinking → tool_use within one logical turn.)
         let mut tool_use_msg_indices = Vec::new();
         for (i, msg) in req.messages.iter().enumerate() {
             if let AnthropicContent::Parts(parts) = &msg.content {
@@ -1050,7 +1048,7 @@ mod tests {
 
     #[test]
     fn redacted_thinking_part_lands_in_assistant_role_message() {
-        // RedactedThinking も同様に assistant role に置かれること。
+        // RedactedThinking must also be placed in the assistant role.
         let scheme = AnthropicScheme::new();
         let request = Request::new()
             .user("ask")

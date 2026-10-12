@@ -1,11 +1,65 @@
-//! Explicit-opt-in Web Interface Protocol (WIP) Worker surface.
+//! Worker's Web Interface Protocol (WIP) projection and execution boundary.
 //!
-//! The adapter intentionally keeps authority in the existing Worker host. In WIP
-//! mode ordinary tools are mounted below `/tools`, removed from the model-visible
-//! tool list, and invoked through three stateful tree/inspect/invoke tools. The
-//! published WIP crates own protocol validation, HTTP encoding, Known Space, and
-//! operation lifecycle state; this module owns only the in-process transport and
-//! the compatibility projection into existing async `Tool` implementations.
+//! In WIP mode, `Tree`, `Inspect`, and `Invoke` access native projections and compatibility
+//! projections at `/tools/<registered-name>`, without duplicating individual Tools for the model.
+//! The public WIP crate owns Protocol types, codecs, Known Space, and call lifecycle; this module
+//! owns Host registration/resolution and connection to existing async Tools. Provider-specific
+//! projections belong to their Features.
+//!
+//! # Object ownership and added operations
+//!
+//! [`WipMountRegistry`] retains root namespace owners. Object existence, identity, and resolver
+//! ownership are separate from operations added by other Features. Dynamic mounts resolve only one
+//! immediate collection child segment; added operations replace neither existing Objects nor resolvers.
+//! Descriptors extending the same Interface must match format, documentation, and type declarations.
+//! Registration rejects duplicate operation names, routes owned elsewhere, and conflicting contracts
+//! for the same reference. Changing enabled operations changes the Interface validator, preventing
+//! execution from old observations.
+//!
+//! Native projections hide compatibility Tools only for the same semantic capability or an explicit
+//! claim. Feature names are not intermediate Objects; old `/features/...` routes are not aliases.
+//! Old routes in persisted history are not rewritten and remain distinct from current call targets.
+//!
+//! # References and call-time authority
+//!
+//! Exact `(scope, name)` pairs identify Interfaces. The same name in different scopes means different
+//! contracts; ancestry uses canonical path segments, not string prefixes. Self-scoped projections use
+//! the resolved Object path as scope, fixing Object, descriptor, validator, and handler from the same
+//! projection. Missing scope Object refs are never fabricated.
+//!
+//! The Host checks target, Object precondition, scope/membership/ref, Interface precondition, and
+//! arguments before dispatching to the fixed handler. Publication, Feature enablement, and observation
+//! do not grant execution authority; handlers recheck current provider capabilities and caller
+//! authority. Compatibility calls validate input against original JSON Schema and evaluate permission
+//! with original Tool names/arguments. `ask` is denied without an approval protocol. Workdir scope
+//! and Backend authorization remain in existing implementations.
+//!
+//! # Client lifetime and observations
+//!
+//! Each [`WipRuntime`] creates a Client, distinguishing sessions by endpoint and Host-supplied opaque
+//! security context. Observations stay within the Runtime, never shared or persisted across Workers.
+//! Restore requires reacquisition; reference strings in history are not cache or wire authority
+//! evidence. Ordinary compaction preserves the live Runtime but does not turn shortened conversation
+//! into observation authority.
+//!
+//! Acquisition, display, and calls are separate. Tree follows only indexable edges; unobserved
+//! children are not empty sets. Inspect displays only the selected Object or Interface in the
+//! official Text View. Displays that cannot meet completeness, freshness, or bounds fail rather than
+//! silently truncate. Displays are untrusted data; signatures are never reparsed as call targets.
+//! The binding defines details.
+//!
+//! # Post-dispatch outcomes and cancellation
+//!
+//! Route/schema/permission denial, stale, provider-confirmed cancelled, interrupted, post-dispatch
+//! disconnection, and unknown outcomes are distinct. Dispatched operations are never automatically
+//! rerun. Unknown mutation outcomes in particular require external state or provider receipt checks.
+//! Cancellation goes only to the operation and handler fixed for execution, without re-resolving the
+//! Object. Sending cancellation alone does not establish a terminal outcome; completion or future
+//! drop releases the execution binding.
+//!
+//! Native typed returns remain values; Entries and strings never trigger implicit extra acquisition.
+//! Later Inspect failures do not fail completed calls. Attachments and compatibility ToolOutput use
+//! existing Engine output/history paths; native attachments still require WIP return-value validation.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};

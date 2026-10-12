@@ -368,7 +368,7 @@ fn create_client(args: &Args) -> Result<Box<dyn LlmClient>, String> {
             ResolvedAuth::ApiKey(api_key),
         )),
         Provider::Ollama => {
-            // Ollama = Anthropic scheme + base_url 差し替え + 認証なし
+            // Ollama uses the Anthropic scheme with a custom base_url and no authentication.
             let scheme = AnthropicScheme::new();
             let cap = default_capability();
             Ok(Box::new(HttpTransport::new(

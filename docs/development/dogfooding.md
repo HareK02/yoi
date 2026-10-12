@@ -1,40 +1,17 @@
-# Dogfooding Yoi
+# ドッグフーディング中の安全規則
 
-This repository is developed with Yoi itself. Dogfooding is valuable because it exposes orchestration, memory, TUI, and workflow problems under real use.
+YoiでYoiを開発するときも、稼働中のServer・Runtimeを新しいbinaryの最初の起動試験に使わない。自身を実行しているプロセスは停止せず、マージ後の稼働環境の更新は利用者が行う。
 
-## Pre-restart gate
+## 更新前の検証
 
-Never use the live dogfood Server or Runtime as the first startup test for a new binary. A dogfood restart is allowed only after this sequence succeeds:
+製品のServer・Runtimeエントリーポイントをビルドし、変更した契約と依存箇所のテスト、root check、format、差分検査を行う。別のDB、Runtimeデータ、ポートを使った隔離環境で起動と実際の署名要求を確認する。過去の接続成功を保存して認証済みと見なすfixtureでは、本番の要求単位の認証を検証できない。
 
-1. Build the production entrypoints: `cargo build -p worker-runtime --bin yoi-runtime -p yoi-workspace-server --bin yoi-server`.
-2. Run the focused and dependent tests for the changed contracts, followed by workspace-root `cargo check`, `cargo fmt --all -- --check`, and `git diff --check HEAD`.
-3. Exercise the provisioning and operational checks in [Workspace ↔ Runtime authentication](server-runtime-auth.md) against isolated Server DB, Runtime data, and ports. The Workspace owner must configure the Runtime endpoint and pinned Runtime key, the Runtime operator must install the Workspace issuer bundle, and actual signed requests must authenticate. A connection-test result describes only that attempt; no stored verification state is a readiness prerequisite.
-4. Have an external supervisor or operator restart Server and Runtime from the same validated source commit/build artifacts. A Worker hosted by the target Runtime must never terminate its own Runtime.
-5. Verify post-restart readiness through the Workspace Runtime projection, ping, Worker list/create, protocol subscription, and a Runtime-to-Server source-proof operation before treating the environment as healthy.
+稼働環境を更新する際は、検証したsourceとartifactを特定できるようにする。更新後は、疎通だけでなく、Workerの一覧・起動・protocol購読など変更に関係する操作を確認する。正常なHTTP応答だけで、画面、console、APIに残るエラーを無視しない。
 
-The former isolated startup shell harness depended on removed Server-global trust commands and is intentionally not a fallback smoke path. New automated startup coverage must configure the same Workspace-scoped connection and explicit Runtime-side Workspace trust used by production, then exercise per-request authentication rather than recreating global trust or seeding a past verification result.
+検証用のWeb buildや生成処理が、稼働中の開発サーバーの生成物を書き換えないようにする。別のsource treeを検証する場合も、生成物やbuild cacheの混用によって結果を誤認しないように隔離する。
 
-## What to record
+## 問題の記録
 
-When a tool limitation, workflow obstacle, or model-facing policy problem blocks work, record it under `docs/report/` or a work item artifact. Do not turn every minor annoyance into a maintained design doc.
+作業を妨げるツール制限、誤解を招く指示、危険な復旧手順を確認した場合は、`docs/report/`または作業記録に報告する。試みたこと、観測した事実、影響、原因の確度、必要な設計判断を区別する。小さな不便ごとに維持対象の設計文書を増やさない。
 
-A report is useful when it explains:
-
-- what the agent/user tried to do
-- what made the work unsafe, confusing, or slow
-- what design boundary was missing
-- what evidence was observed
-
-For a Remote Runtime rollout, also record the source commit, binary artifact digest, Server schema version, Runtime `binding_id` and pinned key fingerprint, the current Workspace `key_id` and public fingerprint, the Runtime-side trust registration/revocation, and typed HTTP/WebSocket outcomes. Do not copy a Runtime trust ID into the Server connection configuration or treat a successful connection test as persisted authentication. A successful document response does not outweigh visible UI, console, or API errors.
-
-## Runtime command caveat
-
-After rebuilding and restarting during dogfooding, `current_exe()` can point at a deleted binary path. Use typed runtime-command configuration and the development-only `YOI_POD_RUNTIME_COMMAND` executable override rather than reviving shell-command overrides.
-
-## Multi-Worker work
-
-Use child Workers for scoped tasks and reviews, but keep orchestration decisions in visible project records. Do not merge, close, or clean up merely because a child notification arrived.
-
-## Secrets and logs
-
-Do not put secrets, private prompts, or ignored secret-like file contents into diagnostics, work items, docs, session logs, or model context. During broad audits, existence/path checks are enough unless the user explicitly asks to inspect content.
+記録には調査に必要なsource・artifact・操作結果の識別情報だけを残す。秘密情報、認証情報、非公開プロンプト、秘密を含むファイルの内容を文書・診断・セッションへ転載しない。広範な監査では、明示的な内容確認が必要でない限り、存在とパスの確認にとどめる。

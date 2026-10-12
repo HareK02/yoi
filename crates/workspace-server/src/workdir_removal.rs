@@ -1,10 +1,24 @@
-//! Durable, retryable Backend authority for persistent Workdir removal.
+//! Persists durable deletion intent and attempts for Repository-backed Workdirs.
 //!
-//! Runtime cleanup is an external side effect, so callers reserve one immutable
-//! operation before invoking the provider. The final registry deletion and
-//! operation completion are committed atomically. If a process stops after the
-//! provider side effect but before that transaction, recovery re-observes the
-//! provider and converges through the same operation.
+//! Deletion intent fixes Workspace, Workdir, owning Runtime, Repository/materialization, actor,
+//! and reason. Endpoints, host paths, and provider handles do not grant caller deletion authority.
+//! External Workdirs follow grant revocation, not this operation.
+//!
+//! Only one pending operation per Workdir is allowed; attempts are claimed transactionally.
+//! Process IDs and startup markers are retained. Recovery reclaims the exact owner/attempt by
+//! compare-and-set only after confirming the previous owner is gone; live or unobservable owners
+//! are not displaced. In-process locks alone are insufficient.
+//!
+//! Server execution revalidates stored materialization and current attachments, reservations,
+//! assignments, retention, and creation operations, then observes occupancy and cleanliness via
+//! Runtime. Dirty resources remain; unknown observations or provider failures retain the registry
+//! and record attention/retryability. Only confirmed deletion or exact working_directory_not_found
+//! is deletion evidence; registry removal and completed/removed commit in the same transaction.
+//!
+//! Normal deletion, Workspace deletion, cleanup, and startup recovery use the same reserved Server
+//! operation execution. Failed DB commits after provider deletion are reobserved through that
+//! operation. Recovery relies on provider identity and results, not an exactly-once guarantee
+//! across all interruption points.
 
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};

@@ -1,6 +1,6 @@
 //! Task tools built-in feature module.
 //!
-//! The built-in Task feature owns the session-lifetime [`TaskStore`] shared by
+//! The built-in Task feature owns the session-lifetime `TaskStore` shared by
 //! the Task tools and reminder hooks. Worker hosts install this module through the
 //! feature contribution boundary and use its narrow snapshot surface for
 //! restore/rewind/compaction compatibility.

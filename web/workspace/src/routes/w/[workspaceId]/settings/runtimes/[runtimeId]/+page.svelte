@@ -1,4 +1,7 @@
 <script lang="ts">
+  // 接続テストはWorkspace／Runtime／現在bindingが一致する結果だけを表示する。
+  // 同じpublic keyでも再登録したbindingへ古い成功を適用しない。route世代は遅延応答の
+  // 除外用であり、binding identityやBackendの変更受理条件を代替しない。
   import { goto, invalidateAll } from '$app/navigation';
   import type {
     RevokeRuntimeTrustKeyRequest,

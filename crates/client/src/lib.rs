@@ -1,7 +1,4 @@
-//! Backend Workspace/Runtime と既存 Worker protocol へ接続するクライアント。
-//!
-//! Standalone execution is owned by the `standalone` crate and does not spawn
-//! a Worker subprocess through this crate.
+#![doc = include_str!("../README.md")]
 
 pub mod backend_api;
 mod backend_auth;

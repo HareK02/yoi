@@ -1,10 +1,4 @@
-//! Subject-scoped Memory storage with immutable change history.
-//!
-//! This module owns subjektiv's domain schema and typed repository. Physical
-//! SQLite placement, connection configuration, migration execution, backup,
-//! restore, and teardown remain owned by [`feature_storage`]. A store is
-//! already bound to one Host storage scope; a subject identifier is therefore a lookup
-//! key, not an authorization credential.
+#![doc = include_str!("../README.md")]
 
 pub mod api;
 pub mod job;
@@ -181,9 +175,9 @@ pub fn subject_worker_singleton_key(subject_id: &str) -> Result<String> {
     Ok(format!("{SUBJECT_WORKER_SINGLETON_PREFIX}{subject_id}"))
 }
 
-/// Immutable host-recorded history that attributes one durable Session to the
-/// subject and Worker that produced it. This is archival provenance only: it is
-/// deliberately not a current-Worker link or execution ownership record.
+/// Immutable historical attribution of a Session to its Subject/Worker, recorded by the Host.
+/// Not a current Worker link or execution ownership. Never infer or repair attribution from candidate presence or bodies.
+/// Session content stays in Session storage; this store saves only attribution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubjectSessionAttribution {
@@ -230,10 +224,10 @@ pub enum ChangeProposalIntent {
     Reopen,
 }
 
-/// Host-owned metadata describing how a staged candidate is expected to change
-/// one existing Memory. It is validated against the current scoped Memory when
-/// the candidate is staged; it is not model-authored and does not itself apply
-/// the change.
+/// Host-owned metadata specifying how a staging candidate proposes to change existing Memory.
+/// Checked against current scoped Memory at staging; registering the candidate does not itself change Memory.
+/// Application rechecks the same Memory ID, expected change ID, intent, and reason,
+/// never retargeting an old proposal to the latest change or inferring the target from claim text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChangeProposal {
@@ -353,15 +347,14 @@ impl SubjectStagingRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Memory recall eligibility, not proof of truth or execution authority.
+/// New Memory starts Active; Retracted is terminal.
 pub enum MemoryState {
-    /// Current and eligible for ordinary recall. This does not assert truth and
-    /// grants no authority.
+    /// Currently eligible for ordinary recall.
     Active,
-    /// No longer current because its question, condition, or applicability has
-    /// ended. A later change may reopen it when circumstances change.
+    /// The question, condition, or applicability period has ended. A later change can restore Active.
     Resolved,
-    /// Invalidated and no longer eligible for recall. Retraction is terminal;
-    /// corrected follow-up experience is a separate Memory linked by derivation.
+    /// Invalidated. A distinct experience after correction creates new Memory and may reference the old change through derivation.
     Retracted,
 }
 
@@ -374,6 +367,9 @@ pub struct MemoryChangeRef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Immutable change record appended for each update to the same Memory.
+/// Opaque change IDs and previous change IDs link history; neither ID magnitude nor timestamps imply order.
+/// The current projection points to the history head. Candidate/derivation references also pin individual changes.
 pub struct MemoryRecord {
     pub schema_version: u32,
     pub id: String,
@@ -461,6 +457,8 @@ pub struct StagingResolution {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Immutable startup context derived from committed Memory, not another authoritative copy of Memory.
+/// Pins the body, exact change references, and source fingerprint; never used as current context after Memory changes.
 pub struct SurfaceSnapshot {
     pub schema_version: u32,
     pub id: String,
@@ -609,14 +607,21 @@ static MIGRATIONS: &[FeatureMigration] = &[
 pub const REGISTRATION: FeatureRegistration =
     FeatureRegistration::new(SUBJEKTIV_FEATURE_ID, MIGRATIONS);
 
+/// Subject Memory repository restricted to a Host storage scope.
+/// Owns schemas, validation, queries, and domain transactions; delegates physical layout
+/// and connection lifecycle to [`feature_storage`]. Synchronous API; async Hosts use a blocking executor.
+///
+/// Scope and subject IDs select storage boundaries; the Host authenticates before calls.
+/// Independent of the legacy Workspace Memory DB, with no implicit import or dual writes.
+/// This store saves no current Worker links; the Host manages execution ownership.
 #[derive(Clone)]
 pub struct SubjektivStore {
     database: FeatureDatabase,
 }
 
 impl SubjektivStore {
-    /// Registers the trusted schema with the neutral Host storage manager.
-    /// One registration can be reused across all scopes served by that manager.
+    /// Registers the schema with neutral Host storage.
+    /// Registration is separate from opening the DB and is reusable across scopes in the same manager.
     pub fn register(storage: &ScopedFeatureStorage) -> Result<RegisteredFeature> {
         storage.register(REGISTRATION).map_err(Into::into)
     }
@@ -631,10 +636,10 @@ impl SubjektivStore {
         Self::from_database(storage.open(registration)?)
     }
 
-    /// Opens a trusted managed database. `store_scope.workspace_id` retains its
-    /// historical SQL name: it stores the physical Host storage-scope identity.
-    /// Backend uses its Workspace ID; local Hosts use a persisted random scope,
-    /// without creating a Workspace. Subject IDs are separate domain identities.
+    /// Validates the managed DB's Feature ID and stored scope match.
+    /// `store_scope.workspace_id` is a compatibility SQL name denoting the physical storage scope.
+    /// Backends use Workspace IDs; local Hosts use persistent independent scopes.
+    /// Subjects have separate identities within a scope; a local scope creates no Workspace.
     pub fn from_database(database: FeatureDatabase) -> Result<Self> {
         if database.feature_id() != SUBJEKTIV_FEATURE_ID {
             return Err(SubjektivError::InvalidRecord(
@@ -736,8 +741,8 @@ impl SubjektivStore {
         })
     }
 
-    /// Replaces behavior only if its exact previously-read content still matches.
-    /// Memory changes do not participate in this condition.
+    /// Updates only when the observed behavior body matches byte-for-byte.
+    /// Behavior is a document independent of Memory, excluded from Memory-change and surface-freshness comparison conditions.
     pub fn update_subject_behavior(
         &self,
         subject_id: &str,
@@ -759,8 +764,9 @@ impl SubjektivStore {
         })
     }
 
-    /// Derived content condition over all current Memory identities, not stored
-    /// on the Subject and never incremented.
+    /// SHA-256 hashes the sorted, length-delimited current `(memory_id, change_id)` set across all states.
+    /// Content/state/provenance changes issue new change IDs, preventing equality even in ABA returns to prior content.
+    /// Saves no redundant Subject counter; staging alone does not change this fingerprint.
     pub fn memory_fingerprint(&self, subject_id: &str) -> Result<String> {
         self.database.try_transaction(|tx| {
             require_subject(tx, subject_id)?;
@@ -847,8 +853,8 @@ impl SubjektivStore {
         })
     }
 
-    /// Subject retirement is distinct from stopping any current Worker. It does
-    /// not edit or delete Memory and cannot be reversed by this baseline schema.
+    /// Retires a Subject independently of stopping Workers. Memory/history remain unedited, undeleted, and readable.
+    /// Retirement is irreversible; new candidates and Memory changes require an active Subject.
     pub fn retire_subject(&self, subject_id: &str) -> Result<SubjectRecord> {
         self.database.try_transaction(|transaction| {
             let mut subject = require_subject(transaction, subject_id)?;
@@ -868,6 +874,9 @@ impl SubjektivStore {
         })
     }
 
+    /// Saves an immutable candidate without changing committed Memory.
+    /// Replay with the same candidate identity and payload returns the original record; different content conflicts.
+    /// Extraction failure after saving never revokes the candidate. The Host commits the extraction pointer separately.
     pub fn stage_candidate(&self, record: SubjectStagingRecord) -> Result<SubjectStagingRecord> {
         validate_staging_record(self.workspace_id(), &record)?;
         validate_staging_admission(&record)?;
@@ -878,9 +887,8 @@ impl SubjektivStore {
         })
     }
 
-    /// Atomically verifies immutable Host attribution already completed at the
-    /// Session lifecycle boundary and stages its extracted candidate. Candidate
-    /// staging never creates or repairs Session attribution.
+    /// Validates immutable Host attribution already recorded by the Session lifecycle and saves the candidate in the same transaction.
+    /// Candidate registration never creates or repairs Session attribution.
     pub fn stage_candidate_with_attribution(
         &self,
         mut record: SubjectStagingRecord,
@@ -1154,6 +1162,9 @@ impl SubjektivStore {
         })
     }
 
+    /// Appends an immutable change only when the observed expected change ID matches the current head.
+    /// Comparison, history append, and current projection update share a transaction, preventing late stale decisions from overwriting.
+    /// This direct update cannot add candidate provenance; use [`Self::apply_candidates`].
     pub fn revise_memory(
         &self,
         subject_id: &str,
@@ -1173,8 +1184,8 @@ impl SubjektivStore {
         })
     }
 
-    /// Atomically writes a Memory change and one candidate's immutable
-    /// resolution. Any conflict or invalid reference rolls both changes back.
+    /// Saves a Memory change and one candidate's immutable disposition together.
+    /// Conflicts or invalid references roll back both.
     pub fn apply_candidate(
         &self,
         subject_id: &str,
@@ -1189,9 +1200,11 @@ impl SubjektivStore {
         Ok((memory, resolutions.remove(0)))
     }
 
-    /// Atomically applies one or more candidates to exactly one new Memory
-    /// change_id. The repository derives `source_candidate_ids` from this list so
-    /// every applied resolution has a reciprocal immutable provenance edge.
+    /// Atomically applies unresolved candidates from the same Subject to one new Memory change.
+    /// Derives provenance from the candidate set, committing the change, reference edges, current projection,
+    /// surface staleness, and each immutable disposition in one transaction. Standalone close cannot record Applied.
+    /// Mismatched comparison conditions or proposal intents roll back everything, leaving candidates unresolved.
+    /// Atomicity covers only this Feature DB, not the Host DB or subsequent surface generation.
     pub fn apply_candidates(
         &self,
         subject_id: &str,
@@ -1223,6 +1236,10 @@ impl SubjektivStore {
         })
     }
 
+    /// Saves candidate decisions with stable request IDs and immutable receipts.
+    /// Exact replay returns the committed receipt; ID reuse with different input is rejected.
+    /// Applied Memory is never revoked by subsequent model-execution or surface-generation failure.
+    /// Failures/empty responses are not themselves candidate dispositions; only explicit decisions are saved.
     pub fn decide_candidate(
         &self,
         subject_id: &str,
@@ -1502,9 +1519,11 @@ impl SubjektivStore {
         })
     }
 
-    /// Captures one deterministic, bounded generation input from only current
-    /// active Memory changes. Kind order is fixed and selection is round-robin
-    /// across kinds; within each kind, updated_at desc then memory id asc.
+    /// Selects generation materials only from current active Memory, with fixed ordering and limits.
+    /// Uses round-robin across kinds; within each kind, descending update time then ascending Memory ID.
+    /// Reserves equal budgets for nonempty kinds before redistributing surplus, preventing large kinds from dominating.
+    /// Uses neither staging, Session history, nor old surfaces. The material budget leaves room for fixed prompts, etc.;
+    /// the caller checks the complete editor-request budget.
     pub fn prepare_surface_generation(&self, subject_id: &str) -> Result<SurfaceGeneration> {
         self.prepare_job_surface_generation(subject_id, None)
     }
@@ -1547,9 +1566,9 @@ impl SubjektivStore {
         })
     }
 
-    /// Validate a Job's structured surface claim against the existing generation
-    /// and publication/failure records. This does not create another receipt or
-    /// roll back Memory. The generation must have begun inside this attempt.
+    /// Checks a structured Job surface result against generation started by the same attempt and the stored terminal outcome.
+    /// Rejects mismatches in the current Memory fingerprint or ready/failed content.
+    /// Creates no new receipt and never rolls back committed Memory.
     #[allow(clippy::too_many_arguments)]
     pub fn validate_job_surface_outcome(
         &self,
@@ -1596,8 +1615,10 @@ impl SubjektivStore {
         })
     }
 
-    /// Validates structured editor output against the exact material snapshot and
-    /// atomically publishes it only while the subject store generation is current.
+    /// Checks editor output shape, budget, and exact material references, publishing in a transaction where the source fingerprint matches current input.
+    /// Reference validation checks existence/freshness, not semantic correctness of generated text.
+    /// Replay with the same fingerprint/output returns the same snapshot; different concurrent output never replaces the first committed result.
+    /// If active Memory exists but no material fits, fails rather than publishes a false empty result.
     pub fn publish_surface_generation(
         &self,
         subject_id: &str,
@@ -1665,8 +1686,9 @@ impl SubjektivStore {
         })
     }
 
-    /// Records a bounded generator failure without changing confirmed Memory. A
-    /// late failure cannot replace a ready surface or dirty a newer generation.
+    /// Saves a bounded failure reason without changing committed Memory.
+    /// Late failures never replace a ready surface or the state of newer Memory input.
+    /// Separate from candidate application, so generation failure never revokes committed decisions.
     pub fn fail_surface_generation(
         &self,
         subject_id: &str,
@@ -1718,9 +1740,9 @@ impl SubjektivStore {
         })
     }
 
-    /// Returns only a current ready snapshot for injection. Other states are
-    /// explicit so callers never report missing/stale/failed generation as empty
-    /// confirmed Memory.
+    /// Returns only ready snapshots matching the current fingerprint for resident injection.
+    /// Ready with an empty body is a normal empty result, distinct from ungenerated/stale/failed.
+    /// Returns availability separately so an absent injected body implies neither absent committed Memory nor successful generation.
     pub fn resident_surface(&self, subject_id: &str) -> Result<ResidentSurface> {
         self.database.try_with_connection(|connection| {
             let subject = require_subject_in_connection(connection, subject_id)?;
@@ -1728,8 +1750,7 @@ impl SubjektivStore {
         })
     }
 
-    /// Atomically reads user-managed behavior and the independently-fresh
-    /// generated Memory surface from one SQLite connection snapshot.
+    /// Returns independent behavior and the generated Memory surface as observations from the same SQLite transaction.
     pub fn resident_context(&self, subject_id: &str) -> Result<SubjectResidentContext> {
         self.database.try_transaction(|transaction| {
             let subject = require_subject(transaction, subject_id)?;

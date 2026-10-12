@@ -1,3 +1,8 @@
+/**
+ * 画像だけでは再現条件や失敗を判断できないため、撮影条件とsource、画像hash、
+ * 上限付きのブラウザ診断を同じreview contextに記録する。採取成功と画面の
+ * 正しさは別であり、合否は実装者が画像と診断を確認して判断する。
+ */
 import { basename, dirname, join, relative, resolve } from "@std/path";
 import { type Browser, chromium, type Page, type Response } from "playwright";
 import { validateAuthState } from "./auth_state.ts";

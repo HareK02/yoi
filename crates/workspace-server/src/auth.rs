@@ -1,3 +1,12 @@
+//! Resolves Backend request actors from human credentials.
+//!
+//! User identifies the human and Account the Workspace owner; request actors retain both.
+//! The store resolves valid API tokens or browser sessions, checking expiry and User existence.
+//! Tokens are matched by hash; session cookies use HttpOnly/SameSite.
+//! This resolution does not authorize individual Workspace resources. Server admission points
+//! and domain services check ownership, Origin, and operation permissions. worker_source
+//! separately verifies Runtime signing proofs.
+
 use axum::http::{HeaderMap, header};
 use chrono::{DateTime, Duration, Utc};
 pub use server_api::{ActorAuthMethod, AuthPublicConfig, AuthenticatedUser, RequestActor};

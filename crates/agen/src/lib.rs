@@ -42,10 +42,9 @@ pub use tool::{
 };
 pub use usage_record::UsageRecord;
 
-/// Implementation dependencies used by code generated from `agen` macros.
+/// Implementation dependencies referenced by macro-generated code.
 ///
-/// This module is not a stable user-facing API. It is public only because macro expansion
-/// happens in the downstream crate.
+/// Public for access from downstream macro expansions, not a stable user-facing API.
 #[doc(hidden)]
 pub mod __private {
     pub use async_trait;

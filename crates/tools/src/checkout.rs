@@ -1,11 +1,36 @@
-//! Native checkout entrypoint using the same processing as ordinary filesystem Tools.
+//! Native checkout entry points sharing regular filesystem Tool handling.
 //!
-//! The Host binds alias, generation, path and validator from the checkout route; none
-//! can be overridden by Operation arguments. File reads/mutations dispatch through
-//! the provider's checked execution boundary. Search shares normal request and
-//! rendering processing but dispatches through checkout_search so provider scope
-//! layers and output rebasing are preserved; checks bracket the bound directory
-//! observation, not an atomic snapshot of the searched tree.
+//! The Host pins aliases, connection generations, paths, and validators from routes; operation
+//! arguments cannot override them. The original router and Tracker record regular Tool and native
+//! read/change observations under the same connection generation. Checks provider capabilities
+//! without creating new routers or attachments. Create uses Write capability and accepts only
+//! relative paths below the bound directory.
+//!
+//! # Checked execution and observation
+//!
+//! File operations dispatch through checked FileTarget to `checkout_execute`; hash and validator
+//! comparisons occur at the provider execution boundary. Partial Read also records the whole-file
+//! hash and total line count; tracking updates only after successful mutation. Post-operation
+//! validators are returned unchanged from provider responses. Create observes the parent directory,
+//! while its created path and tracking target are the new file; these remain distinct.
+//!
+//! Glob/Grep share regular Tool defaults and formatting, but native operations use `checkout_search`
+//! to preserve provider wrapper scope layers and output coordinates. Only the bound directory is
+//! checked before/after search; this neither prevents concurrent descendant edits nor guarantees
+//! an atomic snapshot of the whole tree. Paths come from typed provider results, not links
+//! reconstructed from rendered Grep content.
+//!
+//! # live directory page
+//!
+//! List returns one bounded page and a typed continuation without prefetching entries.
+//! Entries and cursors are limited to direct children of the bound directory; kind/path ordering
+//! is checked. Special entries are path coordinates, not substitutes for checked file/directory
+//! observations. Pagination is live, not a cross-page snapshot. The Host owns conversion to
+//! Worldspace Entry/cursors; Tools retain checkout-root-relative provider coordinates.
+//!
+//! file_target classifies known checked-operation rejections into structured codes. Ambiguous
+//! transport/IO failures and invalid post-mutation responses are not downgraded to stale/no-execution.
+//! Regular Tool error mapping stays unchanged; diagnostic strings are not parsed to classify denial.
 use std::sync::Arc;
 
 use agen::tool::{ToolError, ToolExecutionContext, ToolOutput};

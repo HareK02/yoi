@@ -1,3 +1,8 @@
+//! Resolves connection targets by matching command requirements with explicit selections.
+//!
+//! Explicit Workspace identity needs no Git discovery. Target selection is separate
+//! from Workspace discovery, allowing Backend selection without a Repository.
+
 use std::path::Path;
 
 use client::{BackendTarget, StandaloneTarget, Target, TargetKind};

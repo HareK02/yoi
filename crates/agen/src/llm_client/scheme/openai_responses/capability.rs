@@ -1,7 +1,7 @@
-//! OpenAI Responses scheme の wire-level 既定 capability。
+//! Wire-level default capability for the OpenAI Responses scheme.
 //!
-//! モデル ID 固有の能力テーブルは高レベルの client 構築層の責務。
-//! ここでは wire の保守的 default のみ。
+//! Model ID capability tables belong to the higher-level client construction
+//! layer. This module provides only conservative wire defaults.
 
 use crate::llm_client::capability::{
     CacheStrategy, ModelCapability, StructuredOutput, ToolCallingSupport,

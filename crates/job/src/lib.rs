@@ -1,7 +1,4 @@
-//! Transport-neutral immutable Job intent and structured-result contract.
-//!
-//! Hosts own execution, authority, persistence and lifecycle state. This crate
-//! deliberately contains no runner, state machine, Runtime or domain grants.
+#![doc = include_str!("../README.md")]
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -94,6 +91,11 @@ const fn default_max_attempts() -> u8 {
     DEFAULT_MAX_ATTEMPTS
 }
 
+/// Immutable execution intent within a Host namespace.
+///
+/// `fingerprint` identifies the entire request; `input_digest` binds results to the input snapshot.
+/// Hosts own same-ID replay and attempt creation rules. Profile selector validation checks syntax
+/// only; Hosts separately validate registry existence and requirements and grant domain capabilities.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct JobRequest {
@@ -166,6 +168,11 @@ impl JobRequest {
     }
 }
 
+/// Structured result bound to a Job, attempt, and immutable input.
+///
+/// Hosts validate bindings and result digests at the acceptance boundary. Structured result
+/// acceptance, consumer delivery, and execution resource cleanup are separate facts;
+/// Worker termination and final prose do not imply acceptance.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct JobResultSubmission {

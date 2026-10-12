@@ -1,3 +1,21 @@
+//! Filesystem persistence for the Runtime catalog and Worker aggregates.
+//!
+//! Atomically publishes settled Worker status, execution binding, and pending lifecycle operations
+//! as one Worker record. Session content and metadata projections use separate stores;
+//! sockets and run paths do not substitute for durable identity.
+//!
+//! Legacy conversion copies the Runtime tree into staging under the OS owner lock, validates
+//! Worker record/metadata/Manifest identity consistency, then syncs and switches trees.
+//! Partially converted trees are not opened as normal authority. Duplicate identities, existing
+//! targets, missing Workspace bindings, and metadata identity mismatches are rejected, not guessed away.
+//! After interruption, staging/backup and validation determine which tree to publish;
+//! writes do not continue into an incomplete tree.
+//!
+//! Directories without Worker records are archived, not adopted into the normal catalog.
+//! Archive target collisions are rejected; data of unknown ownership is never overwritten or deleted.
+//! Symlinks/special files are rejected except recognizable stopped sockets. Preserving historical
+//! data and deciding whether execution hints can migrate are separate judgments.
+
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, LogicalWorkdirAttachment, ProfileSelector,
     WorkerRestoreIntent, WorkerStatus, WorkingDirectoryAttachmentClaim,

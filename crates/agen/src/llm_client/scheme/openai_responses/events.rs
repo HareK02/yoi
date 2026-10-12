@@ -1,9 +1,9 @@
-//! OpenAI Responses API の SSE イベントパース
+//! OpenAI Responses API SSE event parsing.
 //!
-//! `response.*` 名前空間の SSE を共通の [`Event`](crate::llm_client::event::Event)
-//! に変換する。Responses の (output_index, content_index) 2 次元座標と
-//! この crate の 1 次元 `BlockStart/Delta/Stop::index` のマッピングは
-//! [`OpenAIResponsesState`] が保持する。
+//! Converts SSE events in the `response.*` namespace to shared [`Event`]s.
+//! [`OpenAIResponsesState`] holds the mapping from Responses' two-dimensional
+//! (output_index, content_index) coordinates to this crate's one-dimensional
+//! `BlockStart/Delta/Stop::index`.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -18,15 +18,16 @@ use crate::llm_client::{
     },
 };
 
-/// SSE パース中の座標 → flat block index マップ。
+/// Coordinate → flat block index map used during SSE parsing.
 #[derive(Debug, Default)]
 pub struct OpenAIResponsesState {
     slots: HashMap<SlotKey, SlotInfo>,
     next_index: usize,
-    /// 蓄積中の reasoning output_item。`output_item.added`(Reasoning) で
-    /// 確保し、`reasoning_text.delta` / `reasoning_summary_text.delta` で
-    /// 蓄積、`output_item.done`(Reasoning) で既存 reasoning_text block または
-    /// metadata-only Thinking block に reasoning persistence material を載せる。
+    /// Reasoning output_items being accumulated. Allocated at
+    /// `output_item.added` (Reasoning), filled by `reasoning_text.delta` /
+    /// `reasoning_summary_text.delta`, then attached as reasoning persistence
+    /// material to an existing reasoning_text block or metadata-only Thinking
+    /// block at `output_item.done` (Reasoning).
     pending_reasoning: HashMap<usize, PendingReasoning>,
     /// Tool input deltas and authoritative final values, keyed by output index.
     pending_tool_inputs: HashMap<usize, PendingToolInput>,
@@ -67,19 +68,19 @@ impl ToolInputKind {
     }
 }
 
-/// 1 つの reasoning output_item の蓄積バッファ。
+/// Accumulation buffer for one reasoning output_item.
 #[derive(Debug, Default)]
 struct PendingReasoning {
     id: Option<String>,
-    /// `reasoning_text.delta` の累積。複数 content_part あれば順に concat。
+    /// Accumulated `reasoning_text.delta`, concatenating multiple content_parts in order.
     text: String,
-    /// `reasoning_summary_text.delta` を summary_index 順に蓄積。
+    /// Accumulates `reasoning_summary_text.delta` in summary_index order.
     summary: Vec<String>,
-    /// `response.content_part.done` が先に到着した reasoning/thinking block。
+    /// Reasoning/thinking blocks whose `response.content_part.done` arrived first.
     ///
-    /// `response.output_item.done` まで待たないと encrypted_content や最終
-    /// summary が揃わないため、live-visible な余分な synthetic Thinking block
-    /// を作らず、既存 block の stop に persistence metadata を載せる。
+    /// encrypted_content and final summaries are not complete until
+    /// `response.output_item.done`. Attach persistence metadata to the existing
+    /// block's stop rather than creating an extra live-visible synthetic Thinking block.
     deferred_thinking_stops: Vec<SlotInfo>,
 }
 
@@ -106,9 +107,9 @@ impl OpenAIResponsesState {
         info
     }
 
-    /// 既存 slot を取得。無ければ `block_type` で暗黙に確保し、
-    /// 新規確保したかを併せて返す。delta 先行 / content_part.added が
-    /// 抜けたときの防御。
+    /// Get an existing slot or implicitly allocate one with `block_type`, also
+    /// returning whether it was newly allocated. Defends against deltas arriving
+    /// first or missing content_part.added events.
     fn get_or_allocate(&mut self, key: SlotKey, block_type: BlockType) -> (SlotInfo, bool) {
         if let Some(info) = self.slots.get(&key).copied() {
             (info, false)
@@ -157,11 +158,11 @@ impl OpenAIResponsesState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SlotKey {
-    /// tool_use (function_call / custom_tool_call) — output_item 全体で 1 block
+    /// tool_use (function_call / custom_tool_call) — one block for the entire output_item.
     OutputItem(usize),
-    /// message の output_text / reasoning item の reasoning_text
+    /// Message output_text / reasoning item reasoning_text.
     ContentPart { output: usize, content: usize },
-    /// reasoning item の summary_text (summary_index)
+    /// Reasoning item summary_text (summary_index).
     Summary { output: usize, summary: usize },
 }
 
@@ -172,7 +173,7 @@ struct SlotInfo {
 }
 
 // ============================================================================
-// SSE イベントの JSON 構造
+// SSE event JSON structures
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -188,7 +189,7 @@ struct OutputItemDone {
     item: OutputItem,
 }
 
-/// `response.output_item.added/done` の `item`。
+/// `item` in `response.output_item.added/done`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OutputItem {
@@ -199,8 +200,8 @@ enum OutputItem {
     Reasoning {
         #[serde(default)]
         id: Option<String>,
-        /// `output_item.done` で初めて埋まる。`include=["reasoning.encrypted_content"]`
-        /// 指定時に opaque blob が乗る。
+        /// First populated at `output_item.done`. Carries an opaque blob when
+        /// `include=["reasoning.encrypted_content"]` is specified.
         #[serde(default)]
         encrypted_content: Option<String>,
     },
@@ -241,7 +242,7 @@ struct ContentPartDone {
     part: ContentPart,
 }
 
-/// `response.content_part.added/done` の `part`。
+/// `part` in `response.content_part.added/done`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ContentPart {
@@ -338,7 +339,7 @@ struct ResponsesUsage {
     output_tokens: Option<u64>,
     #[serde(default)]
     total_tokens: Option<u64>,
-    /// `input_tokens` の内訳。`cached_tokens` がプロンプトキャッシュヒット分。
+    /// Breakdown of `input_tokens`; `cached_tokens` counts prompt cache hits.
     #[serde(default)]
     input_tokens_details: Option<InputTokensDetails>,
 }
@@ -399,11 +400,11 @@ struct TopLevelError {
 // parse entry point
 // ============================================================================
 
-/// SSE フレーム 1 件をパースし、0 個以上の [`Event`] に変換する。
+/// Parse one SSE frame and convert it to zero or more [`Event`]s.
 ///
-/// `event_type` は SSE の `event:` フィールド。未対応の event type は
-/// [`Event::UnhandledSse`] として観測可能にする。`data` が JSON でない /
-/// 必要なフィールドが抜けている等は [`ClientError::Api`] で返す。
+/// `event_type` is the SSE `event:` field. Unsupported event types are observable
+/// as [`Event::UnhandledSse`]. Non-JSON `data`, missing required fields, and similar
+/// failures return [`ClientError::Api`].
 pub(crate) fn parse_sse(
     event_type: &str,
     data: &str,
@@ -427,7 +428,7 @@ pub(crate) fn parse_sse(
                     cache_read_input_tokens: usage
                         .input_tokens_details
                         .and_then(|d| d.cached_tokens),
-                    // Responses API は cache 書き込みを別計上しない（input_tokens に含まれる）
+                    // The Responses API does not account for cache writes separately (included in input_tokens).
                     cache_creation_input_tokens: None,
                 }));
             }
@@ -466,8 +467,8 @@ pub(crate) fn parse_sse(
                     name,
                 ),
                 OutputItem::Reasoning { id, .. } => {
-                    // wrapper を確保。中身の content_part / summary_part は
-                    // 別 SlotKey で扱われ続ける（Streaming 表示は維持）。
+                    // Allocate the wrapper. Its content_parts / summary_parts continue
+                    // to use separate SlotKeys (preserving the streaming display).
                     let entry = state.ensure_reasoning(ev.output_index);
                     if id.is_some() {
                         entry.id = id;
@@ -480,10 +481,10 @@ pub(crate) fn parse_sse(
 
         "response.output_item.done" => {
             let ev: OutputItemDone = from_json(data)?;
-            // Reasoning wrapper の done で蓄積分を既存 reasoning_text block の
-            // stop に載せる。content_part.done が先に来た場合は stop を defer
-            // しておき、ここで encrypted_content / summary と一緒に完了させる。
-            // reasoning_text が無い metadata-only item だけ synthetic block を作る。
+            // On Reasoning wrapper done, attach accumulated material to the existing
+            // reasoning_text block's stop. If content_part.done arrived first, defer
+            // its stop and complete it here with encrypted_content / summary.
+            // Create synthetic blocks only for metadata-only items without reasoning_text.
             if let OutputItem::Reasoning {
                 id,
                 encrypted_content,
@@ -638,7 +639,7 @@ pub(crate) fn parse_sse(
 
         "response.reasoning_text.delta" => {
             let ev: ReasoningTextDelta = from_json(data)?;
-            // round-trip 用に蓄積
+            // Accumulate for round-tripping.
             state
                 .ensure_reasoning(ev.output_index)
                 .text
@@ -673,7 +674,7 @@ pub(crate) fn parse_sse(
 
         "response.reasoning_summary_text.delta" => {
             let ev: ReasoningSummaryTextDelta = from_json(data)?;
-            // round-trip 用に蓄積
+            // Accumulate for round-tripping.
             state.extend_reasoning_summary(ev.output_index, ev.summary_index, &ev.delta);
             Ok(ensure_and_delta(
                 state,
@@ -782,7 +783,7 @@ pub(crate) fn parse_sse(
             Ok(vec![Event::Error(ErrorEvent { code, message })])
         }
 
-        // 未対応 / 情報系 event type は生成 semantics からは無視しつつ trace に残す。
+        // Ignore unsupported / informational event types for generation semantics, but retain them in traces.
         _ => Ok(vec![unhandled_sse_event(event_type, data)]),
     }
 }
@@ -1103,8 +1104,8 @@ fn append_diagnostic(message: String, diagnostic: Map<String, Value>) -> String 
     format!("{} | diagnostic={}", message, Value::Object(diagnostic))
 }
 
-/// 対応する BlockStart がまだ発行されていなければ発行しつつ、delta を流す。
-/// content_part.added を取りこぼしても delta 単独で復旧できるようにする。
+/// Emit a delta, first emitting its BlockStart if not already sent.
+/// Allows recovery from a delta alone when content_part.added was missed.
 fn ensure_and_delta(
     state: &mut OpenAIResponsesState,
     key: SlotKey,
@@ -1219,14 +1220,14 @@ mod tests {
         assert_eq!(u.output_tokens, Some(50));
         assert_eq!(u.total_tokens, Some(12395));
         assert_eq!(u.cache_read_input_tokens, Some(11000));
-        // OpenAI Responses は cache 書き込みを別計上しない
+        // OpenAI Responses does not account for cache writes separately.
         assert_eq!(u.cache_creation_input_tokens, None);
     }
 
     #[test]
     fn text_stream_start_delta_stop() {
         let mut state = OpenAIResponsesState::default();
-        // output_item.added (message) → 無視
+        // output_item.added (message) → ignored.
         with(
             &mut state,
             "response.output_item.added",
@@ -1537,7 +1538,7 @@ mod tests {
 
     #[test]
     fn delta_without_prior_start_recovers() {
-        // 防御: content_part.added が落ちても delta 単独で BlockStart+Delta を発行
+        // Defensive: emit BlockStart+Delta from a delta alone if content_part.added was lost.
         let mut state = OpenAIResponsesState::default();
         let ev = with(
             &mut state,
@@ -1551,8 +1552,8 @@ mod tests {
 
     #[test]
     fn parallel_output_items_get_distinct_indices() {
-        // 2 つの function_call が並列で output_item.added される場合、
-        // flat index が別々になる（Parallel tool calling の基本）。
+        // Two parallel function_call output_item.added events get distinct
+        // flat indices (the basis of parallel tool calling).
         let mut state = OpenAIResponsesState::default();
         let ev1 = with(
             &mut state,
@@ -1675,17 +1676,17 @@ mod tests {
 
     #[test]
     fn reasoning_output_item_completes_metadata_thinking_block_with_text_summary_encrypted() {
-        // 完成済み reasoning wrapper が text + summary[] + encrypted_content を持って
-        // Thinking BlockStop metadata として届くこと。
+        // A completed reasoning wrapper must deliver text + summary[] +
+        // encrypted_content as Thinking BlockStop metadata.
         let mut state = OpenAIResponsesState::default();
 
-        // wrapper added (id だけ持つ)
+        // Wrapper added (with only an id).
         with(
             &mut state,
             "response.output_item.added",
             r#"{"output_index":0,"item":{"type":"reasoning","id":"r1"}}"#,
         );
-        // 内側の reasoning_text 用 content_part
+        // Inner content_part for reasoning_text.
         let start = with(
             &mut state,
             "response.content_part.added",
@@ -1711,7 +1712,7 @@ mod tests {
             r#"{"output_index":0,"content_index":0,"item_id":"r1","part":{"type":"reasoning_text","text":"hello world"}}"#,
         );
         assert!(part_done.is_empty());
-        // summary 1 件
+        // One summary.
         with(
             &mut state,
             "response.reasoning_summary_part.added",
@@ -1728,7 +1729,7 @@ mod tests {
             r#"{"output_index":0,"summary_index":0,"item_id":"r1"}"#,
         );
 
-        // wrapper done (encrypted_content が乗る)
+        // Wrapper done (includes encrypted_content).
         let evs = with(
             &mut state,
             "response.output_item.done",
@@ -1745,7 +1746,7 @@ mod tests {
         assert_eq!(reasoning.summary, vec!["sum-A".to_string()]);
         assert_eq!(reasoning.encrypted_content.as_deref(), Some("ENC-XYZ"));
         assert!(reasoning.signature.is_none());
-        // pending_reasoning は drain されていること
+        // pending_reasoning must be drained.
         assert!(state.pending_reasoning.is_empty());
     }
 
@@ -1835,8 +1836,8 @@ mod tests {
 
     #[test]
     fn reasoning_wrapper_without_inner_content_emits_empty_text() {
-        // encrypted_content だけ届く（reasoning_text 無し）ケースでも
-        // reasoning metadata は届く。
+        // Reasoning metadata must arrive even when only encrypted_content
+        // is received (no reasoning_text).
         let mut state = OpenAIResponsesState::default();
         with(
             &mut state,

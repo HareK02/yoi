@@ -1,8 +1,4 @@
-//! Shared path-safe project-record identifiers.
-//!
-//! Record IDs are fixed-width Crockford base32 encodings of Unix epoch
-//! milliseconds. The fixed width keeps lexicographic order aligned with
-//! chronological order.
+#![doc = include_str!("../README.md")]
 
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -54,6 +50,9 @@ pub fn unix_epoch_millis_now() -> Result<u64, RecordIdError> {
     u64::try_from(duration.as_millis()).map_err(|_| RecordIdError::TimestampOverflow)
 }
 
+/// Converts Unix epoch milliseconds to fixed-width, path-component-safe Crockford base32.
+/// Fixed width makes lexical order match encoded timestamp order.
+/// Allocation may shift timestamps to avoid collisions, so an ID does not prove the actual creation time.
 pub fn encode_unix_epoch_millis(millis: u64) -> String {
     let mut value = millis;
     let mut out = [b'0'; RECORD_ID_WIDTH];
@@ -85,6 +84,9 @@ pub fn validate_record_id(id: &str) -> Result<(), RecordIdError> {
     decode_unix_epoch_millis(id).map(|_| ())
 }
 
+/// Selects a candidate avoiding existing IDs by incrementing milliseconds from the base timestamp.
+/// Keeps the same encoding without a suffix and stops at the probe limit.
+/// This is not a storage reservation. The caller owns concurrency control between checking and saving.
 pub fn allocate_record_id<F>(base_millis: u64, mut exists: F) -> Result<String, RecordIdError>
 where
     F: FnMut(&str) -> bool,

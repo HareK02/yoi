@@ -1,5 +1,15 @@
-//! Ignore rules loaded only through the provider's authorized descriptor opens.
-//! Never use GitignoreBuilder::add/build_global: those reopen host pathnames.
+//! Ignore rules read only through provider-authorized descriptors.
+//!
+//! .ignore takes precedence over Git rules; nearer directories win within the same source class.
+//! Retains only current ancestor matchers, pruning ignored directories before enumeration or reading
+//! their own rules. Checks scope before opening rule sources; configuration discovery never expands
+//! content authority.
+//!
+//! Glob requires an authorized .git marker; Grep applies .gitignore even without one.
+//! Glob skips unavailable sources; Grep preserves existing explicit errors. Both skip scope-denied
+//! sources before opening. UTF-8, file/line/aggregate byte limit, and cancellation violations are
+//! not turned into under-filtered success. Does not follow global/ambient Git configuration or
+//! linked-worktree gitdir/commondir pointers; .git files serve only as markers.
 use crate::{FsAccessPolicy, FsError};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::io::{BufRead, BufReader, Read};

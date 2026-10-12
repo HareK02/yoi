@@ -214,6 +214,10 @@ export async function createSubjektivSubject(
   }
 }
 
+/** 空本文も含めて、観測したexpected_behavior_mdをそのまま変更条件に使う。
+ * 成功応答の本文が要求と異なる場合は結果不明とし、自動再試行しない。
+ * 保存の確認とWorker履歴への適用は別の操作である。
+ */
 export async function updateSubjektivSubjectBehavior(
   fetchFn: typeof fetch,
   workspaceId: string,
@@ -964,6 +968,9 @@ function parseMemorySourceEvidenceRef(
   return result;
 }
 
+/** immutable change_idの一覧をServer順で保持する。
+ * IDは履歴参照用であり、数値への変換やID順のsortで時系列を作らない。
+ */
 export function parseSubjektivMemoryListChangesResponse(
   value: unknown,
   expectedMemoryId?: string,

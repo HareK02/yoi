@@ -1,15 +1,9 @@
-//! Multi-line input buffer with paste placeholders.
+//! Multiline input buffer storing characters and typed references as an Atom sequence.
 //!
-//! The buffer stores a sequence of [`Atom`]s — each either a single
-//! character (including `\n`) or an atomic paste reference. The cursor
-//! is an index in `0..=atoms.len()` marking the insertion point between
-//! atoms. Paste atoms are indivisible: Backspace deletes the whole
-//! placeholder, the cursor can't land "inside" one.
-//!
-//! Display form: paste atoms render as
-//! `[Clipboard #N | X chars, Y lines]`. Submit form: paste atoms expand
-//! back to their original captured content so the Worker sees the full
-//! pasted text (without the placeholder label).
+//! Paste, Feature invocation, and attachment chips are indivisible; the cursor sits
+//! between Atoms. Display placeholders are separate from outgoing Segments; pasted
+//! content expands to its original body on send. Raw slash text and paste are not
+//! inferred to be Feature calls; only confirmed invocations are sent as typed input.
 
 use std::{
     cell::RefCell,
@@ -985,7 +979,7 @@ impl InputBuffer {
         }
     }
 
-    /// Delete one word backward — the same span [`move_word_left`] would
+    /// Delete one word backward — the same span [`Self::move_word_left`] would
     /// jump over.
     pub fn delete_word_before(&mut self) {
         let end = self.cursor;
@@ -1021,7 +1015,7 @@ impl InputBuffer {
         }
     }
 
-    /// Move forward by one word. Mirror of [`move_word_left`].
+    /// Move forward by one word. Mirror of [`Self::move_word_left`].
     pub fn move_word_right(&mut self) {
         self.cancel_completion_on_edit();
         while self.cursor < self.atoms.len()
@@ -2050,7 +2044,7 @@ mod word_motion_tests {
 
     #[test]
     fn script_switch_is_a_word_boundary() {
-        // 漢字 | ひらがな | ASCII
+        // Han | Hiragana | ASCII
         let mut buf = buf_from("日本語のtest");
         buf.cursor = 0;
         buf.move_word_right();
@@ -2070,7 +2064,7 @@ mod word_motion_tests {
 
     #[test]
     fn halfwidth_katakana_is_treated_as_katakana() {
-        // 半角カナ「ｱｲｳｴｵ」は5 atom、すべて Katakana 種別。
+        // Halfwidth kana "ｱｲｳｴｵ" has 5 atoms, all of kind Katakana.
         let mut buf = buf_from("ｱｲｳｴｵfoo");
         buf.cursor = 0;
         buf.move_word_right();
@@ -2078,7 +2072,7 @@ mod word_motion_tests {
         buf.move_word_right();
         assert_eq!(cursor(&buf), 8); // after "foo"
 
-        // 全角と半角のカタカナは同じ Katakana 種別なので1単語につながる。
+        // Fullwidth and halfwidth katakana share kind Katakana, forming one word.
         let mut buf2 = buf_from("カタｶﾅ");
         buf2.cursor = 0;
         buf2.move_word_right();
@@ -2154,7 +2148,7 @@ mod word_motion_tests {
 
     #[test]
     fn delete_word_respects_script_boundary() {
-        // 「日本語の」末尾から1回削除すると、ひらがな部分「の」だけ消える
+        // One deletion from the end of "日本語の" removes only the hiragana "の".
         let mut buf = buf_from("日本語の");
         buf.delete_word_before();
         assert_eq!(as_text(&buf), "日本語");

@@ -151,21 +151,20 @@ pub enum Item {
         /// Optional item ID
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<ItemId>,
-        /// Reasoning text（reasoning body, `reasoning_text.delta` の累積）
+        /// Reasoning text (reasoning body, accumulated `reasoning_text.delta`).
         text: String,
-        /// Reasoning summary（OpenAI Responses の `summary_text[]` を格納。
-        /// 他 scheme は空）
+        /// Reasoning summary (OpenAI Responses `summary_text[]`; empty for other schemes).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         summary: Vec<String>,
-        /// サーバから返された暗号化済み reasoning blob。ZDR / `store=false`
-        /// 運用で stateless に再送するときそのまま添える必要がある。
-        /// Anthropic の `redacted_thinking.data` もここに格納する。
+        /// Encrypted reasoning blob returned by the server. Must be included unchanged
+        /// when resending statelessly under ZDR / `store=false`.
+        /// Also holds Anthropic `redacted_thinking.data`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,
-        /// Anthropic extended thinking の `signature`。新世代 Claude
-        /// (Opus 4.5+/Sonnet 4.6+) では同一論理ターン内の `thinking`
-        /// ブロックを送り返す際に必須。改ざん検知に使われる。他 scheme
-        /// では `None`。
+        /// Anthropic extended thinking `signature`, used for tamper detection.
+        /// Newer Claude models (Opus 4.5+/Sonnet 4.6+) require it when sending
+        /// `thinking` blocks back within the same logical turn.
+        /// `None` for other schemes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
         /// Item status
@@ -624,12 +623,11 @@ pub struct Request {
     /// (Anthropic today) can place a long-lived cache breakpoint there.
     /// Providers without prompt caching ignore the field.
     pub cache_anchor: Option<usize>,
-    /// 会話単位の安定キー。`prompt_cache_key` として送られる
-    /// (OpenAI Responses)。明示キーを必要とする backend では、
-    /// 呼び出し側が安定した conversation identifier を渡す。
-    /// `cache_anchor` と違い名前空間キーであり、`prefix anchor` とは
-    /// 別の概念。`cache_anchor` を読まない provider と同じく、
-    /// `prompt_cache_key` を持たない provider は無視する。
+    /// Stable conversation key, sent as `prompt_cache_key` (OpenAI Responses).
+    /// For backends requiring an explicit key, the caller supplies a stable
+    /// conversation identifier. Unlike `cache_anchor`, this is a namespace key,
+    /// separate from a `prefix anchor`. Just as some providers ignore
+    /// `cache_anchor`, providers without `prompt_cache_key` ignore this field.
     pub cache_key: Option<String>,
     /// Request-local diagnostics sink for transport lifecycle tracing.
     #[doc(hidden)]
@@ -725,7 +723,7 @@ impl Request {
 
     /// Set the conversation cache key.
     ///
-    /// 詳細は [`Request::cache_key`] のフィールドコメント参照。
+    /// See the [`Request::cache_key`] field documentation for details.
     pub fn cache_key(mut self, key: impl Into<String>) -> Self {
         self.cache_key = Some(key.into());
         self
@@ -790,10 +788,11 @@ pub struct RequestConfig {
     pub top_k: Option<u32>,
     /// Stop sequences
     pub stop_sequences: Vec<String>,
-    /// Reasoning / extended-thinking 制御（共通型、scheme 側で各社形式に投影）。
+    /// Shared reasoning / extended-thinking control, projected by each scheme
+    /// into the provider's format.
     ///
-    /// `None` のときは何も送らない。`Some` でも scheme の
-    /// `ModelCapability::reasoning` が `None` なら無視される。
+    /// `None` sends nothing. Even `Some` is ignored if the scheme's
+    /// `ModelCapability::reasoning` is `None`.
     #[serde(default)]
     pub reasoning: Option<crate::llm_client::capability::ReasoningControl>,
 }
@@ -851,7 +850,7 @@ mod parse_tool_arguments_tests {
 
     #[test]
     fn literal_null_normalizes_to_object() {
-        // 既存セッションに残っている "null" が resume 時に復旧できること
+        // Ensure "null" retained in existing sessions can be recovered on resume.
         assert_eq!(parse_tool_arguments("null"), empty_object());
     }
 

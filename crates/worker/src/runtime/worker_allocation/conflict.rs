@@ -1,8 +1,8 @@
 //! Pure functions that decide whether scope rules collide.
 //!
 //! These helpers are read-only over [`LockFile`]; they never touch the
-//! file or the lock itself. The mutating operations in [`crate::mutate`]
-//! call them under the [`crate::LockFileGuard`].
+//! file or the lock itself. The mutating operations in `super::mutate`
+//! call them under the [`super::LockFileGuard`].
 
 use manifest::{Permission, ScopeRule};
 

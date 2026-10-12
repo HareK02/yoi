@@ -1,3 +1,7 @@
+/** content accessとは別のowner管理API。browserのsame-origin認証を使う。
+ * grant一覧は全pageの順序・重複・Workspace一致を検査し、不完全な結果を正常一覧にしない。
+ * 変更応答は要求identityと結果状態を照合し、通信断や不正な成功応答はunknownにする。
+ */
 import type {
   DriveAccess,
   DriveApiError,
@@ -7,7 +11,6 @@ import type {
 } from "#lib/generated/drive-api.ts";
 import { readBoundedJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 
-// Owner-controlled grant transport, separate from ordinary Drive content access.
 export type { DriveAccess, DriveGrantCreateRequest, DriveGrantResponse };
 export class DriveGrantError extends Error {
   constructor(message: string, readonly outcome: "not_committed" | "unknown") {

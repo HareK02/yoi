@@ -82,8 +82,8 @@ pub enum LoggedItem {
         summary: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,
-        /// Anthropic extended thinking signature。新世代 Claude で round-trip
-        /// 必須。OpenAI Responses など他 scheme では `None`。
+        /// Anthropic extended thinking signature, required for round-trips with
+        /// newer Claude generations. `None` for other schemes such as OpenAI Responses.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
@@ -418,13 +418,13 @@ mod tests {
 
     #[test]
     fn round_trip_reasoning_preserves_signature() {
-        // 新世代 Claude の thinking signature が history.json に永続化され、
-        // resume 後の Item::Reasoning に復元されること。
+        // A newer Claude thinking signature persists in history.json and is
+        // restored to Item::Reasoning after resume.
         let original = Item::reasoning("inner thought").with_signature("SIG-OPUS-XYZ");
         let logged: LoggedItem = (&original).into();
         let json = serde_json::to_string(&logged).unwrap();
-        // wire 形式に signature キーが乗ること（古い形式との互換のため
-        // 値が None のときは省略される。Some の値は載る）
+        // The wire format includes Some signatures; None is omitted for
+        // compatibility with older formats.
         assert!(
             json.contains("SIG-OPUS-XYZ"),
             "serialised JSON must carry signature: {json}",
@@ -443,8 +443,8 @@ mod tests {
 
     #[test]
     fn legacy_reasoning_without_signature_field_deserializes() {
-        // signature フィールドが無い旧形式の history.json を読み込んでも
-        // None としてロードできる（後方互換性）。
+        // Legacy history.json without a signature field loads it as None
+        // for backward compatibility.
         let legacy_json =
             r#"{"kind":"reasoning","text":"old","summary":[],"encrypted_content":null}"#;
         let parsed: LoggedItem = serde_json::from_str(legacy_json).unwrap();

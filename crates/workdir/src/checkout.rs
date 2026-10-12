@@ -1,6 +1,27 @@
-//! Request-time checkout contracts. Validators are opaque provider observations,
-//! not content hashes. Callers must separately retain Read's content hash for
-//! read-before-mutation. Create destinations are checkout-root relative.
+//! Contracts for request-time checkout operations and provider observations.
+//!
+//! Observations fetch metadata only, not recursive trees or file caches. Validators are opaque
+//! identity/protected-metadata values, separate from Read content hashes and caller attachment
+//! generations. Write/Edit require both a validator and a previously read content hash;
+//! hashes alone do not accept same-content inode replacements. Callers own Read line numbering
+//! and per-attachment read history.
+//!
+//! Create paths are checkout-root-relative and must be strict descendants of the observed target
+//! directory. Existing destinations are never overwritten; results return the updated observation
+//! of the retained target directory, not the created file. Read results also return the validator
+//! of the state actually read, never a replacement from a later independent stat.
+//!
+//! Missing targets at observation yield NotFound; disappearance of observed targets or validator/hash
+//! mismatches yield Conflict. Once parent creation starts, uncertain commit or post-save observation
+//! yields OutcomeUnknown, not a no-effect claim. Providers/transports do not automatically retry
+//! uncertain mutations.
+//!
+//! Search delegates to shared List/Glob/Grep engines. Scope rules form unions within layers and
+//! intersections across layers, provider authority, and output roots. Wrappers transform coordinates
+//! once; returned paths and Grep content are relative to the final session's logical root.
+//! Paths are not reverse-parsed from rendered filenames; non-UTF-8 names are not lossily aliased.
+//! Unsupported providers reject search rather than fall back to broader trait searches. Search is
+//! live traversal, not an atomic snapshot of all descendants or exclusion of external editors.
 use crate::{
     ContentHash, EditResult, EntryKind, ReadResult, WorkdirError, WorkdirPath,
     WorkdirSessionCapabilities, WorkdirSessionCapability, WriteResult,

@@ -15,7 +15,7 @@
 //! agent-visible WorkerEvent variants, and any future typed system reminder
 //! insertion all ride this queue.
 //! Per `tickets/notify-history-persist.md` and `AGENTS.md` (LLM
-//! context の加工原則), there is **no** "transient, history-skipping"
+//! context processing principles), there is **no** "transient, history-skipping"
 //! lane — everything injected into a request is also committed to
 //! history so any LLM reaction has a visible trigger across turns,
 //! resume, and compaction, and so the Anthropic prompt cache prefix

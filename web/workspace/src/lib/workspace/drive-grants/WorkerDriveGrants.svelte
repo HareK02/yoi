@@ -1,4 +1,7 @@
 <script lang="ts">
+  // 親Workers画面のcatalogとpermissionを使い、grantはRuntime／Workerの組で照合する。
+  // catalog readinessは新規操作を止めるが、同じidentityへの送信済み変更を破棄しない。
+  // 不明な変更結果は明示的refreshまで操作不可とし、自動再試行しない。
   import { untrack } from 'svelte';
   import type { Worker } from '#lib/workspace/sidebar/types.ts';
   import { createDriveGrant, DriveGrantError, listDriveGrants, revokeDriveGrant, type DriveAccess, type DriveGrantResponse } from './api.ts';

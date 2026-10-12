@@ -1,17 +1,17 @@
-//! ChatGPT OAuth (`~/.codex/auth.json`) を読んで `Authorization` /
-//! `ChatGPT-Account-Id` / `X-OpenAI-Fedramp` ヘッダを組み立てる
-//! [`AuthProvider`] 実装。
+//! [`AuthProvider`] implementation that reads ChatGPT OAuth credentials
+//! (`~/.codex/auth.json`) and builds `Authorization` /
+//! `ChatGPT-Account-Id` / `X-OpenAI-Fedramp` headers.
 //!
-//! 設計:
+//! Design:
 //!
-//! - HTTP transport は [`AuthProvider`] trait だけを見て、実体である
-//!   [`CodexAuthProvider`] はこの optional module に置く
-//! - access_token JWT の `exp` を読み、`now` 以下で proactive refresh
-//!   （Codex CLI と同じバッファなし）
-//! - 並行する Codex CLI / 別プロセスの refresh と取り違えないよう、
-//!   refresh 直前に再 load して account_id 一致を確認（guarded reload）
-//! - ファイルロックは取らず、書込前に再 load + diff merge で吸収
-//! - Codex の Keyring storage は対象外。auth.json 不在ならエラーで案内
+//! - The HTTP transport sees only the [`AuthProvider`] trait; the concrete
+//!   [`CodexAuthProvider`] lives in this optional module
+//! - Read the access_token JWT's `exp` and proactively refresh when `exp` <= `now`
+//!   (no buffer, as in Codex CLI)
+//! - Reload immediately before refreshing and check that account_id matches
+//!   to avoid confusing concurrent Codex CLI / other-process refreshes (guarded reload)
+//! - No file locking; reload and merge differences before writing
+//! - Codex Keyring storage is not supported. If auth.json is missing, return an error with guidance
 
 mod auth_json;
 mod error;
@@ -32,10 +32,10 @@ use error::CodexAuthError;
 
 pub use error::PermanentReason;
 
-/// Codex CLI の `last_refresh` ベース fallback 期限（Codex CLI 準拠で 8 日）。
+/// Codex CLI's `last_refresh`-based fallback interval (8 days, matching Codex CLI).
 const TOKEN_REFRESH_INTERVAL_DAYS: i64 = 8;
 
-/// `~/.codex/auth.json` を読んで Codex 互換のヘッダを返す provider。
+/// Provider that reads `~/.codex/auth.json` and returns Codex-compatible headers.
 pub struct CodexAuthProvider {
     auth_path: PathBuf,
     refresh_endpoint: String,
@@ -58,7 +58,7 @@ struct State {
 }
 
 impl CodexAuthProvider {
-    /// `CODEX_HOME` → `$HOME/.codex` の順で auth.json の場所を決める。
+    /// Locate auth.json using `CODEX_HOME`, then `$HOME/.codex` as a fallback.
     pub fn from_default_home() -> Result<Self, ClientError> {
         let codex_home = if let Ok(p) = std::env::var("CODEX_HOME") {
             PathBuf::from(p)
@@ -70,7 +70,7 @@ impl CodexAuthProvider {
         Ok(Self::new(codex_home))
     }
 
-    /// 任意の codex_home から構築する。
+    /// Construct from a custom codex_home.
     pub fn new(codex_home: PathBuf) -> Self {
         Self {
             auth_path: codex_home.join("auth.json"),
@@ -80,14 +80,14 @@ impl CodexAuthProvider {
         }
     }
 
-    /// テスト用に refresh エンドポイントを差し替える。
+    /// Override the refresh endpoint for tests.
     #[cfg(test)]
     fn with_refresh_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.refresh_endpoint = endpoint.into();
         self
     }
 
-    /// テスト用に HTTP クライアントを差し替える。
+    /// Override the HTTP client for tests.
     #[cfg(test)]
     fn with_http_client(mut self, client: reqwest::Client) -> Self {
         self.http = client;
@@ -97,29 +97,29 @@ impl CodexAuthProvider {
     async fn ensure_fresh(&self) -> Result<AuthSnapshot, CodexAuthError> {
         let mut state = self.state.lock().await;
 
-        // 1. 常にディスクから最新を読む（他プロセスの更新を反映）
+        // 1. Always read the latest from disk (reflect updates by other processes)
         let snap = auth_json::load(&self.auth_path).await?;
 
-        // 2. stale でなければそのまま返す
+        // 2. Return as-is if not stale
         if !is_stale(&snap) {
             state.cached = Some(snap.clone());
             return Ok(snap);
         }
 
-        // 3. Refresh 直前に再 load し account_id 一致を確認（guarded reload）。
-        //    一致しなければ他プロセスが先に更新済 → 自分は refresh しない
+        // 3. Reload immediately before refreshing and check that account_id matches (guarded reload).
+        //    If it differs, another process has already updated it → skip refreshing
         let pre_refresh = auth_json::load(&self.auth_path).await?;
         if !is_stale(&pre_refresh) {
             state.cached = Some(pre_refresh.clone());
             return Ok(pre_refresh);
         }
         if pre_refresh.account_id != snap.account_id {
-            // account が切り替わった → 新しい auth を採用、refresh はしない
+            // The account has changed → use the new auth without refreshing
             state.cached = Some(pre_refresh.clone());
             return Ok(pre_refresh);
         }
 
-        // 4. Refresh 実行
+        // 4. Perform the refresh
         let refreshed = refresh::request_refresh(
             &self.http,
             &self.refresh_endpoint,
@@ -127,7 +127,7 @@ impl CodexAuthProvider {
         )
         .await?;
 
-        // 5. 書き戻し（書込前に再 load + merge は persist_refreshed 内で実施）
+        // 5. Write back (persist_refreshed reloads and merges before writing)
         let new_snap = auth_json::persist_refreshed(
             &self.auth_path,
             refreshed.id_token,
@@ -152,9 +152,9 @@ impl CodexAuthProvider {
             .map_err(|e| CodexAuthError::InvalidHeader(format!("ChatGPT-Account-Id: {e}")))?;
         out.push((HeaderName::from_static("chatgpt-account-id"), acc_val));
 
-        // Cloudflare WAF は互換 backend アクセス元を `originator` /
-        // `User-Agent` で識別する。Codex CLI が送る固定値を流用しないと
-        // HTML challenge (403) を返されて SSE に到達できない。
+        // Cloudflare WAF identifies clients accessing the compatible backend by `originator` /
+        // `User-Agent`. Without the fixed values sent by Codex CLI,
+        // it returns an HTML challenge (403), preventing access to SSE.
         out.push((
             HeaderName::from_static("originator"),
             HeaderValue::from_static("codex_cli_rs"),
@@ -164,7 +164,7 @@ impl CodexAuthProvider {
             HeaderValue::from_static("codex_cli_rs/0.60.0"),
         ));
 
-        // FedRAMP 組織は id_token JWT 内の claim で判定
+        // Identify FedRAMP organizations using a claim in the id_token JWT
         if jwt::parse_chatgpt_claims(&snap.id_token)
             .map(|c| c.is_fedramp)
             .unwrap_or(false)
@@ -190,8 +190,8 @@ impl AuthProvider for CodexAuthProvider {
     }
 }
 
-/// `access_token` の JWT `exp` を見て、期限切れなら true。
-/// `exp` が読めない場合は `last_refresh + 8 日` で判定（Codex CLI と同じ）。
+/// Return true if the `access_token` JWT's `exp` indicates expiration.
+/// If `exp` cannot be read, use `last_refresh + 8 days` (as in Codex CLI).
 fn is_stale(snap: &AuthSnapshot) -> bool {
     if let Some(exp) = jwt::parse_exp(&snap.access_token) {
         return exp <= Utc::now();
@@ -241,7 +241,7 @@ mod tests {
     #[tokio::test]
     async fn returns_headers_for_fresh_token() {
         let dir = tempfile::tempdir().unwrap();
-        // 期限を遠い未来に
+        // Set expiration far in the future
         write_auth(dir.path(), Utc::now().timestamp() + 3600, false, "rt");
         let provider = CodexAuthProvider::new(dir.path().to_path_buf());
 
@@ -285,7 +285,7 @@ mod tests {
             "old-refresh",
         );
 
-        // refresh エンドポイントを mock。新しい JWT (将来 exp) を返す
+        // Mock the refresh endpoint to return a new JWT (future exp)
         let server = MockServer::start().await;
         let new_access = make_jwt(json!({ "exp": Utc::now().timestamp() + 3600 }));
         let new_refresh = "new-refresh-token";
@@ -310,7 +310,7 @@ mod tests {
             .unwrap();
         assert_eq!(auth.1.to_str().unwrap(), format!("Bearer {new_access}"));
 
-        // ファイルに新しい refresh_token が書き戻されている
+        // The new refresh_token has been written back to the file
         let on_disk: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(

@@ -1,11 +1,12 @@
-//! APIスキーマ定義
+//! API scheme definitions.
 //!
-//! 各APIスキーマごとの変換ロジック
-//! - リクエスト変換: Request → プロバイダ固有JSON
-//! - レスポンス変換: SSEイベント → Event
+//! Conversion logic for each API scheme:
+//! - Request conversion: Request → provider-specific JSON.
+//! - Response conversion: SSE events → Event.
 //!
-//! [`Scheme`] trait により `HttpTransport<S>` から scheme 固有の差分
-//! （パス、ヘッダ、認証要件、body 生成、SSE パース）をすべて委譲する。
+//! The [`Scheme`] trait delegates all scheme-specific differences from
+//! `HttpTransport<S>` (paths, headers, authentication requirements, body
+//! generation, and SSE parsing).
 
 pub mod anthropic;
 pub mod gemini;
@@ -21,42 +22,40 @@ use super::error::ClientError;
 use super::event::Event;
 use super::types::{Request, RequestConfig};
 
-/// wire scheme の抽象。各プロバイダの API 仕様ごとに 1 つ実装する。
+/// Wire scheme abstraction, implemented once per provider API specification.
 ///
-/// `HttpTransport<S: Scheme>` が URL 組立・認証ヘッダ挿入・SSE パース
-/// のループを担い、`Scheme` 実装は各仕様固有の差分のみ提供する。
+/// `HttpTransport<S: Scheme>` handles URL assembly, authentication header
+/// insertion, and the SSE parsing loop; `Scheme` implementations supply only
+/// specification-specific differences.
 ///
-/// # 状態
+/// # State
 ///
-/// SSE パースでフレーム間に状態を保つ必要がある scheme（Anthropic の
-/// `BlockStop` に `block_type` が載らない仕様の補完など）は
-/// [`Scheme::State`] に中間状態を表す型を置く。
-/// 状態を持たない scheme は `type State = ()` とする。
+/// Schemes requiring state across SSE frames (e.g. to compensate for Anthropic
+/// omitting `block_type` from `BlockStop`) define an intermediate state type in
+/// [`Scheme::State`]. Stateless schemes use `type State = ()`.
 pub trait Scheme: Clone + Send + Sync + 'static {
-    /// SSE パースのフレーム間で共有する状態。`HttpTransport` が
-    /// ストリーム開始時に `Default::default()` を一度だけ作り、
-    /// フレームごとに `&mut` で渡す。
+    /// State shared across SSE frames. `HttpTransport` creates it once via
+    /// `Default::default()` at stream start and passes it by `&mut` for each frame.
     type State: Default + Send + 'static;
 
-    /// scheme のベース URL（`ModelConfig::base_url` 未指定時のデフォルト）
+    /// Default base URL for callers that do not supply an override.
     fn default_base_url(&self) -> &'static str;
 
-    /// リクエスト先の相対パス。Gemini のようにモデル名をパスに埋め込む
-    /// プロバイダもあるため、モデル ID を受け取る。
+    /// Relative request path. Accepts a model ID because some providers, such as
+    /// Gemini, embed the model name in the path.
     fn path(&self, model_id: &str) -> String;
 
-    /// この scheme が要求する認証形式。呼び出し側は client 構築時に
-    /// 設定された認証情報と照合する。
+    /// Authentication format required by this scheme. The caller checks it
+    /// against configured credentials when constructing the client.
     fn required_auth(&self) -> AuthRequirement;
 
-    /// `Content-Type` 以外の追加ヘッダ。`anthropic-version` / `anthropic-beta` 等。
+    /// Additional headers beyond `Content-Type`, e.g. `anthropic-version` / `anthropic-beta`.
     fn additional_headers(&self) -> Vec<(&'static str, String)> {
         Vec::new()
     }
 
-    /// リクエスト body を生成する。`capability` は `CacheStrategy` や
-    /// `ReasoningSupport` を参照して scheme 側の挙動を分岐させるため
-    /// に渡される。
+    /// Build the request body. `capability` lets the scheme select behavior
+    /// based on `CacheStrategy` and `ReasoningSupport`.
     fn build_request_body(
         &self,
         model_id: &str,
@@ -64,11 +63,11 @@ pub trait Scheme: Clone + Send + Sync + 'static {
         capability: &ModelCapability,
     ) -> Value;
 
-    /// SSE イベント 1 件を 0 個以上の [`Event`] に変換する。
+    /// Convert one SSE event to zero or more [`Event`]s.
     ///
-    /// `event_type` は SSE フレームの `event:` フィールド、`data` は
-    /// `data:` フィールド。`[DONE]` 等の終端マーカーは実装側で判定する。
-    /// `state` はストリーム単位で共有される可変状態。
+    /// `event_type` is the SSE frame's `event:` field; `data` is its `data:` field.
+    /// Implementations detect terminal markers such as `[DONE]`.
+    /// `state` is mutable state shared for the stream.
     fn parse_sse(
         &self,
         event_type: &str,
@@ -76,9 +75,9 @@ pub trait Scheme: Clone + Send + Sync + 'static {
         state: &mut Self::State,
     ) -> Result<Vec<Event>, ClientError>;
 
-    /// scheme 既定の capability。モデル ID に関係なく、この wire で
-    /// 安全に送れる最小共通項を返す。既知モデル ID の能力テーブルは
-    /// 高レベルの client 構築層の責務で、scheme はここには関与しない。
+    /// Scheme default capability: the minimum common features safe to send over
+    /// this wire, regardless of model ID. Known-model capability tables belong
+    /// to the higher-level client construction layer, not the scheme.
     fn default_capability(&self) -> ModelCapability;
 
     /// Strongest safe completion boundary for streamed tool calls.
@@ -86,9 +85,8 @@ pub trait Scheme: Clone + Send + Sync + 'static {
         ToolCallCompletionSupport::ResponseComplete
     }
 
-    /// scheme 側でサポートしていない `RequestConfig` フィールドを
-    /// 警告として返す（例: OpenAI Chat は `top_k` 非対応）。
-    /// デフォルトは空 Vec。
+    /// Return warnings for `RequestConfig` fields unsupported by the scheme
+    /// (e.g. OpenAI Chat does not support `top_k`). Defaults to an empty Vec.
     fn validate_config(&self, config: &RequestConfig) -> Vec<ConfigWarning> {
         let _ = config;
         Vec::new()

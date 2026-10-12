@@ -6,7 +6,12 @@ use protocol::{Event, Method};
 
 use crate::transport::Socket;
 
-/// Typed Worker protocol client over an injected message transport.
+/// Typed Worker protocol client over a message transport.
+///
+/// Encodes and sends Methods and decodes received messages into Events. Successful sends
+/// indicate transport delivery, not controller command acknowledgments or durable Submit/Notify
+/// receipts. Callers interpret events; connection snapshots are not consumed automatically
+/// and state is not inferred.
 pub struct Client<T> {
     socket: T,
 }

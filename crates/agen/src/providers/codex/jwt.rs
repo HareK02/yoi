@@ -1,13 +1,13 @@
-//! JWT payload の最小限のパース（署名検証なし）。
+//! Minimal JWT payload parsing (without signature verification).
 //!
-//! Codex CLI と同じく、access_token / id_token の payload を base64url
-//! デコードして `exp` や ChatGPT 固有 claims を取り出すためだけに使う。
+//! As in Codex CLI, used only to base64url-decode access_token / id_token
+//! payloads and extract `exp` and ChatGPT-specific claims.
 
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-/// `Authorization: Bearer` で送る access_token JWT の `exp` を読む。
+/// Read `exp` from the access_token JWT sent in `Authorization: Bearer`.
 pub fn parse_exp(jwt: &str) -> Option<DateTime<Utc>> {
     #[derive(Deserialize)]
     struct Claims {
@@ -17,7 +17,7 @@ pub fn parse_exp(jwt: &str) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp(claims.exp?, 0)
 }
 
-/// id_token JWT から ChatGPT 固有 claims を取り出す。
+/// Extract ChatGPT-specific claims from the id_token JWT.
 pub fn parse_chatgpt_claims(jwt: &str) -> Option<ChatGptClaims> {
     #[derive(Deserialize)]
     struct IdClaims {

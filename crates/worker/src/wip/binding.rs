@@ -1,5 +1,20 @@
-//! Target-specific AI binding. Retrieval, display and invocation are separate:
-//! signatures are untrusted display data, never parsed back into call targets.
+//! Binding separating model-facing WIP acquisition, display, and calls.
+//!
+//! Tree succeeds only after acquiring all indexable edges within the requested depth; it does not
+//! scan Known Space by path prefix. Children at the depth boundary are unobserved, distinct from
+//! observed empty sets. Acquisition completion checks freshness, data, and edge completeness, not
+//! just `ensure`'s return value. Loading and insufficient capacity are reported as acquisition states,
+//! not resolved by overwriting or busy loops.
+//!
+//! Inspect displays an Object signature with ordered Interface references, or one Interface signature.
+//! It neither expands referenced descriptors automatically nor requires a prior Tree. Official Text
+//! View signatures remain unchanged; paths and structured references sit in the outer envelope.
+//! Rendering/envelope bound violations fail the whole display; incomplete contracts never return success.
+//!
+//! Invoke uses structured Interface references and named arguments. Missing, stale, or failed
+//! observations get at most one pre-dispatch acquisition attempt per target; dispatched calls never
+//! rerun. Explicit refresh updates only the selected Object/Interface, not referenced targets.
+//! Interrupted acquisition fails only its own request, never leaving Loading permanently.
 
 use super::*;
 use wip_client::{InterfaceObservation, PreparedRequest};

@@ -1,3 +1,12 @@
+//! Adapter projecting MCP wire discovery results into Worker Features.
+//!
+//! The `mcp` crate owns process/JSON-RPC lifecycle; this module owns capability-dependent bounded
+//! discovery, Tool-name namespacing, schema acceptance, and model-facing result rendering. Server
+//! instructions are not adopted as Worker instructions; external metadata and results remain data.
+//! List-changed notifications prompt rediscovery rather than prove catalog changes; startup
+//! rediscovery is also bounded. Failed server contributions are isolated with diagnostics;
+//! the regular registry decides Tool-name collisions.
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;

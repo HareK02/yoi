@@ -1,8 +1,14 @@
-//! Workspace-HTTP backed Memory tools.
+//! Memory tools through Workspace HTTP and a Host-provided resident prompt source.
 //!
-//! Runtime workers may have Workspace authority without direct local filesystem
-//! authority. In that case model-visible Memory tools must go through the
-//! workspace backend instead of resolving `.yoi/memory` from a Worker workdir.
+//! Workspace authority does not imply filesystem authority, so model-visible Memory operations
+//! delegate to typed Backend operations. They do not discover/import `.yoi/memory` from cwd or
+//! ancestors. The legacy Workspace single document and subject-scoped Subjektiv retain separate
+//! authorities/operations. Enabling the Feature neither migrates/dual-writes legacy data nor
+//! replaces existing tool semantics with subject Memory.
+//!
+//! Resident context is supporting context, not current authority or grounds to update confirmed
+//! Memory. User-managed behavior and generated Memory surfaces remain distinct; fetch/render
+//! failures do not mean "unset".
 
 use crate::subjektiv::{SubjektivHostConnection, SubjektivHostError};
 use std::sync::{Arc, Mutex};
@@ -729,6 +735,11 @@ impl WorkspaceSubjektivResidentSummarySource {
     }
 }
 
+/// Detect behavior changes against the state reflected in history, not the fetched state.
+///
+/// Initial load builds a prompt contribution; change refresh does not advance applied on fetch/render alone.
+/// The interceptor confirms after durably appending a system item, allowing refetch if append fails.
+/// Invalidate applied before rewrite so even identical bodies can be presented in the new history.
 #[async_trait]
 impl SystemPromptContributionSource for WorkspaceSubjektivResidentSummarySource {
     async fn load(&self) -> SystemPromptContribution {
@@ -796,9 +807,14 @@ const SUBJEKTIV_RESTORE_REFRESH_HOOK: &str = "refresh-resident-surface-after-res
 const SUBJEKTIV_BEHAVIOR_REFRESH_HOOK: &str = "refresh-subject-behavior-before-request";
 const SUBJEKTIV_BEHAVIOR_REWRITE_HOOK: &str = "invalidate-subject-behavior-before-rewrite";
 
-/// subjektiv-owned restore behavior. Initial prompt contribution remains a
-/// shared host facility, while loading and rendering a post-restore refresh is
-/// installed only with an execution-enabled, subject-attached subjektiv Feature.
+/// Subjektiv-owned restore-boundary refresh.
+///
+/// Initial prompt contributions are a shared Host facility; only an execution-enabled, subject-connected
+/// Feature requests restore refresh. Source presence alone must not make generic Worker core infer it.
+/// Saved prompt/history is unchanged; one system item representing current resident context is appended.
+/// A generated surface's ready-empty state differs from ungenerated, stale, or failed; those states
+/// never mean empty Memory. Pre-request hooks handle later behavior updates; the restore boundary
+/// itself is not repeated.
 #[derive(Clone)]
 pub(crate) struct SubjektivResidentRestoreRefreshFeature {
     source: Arc<dyn SystemPromptContributionSource>,

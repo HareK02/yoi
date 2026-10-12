@@ -1,14 +1,14 @@
-//! Gemini scheme の wire-level 既定 capability。
+//! Wire-level default capability for the Gemini scheme.
 //!
-//! モデル ID 固有のテーブル(`gemini-*` バージョン別の reasoning 有無)は
-//! client construction layer の責務。ここでは wire の
-//! 保守的 default のみ。
+//! Model ID tables (reasoning support by `gemini-*` version) belong to the
+//! client construction layer. This module provides only conservative wire
+//! defaults.
 
 use crate::llm_client::capability::{
     CacheStrategy, ModelCapability, StructuredOutput, ToolCallingSupport,
 };
 
-/// Scheme 既定の capability(未知モデル / 未明示モデル用)。
+/// Scheme default capability (for unknown or unspecified models).
 pub(crate) fn default_capability() -> ModelCapability {
     ModelCapability {
         tool_calling: ToolCallingSupport::Parallel,

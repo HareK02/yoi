@@ -1,3 +1,10 @@
+//! Explicit Flow source ownership and immutable source snapshots.
+//!
+//! `builtin:<slug>` and `workspace:<slug>` identify distinct logical records and may
+//! coexist with the same slug. There is no implicit override order or unqualified
+//! selector. Source resolution is separate from execution instance creation and
+//! mutation; the Runtime pins the resolved result before execution.
+
 use std::fmt;
 use std::str::FromStr;
 
@@ -114,11 +121,10 @@ pub struct FlowSourceResolveRequest {
     pub selector: FlowSelector,
 }
 
-/// Immutable source snapshot resolved by Workspace authority for one Runtime.
+/// Immutable source snapshot resolved by the Workspace authority.
 ///
-/// This is read-only source authority. Starting or mutating a Flow instance is
-/// deliberately not part of this response; Runtime persists the snapshot in
-/// the target Worker's durable state before execution.
+/// This read-only source authority creates no instances, attempts, or events.
+/// The Runtime commits the snapshot to the target Worker's Session before execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedFlowSource {
     pub selector: FlowSelector,

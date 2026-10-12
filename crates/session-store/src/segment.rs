@@ -1,8 +1,13 @@
-//! Free functions for segment persistence operations.
+//! Segment creation, append, and restoration.
 //!
-//! These functions record and restore segment state without owning a Engine.
-//! The caller (typically Worker) holds the Engine directly and calls these
-//! functions after state-mutating operations.
+//! Records host-committed history and execution boundaries in Store without owning
+//! Engine. Fork and compaction create a Segment with initial history in the same
+//! Session without rewriting the source. Initial records retain the source Segment
+//! and adopted boundary so replacement and branching decisions remain traceable.
+//!
+//! Saving a new Segment does not change the active reference. The host coordinates
+//! compaction activation with Worker metadata and the live append target. On failure,
+//! a saved Segment alone does not establish that current history has switched.
 
 use crate::segment_log::{self, LogEntry, SegmentOrigin};
 use crate::store::{Store, StoreError};
@@ -400,12 +405,11 @@ pub fn save_run_errored(
     )
 }
 
-/// Log an `LlmUsage` entry — 1 LLM リクエスト分の Usage スナップショット。
+/// Logs an `LlmUsage` entry: a usage snapshot for one LLM request.
 ///
-/// `history_len` は送信時の `history.len()`。`input_total_tokens` は
-/// その prefix をプロバイダが実測した占有量（プロンプト全長）で、
-/// プロバイダ別の正規化（Anthropic では `input + cache_read + cache_creation`）を
-/// 済ませた値を渡す。
+/// `history_len` is `history.len()` at send time. `input_total_tokens` is the
+/// provider-measured size of that prefix (the full prompt). Pass a value normalized
+/// for the provider: `input + cache_read + cache_creation` for Anthropic.
 pub fn save_usage(
     store: &impl Store,
     session_id: SessionId,

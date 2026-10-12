@@ -1,8 +1,8 @@
-//! OpenAI Responses API リクエスト body 生成
+//! OpenAI Responses API request body generation.
 //!
-//! Chat Completions の `messages` と違い、Responses は `input[]` の
-//! item 配列で reasoning / function_call / function_call_output が
-//! first-class。`Item` を素に近い形で `input[]` に投影できる。
+//! Unlike Chat Completions `messages`, Responses uses an `input[]` item array
+//! with first-class reasoning / function_call / function_call_output items.
+//! `Item` can be projected into `input[]` with little transformation.
 
 use serde::{Serialize, Serializer};
 use serde_json::Value;
@@ -32,93 +32,92 @@ pub(crate) enum FunctionCallOutputContentItem {
     InputImage { image_url: String },
 }
 
-/// `/v1/responses` のリクエスト body。
+/// Request body for `/v1/responses`.
 #[derive(Debug, Serialize)]
 pub(crate) struct ResponsesRequest {
     pub model: String,
-    /// システムプロンプト相当。`input[]` とは別フィールド。
+    /// System prompt equivalent, separate from `input[]`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     pub input: Vec<InputItem>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ResponseTool>,
-    /// 常時 `"auto"` を送る。scheme 固定値。
+    /// Always sends `"auto"`, a scheme-level constant.
     pub tool_choice: &'static str,
-    /// 常時 `true` を送る。scheme 固定値。
+    /// Always sends `true`, a scheme-level constant.
     pub parallel_tool_calls: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningConfig>,
-    /// ZDR / stateless 運用では `false`。
+    /// `false` for ZDR / stateless operation.
     pub store: bool,
-    /// 常時 `true`。
+    /// Always `true`.
     pub stream: bool,
-    /// `["reasoning.encrypted_content"]` 等。
+    /// E.g. `["reasoning.encrypted_content"]`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<&'static str>,
-    /// 公式 OpenAI Responses API では受理されるが、互換 backend によっては
-    /// 400 で弾く。scheme の `send_max_output_tokens` が `false` のときは
-    /// `None` のまま送る (skip_serializing_if で除外)。
+    /// Accepted by the official OpenAI Responses API, but some compatible backends
+    /// reject it with 400. When the scheme's `send_max_output_tokens` is `false`,
+    /// leave it as `None` (excluded by skip_serializing_if).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
-    /// 公式 OpenAI Responses API では受理されるが、互換 backend によっては
-    /// `temperature` / `top_p` を 400 で弾く。scheme の
-    /// `send_sampling_params` が `false` のときは `None` のまま送る。
+    /// Accepted by the official OpenAI Responses API, but some compatible backends
+    /// reject `temperature` / `top_p` with 400. When the scheme's
+    /// `send_sampling_params` is `false`, leave them as `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
-    /// 会話単位の安定キー。明示キーを必要とする backend では、
-    /// 呼び出し側が安定した conversation identifier を渡す。
-    /// `Request::cache_key` が `None` のときはキー自体を送らない。
+    /// Stable conversation key. For backends requiring an explicit key, the caller
+    /// supplies a stable conversation identifier. The key is omitted entirely
+    /// when `Request::cache_key` is `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
 }
 
-/// reasoning 制御。
+/// Reasoning control.
 #[derive(Debug, Serialize)]
 pub(crate) struct ReasoningConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    /// summary の出力制御。`"auto"` 固定で summary_text を受け取る。
+    /// Summary output control, fixed to `"auto"` to receive summary_text.
     pub summary: &'static str,
 }
 
-/// `input[]` の 1 要素。
+/// One element of `input[]`.
 ///
-/// Responses API の item 型を素に近い形で投影する。未対応 type は
-/// 無視（reasoning 送信時に `content: []` の場合は `None` として弾く）。
+/// Projects Responses API item types with little transformation. Unsupported types
+/// are ignored (reasoning with `content: []` is rejected as `None` when sending).
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum InputItem {
-    /// 会話メッセージ。user / assistant / developer のいずれか。
-    /// `Role::System` items は `developer` として投影する。OpenAI
-    /// Responses 互換 backend の一部は `role: "system"` を拒否するため、
-    /// system 相当の挿入には `role: "developer"` を使う。
+    /// Conversation message: user / assistant / developer.
+    /// `Role::System` items are projected as `developer`. Some OpenAI Responses
+    /// compatible backends reject `role: "system"`, so system-equivalent
+    /// insertions use `role: "developer"`.
     Message {
         role: &'static str,
         content: Vec<InputContent>,
     },
-    /// 過去の function tool 呼び出し（assistant 側）。
+    /// Previous function tool call (assistant side).
     FunctionCall {
         call_id: String,
         name: String,
-        /// JSON 文字列（object でなくても正規化済み）。
+        /// JSON string (normalized even if the original was not an object).
         arguments: String,
     },
-    /// function tool の結果（user 側）。
+    /// Function tool result (user side).
     FunctionCallOutput {
         call_id: String,
         output: FunctionCallOutputBody,
     },
-    /// reasoning item。`encrypted_content` があれば必ず添える。
+    /// Reasoning item, always including `encrypted_content` when present.
     Reasoning {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
-        /// Responses API は reasoning item に `summary` フィールドを必須で
-        /// 要求する（中身が空でも `[]` として送る必要がある）。GPT-5 など
-        /// summary を返さないモデル + reasoning effort 指定なしのターンでは
-        /// summary text が一切付かないので、ここを skip すると 400
-        /// "Missing required parameter: 'input[N].summary'" で弾かれる。
+        /// The Responses API requires `summary` on reasoning items, even if sent
+        /// as an empty `[]`. Models such as GPT-5 may return no summary text on
+        /// turns without a specified reasoning effort. Omitting this field then
+        /// causes a 400 `"Missing required parameter: 'input[N].summary'"` rejection.
         summary: Vec<ReasoningSummaryPart>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         content: Vec<ReasoningContentPart>,
@@ -127,14 +126,13 @@ pub(crate) enum InputItem {
     },
 }
 
-/// メッセージ content_part。role で input/output を使い分ける。
+/// Message content_part, using input/output according to role.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum InputContent {
-    /// user / developer 側のテキスト
+    /// User / developer text.
     InputText { text: String },
-    /// user 側の画像
-    /// assistant 側のテキスト
+    /// Assistant text.
     OutputText { text: String },
 }
 
@@ -150,8 +148,8 @@ pub(crate) enum ReasoningContentPart {
     ReasoningText { text: String },
 }
 
-/// Responses 用 tool 定義。Chat と違い function キーでネストせず
-/// トップレベルに `name` / `parameters` が載る。
+/// Tool definition for Responses. Unlike Chat, `name` / `parameters` are
+/// top-level fields, not nested under a function key.
 #[derive(Debug, Serialize)]
 pub(crate) struct ResponseTool {
     #[serde(rename = "type")]
@@ -159,13 +157,12 @@ pub(crate) struct ResponseTool {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// OpenAI Responses API は `type:"object"` のパラメータスキーマに
-    /// `properties` が存在することを要求する。schemars は引数なし struct
-    /// から `properties` を含まない最小スキーマを出すので、serialize
-    /// 時に空オブジェクトを補う。
+    /// The OpenAI Responses API requires `properties` in `type:"object"` parameter
+    /// schemas. schemars emits minimal schemas without `properties` for structs
+    /// with no arguments, so serialization supplies an empty object.
     #[serde(serialize_with = "serialize_parameters")]
     pub parameters: Value,
-    /// Structured output モード制御。デフォルト false。
+    /// Structured output mode control. Defaults to false.
     pub strict: bool,
 }
 
@@ -182,7 +179,7 @@ fn serialize_parameters<S: Serializer>(value: &Value, s: S) -> Result<S::Ok, S::
 }
 
 impl OpenAIResponsesScheme {
-    /// `Request` から wire 形式の body を組み立てる。
+    /// Build a wire-format body from `Request`.
     pub(crate) fn build_request(
         &self,
         model: &str,
@@ -192,8 +189,8 @@ impl OpenAIResponsesScheme {
         let input = convert_items_to_input(&request.items, capability.vision);
         let tools = request.tools.iter().map(convert_tool).collect();
 
-        // Reasoning 投影: capability が Effort / Both をサポートし、かつ
-        // request 側で effort が指定されているときだけ reasoning を付ける。
+        // Project reasoning: add reasoning only when the capability supports
+        // Effort / Both and the request specifies an effort.
         let supports_effort = matches!(
             capability.reasoning,
             Some(ReasoningSupport::Effort | ReasoningSupport::Both),
@@ -249,7 +246,7 @@ impl OpenAIResponsesScheme {
     }
 }
 
-/// `Item` 列を `input[]` に変換する。
+/// Convert an `Item` sequence to `input[]`.
 fn convert_items_to_input(items: &[Item], supports_images: bool) -> Vec<InputItem> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
@@ -280,7 +277,7 @@ fn convert_items_to_input(items: &[Item], supports_images: bool) -> Vec<InputIte
                 arguments,
                 ..
             } => {
-                // 非 object / 旧形式の "null" を "{}" に正規化。
+                // Normalize non-objects / legacy "null" to "{}".
                 let normalized = parse_tool_arguments(arguments).to_string();
                 out.push(InputItem::FunctionCall {
                     call_id: call_id.clone(),
@@ -554,11 +551,10 @@ mod tests {
 
     #[test]
     fn reasoning_summary_field_is_always_serialized() {
-        // Responses API は reasoning item に `summary` を必須で要求する。
-        // summary が空でも wire 上に `summary: []` として残らないと、
-        // backend によっては missing required parameter として拒否される。
-        // reasoning effort 未指定のターンでは summary text が付かないことが
-        // あるため、空のままでも skip しないこと。
+        // The Responses API requires `summary` on reasoning items. Even an empty
+        // summary must remain as `summary: []` on the wire, or some backends
+        // reject it as a missing required parameter. Turns without a specified
+        // reasoning effort may have no summary text; do not skip empty summaries.
         let scheme = OpenAIResponsesScheme::new();
         let item = Item::reasoning("").with_encrypted_content("ENC");
         let req = Request::new().user("hi").item(item);
@@ -667,9 +663,9 @@ mod tests {
 
     #[test]
     fn tool_schema_without_properties_is_normalized() {
-        // schemars は引数なし struct から `type:"object"` だけのスキーマを
-        // 吐く。OpenAI Responses は `properties` 欠落を 400 で拒否するので
-        // 送る直前に空オブジェクトを補うのを確認。
+        // schemars emits only `type:"object"` for structs with no arguments.
+        // OpenAI Responses rejects missing `properties` with 400, so verify that
+        // an empty object is supplied just before sending.
         let scheme = OpenAIResponsesScheme::new();
         let raw_schema = serde_json::json!({ "type": "object" });
         let req = Request::new().tool(
@@ -707,7 +703,7 @@ mod tests {
 
     #[test]
     fn serialized_body_has_expected_shape() {
-        // wire 形式が崩れていないかのスモークテスト
+        // Smoke test for an intact wire format.
         let scheme = OpenAIResponsesScheme::new();
         let req = Request::new()
             .system("sys")

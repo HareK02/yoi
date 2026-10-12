@@ -19,11 +19,9 @@ enum Authority {
     },
 }
 
-/// A capability issued by trusted Rust Host code after authentication/lease,
-/// delegation, and committed Session evidence checks. Not a request DTO.
-/// Constructors check domain binding, not external identity or execution leases.
-/// Backend must retain its authenticated Worker and active Job grant checks;
-/// standalone must hold the selected Subject lease and attenuate Job batches.
+/// Operation context constructed by a Host after checking external authentication, leases, delegation, and Session evidence.
+/// Constructors validate only store domain bindings, not external execution authority.
+/// Not a request DTO; models never select the Subject or Job batch.
 #[derive(Debug, Clone)]
 pub struct HostOperationContext {
     scope_id: String,
@@ -32,10 +30,9 @@ pub struct HostOperationContext {
 }
 
 impl HostOperationContext {
-    /// The Host has validated body execution authority. Attribution, when supplied,
-    /// must already be immutable history in this store. Before StageExplicit the
-    /// Host must resolve/validate all evidence against committed public Session
-    /// entries; neither this constructor nor the operation reads Session files.
+    /// Pins the Host-verified execution context for the Subject body.
+    /// Supplied attribution must match immutable store history. The Host resolves and validates
+    /// explicit staging evidence against committed public Sessions; neither this constructor nor operations read Session files.
     pub fn validated_body(
         store: &SubjektivStore,
         subject_id: &str,
@@ -62,10 +59,10 @@ impl HostOperationContext {
         })
     }
 
-    /// The Host has validated consolidation authority and (for a Job) its active
-    /// attempt. `Some(candidate_ids)` is the immutable admitted batch; no candidate
-    /// outside it is accessible. `None` retains Backend's non-Job consolidation
-    /// authority, and must not be issued to an attenuated Job.
+    /// Pins Host-verified consolidation authority and, when needed, the current Job attempt.
+    /// `Some(candidate_ids)` is an immutable allowed set, including empty batches; candidates outside it cannot be operated on.
+    /// `None` is for non-Job Host authority, never issued to a restricted Job.
+    /// This context cannot perform Subject-body-only operations.
     pub fn validated_consolidation(
         store: &SubjektivStore,
         subject_id: &str,

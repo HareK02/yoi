@@ -1,9 +1,9 @@
-//! Alias-keyed Worker Workdir session routing.
+//! Live session routing through Worker-local aliases.
 //!
-//! The router owns live provider sessions without exposing whether a session is
-//! local or transported over HTTP.  Attachment aliases are Worker-local stable
-//! identities; provider Workdir ids and human display names are deliberately not
-//! routing keys.
+//! Pins targets by alias and connection generation, not provider Workdir IDs or display names.
+//! Reusing an alias on detach/reattach does not direct old observations, read history, or operations
+//! to the new connection. Routed operations retain active-operation accounting coordinated with
+//! begin/finish/cancel-detach. Detach ends a session connection; it does not delete Workdirs or files.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -376,7 +376,11 @@ impl WorkdirSession for RoutedWorkdirSession {
     }
 }
 
-/// Worker-owned map of stable attachment aliases to provider-neutral sessions.
+/// Maps Worker-owned aliases to live provider sessions.
+///
+/// Issues a generation per connection to distinguish alias reuse. Coordinates active operation
+/// and command accounting with detach; old connections never retarget new sessions.
+/// Detach does not delete the Workdir.
 #[derive(Debug, Default)]
 pub struct WorkdirSessionRouter {
     sessions: RwLock<BTreeMap<WorkdirAttachmentAlias, Arc<RoutedSessionState>>>,

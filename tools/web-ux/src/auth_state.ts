@@ -1,3 +1,8 @@
+/**
+ * 認証fixtureは撮影成果物から分離する。別の利用主体やoriginへの流用と、
+ * 期限切れの状態による誤判定を防ぐため、撮影前にsidecarの結付けを確認する。
+ * metadataが欠けても暗黙に再認証せず、明示的な準備を要求する。
+ */
 import { writePrivateJson } from "./artifacts.ts";
 
 export type AuthStateMetadata = {

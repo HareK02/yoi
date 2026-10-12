@@ -1,9 +1,10 @@
-//! Identity-fenced access adapter for the existing read/edit/write engine.
+//! Identity-fenced access adapter for existing read/edit/write engines.
 //!
-//! Descriptor-rooted resolution is Linux-only and symlinks/mount crossings fail
-//! closed. The final compare and atomic rename are NOT a kernel CAS against an
-//! arbitrary external editor: external editors must cooperate with provider
-//! serialization. A hostile rename in that last syscall gap is not excluded.
+//! Retains target, save-parent, and provider-root descriptors to bind authorization to I/O.
+//! Rejects unavailable Linux descriptor primitives, symlinks, and mount crossings.
+//! Revalidates names/descriptors until just before save, but the final comparison and rename
+//! are not kernel CAS. Does not guarantee against noncooperative external editors replacing
+//! entries between those syscalls, or guarantee parent-directory crash durability.
 use crate::{AtomicWriteMode, FsAccessPolicy};
 use std::fs::{File, Metadata};
 use std::io::{Seek, SeekFrom};
@@ -41,7 +42,17 @@ pub fn identity_validator(metadata: &Metadata) -> std::io::Result<Vec<u8>> {
     }
 }
 
-/// One pinned target and its save parent. Retained through the shared operation.
+/// Target, save-parent, and root descriptors retained during shared operations.
+///
+/// Validators encode device/inode and protected metadata, detecting same-content replacements
+/// independently of content hashes. Excludes atime so Read does not invalidate its own observation.
+/// Saves publish a new temporary inode by rename; updating one hard-link name does not alter
+/// other aliases of the old inode.
+///
+/// Checks named targets and parents before commit, but cannot exclude external replacements between
+/// the final check and rename. Pinned descriptors alone do not guarantee linearizability against
+/// arbitrary external editors. Failures after parent creation or save begins report `effects_possible`
+/// to callers rather than implying no effects.
 pub struct CheckedTarget<'a> {
     policy: &'a dyn FsAccessPolicy,
     root: File,

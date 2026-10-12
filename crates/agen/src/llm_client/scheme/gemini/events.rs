@@ -1,6 +1,6 @@
-//! Gemini SSEイベントパース
+//! Gemini SSE event parsing.
 //!
-//! Google Gemini APIのSSEイベントをパースし、統一Event型に変換
+//! Parse Google Gemini API SSE events and convert them to the unified Event type.
 
 use crate::llm_client::{
     ClientError,
@@ -11,117 +11,117 @@ use serde::Deserialize;
 use super::GeminiScheme;
 
 // ============================================================================
-// SSEイベントのJSON構造
+// SSE event JSON structures
 // ============================================================================
 
-/// Gemini GenerateContentResponse (ストリーミングチャンク)
+/// Gemini GenerateContentResponse (streaming chunk).
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GenerateContentResponse {
-    /// 候補
+    /// Candidates.
     pub candidates: Option<Vec<Candidate>>,
-    /// 使用量メタデータ
+    /// Usage metadata.
     pub usage_metadata: Option<UsageMetadata>,
-    /// プロンプトフィードバック
+    /// Prompt feedback.
     pub prompt_feedback: Option<PromptFeedback>,
-    /// モデルバージョン
+    /// Model version.
     pub model_version: Option<String>,
 }
 
-/// 候補
+/// Candidate.
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Candidate {
-    /// コンテンツ
+    /// Content.
     pub content: Option<CandidateContent>,
-    /// 完了理由
+    /// Finish reason.
     pub finish_reason: Option<String>,
-    /// インデックス
+    /// Index.
     pub index: Option<usize>,
-    /// 安全性評価
+    /// Safety rating.
     pub safety_ratings: Option<Vec<SafetyRating>>,
 }
 
-/// 候補コンテンツ
+/// Candidate content.
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct CandidateContent {
-    /// パーツ
+    /// Parts.
     pub parts: Option<Vec<CandidatePart>>,
-    /// ロール
+    /// Role.
     pub role: Option<String>,
 }
 
-/// 候補パーツ
+/// Candidate part.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CandidatePart {
-    /// テキスト
+    /// Text.
     pub text: Option<String>,
-    /// 関数呼び出し
+    /// Function call.
     pub function_call: Option<FunctionCall>,
 }
 
-/// 関数呼び出し
+/// Function call.
 #[derive(Debug, Deserialize)]
 pub(crate) struct FunctionCall {
-    /// 関数名
+    /// Function name.
     pub name: String,
-    /// 引数
+    /// Arguments.
     pub args: Option<serde_json::Value>,
 }
 
-/// 使用量メタデータ
+/// Usage metadata.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UsageMetadata {
-    /// プロンプトトークン数
+    /// Prompt token count.
     pub prompt_token_count: Option<u64>,
-    /// 候補トークン数
+    /// Candidate token count.
     pub candidates_token_count: Option<u64>,
-    /// 合計トークン数
+    /// Total token count.
     pub total_token_count: Option<u64>,
 }
 
-/// プロンプトフィードバック
+/// Prompt feedback.
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PromptFeedback {
-    /// ブロック理由
+    /// Block reason.
     pub block_reason: Option<String>,
-    /// 安全性評価
+    /// Safety rating.
     pub safety_ratings: Option<Vec<SafetyRating>>,
 }
 
-/// 安全性評価
+/// Safety rating.
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct SafetyRating {
-    /// カテゴリ
+    /// Category.
     pub category: Option<String>,
-    /// 確率
+    /// Probability.
     pub probability: Option<String>,
 }
 
 // ============================================================================
-// イベント変換
+// Event conversion
 // ============================================================================
 
 impl GeminiScheme {
-    /// SSEデータをEvent型に変換
+    /// Convert SSE data to Event.
     ///
     /// # Arguments
-    /// * `data` - SSEイベントデータJSON文字列
+    /// * `data` - SSE event data as a JSON string.
     ///
     /// # Returns
-    /// * `Ok(Some(Vec<Event>))` - 変換成功
-    /// * `Ok(None)` - イベントを無視
-    /// * `Err(ClientError)` - パースエラー
+    /// * `Ok(Some(Vec<Event>))` - Conversion succeeded.
+    /// * `Ok(None)` - Event ignored.
+    /// * `Err(ClientError)` - Parse error.
     pub(crate) fn parse_event(&self, data: &str) -> Result<Option<Vec<Event>>, ClientError> {
-        // データが空または無効な場合はスキップ
+        // Skip empty or invalid data.
         if data.is_empty() || data == "[DONE]" {
             return Ok(None);
         }
@@ -136,12 +136,12 @@ impl GeminiScheme {
 
         let mut events = Vec::new();
 
-        // 使用量メタデータ
+        // Usage metadata.
         if let Some(usage) = response.usage_metadata {
             events.push(self.convert_usage(&usage));
         }
 
-        // 候補を処理
+        // Process candidates.
         if let Some(candidates) = response.candidates {
             for candidate in candidates {
                 let candidate_index = candidate.index.unwrap_or(0);
@@ -149,26 +149,26 @@ impl GeminiScheme {
                 if let Some(content) = candidate.content {
                     if let Some(parts) = content.parts {
                         for (part_index, part) in parts.iter().enumerate() {
-                            // テキストデルタ
+                            // Text delta.
                             if let Some(text) = &part.text {
                                 if !text.is_empty() {
-                                    // Geminiは明示的なBlockStartを送らないため、
-                                    // TextDeltaを直接送る（Timelineが暗黙的に開始を処理）
+                                    // Gemini sends no explicit BlockStart, so emit TextDelta
+                                    // directly (Timeline handles the implicit start).
                                     events.push(Event::text_delta(part_index, text.clone()));
                                 }
                             }
 
-                            // 関数呼び出し
+                            // Function call.
                             if let Some(function_call) = &part.function_call {
-                                // 関数呼び出しの開始
-                                // Geminiでは関数呼び出しは一度に送られることが多い
-                                // ストリーミング引数が有効な場合は部分的に送られる可能性がある
+                                // Function call start.
+                                // Gemini usually sends function calls all at once, but may
+                                // send partial calls when streaming arguments are enabled.
 
-                                // 関数呼び出しIDはGeminiにはないので、名前をIDとして使用
+                                // Gemini has no function call IDs, so use the name as the ID.
                                 let function_id = format!("call_{}", function_call.name);
 
                                 events.push(Event::BlockStart(BlockStart {
-                                    index: candidate_index * 10 + part_index, // 複合インデックス
+                                    index: candidate_index * 10 + part_index, // Composite index.
                                     block_type: BlockType::ToolUse,
                                     metadata: BlockMetadata::ToolUse {
                                         id: function_id,
@@ -176,7 +176,7 @@ impl GeminiScheme {
                                     },
                                 }));
 
-                                // 引数がある場合はデルタとして送る
+                                // Send arguments as a delta if present.
                                 if let Some(args) = &function_call.args {
                                     let args_str = serde_json::to_string(args).unwrap_or_default();
                                     if !args_str.is_empty() && args_str != "null" {
@@ -191,7 +191,7 @@ impl GeminiScheme {
                     }
                 }
 
-                // 完了理由
+                // Finish reason.
                 if let Some(finish_reason) = candidate.finish_reason {
                     let stop_reason = match finish_reason.as_str() {
                         "STOP" => Some(StopReason::EndTurn),
@@ -200,7 +200,7 @@ impl GeminiScheme {
                         _ => None,
                     };
 
-                    // テキストブロックの停止
+                    // Text block stop.
                     events.push(Event::BlockStop(BlockStop {
                         index: candidate_index,
                         block_type: BlockType::Text,
@@ -262,7 +262,7 @@ mod tests {
 
         let events = scheme.parse_event(data).unwrap().unwrap();
 
-        // Usageイベントが含まれるはず
+        // Should contain a Usage event.
         let usage_event = events.iter().find(|e| matches!(e, Event::Usage(_)));
         assert!(usage_event.is_some());
 
@@ -280,7 +280,7 @@ mod tests {
 
         let events = scheme.parse_event(data).unwrap().unwrap();
 
-        // BlockStartイベントがあるはず
+        // Should contain a BlockStart event.
         let start_event = events.iter().find(|e| matches!(e, Event::BlockStart(_)));
         assert!(start_event.is_some());
 
@@ -293,7 +293,7 @@ mod tests {
             }
         }
 
-        // 引数デルタもあるはず
+        // Should also contain an argument delta.
         let delta_event = events.iter().find(|e| {
             if let Event::BlockDelta(d) = e {
                 matches!(d.delta, DeltaContent::InputJson(_))
@@ -311,7 +311,7 @@ mod tests {
 
         let events = scheme.parse_event(data).unwrap().unwrap();
 
-        // BlockStopイベントがあるはず
+        // Should contain a BlockStop event.
         let stop_event = events.iter().find(|e| matches!(e, Event::BlockStop(_)));
         assert!(stop_event.is_some());
 

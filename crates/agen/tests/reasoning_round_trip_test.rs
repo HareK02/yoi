@@ -1,15 +1,11 @@
-//! Reasoning history round-trip 統合テスト
+//! Integration tests for reasoning history round trips.
 //!
-//! Engine のストリーム → history append → 次リクエスト送出までの
-//! ライフサイクルで `Item::Reasoning` が脱落せず保持されることを確認する。
+//! Verifies that `Item::Reasoning` survives the lifecycle from Engine streaming
+//! through history append to the next outgoing request.
 //!
-//! 検証点:
-//! - Anthropic 由来の thinking + signature が `Item::Reasoning::signature` として
-//!   history に残る
-//! - OpenAI Responses 由来の reasoning text + summary + encrypted_content が
-//!   `Item::Reasoning` の各フィールドに展開される
-//! - 直前の reasoning は次の outgoing request の `request.items` の先頭付近に
-//!   含まれる（assistant メッセージの先頭、Anthropic 仕様）
+//! Covers Anthropic thinking and signatures, OpenAI Responses reasoning text,
+//! summaries and encrypted content, and ordering reasoning before other assistant
+//! output as required by Anthropic.
 
 mod common;
 
@@ -41,8 +37,8 @@ fn reasoning_block(text: impl Into<String>, data: ReasoningBlockData) -> Vec<Eve
     ]
 }
 
-/// Anthropic 風: thinking ブロック → text → 終了 のシーケンス。
-/// Engine history に Reasoning(signature 付き) → assistant_message が並ぶ。
+/// Anthropic-style sequence: thinking block, text, completion.
+/// History contains Reasoning with a signature followed by assistant_message.
 #[tokio::test]
 async fn anthropic_thinking_round_trips_signature_into_history() {
     let mut events = reasoning_block(
@@ -85,8 +81,8 @@ async fn anthropic_thinking_round_trips_signature_into_history() {
     assert_eq!(entries[2].item.as_text(), Some("Here's the answer"));
 }
 
-/// OpenAI Responses 風: encrypted_content + summary を持った reasoning が
-/// `Item::Reasoning` のフィールドに展開されること。
+/// OpenAI Responses reasoning with encrypted_content and summary is projected
+/// into the corresponding `Item::Reasoning` fields.
 #[tokio::test]
 async fn openai_reasoning_round_trips_encrypted_and_summary() {
     let mut events = reasoning_block(
@@ -132,13 +128,13 @@ async fn openai_reasoning_round_trips_encrypted_and_summary() {
     }
 }
 
-/// Reasoning は assistant ターン内で text/tool_call より先に並ぶこと（Anthropic
-/// が thinking を assistant メッセージの先頭に要求するため）。
+/// Reasoning precedes text/tool_call in the assistant turn because Anthropic
+/// requires thinking at the start of the assistant message.
 #[tokio::test]
 async fn reasoning_precedes_text_in_assistant_burst() {
     let mut events = vec![
-        // text/tool_call とは独立に、reasoning block が中盤で完了しても、
-        // history append 時には assistant items の先頭に置かれる。
+        // Even if the reasoning block finishes after text/tool_call output,
+        // it is placed first among assistant items when appended to history.
         Event::text_block_start(0),
         Event::text_delta(0, "intermediate"),
         Event::text_block_stop(0, None),
@@ -159,14 +155,14 @@ async fn reasoning_precedes_text_in_assistant_burst() {
     let _out = engine.run(&mut history, "q").await;
 
     let entries = history.entries();
-    // user / reasoning(先頭) / assistant_message
+    // user / reasoning (first assistant item) / assistant_message
     assert!(matches!(entries[1].item, Item::Reasoning { .. }));
     assert_eq!(entries[2].item.as_text(), Some("intermediate"));
 }
 
-/// resume シナリオ: history.json 由来の Item::Reasoning(signature) を Engine に
-/// 注入して run しても、次の outgoing request の `Request::items` にそのまま
-/// 載って LLM へ渡る（engine は items を改変しない契約）。
+/// Restored history: inject an Item::Reasoning with a signature as if restored
+/// from history.json. Running the Engine preserves it in the next `Request::items`
+/// sent to the LLM without modifying the reasoning item.
 #[tokio::test]
 async fn injected_reasoning_survives_into_outgoing_request() {
     use async_trait::async_trait;
@@ -176,7 +172,7 @@ async fn injected_reasoning_survives_into_outgoing_request() {
 
     use agen::llm_client::{ClientError, LlmClient, Request};
 
-    /// Request を 1 度だけキャプチャして空ストリームを返す client。
+    /// Captures a Request and returns a stream containing only completion status.
     #[derive(Clone)]
     struct CapturingClient {
         captured: Arc<Mutex<Option<Request>>>,
@@ -208,7 +204,7 @@ async fn injected_reasoning_survives_into_outgoing_request() {
 
     let mut engine = Engine::new(client);
     let mut history: History = History::new();
-    // resume: 既存 history を流し込む
+    // Restore existing history before continuing.
     engine.set_history(
         &mut history,
         vec![
@@ -225,7 +221,7 @@ async fn injected_reasoning_survives_into_outgoing_request() {
         .unwrap()
         .take()
         .expect("client should have received a request");
-    // Reasoning item が outgoing items に保持されていること
+    // The reasoning item must remain in the outgoing items.
     let mut found = false;
     for item in &req.items {
         if let Item::Reasoning {

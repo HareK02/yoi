@@ -1,3 +1,7 @@
+/** Header／Sidebarのlayout登録を新しい順に表示するstack。
+ * cleanupは登録固有のIDだけを除き、重複cleanupや古いlayoutの破棄で新しい内容を消さない。
+ * active登録がなくなればnullを通知し、呼出側のfallbackへ戻す。
+ */
 export type OverrideDisposer = () => void;
 
 export type OverrideStack<T> = {

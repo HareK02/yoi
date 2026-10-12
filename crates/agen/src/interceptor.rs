@@ -1,8 +1,9 @@
-//! Interceptor - control flow delegation for the Engine execution loop
+//! Host-owned control decisions at Engine execution boundaries.
 //!
-//! Defines the [`Interceptor`] trait that callers implement to inject
-//! orchestration decisions (approval, skip, pause, abort) into the Engine's
-//! turn loop without the Engine knowing about host-application concepts.
+//! [`Interceptor`] delegates approval, skip, pause, and abort decisions to the host,
+//! keeping host-specific policy out of the Engine. Additional model input must go
+//! through history appends: inserting new facts only into an in-flight request
+//! would make its input impossible to reconstruct from stored history.
 
 use std::sync::Arc;
 

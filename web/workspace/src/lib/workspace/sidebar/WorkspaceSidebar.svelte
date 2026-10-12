@@ -1,4 +1,7 @@
 <script lang="ts">
+  // 日常のresource navigationをWorkspace scopeに置く。管理対象はSettingsに分ける。
+  // 子overrideはnavigation部分だけを置き換え、Workspace shortcut headerを保持する。
+  // identityと読み込み失敗は親のBackend projectionを表示し、URLから正常状態を作らない。
   import type { Snippet } from 'svelte';
   import './sidebar.css';
   import { workspaceRoute } from '#lib/workspace/api/http.ts';

@@ -1,36 +1,36 @@
-//! Yoi のホームディレクトリ配下のパス解決を一元化するモジュール。
+//! Centralized path resolution under Yoi's home directory.
 //!
-//! 用途別に三つの base directory を持つ:
+//! Separates base directories by purpose:
 //!
-//! - **`config_dir`** — 人が手で書く / 編集する設定。`profiles.toml`,
-//!   `providers.toml`, `models.toml` 等
-//! - **`data_dir`** — プログラムが書く永続データ。`sessions/` 等
-//! - **`secret_data_dir`** — local secret store の読み書き base。既存
-//!   secret store は path-derived key を使うため、通常 data とは別に
-//!   legacy `$HOME/.yoi` を既定にする
-//! - **`runtime_dir`** — 再起動で消えてよいランタイム状態。socket,
-//!   `workers.json`, `pid` ファイル等
+//! - **`config_dir`** — Handwritten/edited configuration: `profiles.toml`,
+//!   `providers.toml`, `models.toml`, etc.
+//! - **`data_dir`** — Program-written persistent data, such as `sessions/`.
+//! - **`secret_data_dir`** — Base for local secret-store reads/writes. The existing
+//!   store uses path-derived keys, so it defaults to legacy `$HOME/.yoi`, separate
+//!   from regular data.
+//! - **`runtime_dir`** — Runtime state disposable on restart: sockets,
+//!   `workers.json`, `pid` files, etc.
 //!
-//! ## 解決順 (優先順位高 → 低)
+//! ## Resolution order (highest to lowest priority)
 //!
-//! | base | 1. `YOI_<KIND>_DIR` | 2. `YOI_HOME` | 3. `XDG_*` | 4. 既定 |
+//! | base | 1. `YOI_<KIND>_DIR` | 2. `YOI_HOME` | 3. `XDG_*` | 4. default |
 //! |---|---|---|---|---|
 //! | config  | `YOI_CONFIG_DIR`  | `$YOI_HOME/config` | `$XDG_CONFIG_HOME/yoi` | `$HOME/.config/yoi` |
 //! | data    | `YOI_DATA_DIR`    | `$YOI_HOME`        | `$XDG_DATA_HOME/yoi`   | `$HOME/.local/share/yoi` |
 //! | secrets | `YOI_DATA_DIR`    | `$YOI_HOME`        | —                      | `$HOME/.yoi` |
 //! | runtime | `YOI_RUNTIME_DIR` | `$YOI_HOME/run`    | `$XDG_RUNTIME_DIR/yoi` | `$HOME/.yoi/run` |
 //!
-//! `YOI_HOME=$X` のとき config は `$X/config`、data は `$X` 直下、
-//! runtime は `$X/run` に集約される。テストや sandbox 利用ではこれ一本
-//! で全部 tempdir に向けられる。
+//! With `YOI_HOME=$X`, config uses `$X/config`, data uses `$X` directly, and
+//! runtime uses `$X/run`. Tests and sandboxes can redirect all of them to a
+//! temporary directory with this single variable.
 //!
-//! 解決された各 base が存在するか / ディレクトリかは保証しない —
-//! 呼び出し側がファイル操作の前に作成 / 検査する。
+//! Resolved bases are not guaranteed to exist or be directories; callers must
+//! create/check them before file operations.
 
 use std::path::PathBuf;
 
-/// 設定ディレクトリ。`profiles.toml`, `providers.toml`, `models.toml`,
-/// `prompts/` などが置かれる。
+/// Configuration directory for `profiles.toml`, `providers.toml`, `models.toml`,
+/// `prompts/`, etc.
 pub fn config_dir() -> Option<PathBuf> {
     resolve_config_dir_from_parts(
         env_path("YOI_CONFIG_DIR"),
@@ -40,8 +40,7 @@ pub fn config_dir() -> Option<PathBuf> {
     )
 }
 
-/// データディレクトリ。`sessions/` などプログラムが書く永続データの
-/// 置き場。
+/// Data directory for program-written persistent data, such as `sessions/`.
 pub fn data_dir() -> Option<PathBuf> {
     resolve_data_dir_from_parts(
         env_path("YOI_DATA_DIR"),
@@ -51,11 +50,11 @@ pub fn data_dir() -> Option<PathBuf> {
     )
 }
 
-/// Secret store 用の data directory。
+/// Data directory for the secret store.
 ///
-/// SecretStore は base path から復号 key を導出するため、通常 data dir の
-/// XDG fallback には追従させず、明示 override が無い場合は legacy
-/// `$HOME/.yoi` を読み書きする。
+/// SecretStore derives decryption keys from the base path, so it does not follow
+/// the regular data directory's XDG fallback. Without an explicit override, it
+/// reads/writes legacy `$HOME/.yoi`.
 pub fn secret_data_dir() -> Option<PathBuf> {
     resolve_secret_data_dir_from_parts(
         env_path("YOI_DATA_DIR"),
@@ -64,8 +63,8 @@ pub fn secret_data_dir() -> Option<PathBuf> {
     )
 }
 
-/// ランタイムディレクトリ。socket, `workers.json`, Worker ごとの `pid` /
-/// `status.json` 等が置かれる。再起動で消えて構わない。
+/// Runtime directory for sockets, `workers.json`, per-Worker `pid` /
+/// `status.json`, etc. Its contents may be discarded on restart.
 pub fn runtime_dir() -> Option<PathBuf> {
     resolve_runtime_dir_from_parts(
         env_path("YOI_RUNTIME_DIR"),
@@ -85,33 +84,33 @@ pub fn user_profiles_path() -> Option<PathBuf> {
     user_profiles_path_from_config_dir(config_dir())
 }
 
-/// `<config_dir>/<file_name>` — providers.toml / models.toml 等の
-/// user override ファイル。
+/// `<config_dir>/<file_name>` — user override files such as providers.toml /
+/// models.toml.
 pub fn user_catalog_override(file_name: &str) -> Option<PathBuf> {
     user_catalog_override_from_config_dir(config_dir(), file_name)
 }
 
-/// `<data_dir>/sessions/` — session store のデフォルト位置。
+/// `<data_dir>/sessions/` — default session store location.
 pub fn sessions_dir() -> Option<PathBuf> {
     sessions_dir_from_data_dir(data_dir())
 }
 
-/// `<runtime_dir>/workers.json` — machine-wide Worker allocation table。
+/// `<runtime_dir>/workers.json` — machine-wide Worker allocation table.
 pub fn worker_allocation_path() -> Option<PathBuf> {
     worker_allocation_path_from_runtime_dir(runtime_dir())
 }
 
-/// `<runtime_dir>/<worker_name>/` — Worker ごとのランタイムディレクトリ。
+/// `<runtime_dir>/<worker_name>/` — per-Worker runtime directory.
 pub fn worker_runtime_dir(worker_name: &str) -> Option<PathBuf> {
     worker_runtime_dir_from_runtime_dir(runtime_dir(), worker_name)
 }
 
-/// `<runtime_dir>/<worker_name>/sock` — Worker の Unix socket パス。
+/// `<runtime_dir>/<worker_name>/sock` — Worker's Unix socket path.
 ///
-/// Worker プロセス内で実際に socket を作成するのは `worker` crate の
-/// `RuntimeDir::socket_path()` で、Worker 名が分かっている外部 (TUI の
-/// attach フロー等) からの**予測**はこの関数で行う。両者は同じパス
-/// を返すことが期待される。
+/// The `worker` crate's `RuntimeDir::socket_path()` creates the socket inside the
+/// Worker process. This function **predicts** the path for external callers that
+/// know the Worker name, such as the TUI attach flow. Both should return the same
+/// path.
 pub fn worker_socket_path(worker_name: &str) -> Option<PathBuf> {
     worker_socket_path_from_runtime_dir(runtime_dir(), worker_name)
 }
@@ -219,9 +218,9 @@ fn worker_socket_path_from_runtime_dir(
     Some(worker_runtime_dir_from_runtime_dir(runtime_dir, worker_name)?.join("sock"))
 }
 
-/// 空文字列の env は未設定として扱う。`std::env::var` は `Ok("")` と
-/// `Err(NotPresent)` を区別するが、パス解決においては両者を未設定と
-/// 同等に扱うのが直感的。
+/// Treats empty environment values as unset. `std::env::var` distinguishes
+/// `Ok("")` from `Err(NotPresent)`, but path resolution treats both as unset
+/// for intuitive behavior.
 fn env_path(name: &str) -> Option<PathBuf> {
     let value = std::env::var(name).ok()?;
     path_from_env_value(Some(value.as_str()))

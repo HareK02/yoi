@@ -1,20 +1,4 @@
-//! Session metrics — generic ad-hoc measurement lane on top of
-//! `LogEntry::Extension { domain: "metrics" }`.
-//!
-//! セッション中に積み上げて後で引きたい値（prune の発火頻度・Hook の実行
-//! 時間・ツールリトライ回数 等）を session-log に乗せるための薄い層。
-//! session-store は payload を不透明な `serde_json::Value` として扱うので、
-//! このクレートは型と読み書きヘルパーだけを提供する。
-//!
-//! # 設計
-//!
-//! - 厳格な label set は持たない。次元は sparse な `BTreeMap<String,String>`、
-//!   観測できない値は `None` で明示する
-//! - 「後から埋まる値」（例: prune 発火直後の `cache_read_tokens`）は前 entry に
-//!   書き戻さず、`correlation_id` を共有する別 metric として流す。集計は読み手で join
-//! - 集計 / 可視化には [`read_session_metrics`] / [`read_segment_metrics`] /
-//!   [`export_metrics_jsonl`] の明示的な metrics 専用経路を使う。通常の
-//!   Session snapshot は `Extension` を公開しない。
+#![doc = include_str!("../README.md")]
 
 use std::collections::BTreeMap;
 
@@ -26,28 +10,33 @@ use session_store::{
 /// Domain tag used in `LogEntry::Extension` for all metrics records.
 pub const DOMAIN: &str = "metrics";
 
-/// 単発の計測値。`name` は `namespace.metric` 形式の自由文字列
-/// （例: `"prune.fire"`、`"hook.duration"`）。
+/// A single measurement appended to a Session log.
+///
+/// Stored as an extension payload and read separately from ordinary conversation
+/// snapshots. Labels are unrestricted; unobservable dimensions are omitted and
+/// missing values use `None`. Values learned later are appended as separate
+/// measurements with the same `correlation_id`, not written back to old records.
+/// This allows more measurements without changing conversation bodies or existing records.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Metric {
-    /// `namespace.metric` 形式の名前。
+    /// Name in `namespace.metric` form.
     pub name: String,
-    /// epoch ms。
+    /// Epoch milliseconds.
     pub ts: u64,
-    /// sparse な次元（label）。観測できないものはキー自体を入れない。
+    /// Sparse dimensions (labels). Omit keys for unobservable dimensions.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dimensions: BTreeMap<String, String>,
-    /// 主スカラ値。dimension では表現したくない数値を載せる場所。
+    /// Primary scalar value for numbers not represented as dimensions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<f64>,
-    /// 関連 metric を join するためのキー。同一 ID を持つ複数 metric は
-    /// 「同じ事象を多面的に観測している」という意味付けで読まれる。
+    /// Key for joining related metrics. Metrics with the same ID represent
+    /// different observations of the same event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
 }
 
 impl Metric {
-    /// 最小コンストラクタ。`ts` は呼び出し時刻（epoch ms）で埋める。
+    /// Minimal constructor; sets `ts` to the call time in epoch milliseconds.
     pub fn now(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -74,10 +63,10 @@ impl Metric {
     }
 }
 
-/// `LogEntry::Extension { domain: "metrics", payload: <metric> }` を append する。
+/// Appends `LogEntry::Extension { domain: "metrics", payload: <metric> }`.
 ///
-/// `save_extension` の薄い wrapper。書き込み失敗は呼び出し側に返す
-/// （メトリクスのために本体処理を止めるかは呼び出し側の判断）。
+/// Thin wrapper around `save_extension`. Returns write failures to the caller,
+/// who decides whether a metrics failure should stop the main operation.
 pub fn record_metric(
     store: &impl Store,
     session_id: SessionId,
@@ -88,10 +77,10 @@ pub fn record_metric(
     save_extension(store, session_id, segment_id, DOMAIN, payload)
 }
 
-/// `RestoredState.extensions` から metrics domain の payload を順に取り出し、
-/// `Metric` 列に fold する。
+/// Collects metrics-domain payloads from `RestoredState.extensions` in order
+/// into a sequence of `Metric` values.
 ///
-/// schema 変更で deserialize できない payload は無視する（後方互換）。
+/// Skips payloads that cannot deserialize after schema changes for backward compatibility.
 pub fn metrics_from_extensions(extensions: &[(String, serde_json::Value)]) -> Vec<Metric> {
     extensions
         .iter()
@@ -100,11 +89,11 @@ pub fn metrics_from_extensions(extensions: &[(String, serde_json::Value)]) -> Ve
         .collect()
 }
 
-/// A metric together with its durable Session/Segment origin.
+/// A measurement with its storage location and Segment lineage.
 ///
-/// `compacted_from` is copied from the Segment start record so readers can
-/// reconstruct compaction lineage without inferring relationships from metric
-/// names or timestamps.
+/// Takes `compacted_from` from the Segment's initial record rather than inferring
+/// compaction order from names or timestamps. Use `correlation_id` to relate the
+/// same attempt, and `compacted_from` to relate source and resulting Segments.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LocatedMetric {
     pub session_id: SessionId,
@@ -214,7 +203,12 @@ pub fn read_segment_metrics(
         .collect())
 }
 
-/// Read every metric for a Session across all of its Segments.
+/// Reads measurements from all Segments with lineage.
+///
+/// Sorts by timestamp, measurement phase, Segment, and log position for reproducible
+/// exports under the same conditions. This display order does not prove causality;
+/// use `correlation_id` and `compacted_from` for relationships. Rejects Segments
+/// without initial records and Session mismatches.
 pub fn read_session_metrics(
     store: &dyn Store,
     session_id: SessionId,
@@ -277,7 +271,7 @@ mod tests {
 
     #[test]
     fn metric_serializes_minimal_form_compactly() {
-        // dimensions が空 / value/correlation_id が None の時は出力に含めない。
+        // Omit empty dimensions and None values for value/correlation_id.
         let metric = Metric {
             name: "x".into(),
             ts: 1,
@@ -410,7 +404,7 @@ mod tests {
 
     #[test]
     fn fold_skips_undeserializable_payloads() {
-        // 将来 schema が変わって読めない payload も skip して落ちない。
+        // Skip unreadable payloads from future schema changes without failing.
         let extensions = vec![
             (DOMAIN.into(), serde_json::json!({ "garbage": true })),
             (

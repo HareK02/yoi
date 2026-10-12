@@ -1,3 +1,15 @@
+//! Scope brokers and write leases that attenuate parent session authority.
+//!
+//! Checks provider capabilities, attachment ceilings, parent scopes, and delegated scopes per operation.
+//! Child write leases protect their ranges from conflicting parent/sibling writes; commands require
+//! explicit grants and writable scope. Cwd sets coordinate transformations, not wider authority.
+//! Rejects operations when the provider cannot compare scopes.
+//!
+//! Close revokes new operations before awaiting command cleanup; write leases remain held while
+//! cleanup is uncertain. Checkout search composes rule layers and output roots, checking visibility
+//! provider-side before name enumeration, descent, or content reads. Returned coordinates are not
+//! prefixed with cwd again.
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -64,6 +76,11 @@ pub struct WorkdirToolScope {
     pub command: bool,
 }
 
+/// Broker mediating operations within parent provider and attachment ceilings.
+///
+/// Delegation only attenuates scope; cwd and command grants do not expand file authority.
+/// Child write leases suppress conflicting writes and remain held if command cleanup on close
+/// is uncertain.
 #[derive(Clone)]
 pub struct WorkdirToolBroker {
     authority: Arc<ScopedWorkdirSession>,

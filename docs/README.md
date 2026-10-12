@@ -1,66 +1,25 @@
-# Yoi documentation
+# 文書の維持管理
 
-This directory contains maintained developer documentation for Yoi. Its job is to preserve design intent that is hard to recover from code alone.
+文書には、コードから読み取れない設計理由と、開発を継続するための規則を残す。利用ガイド、設定説明、実装一覧は維持しない。同じ説明を複数の場所に置かず、変更の責任を持つコードの近くで管理する。
 
-It is not a dumping ground for external research, old plans, API inventories, or ticket history. Those belong in local notes, work item artifacts, code, or git history.
+## 保管場所と責務
 
-## Reading order
+- `principle/`：複数の実装に共通する設計原則。判断が競合したときの基準と、その理由を書く。個別の処理手順やデータ構造は置かない。
+- `development/`：テスト設計、検証、レビューなど、開発を続けるための規則。製品の操作手順や環境設定の説明は置かない。
+- `report/`：問題発生時の報告。試みた操作、観測した事実、影響、原因の確度、未解決事項を記録する。過去の報告は現行仕様の根拠にせず、当時の記録として蓄積できる。
+- Rustのcrate README：責務と非責務を短く示し、主要moduleへの参照を置く。各crateの`lib.rs`は`#![doc = include_str!("../README.md")]`でREADMEをcrateドキュメントとして使う。
+- Rustのmodule・itemドキュメント：所有境界、状態遷移、失敗時の保証と限界、非自明な判断理由を書く。API一覧や実装の逐語説明は繰り返さない。
 
-1. [`design/overview.md`](design/overview.md) — the system map.
-2. [`design/durable-operations.md`](design/durable-operations.md) — cross-domain operation identity, checkpoints, retries, child operations, and disposition, including durable Workdir removal.
-3. [`design/context-history.md`](design/context-history.md) — the highest-risk invariant: inputs that affect the model must be committed to history before they enter context.
-4. [`design/worker-session-state.md`](design/worker-session-state.md) — Worker identity, replayable session logs, current metadata, and live process hints.
-5. [`design/session-observation.md`](design/session-observation.md) — common session captures, `SessionEntryRef`, Memory evidence, and host-authorized Worker observation.
-6. [`design/flow-state-graph.md`](design/flow-state-graph.md) — Workspace Flow sources, frozen content-addressed definitions, transition attempts, and bounded internal verification.
-7. [`design/profiles-manifests-prompts.md`](design/profiles-manifests-prompts.md) — reusable Profiles, resolved Manifests, and prompt resources.
-8. [`design/tool-permissions-scope.md`](design/tool-permissions-scope.md) — tool policy and filesystem scope.
-9. [`design/plugin-packages.md`](design/plugin-packages.md) — the retained offline package format and the prohibition on ambient Plugin authority.
-10. [`development/plugin-development.md`](development/plugin-development.md) — explicit-path offline Plugin package authoring and inspection.
-11. [`design/memory-knowledge.md`](design/memory-knowledge.md) — deprecated single-document Workspace Memory authority and its separation from subject-scoped subjektiv Memory.
-12. [`design/workspace-kanban-orchestrator-runtime.md`](design/workspace-kanban-orchestrator-runtime.md) — how Kanban operations become durable orchestration events and backend-internal routing decisions.
-13. [`design/workspace-runtime-docker.md`](design/workspace-runtime-docker.md) — the WebUI / Backend / Runtime split, Docker image layout, worker launch path, and workdir materialization boundary.
-14. [`development/ui-ux/design-language.md`](development/ui-ux/design-language.md) — Workspace Webの視覚・interaction原則、文法、token、汎用component。
-15. [`development/ui-ux/product-ux.md`](development/ui-ux/product-ux.md) — Workspace resource、navigation IA、resource固有pattern。
-16. [`development/ui-ux/application-architecture.md`](development/ui-ux/application-architecture.md) — application shell、Header、Sidebar、nested override architecture。
-17. [`development/ui-ux/visual-review.md`](development/ui-ux/visual-review.md) — Web UI実装者がbefore/afterを目視し、完了前に残すvisual validation evidence。
-18. [`development/server-runtime-auth.md`](development/server-runtime-auth.md) — manual Workspace Server / Runtime public-key exchange and authenticated Runtime startup checks.
-19. [`development/work-items.md`](development/work-items.md) — how project work is recorded and reviewed.
-20. [`development/rust-testing-strategy.md`](development/rust-testing-strategy.md) — what Yoi Rust tests should prove, where they belong, and how to name them.
-21. [`development/validation.md`](development/validation.md) — how to check changes.
-22. [`development/workspace-schema-migrations.md`](development/workspace-schema-migrations.md) — how to preflight, apply, verify, and roll back control-plane SQLite schema changes.
-23. [`design/standalone-agent-host.md`](design/standalone-agent-host.md) — in-process standalone Worker host の依存方向、authority、lifecycle、非目標。
-24. [`design/server-feature-storage.md`](design/server-feature-storage.md) — Server管理のWorkspace/Feature専用SQLite、migration、transaction、backup/restore、削除・shutdown境界。
-25. [`design/subjektiv-store.md`](design/subjektiv-store.md) — subject-scoped Memoryのownership、authorization、Session attribution、変更履歴、candidate consolidation境界。
-26. [`design/subjektiv-surface.md`](design/subjektiv-surface.md) — confirmed Memoryから生成するresident surface、availability、append-only restore injection。
-27. [`development/subjektiv-product-cutover.md`](development/subjektiv-product-cutover.md) — legacy Workspace Memoryからsubjektivへのoperator cutover、explicit reset、backup／rollback runbook。
-28. [`design/worker-wip-mode.md`](design/worker-wip-mode.md) — explicit-opt-in Worker WIP mode, Worldspace projection, authority, cache, and retry contracts.
-29. [`design/objective-wip-projection.md`](design/objective-wip-projection.md) — Host-assigned Objective collection/item routes, operation mapping, Backend authority, bounds, and compatibility suppression.
-30. [`design/ticket-wip-projection.md`](design/ticket-wip-projection.md) — Host-assigned Ticket collection/item routes, role-specific operations, route identity, and typed Backend preservation.
-31. [`design/merge-request-wip-projection.md`](design/merge-request-wip-projection.md) — Host-assigned Merge Request routes and preserved review/integration authority gates.
-32. [`design/feature-chat-invocations.md`](design/feature-chat-invocations.md) — declarative `/` invocation identity, grammar, completion, typed draft, attachment staging, execution, and authority boundaries.
-33. [`design/workspace-config-wip-projection.md`](design/workspace-config-wip-projection.md) — Backend-authored configuration as a logical WIP attachment, explicit grants, shared UI conflict domain, and activation boundaries.
+WebなどRust以外の実装に固有の理由は、そのソースのmodule・型・処理に付くコメントで管理する。無関係なRust crateへ移さず、実装説明の別冊も増やさない。複数の画面・部品の設計判断に使うDesign LanguageやUX規則は文書として維持し、個別実装の説明と区別する。
 
-## What belongs here
+`docs/`直下のファイルはこのREADMEだけとする。このファイルは文書の管理規則であり、全ファイルの索引にはしない。
 
-Keep documentation when it records a stable design boundary, a non-obvious rationale, or a workflow that future changes must respect.
+## 追加・変更・削除の判断
 
-Examples that belong:
+文書を追加する前に、残す必要のある判断が既存の原則、moduleドキュメント、テストのどこにも説明されていないことを確認する。コマンド出力、設定項目、型やフィールド、モデル名、schema番号、テスト件数など、実装から得られる可変情報は転記しない。APIの契約を説明する最小の例や、開発規則を実行する検証コマンドは、その目的に必要な範囲で残せる。
 
-- Why Worker metadata is not the session log.
-- Why `Profile` and resolved `Manifest` are different layers.
-- Why context-only event injection is forbidden.
-- Why child Worker notifications are hints rather than completion proof.
+設計変更と同じ差分で、その理由を所有するドキュメントを更新する。設計がなくなった場合は説明も削除する。移動・削除時にはリンク、`include_str!`、テスト、生成処理からの参照を確認し、古い場所に案内だけの文書を残さない。`report/`の過去のパスや引用は、当時の証拠として扱う。
 
-## What does not belong here
+`crates/`以下のREADME・rustdoc・説明コメントは英語で統一し、それ以外の文書は日本語で書く。実行時の文言、テストデータ、引用は言語統一のために変更しない。コード識別子、API名、パスは原綴りを保つ。段落の最初に主張を置き、対象・条件・根拠を明記する。未確認の主張を断定せず、同じ内容の予告・言い換え・総括を重ねない。
 
-Do not keep material only because it once helped a ticket.
-
-Examples that should be removed or moved to `docs/.local/` / work item artifacts:
-
-- External project comparisons.
-- Provider API snapshots, prices, or model tables.
-- Old implementation plans that are no longer the design authority.
-- Public type or method inventories that drift with code.
-- Debug notes that are useful only for one investigation.
-
-`docs/.local/` is intentionally outside the maintained documentation surface.
+作業計画と進捗はTicket・Objective・セッションの記録へ置く。秘密情報、認証情報、非公開プロンプト、生ログは文書へ転載しない。無視対象のローカル調査資料は、製品が参照する正本や維持対象の文書にしない。

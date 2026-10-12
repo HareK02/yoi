@@ -1,4 +1,6 @@
 <script lang="ts">
+  // workflow stateのlaneを横方向に比較するboard。狭い画面でもlaneを縦に分断せず、
+  // tickets.cssの局所横scrollを使う。key、title、blocker／attentionを判断の入口にする。
   import { goto } from "$app/navigation";
   import { untrack } from "svelte";
   import type { ApiResult } from "#lib/workspace/api/http.ts";

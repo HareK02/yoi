@@ -1,4 +1,6 @@
 <script lang="ts">
+    // transcriptの表示対象と操作対象を分離する。direct SubWorkerを閲覧しても、
+    // Composerとrun controlはrouteの親Workerへ送る。表示切替で操作権限を変えない。
     import { invalidateAll } from "$app/navigation";
     import { tick, untrack, type SvelteComponent } from "svelte";
     import { prefersReducedMotion } from "svelte/motion";

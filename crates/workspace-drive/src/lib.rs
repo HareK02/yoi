@@ -1,6 +1,5 @@
-//! Workspace-owned latest-version storage. Call these blocking operations on a
-//! blocking thread, never on an async executor. SQL IMMEDIATE transactions are
-//! the cross-process authority for uploads, tree changes, reads, and collection.
+#![doc = include_str!("../README.md")]
+
 mod blob;
 mod migrations;
 use migrations::MIGRATIONS;
@@ -83,13 +82,16 @@ pub enum Kind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Public projection of a node with a stable Workspace-local ID.
+/// IDs are never reused after deletion and use decimal strings in JSON to preserve JavaScript precision.
+/// Blob keys and physical paths are excluded from the public projection.
 pub struct Node {
     pub id: NodeId,
     pub workspace_id: String,
     pub parent_id: Option<NodeId>,
     pub name: String,
     pub kind: Kind,
-    /// Request ID of the last committed mutation; empty only for the immutable root.
+    /// Request ID of the last committed mutation. Only the immutable root has an empty value.
     pub last_mutation_id: String,
     pub size: u64,
     pub content_type: Option<String>,
@@ -99,6 +101,9 @@ pub struct Node {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+/// Document mutations based on an observed commit request ID.
+/// Update/Relocate/Delete compare the expected mutation ID with the current value in the same transaction.
+/// Conflicts use neither counters nor timestamps; only one concurrent mutation based on the same observation commits.
 pub enum Mutation {
     CreateFolder {
         parent: NodeId,
@@ -137,8 +142,8 @@ pub struct MutationResult {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RequestStatus {
-    /// No committed result in this authority snapshot. A concurrently running
-    /// request may still commit; retry with the SAME identity and fingerprint.
+    /// No committed receipt exists at this observation point.
+    /// Does not prove an in-flight concurrent request will not commit; retry with the same identity and payload.
     Uncommitted,
     Committed {
         result: MutationResult,
@@ -180,6 +185,14 @@ pub struct CollectionPage {
 
 type Authorizer = dyn Fn(&Connection, bool) -> Result<()> + Send + Sync;
 
+/// Workspace-scoped storage of the latest document tree.
+/// SQLite is authoritative for the tree and latest blob references; names/parents never determine blob paths.
+/// The root is immutable, names undergo no normalization or case folding, and ordinary folder deletion requires an empty folder.
+///
+/// Uploads, tree mutations, reads, and GC serialize through the same IMMEDIATE transaction.
+/// Processes must share the same metadata DB and blob root; distributed writes through independent DBs are unsupported.
+/// Operations are synchronous, so async Hosts use blocking threads.
+/// No mechanism snapshots DB and blobs together; metadata backup alone cannot restore content.
 #[derive(Clone)]
 pub struct Drive {
     authorizer: Option<Arc<Authorizer>>,
@@ -217,10 +230,11 @@ impl Drive {
             _storage: storage.clone(),
         })
     }
-    /// Trusted Server attachment: SQLite IMMEDIATE also locks this authority,
-    /// so a cached Drive handle cannot race deletion reservation in server.db.
-    /// This is Host configuration, never a model-selected database path. The
-    /// attached authority is read-only by convention; Drive never writes it.
+    /// Attaches a trusted Host's Workspace authority DB to the connection.
+    /// IMMEDIATE transactions lock authority too, rejecting mutations through cached handles after deletion is reserved.
+    /// Drive does not modify attached authority or guarantee atomic writes across DBs.
+    /// Blob I/O also serializes with Host DB writes, so long operations delay other Host writes.
+    /// The DB path is Host construction input, never model input.
     pub fn open_with_workspace_authority(
         storage: &ScopedFeatureStorage,
         registration: &RegisteredFeature,
@@ -257,10 +271,9 @@ impl Drive {
         })?;
         Ok(drive)
     }
-    /// Bind immutable caller authority to this handle and its clones. The callback
-    /// runs within every client operation's IMMEDIATE transaction, never at bind
-    /// time; attached authority stays locked through blob I/O and publication.
-    /// Host maintenance must use an unbound handle.
+    /// Binds the caller's authorization callback to the handle and its clones.
+    /// Runs inside every client operation transaction, not at binding, holding the authority lock through blob I/O and publication.
+    /// Rechecks receipt replay and result queries too. Host maintenance uses unbound handles.
     pub fn with_authorizer<F>(&self, authorizer: F) -> Self
     where
         F: Fn(&Connection, bool) -> Result<()> + Send + Sync + 'static,
@@ -276,8 +289,7 @@ impl Drive {
             None => Ok(()),
         }
     }
-    /// Early admission check, not a lease: every subsequent operation still
-    /// invokes its authorizer in that operation's own transaction.
+    /// Early admission check, not a lease. Subsequent operations recheck authorization in their own transactions.
     pub fn check_authorized(&self, write: bool) -> Result<()> {
         self.database.try_transaction(|tx| {
             self.authorize(tx, write)?;
@@ -302,8 +314,8 @@ impl Drive {
         })
     }
 
-    /// Keyset pages are ordered by stable ID, not name. Concurrent mutations may
-    /// appear/disappear between pages. There is no snapshot promise across calls.
+    /// Keyset page in stable ID order, not name order or a snapshot across calls.
+    /// Concurrent changes between pages may add, delete, or move entries.
     pub fn list(&self, parent: NodeId, after: Option<NodeId>, limit: usize) -> Result<Page> {
         validate_limit(limit, MAX_PAGE)?;
         self.database.try_transaction(|tx| {
@@ -329,9 +341,9 @@ impl Drive {
         })
     }
 
-    /// Recover the committed result by request identity, including pre-cutover
-    /// receipts whose payload cannot be verified for replay. Committed status is
-    /// not proof that a different actor/payload matches that request.
+    /// Reads the original committed result by request identity. Receipts survive later node deletion.
+    /// Results remain readable even if the legacy receipt's payload cannot be proven for replay,
+    /// but their existence never authorizes an operation with a different actor/payload.
     pub fn request_status(&self, request_id: &str) -> Result<RequestStatus> {
         validate_identity(request_id, "request_id", 128)?;
         self.database.try_transaction(|c| {
@@ -352,12 +364,11 @@ impl Drive {
         })
     }
 
-    /// DB commit is publication. The blob and receipt are never independently
-    /// treated as a successful mutation. Successful request IDs are retained for
-    /// the Workspace lifetime; reuse with a different actor/payload is conflict.
-    /// Pre-cutover replay checks the original typed-payload digest using proven
-    /// receipt correspondence. If that evidence is unavailable, returns Conflict
-    /// without executing; recover the committed result through request_status.
+    /// Publishes metadata updates and a receipt in one DB commit after syncing blobs.
+    /// Saving a blob alone is not success. New blobs left by sync/commit failures stay unreferenced and eligible for GC.
+    /// Request IDs persist for the Workspace lifetime; replay with the same actor/payload returns the original result.
+    /// The actor is trusted input from the authentication adapter; reusing an ID with a different actor/payload conflicts.
+    /// Legacy replay uses only the original payload digest and proven correspondence; unknown correspondence conflicts without execution.
     pub fn mutate(
         &self,
         request_id: &str,
@@ -428,9 +439,9 @@ impl Drive {
         })
     }
 
-    /// Each chunk requires the originally observed committed mutation. Old blobs are
-    /// not retained: after update/delete return conflict/not-found, never switch
-    /// silently to the latest blob. GC cannot run while this read holds SQL lock.
+    /// Pins each chunk to the observed commit request, serializing with uploads/GC via SQL locks.
+    /// Old blobs are not retained as history; updates/deletions return conflict/not-found rather than switch to latest content.
+    /// Checks referenced blob existence and total length even for empty files; missing blobs are not normal empty content.
     pub fn read(
         &self,
         id: NodeId,
@@ -475,8 +486,8 @@ impl Drive {
         })
     }
 
-    /// UTF-8 text over byte offsets. Callers must select character-aligned
-    /// ranges; invalid UTF-8 (including a split character) is an explicit error.
+    /// Reads a byte-offset range as UTF-8.
+    /// Ranges splitting character boundaries or invalid UTF-8 return explicit errors, never implicit correction.
     pub fn read_text(
         &self,
         id: NodeId,
@@ -497,9 +508,9 @@ impl Drive {
         })
     }
 
-    /// Search examines at most `budget` nodes after the cursor. Text inspection
-    /// is limited to UTF-8 text/* files <=64KiB, and matches are bounded by budget.
-    /// An empty matching page may still carry a continuation cursor.
+    /// Search with a budget limiting nodes examined after the cursor.
+    /// Text inspection covers only small UTF-8 text/* blobs, never unbounded reads of large blobs.
+    /// The cursor is the last examined ID, so continuation may exist even with no matches.
     pub fn search(
         &self,
         query: &str,
@@ -535,9 +546,10 @@ impl Drive {
         })
     }
 
-    /// Collection shares the exact database lock with uploads/readers. No grace
-    /// period or process-local mutex is used as a safety proof. Repeat full sweeps
-    /// from None, since new random keys can sort before a previous cursor.
+    /// Holds the same IMMEDIATE lock as readers/uploads and collects only unreferenced blobs and interrupted staging files.
+    /// Includes blobs left by rollback after a crash; relies on neither grace periods nor in-process mutexes alone.
+    /// Local listing scans the whole directory, but responses and retained candidates are bounded.
+    /// New UUIDs may sort before the cursor, so future sweeps start at the beginning.
     pub fn collect(&self, after: Option<&str>, limit: usize) -> Result<CollectionPage> {
         validate_limit(limit, MAX_PAGE)?;
         self.database.try_transaction(|tx| {
@@ -564,14 +576,16 @@ impl Drive {
             })
         })
     }
+    /// Commits a persistent tombstone rejecting new operations. Receipt reads/replays never authorize new mutations.
     pub fn fence(&self) -> Result<()> {
         self.database.try_transaction(|tx| {
             tx.execute("UPDATE drive_state SET deleting=1 WHERE singleton=1", [])?;
             Ok(())
         })
     }
-    /// Retryable purge. Fence is committed first. Root and deletion tombstone
-    /// remain until Host FeatureStorage deletes the metadata scope.
+    /// Commits the fence first, then removes this Workspace's blobs, nodes, and receipts in a retryable manner.
+    /// Retains the root and tombstone until the Host deletes the FeatureStorage scope.
+    /// A Host lifecycle operation distinct from ordinary folder deletion; never processes other Workspaces' storage roots.
     pub fn purge(&self) -> Result<()> {
         self.fence()?;
         self.database.try_transaction(|tx| {

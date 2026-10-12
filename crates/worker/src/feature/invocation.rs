@@ -1,3 +1,22 @@
+//! Registration, completion, and validation of Feature-declared structured chat invocations.
+//!
+//! Public names and aliases serve display/selection; source-qualified identities identify execution
+//! targets. Registration must match the declared descriptor and the Feature being installed. Public
+//! name/alias collisions are rejected; failed Feature installs roll back to the same checkpoint as
+//! other contributions. Completion exposes only enabled handler metadata, not code or credentials.
+//!
+//! Worker executes only `Segment::FeatureInvoke`, never extracting syntax from ordinary text,
+//! attachments, or history. Every call checks the installed descriptor, arguments, current
+//! availability, and handler semantic/authority validation. Availability is rechecked after async
+//! work. Completion providers come from registered metadata, not request-specified providers or
+//! authority. Completion is side-effect-free discovery; oversized candidate values are omitted,
+//! not shortened.
+//!
+//! Handlers use the Host-supplied `invocation_id` as a scoped idempotency key at the business boundary
+//! and reauthorize at the commit boundary inside `invoke`. General availability alone cannot prove
+//! argument-specific authority. Oversized results or ambiguous post-execution failures become
+//! `OutcomeUnknown`, not successful dependent model context. Worker owns execution order and durable receipts.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;

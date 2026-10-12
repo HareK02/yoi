@@ -1,5 +1,31 @@
-//! Worker Drive operations use only the injected Workspace API. Observations
-//! below are bounded preconditions, never a hierarchy replica or a grant cache.
+//! Drive operations through the Workspace API and bounded mutation-precondition observations.
+//!
+//! The Backend owns Drive hierarchy, blobs, and grants. Worker neither reads the Server's physical
+//! blob root nor treats Drive as a Workdir or Session attachment store. Entries are identified by
+//! Workspace and canonical decimal-string node ID; large IDs are never converted to JSON numbers.
+//!
+//! # Mutation-precondition observations
+//!
+//! Regular Tool read/metadata keeps a bounded record of entries and their last commit request IDs.
+//! List/search is discovery, not a substitute for mutation-precondition observation. Explicit
+//! observation is required after cache eviction; successful mutations remove old observations.
+//! This is neither an authority cache nor a persistent hierarchy copy. Edit validates the full
+//! preimage and previously observed commit ID, never editing truncated text. String replacement
+//! shares `fs_operation::text` rules; Backend CAS decides the final winner.
+//!
+//! # Workdir sources and images
+//!
+//! Saving from a Workdir reads bytes through the selected alias's scoped session and verifies each
+//! chunk's path, offset, size, and hash plus the overall SHA256. Source reads and Drive destination
+//! writes are independent capabilities; completing blob transfer alone does not prove publication.
+//! Images are assembled from chunks bound to the entry's commit request; bytes from mixed
+//! generations are never attached. Image type is detected from bytes, not URLs or filenames.
+//! `ImageAttachment` returns through existing ToolOutput. Later Drive updates/deletions do not
+//! change observations already recorded in the Session; Engine/Session owns retention, pruning,
+//! and replay.
+//!
+//! [`wip`] owns native publication, [`backend`] request receipt checks, and delegation Drive blocking
+//! for internal children. Shared WIP references, permissions, and unknown outcomes follow [`crate::wip`].
 pub mod backend;
 pub(crate) mod delegation;
 #[cfg(test)]

@@ -1,3 +1,9 @@
+//! Standalone launch validation before side effects.
+//!
+//! Resolves Standalone Profiles from built-in/user registries and canonicalizes cwd.
+//! Repository-local Profiles and path selectors do not authorize launch. Selecting a Subject
+//! requires a compatible body policy, but policy alone never creates or selects a Subject.
+
 use std::path::{Path, PathBuf};
 
 use manifest::{

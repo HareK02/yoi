@@ -1,13 +1,12 @@
-//! extract sub-Engine への入力テキスト組み立て。
+//! Builds input text for the extract sub-Engine.
 //!
-//! `crates/worker/src/worker.rs::build_summary_prompt` と同じ方針で
-//! Item 列を flat な行に落とす（reasoning は省く、tool call は名前のみ、
-//! tool result は summary のみ）。conversation 全体を Markdown の単一
-//! セクションとして渡し、抽出指示は system prompt 側に寄せる。
+//! Flattens the supplied Items into lines (omitting reasoning, keeping only tool-call names
+//! and tool-result summaries). Passes the conversation slice as a single Markdown
+//! section, leaving extraction instructions to the system prompt.
 
 use agen::Item;
 
-/// 与えられた `items` を extract sub-Engine の最初の user 入力に整形する。
+/// Formats `items` as the extract sub-Engine's initial user input.
 pub fn build_extract_input(items: &[Item]) -> String {
     let mut out = String::new();
     out.push_str(

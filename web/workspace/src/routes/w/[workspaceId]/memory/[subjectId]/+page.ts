@@ -1,3 +1,7 @@
+/** Subject、resident surface、Committed Memoryの一ページを独立した結果として読む。
+ * surface未生成や候補の存在からCommitted Memory件数を推測せず、全件走査もしない。
+ * 一つの読み込み失敗を他のresourceの空状態へ置き換えない。
+ */
 import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 import {
   MEMORY_API_LOAD_POLICY,

@@ -1,6 +1,11 @@
-//! Subject-scoped observation of standalone Sessions. This module owns no
-//! Session body or projection: it uses the shared strict committed public index
-//! reader for the FsStore layout, never a raw snapshot projector.
+//! Read adapter for standalone Sessions attributed to a Subject.
+//!
+//! Checks saved storage-scope/Subject/Worker bindings and attribution, reading only the shared
+//! strict committed public index. Does not copy Session content into the Memory DB or expose
+//! system prompts, reasoning, uncommitted Runs, or partial JSONL tails. The Host establishes
+//! attribution even for Sessions without candidates. Cursor continuation revalidates filters,
+//! bindings, and committed generations. Local storage namespaces are not execution Runtime
+//! identities; public evidence does not fabricate Workspace/Account/Runtime identity.
 
 use std::path::{Path, PathBuf};
 

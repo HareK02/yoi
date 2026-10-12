@@ -1,5 +1,9 @@
-//! Drive authority is rechecked inside the metadata transaction against the
-//! attached Server DB. A bound handle is not an authorization cache or lease.
+//! Authorizes Drive operations against current grants in the connected Server DB.
+//!
+//! Checks before upload body reception only admit the request; handles retain no authority.
+//! Each operation's metadata transaction rechecks Worker liveness, unrevoked grants, and write
+//! permission. Human requests also check current User/Account and active Workspace. Incomplete
+//! or contradictory Worker/Runtime sources do not fall back to Account authority.
 use super::*;
 use rusqlite::params;
 use server_api::{

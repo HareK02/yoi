@@ -1,8 +1,4 @@
-//! Shared Memory domain and Workspace API transport types.
-//!
-//! Normal Memory persistence is owned by the Workspace control plane. This crate
-//! intentionally contains no repository-local `.yoi` layout, discovery, reader,
-//! writer, or fallback implementation.
+#![doc = include_str!("../README.md")]
 
 pub mod audit;
 pub mod backend;

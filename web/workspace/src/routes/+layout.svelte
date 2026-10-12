@@ -1,4 +1,9 @@
 <script lang="ts">
+  // application shell、Header、Sidebar外枠はrootだけが描画する。
+  // scope layoutは内容をoverrideへ登録し、pageはmainの内容だけを所有する。
+  // navigationの構成はWorkspace identityやpermissionの根拠にはしない。
+  // Header下辺とSidebar右辺だけで領域境界を示し、viewport外周に線を重ねない。
+  // MobileはSidebarがHeader下を占有する間mainをinertにし、隠れた内容へfocusを入れない。
   import { page } from '$app/state';
   import { setContext } from 'svelte';
   import { MediaQuery } from 'svelte/reactivity';

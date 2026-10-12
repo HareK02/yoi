@@ -1,3 +1,31 @@
+//! SQLite persistence and schema consistency for Workspace resources.
+//!
+//! # Startup and migrations
+//!
+//! Normal open, migration preflight, and explicit application share connection preparation.
+//! Preflight copies a read-only source into memory and exercises the full migration without
+//! changing the source DB. Existing DBs apply retained migrations in order; new DBs use the
+//! latest canonical schema. A partially committed migration sequence is a valid history prefix
+//! from which the next attempt resumes.
+//!
+//! Schema history must match the retained baseline's version/name sequence. Unknown, modified,
+//! misordered, or unsupported histories are rejected. Workspace table rebuilds across domains
+//! align with Ticket/Merge Request validation and ordering, then validate resource references
+//! and foreign keys. Recovery requirements, such as unresolved legacy deletion receipts, block
+//! migration before it starts. Updating only the new schema would diverge from existing DBs;
+//! both creation paths must maintain the same contract.
+//!
+//! # Resource state and operation records
+//!
+//! Workspace bootstrap commits resources and creation receipts in one transaction. Jobs and
+//! Workdir deletion span Runtime/providers, so immutable intent and evidence of external results
+//! are stored separately. The Worker registry retains persistent identity, assignment, retention,
+//! and observation projections; it does not replace controller input admission or Runtime lifecycle.
+//!
+//! The internal Restore journal records client intent with a request ID and observation token
+//! fixed before sending. Unknown outcomes and restarts reuse that pair, settling on a confirmed
+//! result. This is not a second lifecycle state machine duplicating Runtime operations or receipts.
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};

@@ -1,7 +1,6 @@
-//! ToolCallCollector - ツール呼び出し収集用ハンドラ
+//! ToolCallCollector - a handler for collecting tool calls.
 //!
-//! TimelineのToolUseBlockHandler として登録され、
-//! ストリーム中のToolUseブロックを収集する。
+//! Registered as a ToolUseBlockHandler on Timeline to collect streaming ToolUse blocks.
 
 use crate::{
     handler::{Handler, ToolUseBlockEvent, ToolUseBlockKind},
@@ -9,17 +8,17 @@ use crate::{
 };
 use std::sync::{Arc, Mutex};
 
-/// ToolUseブロックから収集したツール呼び出し情報を保持
+/// Holds tool call information collected from ToolUse blocks.
 ///
-/// ToolCallCollectorのHandler実装で使用するスコープ型
+/// Scope type for ToolCallCollector's Handler implementation.
 #[derive(Debug, Default)]
 pub struct CollectorState {
-    /// 現在のツール呼び出し情報 (ブロック進行中)
+    /// Current tool call information (while the block is in progress).
     current_id: Option<String>,
     current_name: Option<String>,
     /// Zero-based order among tool calls in this assistant response.
     call_index: Option<usize>,
-    /// 蓄積中のJSON入力
+    /// JSON input being accumulated.
     input_json_buffer: String,
 }
 
@@ -30,19 +29,18 @@ pub(crate) struct CollectedToolCall {
     pub call: ToolCall,
 }
 
-/// ToolCallCollector - ToolUseブロックハンドラ
+/// ToolCallCollector - a ToolUse block handler.
 ///
-/// Timelineに登録してToolUseブロックイベントを受信し、
-/// 完了したToolCallを収集する。
+/// Register with Timeline to receive ToolUse block events and collect completed ToolCalls.
 #[derive(Clone)]
 pub struct ToolCallCollector {
-    /// 収集されたToolCall
+    /// Collected ToolCalls.
     collected: Arc<Mutex<Vec<CollectedToolCall>>>,
     next_call_index: Arc<Mutex<usize>>,
 }
 
 impl ToolCallCollector {
-    /// 新しいToolCallCollectorを作成
+    /// Create a new ToolCallCollector.
     pub fn new() -> Self {
         Self {
             collected: Arc::new(Mutex::new(Vec::new())),
@@ -50,7 +48,7 @@ impl ToolCallCollector {
         }
     }
 
-    /// 収集されたToolCallを取得してクリア
+    /// Take the collected ToolCalls and clear the collection.
     pub fn take_collected(&self) -> Vec<ToolCall> {
         self.take_collected_with_index()
             .into_iter()
@@ -64,7 +62,7 @@ impl ToolCallCollector {
         std::mem::take(&mut *guard)
     }
 
-    /// 収集されたToolCallの参照を取得
+    /// Access the collected ToolCalls.
     pub fn collected(&self) -> Vec<ToolCall> {
         self.collected
             .lock()
@@ -80,12 +78,12 @@ impl ToolCallCollector {
         *self.next_call_index.lock().unwrap() = 0;
     }
 
-    /// 収集されたToolCallがあるかどうか
+    /// Whether any ToolCalls have been collected.
     pub fn has_pending_calls(&self) -> bool {
         !self.collected.lock().unwrap().is_empty()
     }
 
-    /// 収集をクリア
+    /// Clear the collection.
     pub fn clear(&self) {
         self.collected.lock().unwrap().clear();
     }
@@ -116,7 +114,7 @@ impl Handler<ToolUseBlockKind> for ToolCallCollector {
                 scope.input_json_buffer.push_str(delta);
             }
             ToolUseBlockEvent::Stop(_stop) => {
-                // ブロック完了時にToolCallを確定
+                // Finalize the ToolCall when the block completes.
                 if let (Some(id), Some(name)) = (scope.current_id.take(), scope.current_name.take())
                 {
                     // A Stop event proves the provider finished the block, but
@@ -161,13 +159,13 @@ mod tests {
         let mut timeline = Timeline::new();
         timeline.on_tool_use_block(collector.clone());
 
-        // ToolUseブロックのイベントシーケンスをディスパッチ
+        // Dispatch a sequence of ToolUse block events.
         timeline.dispatch(&Event::tool_use_start(0, "tool_123", "get_weather"));
         timeline.dispatch(&Event::tool_input_delta(0, r#"{"city":"#));
         timeline.dispatch(&Event::tool_input_delta(0, r#""Tokyo"}"#));
         timeline.dispatch(&Event::tool_use_stop(0));
 
-        // 収集されたToolCallを確認
+        // Check the collected ToolCalls.
         let calls = collector.take_collected();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "tool_123");
@@ -177,7 +175,7 @@ mod tests {
 
     #[test]
     fn test_collect_empty_buffer_returns_object() {
-        // 引数なしツール呼び出し: input_json_delta が一度も来ないケース
+        // A tool call without arguments: no input_json_delta arrives.
         let collector = ToolCallCollector::new();
         let mut timeline = Timeline::new();
         timeline.on_tool_use_block(collector.clone());
@@ -239,12 +237,12 @@ mod tests {
         let mut timeline = Timeline::new();
         timeline.on_tool_use_block(collector.clone());
 
-        // 1つ目のToolCall
+        // First ToolCall
         timeline.dispatch(&Event::tool_use_start(0, "call_1", "tool_a"));
         timeline.dispatch(&Event::tool_input_delta(0, r#"{"a":1}"#));
         timeline.dispatch(&Event::tool_use_stop(0));
 
-        // 2つ目のToolCall
+        // Second ToolCall
         timeline.dispatch(&Event::tool_use_start(1, "call_2", "tool_b"));
         timeline.dispatch(&Event::tool_input_delta(1, r#"{"b":2}"#));
         timeline.dispatch(&Event::tool_use_stop(1));

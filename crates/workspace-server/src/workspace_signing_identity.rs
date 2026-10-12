@@ -1,3 +1,14 @@
+//! Consistency of per-Workspace signing identities and private material.
+//!
+//! The store retains public identities and material references; a separate store manages private
+//! material. Workspace creation first reserves immutable Workspace/key/material references and
+//! prepares the same material on replay. Bootstrap activates it after checking public key/material
+//! agreement. Successful material preparation alone does not commit Workspace creation.
+//!
+//! Capability issuance selects the current active identity, checks the claims' Workspace, key ID,
+//! and fingerprint against it, then signs. Missing/corrupt material does not fall back to a shared
+//! Server key. Debug redacts private material; Drop zeroizes private key strings.
+
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;

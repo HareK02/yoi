@@ -1,7 +1,7 @@
-//! Timeline層
+//! Timeline layer.
 //!
-//! LLMからのイベントストリームを受信し、登録されたHandlerにディスパッチします。
-//! 通常はEngine経由で使用しますが、直接使用することも可能です。
+//! Receives an LLM event stream and dispatches it to registered handlers.
+//! Usually used through the Engine, but can also be used directly.
 
 use std::{collections::HashMap, marker::PhantomData};
 
@@ -12,11 +12,11 @@ use crate::handler::*;
 // Helpers
 // =============================================================================
 
-/// 1リクエスト内で受信した複数 UsageEvent をマージする。
-/// 各フィールドについて新しい値が `Some` ならそれで上書き。
-/// プロバイダによっては input/cache 系を最初の event だけに載せ、
-/// output_tokens を後続 event で更新するため、最後の値だけを取るのではなく
-/// フィールド単位で latest-non-None を取る。
+/// Merge multiple UsageEvents received within one request.
+/// Overwrite each field when the new value is `Some`.
+/// Some providers send input/cache fields only in the first event and update
+/// output_tokens in later events, so use the latest non-None value per field
+/// rather than taking only the last event.
 fn merge_usage(acc: &mut UsageEvent, new: &UsageEvent) {
     if new.input_tokens.is_some() {
         acc.input_tokens = new.input_tokens;
@@ -39,19 +39,19 @@ fn merge_usage(acc: &mut UsageEvent, new: &UsageEvent) {
 // Type-erased Handler
 // =============================================================================
 
-/// 型消去された`Handler` trait
+/// Type-erased `Handler` trait.
 ///
-/// 各Handlerは独自のScope型を持つため、Timelineで保持するには型消去が必要です。
-/// 通常は直接使用せず、`Timeline::on_text_block()`などのメソッド経由で
-/// 自動的にラップされます。
+/// Each handler has its own Scope type, so Timeline needs type erasure to store them.
+/// Usually wrapped automatically by methods such as `Timeline::on_text_block()`
+/// rather than used directly.
 pub trait ErasedHandler<K: Kind>: Send + Sync {
-    /// イベントをディスパッチ
+    /// Dispatch an event.
     fn dispatch(&mut self, event: &K::Event);
-    /// スコープを開始
+    /// Start a scope.
     fn start_scope(&mut self);
 }
 
-/// `Handler<K>`を`ErasedHandler<K>`として扱うためのラッパー
+/// Wrapper that exposes `Handler<K>` as `ErasedHandler<K>`.
 pub struct HandlerWrapper<H, K>
 where
     H: Handler<K>,
@@ -59,7 +59,7 @@ where
 {
     handler: H,
     scope: Option<H::Scope>,
-    // fn() -> K は常にSend+Syncなので、Kの制約に関係なくSendを満たせる
+    // fn() -> K is always Send+Sync, so Send does not depend on K's bounds.
     _kind: PhantomData<fn() -> K>,
 }
 
@@ -98,7 +98,7 @@ where
 // Block Handler Registry
 // =============================================================================
 
-/// ブロックハンドラーの型消去trait
+/// Type-erased trait for block handlers.
 trait ErasedBlockHandler: Send + Sync {
     fn dispatch_start(&mut self, start: &BlockStart);
     fn dispatch_delta(&mut self, delta: &BlockDelta);
@@ -106,11 +106,11 @@ trait ErasedBlockHandler: Send + Sync {
     fn dispatch_abort(&mut self, abort: &BlockAbort);
     fn start_scope(&mut self);
     fn end_scope(&mut self);
-    /// スコープがアクティブかどうか
+    /// Whether a scope is active.
     fn has_scope(&self) -> bool;
 }
 
-/// TextBlockKind用のラッパー
+/// Wrapper for TextBlockKind.
 struct TextBlockHandlerWrapper<H>
 where
     H: Handler<TextBlockKind>,
@@ -167,7 +167,7 @@ where
     }
 
     fn dispatch_abort(&mut self, _abort: &BlockAbort) {
-        // TextBlockはabortを特別扱いしない（スコープ終了のみ）
+        // TextBlock needs no special abort handling (only scope cleanup).
     }
 
     fn start_scope(&mut self) {
@@ -183,7 +183,7 @@ where
     }
 }
 
-/// ThinkingBlockKind用のラッパー
+/// Wrapper for ThinkingBlockKind.
 struct ThinkingBlockHandlerWrapper<H>
 where
     H: Handler<ThinkingBlockKind>,
@@ -250,7 +250,7 @@ where
     }
 }
 
-/// ToolUseBlockKind用のラッパー
+/// Wrapper for ToolUseBlockKind.
 struct ToolUseBlockHandlerWrapper<H>
 where
     H: Handler<ToolUseBlockKind>,
@@ -335,10 +335,10 @@ where
 // Timeline
 // =============================================================================
 
-/// イベントストリームの管理とハンドラへのディスパッチ
+/// Manages an event stream and dispatches events to handlers.
 ///
-/// LLMからのイベントを受信し、登録されたハンドラに振り分けます。
-/// ブロック系イベントはスコープ管理付きで処理されます。
+/// Receives events from the LLM and routes them to registered handlers.
+/// Block events are handled with scope management.
 ///
 /// # Examples
 ///
@@ -359,30 +359,30 @@ where
 /// timeline.on_text_block(MyHandler);
 /// ```
 ///
-/// # サポートするイベント種別
+/// # Supported event kinds
 ///
-/// - **メタ系**: Usage, Ping, Status, Error
-/// - **ブロック系**: TextBlock, ThinkingBlock, ToolUseBlock
+/// - **Meta**: Usage, Ping, Status, Error
+/// - **Block**: TextBlock, ThinkingBlock, ToolUseBlock
 pub struct Timeline {
-    // Meta系ハンドラー
+    // Meta handlers
     usage_handlers: Vec<Box<dyn ErasedHandler<UsageKind>>>,
     ping_handlers: Vec<Box<dyn ErasedHandler<PingKind>>>,
     status_handlers: Vec<Box<dyn ErasedHandler<StatusKind>>>,
     error_handlers: Vec<Box<dyn ErasedHandler<ErrorKind>>>,
-    // Block系ハンドラー（BlockTypeごとにグループ化）
+    // Block handlers (grouped by BlockType)
     text_block_handlers: Vec<Box<dyn ErasedBlockHandler>>,
     thinking_block_handlers: Vec<Box<dyn ErasedBlockHandler>>,
     tool_use_block_handlers: Vec<Box<dyn ErasedBlockHandler>>,
 
-    // 現在アクティブなブロック。provider は index ごとに複数 scope を
-    // interleave できるため、単一の current block ではなく全 scope を追跡する。
+    // Currently active blocks. Providers can interleave multiple scopes by index,
+    // so track all scopes rather than a single current block.
     active_blocks: HashMap<(BlockType, usize), ()>,
     current_block: Option<BlockType>,
 
-    // 1リクエスト内で受信した Usage event の集約バッファ。
-    // Anthropic は message_start と message_delta、Gemini は各チャンクと、
-    // 多くのプロバイダが複数 Usage を発行するため、リクエスト境界で
-    // 1度だけ発火するためにここでマージする。flush_usage() で発火する。
+    // Aggregation buffer for Usage events received within one request.
+    // Many providers emit multiple Usage events: Anthropic in message_start and
+    // message_delta, Gemini in each chunk. Merge them here to dispatch only once
+    // at the request boundary via flush_usage().
     pending_usage: Option<UsageEvent>,
 }
 
@@ -412,20 +412,20 @@ impl Timeline {
     // Handler Registration
     // =========================================================================
 
-    /// UsageKind用のHandlerを登録
+    /// Register a Handler for UsageKind.
     pub fn on_usage<H>(&mut self, handler: H) -> &mut Self
     where
         H: Handler<UsageKind> + Send + Sync + 'static,
         H::Scope: Send + Sync,
     {
-        // Meta系はデフォルトでスコープを開始しておく
+        // Meta handlers start with a scope by default.
         let mut wrapper = HandlerWrapper::new(handler);
         wrapper.start_scope();
         self.usage_handlers.push(Box::new(wrapper));
         self
     }
 
-    /// PingKind用のHandlerを登録
+    /// Register a Handler for PingKind.
     pub fn on_ping<H>(&mut self, handler: H) -> &mut Self
     where
         H: Handler<PingKind> + Send + Sync + 'static,
@@ -437,7 +437,7 @@ impl Timeline {
         self
     }
 
-    /// StatusKind用のHandlerを登録
+    /// Register a Handler for StatusKind.
     pub fn on_status<H>(&mut self, handler: H) -> &mut Self
     where
         H: Handler<StatusKind> + Send + Sync + 'static,
@@ -449,7 +449,7 @@ impl Timeline {
         self
     }
 
-    /// ErrorKind用のHandlerを登録
+    /// Register a Handler for ErrorKind.
     pub fn on_error<H>(&mut self, handler: H) -> &mut Self
     where
         H: Handler<ErrorKind> + Send + Sync + 'static,
@@ -461,7 +461,7 @@ impl Timeline {
         self
     }
 
-    /// TextBlockKind用のHandlerを登録
+    /// Register a Handler for TextBlockKind.
     pub fn on_text_block<H>(&mut self, handler: H) -> &mut Self
     where
         H: Handler<TextBlockKind> + Send + Sync + 'static,
@@ -472,7 +472,7 @@ impl Timeline {
         self
     }
 
-    /// ThinkingBlockKind用のHandlerを登録
+    /// Register a Handler for ThinkingBlockKind.
     pub fn on_thinking_block<H>(&mut self, handler: H) -> &mut Self
     where
         H: Handler<ThinkingBlockKind> + Send + Sync + 'static,
@@ -483,7 +483,7 @@ impl Timeline {
         self
     }
 
-    /// ToolUseBlockKind用のHandlerを登録
+    /// Register a Handler for ToolUseBlockKind.
     pub fn on_tool_use_block<H>(&mut self, handler: H) -> &mut Self
     where
         H: Handler<ToolUseBlockKind> + Send + Sync + 'static,
@@ -498,10 +498,10 @@ impl Timeline {
     // Event Dispatch
     // =========================================================================
 
-    /// メインのディスパッチエントリポイント
+    /// Main dispatch entry point.
     pub fn dispatch(&mut self, event: &Event) {
         match event {
-            // Meta系: 即時ディスパッチ（登録順）
+            // Buffer usage until flush; dispatch other handled meta events immediately.
             Event::Usage(u) => self.dispatch_usage(u),
             Event::Ping(p) => self.dispatch_ping(p),
             Event::Status(s) => self.dispatch_status(s),
@@ -509,7 +509,7 @@ impl Timeline {
             // Observability-only event: stream trace records it before timeline dispatch.
             Event::UnhandledSse(_) => {}
 
-            // Block系: スコープ管理しながらディスパッチ
+            // Block events: dispatch with scope management.
             Event::BlockStart(s) => self.handle_block_start(s),
             Event::BlockDelta(d) => self.handle_block_delta(d),
             Event::BlockStop(s) => self.handle_block_stop(s),
@@ -517,9 +517,9 @@ impl Timeline {
         }
     }
 
-    /// Usage event を即時には dispatch せず、pending_usage にマージする。
-    /// 1リクエスト内で複数の Usage event が来ても、ハンドラには 1 度だけ
-    /// 最終値を渡したいため。flush_usage() で発火する。
+    /// Merge Usage events into pending_usage instead of dispatching immediately.
+    /// Even if a request emits multiple Usage events, handlers receive the final
+    /// values only once, when flush_usage() dispatches them.
     fn dispatch_usage(&mut self, event: &UsageEvent) {
         match &mut self.pending_usage {
             Some(acc) => merge_usage(acc, event),
@@ -527,9 +527,9 @@ impl Timeline {
         }
     }
 
-    /// pending_usage を usage_handlers に発火し、バッファをクリアする。
-    /// 1リクエスト分のストリーム終了時に1回だけ呼ぶ想定。
-    /// pending_usage が空ならば何もしない。
+    /// Dispatch pending_usage to usage_handlers and clear the buffer.
+    /// Intended to be called once at the end of a request's stream.
+    /// Does nothing if pending_usage is empty.
     pub fn flush_usage(&mut self) {
         if let Some(event) = self.pending_usage.take() {
             for handler in &mut self.usage_handlers {
@@ -571,8 +571,8 @@ impl Timeline {
     fn handle_block_delta(&mut self, delta: &BlockDelta) {
         let block_type = delta.delta.block_type();
 
-        // OpenAIなどのプロバイダはBlockStartを送らない場合があるため、
-        // Deltaが来たときにその index のスコープがなければ暗黙的に開始する
+        // Providers such as OpenAI may omit BlockStart, so implicitly start a scope
+        // for this index when a Delta arrives without one.
         self.active_blocks
             .entry((block_type, delta.index))
             .or_insert(());
@@ -580,7 +580,7 @@ impl Timeline {
 
         let handlers = self.get_block_handlers_mut(block_type);
         for handler in handlers {
-            // スコープがなければ暗黙的に開始
+            // Implicitly start a scope if none exists.
             if !handler.has_scope() {
                 handler.start_scope();
             }
@@ -624,19 +624,19 @@ impl Timeline {
             BlockType::Text => &mut self.text_block_handlers,
             BlockType::Thinking => &mut self.thinking_block_handlers,
             BlockType::ToolUse => &mut self.tool_use_block_handlers,
-            BlockType::ToolResult => &mut self.text_block_handlers, // ToolResultはTextとして扱う
+            BlockType::ToolResult => &mut self.text_block_handlers, // Treat ToolResult as Text.
         }
     }
 
-    /// 現在アクティブなブロックタイプを取得
+    /// Get the currently active block type.
     pub fn current_block(&self) -> Option<BlockType> {
         self.current_block
     }
 
-    /// 現在アクティブな全ブロックを中断する
+    /// Abort all currently active blocks.
     ///
-    /// キャンセルやエラー時に呼び出し、index ごとに進行中の全ブロックへ
-    /// BlockAbortイベントを発火してスコープをクリーンアップする。
+    /// Call on cancellation or error to emit BlockAbort events for all in-progress
+    /// blocks by index and clean up their scopes.
     pub fn abort_current_block(&mut self) {
         let active = self.active_blocks.keys().copied().collect::<Vec<_>>();
         for (block_type, index) in active {
@@ -739,7 +739,7 @@ mod tests {
 
     #[test]
     fn test_meta_event_dispatch() {
-        // シンプルなテスト用構造体
+        // Simple test struct
         struct TestUsageHandler {
             calls: Arc<Mutex<Vec<UsageEvent>>>,
         }
@@ -760,10 +760,10 @@ mod tests {
         timeline.on_usage(handler);
 
         timeline.dispatch(&Event::usage(100, 50));
-        // pending_usage に積まれているだけなのでまだ未発火
+        // Only buffered in pending_usage; not yet dispatched.
         assert_eq!(calls.lock().unwrap().len(), 0);
 
-        // flush で 1 度だけ発火
+        // Flush dispatches once.
         timeline.flush_usage();
         let recorded = calls.lock().unwrap();
         assert_eq!(recorded.len(), 1);
@@ -788,7 +788,7 @@ mod tests {
             calls: calls.clone(),
         });
 
-        // Anthropic 風: message_start で input + 暫定 output
+        // Anthropic-style: input + provisional output in message_start.
         timeline.dispatch(&Event::Usage(UsageEvent {
             input_tokens: Some(409),
             output_tokens: Some(1),
@@ -796,7 +796,7 @@ mod tests {
             cache_read_input_tokens: Some(0),
             cache_creation_input_tokens: Some(0),
         }));
-        // message_delta で最終 output
+        // Final output in message_delta.
         timeline.dispatch(&Event::Usage(UsageEvent {
             input_tokens: Some(409),
             output_tokens: Some(71),
@@ -805,7 +805,7 @@ mod tests {
             cache_creation_input_tokens: Some(0),
         }));
 
-        // 未 flush の段階では発火しない
+        // No dispatch before flushing.
         assert_eq!(calls.lock().unwrap().len(), 0);
 
         timeline.flush_usage();
@@ -814,7 +814,7 @@ mod tests {
         assert_eq!(recorded[0].input_tokens, Some(409));
         assert_eq!(recorded[0].output_tokens, Some(71));
 
-        // flush 後にもう一度 flush しても何も起きない
+        // Flushing again after a flush does nothing.
         drop(recorded);
         timeline.flush_usage();
         assert_eq!(calls.lock().unwrap().len(), 1);

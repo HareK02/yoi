@@ -1,3 +1,15 @@
+//! Coordinates editing and publication of resident context generated from confirmed Memory.
+//!
+//! Budget checks cover the whole request, including the system prompt, JSON input representation,
+//! and tool schemas, not just source material. Each LLM request repeats the check to account for
+//! history growth in correction turns. This estimate excludes provider-specific HTTP representations;
+//! it is neither a billing-token measurement nor a strict guarantee of model limits.
+//!
+//! Edit counts, execution time, and source refetches after publication conflicts are bounded.
+//! Cancellation and background generations are rechecked before publication; the Host decides final
+//! source freshness and persistence. Active Memory whose material exceeds the budget must not yield
+//! successful empty generation. Generation failure does not undo confirmed Memory or applied candidates.
+
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;

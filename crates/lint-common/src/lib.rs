@@ -1,4 +1,4 @@
-//! Shared record lint primitives for memory and workflow files.
+#![doc = include_str!("../README.md")]
 
 mod frontmatter;
 mod slug;

@@ -1,4 +1,9 @@
 //! Trusted Host placement and lifecycle for Workspace Drive (no HTTP/DTO surface).
+//!
+//! Workspace deletion reservations reject even existing handles through transaction serialization
+//! with the Server DB. Deletion starts with a durable Drive fence and settles purge tombstones and
+//! blob/metadata deletion before deleting FeatureStorage. Blob deletion failures retain
+//! FeatureStorage; partial failure is not completion.
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 

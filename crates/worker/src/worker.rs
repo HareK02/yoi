@@ -89,8 +89,11 @@ const MAX_SUBMISSION_RECEIPTS: usize = 128;
 const MAX_INVOCATION_RECEIPTS: usize = 1024;
 const MAX_INVOCATION_IDENTITY_BYTES: usize = 256;
 
-/// A durable start without a matching result is intentionally not retryable.
-/// This is a conservative fence, not an exactly-once business-operation ledger.
+/// Durable replay-prevention receipt retaining invocation start and a bounded result.
+///
+/// Stores the typed payload digest and qualified identity, not a copy of all arguments.
+/// A start without a result cannot rule out side effects, so reexecution is rejected.
+/// The same ID with a different payload is also rejected. This is not a business exactly-once ledger.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InvocationReceipt {
@@ -3105,7 +3108,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Note: this constructor does **not** parse `manifest.worker.system_prompt`
     /// as a template. `Worker::from_manifest` is the production path for
     /// templated prompts; callers of `Worker::new` that want a template
-    /// should parse it themselves and call [`set_system_prompt_template`].
+    /// should parse it themselves and call [`Self::set_system_prompt_template`].
     pub async fn new(
         manifest: WorkerManifest,
         worker: Engine<C, Mutable, SessionHistoryMetadata>,
@@ -3714,7 +3717,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         &self.store
     }
 
-    /// Rewind the current segment to just before the specified public user input.
+    /// Rewinds the current Segment to just before the specified public user input.
+    ///
+    /// Saves the display-history prefix and pending activation checkpoint in one Store replacement.
+    /// Retains invocation-only receipts and recovery-blocked state, avoiding a failure window
+    /// between truncation and checkpoint append. Rewinding history does not undo committed
+    /// business side effects.
     pub async fn rewind_to(&mut self, entry_id: String) -> Result<RewindAppliedState, RewindError> {
         // Reject invalid targets before invoking rewrite hooks or quiescing tasks.
         // Resolve again under the append lock after the asynchronous barrier.
@@ -3895,7 +3903,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Snapshot of the cumulative LLM Usage measurement timeline.
     ///
     /// One entry per LLM call. Restored on `restore` and appended in
-    /// `persist_turn`. Used by token-accounting APIs in [`token_counter`].
+    /// `persist_turn`. Used by token-accounting APIs in [`agen::token_counter`].
     /// Returns a clone since the underlying vector is shared with hooks
     /// running on the Engine.
     pub fn usage_history(&self) -> Vec<UsageRecord> {
@@ -3905,14 +3913,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .clone()
     }
 
-    /// Snapshot of the extract (memory.extract) boundary pointer.
-    ///
-    /// `None` means no extract has run yet on the current session — the
-    /// next extract will start from entry 0. Updated by
-    /// [`try_post_run_extract`](Self::try_post_run_extract) on success
-    /// and reset by [`compact`](Self::compact) (the new compacted
-    /// session has a fresh log with no `LogEntry::Extension` entries).
-    /// Cheap clone via `Option<Clone>`.
     /// Snapshot of the typed user segments tracked alongside worker
     /// history. The K-th entry corresponds to the K-th `Item::user_message`
     /// derived from `LogEntry::AnnotatedUserInput` entries (post-compaction); seed
@@ -4090,7 +4090,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
 
     /// Attach the broadcast sender used for typed lifecycle `Event`s.
     ///
-    /// The Controller wires this alongside [`attach_alerter`] so that
+    /// The Controller wires this alongside [`Self::attach_alerter`] so that
     /// Worker-internal operations (currently: compaction) can surface
     /// progress to connected clients.
     pub fn attach_working_event_tx(&mut self, working_event_tx: broadcast::Sender<Event>) {
@@ -4143,12 +4143,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         }
     }
 
-    /// Push a `Method::Notify` entry onto the pending buffer.
-    ///
-    /// The notification will be appended to `worker.history` as an
-    /// `Item::system_message` just before the next LLM request, via
-    /// `WorkerInterceptor::pending_history_appends`. See [`NotifyBuffer`]
-    /// for overflow behaviour and the lane-of-record rationale.
     /// Configure the fixed idle notification coalescing window.
     ///
     /// The deadline is derived from the oldest durable notification receipt,
@@ -4613,6 +4607,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         Ok(())
     }
 
+    /// Resolves Submit's Flow selector and prepares initial state and instruction projections.
+    ///
+    /// Rejects duplicate active instances, multiple Flow segments, disabled Features, and Workspace
+    /// mismatches. Source resolution is read-only and does not yet change the live instance.
+    /// The caller commits typed input, the instruction history projection, and Flow state in one
+    /// AnnotatedUserInput before updating in-memory state.
     fn prepare_flow_input(
         &self,
         input: Vec<Segment>,
@@ -4932,6 +4932,16 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.handle_worker_result(result, history_before).await
     }
 
+    /// Processes committed Submit invocations in segment order and returns whether dependent LLM
+    /// execution may proceed.
+    ///
+    /// Persists start in the pending activation extension before calling the handler, then appends
+    /// the result and updated receipt in one AnnotatedSystemItem. If result append fails, start
+    /// remains, preventing reexecution of uncertain side effects within this process or after
+    /// restore, Pause/Resume, or compaction. Exact replay uses saved results but revalidates semantics
+    /// and authority before reusing successful context. Receipt exhaustion rejects untrackable
+    /// execution rather than dropping old evidence. The first failure/unknown result stops later
+    /// invocations and dependent LLM execution without rolling back earlier side effects.
     async fn execute_feature_invocations(&self, segments: &[Segment]) -> Result<bool, WorkerError>
     where
         St: Clone + 'static,
@@ -6352,8 +6362,18 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         Ok(())
     }
 
-    /// Runs one parent-owned observable compaction service and returns the new
-    /// Segment ID. Lifecycle states are committed before they are broadcast.
+    /// Saves a new Segment and switches history references through parent-owned compaction.
+    ///
+    /// Completes pre-rewrite hooks and confirms background tasks stopped, then saves the summary
+    /// and retained tail in a new Segment. Creation alone does not change current history; CAS of
+    /// the metadata active reference is the commit point. Lock order is append barrier, allocation,
+    /// then metadata, excluding Submit/Notify during the switch. If allocation update fails after
+    /// CAS, rejects appends and retains exclusion while reporting the mismatch. Success aligns the
+    /// append destination, history, and cache identity before publishing the new base to subscribers.
+    ///
+    /// Confirms release of the compaction Internal Worker before activation. Cancellation or future
+    /// drop alone does not prove release; unconfirmed cleanup blocks the next execution. Progress
+    /// is a runtime observation, not a restartable durable workflow record.
     pub async fn compact(&mut self, retained_tokens: u64) -> Result<SegmentId, WorkerError> {
         self.compact_with_cancel(retained_tokens, None, CompactionTrigger::RequestThreshold)
             .await

@@ -1,22 +1,14 @@
-//! Typed system-message items injected by the agent system.
+//! Typed records of system input a Worker presents to the model.
 //!
-//! Items in worker history with `role:system` are never produced by the
-//! LLM — they are always inserted by the Worker itself (notifications,
-//! file ref resolutions, child-worker lifecycle events, reminders, …).
-//! [`SystemItem`] carries the
-//! typed shape of each such injection so clients can dispatch on
-//! `kind` instead of parsing text prefixes like `[Notification] …` or
-//! `[File: …]`.
+//! Notifications, child events, reference resolution, and reminders are Worker-added
+//! input, not model output. [`SystemItem`] retains the display kind and model-visible
+//! body, representing the same input in history and live events. Stored bodies allow
+//! old input to be reproduced even if prompt rendering rules later change.
 //!
-//! Persisted as the payload of [`crate::LogEntry::AnnotatedSystemItem`] (one
-//! entry per item), and broadcast live as the payload of
-//! `Event::SystemItem` on the wire.
-//!
-//! For LLM context replay, each `SystemItem` reduces to an
-//! `Item::system_message(...)` whose body matches the legacy free-text
-//! shape (see [`SystemItem::history_text`]). The kind metadata is
-//! preserved only on the log/wire side; the LLM still sees plain
-//! system-message text.
+//! Input affecting the model is committed via [`crate::LogEntry::AnnotatedSystemItem`]
+//! before use. Request-only transient insertion would leave later turns unable to
+//! explain decisions from stored history. The model projection uses only the body;
+//! clients can render using type information without parsing body prefixes.
 
 use agen::llm_client::types::Item;
 use protocol::WorkerEvent;

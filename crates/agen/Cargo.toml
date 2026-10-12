@@ -11,7 +11,7 @@ homepage = "https://gitea.hareworks.net/Hare/yoi"
 documentation = "https://docs.rs/agen"
 keywords = ["llm", "agent", "tools", "streaming", "orchestration"]
 categories = ["api-bindings", "asynchronous"]
-include = ["src/**", "tests/**", "examples/*.rs", "docs/**", "README.md", "LICENSE"]
+include = ["src/**", "tests/**", "examples/*.rs", "README.md", "LICENSE"]
 autoexamples = false
 
 [features]

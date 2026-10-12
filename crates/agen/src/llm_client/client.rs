@@ -1,4 +1,4 @@
-//! LLMクライアント共通trait定義
+//! Shared LLM client trait definitions.
 
 use std::pin::Pin;
 
@@ -6,19 +6,19 @@ use crate::llm_client::{ClientError, Request, RequestConfig, event::Event};
 use async_trait::async_trait;
 use futures::Stream;
 
-/// 設定に関する警告
+/// Configuration warning.
 ///
-/// プロバイダがサポートしていない設定を使用した場合に返される。
+/// Returned when using a configuration option unsupported by the provider.
 #[derive(Debug, Clone)]
 pub struct ConfigWarning {
-    /// 設定オプション名
+    /// Configuration option name.
     pub option_name: &'static str,
-    /// 警告メッセージ
+    /// Warning message.
     pub message: String,
 }
 
 impl ConfigWarning {
-    /// 新しい警告を作成
+    /// Create a new warning.
     pub fn unsupported(option_name: &'static str, provider_name: &str) -> Self {
         Self {
             option_name,
@@ -48,19 +48,19 @@ pub enum ToolCallCompletionSupport {
     ResponseComplete,
 }
 
-/// LLMクライアントのtrait
+/// LLM client trait.
 ///
-/// 各プロバイダはこのtraitを実装し、統一されたインターフェースを提供する。
+/// Each provider implements this trait to expose a unified interface.
 #[async_trait]
 pub trait LlmClient: Send + Sync {
-    /// ストリーミングリクエストを送信し、Eventストリームを返す
+    /// Send a streaming request and return an Event stream.
     ///
     /// # Arguments
-    /// * `request` - リクエスト情報
+    /// * `request` - Request information.
     ///
     /// # Returns
-    /// * `Ok(Stream)` - イベントストリーム
-    /// * `Err(ClientError)` - エラー
+    /// * `Ok(Stream)` - Event stream.
+    /// * `Err(ClientError)` - Error.
     async fn stream(&self, request: Request) -> Result<ResponseStream, ClientError>;
 
     /// Clone this client into a new `Box<dyn LlmClient>`.
@@ -74,15 +74,15 @@ pub trait LlmClient: Send + Sync {
         ToolCallCompletionSupport::ResponseComplete
     }
 
-    /// 設定をバリデーションし、未サポートの設定があれば警告を返す
+    /// Validate configuration and return warnings for unsupported options.
     ///
     /// # Arguments
-    /// * `config` - バリデーション対象の設定
+    /// * `config` - Configuration to validate.
     ///
     /// # Returns
-    /// サポートされていない設定に対する警告のリスト
+    /// List of warnings for unsupported options.
     fn validate_config(&self, config: &RequestConfig) -> Vec<ConfigWarning> {
-        // デフォルト実装: 全ての設定をサポート
+        // Default implementation: all options are supported.
         let _ = config;
         Vec::new()
     }
@@ -94,9 +94,9 @@ impl Clone for Box<dyn LlmClient> {
     }
 }
 
-/// `Box<dyn LlmClient>` に対する `LlmClient` の実装
+/// `LlmClient` implementation for `Box<dyn LlmClient>`.
 ///
-/// これにより、動的ディスパッチを使用するクライアントも `Engine` で利用可能になる。
+/// Allows clients using dynamic dispatch to be used with `Engine`.
 #[async_trait]
 impl LlmClient for Box<dyn LlmClient> {
     async fn stream(&self, request: Request) -> Result<ResponseStream, ClientError> {

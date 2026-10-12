@@ -1,5 +1,16 @@
-//! Native non-indexable Drive entries. Publication resolves just one ID through
-//! current Backend authorization; the Client owns entry/committed-request validators.
+//! Native Drive projection with no indexable entry children.
+//!
+//! `/drive` is a discovery entrance; Tree does not enumerate file inventory. Only entries selected
+//! from bounded list/search results resolve directly. Paths contain a hex-encoded Workspace ID and
+//! decimal node ID, preventing substitution with another Workspace or ID. Previously acquired
+//! Client entries are not added to Tree either.
+//!
+//! The provider resolves one entry under current Backend authorization and creates a self-scoped
+//! contract for its kind. Metadata, descriptor, validator, and handler are fixed to one publication;
+//! the route binds the entry/creation parent. Move destinations accept typed Entry paths.
+//! Interfaces describe operations for the entry kind; the Backend rejects writes under read-only
+//! grants. Native Invoke still applies original Tool permissions. [`crate::wip`] owns the shared
+//! cache, validator, and cancellation contracts.
 use super::{
     DriveFeature, SPECS, Spec,
     backend::{DriveError, decimal},

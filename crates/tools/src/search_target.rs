@@ -1,6 +1,9 @@
-//! Provider dispatch shared by native and ordinary search processing.
-//! Request construction/defaults and rendering remain in Glob/Grep; this only
-//! selects the provider surface and verifies the returned readonly result kind.
+//! Provider dispatch shared by regular search and native checkout search.
+//!
+//! Glob/Grep own request defaults, input handling, and formatting; this module checks provider
+//! routing and read-only response kinds. Only native search uses `checkout_search`; provider
+//! wrappers restrict its request scope and output coordinates. Tools neither create scopes
+//! nor reinterpret rendered paths.
 use agen::tool::ToolError;
 use workdir::{
     CheckoutSearchOperation, CheckoutSearchRequest, CheckoutSearchResult, GlobRequest, GlobResult,

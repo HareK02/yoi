@@ -1,8 +1,14 @@
-//! Ordinary removal authority, not a recovery lifecycle. The content witness is
-//! outside the tree being removed so a crash/partial unlink cannot erase it.
-//! Every retry checks current identities, mounts and remaining content. Missing
-//! entries are expected after partial deletion. The same intact clean checkout
-//! may renew its witness after owner recovery, never discarding new ignored content.
+//! Mount-safe deletion and content checks after partial deletion.
+//!
+//! Content witnesses are stored outside the deletion tree, surviving partial unlinking.
+//! Witnesses describe past facts; every retry revalidates current identity, mounts, and remaining
+//! content. Missing entries count as partial deletion, but new or changed content is not discarded.
+//! Only the same intact clean checkout can refresh an old witness. List/detail check saved identity
+//! only; they infer neither remaining file hashes nor current cleanliness.
+//!
+//! Rejects deletion if Linux openat2 or /proc mount checks are unavailable; no unchecked recursive
+//! deletion fallback. Does not implicitly unmount resources or delete other owners' data.
+//! OS errors stay in Runtime-private logs; public diagnostics contain only closed causes and safe messages.
 use super::*;
 use std::io;
 

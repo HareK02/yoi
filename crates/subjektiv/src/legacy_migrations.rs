@@ -1,5 +1,8 @@
-//! Frozen migrations 1–6 and the one-time conversion of their data.
-//! Do not expose these old fields through current domain operations.
+//! Frozen migrations and one-time conversion of existing data.
+//!
+//! Preserves original serialized records in an immutable archive; current changes receive independent IDs and predecessors.
+//! Legacy counters cannot prove the complete surface input set, so snapshots and runs remain as history,
+//! detached from current input identity and stale until regeneration. Legacy representations are not exposed to current operations.
 use super::*;
 
 pub(super) fn create_schema(transaction: &Transaction<'_>) -> feature_storage::Result<()> {

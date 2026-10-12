@@ -1,6 +1,13 @@
-//! Shared model-facing Memory operations and bounded projections.
-//! Hosts retain authentication, execution leases, Job admission and committed
-//! Session evidence validation; this module never derives ambient authority.
+//! Shared Host Memory operations and bounded responses.
+//!
+//! Applies the Subject and consolidation candidate batch pinned by [`HostOperationContext`] to operations.
+//! The Host owns authentication, execution leases, Job admission, and validation of committed Session evidence.
+//! This module reads neither Session files nor arbitrary paths, and never infers authority from model input.
+//!
+//! Query cursors pin filters and the Memory fingerprint, rejecting intervening changes as stale.
+//! Body/provenance continuation pins immutable change IDs; history pages pin the predecessor-chain head.
+//! Pages respect the whole-response serialization budget and UTF-8 boundaries, allowing continuation
+//! offsets to resume even with JSON escapes or long lines. Returns only stored evidence anchors, never copies raw Session bodies.
 
 mod context;
 mod operation;

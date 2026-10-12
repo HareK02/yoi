@@ -1,7 +1,20 @@
-//! Post-save Ticket item checks executed through the Backend-owned Job runner.
+//! Asynchronous advisory checks of saved Ticket content using Backend Jobs.
 //!
-//! The immutable input contains only the persisted Ticket item and the edit that
-//! produced it. Conversation history is deliberately outside this boundary.
+//! Authenticated Worker Create/EditItem paths freeze check input and reserve a Job after saving.
+//! Failed preparation, execution, or delivery does not roll back the save or change Ticket state,
+//! Queue, or assignments. Direct browser edits have no notification Worker and start no check.
+//!
+//! Input is limited to saved title/body, content digest, and the prior body/replacement context
+//! needed for that edit, excluding conversation, user agreements, and external facts. Content
+//! digests identify advisory freshness, not Job intent. Identical content with different edit
+//! context or sources creates different Jobs; oversized input is not truncated and marked checked.
+//!
+//! Results are checked for unknown fields, duplicates, count/string limits, and quotes that are
+//! exact substrings of the checked title/body. Invalid results end as invalid_result.
+//! Delivery rereads the Ticket and notifies the original Worker only of findings matching the
+//! saved digest. No findings and stale results end delivery with distinct suppression reasons,
+//! without redelivery on recovery. Advice is neither an approval gate nor implementation guidance;
+//! no findings do not prove the entire specification correct.
 
 use std::collections::BTreeSet;
 

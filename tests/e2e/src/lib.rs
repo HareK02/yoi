@@ -1,8 +1,4 @@
-//! Opt-in E2E helpers for driving the real `yoi panel` process through a PTY.
-//!
-//! The harness intentionally sends keyboard and mouse input only through the PTY.
-//! Structured JSONL events emitted by the TUI are used for synchronization,
-//! assertions, and failure artifacts; they are not an input or authority channel.
+#![doc = include_str!("../README.md")]
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -567,6 +563,10 @@ pub struct PanelArtifacts {
     pub run_json: PathBuf,
 }
 
+/// 実TUIへの入力をPTYだけで送るharness。
+///
+/// JSONL観測イベントは同期、assertion、失敗時のartifactに使う。製品状態を
+/// 変更する入力には使わない。最初の描画と具体的なfixture内容の表示準備は別に検査する。
 pub struct PanelHarness {
     child: Child,
     master: File,

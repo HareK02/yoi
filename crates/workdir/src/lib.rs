@@ -1,9 +1,4 @@
-//! Persistent Workdir identity and Worker-bound operation sessions.
-//!
-//! A [`Workdir`] identifies a materialized repository execution context across
-//! Worker lifetimes. A [`WorkdirSession`] is the live operation attachment
-//! bound to one Worker. Tools consume sessions; they do not own Workdir
-//! materialization or cleanup.
+#![doc = include_str!("../README.md")]
 
 pub mod checkout;
 pub use checkout::{
@@ -187,12 +182,13 @@ impl WorkdirSessionCapabilities {
 
 pub type WriteOutcome = WriteResult;
 
-/// Live, Worker-bound operations for one persistent [`Workdir`].
+/// Worker-bound operation session for a persistent [`Workdir`].
 ///
-/// Implementations execute filesystem search and command work on the host
-/// that owns the materialization. Structured requests and results never
-/// contain the raw materialized root. Closing a session is terminal and does
-/// not delete the persistent Workdir or its materialization.
+/// Filesystem search and commands run on the host owning materialization.
+/// Session closure is terminal but does not delete the Workdir or files.
+/// Unsupported checkout/search implementations explicitly reject requests, with no ambient
+/// filesystem fallback. Providers own identity validators; callers own read hash history
+/// and attachment generations.
 #[async_trait]
 pub trait WorkdirSession: std::fmt::Debug + Send + Sync {
     fn workdir(&self) -> &Workdir;
@@ -294,8 +290,13 @@ pub trait WorkdirSession: std::fmt::Debug + Send + Sync {
 
 pub type WorkdirSessionHandle = Arc<dyn WorkdirSession>;
 
-/// Closed diagnostic vocabulary: no request text, paths or secrets.
-/// A reason describes a refusing branch, not an authorization grant.
+/// Closed diagnostic vocabulary for denial reasons, excluding paths and free text.
+///
+/// Assigned by the branch deciding denial, never inferred from error text. Missing reasons from
+/// legacy providers remain unknown. Distinguishes PermissionDenied with an OS error code from
+/// synthetic PermissionDenied of unknown origin, without asserting the specific OS-level cause.
+/// Remote provider reasons are reported data, not authority or independent attestation.
+/// `DenialContext` adds diagnostics without changing error classification or retry/cleanup rules.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]

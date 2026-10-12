@@ -1,3 +1,6 @@
+/** previewは宣言されたmedia typeで選び、拡張子からHTML／SVG等の実行可能な表示を許可しない。
+ * Markdown／plain textとrasterだけを対象とし、その他はdownloadに限定する。
+ */
 import type { DriveEntry } from "#lib/generated/drive-api.ts";
 
 export { DRIVE_TEXT_MAX_BYTES } from "#lib/workspace/drive/api.ts";

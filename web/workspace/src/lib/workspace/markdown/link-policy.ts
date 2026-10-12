@@ -1,4 +1,8 @@
-// Workspace resource links are navigation, never bearer credentials or fetch targets.
+/** Markdownのリンク先を明示的resource routeか外部HTTP(S)へ限定する。
+ * Workspace contextがある場合、resource routeはそのWorkspaceだけを許可する。
+ * URLはnavigation用であり、bearer credentialや自動fetch先ではない。
+ * 任意の相対path、API path、protocol-relative URL、userinfo付き外部URLは拒否する。
+ */
 export const MARKDOWN_WORKSPACE_CONTEXT = "yoi-markdown-workspace";
 export type MarkdownWorkspace = () => string;
 export type MarkdownLinkTarget = { href: string; external: boolean };

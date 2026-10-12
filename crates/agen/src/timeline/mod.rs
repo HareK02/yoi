@@ -1,14 +1,9 @@
-//! Timeline層
+//! Dispatch normalized LLM events and collect blocks.
 //!
-//! LLMからのイベントストリームを受信し、登録されたHandlerにディスパッチします。
-//!
-//! # 主要コンポーネント
-//!
-//! - [`Timeline`] - イベントストリームの管理とディスパッチ
-//! - [`Handler`] - イベントを処理するトレイト
-//! - [`TextBlockCollector`] - テキストブロックを収集するHandler
-//! - [`ThinkingBlockCollector`] - reasoning material を Thinking block から収集するHandler
-//! - [`ToolCallCollector`] - ツール呼び出しを収集するHandler
+//! [`Timeline`] dispatches common events to handlers without parsing provider protocols.
+//! Block assembly and display callbacks are separate from turn decisions. The Engine
+//! uses collected responses to update history and execute tools. Provisional streaming
+//! output is distinct from committed history.
 
 pub mod event;
 mod text_block_collector;
@@ -16,7 +11,7 @@ mod thinking_block_collector;
 mod timeline;
 mod tool_call_collector;
 
-// 公開API
+// Public API
 pub use event::*;
 pub use text_block_collector::TextBlockCollector;
 pub use thinking_block_collector::ThinkingBlockCollector;
@@ -24,7 +19,7 @@ pub use timeline::Timeline;
 pub(crate) use tool_call_collector::CollectedToolCall;
 pub use tool_call_collector::ToolCallCollector;
 
-// 型定義からのre-export
+// Re-exports from type definitions
 pub use crate::handler::{
     // Meta Kinds
     ErrorKind,

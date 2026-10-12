@@ -1,35 +1,4 @@
-//! Session persistence via append-only JSONL logs.
-//!
-//! # Architecture
-//!
-//! A [`Session`](SessionId) is a fork-tree of [`Segment`](SegmentId)s
-//! belonging to the same logical conversation. Each Segment is recorded
-//! as a sequence of [`LogEntry`] values, one per line in a `.jsonl`
-//! file. Reading a segment log and collecting entries reconstructs the
-//! Engine state at that segment — no separate snapshots or checkpoints
-//! needed. Compaction and fork operations mint a fresh Segment within
-//! the same Session.
-//!
-//! This crate provides free functions for persistence operations.
-//! The caller (typically Worker) holds the Engine directly and calls these
-//! functions after state-mutating operations.
-//!
-//! Debug-mode [`TraceEntry`] records capture raw stream events in a separate
-//! `.trace.jsonl` file, independent of the segment log.
-//!
-//! # Quick start
-//!
-//! ```ignore
-//! use session_store::{create_segment, restore, save_delta, FsStore, SegmentStartState};
-//!
-//! let store = FsStore::new("./sessions")?;
-//! let (session_id, segment_id) = create_segment(&store, SegmentStartState {
-//!     system_prompt: None,
-//!     config: &config,
-//!     history: Vec::new(),
-//!     user_segments: Vec::new(),
-//! })?;
-//! ```
+#![doc = include_str!("../README.md")]
 
 use std::io;
 use std::path::Path;
@@ -141,11 +110,10 @@ pub use worker_metadata::{
 };
 pub use worker_session_store::WorkerSessionStore;
 
-/// Session identifier — the fork-tree root. UUID v7 (time-ordered).
+/// UUID v7 identifying Segments belonging to the same conversation.
 ///
-/// All Segments belonging to the same Session share this ID. Compaction
-/// and fork operations create a new Segment within the same Session, so
-/// `WHERE session_id = ?` retrieves the full lineage.
+/// Fork/compaction preserves this ID and only adds Segments. Switching the current
+/// history projection therefore does not change the conversation-wide reference.
 pub type SessionId = uuid::Uuid;
 
 /// Segment identifier. UUID v7 (time-ordered, lexicographically sortable).

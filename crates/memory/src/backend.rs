@@ -1,8 +1,11 @@
-//! Typed transport boundary for Workspace-backed Memory operations.
+//! Typed communication boundary for legacy single-document Workspace Memory.
 //!
-//! Runtime Workers serialize these DTOs to the Workspace API. Persistence and
-//! validation are owned by the Workspace authority; this crate deliberately has
-//! no repository-local filesystem executor.
+//! Workspace authority owns persistence and validation of documents, candidates, and dispositions.
+//! Does not reinterpret existing input as subject Memory, implicitly assign subjects, or dual-write.
+//! This module has no storage or fallback implementation that searches Repositories or ancestor directories.
+//! Resident response types are shared with subject Memory, but do not imply identical storage destinations.
+//! [`MemoryResidentSummaryOutput`] represents availability separately from body presence.
+//! `Ready` without content is a successfully generated empty result, distinct from ungenerated, stale, or failed.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

@@ -1,11 +1,19 @@
-//! Workspace lifecycle admission, not operation serialization.
+//! Admission gate coordinating Workspace deletion with HTTP handler lifetimes.
 //!
-//! Resource owners retain their own locks/transactions. Deletion first stops
-//! ordinary admission, then drains admitted requests. Synchronous Runtime
-//! callbacks remain admissible while a parent request is still running; once
-//! the last ordinary request leaves, callback admission also closes. This
-//! avoids both callback/deletion cycles and an unbounded stream of new work
-//! starving deletion. All leases, including the deletion fence, are RAII.
+//! Normal requests acquire leases immediately; independent handlers can run concurrently.
+//! Resource owners handle Worker, Workdir, and SQLite exclusion; this gate does not serialize them.
+//! Business-operation lock waits do not precede proof verification, avoiding expiry of short-lived
+//! proofs while waiting for other requests.
+//!
+//! Deletion closes normal admission before draining existing handlers. Only Runtime callbacks
+//! needed by active parent requests may acquire tracked leases; callback admission also closes
+//! when the last normal lease leaves. This prevents deletion blocking callbacks awaited by parents
+//! and callbacks indefinitely extending the drain. Callbacks still require authentication and
+//! authorization.
+//!
+//! Drop releases leases and temporary deletion fences. Cancelling a deletion wait reopens normal
+//! admission, but durable Workspace state blocks admission after deletion reservation succeeds.
+//! Leases cover HTTP responses, not the full lifetime of upgraded WS or background work.
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard};

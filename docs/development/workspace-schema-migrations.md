@@ -1,59 +1,9 @@
-# Workspace schema migrations
+# 保存schema変更の開発規則
 
-Workspace schema authority belongs to `crates/workspace-server/src/store.rs`. The canonical
-schema, ordered migrations, migration-history validation, startup upgrade path, and explicit
-`yoi-server migrate` command must remain one contract.
+公開またはドッグフーディングで使用したmigrationは、対応する保存データを更新できる限り保持する。新しいmigrationを追加したことだけを理由に、直前のmigrationを削除しない。
 
-## Retained migration chain
+schema変更では、既存の順序付きmigrationへ新しい処理を追加し、新規DBの作成結果も同じschemaへ揃える。適用済みmigrationの名前や内容を、語彙を統一するだけの目的で書き換えない。schema一覧はコードを正本とし、文書へ複製しない。
 
-Released or dogfooded schema migrations are retained and composed in version order. Adding a new
-schema version does not authorize deleting the preceding migration. A migration may be removed
-only as an explicit baseline-retirement operation after the supported installations that depend on
-it have been migrated or intentionally discarded.
+検証には、最古の対応schemaからの更新、保存値と制約の維持、新規作成結果との一致、失敗時のrollbackを含める。途中まで完了した更新の再開や、元DBを変更しないdry-runを提供する場合は、その保証も実装経路で確認する。schema番号だけのassertionでは不足する。
 
-The current retained Workspace chain is:
-
-1. schema 50: `workspace schema baseline`
-2. schema 51: `workspace runtime bindings`
-3. schema 52: Runtime-binding counter and audit (historical migration purpose; the persisted migration name remains frozen).
-4. schema 53: `durable Workspace deletion operations`
-
-A database may begin at any retained baseline. Its following history rows must be the exact prefix
-of the ordered migration chain from that baseline. This allows both a freshly created current
-database and a database upgraded across several releases while rejecting edited, reordered, or
-unknown histories.
-
-## Runtime behavior
-
-`SqliteWorkspaceStore::open` computes all pending retained migrations and applies them in order.
-Each migration is transactional and restartable: if a later step fails, completed steps remain a
-valid canonical prefix and the next run resumes from that version.
-
-`yoi-server migrate` invokes the same store migration path without starting the Server:
-
-```sh
-# Copy the DB into memory and validate the complete pending path without changing the source.
-yoi-server migrate --dry-run
-
-# Preflight the complete path, then apply it to the source DB.
-yoi-server migrate
-```
-
-Use `--database <PATH>` for a non-default Server DB. Stop `yoi-server` before applying migrations
-and make an external backup before an operational upgrade.
-
-## Development workflow
-
-When changing the Workspace schema:
-
-1. increment `LATEST_SCHEMA_VERSION`;
-2. append one `Migration` entry with the new version, stable name, and apply function;
-3. preserve all migrations at or above `OLDEST_SCHEMA_VERSION`;
-4. update the canonical latest-schema creator for fresh databases;
-5. add a fixture at the oldest retained version and prove migration through every retained step;
-6. prove that `--dry-run` leaves the source DB unchanged;
-7. keep DDL validation and cross-schema foreign-key checks in the shared store preparation path.
-
-A deliberate baseline retirement must be a separately reviewed change. It must identify the oldest
-remaining version, provide an operational migration/discard plan for older databases, update tests
-and this document, and must not be inferred merely because a new migration was added.
+古いbaselineの対応終了は、対象となる保存データを移行または明示的に破棄する判断を含め、独立にレビューする。残す最古のschema、移行・破棄の責任、影響するテストを明記する。所有storeのmigration経路と検証を共用し、起動・管理操作ごとに別のDDL判定を増やさない。

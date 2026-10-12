@@ -1,28 +1,9 @@
 # lint-common
 
-## Role
+Shared frontmatter splitting and slug validation for Markdown records. Only syntax handling is shared; owning crates retain validation of record-specific required fields and semantics.
 
-`lint-common` contains shared linting primitives for structured project records.
+## Main entry points
 
-## Boundaries
-
-Owns:
-
-- reusable frontmatter/slug/path validation helpers
-- common lint diagnostic shapes used by higher-level crates
-
-Does not own:
-
-- memory-specific policy (`memory`)
-- workflow-specific policy (`workflow`)
-- Ticket backend policy (`ticket`)
-- product CLI command shape (`yoi`)
-
-## Design notes
-
-Keeping common lint mechanics here avoids duplicating low-level validation while leaving each record type's policy in its owning crate.
-
-## See also
-
-- [`../../docs/design/memory-knowledge.md`](../../docs/design/memory-knowledge.md)
-- [`../../docs/development/work-items.md`](../../docs/development/work-items.md)
+- [`split_frontmatter`] and [`Frontmatter`] — frontmatter/body boundary
+- [`Slug`] and [`is_valid_slug`] — identifier syntax validation
+- [`RecordLintError`] — shared syntax errors

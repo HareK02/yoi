@@ -1,8 +1,4 @@
-//! Foundational filesystem operation contracts and provider-side search.
-//!
-//! This crate deliberately has no dependency on Workdir identity, Runtime
-//! transport, or LLM Tool implementations. Paths are logical and root-relative;
-//! providers supply host roots and access policy.
+#![doc = include_str!("../README.md")]
 
 mod checked;
 pub use checked::{CheckedTarget, identity_validator};

@@ -1,5 +1,5 @@
-// Invoked only by the Rust loopback harness. No mocked responses, live server,
-// browser fixtures, environment variables, or bearer credentials in argv/logs.
+// Rust loopback harness専用。production adapterを実HTTPで検証し、応答をmockしない。
+// fixture認証情報はstdinから受け取り、argvやログへ出さない。画面操作の検証とは分離する。
 import {
   createDriveClient,
   type DriveClient,

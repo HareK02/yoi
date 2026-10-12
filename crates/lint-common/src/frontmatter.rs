@@ -1,4 +1,7 @@
-//! Common frontmatter helpers.
+//! Share the frontmatter/body boundary for Markdown records.
+//!
+//! Splitting returns borrowed slices without interpreting YAML semantics. Owning crates
+//! validate required fields and record-specific values, keeping domain policy out of shared code.
 
 use chrono::{DateTime, Utc};
 

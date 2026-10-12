@@ -1,3 +1,7 @@
+/** Session snapshotとprotocolイベントからtranscriptの表示projectionを構築する。
+ * Overview／Normalは表示だけを変え、保存履歴やWorker状態の根拠を変更しない。
+ * 実行状態はWorker snapshotで更新し、stream表示とWebSocket接続状態から推測しない。
+ */
 import type {
   Alert,
   CommandEvent,

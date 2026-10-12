@@ -1,3 +1,10 @@
+//! Feature exploring one immutable Session capture fixed by the Host.
+//!
+//! Worker-observation owns live Worker reauthorization and recapture; this Feature reads only its
+//! retained snapshot. It has no Workspace client or Memory state, and follows shared Session capture
+//! references, privacy, and exploration bounds. It exposes history to internal verifiers and similar
+//! consumers without business-mutation capabilities.
+
 use std::sync::Arc;
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};

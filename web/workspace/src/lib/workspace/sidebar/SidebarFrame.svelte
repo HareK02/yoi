@@ -1,4 +1,7 @@
 <script lang="ts">
+  // navigation内容だけをscrollさせ、下部の表示mode controlは到達可能なままにする。
+  // hover previewはkeyboard focusでも保持し、折りたたんだ内容はinertでtab順から外す。
+  // Mobileの開閉はHeaderから行うため、狭い画面で隠れたSidebar内に開閉操作を閉じ込めない。
   import { onDestroy, onMount, type Snippet } from 'svelte';
   import { on } from 'svelte/events';
   import Bevel from '#lib/workspace/ui/Bevel.svelte';

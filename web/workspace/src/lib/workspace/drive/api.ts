@@ -1,3 +1,8 @@
+/** 認証済みDrive APIの境界。node IDはJavaScriptの整数精度を超えるため十進文字列で保持する。
+ * Web latest routeとAPI download URLを分け、URLやIDの所持を認可として扱わない。
+ * bounded bodyを検査し、送信後の通信断や不正な成功応答は結果不明としてreceipt照会へ渡す。
+ * uploadはraw Blobで送るが、SHA-256計算には上限付きArrayBufferを使う。
+ */
 import type {
   DriveApiError,
   DriveEntry,
@@ -516,7 +521,8 @@ export function createDriveClient(fetchFn: typeof fetch = fetch): DriveClient {
       ),
     image: async (ws, entry, signal) => {
       parseDriveEntry(entry, ws);
-      // Do not render active SVG or HTML as a preview.
+      // 観測したlast_mutation_idにdownloadを固定し、取得中の置換をlatestへの追従で隠さない。
+      // SVGやHTML等の実行可能な形式はpreviewにしない。
       if (
         !/^(image\/(png|jpeg|gif|webp))$/.test(entry.content_type ?? "") ||
         entry.size === null || entry.size > DRIVE_RESPONSE_MAX_BYTES

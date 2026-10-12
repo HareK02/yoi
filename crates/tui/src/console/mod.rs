@@ -1,3 +1,11 @@
+//! Manages connection-specific Console loops and client-local attachment staging.
+//!
+//! Staging uses Backend transport; completion replaces the corresponding input chip
+//! with an UploadedFile reference. Connections own only unsent resources. Deleting
+//! drafts does not remove accepted, restored, or historical attachments. Standalone
+//! has no upload API, so it retains typed drafts and reports the unsupported operation
+//! rather than falling back to sending raw paths.
+
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;

@@ -1,21 +1,19 @@
-//! Compact / prune 専用のトークン会計補助。
+//! Token-accounting helpers specific to compact / prune.
 //!
-//! 汎用部分（`prefix_bytes`, `tokens_at`, `total_tokens`, `total_tokens_at`）は
-//! [`agen::token_counter`] にあり、`UsageRecord` の列と現在の history から
-//! pure に推定する。本モジュールは compact / prune 固有のロジック
-//! （`split_for_retained`, `savings_for_prune`）と、Worker 上の公開 API に
-//! 限定する。
+//! Generic functions (`prefix_bytes`, `tokens_at`, `total_tokens`, `total_tokens_at`) live in
+//! [`agen::token_counter`] and compute pure estimates from `UsageRecord` sequences and current
+//! history. This module is limited to compact / prune logic (`split_for_retained`,
+//! `savings_for_prune`) and public Worker APIs.
 //!
-//! # 方針
+//! # Policy
 //!
-//! - ローカルトークナイザは持たない。実測値があればそれを採用し、
-//!   measurement 間はバイト数で按分、最新 measurement より先は byte/4 で外挿する
-//! - Compact の retained split では、request-time pruning / projection 後の
-//!   `UsageRecord` を persisted history prefix の単調系列として扱わない。
-//!   現在の prompt occupancy 推定を raw serialized bytes に配分し、末尾の
-//!   persisted tail サイズで cut を決める。
-//! - 推定の出どころは [`EstimateSource`] で呼び出し側に明示する。
-//!   課金判断には使えないが、compact / prune の閾値判定には十分な精度
+//! - No local tokenizer. Use measurements when available, interpolate between them by byte count,
+//!   and extrapolate beyond the latest measurement at byte/4.
+//! - Compact's retained split does not treat request-time pruned/projected `UsageRecord`s as a
+//!   monotonic series of persisted history prefixes. It distributes current prompt-occupancy
+//!   estimates over raw serialized bytes and chooses the cut by persisted tail size.
+//! - [`EstimateSource`] exposes estimate provenance to callers. Accuracy is sufficient for
+//!   compact / prune thresholds, not billing decisions.
 
 use agen::llm_client::client::LlmClient;
 use agen::token_counter::{item_bytes, prefix_bytes, tokens_at};
@@ -26,9 +24,9 @@ pub use agen::token_counter::{EstimateSource, TokenEstimate};
 
 use crate::Worker;
 
-/// history を分割する位置。
+/// Position at which to split history.
 ///
-/// `items[..index]` が捨てる／要約される側、`items[index..]` が残る側。
+/// `items[..index]` is discarded/summarized; `items[index..]` is retained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SplitPoint {
     pub index: usize,
@@ -101,25 +99,19 @@ fn ceil_div_u128(n: u128, d: u128) -> u128 {
     if n == 0 { 0 } else { ((n - 1) / d) + 1 }
 }
 
-/// `history[cut..]` が `ToolCall` / `ToolResult` のペア境界を尊重するよう
-/// `cut` を後退させる。
+/// Move `cut` backward so `history[cut..]` respects `ToolCall` / `ToolResult` pair boundaries.
 ///
-/// LLM API は「`ToolResult` を送るならその `ToolCall` も同じ request に
-/// 含まれていなければならない」というバリデーションを持つ。トークン数
-/// だけで切った `cut` は並列 tool 呼び出しの途中に落ちうるので、retained
-/// 側の先頭に対応 `ToolCall` を持たない `ToolResult`（orphan）が残ると
-/// 次セッション初回 request が API バリデーションで弾かれる。
+/// LLM APIs require each `ToolResult`'s `ToolCall` in the same request. Token-only cuts can fall
+/// inside parallel tool calls, leaving an orphan `ToolResult` at the retained head and causing
+/// API validation to reject the next session's first request.
 ///
-/// 対策は「retained に入る `ToolResult` について、対応 `ToolCall` も
-/// retained に含まれる位置まで `cut` を引き下げる」こと。retained_tokens
-/// 予算は超えうるが、ここでは直接 LLM に投げる訳ではなく次の
-/// `pre_llm_request` で再評価されるだけなので safe。
+/// Lower `cut` until every retained `ToolResult`'s matching `ToolCall` is also retained. This may
+/// exceed the retained_tokens budget, but is safe: nothing is sent directly to the LLM here;
+/// the next `pre_llm_request` reevaluates it.
 ///
-/// アルゴリズム: history を末尾から走査し、retained 範囲内の `ToolResult`
-/// に出会うたびに対応 `ToolCall` の位置で `cut` を min 更新する。`cut` が
-/// 下がると以前は要約側だった位置が retained に入るので、後続走査で連鎖的
-/// に正しい位置まで引き下がる。`ToolCall` の `call_id` はユニークなので
-/// 事前にマップ化して O(n) で済ます。
+/// Scan history backward, lowering `cut` to each retained `ToolResult`'s matching `ToolCall` position.
+/// Lowering the cut retains positions previously on the summary side; the remaining scan cascades
+/// backward to the correct boundary. Unique `ToolCall` `call_id`s allow a precomputed map for O(n).
 fn balance_to_pair_boundary(history: &[Item], cut: usize) -> usize {
     let mut idx = cut.min(history.len());
     if idx == 0 {
@@ -151,9 +143,8 @@ fn balance_to_pair_boundary(history: &[Item], cut: usize) -> usize {
     idx
 }
 
-/// 1 つの ToolResult 項目について、`content` を `None` に射影したとき
-/// 減少するシリアライズ後バイト数。ToolResult 以外や既に content=None
-/// の item は 0 を返す。
+/// Serialized bytes saved by projecting one ToolResult's `content` to `None`.
+/// Returns 0 for non-ToolResult items or items already having content=None.
 fn tool_result_content_bytes(item: &Item) -> u64 {
     if !matches!(
         item,
@@ -186,13 +177,12 @@ pub(crate) fn token_estimates_for_prune_impl(
         .collect()
 }
 
-/// Prune 射影（`ToolResult.content = None`）で節約されるトークン数の推定。
+/// Estimate token savings from prune projection (`ToolResult.content = None`).
 ///
-/// `indices` は [`agen::prune::prunable_indices`] が返す候補列を
-/// 想定する。各候補の content バイト差分を合算し、usage 履歴由来の
-/// tokens/byte レートでトークン数に換算する。範囲を「丸ごと drop」する
-/// のではなく、item 自体（summary 等）は残したままの値を返す点が
-/// `tokens_at` ベースの計算と異なる。
+/// `indices` is expected to contain candidates from [`agen::prune::prunable_indices`]. Sum their
+/// content-byte differences and convert using the usage-history tokens/byte rate. Unlike
+/// `tokens_at`-based calculations, this retains the items themselves (summaries, etc.) rather
+/// than dropping the entire range.
 pub(crate) fn savings_for_prune_impl(
     history: &[Item],
     records: &[UsageRecord],
@@ -218,9 +208,9 @@ pub(crate) fn savings_for_prune_impl(
         };
     }
 
-    // 最新の measurement を使って tokens/byte を求め、バイト差分を換算する。
-    // 実測値そのものではなく比率しか使わないので、history_len と
-    // record.history_len が一致しなくても rate は正しい。
+    // Convert byte differences using the latest measurement's tokens/byte rate.
+    // Only the ratio, not the measurement itself, is used, so the rate remains
+    // valid even when history_len differs from record.history_len.
     let prefix = prefix_bytes(history);
     let last = records.last().expect("records non-empty");
     let ref_bytes = prefix[last.history_len.min(history.len())];
@@ -240,31 +230,30 @@ pub(crate) fn savings_for_prune_impl(
     TokenEstimate { tokens, source }
 }
 
-// ── Worker に生やす公開 API ───────────────────────────────────────────────
+// ── Public Worker APIs ───────────────────────────────────────────────
 
 impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
-    /// 現在の history 全体の推定トークン数。
+    /// Estimated tokens for the entire current history.
     ///
-    /// 最後の measurement と、その後に追加された未測定分の byte/4 外挿。
+    /// Uses the last measurement plus byte/4 extrapolation for subsequent unmeasured additions.
     pub fn total_tokens(&self) -> TokenEstimate {
         let usage = self.usage_history();
         agen::token_counter::total_tokens(&self.history(), &usage)
     }
 
-    /// 任意の history index 時点でのプロンプト全長推定。
+    /// Estimate full prompt length at any history index.
     ///
-    /// `total_tokens()` と同じ accounting を任意位置で評価する版。
-    /// memory extract trigger が
-    /// `total_tokens_at(now) - total_tokens_at(pointer)` で
-    /// pointer 以降に増えたプロンプト長を測るのに使う。
+    /// Evaluates the same accounting as `total_tokens()` at an arbitrary position.
+    /// Memory extraction triggers use `total_tokens_at(now) - total_tokens_at(pointer)`
+    /// to measure prompt growth since the pointer.
     pub fn total_tokens_at(&self, history_len: usize) -> TokenEstimate {
         let usage = self.usage_history();
         agen::token_counter::total_tokens_at(&self.history(), &usage, history_len)
     }
 
-    /// 末尾から `retained` トークン以上を残すための分割位置。
+    /// Split position retaining at least `retained` tokens from the tail.
     ///
-    /// `history[..cut.index]` が要約／破棄される側、`history[cut.index..]` が残る側。
+    /// `history[..cut.index]` is summarized/discarded; `history[cut.index..]` is retained.
     pub fn split_for_retained(&self, retained: u64) -> SplitPoint {
         let usage = self.usage_history();
         split_for_retained_impl(&self.history(), &usage, retained)
@@ -496,10 +485,10 @@ mod tests {
     #[test]
     fn balance_retreats_from_inside_parallel_tool_results() {
         // [Msg, TC_a, TC_b, TC_c, TR_a, TR_b, TR_c]
-        // cut=5 → retained=[TR_b, TR_c]。TR_c の TC は idx=3、TR_b は idx=2 →
-        // idx=2 まで後退。だが retained に TR_a (idx=4) が新たに入り、その TC_a
-        // は idx=1 でまだ外 → 連鎖後退で最終的に idx=1。retained は
-        // [TC_a, TC_b, TC_c, TR_a, TR_b, TR_c]。
+        // cut=5 -> retained=[TR_b, TR_c]. TR_c's TC is at idx=3, TR_b's at idx=2,
+        // so retreat to idx=2. This now retains TR_a (idx=4), whose TC_a at idx=1
+        // is still outside. Cascading retreat ends at idx=1, retaining
+        // [TC_a, TC_b, TC_c, TR_a, TR_b, TR_c].
         let history = vec![
             msg("u"),
             tc("a"),
@@ -514,47 +503,47 @@ mod tests {
 
     #[test]
     fn balance_retreats_between_call_and_result() {
-        // [TC_a, TR_a, TC_b, TR_b]。cut=3 → retained=[TR_b] orphan。
-        // TC_b は idx=2 → cut=2。retained=[TC_b, TR_b]。
+        // [TC_a, TR_a, TC_b, TR_b]. cut=3 -> retained=[TR_b], an orphan.
+        // TC_b is at idx=2 -> cut=2, retained=[TC_b, TR_b].
         let history = vec![tc("a"), tr("a"), tc("b"), tr("b")];
         assert_eq!(balance_to_pair_boundary(&history, 3), 2);
     }
 
     #[test]
     fn balance_cascades_through_nested_pairs() {
-        // [TC_a, TC_b, TR_b, TR_a, TC_c, TR_c]。cut=3 → retained=[TR_a, TC_c, TR_c]。
-        // TR_a の TC は idx=0 → cut=0。retained=full。
+        // [TC_a, TC_b, TR_b, TR_a, TC_c, TR_c]. cut=3 -> retained=[TR_a, TC_c, TR_c].
+        // TR_a's TC is at idx=0 -> cut=0, retaining everything.
         let history = vec![tc("a"), tc("b"), tr("b"), tr("a"), tc("c"), tr("c")];
         assert_eq!(balance_to_pair_boundary(&history, 3), 0);
     }
 
     #[test]
     fn balance_noop_when_cut_at_pair_boundary() {
-        // [TC_a, TR_a, Msg, TC_b, TR_b]。cut=2 → retained=[Msg, TC_b, TR_b] balanced。
+        // [TC_a, TR_a, Msg, TC_b, TR_b]. cut=2 -> retained=[Msg, TC_b, TR_b], balanced.
         let history = vec![tc("a"), tr("a"), msg("u"), tc("b"), tr("b")];
         assert_eq!(balance_to_pair_boundary(&history, 2), 2);
     }
 
     #[test]
     fn balance_handles_orphan_result_without_matching_call() {
-        // ToolCall がそもそも存在しない ToolResult は触らない（壊れた history は
-        // ここでは直しようがない）。cut=1 → そのまま 1 を返す。
+        // Leave ToolResults with no matching ToolCall untouched; broken history cannot
+        // be repaired here. cut=1 -> return 1 unchanged.
         let history = vec![msg("u"), tr("zombie")];
         assert_eq!(balance_to_pair_boundary(&history, 1), 1);
     }
 
     #[test]
     fn balance_keeps_cut_when_call_is_inside_retained() {
-        // [Msg, TC_a, TR_a]。cut=1 → retained=[TC_a, TR_a]。TR_a の call_pos=1 >= idx=1。OK。
+        // [Msg, TC_a, TR_a]. cut=1 -> retained=[TC_a, TR_a]. TR_a's call_pos=1 >= idx=1: OK.
         let history = vec![msg("u"), tc("a"), tr("a")];
         assert_eq!(balance_to_pair_boundary(&history, 1), 1);
     }
 
     #[test]
     fn split_for_retained_aligns_to_pair_boundary() {
-        // 並列 TC*3 / TR*3 ターン後に Msg を 1 件足し、retained=Msg のサイズ相当に
-        // 設定。トークン的には cut=末尾近くだが、orphan を避けるため TC 群の手前
-        // まで後退するはず。
+        // Add one Msg after a parallel TC*3 / TR*3 turn and set retained to its size.
+        // The token-only cut is near the tail, but should retreat before the TC group
+        // if needed to avoid orphans.
         let history = vec![
             msg("user"),
             tc("a"),
@@ -567,16 +556,15 @@ mod tests {
         ];
         let total_bytes: u64 = history.iter().map(item_bytes).sum();
         let records = vec![record(history.len(), total_bytes)]; // rate = 1 tok/byte
-        // tail の item_bytes 相当のみ retain したい。
+        // Retain only the tail's item_bytes equivalent.
         let tail_tokens = item_bytes(&history[7]);
         let cut = split_for_retained_impl(&history, &records, tail_tokens);
-        // token 単独だと cut は 7（tail のみ retained）になるが、retained 先頭が
-        // Msg なら balance しなくて OK。balance helper の no-op を確認する意味も込めて
-        // index == 7 を期待する。
+        // Tokens alone give cut=7 (only the tail retained). A retained head of Msg needs
+        // no balancing. Expect index == 7, also checking the balance helper's no-op.
         assert_eq!(cut.index, 7);
 
-        // 逆に retained をやや増やしてトークン的に cut=6（TR_c のみ retained）に
-        // させると、TR_c は orphan なので balance が 1 まで後退するはず。
+        // Slightly increasing retained gives token-only cut=6 (TR_c alone from the tool turn).
+        // TR_c is an orphan, so balancing should retreat to 1.
         let big_retain = tail_tokens + item_bytes(&history[6]);
         let cut = split_for_retained_impl(&history, &records, big_retain);
         assert_eq!(cut.index, 1);

@@ -1,9 +1,12 @@
-//! HTTP transport contract and client for remote Workdir sessions.
+//! HTTP contracts and an optional client for remote Workdir sessions.
 //!
-//! The protocol keeps filesystem/search/process operations provider-side: one
-//! [`WorkdirSessionOperation`] is one bounded HTTP request. The HTTP client is
-//! optional so Runtime servers can share these DTOs without depending on a
-//! client stack.
+//! Keeps filesystem/search/process operations provider-side and pairs typed operations with results.
+//! The optional client lets Runtime share DTOs without the client stack. Lost mutation responses,
+//! decode failures, or pairing mismatches after dispatch yield OutcomeUnknown; no automatic resend.
+//!
+//! Denial reasons travel as an optional closed enum; provider free text maps to safe vocabulary.
+//! Missing reasons stay unknown. Diagnostic wrappers preserve original classifications such as
+//! Conflict/OutcomeUnknown and do not infer meaning from unknown reason strings.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

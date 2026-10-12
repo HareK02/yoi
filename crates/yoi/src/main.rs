@@ -1,3 +1,8 @@
+//! Parses product commands and dispatches to typed client/TUI/Runtime entry points.
+//!
+//! Binary-name and top-level argument interpretation stay here, separate from
+//! execution in lower-level crates.
+
 mod cli_connection;
 mod mcp_cli;
 mod objective_cli;

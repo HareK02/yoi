@@ -174,7 +174,7 @@ impl SegmentLogSink {
     ///
     /// Used by restore paths that load a session's complete log into
     /// the mirror before any subscriber is connected. Callers that need
-    /// to notify existing subscribers should use [`reset_with_initial`].
+    /// to notify existing subscribers should use [`Self::reset_with_initial`].
     pub fn replace_silent(&self, entries: Vec<LogEntry>) {
         let mut mirror = self
             .inner

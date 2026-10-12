@@ -1,3 +1,9 @@
+/** Workspaceごとに共有するsubscription transport。
+ * 受信frameをRust生成validatorと保持中selectorの両方で検査する。
+ * 不正frameは共有socketを固定診断で閉じ、再接続時にroutingを消してsnapshotを取り直す。
+ * 正常なsubscription_closedは対象subscriptionだけを終了または再購読する。
+ * 送信Methodの実行時decodeと意味検査はRust Serverが所有する。
+ */
 import { browser } from "$app/env";
 import type {
   EventSubscriptionSelector,

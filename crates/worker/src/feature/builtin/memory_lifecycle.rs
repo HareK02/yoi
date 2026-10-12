@@ -1,3 +1,17 @@
+//! Memory extraction lifecycle using committed runs and a restricted Internal Worker.
+//!
+//! Worker core owns only generic hook/task/session plumbing; this Feature owns extraction targets,
+//! audit, and pointers. Workspace Memory and Subjektiv have separate pointer domains and are never
+//! simultaneous automatic extraction targets. Extraction uses the parent's committed capture and
+//! resolved evidence, not uncommitted child Worker output.
+//!
+//! Pointers advance only on success with explicit FinishMemoryExtraction, not mere Engine completion.
+//! Generation fences and cancellation are checked; extensions append only when the capture's Segment
+//! matches the current one, preventing pre-rewrite extraction results from marking ranges processed
+//! in a new Segment. Candidate staging is an independent durable write before Finish, so later
+//! failure, cancellation, or fence loss does not roll it back. Retries without pointer advancement
+//! can produce semantic duplicates; consolidation owns candidate comparison.
+
 use std::sync::Arc;
 use std::time::Duration;
 

@@ -1,16 +1,16 @@
-//! [`ModelManifest`] を [`Box<dyn LlmClient>`] に落とす worker-side factory。
+//! Worker-side factory converting [`ModelManifest`] into [`Box<dyn LlmClient>`].
 //!
-//! 段階:
-//! 1. `ModelManifest` を [`catalog::resolve_model_manifest`] で
-//!    カタログ込み [`ModelConfig`] に解決（ref → 展開 / inline → 検証）
-//! 2. `AuthRef` を local secret store / ファイルから解決して [`ResolvedAuth`] に
-//! 3. `scheme.required_auth()` と解決値を照合（非対応組合せは構築エラー）
-//! 4. `ModelCapability` は manifest 明示 > model catalog > provider
-//!    default_capability > scheme 既定 の順でフォールバック（上位 3 段は
-//!    `catalog::resolve_model_manifest` が [`ModelConfig`] に詰め込む）
+//! Steps:
+//! 1. Resolve `ModelManifest` through [`catalog::resolve_model_manifest`] into catalog-aware
+//!    [`ModelConfig`] (expand refs; validate inline configuration).
+//! 2. Resolve `AuthRef` from the local secret store / files into [`ResolvedAuth`].
+//! 3. Check the resolved value against `scheme.required_auth()`; unsupported pairs fail construction.
+//! 4. `ModelCapability` falls back in order: explicit manifest > model catalog > provider
+//!    default_capability > scheme default. `catalog::resolve_model_manifest` puts the first three
+//!    levels into [`ModelConfig`].
 //!
-//! agen は低レベル基盤に留める方針なので、高レベル側で必要に
-//! なる認証ストア解決と secret store 解決は worker 側で行う。
+//! agen remains low-level infrastructure; worker handles the higher-level auth-store and secret-store
+//! resolution.
 
 use std::sync::Arc;
 
@@ -30,7 +30,7 @@ use secrets::{SecretStore, SecretValue};
 
 pub use manifest::model_catalog::{ModelConfig, ResolveError as CatalogResolveError};
 
-/// プロバイダ構築時のエラー。
+/// Errors during provider construction.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("model configuration error: {0}")]
@@ -56,7 +56,7 @@ pub enum ProviderError {
     ManifestResolve(#[from] catalog::ResolveError),
 }
 
-/// `AuthRef` をランタイムで使える [`ResolvedAuth`] に解決する。
+/// Resolve `AuthRef` into runtime-usable [`ResolvedAuth`].
 fn resolve_auth(scheme: SchemeKind, auth: &AuthRef) -> Result<ResolvedAuth, ProviderError> {
     let resolver = DefaultSecretResolver;
     resolve_auth_with_resolver(scheme, auth, &resolver)
@@ -123,9 +123,9 @@ fn resolve_auth_with_resolver(
     }
 }
 
-/// `AuthRef::CodexOAuth` 指定時、`base_url` 未指定なら ChatGPT backend を既定とする。
-/// Codex CLI が使う `/backend-api/codex` を base に取り、scheme 側の `/responses`
-/// path と結合して `https://chatgpt.com/backend-api/codex/responses` になる。
+/// `AuthRef::CodexOAuth` defaults to the ChatGPT backend when `base_url` is unset.
+/// The Codex CLI base `/backend-api/codex` combines with the scheme's `/responses` path
+/// to form `https://chatgpt.com/backend-api/codex/responses`.
 fn effective_base_url<S: Scheme>(scheme: &S, config: &ModelConfig) -> String {
     if let Some(b) = &config.base_url {
         return b.clone();
@@ -147,11 +147,11 @@ fn build_transport<S: Scheme>(
             scheme: config.scheme,
         });
     }
-    // capability の優先順位 (上位 3 段は `ModelConfig` に既に反映済み):
-    //   1. manifest 明示
+    // Capability precedence (the first three levels are already reflected in `ModelConfig`):
+    //   1. explicit manifest
     //   2. model catalog
     //   3. provider.default_capability
-    //   4. `Scheme::default_capability()`（scheme ごとの wire-level 安全側）
+    //   4. `Scheme::default_capability()` (scheme-specific conservative wire-level default)
     let capability: ModelCapability = config
         .capability
         .clone()
@@ -191,9 +191,8 @@ fn build_from_config(config: &ModelConfig) -> Result<Box<dyn LlmClient>, Provide
             TransportPolicy::standard(),
         ),
         SchemeKind::OpenaiResponses => {
-            // ChatGPT backend (codex-oauth) は `max_output_tokens` /
-            // `temperature` / `top_p` を 400 で弾くため、その経路では
-            // 送出を止める。
+            // The ChatGPT backend (codex-oauth) rejects `max_output_tokens`,
+            // `temperature`, and `top_p` with HTTP 400; omit them on that path.
             let send_to_official = !matches!(config.auth, AuthRef::CodexOAuth);
             let scheme = OpenAIResponsesScheme::new()
                 .with_send_max_output_tokens(send_to_official)
@@ -208,17 +207,16 @@ fn build_from_config(config: &ModelConfig) -> Result<Box<dyn LlmClient>, Provide
     }
 }
 
-/// [`ModelManifest`] から [`LlmClient`] を構築する。ref / inline の
-/// いずれも受け取り、カタログ解決は内部で行う。
+/// Build an [`LlmClient`] from a [`ModelManifest`], accepting refs or inline configuration
+/// and resolving the catalog internally.
 pub fn build_client(manifest: &ModelManifest) -> Result<Box<dyn LlmClient>, ProviderError> {
     let config = catalog::resolve_model_manifest(manifest)?;
     build_from_config(&config)
 }
 
-/// 既に解決済みの [`ModelConfig`] から [`LlmClient`] を構築する。
-/// `ModelManifest` から既に `catalog::resolve_model_manifest` を通した
-/// ケース（factory / spawn 経路でカタログ引きを 1 回だけにしたい等）で
-/// 使う。
+/// Build an [`LlmClient`] from an already resolved [`ModelConfig`].
+/// Use when `ModelManifest` has already passed through `catalog::resolve_model_manifest`,
+/// for example to resolve the catalog only once in factory / spawn paths.
 pub fn build_client_from_config(config: &ModelConfig) -> Result<Box<dyn LlmClient>, ProviderError> {
     build_from_config(config)
 }
@@ -360,7 +358,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _guard = ConfigDirGuard::new(dir.path());
 
-        // Ollama は AuthRef::None で構築できる end-to-end path。
+        // End-to-end path building Ollama with AuthRef::None.
         let manifest = ModelManifest {
             ref_: Some("ollama-local/llama3.1".into()),
             ..Default::default()
@@ -379,7 +377,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _guard = ConfigDirGuard::new(dir.path());
 
-        // Form C: 完全直書き。Ollama 相当を AuthRef::None で構築。
+        // Form C: fully inline. Build an Ollama equivalent with AuthRef::None.
         let manifest = ModelManifest {
             scheme: Some(SchemeKind::Anthropic),
             base_url: Some("http://localhost:11434".into()),
@@ -397,7 +395,7 @@ mod tests {
 
     #[test]
     fn ollama_config_succeeds_without_key() {
-        // Ollama = Anthropic scheme + base_url 差し替え + AuthRef::None
+        // Ollama = Anthropic scheme + overridden base_url + AuthRef::None
         let config = ModelConfig {
             scheme: SchemeKind::Anthropic,
             base_url: Some("http://localhost:11434".into()),

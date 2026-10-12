@@ -1,8 +1,8 @@
-//! Codex OAuth サブモジュール内部のエラー型。
+//! Internal error types for the Codex OAuth submodule.
 //!
-//! `LlmClient` 境界に渡す際は `to_client_error` で `ClientError` に
-//! 変換する。`Permanent` 系（refresh_token 失効）は `codex login` の
-//! 再実行案内付きメッセージにする。
+//! Convert to `ClientError` using `to_client_error` at the `LlmClient`
+//! boundary. `Permanent` errors (invalidated refresh_token) include
+//! a message instructing the user to run `codex login` again.
 
 use std::path::PathBuf;
 
@@ -25,7 +25,7 @@ pub enum CodexAuthError {
     #[error("token refresh failed (transient): {0}")]
     RefreshTransient(String),
 
-    /// refresh_token が永続的に失効。再ログインが必要。
+    /// refresh_token is permanently invalidated. Logging in again is required.
     #[error("token refresh failed permanently ({reason:?}): {message}")]
     RefreshPermanent {
         reason: PermanentReason,
@@ -45,7 +45,7 @@ pub enum PermanentReason {
 }
 
 impl CodexAuthError {
-    /// `LlmClient` トランスポート境界向けに変換する。
+    /// Convert for the `LlmClient` transport boundary.
     pub fn to_client_error(self) -> ClientError {
         match self {
             CodexAuthError::NotLoggedIn(_)

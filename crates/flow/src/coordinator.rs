@@ -1,3 +1,18 @@
+//! Builds transition attempts from pinned Flow definitions and chooses destinations
+//! from complete verdict sets.
+//!
+//! Callers do not specify a target state: an attempt pins every outgoing condition
+//! of the current state. Each condition needs exactly one result, with no duplicate,
+//! missing, or unknown IDs. Entry requires exactly one Met result and no
+//! Indeterminate results. Verifier failures, cancellations, and incomplete responses
+//! are not successful transitions.
+//!
+//! Checks the instance, active attempt, definition digest, and captured state so old
+//! verifier results cannot apply to new attempts, even after returning to the same
+//! state. Event sequences track append order, not freshness or source identity.
+//! This module performs typed state transformations; callers own persistence,
+//! verifier startup, and business side effects.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -198,11 +213,13 @@ pub struct FlowRuntimeEvent {
     pub event: FlowEventKind,
 }
 
-/// Durable Flow authority owned by one Runtime Worker.
+/// Flow state durably owned by one Runtime Worker.
 ///
-/// Workspace authority resolves the exact source content, but never mutates
-/// this value. Runtime persists the complete snapshot with the Worker session
-/// and replaces it only after the corresponding session-log write succeeds.
+/// Pins the resolved definition and digest to the instance, so source edits do not
+/// change existing instances. Callers prepare new state on a clone and replace live
+/// state only after a successful Session write. Recover verifying attempts after
+/// restoration rather than creating competing attempts. Events reject reused attempt
+/// IDs even after failure/cancellation. Stopping a Worker does not transfer state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlowRuntimeState {
     pub definition: CompiledFlowDefinition,
@@ -253,8 +270,7 @@ impl FlowRuntimeState {
         ))
     }
 
-    /// Begin a new attempt, or return the persisted active attempt after a
-    /// Runtime/Worker restore. A recovered attempt is never rewritten.
+    /// Starts a new attempt or returns the restored active attempt unchanged.
     pub fn begin_or_recover_transition(
         &mut self,
         attempt_id: impl Into<String>,

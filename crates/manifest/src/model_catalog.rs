@@ -1,17 +1,17 @@
-//! プロバイダ / モデルカタログ。
+//! Provider / model catalogs.
 //!
-//! - builtin プロバイダ: `resources/providers/builtin.toml`
-//! - builtin モデル:    `resources/models/builtin.toml`
+//! - builtin providers: `resources/providers/builtin.toml`
+//! - builtin models:    `resources/models/builtin.toml`
 //! - user override:     `<config_dir>/{providers,models}.toml`
 //!
-//! `<config_dir>` の解決は [`crate::paths::config_dir`] を参照。
-//! どちらの override も「あれば builtin を置換、無ければ builtin」と
-//! いう一方向の差し替え（マージしない）。providers / models は独立に
-//! 読み、片方だけ user override も可。
+//! See [`crate::paths::config_dir`] for `<config_dir>` resolution. Each override
+//! replaces its builtin catalog if present, otherwise the builtin is used; no
+//! merging occurs. Provider and model catalogs load independently, so either
+//! can be overridden alone.
 //!
-//! [`resolve_model_manifest`] が [`crate::ModelManifest`]（ref / inline
-//! 両形）を最終的な [`ModelConfig`] に解決する単一の入口で、wire 層
-//! に渡す前のバリデーションもここで行う。
+//! [`resolve_model_manifest`] is the single entry point for resolving either ref
+//! or inline [`crate::ModelManifest`] declarations into a final [`ModelConfig`],
+//! including validation before passing it to the wire layer.
 
 use std::path::{Path, PathBuf};
 
@@ -45,9 +45,8 @@ pub enum CatalogError {
     BuiltinParse(#[source] toml::de::Error),
 }
 
-/// マニフェスト解決時のエラー。`ModelManifest` がカタログ参照を満たせ
-/// ない、あるいは inline フォームでも必須フィールドが揃わない場合に
-/// 返す。
+/// Manifest resolution error: `ModelManifest` cannot satisfy a catalog reference
+/// or an inline declaration is missing required fields.
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
     #[error("failed to load provider catalog: {0}")]
@@ -62,15 +61,14 @@ pub enum ResolveError {
     InlineMissing(&'static str),
 }
 
-/// UI 向けの認証ヒント。
+/// UI authentication hint.
 ///
-/// 「何を表示・要求するか」のメタ情報で、ランタイムの [`AuthRef`]
-/// とは責務が別。1:1 の対応関係にあり、[`auth_hint_to_ref`] / [`AuthHint`]
-/// 解決経路で相互変換される。
+/// Metadata describing what to display/request, separate from runtime [`AuthRef`].
+/// Maps 1:1 to it via `auth_hint_to_ref` during resolution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuthHint {
-    /// 認証不要（ローカル Ollama 等）
+    /// No authentication required (e.g. local Ollama).
     None,
     /// API key file reference. Normal credential configuration should prefer
     /// [`AuthHint::SecretRef`] so plaintext credentials stay out of manifests.
@@ -82,12 +80,12 @@ pub enum AuthHint {
         #[serde(rename = "ref")]
         ref_: String,
     },
-    /// ChatGPT OAuth（`~/.codex/auth.json`）
+    /// ChatGPT OAuth (`~/.codex/auth.json`)
     #[serde(rename = "codex_oauth")]
     CodexOAuth,
 }
 
-/// プロバイダカタログの 1 エントリ。
+/// One provider catalog entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderEntry {
     pub id: String,
@@ -96,43 +94,41 @@ pub struct ProviderEntry {
     #[serde(default)]
     pub base_url: Option<String>,
     pub auth_hint: AuthHint,
-    /// モデルカタログ未登録モデルでこの provider が使われたとき
-    /// （ref で provider はあるが model 行は無い等）のフォールバック。
-    /// 省略時は `Scheme::default_capability()` を最終フォールバックに
-    /// 使う。
+    /// Fallback when this provider serves a model absent from the model catalog
+    /// (e.g. a ref has a provider but no model entry). If omitted,
+    /// `Scheme::default_capability()` is the final fallback.
     #[serde(default)]
     pub default_capability: Option<ModelCapability>,
-    /// モデルカタログ未登録モデルで使う既定の context window。省略時は
-    /// [`DEFAULT_CONTEXT_WINDOW`] を使う。
+    /// Default context window for models absent from the model catalog.
+    /// Uses [`DEFAULT_CONTEXT_WINDOW`] if omitted.
     #[serde(default)]
     pub default_context_window: Option<u64>,
 }
 
-/// モデルカタログの 1 エントリ。
+/// One model catalog entry.
 ///
-/// `id` は **provider 内ユニーク**。同じ `gpt-5` が異なる provider に
-/// 存在するのは OK で、ref が必ず `<provider>/<model_id>` を含むため
-/// 曖昧性が出ない。
+/// `id` is **unique within a provider**. The same `gpt-5` may appear under different
+/// providers without ambiguity, since refs always include `<provider>/<model_id>`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelEntry {
     pub id: String,
     pub provider: String,
-    /// モデル単位の capability override。省略時は
-    /// `ProviderEntry::default_capability` にフォールバックする。
+    /// Per-model capability override, falling back to
+    /// `ProviderEntry::default_capability` if omitted.
     #[serde(default)]
     pub capability: Option<ModelCapability>,
-    /// モデル単位の context window。省略時は provider default → builtin
-    /// fallback にフォールバックする。実効値は `max_context_window` で clamp
-    /// される。
+    /// Per-model context window. If omitted, falls back to the provider default,
+    /// then the builtin fallback. The effective value is clamped by
+    /// `max_context_window`.
     #[serde(default)]
     pub context_window: Option<u64>,
-    /// backend が実際に受け付ける context window の上限。UI や pre-request
-    /// safety は希望値ではなく clamp 済みの実効値を使う。
+    /// Maximum context window actually accepted by the backend. UI and
+    /// pre-request safety checks use the clamped effective value, not the desired one.
     #[serde(default)]
     pub max_context_window: Option<u64>,
 }
 
-/// 解決済みモデル設定。`build_client` が消費する完成形。
+/// Resolved model configuration, ready for `build_client`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelConfig {
     pub scheme: SchemeKind,
@@ -158,7 +154,7 @@ struct ModelCatalogFile {
     model: Vec<ModelEntry>,
 }
 
-/// `auth_hint` に対応する [`AuthRef`] のひな型を返す。
+/// Returns an [`AuthRef`] template corresponding to `auth_hint`.
 fn auth_hint_to_ref(hint: &AuthHint) -> AuthRef {
     match hint {
         AuthHint::None => AuthRef::None,
@@ -170,13 +166,11 @@ fn auth_hint_to_ref(hint: &AuthHint) -> AuthRef {
 
 // --- providers ---------------------------------------------------------------
 
-/// builtin + user override を解決して provider カタログを返す。
+/// Returns the provider catalog after resolving builtin + user overrides.
 ///
-/// user override (`<config_dir>/providers.toml`) が存在すれば builtin
-/// を置き換える。存在しなければ builtin のみ。user override が存在
-/// するが壊れている場合はエラーを返す（silent fallback はしない —
-/// ユーザーが書いた設定が silent に無視されて builtin に戻る挙動は
-/// 気付きにくいため）。
+/// A user override (`<config_dir>/providers.toml`) replaces the builtin if present;
+/// otherwise only the builtin is used. An invalid override returns an error rather
+/// than silently falling back, since ignoring user configuration is hard to notice.
 pub fn load_providers() -> Result<Vec<ProviderEntry>, CatalogError> {
     if let Some(path) = crate::paths::user_catalog_override("providers.toml")
         && path.is_file()
@@ -186,14 +180,14 @@ pub fn load_providers() -> Result<Vec<ProviderEntry>, CatalogError> {
     load_builtin_providers()
 }
 
-/// builtin provider カタログのみを返す。
+/// Returns only the builtin provider catalog.
 pub fn load_builtin_providers() -> Result<Vec<ProviderEntry>, CatalogError> {
     let parsed: ProviderCatalogFile =
         toml::from_str(BUILTIN_PROVIDERS).map_err(CatalogError::BuiltinParse)?;
     Ok(parsed.provider)
 }
 
-/// 指定パスから provider カタログを読む。
+/// Reads a provider catalog from the given path.
 pub fn load_providers_from(path: &Path) -> Result<Vec<ProviderEntry>, CatalogError> {
     let text = std::fs::read_to_string(path).map_err(|source| CatalogError::Io {
         path: path.to_path_buf(),
@@ -209,7 +203,7 @@ pub fn load_providers_from(path: &Path) -> Result<Vec<ProviderEntry>, CatalogErr
 
 // --- models ------------------------------------------------------------------
 
-/// builtin + user override を解決してモデルカタログを返す。
+/// Returns the model catalog after resolving builtin + user overrides.
 pub fn load_models() -> Result<Vec<ModelEntry>, CatalogError> {
     if let Some(path) = crate::paths::user_catalog_override("models.toml")
         && path.is_file()
@@ -219,14 +213,14 @@ pub fn load_models() -> Result<Vec<ModelEntry>, CatalogError> {
     load_builtin_models()
 }
 
-/// builtin model カタログのみを返す。
+/// Returns only the builtin model catalog.
 pub fn load_builtin_models() -> Result<Vec<ModelEntry>, CatalogError> {
     let parsed: ModelCatalogFile =
         toml::from_str(BUILTIN_MODELS).map_err(CatalogError::BuiltinParse)?;
     Ok(parsed.model)
 }
 
-/// 指定パスからモデルカタログを読む。
+/// Reads a model catalog from the given path.
 pub fn load_models_from(path: &Path) -> Result<Vec<ModelEntry>, CatalogError> {
     let text = std::fs::read_to_string(path).map_err(|source| CatalogError::Io {
         path: path.to_path_buf(),
@@ -239,12 +233,12 @@ pub fn load_models_from(path: &Path) -> Result<Vec<ModelEntry>, CatalogError> {
     Ok(parsed.model)
 }
 
-// --- ref 解決 / マニフェスト → ModelConfig ---------------------------------
+// --- ref resolution / manifest → ModelConfig ---------------------------------
 
-/// `<provider_id>/<model_id>` の最初の `/` で 1 回だけ split する。
-/// OpenRouter の `openrouter/anthropic/claude-sonnet-4.6` のように
-/// model_id に `/` を含むケースは、provider=`openrouter`、
-/// model_id=`anthropic/claude-sonnet-4.6` として通る。
+/// Splits `<provider_id>/<model_id>` once, at the first `/`.
+/// Model IDs containing `/`, such as OpenRouter's
+/// `openrouter/anthropic/claude-sonnet-4.6`, resolve as provider=`openrouter`,
+/// model_id=`anthropic/claude-sonnet-4.6`.
 fn split_ref(s: &str) -> Option<(&str, &str)> {
     let (provider, rest) = s.split_once('/')?;
     if provider.is_empty() || rest.is_empty() {
@@ -253,30 +247,30 @@ fn split_ref(s: &str) -> Option<(&str, &str)> {
     Some((provider, rest))
 }
 
-/// `ModelManifest` をカタログ込みで解決し、最終 [`ModelConfig`] を返す。
+/// Resolves `ModelManifest` against catalogs into a final [`ModelConfig`].
 ///
-/// - **`ref` あり** → provider カタログを引き、未登録なら hard error。
-///   model カタログは未登録でも warn ログだけに留め、`provider.default_capability`
-///   にフォールバック（タイポで動く可能性は API 側 `model not found` で
-///   結果的に検出されるため）。
-/// - **`ref` なし** → `scheme` / `model_id` / `auth` の 3 つが揃って
-///   いることを検証し、そのまま `ModelConfig` を組む。
+/// - **With `ref`**: looks up the provider; an unknown provider is a hard error.
+///   A missing model entry only logs a warning and falls back to
+///   `provider.default_capability` (typos are eventually caught by the API's
+///   `model not found` error).
+/// - **Without `ref`**: requires `scheme` / `model_id` / `auth` and builds
+///   `ModelConfig` directly.
 ///
-/// 各フィールドの解決順は ticket の表に準拠:
-/// scheme/base_url は manifest 明示 > provider、model_id は manifest 明示 > ref、
-/// auth は manifest 明示 > provider.auth_hint 由来、capability は
-/// manifest 明示 > model catalog > provider.default_capability >
-/// （`build_client` 側で）`Scheme::default_capability()`。
-/// context_window は manifest 明示 > model catalog > provider default >
-/// [`DEFAULT_CONTEXT_WINDOW`]。実効 context_window は manifest/model の
-/// max_context_window で clamp される。
+/// Field precedence:
+/// scheme/base_url: explicit manifest > provider; model_id: explicit manifest > ref;
+/// auth: explicit manifest > provider.auth_hint; capability:
+/// explicit manifest > model catalog > provider.default_capability >
+/// `Scheme::default_capability()` (in `build_client`).
+/// context_window: explicit manifest > model catalog > provider default >
+/// [`DEFAULT_CONTEXT_WINDOW`]. The effective context_window is clamped by the
+/// manifest/model max_context_window.
 pub fn resolve_model_manifest(manifest: &ModelManifest) -> Result<ModelConfig, ResolveError> {
     let providers = load_providers().map_err(ResolveError::LoadProviders)?;
     let models = load_models().map_err(ResolveError::LoadModels)?;
     resolve_with_catalogs(manifest, &providers, &models)
 }
 
-/// テスト等で in-memory カタログを差し込む解決経路。
+/// Resolution path accepting in-memory catalogs, e.g. for tests.
 pub fn resolve_with_catalogs(
     manifest: &ModelManifest,
     providers: &[ProviderEntry],
@@ -290,7 +284,7 @@ pub fn resolve_with_catalogs(
             .find(|p| p.id == provider_id)
             .ok_or_else(|| ResolveError::UnknownProvider(provider_id.to_string()))?;
 
-        // model 行は無くても続行可（warn ログ + provider.default_capability）。
+        // Missing model entries may proceed with a warning + provider.default_capability.
         let model_entry = models
             .iter()
             .find(|m| m.provider == provider_id && m.id == ref_model_id);
@@ -637,10 +631,9 @@ auth_hint = { kind = "none" }
         assert!(matches!(err, CatalogError::Parse { .. }));
     }
 
-    /// `YOI_CONFIG_DIR` を tempdir に向けるテストガード。
-    /// `paths::config_dir` は他の env (YOI_HOME / XDG_CONFIG_HOME)
-    /// より高優先で `YOI_CONFIG_DIR` を尊重するため、これだけで
-    /// 開発機の env 設定に左右されないテストになる。
+    /// Test guard pointing `YOI_CONFIG_DIR` to a temporary directory.
+    /// `paths::config_dir` prioritizes it over YOI_HOME / XDG_CONFIG_HOME,
+    /// isolating tests from the development machine's environment settings.
     struct ConfigDirGuard {
         prev: Option<String>,
     }
@@ -648,8 +641,8 @@ auth_hint = { kind = "none" }
     impl ConfigDirGuard {
         fn new(path: &Path) -> Self {
             let prev = std::env::var("YOI_CONFIG_DIR").ok();
-            // SAFETY: serial_test の `#[serial]` 属性で env を弄るテスト
-            // 同士は直列化される。
+            // SAFETY: serial_test's `#[serial]` attribute serializes tests that
+            // modify the environment.
             unsafe { std::env::set_var("YOI_CONFIG_DIR", path) };
             Self { prev }
         }
@@ -692,7 +685,7 @@ auth_hint = { kind = "none" }
     #[serial]
     fn load_falls_back_to_builtin_when_override_absent() {
         let dir = tempfile::tempdir().unwrap();
-        // override ファイルは作らない
+        // Do not create an override file.
         let _g = ConfigDirGuard::new(dir.path());
         let entries = load_providers().unwrap();
         assert!(!entries.is_empty());

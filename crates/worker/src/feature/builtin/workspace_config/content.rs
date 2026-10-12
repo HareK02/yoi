@@ -1,5 +1,22 @@
-//! Request-time logical subtree. Metadata is captured per resolution, never
-//! cached as authority; authorization and canonical tree CAS stay in Backend.
+//! Logical configuration subtree built per request from Backend metadata.
+//!
+//! Maps `/workspace-config` to the Backend's empty root path and children to canonical relative
+//! source paths. Connection, authorization, and node information are fetched at resolution, without
+//! permanent file inventory or authority caches. Read/write targets are fixed by selected routes;
+//! model arguments cannot override Workspace, connection, validator, or expected digest. Root mutation
+//! batches handle multiple sources and import references together, passing digest, entrypoints, and
+//! node state from one tree observation as preconditions to canonical commit.
+//!
+//! Path and root validators have different roles. Additional observations of other paths must match
+//! connection, root validator, digest, and entrypoints, never mixing snapshots in one batch.
+//! Backend whole-tree CAS is the final conflict boundary with UI/other Workers; local locks cannot
+//! replace it. Connection lifetimes and evaluation-contract changes can also cause staleness, so
+//! identical source bytes alone do not prove freshness. Post-call validators come from returned
+//! commit/read results, not subsequently read state.
+//!
+//! Explicit nonexistent paths provide create contracts bound to their absence observations.
+//! Oversized trees/paths/text/changes or invalid metadata are not published as complete observations.
+//! Only authorization denial maps to namespace absence; transport/Backend failures are not hidden as absence.
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 

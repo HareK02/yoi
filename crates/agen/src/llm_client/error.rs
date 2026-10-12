@@ -1,17 +1,22 @@
-//! LLMクライアントエラー型
+//! Report provider communication failures to turn control.
+//!
+//! Context limit rejections are classified from structured provider codes;
+//! fuzzy body matches must not imply success or retryability. The Engine maps
+//! client errors to typed execution results, which the host records as the Run's
+//! terminal outcome. Live diagnostic display and persistence are separate concerns.
 
 use std::{fmt, time::Duration};
 
-/// LLMクライアントのエラー
+/// LLM client error.
 #[derive(Debug)]
 pub enum ClientError {
-    /// HTTPリクエストエラー
+    /// HTTP request error.
     Http(reqwest::Error),
-    /// JSONパースエラー
+    /// JSON parse error.
     Json(serde_json::Error),
-    /// SSEパースエラー
+    /// SSE parse error.
     Sse(String),
-    /// APIエラー (プロバイダからのエラーレスポンス)
+    /// API error (an error response from the provider).
     Api {
         status: Option<u16>,
         code: Option<String>,
@@ -26,7 +31,7 @@ pub enum ClientError {
         phase: &'static str,
         timeout: Duration,
     },
-    /// 設定エラー
+    /// Configuration error.
     Config(String),
 }
 
@@ -137,16 +142,16 @@ pub(crate) fn is_image_size_diagnostic(code: Option<&str>, message: &str) -> boo
             || (message.contains("image dimensions") && message.contains("exceed")))
 }
 
-/// transient な失敗としてリトライ対象になるかを判定する。
+/// Determine whether a failure is transient and eligible for retry.
 ///
-/// 対象:
-/// - `Api { status }` のうち 408 / 425 / 429 / 500 / 502 / 503 / 504 / 529
-/// - `Http(reqwest::Error)` のうち `is_connect()` または `is_timeout()`
-/// - `Timeout { .. }` の lifecycle hard timeout
+/// Eligible failures:
+/// - `Api { status }` with 408 / 425 / 429 / 500 / 502 / 503 / 504 / 529.
+/// - `Http(reqwest::Error)` with `is_connect()` or `is_timeout()`.
+/// - Lifecycle hard timeouts from `Timeout { .. }`.
 ///
-/// それ以外（Json、Sse、Config、上記以外の Api ステータス）は false。
-/// SSE 読み出し開始後の失敗は呼び出し側で `Sse` として上に流すため、
-/// ここで対象外にしておけば自動的に弾かれる。
+/// Other failures (Json, Sse, Config, and other Api statuses) return false.
+/// Callers propagate failures after SSE reading begins as `Sse`, so excluding
+/// them here automatically prevents retries.
 pub fn is_retryable(error: &ClientError) -> bool {
     match error {
         ClientError::Api {

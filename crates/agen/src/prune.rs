@@ -1,19 +1,17 @@
-//! Prune — context projection for old tool-result content.
+//! Request-only omission of details from old tool results.
 //!
-//! LLM 送信時のコンテキストから古い [`Item::ToolResult`] の `content` を
-//! 省略して、コンテキスト窓のトークンを回収する。`summary` は残すので
-//! 「何が起きたか」の痕跡は保たれる。
+//! [`prunable_indices`] selects candidates while protecting a token budget at the
+//! history tail; [`project`] removes detailed text and attachments. Summaries remain
+//! visible to the model. Projection operates on a request-history clone, leaving
+//! stored history and annotations unchanged.
 //!
-//! # 設計方針
+//! This module does not own token measurements. The host supplies prefix and savings
+//! estimates; unavailable estimates or invalid boundaries produce no candidates.
+//! The Engine also checks savings to avoid invalidating the cache for little benefit.
 //!
-//! Prune は **コンテキスト射影** であり、history の変換ではない。
-//! この crate が提供するのは pure な候補抽出 [`prunable_indices`] のみで、
-//! 射影の適用は LLM に送る一時コンテキストに対してだけ行う。
-//! Engine の永続履歴は決して変更されない。
-//!
-//! 保護境界は末尾 token budget で決めるが、この crate は usage 履歴を
-//! 所有しない。prefix ごとの token 推定値と savings 推定は上位層から
-//! callback で注入される。
+//! Compaction, which stores a summary as a new segment, is a separate responsibility.
+//! Omitting already-consumed images likewise affects only the request projection,
+//! never the stored results.
 
 use serde::{Deserialize, Serialize};
 
@@ -36,27 +34,26 @@ pub type TokenEstimator = Box<dyn Fn(&[Item]) -> Vec<TokenEstimate> + Send + Syn
 /// Engine can make `min_savings` decisions without knowing about usage
 /// measurement sources. Return `0` to signal "no data / refuse to prune".
 ///
-/// 推定対象は「drop する範囲全体」ではなく「content を None にする差分」
-/// であることに注意。item 自体（summary 等）は残るので、この callback は
-/// 実際の projection と一致する savings を返す必要がある。
+/// Estimate the savings from removing details, not from dropping entire items.
+/// Items and their summaries remain, so this callback must match the actual projection.
 pub type SavingsEstimator = Box<dyn Fn(&[Item], &[usize]) -> u64 + Send + Sync>;
 
 /// Result of one prune evaluation pass, surfaced to the optional
 /// [`PruneObserver`] for instrumentation.
 ///
-/// Engine は LLM リクエストごとに 1 回 prune の評価をし、その結果を
-/// （observer が登録されていれば）この値で通知する。fire/skip の判定
-/// 結果と、判定材料になった候補数 / 推定 savings / 保護領域の先頭 index を持つ。
+/// The Engine evaluates pruning once per LLM request and reports this value if
+/// an observer is registered. It includes the decision and its inputs: candidate
+/// count, estimated savings, and the start index of the protected suffix.
 #[derive(Debug, Clone)]
 pub struct PruneEvaluation {
-    /// `prunable_indices` の長さ。`Skipped::NoCandidates` の時は 0。
+    /// Length of `prunable_indices`; zero for `SkippedNoCandidates`.
     pub candidate_count: usize,
-    /// 推定された savings (tokens)。`NoCandidates` の時は 0。
+    /// Estimated token savings; zero when there are no candidates.
     pub estimated_savings: u64,
-    /// Token budget で保護される suffix の先頭 item index。
-    /// usage 推定が `NoData` で境界が決まらない場合は `None`。
+    /// First item in the suffix protected by the token budget.
+    /// `None` when `NoData` estimates prevent determining the boundary.
     pub protected_start_index: Option<usize>,
-    /// 判定結果。
+    /// Evaluation outcome.
     pub decision: PruneDecision,
 }
 
@@ -64,13 +61,13 @@ pub struct PruneEvaluation {
 /// "fire vs skip" decision tree the Engine walks before each LLM request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PruneDecision {
-    /// `prunable_indices` が空 → 何もしない。
+    /// No projection: `prunable_indices` is empty.
     SkippedNoCandidates,
-    /// 候補はあったが推定 savings が `min_savings` 未満 → 何もしない。
+    /// No projection: candidates exist, but estimated savings are below `min_savings`.
     SkippedBelowMinSavings,
-    /// 候補があり savings >= min_savings → projection を適用した。
-    /// `pruned_count` は `project()` が実際に書き換えた item 数
-    /// （既に content=None だった候補は 0 計上）。
+    /// Applied projection because candidates exist and savings meet `min_savings`.
+    /// `pruned_count` counts items actually changed by `project()`;
+    /// candidates that already lack details contribute zero.
     Fired { pruned_count: usize },
 }
 
@@ -513,7 +510,7 @@ mod tests {
         let estimates = uniform_estimates(&items, 10);
         let candidates = prunable_indices(&items, 20, &estimates);
         assert_eq!(project(&mut items, &candidates), 1);
-        // 2 周目: 候補は一度の prunable_indices 結果を使い回しても 0 件。
+        // Second pass: reusing the same prunable_indices result changes zero items.
         assert_eq!(project(&mut items, &candidates), 0);
     }
 

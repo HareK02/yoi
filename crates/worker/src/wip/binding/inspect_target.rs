@@ -1,4 +1,9 @@
-//! Input-only compact Interface addresses. Never parse rendered signatures.
+//! Compact Interface addresses exclusively for Inspect input.
+//!
+//! `scope::name` preserves the explicit absolute scope and name exactly, rejecting scope inference,
+//! normalization, relative resolution, and operation suffixes. Special characters decode as JSON
+//! strings. Quoting an entire Object path containing `::` distinguishes it from an Interface address.
+//! Invalid Interface input never falls back to Object lookup; displayed signatures are not parsed.
 use super::{InterfaceReference, ToolError};
 
 #[derive(Debug, PartialEq, Eq)]

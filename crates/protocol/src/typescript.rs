@@ -173,11 +173,13 @@ pub fn generated_protocol_types() -> String {
     normalize_typescript(output)
 }
 
-/// Render the strict runtime validator paired with the generated declarations.
+/// Generates the Browser receive validator paired with TypeScript declarations.
 ///
-/// `schemars` projects the reachable Serde shape from [`SubscriptionFrame`]. The
-/// normalization closes every object and expands flattened enum payloads before
-/// embedding that schema into the dependency-free Browser validator template.
+/// Normalizes schemas reachable from [`SubscriptionFrame`] to Rust's actual wire shape.
+/// Corrects required/nullable fields and integer bounds rather than adopting Serde's
+/// decode-time omission rules as the receive contract. Expands common flattened-enum
+/// fields into each variant before closing objects, then embeds the schema in a
+/// validator template that rejects unknown fields.
 pub fn generated_protocol_validator() -> String {
     let mut schema = serde_json::to_value(schemars::schema_for!(SubscriptionFrame))
         .expect("SubscriptionFrame schema must serialize");
@@ -365,6 +367,8 @@ fn close_object_shapes(schema: &mut Value) {
     }
 }
 
+/// Makes schemas with `default: null` accept null in their types as well.
+/// A null default with a string-only or similar type would reject null sent by Rust.
 fn normalize_null_default(schema: &mut Map<String, Value>) {
     if schema.get("default") != Some(&Value::Null) || schema.contains_key("anyOf") {
         return;
@@ -386,6 +390,10 @@ fn normalize_null_default(schema: &mut Map<String, Value>) {
     }
 }
 
+/// Limits JSON integers to the intersection of Rust's type range and JavaScript's
+/// safe-integer range for TypeScript `number`. Never relaxes explicit bounds;
+/// rejects unknown formats during generation rather than emitting integer types
+/// with unknown ranges as if they could be validated.
 fn normalize_integer_format(schema: &mut Map<String, Value>) {
     let is_integer = match schema.get("type") {
         Some(Value::String(value)) => value == "integer",
@@ -426,6 +434,9 @@ fn tighten_numeric_bound(
     );
 }
 
+/// Serde decode-time defaults do not imply omitted fields on the wire.
+/// Restores fields with schema defaults to required to match the serialized shape.
+/// Does not fill missing fields with defaults in the Browser.
 fn require_serialized_defaults(schema: &mut Map<String, Value>) {
     if schema.get("type").and_then(Value::as_str) != Some("object") {
         return;

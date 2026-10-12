@@ -1,9 +1,36 @@
-//! Durable Backend-owned jobs executed by ordinary Runtime-managed Workers.
+//! Backend-owned Jobs with fixed input and execution limits.
 //!
-//! A job is durable intent. An attempt binds that intent to one dedicated
-//! Worker, and a result is accepted only through the fenced structured-result
-//! API below. Runtime lifecycle and final prose are deliberately not success
-//! authority.
+//! Jobs retain immutable input and final results. Each attempt binds one trial to a dedicated
+//! Runtime Worker, input digest, tracked submission identity, and deadline. Requesting and
+//! notification Workers are sources and destinations, not parents; stopping or removing them
+//! does not cancel the Job. Worker retention and execution lifecycle follow existing Runtime
+//! and Workspace resource management.
+//!
+//! # Replay and reevaluation
+//!
+//! Replaying the same Job ID and fingerprint returns the current attempt; ID reuse with different
+//! input is rejected. Attempts without execution slots remain durably reserved; dispatch advances
+//! on completion and restart. Only explicit reevaluation adds attempts. The store checks confirmed
+//! failure, remaining attempt budget, completed cleanup of prior attempt Workers, and no occupancy
+//! by other Jobs. Unknown execution outcomes are not rerun as new attempts.
+//!
+//! Serialization-key resource conflicts return the original immutable request as resource_reused.
+//! This does not mean new input was processed. Pending/unknown Jobs and unfinished cleanup
+//! retain resource occupancy, distinct from replay of an identical request.
+//!
+//! # Structured results and notifications
+//!
+//! Result admission matches the authenticated Worker, Workspace, Job, current attempt, input
+//! digest, and tracked run, then stores bounded JSON. Identical result replay is idempotent;
+//! differing results and stale attempts are rejected. Final prose, Idle, Stopped, and successful
+//! model calls are not evidence of Job success. Submission authority comes from the Job binding
+//! fixed by the Host at creation/Restore, not a Profile name or purpose alone.
+//!
+//! Notifications have delivery records separate from results. After restart, unknown deliveries
+//! are retried with the same tracked notification ID. Results survive stopped/missing destinations
+//! without rerunning the model. Execution recovery matches observable Workers and tracked
+//! submissions; lost evidence leaves the outcome unknown. Exactly-once execution of all external
+//! side effects is not guaranteed.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

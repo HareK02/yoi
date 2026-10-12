@@ -1,3 +1,8 @@
+/**
+ * scenarioから起動したプロセスだけを所有し、終了・失敗時に回収する。
+ * 外部の稼働ServerやRuntimeを停止対象にしない。診断出力は上限と秘匿処理を
+ * 適用し、切詰めた事実も記録して、途中のログを完全な証拠と誤認させない。
+ */
 import { dirname, isAbsolute, resolve } from "@std/path";
 import { bounded, redactText, writePrivateJson } from "./artifacts.ts";
 import type { CaptureError, OwnedProcess } from "./types.ts";

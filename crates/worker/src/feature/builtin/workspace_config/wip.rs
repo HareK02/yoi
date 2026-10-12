@@ -1,4 +1,10 @@
-//! Shared native self-attach entrance and production request-time config subtree.
+//! Registers the native self-attach entrance and request-resolved configuration content subtree.
+//!
+//! Connection to the existing attachment ledger and configuration content share a root, but attach
+//! is not a content mutation and creates no separate content validator. Only the production adapter
+//! registers a subtree provider bound to current grants. There is no configuration-specific
+//! compatibility Tool or `/tools` fallback. The parent module and content own Feature enablement,
+//! connection targets, and configuration-body projection boundaries.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

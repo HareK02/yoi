@@ -1,3 +1,9 @@
+//! Read-only catalog of embedded Flow sources.
+//!
+//! Provides exact source bytes without copying them into the Workspace DB or
+//! maintaining manual update counters. The Runtime pins the compiled digest,
+//! so resource updates do not change existing instance definitions.
+
 use crate::{CompiledFlowDefinition, FlowCompileError, compile_flow_source};
 
 pub const CODER_REVIEW_FLOW_SLUG: &str = "coder-review";

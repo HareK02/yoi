@@ -300,13 +300,25 @@ impl Drop for RuntimeEventSelectorSubscription {
     }
 }
 
-/// Concrete embedded Runtime domain entity.
+/// Domain entity managing Worker lifecycles and Runtime-local resources.
 ///
-/// The default implementation is memory-backed and tools/provider-less by
-/// design.  An optional `fs-store` feature adds filesystem persistence while
-/// preserving the same typed authority boundary. It can later be adapted by
-/// backend registries or web servers without making sockets, sessions, or paths
-/// public authority.
+/// Memory-backed by default, with persistence provided by `fs-store`. Workspace registry
+/// projections do not authorize controller input admission. Scoped operations validate current
+/// Workspace membership and delegate to execution backends/controllers. Per-Worker operation
+/// locks serialize lifecycle changes.
+///
+/// Workdir cleanup reserves target IDs under the state mutex, then inspects and deletes files
+/// outside it. Conflicting use/cleanup of the same target is rejected without blocking unrelated
+/// Worker observations on long I/O. Transient reservations replace neither durable deletion
+/// evidence nor Backend attachment authority.
+///
+/// Restore/Stop separate settled status from pending operations, persisting intent before backend
+/// side effects. Pending operations reject conflicting input, lifecycle, deletion, and retention
+/// even when status appears Idle/Stopped. Startup reconciles pending Stop first and does not
+/// auto-restore Workers whose stop is confirmed and committed. Restore reuses the same operation
+/// ID; candidates with uncertain commit/cleanup are not replaced by new executions. Successful
+/// commit publishes backend observation registration and buffered protocol events; rollback
+/// discards the candidate.
 #[derive(Clone, Debug)]
 pub struct Runtime {
     inner: Arc<Mutex<RuntimeState>>,
@@ -1858,6 +1870,18 @@ impl Runtime {
             .into_legacy_result()
     }
 
+    /// Admits Restore with a fixed observation token and request ID.
+    ///
+    /// Revalidates the token under the Worker operation lock and saves the request owner and
+    /// `pending_restore` operation ID in the same Worker record before preparation/execution.
+    /// The same request reuses its stored payload; replaying a terminal receipt never restarts
+    /// a Worker stopped later. New intent with an old token conflicts. This token is an admission
+    /// boundary distinct from controller command IDs and cleanup-plan digests.
+    ///
+    /// If a saved pending operation has no public owner, binds recovery to that operation without
+    /// substituting another request or preparing a new candidate. Uncertain commits/responses
+    /// retain ReconciliationRequired, never implying no effect or rollback. Accepted denotes
+    /// Restore commit, not success of a subsequent Run.
     pub fn restore_worker_operation_scoped(
         &self,
         scope: &RuntimeWorkspaceScope,
@@ -3533,6 +3557,12 @@ impl Runtime {
     }
 
     #[cfg(feature = "ws-server")]
+    /// Checks the authorized Worker against the captured execution endpoint before operating.
+    ///
+    /// Validates scope, pending lifecycle settlement, and endpoint freshness before durable mutation.
+    /// Never forwards send/Shutdown to the next execution of the same WorkerRef, even if this
+    /// connection has not observed the old execution ending. Continued registry observation
+    /// and the operational connection have separate lifetimes.
     pub fn send_connected_protocol_method_scoped(
         &self,
         scope: &RuntimeWorkspaceScope,

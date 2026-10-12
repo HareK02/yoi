@@ -1,3 +1,25 @@
+//! Workspace HTTP admission and coordination of domain resource operations.
+//!
+//! The catalog dispatcher acquires a Workspace lifecycle lease and verifies a signing
+//! proof or human actor before entering the inner router. Proof verification precedes
+//! resource lock waits; a deleting Workspace rejects reads too. Accepted handlers are
+//! not reauthenticated merely because the proof expires. Subsequent resource/provider
+//! operations follow their owners' current constraints.
+//!
+//! Shared Worker admission lives in worker_operations; deletion draining lives in
+//! workspace_admission. Generated contract routers and registered WS routes define
+//! production entry points. Test helpers do not imply unauthenticated production routes.
+//!
+//! # Tickets and Orchestrators
+//!
+//! Ticket operations persist through the domain backend. Current Workspace role assignments
+//! constrain Worker-origin state decisions. Queue and event notifications do not imply
+//! implementation completion. Runtime Worker spawning, Workdir linking, and Ticket assignment
+//! use their respective durable operations. Orchestrator backlog attention rereads current
+//! Tickets and interested assignments at startup, Restore, and turn end. Subscription snapshots
+//! and reconnection are not turn-end events; Running-to-Idle events are handled separately.
+//! This coordinates notifications, not a general event queue or worktree layout policy.
+
 use subjektiv::api::*;
 mod backend_job_profile;
 mod subjektiv_job;
@@ -847,6 +869,13 @@ struct ExternalProviderAuditContext {
     attachment_alias: String,
 }
 
+/// Workdir session bound to one External provider connection generation.
+///
+/// Command handles map to provider handles within this session, never a new generation
+/// or reconnected provider. Closing on replacement/detach requests cancellation and terminal
+/// output confirmation from the old connection; unconfirmed cleanup is not reported as success.
+/// Only confirmed provider shutdown can replace per-command confirmation. Reconnection does
+/// not prove that missing commands have stopped.
 struct ExternalProviderWorkdirSession {
     workdir: workdir::Workdir,
     connection: Arc<ExternalProviderConnection>,
@@ -2605,6 +2634,13 @@ fn repository_api_rejection(path: &str, status: StatusCode, message: &str) -> Re
 
 // Log here, not only in the inner Workspace router: the catalog dispatcher can
 // reject authentication before that router (and its API error logger) is entered.
+/// Records outer-dispatcher rejections using the same safe internal diagnostics.
+///
+/// Claim-derived identities are emitted as claimed hashes. Method, path without query,
+/// and Workspace are request metadata with control-character and length limits. The generated
+/// request ID identifies this rejection, not a caller ID or cross-service trace. HTTP responses
+/// remain generic 401s without proof details. Classification describes this verification result,
+/// not the cause or resolution of earlier intermittent 401s.
 fn runtime_request_proof_rejection(
     method: &str,
     path: &str,
@@ -5245,6 +5281,14 @@ impl WorkspaceApi {
         Some(summary)
     }
 
+    /// Binds observation-based Restore intent to a Runtime-owned operation.
+    ///
+    /// First queries existing owners/receipts without preparation, handling replay and recovery
+    /// before new-launch eligibility. New intent rereads singleton, Workdir, and External grants
+    /// to build references. SSH resources are issued only after Runtime admits the same observation
+    /// token under its operation lock. Replay does not replace saved preparation; incomplete auth
+    /// preparation remains ReconciliationRequired. Runtime owns lifecycle settlement, while the
+    /// returned summary comes from current observation.
     fn restore_workspace_worker(
         &self,
         worker: &RuntimeWorkerRef,
@@ -5658,6 +5702,12 @@ fn persist_external_workdir_permissions(
     }
 }
 
+/// Converts External grants into session capabilities using READ, WRITE, COMMAND levels.
+///
+/// WRITE includes READ; COMMAND includes WRITE. Arbitrary independent boolean combinations
+/// are not permissions: legacy read+command without write is rejected. Provider registration
+/// must match the grant's capabilities; Worker attachments intersect permissions with that ceiling.
+/// Write scope alone does not create command permission.
 fn external_workdir_capabilities(permissions: &str) -> Result<workdir::WorkdirSessionCapabilities> {
     match external_workdir_permissions(permissions)?.grant_level() {
         Some(server_api::ExternalWorkdirPermissionLevel::Read) => {
@@ -26147,6 +26197,12 @@ async fn post_passkey_registration_options(
     }))
 }
 
+/// Consumes a stored WebAuthn ceremony and registers only verified credentials.
+///
+/// Binds the challenge to User, RP, Origin, and stored verifier state, rejecting consumed or
+/// expired ceremonies. Browser assertions alone do not create keys or sessions: credentials
+/// are saved and browser sessions issued only after webauthn-rs verification succeeds.
+/// Login also verifies a stored ceremony.
 fn complete_passkey_registration(
     api: &ServerAuthApi,
     request: PasskeyRegistrationCompleteRequest,
@@ -26485,6 +26541,12 @@ fn approve_device_login(
     })
 }
 
+/// Returns the API token generated by browser approval to the device client.
+///
+/// Pending and expired flows return no credentials. Approved flows consume and return the
+/// token, clearing the store's temporary token so normal repeated polling yields Consumed.
+/// This does not guarantee retrieval of the same token after response loss and is separate
+/// from browser-cookie authentication.
 async fn post_device_login_poll(
     State(api): State<ServerAuthApi>,
     Json(request): Json<DeviceLoginPollRequest>,

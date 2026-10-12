@@ -83,12 +83,6 @@ Deno.test("Shell regions use selected Bevel edges while open separators use Beve
       import.meta.url,
     ),
   );
-  const designLanguage = await Deno.readTextFile(
-    new URL(
-      "../../../docs/development/ui-ux/design-language.md",
-      import.meta.url,
-    ),
-  );
 
   assert(
     rootLayout.includes('class="app-shell__topbar-bevel"') &&
@@ -109,18 +103,9 @@ Deno.test("Shell regions use selected Bevel edges while open separators use Beve
     "Desktop shell boundaries must use one selected border edge and Mobile must share Header fold state",
   );
   assert(
-    designLanguage.includes(
-      "Headerのbottom edgeとSidebarのright edgeだけを有効",
-    ) &&
-      designLanguage.includes("Mobileのfold controlはHeaderに置く") &&
-      designLanguage.includes("main contentと同時表示しない") &&
-      designLanguage.includes("同じlayerではheading、本文、Lineの端を揃え") &&
-      designLanguage.includes(
-        "親layoutがそのlayer全体へinline方向の余白を与え",
-      ) &&
-      showroomCss.includes(".resource-list {") &&
+    showroomCss.includes(".resource-list {") &&
       showroomCss.includes("margin-inline: var(--space-2)"),
-    "The design language and showroom must preserve adjacent area and line hierarchy",
+    "showroomはresource layer全体の余白を維持する",
   );
   assert(
     sidebarCss.includes(".section-action {") &&

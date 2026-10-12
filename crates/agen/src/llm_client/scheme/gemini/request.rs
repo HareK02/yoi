@@ -140,12 +140,12 @@ pub(crate) struct GeminiGenerationConfig {
     /// Stop sequences
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stop_sequences: Vec<String>,
-    /// Thinking / reasoning 設定（Gemini 2.5 以降）。
+    /// Thinking / reasoning settings (Gemini 2.5 and later).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_config: Option<GeminiThinkingConfig>,
 }
 
-/// Gemini thinking config (gemini-2.5 以降)
+/// Gemini thinking config (gemini-2.5 and later).
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GeminiThinkingConfig {
@@ -193,8 +193,8 @@ impl GeminiScheme {
             None
         };
 
-        // Reasoning の投影: capability が BudgetTokens / Both をサポートし、
-        // request 側で budget_tokens が指定されているときだけ thinking_config を付ける。
+        // Project reasoning: add thinking_config only when the capability
+        // supports BudgetTokens / Both and the request specifies budget_tokens.
         let supports_budget = matches!(
             capability.reasoning,
             Some(ReasoningSupport::BudgetTokens | ReasoningSupport::Both),

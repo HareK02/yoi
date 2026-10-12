@@ -1,3 +1,17 @@
+//! Feature connecting Worker-owned Flow state to a read-only internal verifier.
+//!
+//! The model submits only a reason, choosing neither instance nor target state. The coordinator
+//! clones the current Worker's local state and commits attempts/events to the Session before
+//! replacing in-memory state. It does not use the Workspace client for transition mutations and
+//! first recovers restored verifying attempts. The `flow` crate owns graph and verdict-set validation.
+//!
+//! The verifier receives a fixed capture of the committed parent Session, current state, reason,
+//! and all outgoing conditions. Even with a Workdir, it gets only Read/Glob/Grep through a read-only
+//! wrapper, not Workspace, Ticket, Memory, Worker management, write, or Bash capabilities.
+//! Only complete typed `FinishFlowVerification` results are accepted; prose completion is not
+//! success. State-entry instructions return as regular Tool results; this Feature owns neither
+//! role-specific business loops nor side effects.
+
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

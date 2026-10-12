@@ -1,7 +1,7 @@
-//! ChatGPT OAuth トークンの refresh HTTP 呼出。
+//! HTTP calls to refresh ChatGPT OAuth tokens.
 //!
-//! Codex CLI と同じ `POST https://auth.openai.com/oauth/token` 形式。
-//! 401 + `error.code` で永続失敗を分類する。
+//! Uses the same `POST https://auth.openai.com/oauth/token` format as Codex CLI.
+//! Classifies permanent failures using 401 + `error.code`.
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -29,10 +29,10 @@ pub struct RefreshResponse {
     pub refresh_token: Option<String>,
 }
 
-/// refresh_token を使って新しいトークン群を取得する。
+/// Obtain new tokens using refresh_token.
 ///
-/// 永続失敗（401 + `refresh_token_(expired|reused|invalidated)`）は
-/// `RefreshPermanent`、それ以外は `RefreshTransient`。
+/// Permanent failures (401 + `refresh_token_(expired|reused|invalidated)`) return
+/// `RefreshPermanent`; all others return `RefreshTransient`.
 pub async fn request_refresh(
     client: &reqwest::Client,
     endpoint: &str,

@@ -1,6 +1,6 @@
-//! Anthropic SSEイベントパース
+//! Anthropic SSE event parsing.
 //!
-//! Anthropic Messages APIのSSEイベントをパースし、統一Event型に変換
+//! Parse Anthropic Messages API SSE events and convert them to the unified Event type.
 
 use crate::llm_client::{
     ClientError,
@@ -14,7 +14,7 @@ use serde::Deserialize;
 use super::AnthropicScheme;
 use super::scheme_impl::{AnthropicState, PendingThinking};
 
-/// Anthropic SSEイベントタイプ
+/// Anthropic SSE event type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AnthropicEventType {
     MessageStart,
@@ -28,7 +28,7 @@ pub(crate) enum AnthropicEventType {
 }
 
 impl AnthropicEventType {
-    /// イベントタイプ文字列からパース
+    /// Parse an event type string.
     pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
             "message_start" => Some(Self::MessageStart),
@@ -45,10 +45,10 @@ impl AnthropicEventType {
 }
 
 // ============================================================================
-// SSEイベントのJSON構造
+// SSE event JSON structures
 // ============================================================================
 
-/// message_start イベント
+/// message_start event.
 #[derive(Debug, Deserialize)]
 pub(crate) struct MessageStartEvent {
     pub message: MessageStartMessage,
@@ -62,7 +62,7 @@ pub(crate) struct MessageStartMessage {
     pub usage: Option<UsageData>,
 }
 
-/// content_block_start イベント
+/// content_block_start event.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ContentBlockStartEvent {
     pub index: usize,
@@ -79,15 +79,15 @@ pub(crate) enum ContentBlock {
     Thinking {
         #[serde(default)]
         thinking: String,
-        /// 非ストリーミングレスポンス由来の初期 signature（通常はストリームでは
-        /// 空 → `signature_delta` で埋まる）。
+        /// Initial signature from a non-streaming response (usually empty in
+        /// streams, then filled by `signature_delta`).
         #[serde(default)]
         signature: Option<String>,
     },
     #[serde(rename = "redacted_thinking")]
     RedactedThinking {
-        /// 暗号化された opaque blob。signature ではなく、まるごと
-        /// `redacted_thinking.data` として送り返す必要がある。
+        /// Encrypted opaque blob, not a signature. Must be sent back in full
+        /// as `redacted_thinking.data`.
         #[serde(default)]
         data: String,
     },
@@ -99,7 +99,7 @@ pub(crate) enum ContentBlock {
     },
 }
 
-/// content_block_delta イベント
+/// content_block_delta event.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ContentBlockDeltaEvent {
     pub index: usize,
@@ -120,13 +120,13 @@ pub(crate) enum DeltaBlock {
     SignatureDelta { signature: String },
 }
 
-/// content_block_stop イベント
+/// content_block_stop event.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ContentBlockStopEvent {
     pub index: usize,
 }
 
-/// message_delta イベント
+/// message_delta event.
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct MessageDeltaEvent {
@@ -141,7 +141,7 @@ pub(crate) struct MessageDeltaData {
     pub stop_sequence: Option<String>,
 }
 
-/// 使用量データ
+/// Usage data.
 #[derive(Debug, Deserialize)]
 pub(crate) struct UsageData {
     pub input_tokens: Option<u64>,
@@ -150,7 +150,7 @@ pub(crate) struct UsageData {
     pub cache_creation_input_tokens: Option<u64>,
 }
 
-/// エラーイベント
+/// Error event.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ErrorEventData {
     pub error: ErrorDetail,
@@ -164,20 +164,20 @@ pub(crate) struct ErrorDetail {
 }
 
 // ============================================================================
-// イベント変換
+// Event conversion
 // ============================================================================
 
 impl AnthropicScheme {
-    /// SSEイベントをEvent型に変換
+    /// Convert an SSE event to Event.
     ///
     /// # Arguments
-    /// * `event_type` - SSEイベントタイプ
-    /// * `data` - イベントデータJSON文字列
+    /// * `event_type` - SSE event type.
+    /// * `data` - Event data as a JSON string.
     ///
     /// # Returns
-    /// * `Ok(Some(Event))` - 変換成功
-    /// * `Ok(None)` - イベントを無視（unknown event等）
-    /// * `Err(ClientError)` - パースエラー
+    /// * `Ok(Some(Event))` - Conversion succeeded.
+    /// * `Ok(None)` - Event ignored (e.g. an unknown event).
+    /// * `Err(ClientError)` - Parse error.
     pub(crate) fn parse_event(
         &self,
         event_type: &str,
@@ -191,11 +191,11 @@ impl AnthropicScheme {
         match event_type {
             AnthropicEventType::MessageStart => {
                 let event: MessageStartEvent = serde_json::from_str(data)?;
-                // message_start時にUsageイベントがあれば出力
+                // Emit a Usage event at message_start if available.
                 if let Some(usage) = event.message.usage {
                     return Ok(Some(Event::Usage(self.convert_usage(&usage))));
                 }
-                // Statusイベントとして開始を通知
+                // Notify start via a Status event.
                 Ok(Some(Event::Status(StatusEvent {
                     status: ResponseStatus::Started,
                 })))
@@ -210,18 +210,18 @@ impl AnthropicScheme {
             }
             AnthropicEventType::ContentBlockStop => {
                 let event: ContentBlockStopEvent = serde_json::from_str(data)?;
-                // Note: BlockStopにはblock_typeが必要だが、AnthropicはStopイベントに含めない
-                // Timeline層がBlockStartを追跡して正しいblock_typeを知る
+                // Note: BlockStop requires block_type, but Anthropic omits it from Stop events.
+                // The stateful parser tracks BlockStart to restore the correct block_type.
                 Ok(Some(Event::BlockStop(BlockStop {
                     index: event.index,
-                    block_type: BlockType::Text, // Timeline層で上書きされる
+                    block_type: BlockType::Text, // Placeholder for the stateful parser.
                     stop_reason: None,
                     reasoning: None,
                 })))
             }
             AnthropicEventType::MessageDelta => {
                 let event: MessageDeltaEvent = serde_json::from_str(data)?;
-                // Usage情報があれば出力
+                // Emit Usage information if available.
                 if let Some(usage) = event.usage {
                     return Ok(Some(Event::Usage(self.convert_usage(&usage))));
                 }
@@ -271,7 +271,7 @@ impl AnthropicScheme {
                 DeltaContent::InputJson(partial_json.clone())
             }
             DeltaBlock::SignatureDelta { .. } => {
-                // signature_delta は無視
+                // Ignore signature_delta.
                 return None;
             }
         };
@@ -282,15 +282,14 @@ impl AnthropicScheme {
         }))
     }
 
-    /// state を持ち回す上位パース。
+    /// Higher-level parser carrying state across events.
     ///
-    /// `parse_event` の単発 Event に加えて、以下を行う:
-    /// - `content_block_stop` の `block_type` を直前の Start 値で書き戻す
-    /// - `thinking` / `redacted_thinking` ブロックの本体・signature・data を
-    ///   `state.pending_thinking` に蓄積し、`content_block_stop` の Thinking
-    ///   BlockStop metadata に載せる
-    /// - `signature_delta` を蓄積（Stream channel には流さず、reasoning metadata
-    ///   にだけ反映する）
+    /// In addition to the single Event from `parse_event`, it:
+    /// - Writes the preceding Start's `block_type` into `content_block_stop`.
+    /// - Accumulates the body, signature, and data of `thinking` /
+    ///   `redacted_thinking` blocks in `state.pending_thinking` and attaches them
+    ///   to Thinking BlockStop metadata at `content_block_stop`.
+    /// - Accumulates `signature_delta` only in reasoning metadata, not the Stream channel.
     pub(crate) fn parse_with_state(
         &self,
         event_type: &str,
@@ -301,8 +300,8 @@ impl AnthropicScheme {
             return Ok(Vec::new());
         };
 
-        // signature_delta はストリーム表示には流さず、state にだけ蓄積。
-        // それ以外は parse_event で標準 Event 化する。
+        // Accumulate signature_delta in state only, not in the stream display.
+        // Convert everything else to standard Events via parse_event.
         let mut emitted: Vec<Event> = Vec::new();
 
         match parsed_event_type {
@@ -351,7 +350,7 @@ impl AnthropicScheme {
                     }
                     DeltaBlock::SignatureDelta { signature } => {
                         if let Some(pending) = state.pending_thinking.as_mut() {
-                            // 通常 1 回しか来ないが、複数 fragment 来ても連結しておく
+                            // Usually received once, but concatenate multiple fragments if present.
                             match &mut pending.signature {
                                 Some(acc) => acc.push_str(signature),
                                 None => pending.signature = Some(signature.clone()),
@@ -391,7 +390,7 @@ impl AnthropicScheme {
                     reasoning,
                 }));
             }
-            // 残りは state を必要としない。既存 parse_event に委譲。
+            // The rest needs no state; delegate to the existing parse_event.
             _ => {
                 if let Some(event) = self.parse_event(event_type, data)? {
                     emitted.push(event);
@@ -403,13 +402,13 @@ impl AnthropicScheme {
     }
 
     fn convert_usage(&self, usage: &UsageData) -> UsageEvent {
-        // Anthropic の `input_tokens` は **キャッシュ外** の入力トークンのみで、
-        // プロンプト全長は input_tokens + cache_read + cache_creation。
-        // UsageEvent の `input_tokens` には「占有量（プロンプト全長）」を載せる
-        // 規約に合わせて、ここでキャッシュ分を足し込む。
-        // cache_read_input_tokens / cache_creation_input_tokens は内訳として
-        // 別フィールドに残るので、料金計算側で `input - cache_read - cache_creation`
-        // により非キャッシュ入力分は逆算可能。
+        // Anthropic's `input_tokens` counts only **uncached** input tokens.
+        // Full prompt length is input_tokens + cache_read + cache_creation.
+        // Add cached tokens here to follow UsageEvent's convention of reporting
+        // occupancy (full prompt length) in `input_tokens`.
+        // cache_read_input_tokens / cache_creation_input_tokens remain separate
+        // breakdown fields, so billing can recover uncached input with
+        // `input - cache_read - cache_creation`.
         let raw_input = usage.input_tokens.unwrap_or(0);
         let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
         let cache_creation = usage.cache_creation_input_tokens.unwrap_or(0);
@@ -438,7 +437,7 @@ mod tests {
         let event = scheme.parse_event("message_start", data).unwrap().unwrap();
         match event {
             Event::Usage(u) => {
-                // キャッシュなしなので input_total = raw_input = 10
+                // No cache, so input_total = raw_input = 10.
                 assert_eq!(u.input_tokens, Some(10));
             }
             _ => panic!("Expected Usage event"),
@@ -447,9 +446,9 @@ mod tests {
 
     #[test]
     fn test_convert_usage_includes_cache_in_input_total() {
-        // Anthropic の input_tokens はキャッシュ外のみで、占有量は
-        // input + cache_read + cache_creation。
-        // UsageEvent.input_tokens は占有量に正規化される。
+        // Anthropic's input_tokens counts only uncached tokens; occupancy is
+        // input + cache_read + cache_creation.
+        // UsageEvent.input_tokens is normalized to occupancy.
         let scheme = AnthropicScheme::new();
         let usage = UsageData {
             input_tokens: Some(100),
@@ -531,7 +530,7 @@ mod tests {
 
     #[test]
     fn thinking_block_stop_carries_reasoning_with_signature() {
-        // thinking ブロックが完了したら reasoning metadata に text+signature が乗ること
+        // Completed thinking blocks carry text+signature in reasoning metadata.
         let scheme = AnthropicScheme::new();
         let mut state = AnthropicState::default();
 

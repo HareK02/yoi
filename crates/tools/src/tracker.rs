@@ -1,46 +1,16 @@
-//! Worker-lifetime tracker for file operations performed by the builtin
-//! file-manipulation tools.
+//! Tracker retaining file Tool read hashes, mutation coordination, and recent operation paths.
 //!
-//! A `Tracker` serves two orthogonal purposes:
+//! Read and successful Write/Edit record content hashes and line counts. Before changing existing
+//! files, checks against the last observation. This verifies mutation preconditions, not scope
+//! authorization, and complements hash/validator checks at the provider execution boundary.
+//! Regular Tools and native operations on the same attachment share observations. Aliases and
+//! connection generations separate namespaces, preventing stale reads from applying to a different
+//! session when an alias is reused after detach.
 //!
-//! 1. **Read-before-edit policy.** It records a SHA-256 hash of each
-//!    file's contents at the moment it was observed via `Read` (or
-//!    mutated via `Write` / `Edit`), and lets `Write` / `Edit` later
-//!    verify that the file has not been externally modified since then.
-//!
-//! 2. **Recency of touched files.** It keeps an LRU-ordered list of
-//!    files that have been touched by any of the tools, so the Worker
-//!    layer can ask "which files did the agent recently look at?" —
-//!    used e.g. as a default reference set passed to context compaction.
-//!
-//! Despite its historic name, the Tracker already watches all three of
-//! Read / Write / Edit; the rename away from `ReadTracker` reflects this.
-//!
-//! # Lifetime
-//!
-//! A `Tracker` is **Worker-process scoped**: the Worker layer creates a fresh
-//! instance at the start of each Worker run (including resume) and discards
-//! it when the process exits — it is not persisted, so a resumed
-//! conversation starts with an empty read/edit history. The local WorkdirSession
-//! scope boundary is likewise Worker-process scoped (derived from the
-//! manifest). The two are orthogonal and the Worker wires them together
-//! when registering builtin tools.
-//!
-//! ```no_run
-//! # use std::path::PathBuf;
-//! # use std::sync::Arc;
-//! # use manifest::Scope;
-//! # use tools::{Tracker, core_builtin_tools};
-//! # use workdir::{LocalWorkdirSession, WorkdirSessionHandle};
-//! let scope = Scope::writable("/workspace").unwrap();
-//! let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::new(
-//!     scope,
-//!     PathBuf::from("/workspace"),
-//! ));
-//! let tracker = Tracker::new(); // session lifetime
-//! let bash_outputs = PathBuf::from("/run/yoi/bash-output");
-//! let defs = core_builtin_tools(session, tracker, bash_outputs);
-//! ```
+//! Per-path mutexes coordinate mutations within a Worker only; they do not prevent external process
+//! edits. A bounded LRU of recently touched paths supplies reference candidates for compaction, etc.
+//! Tracker is transient state of a running Worker, never persisted/restored. Past Reads in a restored
+//! conversation do not establish mutation preconditions for a new Tracker.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
@@ -215,7 +185,7 @@ impl Tracker {
     /// subsequent edits see a clean history).
     ///
     /// Also bumps `path` to the front of the recency list. If the list
-    /// grows past [`RECENCY_CAPACITY`], the oldest entry is evicted.
+    /// grows past `RECENCY_CAPACITY`, the oldest entry is evicted.
     pub fn record(&self, path: &Path, bytes: &[u8]) {
         let key = self.key(canonicalize_or_owned(path));
         let hash = hash_bytes(bytes);

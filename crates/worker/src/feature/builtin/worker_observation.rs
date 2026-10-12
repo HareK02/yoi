@@ -1,3 +1,16 @@
+//! Feature reading committed Sessions of Host-authorized Workers.
+//!
+//! The Host injects [`WorkerObservationProvider`]; model input never constructs grants, URLs,
+//! session handles, or provider clients. List returns only currently authorized subjects, and every
+//! capture reauthorizes. Missing and unauthorized subjects return the same NotFound, preventing
+//! distinction. Runtime peers and parent-owned SubWorkers are separate tagged subjects.
+//!
+//! Each exploration operation recaptures its target to reflect newly committed entries. Shared
+//! Session capture owns exploration projections and reference semantics. This Feature does not
+//! enable fixed-snapshot session-explore or Memory extraction; observation grants no Worker control,
+//! Ticket mutation, or approval capability. SubWorker completion notifications contain no transcript;
+//! they prompt inspection rather than substitute for reading the committed Session.
+
 use std::sync::Arc;
 
 #[cfg(test)]

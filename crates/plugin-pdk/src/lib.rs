@@ -1,36 +1,4 @@
-//! Guest-side helpers for Yoi Component Model Tool plugins.
-//!
-//! This crate is intentionally small and guest-only: it depends on JSON/WIT
-//! binding support, but not on Yoi host/runtime crates. It grants no authority;
-//! package manifests and host-side Plugin grants decide whether a Tool or host
-//! API can run.
-//!
-//! Component authors still generate the WIT bindings in their guest crate, then
-//! delegate the exported `call` function to [`run_json_tool`] or to the
-//! [`export_component_tool!`] macro:
-//!
-//! ```ignore
-//! use yoi_plugin_pdk::wit_bindgen;
-//!
-//! wit_bindgen::generate!({
-//!     world: "tool",
-//!     path: "../../../../resources/plugin/wit",
-//!     generate_all,
-//!     runtime_path: "yoi_plugin_pdk::wit_bindgen::rt",
-//! });
-//!
-//! fn echo(
-//!     ctx: yoi_plugin_pdk::ToolContext,
-//!     input: EchoInput,
-//! ) -> Result<yoi_plugin_pdk::ToolOutput, yoi_plugin_pdk::ToolError> {
-//!     yoi_plugin_pdk::ToolOutput::json(
-//!         format!("{} ok", ctx.tool_name()),
-//!         EchoOutput { text: input.text },
-//!     )
-//! }
-//!
-//! yoi_plugin_pdk::export_component_tool!(Plugin, echo);
-//! ```
+#![doc = include_str!("../README.md")]
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -51,9 +19,9 @@ pub const TOOL_WIT: &str = include_str!("../../../resources/plugin/wit/yoi-plugi
 pub const HOST_WIT: &str =
     include_str!("../../../resources/plugin/wit/deps/yoi-host/yoi-host-v1.wit");
 
-/// Maximum serialized ToolOutput JSON accepted by Yoi's current Plugin runtime.
+/// Serialized JSON limit defined by the offline Tool world's output contract.
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
-/// Maximum summary bytes accepted by Yoi's current Plugin runtime.
+/// Byte limit for summaries in the offline Tool world.
 pub const MAX_SUMMARY_BYTES: usize = 1024;
 /// Conservative content cap that leaves room for JSON framing and escaping.
 pub const MAX_CONTENT_BYTES: usize = MAX_TOOL_OUTPUT_BYTES - MAX_SUMMARY_BYTES - 4096;
@@ -80,7 +48,11 @@ impl ToolContext {
     }
 }
 
-/// ToolOutput JSON shape accepted by the current Yoi Plugin runtime.
+/// Bounded Tool output formatted on the guest side.
+///
+/// Shorten text at character boundaries and recheck the serialized JSON limit, including escapes.
+/// Typed JSON through [`Self::json`] errors on overflow rather than truncating and breaking
+/// its structure. Providing this output format does not provide Plugin execution by Workers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ToolOutput {
     summary: String,
@@ -308,11 +280,11 @@ where
     })
 }
 
-/// Execute a typed JSON Tool handler and return ToolOutput JSON for the runtime.
+/// Guest-side boundary that runs a typed JSON handler and converts the result to ToolOutput JSON.
 ///
-/// Handler errors and parse/serialization failures are not panics or host-side
-/// authority decisions. They are rendered into ordinary ToolOutput JSON so the
-/// runtime can route them through the normal Tool result path.
+/// Convert parse, handler, and serialization failures to the normal output form. These errors
+/// are not host authorization decisions, and catching handler panics is not guaranteed.
+/// The PDK does not depend on host/runtime crates or grant permissions through input conversion.
 pub fn run_json_tool<I, F>(tool_name: &str, input_json: &str, handler: F) -> String
 where
     I: DeserializeOwned,
@@ -328,16 +300,11 @@ where
     }
 }
 
-/// Implement the generated Component Model `Guest` trait for a typed JSON
-/// handler and export it with the `wit-bindgen` generated `export!` macro.
+/// Connect a typed JSON handler to a WIT `Guest` implementation and component export.
 ///
-/// The caller must import the PDK's `wit_bindgen` re-export and invoke
-/// `wit_bindgen::generate!` for the `tool` world first, with
-/// `runtime_path: "yoi_plugin_pdk::wit_bindgen::rt"`. That defines the
-/// `Guest` trait and `export!` macro in the current module. The generated
-/// component still imports only WIT-declared
-/// host APIs; this macro does not grant filesystem, network, or environment
-/// authority.
+/// Use guest-generated bindings and centralize handler conversion in [`run_json_tool`].
+/// This macro grants no host API permissions and is not a mechanism for registering or
+/// executing dynamic Plugins in the current Worker.
 #[macro_export]
 macro_rules! export_component_tool {
     ($adapter:ident, $handler:path) => {
@@ -642,6 +609,11 @@ impl ServiceOutputCommand {
     }
 }
 
+/// Instance processing results and output commands requested from the host.
+///
+/// The guest does not send anything here; it returns commands as data tied to the original
+/// ingress event. Command creation/serialization and host authorization/execution are separate
+/// boundaries. This type provides neither network permissions nor the current Worker execution mechanism.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ServiceOutput {
     #[serde(default)]

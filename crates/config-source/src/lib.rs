@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -37,6 +39,11 @@ impl<'de> Deserialize<'de> for VirtualPath {
     }
 }
 
+/// Relative path identifying an entry in the virtual source tree, not a host path.
+///
+/// Reject absolute paths, URLs, empty components, `.` and `..`. [`resolve_import`] resolves
+/// relative imports against the containing virtual directory, independent of the storing
+/// Backend's cwd or OS directory structure.
 impl VirtualPath {
     pub fn parse(value: impl AsRef<str>) -> Result<Self, ConfigTreeError> {
         let value = value.as_ref();
@@ -299,6 +306,15 @@ impl<'de> Deserialize<'de> for ConfigTreeSnapshot {
     }
 }
 
+/// Virtual tree identified by the contents of author-saved sources.
+///
+/// Keep entry points, import targets, and text assets in one tree. Evaluated Profiles and prompts
+/// do not replace these sources. The digest identifies paths, content types, and complete bytes,
+/// not edit counts or freshness. External deserialization also verifies contents against the digest.
+///
+/// [`Self::apply`] creates a candidate without changing the original snapshot. Save permissions,
+/// persistence, and conflict detection with the UI or multiple Workers lie outside this type;
+/// callers must check the authoritative tree's whole digest and evaluation contract at the save boundary.
 impl ConfigTreeSnapshot {
     pub fn empty() -> Self {
         Self::from_entries(Vec::new()).expect("empty config snapshot is valid")
@@ -403,9 +419,11 @@ impl ConfigTreeSnapshot {
         changes
     }
 
-    /// Apply an atomic batch. Each expected_digest compares the target's complete
-    /// source bytes only; it is not a tree precondition. Callers needing whole-tree
-    /// CAS must also compare the authoritative tree digest under their write lock.
+    /// Check source-byte preconditions only and return a candidate for the entire change batch.
+    ///
+    /// The original snapshot remains unchanged even if a change fails. `expected_digest` compares
+    /// only entry contents, not whole-tree CAS. Saving must separately compare the authoritative
+    /// whole-tree digest under a write lock or within a transaction.
     pub fn apply(&self, changes: &[ConfigTreeChange]) -> Result<Self, ConfigTreeError> {
         self.validate()?;
         if changes.len() > MAX_CHANGE_COUNT {
@@ -591,6 +609,11 @@ impl ConfigSchemaContribution {
         })
     }
 
+    /// Optional editor shape for completion and non-materializing constraint analysis.
+    ///
+    /// Evaluate saved projections with `source`. Do not fill omitted values from this shape or
+    /// require omitted fields in partial Profiles. Include its contents in the bundle fingerprint
+    /// to identify the combination of storage schema and editor shape.
     pub fn with_authoring_source(mut self, source: impl Into<String>) -> Self {
         self.authoring_source = Some(source.into());
         self
@@ -750,6 +773,12 @@ pub struct ToolchainContract {
     pub fingerprint: String,
 }
 
+/// Contract identifying the schema, toolchain, and import policy used to evaluate a source.
+///
+/// Separate source digests from evaluation conditions: a schema update is not the same
+/// evaluation even when source bytes are unchanged. Persistence must manage the sources,
+/// this contract, and the projection together. This type neither saves configuration nor
+/// applies it to existing Workers.
 impl ToolchainContract {
     pub fn new(
         schema_version: u32,
@@ -1111,6 +1140,13 @@ fn pop_container(
     }
 }
 
+/// Closed environment for evaluating and analyzing virtual source snapshots.
+///
+/// Separate input sources from schema contracts; return evaluation results as JSON projections
+/// and their digest. Evaluation does not discover configuration sources in host files,
+/// environment variables, or the network. Native and WASM share this implementation, so editor
+/// analysis does not use a separate storage schema. Constraint analysis of editor shapes is
+/// non-materializing and does not add defaults to saved projections.
 #[derive(Debug, Clone)]
 pub struct SnapshotEnvironment {
     snapshot: ConfigTreeSnapshot,
@@ -1141,8 +1177,11 @@ impl SnapshotEnvironment {
         self.evaluate_with_builtin_sources(contract, Arc::default())
     }
 
-    /// Capture only builtin sources actually loaded by evaluation, including transitive imports.
-    /// These immutable bytes are provenance for the evaluated value, not Runtime inputs.
+    /// Retrieve original bytes for transitive builtin dependencies actually loaded during evaluation.
+    ///
+    /// This is provenance for evaluated values, not an instruction to reevaluate in the Runtime.
+    /// Saving and launching can pin values and dependency sources by digest, avoiding implicit
+    /// replacement with current builtins. Archive construction and validation happen outside this type.
     pub fn builtin_import_sources(
         &self,
         contract: &ToolchainContract,
@@ -1597,6 +1636,19 @@ impl HostEnvironment for ConfigAuthoringEnvironment<'_> {
     }
 }
 
+/// Import loader returning only snapshot sources and explicitly published builtins.
+///
+/// Resolve relative imports against the containing virtual directory; keep relative imports
+/// within builtins in the builtin namespace. Do not use host paths to supply missing entries
+/// or compensate for namespace escapes. Builtins are read-only; same-name Workspace entries
+/// cannot override them.
+///
+/// Check import-graph cycles and depth before loading, including imports in lazy fields.
+/// Builtins share the snapshot's entry-count and byte budgets. Count repeated loads of the
+/// same builtin once and include unused Workspace entries in the budget.
+/// Use virtual paths for diagnostics and relative resolution. Engine cache identities also
+/// include interpretation and content digests, so changed content or content types cannot
+/// be confused with previous cached entries.
 #[derive(Debug, Clone)]
 pub struct SnapshotImportLoader {
     snapshot: ConfigTreeSnapshot,

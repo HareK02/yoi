@@ -1,5 +1,14 @@
-//! Identity-bound Drive API adapter. The Backend owns grants, hierarchy, CAS and
-//! receipts. In particular, a lost mutation response is queried, never resent.
+//! Identity-bound Drive API adapter and mutation receipt checks.
+//!
+//! The Backend owns grants, hierarchy, CAS, and receipts, applying current authorization to every
+//! read/chunk/status request. The adapter validates Workspace, node ID, commit ID, and size, and
+//! never copies raw diagnostics that may contain provider paths, SQL, or credentials into output.
+//!
+//! Mutations use Host-generated request IDs and observed node/commit IDs. Conflicts do not trigger
+//! retries against substituted current state. For an unknown mutation response, check the same
+//! request's receipt once; only a committed receipt with valid IDs and metadata proves DB success.
+//! An uncommitted snapshot cannot rule out a later commit by an in-flight request, so all other
+//! cases retain an unknown outcome with the original request ID. Never blindly resend with a new ID.
 use std::{sync::Arc, time::Duration};
 
 use crate::worker::{

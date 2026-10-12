@@ -38,7 +38,7 @@ pub(crate) struct OpenAIRequest {
     pub tools: Vec<OpenAITool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
-    /// Reasoning effort（o1 / o3 / o4 / gpt-5 系で有効）。
+    /// Reasoning effort (supported by the o1 / o3 / o4 / gpt-5 families).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 }
@@ -147,8 +147,8 @@ impl OpenAIScheme {
             (None, request.config.max_tokens)
         };
 
-        // Reasoning の投影: capability が Effort / Both をサポートし、
-        // request 側で effort が指定されているときだけ reasoning_effort を付ける。
+        // Project reasoning: add reasoning_effort only when the capability
+        // supports Effort / Both and the request specifies an effort.
         let supports_effort = matches!(
             capability.reasoning,
             Some(ReasoningSupport::Effort | ReasoningSupport::Both),

@@ -1,4 +1,11 @@
-//! Identity-bound typed Workspace transport. Never retries a dispatched request.
+//! Typed Workspace configuration transport bound to Worker identity.
+//!
+//! Uses `workers/self/workspace-config`, never bypassing it for the owner editor API. Responses are
+//! checked for Workspace, alias, content root, and connection lifetime, distinguishing typed Backend
+//! `NotCommitted` from `Unknown`. Authorization, CAS, and input rejections become safe fixed
+//! diagnostics; raw provider/transport bodies never reach the model. Missing, oversized, or
+//! undecodable mutation responses do not prove non-commit; dispatched requests are never resent.
+//! This adapter does not reimplement Backend source-persistence transactions or activation.
 use std::sync::Arc;
 
 use async_trait::async_trait;

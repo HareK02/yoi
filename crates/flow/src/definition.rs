@@ -1,3 +1,19 @@
+//! Compiles DCDL sources into typed Flow definitions.
+//!
+//! The source document is the graph authority; states and transitions are not split
+//! into independently editable records. DCDL evaluation passes through private
+//! Serde-compatible values into the source schema, then graph validation produces
+//! a [`CompiledFlowDefinition`]. Intermediate JSON is neither a public API type nor
+//! a persisted Runtime state type. Imports are rejected, and a single document's
+//! content digest pins the execution definition.
+//!
+//! Validates schemas, identifiers, and targets; rejects unreachable states, closed
+//! paths that cannot reach a user-defined terminal, outgoing terminal transitions,
+//! and nonterminal states without transitions. Authored `$cancelled` states are
+//! forbidden; synthetic cancellation transitions are excluded from normal-terminal
+//! reachability checks. Only validated definitions receive a `$cancelled` terminal,
+//! so exceptional cancellation cannot make an invalid normal-completion graph pass.
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fmt::Write as _;

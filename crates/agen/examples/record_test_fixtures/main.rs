@@ -108,7 +108,7 @@ async fn run_scenario_with_ollama(
     subdir: &str,
     model: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Ollama = Anthropic scheme + base_url 差し替え + 認証なし
+    // Ollama uses the Anthropic scheme with a custom base_url and no authentication.
     let model = model.as_deref().unwrap_or("llama3");
     let client = HttpTransport::new(
         AnthropicScheme::new(),

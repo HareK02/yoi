@@ -1,3 +1,20 @@
+//! Local stdio MCP server communication and process lifecycle.
+//!
+//! The Host resolves launch specs, clears the environment, and passes only explicit
+//! values to child processes. Values resolved from SecretStore or inherited from
+//! the environment are redacted in diagnostics. This is not a sandbox: child
+//! execution capabilities depend on Host and OS user boundaries.
+//!
+//! Handles stdout as JSON-RPC and stderr as bounded diagnostics, separately.
+//! Limits line lengths, response bytes, discovery pages, and request deadlines;
+//! malformed communication is not registered as valid descriptors. Requests are
+//! accepted only after the initialize/initialized handshake. Shutdown closes stdin,
+//! waits for exit within a deadline, and kills/waits to reap the process if needed.
+//! Startup failures also trigger cleanup; killing on Drop is a last resort.
+//!
+//! This module preserves Tool/resource/prompt wire values. `worker::feature::mcp`
+//! owns Yoi naming, schema acceptance, model output limits, and Feature registration.
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fmt;

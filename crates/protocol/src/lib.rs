@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 pub mod identity;
 pub mod invocation;
 #[cfg(feature = "stream")]
@@ -211,6 +213,10 @@ pub struct WorkerStateSnapshot {
     pub state: WorkerState,
 }
 
+/// Handles current controller state; input admission is not inferred from past history.
+///
+/// Distinguishes Run from maintenance. The Runtime catalog's `Stopped` state persists
+/// after shutdown and is not part of this controller snapshot.
 impl WorkerStateSnapshot {
     pub fn initial() -> Self {
         Self {
@@ -445,6 +451,11 @@ pub enum WorkerEvent {
     },
 }
 
+/// Separates child reports into control handling and model-facing notifications.
+///
+/// Scope registration updates are control-only and do not wake the parent's model.
+/// Messages may arrive out of order; child notifications prompt state checks,
+/// not proof of completed artifacts or validation.
 impl WorkerEvent {
     /// Whether this event should become an agent-visible notification/history item.
     ///
@@ -732,6 +743,13 @@ impl Segment {
     }
 }
 
+/// Treats input acceptance and model-history inclusion as separate boundaries.
+///
+/// Submit/Notify receipts do not imply execution success; the corresponding Event
+/// reports committed history. Human Submit requests use a waiting FIFO, while agents
+/// use SubmitIfIdle only when Idle, never implicitly scheduling the next Run.
+/// Pause/Resume suspend and resume a Run independently of new Submit acceptance;
+/// Resume does not create a new user message.
 impl Method {
     /// Convenience: a `Submit` carrying a single `Segment::Text`.
     /// Used by dumb clients, inter-Worker tools, and tests that only have

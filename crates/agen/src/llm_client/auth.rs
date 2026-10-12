@@ -1,43 +1,43 @@
-//! `Scheme` 実装と通信層が要求する認証要件、および動的認証プロバイダ。
+//! Authentication requirements for `Scheme` implementations and the transport layer,
+//! plus dynamic authentication providers.
 //!
-//! `AuthRequirement` は scheme が宣言する「この scheme はどんな認証を
-//! 期待するか」のランタイム記述で、設定ファイルや環境変数などから
-//! [`super::transport::ResolvedAuth`] を組み立てる責務は呼び出し側にある。
+//! `AuthRequirement` describes the authentication a scheme expects at runtime.
+//! The caller is responsible for building [`super::transport::ResolvedAuth`]
+//! from configuration files, environment variables, or other sources.
 //!
-//! リクエスト毎にトークンが変わり得る認証は [`AuthProvider`] trait を
-//! 実装し、[`super::transport::ResolvedAuth::Custom`] 経由で transport に渡す。
+//! Authentication whose tokens may change per request implements [`AuthProvider`]
+//! and is passed to the transport via [`super::transport::ResolvedAuth::Custom`].
 
 use async_trait::async_trait;
 use reqwest::header::{HeaderName, HeaderValue};
 
 use super::error::ClientError;
 
-/// `Scheme::required_auth()` が返す認証要件。
+/// Authentication requirements returned by `Scheme::required_auth()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthRequirement {
-    /// 認証を行わない（Ollama など）
+    /// No authentication (e.g. Ollama).
     None,
-    /// `Authorization: Bearer <token>` ヘッダ（token は API key 相当）
+    /// `Authorization: Bearer <token>` header (the token acts as an API key).
     Bearer,
-    /// `x-api-key: <token>` ヘッダ（Anthropic 形式）
+    /// `x-api-key: <token>` header (Anthropic format).
     XApiKey,
-    /// クエリパラメータ `?<name>=<token>`（Gemini 形式）
+    /// Query parameter `?<name>=<token>` (Gemini format).
     QueryParam { name: &'static str },
-    /// 複合ヘッダ（呼び出し側が [`AuthProvider`] で解決）
+    /// Combined headers (resolved by the caller through [`AuthProvider`]).
     Custom,
 }
 
-/// リクエスト毎に認証ヘッダを動的に組み立てるプロバイダ。
+/// Provider that builds authentication headers dynamically for each request.
 ///
-/// access token が refresh で更新されたり、複数ヘッダを同時に注入する
-/// 必要があるケースで使う。実体は呼び出し側に置き、agen は
-/// trait を知るだけ。
+/// Use this when access tokens are refreshed or multiple headers must be injected
+/// together. The implementation belongs to the caller; agen only knows the trait.
 ///
-/// 返したヘッダはそのまま `HeaderMap` に挿入される。`Authorization`
-/// 含む scheme 既定の認証ヘッダは送出されないので、必要なら
-/// 実装側でセットすること。
+/// Returned headers are inserted directly into `HeaderMap`. The scheme's default
+/// authentication headers, including `Authorization`, are not sent; the
+/// implementation must set them if needed.
 #[async_trait]
 pub trait AuthProvider: Send + Sync + std::fmt::Debug {
-    /// 1 リクエスト分の認証ヘッダを返す。refresh が必要なら内部で行う。
+    /// Return authentication headers for one request, refreshing internally if needed.
     async fn headers(&self) -> Result<Vec<(HeaderName, HeaderValue)>, ClientError>;
 }

@@ -1,4 +1,6 @@
 <script lang="ts">
+  // current／historicalはchange_idとcurrent_change_idの一致で区別する。
+  // 本文・evidenceの続きも同じimmutable changeへ固定し、現在版の内容を混ぜない。
   import DocumentMarkdown from '#lib/workspace/markdown/DocumentMarkdown.svelte';
   import { formatDate, workspaceRoute } from '#lib/workspace/api/http.ts';
   import type {

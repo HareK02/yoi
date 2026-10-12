@@ -1,9 +1,19 @@
-//! Shared subscription-multiplexer wire contract.
+//! Transport contract for multiple subscriptions over one connection.
 //!
-//! This protocol is distinct from the single-Worker [`crate::Method`] / [`crate::Event`]
-//! protocol. A connection carries many independently managed subscriptions. The
-//! connection endpoint owns authorization and maps the typed selectors below to
-//! visible resources; clients cannot provide Workspace scope as selector input.
+//! Manages subscriptions separately from a single Worker's [`crate::Method`] and
+//! [`crate::Event`]. The endpoint owns authorization and selector resolution;
+//! it does not accept Workspace scope from clients. Each subscription snapshot
+//! anchors subsequent events; reconnecting replaces public state.
+//!
+//! Worker snapshots use public DTOs, not stored logs, keeping storage replay rules
+//! out of clients. Committed history and uncommitted output stay separate;
+//! subsequent history-commit events are matched by entry ID. Reasoning and internal
+//! extension payloads are not exposed in conversation views.
+//!
+//! Input acceptance, stream deltas, and history commits are distinct boundaries;
+//! live notifications alone do not establish durable state or completed results.
+//! Turn boundaries also differ from individual generation requests. Transport
+//! retries before streaming are retry notifications for the same generation request.
 
 use std::collections::HashSet;
 use std::fmt;

@@ -1,8 +1,16 @@
-//! Host-scoped model tools for change-identified subjektiv Memory.
+//! Model tools for Subjektiv Memory with change IDs, bound to a Host connection.
 //!
-//! Confirmed Memory is read-only here. Explicit remembering and change requests
-//! become immutable staging candidates; T-670 remains the only authority that may
-//! adopt a candidate as a confirmed change.
+//! Confirmed Memory is read-only here. Remember/ProposeChange creates only immutable staging
+//! candidates; adoption and confirmed changes remain under consolidation authority. The Host fixes
+//! subject/session/provenance from committed captures and connections, not model input. Preferences
+//! require HumanInput evidence; model-authored tool calls never become authority for human preferences.
+//!
+//! Non-preference proposals without entry_refs stay pending_commit and use their own tool call as
+//! evidence after commit. Receipts derive from Session and tool-call identity and are reconstructed
+//! from durable history for staging, enabling idempotent retries with the same receipt after hook
+//! failure or restore. RunCommitted and PreLlmRequest replay them; fail-closed BeforeSessionRewrite
+//! prevents compaction from dropping unstaged receipts. Uncommitted operations are never staged.
+//! Staging changes neither confirmed Memory fingerprints nor surfaces.
 
 use std::collections::HashSet;
 use std::sync::Arc;

@@ -85,9 +85,9 @@ pub struct Allocation {
     /// a top-level Worker started directly by a human.
     pub delegated_from: Option<String>,
     /// Segment ID this Worker is currently writing to. `None` means this
-    /// is a pre-reservation made by a spawner via [`super::super::delegate_scope`]
+    /// is a pre-reservation made by a spawner via [`super::delegate_scope`]
     /// before the child has come up; the child fills it in at
-    /// [`crate::adopt_allocation`] time.
+    /// [`super::adopt_allocation`] time.
     #[serde(default)]
     pub segment_id: Option<SegmentId>,
 }

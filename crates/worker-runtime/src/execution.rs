@@ -1,3 +1,11 @@
+//! Operation and result boundaries between Runtime and execution backends.
+//!
+//! Lifecycle operation IDs identify durable reconciliation; they are not interchangeable with
+//! controller command IDs or Submit/Notify request IDs. Catalog Idle/Stopped status alone does
+//! not determine input acceptance. Submit/Notify success rests on their durable receipts,
+//! not transport enqueueing or connection closure. Lost responses do not imply no effects;
+//! operation-specific unknown/settlement rules still apply.
+
 use crate::catalog::{
     ConfigBundleRef, ProfileSelector, RepositoryRefObservation, RepositoryRefObservationRequest,
     WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest, WorkingDirectoryStatus,
@@ -224,6 +232,13 @@ enum WorkerExecutionPublicationState {
     Discarded,
 }
 
+/// Publication boundary for protocol observations bound to Worker identity.
+///
+/// Restore candidates buffer events until the execution commit to the catalog succeeds.
+/// Events during activation join the same queue, so publication preserves event order.
+/// Discarding a candidate on rollback also suppresses its later events. This isolation prevents
+/// a newly started controller from exposing a live candidate inconsistent with the settled
+/// catalog; it does not prove execution cleanup.
 #[derive(Clone)]
 pub struct WorkerExecutionContext {
     worker_ref: WorkerRef,

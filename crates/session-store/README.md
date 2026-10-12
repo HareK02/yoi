@@ -1,32 +1,15 @@
 # session-store
 
-## Role
+`session-store` stores replayable Session history and current Worker restoration data.
+Session history uses append-only JSONL; current Segment references and child/peer
+registrations live separately in Worker metadata. It does not own process liveness
+checks or Runtime catalog lifecycle management.
 
-`session-store` owns replayable append-only session logs.
+## Design entry points
 
-## Boundaries
-
-Owns:
-
-- session identifiers and segment lineage
-- JSONL log entries for replayable conversation/runtime history
-- restoring Engine/session state from committed records
-- schema surfaces that should make drift compile-visible
-
-Does not own:
-
-- current Worker-name metadata (`session-store` worker metadata)
-- live process/socket discovery (`worker-allocation`, `client`)
-- UI state (`tui`)
-- generated memory summaries (`memory`)
-
-## Design notes
-
-A session log records what happened. It is not the current Worker registry and should not be queried as the only source of "what does Worker X mean now?"
-
-Prefer explicit current log variants over broad legacy compatibility when schema changes; hidden compatibility can make future replay bugs silent.
-
-## See also
-
-- [`../../docs/design/worker-session-state.md`](../../docs/design/worker-session-state.md)
-- [`../../docs/design/context-history.md`](../../docs/design/context-history.md)
+- [`segment_log`] / [`segment`]: history replay and fork/compaction lineage
+- [`worker_session_store`]: storage boundary for a Session bound to a Worker
+- [`worker_metadata`]: current Worker state and active Segment switching
+- [`system_item`]: records of system input presented to the model
+- [`public_snapshot`] / [`public_index`]: public projections of stored history
+- [`event_trace`]: diagnostic records independent of history replay

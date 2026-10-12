@@ -1,8 +1,4 @@
-//! Local workspace web control plane backend bootstrap.
-//!
-//! This crate deliberately provides backend building blocks and an HTTP router;
-//! it is not the product CLI facade. Tickets and Objectives are served through
-//! Backend authority surfaces rather than Worker-local filesystem access.
+#![doc = include_str!("../README.md")]
 
 pub mod auth;
 pub mod authority;

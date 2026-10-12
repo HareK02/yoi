@@ -151,9 +151,8 @@ impl UsageTracker {
         pending.usage_recorded = true;
         let request_id = pending.id;
         let history_len = pending.history_len;
-        // UsageEvent.input_tokens は scheme 層で「占有量（プロンプト全長）」に
-        // 正規化済みである前提（Anthropic は cache_read + cache_creation を
-        // 加算して emit する）。
+        // Assumes the scheme layer has normalized UsageEvent.input_tokens to occupancy
+        // (full prompt length). Anthropic adds cache_read + cache_creation before emitting.
         let input_total = event.input_tokens.unwrap_or(0);
         let cache_read = event.cache_read_input_tokens.unwrap_or(0);
         let cache_write = event.cache_creation_input_tokens.unwrap_or(0);

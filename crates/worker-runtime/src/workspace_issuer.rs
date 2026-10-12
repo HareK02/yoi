@@ -1,3 +1,14 @@
+//! Runtime request authentication through explicitly registered Workspace issuers.
+//!
+//! Matches actual HTTP method, path/query, body digest, operation, Runtime audience, Workspace/Worker
+//! scope, expiry, and single-use token ID against signed claims. Ping is an ordinary signed request;
+//! prior handshakes or saved connection tests do not authorize it. No fallback to self-reported
+//! public keys, Server-global trust, or static bearers.
+//!
+//! Trust IDs are administrative, not namespaces for sender claims. Replay tracking uses Workspace
+//! and trusted key fingerprints, so re-registering or rotating the same key cannot revive consumed
+//! requests. This does not guarantee invalidation of unconsumed, unexpired requests from a reaccepted key.
+
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;

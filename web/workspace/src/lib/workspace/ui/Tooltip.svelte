@@ -1,4 +1,8 @@
 <script lang="ts">
+  // hoverの遅延は通過時の表示を抑え、keyboard focusでは即時に補助説明を示す。
+  // childrenへ渡すidをtriggerのaria-describedbyに使い、Escapeでもfocusは動かさない。
+  // 内容は操作controlを含まないtextに限定する。判断に必須の状態・制約はここへ隠さず、
+  // touchでもTooltip以外から読めるようにする。fixed配置はscroll時にも対象位置へ合わせる。
   import { onDestroy, onMount, tick, type Snippet } from 'svelte';
 
   type Placement = 'top' | 'bottom';

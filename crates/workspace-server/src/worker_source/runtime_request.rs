@@ -1,3 +1,19 @@
+//! Runtime request proof verification and secret-free rejection diagnostics.
+//!
+//! Unverified issuers only select public keys from current Workspace bindings. After matching
+//! signature, Backend audience, Workspace, permission, method, path/query, body digest, and time,
+//! verification consumes the JTI transactionally and checks Worker registration or creation
+//! reservations and singleton ownership. One sampled clock serves time checks and JTI records;
+//! the lower-level verifier owns tolerance and ordering. Diagnostics do not recompute rejection
+//! with another clock.
+//!
+//! Rejection reasons expose only safe categories and verification stages. Claim-derived identities
+//! use domain-separated hashes, omitted on decode failure. request_verified may still precede
+//! replay/registration/ownership checks; it is not an authenticated principal. Diagnostics do not
+//! infer key-mismatch causes or absence/revocation distinctions the store does not make.
+//! Proofs, raw claims, keys, bodies, and store error text are not retained. Identity hashes are
+//! not encryption and do not make guessable IDs secret.
+
 use worker_runtime::auth::{
     RuntimeAuthError, RuntimeRequestClaim, RuntimeRequestSourceClaims,
     RuntimeRequestSourceExpectation, decode_runtime_request_source_claims,

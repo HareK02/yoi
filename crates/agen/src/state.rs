@@ -1,58 +1,34 @@
-//! Engine State
+//! Type states that restrict changes to Engine configuration.
 //!
-//! State marker types for cache protection using the Type-state pattern.
-//! Engine has state transitions from `Mutable` → `Locked`.
+//! Transitioning from [`Mutable`] to [`Locked`] fixes the configuration and history
+//! prefix length, restricting changes to system prompts and tool definitions during
+//! execution. Changes require an explicit unlock because altering the prefix may
+//! prevent prompt-cache reuse. History itself belongs to the caller: these states
+//! neither prevent external history mutations nor guarantee cache hits.
 
-/// Marker trait representing Engine state
+/// Sealed trait for Engine type states.
 ///
-/// This trait is sealed and cannot be implemented externally.
+/// External implementations are prohibited so the crate controls the separation
+/// between configuration and execution APIs.
 pub trait EngineState: private::Sealed + Send + Sync + 'static {}
 
 mod private {
     pub trait Sealed {}
 }
 
-/// Mutable state (editable)
+/// State in which configuration can be edited.
 ///
-/// In this state, the following operations are available:
-/// - Setting/changing system prompt
-/// - Editing message history (add, delete, clear)
-/// - Registering tools and hooks
-///
-/// Can transition to [`Locked`] state via `Engine::lock(&history)`.
-///
-/// # Examples
-///
-/// ```ignore
-/// use agen::Engine;
-///
-/// let mut engine = Engine::new(client)
-///     .system_prompt("You are helpful.");
-///
-/// // History can be edited
-/// engine.push_message(Message::user("Hello"));
-/// engine.clear_history();
-///
-/// // Lock to protected state
-/// let locked = engine.lock();
-/// ```
+/// Transitions to [`Locked`] through `Engine::lock` or the first `run`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Mutable;
 
 impl private::Sealed for Mutable {}
 impl EngineState for Mutable {}
 
-/// Cache locked state (cache protected)
+/// State with fixed configuration and history prefix length.
 ///
-/// In this state, the following restrictions apply:
-/// - System prompt cannot be changed
-/// - Existing message history cannot be modified (only appending to the end)
-///
-/// To ensure LLM API KV cache hits,
-/// using this state during execution is recommended.
-///
-/// Can return to [`Mutable`] state via `Engine::unlock()`,
-/// but note that cache protection will be released.
+/// `Engine::unlock` returns to [`Mutable`] and permits configuration changes,
+/// but requests made after those changes may no longer reuse the previous cache.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Locked;
 

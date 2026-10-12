@@ -1,3 +1,17 @@
+//! Adapter delegating Workspace operations to embedded/remote Runtimes.
+//!
+//! RuntimeRegistry selects execution owners by Runtime/Worker identity and converts typed
+//! requests and results. The Server owns Workspace assignments, Workdir links, and retention;
+//! Runtime owns execution endpoints and lifecycle settlement. Display names, socket/session
+//! paths, and catalog state do not grant operation authority.
+//!
+//! Remote requests match the selected Workspace binding against current configuration before
+//! issuing short-lived capabilities with the current Workspace signing identity. A binding match
+//! selects a destination, not proof of authentication. Stale clients with replaced/revoked bindings
+//! are rejected. Method, path/query, body digest, permission, and target identity are request-bound;
+//! verification follows Runtime's current Workspace trust. Past connection tests are not reused
+//! as authentication state.
+
 use crate::Error;
 use crate::resource_broker::BackendResourceBroker;
 #[cfg(test)]

@@ -1,41 +1,40 @@
-//! Usage 履歴ベースのトークン会計（汎用部分）。
+//! Token estimates based on provider measurements and history growth.
 //!
-//! `UsageRecord` の列（プロバイダ実測値）と現在の history から、
-//! 任意の history index 時点のプロンプト全長トークン数を pure に計算する。
+//! Uses the full input token count from [`UsageRecord`], interpolating between
+//! measured boundaries by byte count and extrapolating beyond the latest boundary
+//! from text bytes. Input totals include cache reads rather than inventing a
+//! system/history breakdown.
 //!
-//! # 方針
-//!
-//! - ローカルトークナイザは持たない。実測値があればそれを採用し、
-//!   measurement 間はバイト数で按分、最新 measurement より先は byte/4
-//!   fallback で外挿する
-//! - 推定の出どころは [`EstimateSource`] で呼び出し側に明示する。
-//!   課金判断には使えないが、compact / prune / memory extract trigger 等の
-//!   閾値判定には十分な精度
-//! - `records` は `history_len` 昇順を仮定する（呼び出し側がそのように積む）
+//! [`EstimateSource`] distinguishes measurements from estimates. Estimates inform
+//! threshold decisions; they neither determine billing nor guarantee that a request
+//! fits the provider's context limit. Attachment base64 is a storage representation,
+//! not text input, and is excluded from byte counts. Provider measurements for
+//! requests that actually sent images remain valid. The caller supplies records in
+//! ascending `history_len` order.
 
 use crate::{Item, UsageRecord};
 
-/// 推定の出どころ。
+/// Source of a token estimate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EstimateSource {
-    /// measurement の境界にちょうど一致（実測値そのもの）
+    /// Exact match with a measurement boundary; uses the measured value.
     Measured,
-    /// 連続する 2 つの measurement の間をバイト按分で計算
+    /// Interpolated between consecutive measurements in proportion to byte count.
     Interpolated,
-    /// 最後の measurement より新しい区間を byte/4 fallback で外挿
+    /// Extrapolated beyond the latest measurement using the bytes/4 fallback.
     Extrapolated,
-    /// measurement が 1 件も無く、バイト数のみのフォールバック
+    /// Byte-count fallback with no measurements available.
     NoData,
 }
 
-/// トークン数の推定値。
+/// Estimated token count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenEstimate {
     pub tokens: u64,
     pub source: EstimateSource,
 }
 
-/// `items[..i]` までの累積バイト数（`prefix[i]`）を返す。長さは `items.len()+1`。
+/// Returns cumulative bytes for `items[..i]` in `prefix[i]`, with length `items.len() + 1`.
 pub fn prefix_bytes(items: &[Item]) -> Vec<u64> {
     let mut prefix = Vec::with_capacity(items.len() + 1);
     let mut acc: u64 = 0;
@@ -47,7 +46,7 @@ pub fn prefix_bytes(items: &[Item]) -> Vec<u64> {
     prefix
 }
 
-/// 1 Item の text-shaped size。JSON シリアライズ長を使う粗い近似。
+/// Approximate text size of one Item, using its JSON serialization length.
 ///
 /// Binary attachments are deliberately projected out. Their durable base64 encoding is a
 /// storage representation, not provider text, so charging it at the text `bytes / 4` fallback
@@ -63,11 +62,11 @@ pub fn item_bytes(item: &Item) -> u64 {
         .unwrap_or(0)
 }
 
-/// `history[..index]` までのトークン数を推定する。
+/// Estimates the token count of `history[..index]`.
 ///
-/// `prefix` は [`prefix_bytes`] で得た `history.len() + 1` 長の累積バイト列。
-/// 呼び出し側が 1 度だけ計算して使い回すことで、線形探索や複数回の推定が
-/// O(n) シリアライズで済む（内部で毎回再計算すると O(n²) になる）。
+/// `prefix` contains `history.len() + 1` cumulative byte counts from [`prefix_bytes`].
+/// Computing it once and reusing it keeps serialization for a scan or repeated
+/// estimates O(n), rather than O(n²) from recomputing it for every estimate.
 pub fn tokens_at(
     history: &[Item],
     records: &[UsageRecord],
@@ -91,7 +90,7 @@ pub fn tokens_at(
         };
     }
 
-    // exact match（rev 走査で一番新しい record を採用）
+    // Exact match: reverse iteration selects the most recent record.
     if let Some(r) = records.iter().rev().find(|r| r.history_len == index) {
         return TokenEstimate {
             tokens: r.input_total_tokens,
@@ -153,15 +152,15 @@ pub fn tokens_at(
     }
 }
 
-/// 現在の history 全体の推定トークン数。
+/// Estimated token count for the entire current history.
 pub fn total_tokens(history: &[Item], records: &[UsageRecord]) -> TokenEstimate {
     let prefix = prefix_bytes(history);
     tokens_at(history, records, history.len(), &prefix)
 }
 
-/// 任意の history index 時点でのプロンプト全長推定。
-/// `history_len == 0` で 0 を返す。delta 計算 (extract trigger 等) で
-/// `total_tokens_at(now) - total_tokens_at(pointer)` の形で使う。
+/// Estimates the full prompt token count at an arbitrary history boundary.
+/// Returns zero for `history_len == 0`. Differences such as
+/// `total_tokens_at(now) - total_tokens_at(pointer)` can drive extraction triggers.
 pub fn total_tokens_at(
     history: &[Item],
     records: &[UsageRecord],

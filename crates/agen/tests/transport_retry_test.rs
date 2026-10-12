@@ -1,7 +1,7 @@
-//! HTTP transport の単発 request / error classification テスト。
+//! Tests for single-attempt HTTP requests and error classification.
 //!
-//! Retry/backoff は Engine の lifecycle 管理に属するため、transport は 1 回だけ
-//! request を送り、HTTP status / Retry-After を `ClientError` に載せて返す。
+//! Retry and backoff belong to the Engine lifecycle. The transport sends one
+//! request and returns the HTTP status and Retry-After information in `ClientError`.
 
 use agen::llm_client::LlmClient;
 use agen::llm_client::auth::AuthRequirement;
@@ -17,8 +17,8 @@ use std::time::Duration;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// SSE 本体は触らないテスト用 scheme。`parse_fail` を立てると
-/// stream 消費中で `ClientError::Sse` を返す。
+/// Test scheme that does not inspect SSE payloads. With `parse_fail` set,
+/// it returns `ClientError::Sse` while consuming the stream.
 #[derive(Clone)]
 struct DummyScheme {
     parse_fail: bool,

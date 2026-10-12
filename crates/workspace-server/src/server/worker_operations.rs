@@ -1,4 +1,35 @@
-//! Workspace identity-bound operation reception. Runtime/controller remain execution authority.
+//! Worker operation admission based on Workspace registration.
+//!
+//! [`WorkspaceWorker`] fixes Runtime/Worker identity; it is not a lease guaranteeing a live
+//! execution or authorization. Each operation rereads registration and revalidates the request's
+//! Account or Worker control grant before delegating to Runtime. The controller determines actual
+//! Idle/Busy state and input admission; catalog state alone cannot determine execution eligibility.
+//!
+//! # Caller and input boundaries
+//!
+//! The Server builds [`WorkerOperationContext`] from authentication results. Worker control locks
+//! per grant and rechecks the same grant ID and permissions after waiting. Account requests reread
+//! credentials, Account, and active Workspace, also checking browser session Origin. Test-only
+//! Backend contexts do not exist in production.
+//!
+//! Worker control converts User input to UserIfIdle, never queuing Submit for a running Worker.
+//! Notify requires separate permission. Normal input is denied to Backend Job Workers and Workers
+//! with unsettled Ticket claims. Only Runtime Accepted Stop closes the current Workdir session
+//! and synchronizes attachments. WorkerRemove is a separate contract: it verifies a target-bound
+//! proof, then rechecks grants and retention in the removal service.
+//!
+//! # Connections and results
+//!
+//! Dedicated and multiplexed WS use the same [`WorkspaceWorkerMethodSender`]. Connections check
+//! observe; method sends check send_input and browser context. Successful sends mean transport
+//! channel enqueue, not controller acknowledgment or durable Submit/Notify receipts.
+//! Actual results arrive through the event stream. Connections bind to one execution and do not
+//! implicitly reconnect or Restore into the next execution with the same Worker ID.
+//!
+//! Unary input lacks the WS Submit replay-key contract; unknown delivery outcomes remain diagnostic.
+//! Restore observation tokens, controller command IDs, Submit/Notify request IDs, and cleanup plan
+//! digests have separate verifying owners, not a shared success criterion or replay contract.
+//! Internal SubWorkers are parent Worker sessions, outside this Workspace registry handle.
 use super::*;
 
 /// Caller authority supplied by authenticated Server adapters, never public JSON/identity hints.

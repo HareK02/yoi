@@ -1,13 +1,4 @@
-//! Built-in tools for the Yoi LLM agent.
-//!
-//! Read / Write / Edit / Glob / Grep / Bash operate through a host-owned
-//! [`workdir::WorkdirSession`] handle. This crate owns tool schemas, rendering, and
-//! read-before-edit tracking; it does not own Workdir identity/materialization or
-//! WorkdirSession lifecycle.
-//!
-//! Bash is intentionally not sandboxed. The WorkdirSession supplies its initial cwd
-//! and command capability, while the Runtime process and OS user remain the
-//! trusted execution boundary.
+#![doc = include_str!("../README.md")]
 
 pub mod checkout;
 pub mod error;

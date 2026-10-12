@@ -1,3 +1,9 @@
+//! Stores per-Workspace local input history as typed Segments.
+//!
+//! This history supports editing reuse; it is not a Worker's durable Session or model
+//! context. Feature invocations and UploadedFile references stay typed during re-editing
+//! rather than reverting to strings.
+
 use std::collections::VecDeque;
 use std::fs;
 use std::io;

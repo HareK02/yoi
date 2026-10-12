@@ -1,3 +1,15 @@
+//! Assembly of in-process Workers and Host-owned resources.
+//!
+//! Fresh launches use `WorkerBootstrap`; restores use saved Sessions. Both follow the existing
+//! controller lifecycle. Transport is InProcess; normal launches create no subprocess or listener.
+//! Canonical cwd supplies filesystem authority; the controller plans/installs Features.
+//! Injected model clients replace transport without skipping Profile or capability validation.
+//!
+//! The Host owns the Worker lease and, when selected, the Subject lease. It waits for Job cleanup
+//! and SQLite closure, then releases leases after confirmed controller shutdown, final record
+//! commit, and Subject closure. Timeout, lost confirmation, and drop do not prove cleanup;
+//! leases remain held to prevent reopening.
+
 use std::path::PathBuf;
 use std::time::Duration;
 

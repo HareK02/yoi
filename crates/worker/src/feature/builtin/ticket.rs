@@ -1,8 +1,32 @@
-//! Built-in Ticket feature adapter.
+//! Ticket Feature and native WIP projection connected to the Workspace API.
 //!
-//! The ticket crate owns Ticket domain logic and Tool implementations. This
-//! module binds an authority-scoped Workspace client, declares the built-in
-//! feature, and contributes those tools through the normal registry path.
+//! The `ticket` crate owns the Ticket domain and regular Tools; the Backend owns Workspace state,
+//! relationships, and audit. This module connects a scoped Workspace client to the enabled Tools.
+//! Shared WIP references, permissions, and unknown outcomes follow [`crate::wip`].
+//!
+//! # Route-bound subjects
+//!
+//! The native projection exposes `/tickets` and one immediate child segment. Items accept canonical
+//! `T-*` or canonical internal IDs, never resolving Objective keys or deeper suffixes as Tickets.
+//! Item descriptors omit subject `ticket`/`id`, reconstructing original Tool arguments only from the
+//! resolved route. Related/dependency Tickets remain separate inputs resolved by the Backend.
+//! Operations come from regular Tools actually enabled by `TicketFeatureAccess`, retaining original
+//! schemas and permission identities. WIP adds neither a broader business catalog nor another workflow.
+//!
+//! # Bounded responses and observation invalidation
+//!
+//! Query returns bounded snippets and canonical item paths; read returns bounded Backend details.
+//! Objectives and Merge Requests remain references, without expanding their content or native routes.
+//! Successful item-read response hashes feed route validators; canonical/internal aliases share an
+//! observation group. Mutation receipts are not complete representations, so updates discard
+//! observation hashes. Related targets and targets in queue results are also invalidated; no mutation
+//! counter is created. These local observations replace neither Backend item/state CAS nor current
+//! authorization.
+//!
+//! Fetching canonical references after mutations uses failure classes acknowledging that writes may
+//! already have succeeded. HTTP failures at that stage are not misclassified as "unexecuted".
+//! Optional arguments distinguish omission from explicit null for original JSON Schema/permission
+//! evaluation; defaults use the same implementation as regular Tools.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};

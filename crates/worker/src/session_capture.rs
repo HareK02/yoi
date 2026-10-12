@@ -1,8 +1,15 @@
-//! Workspace- and Memory-independent exploration of an immutable ordered session capture.
+//! Exploration domain for immutable Session captures, with no Workspace/Memory mutation capability.
 //!
-//! Hosts construct a capture from committed session items. The capture excludes reasoning,
-//! assigns append-stable `SessionEntryRef` values, and provides sparse overview, bounded
-//! range/search, read, and generic evidence projections without granting mutation authority.
+//! A capture is an ordered projection of committed entries; exploration excludes reasoning and
+//! system prompts. Overview, search, bounded reads, and evidence conversion share `SessionEntryRef`.
+//! References identify entries in the selected Session and cannot be reused for another subject.
+//! Appends preserve existing entry identities. Sparse real user/assistant anchors and intervening
+//! entry counts index long histories. Search with an empty filter also provides bounded range lists.
+//!
+//! Host-fixed snapshot exploration, Memory candidate evidence validation, and current Worker
+//! observation share only this domain; they do not enable or modify each other's Features.
+//! The provider owns authorization to recapture a current Worker. A capture itself proves neither
+//! completion nor approval and grants no business-mutation authority.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -22,6 +29,8 @@ const MAX_READ_MAX_ITEMS: usize = 80;
 const DEFAULT_READ_MAX_BYTES: usize = 32 * 1024;
 const OVERVIEW_ANCHOR_STRIDE: usize = 8;
 
+/// Append-stable exploration reference derived from an entry identity in the selected Session.
+/// Shared by overview, search, read, and evidence conversion; it does not identify other Sessions' entries.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionEntryRef(String);

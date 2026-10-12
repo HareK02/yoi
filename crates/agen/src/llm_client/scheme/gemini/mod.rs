@@ -1,29 +1,29 @@
-//! Google Gemini API スキーマ
+//! Google Gemini API scheme.
 //!
-//! - リクエストJSON生成
-//! - SSEイベントパース → Event変換
+//! - Request JSON generation.
+//! - SSE event parsing → Event conversion.
 
 mod capability;
 mod events;
 mod request;
 mod scheme_impl;
 
-/// Geminiスキーマ
+/// Gemini scheme.
 ///
-/// Google Gemini APIのリクエスト/レスポンス変換を担当
+/// Handles request/response conversion for the Google Gemini API.
 #[derive(Debug, Clone, Default)]
 pub struct GeminiScheme {
-    /// ストリーミング関数呼び出し引数を有効にするか
+    /// Whether to enable streaming function call arguments.
     pub stream_function_call_arguments: bool,
 }
 
 impl GeminiScheme {
-    /// 新しいスキーマを作成
+    /// Create a new scheme.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// ストリーミング関数呼び出し引数を有効/無効にする
+    /// Enable or disable streaming function call arguments.
     pub fn with_stream_function_call_arguments(mut self, enabled: bool) -> Self {
         self.stream_function_call_arguments = enabled;
         self

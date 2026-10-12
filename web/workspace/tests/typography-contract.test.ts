@@ -51,12 +51,6 @@ Deno.test("Workspace typography tokens bind the documented three-level scale", a
   const appCss = await Deno.readTextFile(
     new URL("../src/app.css", import.meta.url),
   );
-  const designLanguage = await Deno.readTextFile(
-    new URL(
-      "../../../docs/development/ui-ux/design-language.md",
-      import.meta.url,
-    ),
-  );
 
   for (
     const contract of [
@@ -73,12 +67,4 @@ Deno.test("Workspace typography tokens bind the documented three-level scale", a
   ) {
     assert(appCss.includes(contract), `app.css must preserve ${contract}`);
   }
-
-  assert(
-    designLanguage.includes("--font-size-title /* 24px */") &&
-      designLanguage.includes("--font-size-body /* 14px */") &&
-      designLanguage.includes("--font-size-compact /* 12px */") &&
-      designLanguage.includes("`12px`未満と`13px`を使わない"),
-    "The design language must preserve the title, body, and compact typography contract",
-  );
 });

@@ -1,3 +1,10 @@
+//! Distinct Backend and Standalone targets and product operation intents.
+//!
+//! Backend targets resolve an origin and Workspace and identify Workers by Runtime/Worker pairs.
+//! Standalone spawn/list/resume are intents passed to higher-level crates, not execution;
+//! this module starts no subprocesses. Target identity is separate from product commands
+//! and Worker state authority.
+
 use std::{fmt, path::PathBuf};
 
 use crate::{

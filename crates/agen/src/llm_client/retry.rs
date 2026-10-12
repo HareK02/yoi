@@ -1,25 +1,25 @@
-//! LLM response stream を開く前の transient error 向けリトライポリシー。
+//! Retry policy for transient errors before opening an LLM response stream.
 //!
-//! `LlmClient::stream` の open error に対して `is_retryable` を見て
-//! retry / backoff / cancellation をまとめて管理する。
-//! SSE 読み出し開始後の失敗は対象外。
+//! Uses `is_retryable` on `LlmClient::stream` open errors to manage retries,
+//! backoff, and cancellation together. Failures after SSE reading begins
+//! are excluded.
 
 use std::time::Duration;
 
-/// 指数バックオフ + ジッター + 累積タイムアウトを表すポリシー。
+/// Policy combining exponential backoff, jitter, and a cumulative timeout.
 ///
-/// `Default` は agen 全体の固定値を返す。呼び出し側からの上書きが
-/// 必要になったら拡張する。
+/// `Default` returns fixed values shared across agen. Extend this if caller
+/// overrides become necessary.
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
-    /// 指数の基準値。`base * 2^attempt` を `cap` で頭打ちにした上限から
-    /// フルジッターで実際の wait を抽選する。
+    /// Exponential base. Full jitter samples the actual wait from an upper bound
+    /// of `base * 2^attempt`, capped at `cap`.
     pub base: Duration,
-    /// 1 回あたりの wait の上限。
+    /// Maximum wait per attempt.
     pub cap: Duration,
-    /// 試行の合計回数（初回 + リトライ）。`1` ならリトライしない。
+    /// Total attempts (initial attempt + retries). `1` disables retries.
     pub max_attempts: u32,
-    /// 初回送信開始からの累積タイムアウト。これを超える wait は打ち切る。
+    /// Cumulative timeout from the first send. Waits exceeding it are cut short.
     pub total_timeout: Duration,
 }
 
@@ -35,8 +35,8 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
-    /// `attempt` 回目の失敗（0-indexed）後に待つ時間を返す。
-    /// `Retry-After` で上書きしたい場合は呼び出さず、その値をそのまま使う。
+    /// Return the wait after failure number `attempt` (zero-indexed).
+    /// For a `Retry-After` override, use its value directly instead of calling this.
     pub fn backoff(&self, attempt: u32) -> Duration {
         let shift = attempt.min(20);
         let base_nanos = self.base.as_nanos() as u64;
@@ -47,9 +47,9 @@ impl RetryPolicy {
     }
 }
 
-/// `[0, max_nanos]` から擬似乱数的に 1 つ取り出す。`SystemTime` の
-/// 下位ビットを splitmix64 で攪拌するだけの軽量実装で、暗号的乱数性は
-/// 持たないがフルジッターのぶつかり回避には十分。
+/// Sample a pseudorandom value from `[0, max_nanos]`. This lightweight
+/// implementation mixes the low bits of `SystemTime` with splitmix64.
+/// It is not cryptographically random, but suffices to avoid full-jitter collisions.
 fn jitter_nanos(max_nanos: u64) -> u64 {
     if max_nanos == 0 {
         return 0;

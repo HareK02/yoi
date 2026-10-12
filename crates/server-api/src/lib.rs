@@ -1,8 +1,4 @@
-//! Shared Workspace HTTP resource contracts.
-//!
-//! This crate owns transport DTOs exposed by the Workspace Server and consumed
-//! by Rust clients. Runtime-internal projections remain in their owning crates;
-//! callers must explicitly construct these Server-authoritative resources.
+#![doc = include_str!("../README.md")]
 
 use std::collections::BTreeMap;
 
@@ -472,6 +468,17 @@ pub struct WorkspaceWorkerSessionHistoryResponse {
     pub observation: runtime_api::WorkerSessionHistoryAvailability,
 }
 
+/// Shared Workspace HTTP contract. Server/Runtime determine resource authorization and settlement.
+///
+/// # Restore intent and results
+///
+/// Replay keeps the [`WorkerRestoreRequest`] observation token and request ID fixed. The token
+/// identifies a Runtime observation, not a controller command ID or cleanup plan digest. GET
+/// comparisons do not replace admission checks under the Runtime operation lock; conflicts do
+/// not trigger automatic token replacement.
+/// [`WorkerRestoreState`] Accepted means Restore committed, not that the subsequent run succeeded.
+/// Distinguish read-only preflight Rejected, confirmed RolledBack after side effects, and
+/// ReconciliationRequired needing settled-state checks. Response loss does not imply rollback.
 #[api(reqwest, axum, openapi)]
 pub trait ServerApi {
     #[get("/health", status = 200, error_status = 400)]
@@ -3605,6 +3612,11 @@ pub struct ServerRuntimeSource {
     pub worker_id: Option<String>,
 }
 
+/// Request context built by Server authentication adapters, not authority selected via public JSON.
+///
+/// actor and Runtime/Worker sources are middleware verification results; operation services recheck
+/// current registrations, grants, and Accounts as needed. Transport headers are a Server-internal
+/// extension reusing existing authentication, excluded from generated client and OpenAPI inputs.
 #[derive(Clone)]
 pub struct ServerRequestContext {
     pub actor: Option<RequestActor>,
@@ -3685,6 +3697,8 @@ pub struct RequestActor {
     pub auth_method: ActorAuthMethod,
 }
 
+/// user_id identifies a human; account_id identifies the Workspace owner's namespace.
+/// Actor authentication is separate from Workspace resource authorization, checked by resource services.
 impl RequestActor {
     pub fn user(&self) -> AuthenticatedUser {
         AuthenticatedUser {

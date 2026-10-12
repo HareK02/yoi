@@ -1,7 +1,7 @@
-//! Typed Memory audit events sent to the Workspace authority.
+//! Transport types for Memory audit events.
 //!
-//! Runtime Workers construct these DTOs and submit them through the Memory
-//! backend operation boundary. Repository-local audit logs are not an authority.
+//! Runtime Workers pass these DTOs to backend operations. This crate does not store audit logs,
+//! and DTOs alone do not guarantee persistence. Session storage owns Session records.
 
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;

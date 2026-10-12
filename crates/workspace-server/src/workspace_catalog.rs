@@ -1,3 +1,20 @@
+//! Workspace creation and replay without requiring a Repository.
+//!
+//! Workspace identity is independent of Git Repositories and Workdirs. Omitting the initial
+//! Repository means no asset, not Git initialization or an inferred substitute. Supplied objects
+//! undergo normal validation; invalid input is not omission. The owner is the Account supplied
+//! by the authentication adapter.
+//!
+//! Normalized requests and owners produce fingerprints. After signing material reservation and
+//! preparation, the store bootstrap transaction commits Workspace, optional Repository, initial
+//! settings, signing identity, and creation receipt. Different input under the same operation key
+//! conflicts. Replaying material preparation retains the reserved Workspace/key identities.
+//!
+//! Replay returns current Workspace/settings, not creation snapshots. With an initial Repository,
+//! it returns the asset currently registered under the original key, or None after deletion/rename,
+//! without reregistration or initialization. Requests originally omitting Repository replay as
+//! None even if assets were added later.
+
 use std::sync::Arc;
 
 use chrono::{SecondsFormat, Utc};

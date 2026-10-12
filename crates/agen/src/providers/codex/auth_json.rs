@@ -1,9 +1,9 @@
-//! `~/.codex/auth.json` の読み書き。
+//! Reading and writing `~/.codex/auth.json`.
 //!
-//! Codex CLI と schema を共有するが、知らないフィールドを失わないよう
-//! ファイル全体を `serde_json::Value` で保持し、必要箇所
-//! のみアクセスする。書込は `mode 0o600` を再設定（Codex CLI 同様）、
-//! ファイルロックは取らない（manager 側で guarded reload）。
+//! Shares the schema with Codex CLI, but retains the entire file as
+//! `serde_json::Value` and accesses only the required fields to preserve
+//! unknown fields. Writes reapply `mode 0o600` (as in Codex CLI),
+//! without file locking (the manager performs a guarded reload).
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use super::error::CodexAuthError;
 
-/// auth.json から取り出した使い回す情報のスナップショット。
+/// Snapshot of reusable information extracted from auth.json.
 #[derive(Debug, Clone)]
 pub struct AuthSnapshot {
     pub access_token: String,
@@ -24,12 +24,12 @@ pub struct AuthSnapshot {
     pub account_id: String,
     pub id_token: String,
     pub last_refresh: Option<DateTime<Utc>>,
-    /// 書き戻し時に他のフィールドを失わないため、ファイル全体を保持する。
+    /// Retain the entire file to preserve other fields when writing back.
     pub raw: Value,
 }
 
 impl AuthSnapshot {
-    /// `Value` から必要フィールドを抽出。欠落・型不一致は `MalformedAuthJson`。
+    /// Extract required fields from `Value`. Missing fields or type mismatches yield `MalformedAuthJson`.
     pub fn from_value(raw: Value) -> Result<Self, CodexAuthError> {
         let tokens = raw
             .get("tokens")
@@ -55,7 +55,7 @@ impl AuthSnapshot {
             .ok_or_else(|| CodexAuthError::MalformedAuthJson("missing tokens.id_token".into()))?
             .to_string();
 
-        // account_id は tokens.account_id を優先、無ければ id_token JWT 由来
+        // Prefer tokens.account_id; fall back to the id_token JWT if absent
         let account_id = tokens
             .get("account_id")
             .and_then(Value::as_str)
@@ -84,7 +84,7 @@ impl AuthSnapshot {
     }
 }
 
-/// auth.json を読む。存在しなければ `NotLoggedIn`。
+/// Read auth.json. Return `NotLoggedIn` if it does not exist.
 pub async fn load(path: &Path) -> Result<AuthSnapshot, CodexAuthError> {
     let bytes = match tokio::fs::read(path).await {
         Ok(b) => b,
@@ -103,11 +103,11 @@ pub async fn load(path: &Path) -> Result<AuthSnapshot, CodexAuthError> {
     AuthSnapshot::from_value(raw)
 }
 
-/// 既存ファイルを再読込し、`tokens.{id_token,access_token,refresh_token}` と
-/// `last_refresh` を更新して書き戻す。Codex CLI の `persist_tokens` 相当。
+/// Reload the existing file, update `tokens.{id_token,access_token,refresh_token}`
+/// and `last_refresh`, and write it back. Equivalent to Codex CLI's `persist_tokens`.
 ///
-/// 並行する Codex CLI / 別プロセスが先に refresh していた場合の
-/// fields を保護するため、書込前に再 load して merge する。
+/// Reload and merge before writing to preserve fields if a concurrent
+/// Codex CLI / another process has already refreshed.
 pub async fn persist_refreshed(
     path: &Path,
     new_id_token: Option<String>,
@@ -161,8 +161,8 @@ fn write_atomic(path: &Path, value: &Value) -> Result<(), CodexAuthError> {
     file.flush()
         .map_err(|e| CodexAuthError::Io(format!("flush {}: {e}", path.display())))?;
 
-    // 既存ファイルが緩いパーミッションだった場合に備えて 0o600 を強制し直す。
-    // OpenOptions の `mode()` は新規作成時しか効かないため。
+    // Reapply 0o600 in case the existing file had permissive permissions.
+    // OpenOptions `mode()` only takes effect when creating a new file.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -204,7 +204,7 @@ mod tests {
         assert_eq!(snap.refresh_token, "ref");
         assert_eq!(snap.account_id, "acc-1");
         assert!(snap.last_refresh.is_some());
-        // 未知フィールドが raw に保持されている
+        // Unknown fields are retained in raw
         assert_eq!(
             snap.raw.get("OPENAI_API_KEY").and_then(Value::as_str),
             Some("sk-extra")
@@ -214,7 +214,7 @@ mod tests {
     #[tokio::test]
     async fn account_id_falls_back_to_jwt_claim() {
         let dir = tempfile::tempdir().unwrap();
-        // tokens.account_id を欠落させ、id_token JWT 内 claim から拾う
+        // Omit tokens.account_id and obtain it from a claim in the id_token JWT
         let id_token = "h.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiZnJvbS1qd3QifX0.s";
         let path = write_auth_json(
             dir.path(),
@@ -249,7 +249,7 @@ mod tests {
                 .unwrap();
         assert_eq!(updated.access_token, "new-acc");
         assert_eq!(updated.refresh_token, "new-ref");
-        // 未知フィールド agent_identity が保たれる
+        // The unknown field agent_identity is preserved
         let on_disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(on_disk.get("agent_identity").is_some());
         assert!(on_disk.get("last_refresh").is_some());
@@ -264,7 +264,7 @@ mod tests {
             dir.path(),
             r#"{"tokens":{"id_token":"h.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYSJ9fQ.s","access_token":"a","refresh_token":"r","account_id":"a"}}"#,
         );
-        // 既存ファイルを 644 に変えてから persist → 600 に直るか
+        // Change the existing file to 644, then persist → check that it returns to 600
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         persist_refreshed(&path, None, Some("a2".into()), None)
             .await

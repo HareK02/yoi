@@ -1,4 +1,7 @@
 <script lang="ts">
+  // root slotへWorkspace内容を登録し、子layoutには別のSidebar controllerを提供する。
+  // Settings等の子はこのslotだけを差し替えるため、Workspace shortcut headerが残る。
+  // Workspace切替と破棄時に旧subscriptionを解放し、別Workspaceのprojectionを混ぜない。
   import { onDestroy, setContext } from 'svelte';
   import { page } from '$app/state';
   import HeaderOverride from '#lib/workspace/header/HeaderOverride.svelte';

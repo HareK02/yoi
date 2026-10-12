@@ -1,3 +1,20 @@
+//! Provider-independent orchestration of turns and tool execution.
+//!
+//! The Engine uses common Request and Event types to keep wire formats and
+//! authentication out of the turn loop. It delegates caller control decisions to
+//! Interceptor and does not own notification intake, storage, or segment switches
+//! during compaction.
+//!
+//! New history items enter in-memory history only after their annotation callback
+//! succeeds. Hosts that require persistence record items in that callback.
+//! Request-time reordering and pruning operate on a clone, preserving stored order
+//! and caller-owned annotations.
+//!
+//! Retries before a stream opens differ from continuation requests after partial
+//! output has been recorded. A stream failure after early tool dispatch disables
+//! automatic continuation: regenerating the same side effect under a new call ID
+//! is unsafe, so the Engine finalizes the executions it owns and returns an error.
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc, time::Instant};
 
@@ -464,7 +481,7 @@ const MAX_STREAM_CONTINUATIONS: u32 = 3;
 ///
 /// Calling `run()` on a `Mutable` Engine consumes it and returns a
 /// `Locked` Engine together with the result. The engine borrows the caller's
-/// [`History`](crate::History) only while running, so host annotations stay with
+/// [`History`] only while running, so host annotations stay with
 /// the host-owned history and are never projected to providers.
 ///
 /// ```ignore
@@ -488,7 +505,7 @@ const MAX_STREAM_CONTINUATIONS: u32 = 3;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmRetryNotice {
-    /// 直近で失敗した attempt 番号。1 origin。
+    /// Number of the most recently failed attempt, starting at 1.
     pub failed_attempt: u32,
     pub max_attempts: u32,
     pub wait: std::time::Duration,
@@ -539,6 +556,14 @@ impl Drop for ResponseStreamPump {
     }
 }
 
+/// Coordinates LLM responses, tool results, and control callbacks in one turn loop.
+///
+/// History belongs to the caller. `run` appends new input and starts a logical run;
+/// `resume` continues a paused or yielded run without creating a new user message.
+/// The turn budget survives pauses and yields, so resuming does not reset the limit.
+///
+/// Type states restrict Engine configuration changes; they do not guarantee that
+/// external History remains unchanged or that the provider reports a cache hit.
 pub struct Engine<C: LlmClient, S: EngineState = Mutable, A: Send + Sync = ()> {
     /// LLM client
     client: C,
@@ -550,8 +575,8 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable, A: Send + Sync = ()> {
     text_block_collector: TextBlockCollector,
     /// Tool call collector (Timeline handler)
     tool_call_collector: ToolCallCollector,
-    /// Thinking block collector (Timeline handler)。metadata 付きで完了した
-    /// Thinking block を 1 ターン分バッファし、history に append する。
+    /// Thinking block collector (Timeline handler). Buffers completed blocks and
+    /// their metadata for one turn before appending them to history.
     thinking_block_collector: ThinkingBlockCollector,
     /// Tool server handle
     tool_server: ToolServerHandle,
@@ -561,12 +586,9 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable, A: Send + Sync = ()> {
     system_prompt: Option<String>,
     /// History length at lock time (only meaningful in Locked state)
     locked_prefix_len: usize,
-    /// AgentTurn count across the lifetime of this Engine.
+    /// Cumulative AgentTurns started during this Engine's lifetime.
     ///
-    /// Once retry (`agen-stream-continuation`) is implemented, an
-    /// AgentTurn collapses N retried `LlmCall`s with identical input;
-    /// today retry is not implemented so AgentTurn and LlmCall fire 1:1
-    /// and the increment site (the LLM-call loop) is shared.
+    /// The logical run's turn budget is tracked separately in `active_run_turn_count`.
     turn_count: usize,
     /// AgentTurns consumed by the currently active logical run.
     ///
@@ -1299,10 +1321,9 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
 
     /// Build assistant response items from reasoning items, text blocks, and tool calls.
     ///
-    /// Reasoning items come first (Anthropic / OpenAI Responses 双方ともに
-    /// アシスタント応答内で reasoning は先頭に並ぶ仕様)。これは Anthropic
-    /// が新世代モデルで thinking ブロックを assistant メッセージの先頭に
-    /// 置くことを要求するためでもある。
+    /// Reasoning items precede other assistant output for both Anthropic and
+    /// OpenAI Responses. This also satisfies newer Anthropic models' requirement
+    /// that thinking blocks appear at the start of the assistant message.
     fn build_assistant_items(
         &self,
         reasoning_items: &[crate::llm_client::event::ReasoningBlockData],
@@ -3293,7 +3314,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                             let event = match result {
                                 Ok(event) => event,
                                 Err(err) => {
-                                    // 部分情報でも発火しておく（料金会計用）
+                                    // Emit even partial usage for billing accounting.
                                     self.timeline.flush_usage();
                                     return Ok(StreamResponseOutput {
                                         completion: StreamCompletion::Interrupted {
@@ -3585,7 +3606,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 }
             }
         }
-        // ストリーム完了時に集約済み Usage を 1 度だけ発火
+        // Emit aggregated usage once when the stream completes.
         self.timeline.flush_usage();
         debug!(event_count = event_count, "Stream completed");
         Ok(StreamResponseOutput {
@@ -3900,19 +3921,16 @@ impl<C: LlmClient, A: Send + Sync> Engine<C, Mutable, A> {
         }
     }
 
-    /// Lock and transition to Locked state
+    /// Finalizes configuration and transitions to Locked.
     ///
-    /// Flushes pending tool factories, then fixes the current system prompt
-    /// and history as a "committed prefix". After this, only `run()` / `resume()`
-    /// may append to history, ensuring cache hits.
-    ///
-    /// Most callers should use [`run()`](Self::run) instead, which calls
-    /// this internally. Use `lock()` directly only when you need the
-    /// `Locked` engine back on error (e.g. in a persistence layer).
+    /// Flushes pending tool factories and records the current history length as the
+    /// prefix boundary. External History mutations remain possible, so the caller
+    /// is also responsible for preserving the prefix. This transition changes the
+    /// type state; it does not persist history.
     ///
     /// # Panics
     ///
-    /// Panics if a pending tool factory produces a duplicate name.
+    /// Panics if pending tool factories produce duplicate names.
     pub fn lock(self, history: &History<A>) -> Engine<C, Locked, A> {
         self.tool_server.flush_pending();
         let locked_prefix_len = history.len();

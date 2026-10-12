@@ -1,3 +1,14 @@
+//! Projects stored history for clients.
+//!
+//! Converts committed entry IDs and provenance to public DTOs, keeping JSONL replay
+//! rules out of clients. Model reasoning, system prompts, internal response boundaries,
+//! and extension payloads are not exposed in conversation views. Measurements use
+//! dedicated readers and do not enter ordinary snapshots.
+//!
+//! Retained-history reads validate active references and Session IDs and cap read volume.
+//! Observation neither migrates old formats nor repairs corruption; required migration
+//! or repair returns an error. Matches live output by entry ID, not timestamps alone.
+
 mod run_stats;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};

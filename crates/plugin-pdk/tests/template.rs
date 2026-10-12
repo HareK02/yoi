@@ -10,17 +10,14 @@ const TEMPLATE_LIB: &str =
     include_str!("../../../resources/plugin/templates/rust-component-tool/src/lib.rs");
 const TEMPLATE_PLUGIN: &str =
     include_str!("../../../resources/plugin/templates/rust-component-tool/plugin.toml");
-const TEMPLATE_README: &str =
-    include_str!("../../../resources/plugin/templates/rust-component-tool/README.md");
 const SERVICE_TEMPLATE_CARGO: &str =
     include_str!("../../../resources/plugin/templates/rust-component-instance/Cargo.toml");
 const SERVICE_TEMPLATE_LIB: &str =
     include_str!("../../../resources/plugin/templates/rust-component-instance/src/lib.rs");
 const SERVICE_TEMPLATE_PLUGIN: &str =
     include_str!("../../../resources/plugin/templates/rust-component-instance/plugin.toml");
-const SERVICE_TEMPLATE_README: &str =
-    include_str!("../../../resources/plugin/templates/rust-component-instance/README.md");
-const SAMPLE_LIB: &str = include_str!("../../../docs/examples/plugin-component-tool/lib.rs");
+// Preserve the removed document's source as a byte-identical fixture to keep the test input unchanged.
+const SAMPLE_LIB: &str = include_str!("fixtures/component-tool-source.txt");
 const PDK_CARGO: &str = include_str!("../Cargo.toml");
 
 #[test]
@@ -50,7 +47,6 @@ fn rust_component_tool_template_has_expected_files() {
     assert!(TEMPLATE_LIB.contains("runtime_path: \"yoi_plugin_pdk::wit_bindgen::rt\""));
     assert!(TEMPLATE_LIB.contains("yoi_plugin_pdk::export_component_tool!"));
     assert!(TEMPLATE_LIB.contains("ToolOutput::json"));
-    assert!(TEMPLATE_README.contains("Component Model Tool Plugin"));
 }
 
 #[test]
@@ -114,12 +110,11 @@ fn rust_component_service_template_has_event_output_pattern() {
     assert!(SERVICE_TEMPLATE_LIB.contains("PluginIngressEvent"));
     assert!(SERVICE_TEMPLATE_LIB.contains("ServiceOutput::websocket_send"));
     assert!(!SERVICE_TEMPLATE_LIB.contains("recv(timeout"));
-    assert!(SERVICE_TEMPLATE_README.contains("output command"));
     assert!(!SERVICE_TEMPLATE_PLUGIN.contains("kind = \"wasm\""));
 }
 
 #[test]
-fn documented_sample_uses_pdk_component_path() {
+fn component_tool_fixture_uses_pdk_bindings() {
     assert!(SAMPLE_LIB.contains("use yoi_plugin_pdk::wit_bindgen"));
     assert!(SAMPLE_LIB.contains("wit_bindgen::generate!"));
     assert!(SAMPLE_LIB.contains("generate_all"));

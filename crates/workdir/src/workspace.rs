@@ -1,8 +1,9 @@
-//! Shared Workdir inventory domain contracts.
+//! Shared domain projection of Workdir inventory.
 //!
-//! These types are a neutral lower-level authority shared by Server and Runtime
-//! transport projections. They intentionally do not expose provider/session
-//! handles, host paths, Runtime URLs, or credentials.
+//! Types shared by Server and Runtime expose no provider/session handles, host paths, Runtime URLs,
+//! or credentials. A Workdir's inventory presence is separate from content access through a Worker's
+//! live attachment. Status and past materialization evidence alone do not grant current scope
+//! or cleanup authority.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

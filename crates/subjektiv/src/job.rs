@@ -1,7 +1,8 @@
-//! Common consolidation Job policy and verified result projections.
+//! Shared consolidation Job selection rules and validation against stored results.
 //!
-//! Hosts authenticate/admit Jobs and bind their immutable batch and attempt.
-//! These helpers do not dispatch, replay, or grant Job execution authority.
+//! The Host owns authentication/admission and pins immutable batches/attempts.
+//! This module neither dispatches nor reruns Jobs, and grants no execution authority from Profile names or model claims.
+//! Validates Memory candidate processing and surface preparation separately; failure of the latter never revokes the former.
 use serde::Deserialize;
 
 use crate::api::{OperationError, OperationResult};
@@ -11,9 +12,9 @@ pub const CANDIDATE_BATCH_LIMIT: usize = 100;
 pub const CONSOLIDATION_THRESHOLD_FILES: usize = 5;
 pub const CONSOLIDATION_THRESHOLD_BYTES: u64 = 50_000;
 
-/// Selects an ordered prefix using the T-704 complete-result budget. Reserve
-/// 2,048 bytes for the Subject/Host surface envelope, then twice the JSON-escaped
-/// ID size plus 128 bytes per candidate for its compact verified disposition.
+/// Selects an ordered prefix fitting the result budget.
+/// Estimates the Subject/surface envelope and JSON-escaped IDs appearing in both
+/// batch declarations and validated dispositions. Overflow candidates stay for the next batch; existing batches never expand.
 pub fn bounded_candidate_batch(
     ids: impl IntoIterator<Item = String>,
     max_result_bytes: u32,
@@ -34,8 +35,8 @@ pub fn bounded_candidate_batch(
     Ok(selected)
 }
 
-/// Empty ready Subjects need no work, even when forced. Missing/stale/failed
-/// surfaces bypass candidate thresholds; confirmed Memory is never discarded.
+/// With no candidates and a ready surface, skips even when forced; ungenerated/stale/failed surfaces need generation regardless of candidate thresholds.
+/// This is not a decision to delete committed Memory.
 pub fn consolidation_required(
     candidate_count: usize,
     total_bytes: u64,
@@ -72,9 +73,9 @@ struct SurfaceResult {
     reason_code: Option<String>,
 }
 
-/// Verifies the exact Subject/batch, every immutable disposition, and the actual
-/// terminal surface outcome begun by this Job attempt. Model claims alone never
-/// establish completion. Same admission semantics as the Backend T-704 adapter.
+/// Validates the exact Subject/batch, immutable dispositions for all candidates, and that Job attempt's stored terminal surface outcome.
+/// Rejects unresolved candidates, stale input, generation from another attempt, and fabricated results.
+/// Model final text or Idle is not completion evidence; this validation also does not replace Host Job-result acceptance.
 pub fn validate_result(
     store: &SubjektivStore,
     subject_id: &str,
@@ -117,9 +118,9 @@ pub fn validate_result(
         })
 }
 
-/// Enriches a previously verified result with compact durable dispositions. Full
-/// reasons, affected changes and provenance remain in the receipt store. This
-/// deterministic projection neither applies candidates nor creates a new ledger.
+/// Adds a compact projection of stored dispositions to a validated result.
+/// Reasons, change references, and provenance stay in the receipt store, not duplicated in bounded Job results.
+/// Neither reapplies candidates nor creates a new ledger.
 pub fn with_dispositions(
     store: &SubjektivStore,
     subject_id: &str,

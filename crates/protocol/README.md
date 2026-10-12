@@ -1,31 +1,13 @@
 # protocol
 
-## Role
+`protocol` defines input, control, event, and public history types shared by Workers
+and clients. It does not own transport, stored-log replay, or rendering. It separates
+live state from committed history so clients can reconnect without depending on storage formats.
 
-`protocol` defines the JSONL message boundary between Worker clients and Worker servers.
+## Design entry points
 
-## Boundaries
-
-Owns:
-
-- transport-neutral method/event/result types
-- request/reply and broadcast event shapes
-- protocol error categories shared by clients and servers
-
-Does not own:
-
-- Unix socket implementation details (`client`, `worker`)
-- TUI rendering (`tui`)
-- Engine history semantics (`agen`)
-- durable storage (`session-store`, `session-store` worker metadata)
-
-## Design notes
-
-The exact enum variants are code authority. The README should describe the boundary, not duplicate every message shape.
-
-Protocol events can inform UI and orchestration, but durable state changes still need to flow through Worker/session/metadata records.
-
-## See also
-
-- [`../../docs/design/worker-session-state.md`](../../docs/design/worker-session-state.md)
-- [`../../docs/design/context-history.md`](../../docs/design/context-history.md)
+- [`Method`] / [`Event`]: input acceptance versus live updates and history commits
+- [`WorkerStateSnapshot`]: controller state versus Runtime catalog state
+- [`SessionSnapshot`]: public representation of committed history
+- [`subscription`]: ordering of snapshots and subsequent events
+- [`invocation`]: validation of typed Feature input

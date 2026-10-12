@@ -1,4 +1,11 @@
-//! Shared provider dispatch for Tool and checkout file processing.
+//! File dispatch shared by regular Tools and native checkout.
+//!
+//! Targets with validators use provider checked execution; others use regular session operations.
+//! Post-operation validators come from the same execution response, not a later stat.
+//! Only known checked rejections map to `checkout_stale`, `checkout_denied`, `checkout_invalid`,
+//! or `checkout_unavailable`. Ambiguous IO/transport failures and explicit OutcomeUnknown do not
+//! imply nonexecution. Invalid read-only responses mean retrieval failure; invalid mutation
+//! responses mean unknown outcomes.
 use agen::tool::ToolError;
 use workdir::{
     CheckoutOperation, CheckoutOutput, CheckoutRequest, ContentHash, EditRequest, EditResult,

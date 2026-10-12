@@ -1,14 +1,14 @@
-//! Worker 視点のファイルシステム操作。
+//! Filesystem operations from the Worker's perspective.
 //!
-//! `WorkdirSession` の上に「Worker が読み取りたい / 列挙したい」操作を集約する軽い wrapper。
+//! Lightweight wrapper over `WorkdirSession` collecting Worker read/list operations.
 //!
-//! - `ReadRequirement` と `render_auto_read` — compact worker が `mark_read_required`
-//!   で nominate したファイルを再読し、`[Auto-read file: ...]` system message に
-//!   変換する経路。`Worker::compact` から呼ばれる。
-//! - `slice_lines` — 行 offset / limit でテキストを切り出す純粋ヘルパ。
-//!   compact tool 側の `mark_read_required` でも使用。
-//! - `list_file_completions` — TUI 補完用、prefix マッチでファイル候補を列挙する経路。
-//!   IPC `Method::ListCompletions` 経由で呼ばれる前提（Phase 2 で接続）。
+//! - `ReadRequirement` and `render_auto_read` reread files nominated by the compact worker's
+//!   `mark_read_required`, rendering `[Auto-read file: ...]` system messages.
+//!   Called by `Worker::compact`.
+//! - `slice_lines` is a pure helper slicing text by line offset / limit, also used by the compact
+//!   tool's `mark_read_required`.
+//! - `list_file_completions` lists prefix-matching file candidates for TUI completion.
+//!   Intended for IPC `Method::ListCompletions` (connected in Phase 2).
 
 use std::path::{Path, PathBuf};
 
@@ -21,16 +21,16 @@ use workdir::{
     EntryKind, ListRequest, ReadRequest, StatRequest, WorkdirPath, WorkdirSessionHandle,
 };
 
-/// 補完候補1件の最大数。`list_file_completions` がこの値を超えたら打ち切り。
+/// Maximum completion candidate count; `list_file_completions` stops at this bound.
 const COMPLETION_LIMIT: usize = 100;
-/// submit-time directory FileRef の shallow listing で返す最大 entry 数。
-/// TUI completion と同じ浅い一覧という意味論に揃えるため、同じ上限を使う。
+/// Maximum entries in a submit-time directory FileRef's shallow listing.
+/// Shares the TUI completion bound to preserve the same shallow-listing semantics.
 const DIR_FILE_REF_ENTRY_LIMIT: usize = COMPLETION_LIMIT;
 /// Provider-side bound for auto-read and submit-time referenced-file reads.
 const AUTO_READ_BYTE_LIMIT: usize = 4 * 1024 * 1024;
 
-/// Compact worker が `mark_read_required` で nominate した「次セッション開始時に
-/// 自動で再読すべきファイル」のエントリ。
+/// File nominated by the compact worker's `mark_read_required` for automatic rereading
+/// at the start of the next session.
 #[derive(Debug, Clone)]
 pub struct ReadRequirement {
     pub path: PathBuf,
@@ -40,23 +40,23 @@ pub struct ReadRequirement {
     pub limit: Option<usize>,
 }
 
-/// Worker から見えるファイルシステム操作の入口。Clone は cheap（`WorkdirSession` 内 `Arc`）。
+/// Entry point for Worker-visible filesystem operations. Cheap to clone (`Arc` in `WorkdirSession`).
 #[derive(Debug, Clone)]
 pub struct WorkerFsView {
     session: WorkdirSessionHandle,
 }
 
-/// `list_file_completions` が返す候補1件。
+/// One candidate returned by `list_file_completions`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileCandidate {
-    /// 入力 prefix と整合する形のパス（prefix が absolute なら absolute、
-    /// relative なら cwd 相対）。
+    /// Path matching the input prefix's form: absolute for an absolute prefix,
+    /// cwd-relative for a relative prefix.
     pub path: String,
     pub is_dir: bool,
 }
 
-/// `resolve_file_ref` の失敗理由。Worker 側で Alert に振り分けるために
-/// WorkdirSession / 内部判定の両方を区別できるよう保持する。
+/// Failure reason for `resolve_file_ref`. Distinguishes WorkdirSession failures from
+/// internal checks so Worker can select the appropriate Alert.
 #[derive(Debug)]
 pub enum ResolveError {
     /// Path resolution / scope check failed via `WorkdirSession`.
@@ -251,7 +251,7 @@ impl WorkerFsView {
     }
 }
 
-/// `text` の `offset` 行目から `limit` 行（None なら末尾まで）を、元の改行で繋いで返す。
+/// Return `limit` lines of `text` starting at line `offset` (None means to the end), joined by newlines.
 pub fn slice_lines(text: &str, offset: usize, limit: Option<usize>) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let start = offset.min(lines.len());
@@ -536,7 +536,7 @@ mod tests {
         let view = WorkerFsView::new(fs_for(&dir));
 
         let cands = view.list_file_completions("").await;
-        // ディレクトリ first
+        // Directories first
         let names: Vec<&str> = cands.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(names, vec!["subdir", "alpha.rs", "beta.rs"]);
         assert!(cands[0].is_dir);

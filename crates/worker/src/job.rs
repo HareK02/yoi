@@ -1,11 +1,14 @@
-//! Host-facing, result-only Jobs executed by the private Internal Worker substrate.
+//! Job execution by a restricted Internal Worker; the Host owns result acceptance and persistence.
 //!
-//! The host owns persistence, concurrency, timeout, retries and result acceptance. Normal
-//! timeout/shutdown routes through the cancellation sender and awaits `run`, including Worker
-//! resource cleanup. An emergency drop/abort does not confirm asynchronous cleanup; the Host
-//! must retain its lease and reconcile any unknown outcome before allowing another execution.
-//! The result-only Feature owns no background tasks, but an in-flight synchronous Host sink
-//! cannot be preempted by dropping its tool future and must itself be bounded.
+//! Selected Profile requirements are checked against explicit Host grants. Unsatisfied capabilities
+//! are rejected, not silently stripped. Profile names and resolution cwd grant no filesystem or
+//! Workspace authority. Success requires structured output synchronously accepted by the Host sink,
+//! not a final answer or completion of execution.
+//!
+//! The Host manages concurrency, timeouts, and retries, and awaits `run` and resource release even
+//! after cancellation. Emergency drop or abort cannot confirm asynchronous cleanup, so leases and
+//! unknown-outcome state remain. The result Feature has no background work, but dropping a tool
+//! future cannot interrupt a running synchronous sink. The Host must also bound the sink's work.
 
 mod result;
 pub use result::{JobResultFeature, JobResultFinalizer, JobResultSink, SUBMIT_JOB_RESULT_TOOL};

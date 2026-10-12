@@ -1,4 +1,6 @@
 <script lang="ts">
+  // 開いた領域のseparator。線だけに端の余白を持たせず、親layerの本文と端を揃える。
+  // 入れ子の余白は親が領域全体へ与える。装飾線だけは読み上げ対象から外す。
   export type BevelLineDirection = 'x' | 'y';
 
   type Props = {

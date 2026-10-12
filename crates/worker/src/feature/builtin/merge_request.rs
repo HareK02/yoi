@@ -1,3 +1,26 @@
+//! Connects enabled Merge Request Tools to the Workspace API and native WIP.
+//!
+//! The native projection accepts only `/merge-requests` and its immediate canonical IDs, binding
+//! each item's subject to its route. It removes `merge_request_id` from descriptors and reconstructs
+//! it for original schema and permission evaluation. Only enabled regular Tools are projected;
+//! no Backend-wide catalog or custom query is added. [`crate::wip`] owns shared reference,
+//! permission, Client-lifetime, and unknown-outcome contracts.
+//!
+//! # Injected review capability
+//!
+//! Review routes must exactly match the MR in the Host-injected Reviewer context. Capability tokens
+//! never appear in descriptors or model arguments. Candidate, Ticket snapshot, approval, repository,
+//! and integration evidence retain regular Tool and Backend checks. This adapter neither performs
+//! Git/provider integration nor owns Ticket conclusion decisions.
+//!
+//! # Bounded responses and subject validation
+//!
+//! Read returns the existing bounded thread page, keeping linked Tickets as references. Successful
+//! item-read response hashes are observed; mutations discard observations. Receipts do not fabricate
+//! complete representations or local mutation generations. Open results include the new item path.
+//! Item responses are checked against the bound MR; subject mismatches after mutations are not
+//! treated as unexecuted operations. Optional argument omission/null stays as in original Tool input.
+
 use crate::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureInstructionContribution,
     FeatureInstructionDeclaration, FeatureInstructionId, FeatureModule, ToolContribution,

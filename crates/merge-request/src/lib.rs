@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -316,7 +318,10 @@ impl MergeRequest {
         self.thread.iter().rev().find_map(|e|match e{MergeRequestThreadEvent::Review(v)if v.subject_ref==subject&&!self.thread.iter().any(|x|matches!(x,MergeRequestThreadEvent::ReviewRevoked(r)if r.review_event_id==v.event_id))=>Some(v),_=>None})
     }
 
-    /// Returns the recorded merged result, without resolving selectors or mutating state.
+    /// Returns the stored immutable integration result without resolving selectors again.
+    /// Pins the approved source and approval event; branch movement/deletion or later requirement reviews never replace them.
+    /// Post-integration evidence evaluation uses the pinned source, independent of current branch/provider availability.
+    /// Do not infer approval from `merged` state alone; verify evidence with [`Self::integration_approval`].
     pub fn merged_result(&self) -> Result<&MergeEvent, MergeRequestEvidenceError> {
         if self.state != MergeRequestState::Merged {
             return Err(MergeRequestEvidenceError::NotMerged);
@@ -331,8 +336,9 @@ impl MergeRequest {
             .ok_or(MergeRequestEvidenceError::MergeResultMissing)
     }
 
-    /// Validates the specific approval recorded by the merged result. A later
-    /// requirement review does not replace this integration evidence.
+    /// Verifies source equality, ordering, non-revocation, and the matching review request for the approval event named by the integration result.
+    /// Later requirement approval does not replace integration-time approval. Validation requires the full thread;
+    /// a merge event in a page alone cannot prove approval exists.
     pub fn integration_approval(&self) -> Result<&ReviewEvent, MergeRequestEvidenceError> {
         let merge = self.merged_result()?;
         let review = self
@@ -393,12 +399,15 @@ impl MergeRequest {
     }
 }
 
-/// Finds an effective approval of the authoritative current Ticket digest and
-/// exact linked source snapshot. Callers supply all linked requests and resolved
-/// source refs (recorded merged refs for completion); this function does not read
-/// authority, resolve selectors, require merged state, or mutate lifecycle state.
-/// An explicit event id validates that approval only; `None` discovers any valid
-/// attestation. Snapshot ordering is immaterial, but duplicate ids are rejected.
+/// Finds a valid review approving the current Ticket digest and the exact set of all related MR/sources.
+/// The source of the MR holding the review and its corresponding ReviewRequested must also match.
+/// Comments, recent timestamps, or one representative MR cannot substitute for approval of all requirements.
+///
+/// The caller supplies all MRs and observed sources, using stored sources for integrated MRs.
+/// Does not resolve selectors, require merged state, or authorize/change Ticket completion.
+/// A post-integration review may approve a new requirement set while integration results remain immutable.
+/// With an event ID, validates only that approval; otherwise searches for a valid approval.
+/// Set order does not matter, but duplicate IDs are rejected.
 pub fn requirement_approval<'a>(
     requests: &'a [MergeRequest],
     content_digest: &str,
@@ -656,6 +665,9 @@ pub enum MergeRequestError {
     Storage(#[from] rusqlite::Error),
 }
 
+/// SQLite storage for Workspace/Repository-scoped MR records and thread events.
+/// External authority owns Git operations and source observation; this store checks supplied results,
+/// current assignments, and review evidence. Ticket completion decisions are not this store's responsibility.
 pub struct MergeRequestStore {
     conn: Arc<Mutex<Connection>>,
     assignments: Arc<dyn AssignmentSource>,
@@ -1174,6 +1186,9 @@ impl MergeRequestStore {
         Ok(())
     }
 
+    /// Records externally performed integration results with the approved source.
+    /// Rechecks assignments, Ticket content/state, and valid approval before commit.
+    /// Replay with the same operation ID and all inputs returns the same result; reuse with different inputs is rejected.
     pub fn complete(&self, i: CompleteMergeRequest) -> Result<MergeEvent, MergeRequestError> {
         self.validate_completion(&i)?;
         let mut connection = self.lock()?;

@@ -1,3 +1,8 @@
+//! Message transport for one Worker connection.
+//!
+//! Separates in-process, Unix socket, and WS framing from protocol Method/Event encoding.
+//! Changing transports does not change ownership of Worker execution, input admission, or receipts.
+
 use std::error::Error;
 
 use async_trait::async_trait;
@@ -6,10 +11,9 @@ pub mod in_process;
 pub mod unix_socket;
 pub mod websocket;
 
-/// Message-oriented transport for one Worker protocol connection.
+/// UTF-8 message transport for a Worker protocol connection.
 ///
-/// Implementations own physical framing. `client::Client` owns the typed
-/// Method/Event protocol encoding layered on top of these UTF-8 messages.
+/// Implementations own physical framing; the higher-level Client encodes and decodes Method/Event.
 #[async_trait]
 pub trait Socket {
     type Error: Error + Send + Sync + 'static;

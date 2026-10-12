@@ -3790,8 +3790,8 @@ where
     St: Store,
 {
     let manifest = worker.manifest();
-    // `build_client` がここに到達する前に同じマニフェストで成功している
-    // ため、カタログ解決も必ず通る。念のため失敗時は "unknown" に落とす。
+    // `build_client` already succeeded with this manifest, so catalog resolution
+    // must also succeed. Fall back to "unknown" on failure as a precaution.
     let resolved = manifest::model_catalog::resolve_model_manifest(&manifest.model).ok();
     let context_window = resolved
         .as_ref()

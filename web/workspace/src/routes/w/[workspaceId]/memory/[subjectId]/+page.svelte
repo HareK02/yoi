@@ -1,4 +1,9 @@
 <script lang="ts">
+  // identity、current Worker、Committed Memory、生成contextの利用可否を先に示す。
+  // current WorkerはBackend singleton projectionであり、過去のSession帰属から推測しない。
+  // behaviorは利用者が管理する本文、surfaceはMemoryからの生成物として分ける。
+  // ready-empty／ungenerated／stale／failedとrequest failureを区別し、surfaceの現在性を
+  // 実行中Workerの履歴へ反映済みであることの証明には使わない。診断値は詳細へ分離する。
   import { untrack } from 'svelte';
   import DocumentMarkdown from '#lib/workspace/markdown/DocumentMarkdown.svelte';
   import { formatDate, workspaceRoute } from '#lib/workspace/api/http.ts';

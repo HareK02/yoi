@@ -1,5 +1,26 @@
-//! WIP-only, grant-bound Workspace configuration Feature. No local config store
-//! or OS Workdir/session is created by this logical attachment.
+//! WIP-only logical attachment Feature for Workspace configuration allowed by explicit grants.
+//!
+//! Configuration source authority resides in the Backend virtual tree; evaluated Profiles/Prompts
+//! are not edited in place of source. The Feature connects to the existing ledger through a
+//! Workspace-bound client. It creates no OS directory copy, WorkdirSession, Bash capability, or
+//! independent attachment ledger. The Backend and configuration domain own source persistence,
+//! evaluation, CAS, and policies for applying changes to running Workers.
+//!
+//! # Shared attach path
+//!
+//! Structured chat invocation and native self-attach share [`WorkspaceConfigFeature::attach`].
+//! The access argument only restricts existing grants; unavailable explicit write access is rejected,
+//! not downgraded. Attach runs while preparing admitted input and records a durable result before
+//! passing it to the dependent LLM. Availability alone does not prove authority: validation, including
+//! replay/resume, and Backend ledger updates check current access. Opaque connection IDs identify
+//! connection lifetimes; alias reuse cannot revive old connection authority.
+//!
+//! # Request-time projection
+//!
+//! [`wip`] provides the native entrance; content builds a logical subtree from current Backend
+//! metadata. Source bodies stay out of observations; directories derive from source paths. This
+//! tree adds no Workflow/Repository registration, credential management, or Host configuration files.
+//! Shared WIP references, Client lifetimes, and unknown outcomes follow [`crate::wip`].
 
 pub mod backend;
 mod content;

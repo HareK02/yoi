@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -59,6 +61,10 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Logical secret ID with no interpretation of provider semantics.
+///
+/// `/` separates name components, not references to individual host files.
+/// Reject absolute references and traversal components to prevent escape even if misused as a path.
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct SecretId(String);
 
@@ -86,6 +92,11 @@ impl fmt::Display for SecretId {
     }
 }
 
+/// Secret value that omits plaintext from Debug output.
+///
+/// [`Self::expose_secret`] and [`Self::into_string`] return plaintext; callers remain responsible
+/// for keeping it out of diagnostics, history, and model context. This wrapper does not
+/// guarantee arbitrary serialization, memory erasure, or redaction of external logs.
 #[derive(Clone, Eq, PartialEq)]
 pub struct SecretValue(String);
 
@@ -109,6 +120,16 @@ impl fmt::Debug for SecretValue {
     }
 }
 
+/// Local store retrieving secrets by logical ID.
+///
+/// Store obfuscated values and integrity tags to keep plaintext out of scattered configuration files.
+/// Normal constructors derive the key from the data directory path, so this is neither a strong
+/// keychain nor protection against local attackers. It does not guarantee secrecy from anyone
+/// who knows that path; moving the store also changes the conditions for decrypting existing values.
+///
+/// Saving writes and syncs a temporary file, then replaces the store by rename. Parent-directory
+/// sync is best-effort; CAS or locks do not serialize multiple writers' read-modify-write cycles.
+/// Replacement by rename does not guarantee protection against lost concurrent updates.
 #[derive(Debug, Clone)]
 pub struct SecretStore {
     path: PathBuf,

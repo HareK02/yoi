@@ -1,10 +1,8 @@
-//! Single source of truth for manifest default values.
+//! Centralizes Manifest defaults.
 //!
-//! Every default that would otherwise be duplicated between serde
-//! `#[serde(default = "...")]` attributes (on [`crate::WorkerManifest`])
-//! and the cascade resolution in [`crate::config`] lives here as a
-//! `pub const`. Both paths read from this module, so changing a
-//! default requires editing exactly one line.
+//! Serde defaults in [`crate::WorkerManifest`] and resolution in
+//! [`crate::WorkerManifestConfig`] share constants to keep decoding and partial
+//! configuration merging consistent.
 
 /// Read-only Repository/Workdir/attachment reference discovery in WIP mode.
 /// This enables a reference provider, not normal Tools or any authority grant.

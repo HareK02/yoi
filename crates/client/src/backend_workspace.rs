@@ -1,3 +1,11 @@
+//! Generated client adapter for the Backend Workspace catalog.
+//!
+//! Workspace creation passes an operation key and optional initial Repository to the Server,
+//! without local Git discovery or repository initialization. Empty Repository lists are valid.
+//! The Server determines creation idempotency, ownership, and current-state replay; this client
+//! keeps no separate creation ledger. It classifies 401/403 as shared Backend authentication
+//! errors, distinct from other domain errors.
+
 use crate::{BackendApiClient, BackendApiClientError};
 use server_api::{
     InitialRepositoryIntent, RepositorySummary, WorkspaceCreateRequest, WorkspaceCreateResponse,

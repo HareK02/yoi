@@ -1,17 +1,17 @@
-//! Anthropic scheme の wire-level 既定 capability。
+//! Wire-level default capability for the Anthropic scheme.
 //!
-//! モデル ID 固有のテーブル(`claude-*` など)は client construction layer
-//! の責務。ここでは未知モデルでも「この wire で
-//! 安全に送れる最小共通項」を返すだけに留める。
+//! Model ID tables (e.g. `claude-*`) belong to the client construction layer.
+//! This module returns only the minimum common features safe to send over
+//! this wire, even for unknown models.
 
 use crate::llm_client::capability::{
     CacheStrategy, ModelCapability, StructuredOutput, ToolCallingSupport,
 };
 
-/// Scheme 既定の capability。
+/// Scheme default capability.
 ///
-/// Ollama の `/v1/messages` 流用を想定して `cache_control` を送らない
-/// `CacheStrategy::Auto` にする。
+/// Uses `CacheStrategy::Auto` to avoid sending `cache_control`, allowing reuse
+/// with Ollama's `/v1/messages` endpoint.
 pub(crate) fn default_capability() -> ModelCapability {
     ModelCapability {
         tool_calling: ToolCallingSupport::Parallel,

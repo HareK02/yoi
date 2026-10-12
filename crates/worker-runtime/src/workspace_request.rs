@@ -1,3 +1,10 @@
+//! Runtime-originated HTTP requests bound to Workspace boundaries.
+//!
+//! Signs the actual request method/path/body with Runtime identity, using the Backend URL from
+//! an explicit Workspace issuer bundle as audience. Connection hints alone do not create
+//! Account/Worker authority. Reads bounded responses with an async client; no blocking HTTP
+//! clients on async Worker/runtime paths.
+
 use std::error::Error as _;
 use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

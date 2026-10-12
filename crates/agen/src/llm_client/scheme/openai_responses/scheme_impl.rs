@@ -20,8 +20,8 @@ impl Scheme for OpenAIResponsesScheme {
     type State = OpenAIResponsesState;
 
     fn default_base_url(&self) -> &'static str {
-        // `/v1` は base_url 側に寄せる。互換 backend を使う場合も、
-        // base URL を差し替えるだけで同じ `/responses` path を使える。
+        // Keep `/v1` in base_url. Compatible backends can reuse the same
+        // `/responses` path by replacing only the base URL.
         "https://api.openai.com/v1"
     }
 

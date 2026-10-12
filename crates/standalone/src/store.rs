@@ -1,3 +1,11 @@
+//! Worker records and process leases independent of the Runtime registry.
+//!
+//! Separates WorkerId and internal storage keys from display names, storing Session pointers,
+//! cwd identity, and optional Subject bindings. Checks canonical cwd paths and available device/inode
+//! identity, so replacements at the same path are not restore targets. Checks kernel locks against
+//! saved lease evidence; owners with uncertain liveness are not reclaimed. Uncertain record commits
+//! do not imply that execution stopped or leases were released.
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};

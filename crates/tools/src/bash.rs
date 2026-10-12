@@ -1,3 +1,11 @@
+//! Bash Tool using WorkdirSession command capability.
+//!
+//! The selected session owns cwd, process launch, bounded output, timeout, and cancellation.
+//! Bash is not a sandbox; the Runtime process and OS user define the execution boundary.
+//! Per-execution handles and nonces prevent cancellation of another command. Dropping a future
+//! does not confirm termination; active registrations remain until cleanup requests cancellation
+//! and observes terminal output.
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

@@ -1,3 +1,9 @@
+//! Workspace creation and Repository mapping through the Backend catalog.
+//!
+//! Workspaces without a Repository use the same creation API. Connection routing
+//! is recorded in global client config; Workspace identity is not persisted in
+//! the Repository.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;

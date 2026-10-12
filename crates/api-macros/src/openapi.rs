@@ -1,8 +1,10 @@
-//! Deterministic OpenAPI 3.1 projection for `#[api(openapi)]` contracts.
+//! Generate deterministic OpenAPI documents from API contracts.
 //!
-//! The projection deliberately has no deployment topology (`servers`) and no
-//! generated timestamps. Callers supply an opaque source digest, which is
-//! retained as provenance in `info.x-yoi-source-digest`.
+//! Omit deployment URLs and generation timestamps; retain the caller's source digest as
+//! provenance. This separates contract changes from environment changes and produces the
+//! same bytes from the same inputs. Owners explicitly assert wire-schema/Serde agreement
+//! through [`OpenApiSchema`]; name collisions, unsafe integers, and ambiguous schemas are
+//! not silently published.
 
 use std::{
     borrow::Cow,

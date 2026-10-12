@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 mod app;
 mod backend_dashboard;
 mod backend_spawn;
@@ -129,6 +131,10 @@ impl Drop for TerminalModeGuard {
     }
 }
 
+/// Opens Console or Dashboard from a typed launch request.
+///
+/// Restores raw mode and the alternate screen on both success and error.
+/// Emits exit diagnostics after screen restoration, not inside the alternate screen.
 pub async fn launch(options: LaunchOptions) -> ExitCode {
     let LaunchOptions {
         target,

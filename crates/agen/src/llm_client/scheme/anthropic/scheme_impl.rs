@@ -1,7 +1,7 @@
 //! `impl Scheme for AnthropicScheme`
 //!
-//! Anthropic Messages API の wire 表現に必要な URL・ヘッダ・SSE パース・
-//! リクエスト body 生成を共通 `Scheme` trait にぶら下げる。
+//! Implements the URLs, headers, SSE parsing, and request body generation needed
+//! for the Anthropic Messages API wire format through the shared `Scheme` trait.
 
 use serde_json::Value;
 
@@ -17,22 +17,20 @@ use crate::llm_client::{
 
 use super::AnthropicScheme;
 
-/// Anthropic の SSE パースで必要な状態。
+/// State required for Anthropic SSE parsing.
 ///
-/// 1. `content_block_stop` イベントは `block_type` を持たない仕様なので、
-///    直前の `content_block_start` で観測した `block_type` を保持して
-///    `BlockStop` に書き戻す。
-/// 2. `thinking` ブロック中の `thinking_delta` テキストと `signature_delta`
-///    署名、および `redacted_thinking` ブロックの `data` を蓄積し、
-///    `content_block_stop` の Thinking block metadata として返す
-///    （round-trip 永続化のため）。
+/// 1. `content_block_stop` events lack `block_type`, so retain the type observed
+///    in the preceding `content_block_start` and write it back into `BlockStop`.
+/// 2. Accumulate `thinking_delta` text and `signature_delta` signatures from
+///    `thinking` blocks, plus `data` from `redacted_thinking` blocks. Return them
+///    as Thinking block metadata at `content_block_stop` for round-trip persistence.
 #[derive(Debug, Default)]
 pub struct AnthropicState {
     pub(crate) current_block_type: Option<BlockType>,
     pub(crate) pending_thinking: Option<PendingThinking>,
 }
 
-/// 1 つの `thinking` または `redacted_thinking` content_block の蓄積バッファ。
+/// Accumulation buffer for one `thinking` or `redacted_thinking` content_block.
 #[derive(Debug, Default)]
 pub(crate) struct PendingThinking {
     pub(crate) text: String,
@@ -64,11 +62,9 @@ impl Scheme for AnthropicScheme {
     }
 
     fn required_auth(&self) -> AuthRequirement {
-        // Ollama の `/v1/messages` 互換では認証が要らないが、それは
-        // `AuthRef::None` + `build_headers` 側の「ResolvedAuth::None
-        // なら何もしない」分岐で吸収する（`accepts` 判定で弾かれない
-        // よう、現状は XApiKey を要求しつつ、None 側でもパスするよう
-        // にする戦略）。
+        // Anthropic uses XApiKey. Compatible endpoints such as Ollama can opt out
+        // through ResolvedAuth::None, which the transport accepts for any auth
+        // requirement and handles without sending authentication headers.
         AuthRequirement::XApiKey
     }
 

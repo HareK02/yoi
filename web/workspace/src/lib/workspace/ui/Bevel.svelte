@@ -1,4 +1,7 @@
 <script lang="ts">
+  // 単色の境界だけを所有し、背景と操作の意味は内側のsemantic childへ委ねる。
+  // 隣接領域では境界となる辺だけを描き、無効な辺の角丸も消して境界の途切れを避ける。
+  // controlのfocus表示は外枠へ移さず、childの入力・buttonとしての動作を保つ。
   import type { Snippet } from 'svelte';
 
   type Props = {

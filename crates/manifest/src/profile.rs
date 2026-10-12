@@ -1,9 +1,4 @@
-//! Profile discovery and resolution.
-//!
-//! Profiles are reusable, human-authored recipes. They are intentionally not
-//! complete runtime manifests: runtime-bound and authority-bearing fields such
-//! as `worker.name` and concrete `scope.allow` rules are supplied by the resolver
-//! from launch context.
+//! Profile selection and resolution.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -461,6 +456,20 @@ impl ProfileResolveOptions {
     }
 }
 
+/// Resolves a launch-time Manifest from a reusable Profile.
+///
+/// Names and concrete scope rules come from the launch context, not the Profile,
+/// so reusing configuration for another Worker does not inherit the original
+/// Worker's identity or path authority. Scope intent and configured secret references
+/// are retained; input validation rejects runtime-bound fields and Manifest-style
+/// authority rules.
+///
+/// Profiles resolve as values, not executable scripts. Omitted values use
+/// [`crate::WorkerManifestConfig::resolution_defaults`], not an implicit builtin
+/// parent role. Source-relative paths resolve against their own source before
+/// Manifest conversion. [`ResolvedProfile`] keeps source values and the Manifest
+/// snapshot separate, so restoration after launch need not reselect the current
+/// Profile.
 #[derive(Debug, Clone, Default)]
 pub struct ProfileResolver {
     workspace_base: Option<PathBuf>,

@@ -1,10 +1,11 @@
-//! Fail-closed Drive boundary for parent-owned Internal SubWorkers, including Reviewers.
+//! Boundary that blocks Drive capabilities for parent-owned Internal SubWorkers.
 //!
-//! Internal children have no Backend Drive identity. Explicit internal Drive delegation is not
-//! supported until the Backend can approve scope bound to that child identity. A parent's current
-//! grant, enabled profile, or Reviewer attestation is not a child Drive grant. Registered Runtime
-//! Workers must use their own identity-bound, current Backend grants; this wrapper creates neither
-//! identities nor grants and keeps no local authorization cache.
+//! Internal children have no independent Backend Drive identity/grant. Parent grants, effective
+//! Profiles, and Reviewer attestations therefore grant no child authority. Spawn disables Drive
+//! after resolving every Profile selector; this wrapper also rejects JSON/binary Drive operations
+//! through the shared Workspace client. Non-Drive operations and Reviewer attestations remain;
+//! no identity, grant, or authorization cache is created. Future internal delegation will require
+//! scope no broader than the parent's, bound to a child identity, and Backend reauthorization.
 
 use std::{sync::Arc, time::Duration};
 

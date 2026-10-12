@@ -1,21 +1,14 @@
-//! Compact worker state and the four tools that drive it.
+//! Summarization and reference-file selection by the compaction Internal Worker.
 //!
-//! The compact worker is a disposable `Engine` instance spun up by
-//! [`Worker::compact`]. It receives the history to summarise plus a list of
-//! default reference files (from the session-lifetime `Tracker`) and runs
-//! a tool-driven LLM loop. The tools here let it:
+//! Summary input is a bounded history projection; it does not rewrite the original history.
+//! Results collect in [`CompactWorkerContext`]; [`crate::Worker::compact`] validates, saves,
+//! and activates them. Missing summaries or hard-limit violations fail compaction, unlike
+//! targets or warning-only thresholds.
 //!
-//! - `read_file` — inspect referenced files (reuses `tools::read_tool`)
-//! - `mark_read_required(path, offset?, limit?)` — nominate a file whose
-//!   contents should be injected into the compacted context as an
-//!   auto-read system message
-//! - `add_reference(path)` — nominate a file the next session should
-//!   know about by name only (contents not included)
-//! - `write_summary(text)` — deliver (or overwrite) the structured summary
-//!
-//! Everything the worker decides ends up in [`CompactWorkerContext`],
-//! which `Worker::compact` drains after the loop and turns into the
-//! compacted session's opening system messages.
+//! Auto-read accepts only UTF-8 text through the current WorkdirSession, checking scope and
+//! the aggregate budget. Images, binary data, and truncated content stay out of the body;
+//! paths can remain as references for the next request. Naming a reference grants no read
+//! authority; incorporating it into the compacted result still follows actual read conditions.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

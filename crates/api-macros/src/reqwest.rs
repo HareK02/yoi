@@ -1,8 +1,8 @@
-//! Reqwest transport support used by clients generated with `#[api(reqwest)]`.
+//! Transport boundary for generated clients.
 //!
-//! The generated builder validates the base URL before it can be stored. Callers that enforce
-//! stricter egress policy (custom DNS resolution, proxy policy, TLS roots, or connection pinning)
-//! can construct their own [`reqwest::Client`] and inject it with the validated [`BaseUrl`].
+//! Validate the base URL before storing it; apply timeouts and byte limits to requests
+//! and response reads. Stricter outbound constraints such as DNS, proxy, and TLS policy
+//! remain at the boundary where callers inject their own [`reqwest::Client`] with [`BaseUrl`].
 
 use std::{fmt, time::Duration};
 

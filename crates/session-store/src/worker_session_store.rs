@@ -1,13 +1,19 @@
-//! Filesystem store for the canonical `1 Worker = 1 Session` aggregate.
+//! File storage for a Session bound to one Worker.
 //!
-//! Layout under one Worker aggregate:
-//! - `session/session.json` — immutable Session identity
-//! - `session/segments/<segment_id>.jsonl`
-//! - `session/segments/<segment_id>.trace.jsonl`
+//! The manifest fixes the Session ID; requests to switch Sessions are rejected.
+//! Fork/compaction adds Segments within the same Session, so Worker restoration and
+//! history observation need not change the conversation ID. Runtime execution attempts
+//! and sockets are not part of this ID.
 //!
-//! Unlike [`crate::FsStore`], this store cannot enumerate or switch between
-//! arbitrary Sessions. The first segment materializes the sole Session identity;
-//! every later operation must use that same ID.
+//! Validates complete JSONL records before append; only a trailing fragment without
+//! a closing newline is discarded as uncommitted. Corrupt complete records are rejected.
+//! Failed appends attempt rollback to the previous boundary; if rollback also fails,
+//! both failures are returned. Whole-Segment and manifest saves sync temporary files
+//! and rename them.
+//!
+//! Retained-history observation uses a read path without creation or migration.
+//! Reads are rejected where access time cannot be preserved, avoiding observation-induced
+//! changes to stored state.
 
 use crate::event_trace::TraceEntry;
 use crate::paste_artifact::{read_from_dir, write_to_dir};

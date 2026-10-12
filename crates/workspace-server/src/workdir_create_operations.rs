@@ -1,3 +1,12 @@
+//! Persists immutable Workdir creation intent and Repository credential candidates.
+//!
+//! Creation fingerprints identify Repository source, selector, requested Runtime, and display
+//! name. Replay retains saved selectors and resolved resources, not current defaults. Store
+//! reservations reject differences under the same operation ID; SSH candidates fix identity at
+//! selection. Retained generated Workdir IDs and candidates support provider retries, not proof
+//! of creation. Creation retries do not start on resources with pending removal; transitions
+//! from failed to pending also check the current deletion fence within a transaction.
+
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 

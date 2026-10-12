@@ -1,11 +1,9 @@
-//! Debug-only LLM request/stream trace recording.
+//! Diagnostic records of LLM transport, independent of history replay.
 //!
-//! [`TraceEntry`] captures stream lifecycle markers and normalized provider
-//! stream events for debugging stalls. It is not a byte-for-byte raw SSE
-//! capture. Written to a separate `.trace.jsonl` file,
-//! completely independent of the segment log used for state restoration.
-//!
-//! Disabled by default. Enable via `SessionConfig::record_event_trace`.
+//! [`TraceEntry`] records normalized events and lifecycle boundaries, not a complete
+//! copy of raw SSE. Stored separately from Segment logs, it is not a source for
+//! restored model input. This separates observed transport state from input/output
+//! committed to history.
 
 use agen::llm_client::event::Event;
 use serde::{Deserialize, Serialize};

@@ -1,4 +1,6 @@
 <script lang="ts">
+  // Settings navigationだけをWorkspaceの子slotへ登録する。
+  // 親navigationを複製せず、さらに深いscopeへ独立したoverride controllerを渡す。
   import { page } from '$app/state';
   import { setContext } from 'svelte';
   import SettingsSidebar from '#lib/workspace/sidebar/SettingsSidebar.svelte';

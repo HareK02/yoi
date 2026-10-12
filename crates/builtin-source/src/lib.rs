@@ -1,4 +1,5 @@
-//! Explicit compile-time public Decodal source catalog, shared by native and WASM hosts.
+#![doc = include_str!("../README.md")]
+
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
@@ -33,6 +34,11 @@ const DEFAULT_IMPORT: &[BuiltinProfileImport] = &[BuiltinProfileImport {
 }];
 const NO_IMPORTS: &[BuiltinProfileImport] = &[];
 
+/// Fixed catalog of public embedded Profile sources and import relationships.
+///
+/// Only the sources listed here are shared across native/WASM, not arbitrary resources.
+/// Launch selectors identify entry points; paths identify assets for imports.
+/// Publishing sources alone neither launches Workers nor grants permissions.
 pub const BUILTIN_PROFILE_RESOURCES: &[BuiltinProfileResource] = &[
     BuiltinProfileResource {
         selector: None,
@@ -150,6 +156,10 @@ pub const BUILTIN_PROFILE_RESOURCES: &[BuiltinProfileResource] = &[
     },
 ];
 
+/// Catalog snapshot fixing source bytes, selector entry points, and import relationships together.
+///
+/// [`Self::digest`] identifies all ordered contents and the catalog chosen by the consumer.
+/// It is not information for replacing values already evaluated in a Workspace with the current catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuiltinProfileCatalogSnapshot {
     pub id: &'static str,

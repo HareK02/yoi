@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use config_source::{
     ConfigSchemaContribution, ConfigTreeChange, ConfigTreeSnapshot, EvaluationResult,
     SnapshotEnvironment, ToolchainContract, VirtualPath, WorkspaceConfigSchemaBundle,
@@ -17,6 +19,10 @@ pub fn compose_schema_bundle(contributions: JsValue) -> Result<JsValue, JsValue>
     encode(WorkspaceConfigSchemaBundle::compose(contributions).map_err(js_error)?)
 }
 
+/// Retain the browser's edit candidate as a snapshot.
+///
+/// Deserialization uses shared digest validation but neither saves to nor authorizes the Backend.
+/// Keep the schema bundle in separate state to distinguish sources from evaluation conditions.
 #[wasm_bindgen]
 pub fn set_snapshot(snapshot: JsValue) -> Result<(), JsValue> {
     let snapshot: ConfigTreeSnapshot = decode(snapshot)?;
@@ -85,6 +91,10 @@ struct WasmCompletionItem {
     priority: i32,
 }
 
+/// Complete after converting the editor's UTF-16 offset to the shared analyzer's UTF-8 byte offset.
+///
+/// Convert the returned start position back to UTF-16 so non-ASCII characters do not
+/// misalign editor and analyzer positions. Reject offsets that cannot map to a character boundary.
 #[wasm_bindgen]
 pub fn complete_current(
     entrypoint: String,

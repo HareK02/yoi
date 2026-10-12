@@ -1,4 +1,7 @@
 <script lang="ts">
+  // optional node routeでcontrollerを共有し、draftとreceiptはpage sessionだけに保持する。
+  // Driveから離れる際は破棄を確認する。権限拒否はBackend応答から表示し、Web独自ACLは作らない。
+  // partial textは保存させず、image Object URLは切替・破棄時に解放する。
   import { onDestroy } from 'svelte';
   import { beforeNavigate } from '$app/navigation';
   import { createDriveClient, driveDownloadUrl, DRIVE_FILE_MAX_BYTES, DRIVE_RESPONSE_MAX_BYTES, type DriveEntry, parseDriveDecimal } from '#lib/workspace/drive/api.ts';

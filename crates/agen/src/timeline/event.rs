@@ -1,5 +1,5 @@
-//! Timeline層のイベント型
+//! Event types for the Timeline layer.
 //!
-//! llm_client層のイベント型をそのまま使用する。
+//! Uses the event types from the llm_client layer directly.
 
 pub use crate::llm_client::event::*;

@@ -1,7 +1,5 @@
-# Rust Component Model instance Plugin template
+# Rust Component Instance Plugin雛形
 
-This offline authoring template declares the proposed `yoi:plugin/instance@1.0.0` world. Yoi currently provides no Plugin installation or Worker execution path.
+提案段階の`yoi:plugin/instance@1.0.0`を対象にしたオフラインpackageの雛形である。YoiはPluginのインストールやWorker内での実行を提供していない。
 
-The example contains request/response Tool and Service ingress shapes that a future sandboxed Server Plugin platform may support. Their host API and grant metadata is inert in the current product and grants no authority.
-
-Build with `cargo component build --release` (or the project-specific build command used by your package), then run `yoi plugin check .` and `yoi plugin pack .` against the explicit directory. Passing offline validation does not install or authorize the package.
+Tool・Serviceの要求と応答は将来の実行境界を検討するための例である。host APIやgrantのmetadataは現在の製品では権限を付与せず、オフライン検査の成功も実行の許可を意味しない。

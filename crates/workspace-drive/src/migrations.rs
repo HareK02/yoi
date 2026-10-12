@@ -1,4 +1,8 @@
-//! Frozen schema upgrades. Old column/JSON names occur only to preserve existing data.
+//! Frozen schema conversions preserving existing records.
+//!
+//! Binds current nodes to receipt-derived commit requests, preserving original fingerprints,
+//! receipts for deleted nodes, and ID allocation history. Missing or ambiguous current-state correspondence rolls back the entire migration.
+//! Legacy representations are used only for exact replay validation against original requests, never as authority for new mutations.
 use crate::{Mutation, NodeId};
 use feature_storage::FeatureMigration;
 use rusqlite::{OptionalExtension, Transaction};

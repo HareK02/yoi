@@ -1,7 +1,14 @@
-//! Pure text-operation policy shared by filesystem providers and operation frontends.
+//! Pure text operations shared by providers and frontends.
 //!
-//! This module owns no paths, descriptors, version fences, or I/O. Limits count
-//! UTF-8 bytes, not characters, and default to unlimited.
+//! Owns argument schemas, JSON decoding, edit conditions, and result sizes, not paths, descriptors,
+//! authorization, I/O, or version fences. Providers call within existing consistency boundaries;
+//! checked edits must not be decomposed into unchecked Read–Write. Adapters own whole-text versus
+//! line-range Read selection, history, digests, and canonical multi-file commits.
+//!
+//! Edit requires a nonempty old string and a different replacement, which may be empty.
+//! Unless replace_all is set, the nonoverlapping match must be unique. Providers set UTF-8 byte limits. Arithmetic overflow and capacity are
+//! checked before allocating results. Pure validation failures have no side effects; transport
+//! failures after dispatch are not converted into validation failures here.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, de::DeserializeOwned};

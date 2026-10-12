@@ -165,6 +165,8 @@
   function currentTestResult(
     runtime: WorkspaceRuntimeResource,
   ): RuntimeConnectionTestResponse | undefined {
+    // 登録し直したRuntimeへ古い接続テストを流用しない。key一致やchecked_atではなく
+    // 現在のWorkspaceとbinding identityを表示条件にする。
     const result = testResults[runtime.runtime_id];
     return result?.workspace_id === data.workspaceId &&
       result?.binding_id === runtime.management?.binding?.binding_id
