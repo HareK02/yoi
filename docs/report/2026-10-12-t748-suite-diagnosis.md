@@ -311,8 +311,71 @@ original default-parallel Server **965 passed / 0 failed / 1 existing ignored**,
 executor panics appeared, with no residual test processes. Workdir default153 /
 http-client156 and fmt/diff/naming558/0/0 passed. Logs use the same isolated
 candidate cache: `target/t748-discovery-summary-{root-check,full-suite,workdir-default,workdir-http}.log`.
-The following docs-only publication changes no tested code; fresh exact-source
-independent review is required before an approved handoff.
+Docs-only publication `b63bdb44` changed no tested code. MR seq9 independently
+confirmed these fixes, then requested changes for Runtime management's residual
+synchronous authority calls; it was not an approval of the complete source.
+
+## Runtime management: authority, network, and accepted publication ownership
+
+Seq9 major `T748-ASYNC-RUNTIME-MANAGEMENT` identified registration's direct
+`get_validated` signing identity read and post-ping direct live-binding fence.
+The Reviewer reproduced both exact compiled helpers waiting approximately 300ms
+on the shared SQL mutex with no Tokio timer progress (helper-boundary, not endpoint
+or E2E proof). Registration's synchronous Runtime Worker scan also requires a
+network/authority boundary; ping previously used an unbounded blocking admission.
+
+Fix `925bce2a` introduces whole owned DB stages for validated active signing
+identity and the post-ping current binding fence. Runtime Worker scans and ping
+use existing finite Host admission. A changed/revoked binding still produces
+conflict rather than attesting the earlier connection; owner/key/CAS validation
+and existing whole store transactions are retained.
+
+The adjacent management audit also closes cancellation separation between SQL
+commit and local Runtime publication. Registration and metadata updates now own
+mutation, expectations/registry/subscription publication, and response observation
+in one accepted Host workflow, with their SQL helper awaited on the independent
+DB owner. Public Runtime resource/detail helpers admit ownership; the already-owned
+workflows call explicit `_on_host` variants directly instead of reacquiring the
+same lane. There is no Runtime/network await inside a SQL transaction or nested
+Host admission. A cancelled waiter cannot strand a committed metadata change
+without publishing the matching binding.
+
+Launch options were another mixed Runtime summary/config helper placed on sole
+DB. Its signed Runtime authorization could enqueue DB work behind its own waiting
+parent. It now uses Host, preserving SQL/control progress and finite ownership.
+The audit traced remaining signing validation/binding-fence calls: UI signing
+operations already use DB, Runtime gate calls occur on Host, and removal already
+has an owned Host workflow. DNS validation stays async; pure local registration
+construction/notification stays in the accepted publication owner.
+
+Permanent regressions cover both authority stages under a real separate SQLite
+IMMEDIATE writer and shared-mutex busy observer: current-thread timer/control
+progress, overload503, cancelled actual DB lease retention/cleanup, positive
+validation and revoked binding409. An actual signed loopback ping is held while
+SQL contention starts; after its reply the real handler's post-ping fence queues
+without blocking Tokio or Host control. Another signed loopback scan proves SQL/
+timer progress and retained cancelled finite Host admission. The metadata mutation
+case cancels while its own SQL is waiting, then observes one durable update and
+an equal published binding after actual Host/DB drain. Producers are stopped and
+drained while the original fixture runtime remains alive.
+
+Old identity, binding, scan and launch placements each fail their expected
+contention/watchdog boundary; fixed code passes. Logs:
+`target/t748-management-old-{identity,binding,scan,launch}-placement-red.log`,
+`target/t748-management-final-restored-green.log` (16 boundaries), registration
+policy11 and connection policy13. A zero-match launch-options exploration is not
+counted as proof; its real held-summary case is in the 16 boundaries. The first
+fixture teardown named an unavailable method and failed compilation; it was
+corrected to the existing `shutdown_async`, not counted as a semantic test run.
+
+Exact code `925bce2a405b6d3255887fba88867ab8d23882dc` passed root `cargo check` and
+original default-parallel Server **969 passed / 0 failed / 1 existing ignored**,
+11 binary tests; library duration **172.25 seconds**. Only three deliberate
+executor panics appeared, with no residual test processes. Workdir default153 /
+http-client156, fmt/diff/naming558/0/0 passed. Same isolated cache; evidence logs:
+`target/t748-management-{root-check,full-suite,workdir-default,workdir-http}.log`.
+The following docs-only publication changes no tested code and still requires a
+fresh exact-source independent verdict before an approved handoff.
 
 No latency benchmark, production incident measurement, target integration,
 Ticket conclusion, or running-environment update is claimed. T743 has now

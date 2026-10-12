@@ -116,10 +116,19 @@ Worker discovery uses the same whole `workers_response` DB stage as Worker list
 and resource detail: projection snapshot, Workdir registry/links, and authority
 projection never acquire the shared connection on Tokio. Source-proof requirement
 and pure query/cursor validation still precede admission; overload remains 503.
-Runtime resource list/detail use a finite Host stage for synchronous Runtime
-summary I/O, then await the independent DB binding read. Do not confuse a Runtime
-summary callback with the pure stored Worker projection or run network waits on
-the sole DB worker.
+Runtime resource list/detail use an accepted Host workflow for synchronous Runtime
+summary I/O and await independent DB binding/audit reads. Launch options are also
+mixed Runtime/config helpers and use Host, not the sole DB worker. Runtime
+registration validates its signing identity in a whole DB stage, scans existing
+Workers on Host, then owns SQL key/CAS mutation, local registration publication
+and response observation in one accepted workflow. Metadata updates likewise keep
+commit and publication together after waiter cancellation. Public resource/detail
+helpers admit Host ownership; already-owned workflows call their `_on_host`
+variants directly, never await another admission to the same occupied lane.
+Connection tests ping on finite Host ownership and then await the whole current
+binding fence on DB. A replaced/revoked binding cannot attest the earlier ping.
+Do not confuse a Runtime summary callback with a pure stored Worker projection
+or run network waits on the sole DB worker.
 
 ## Regression evidence
 
