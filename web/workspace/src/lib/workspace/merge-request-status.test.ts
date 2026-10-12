@@ -86,10 +86,10 @@ Deno.test("observed live source movement requires fresh review but an unchanged 
   );
 });
 
-Deno.test("done Ticket can retain immutable approval while current requirement evidence is incomplete", () => {
+Deno.test("closed Ticket can retain immutable approval while current requirement evidence is incomplete", () => {
   const ticket = parseTicketDetail({
     ...fixtureDetail(),
-    state: "done",
+    state: "closed",
     evidence: {
       ...fixtureDetail().evidence,
       has_merge_request: true,
@@ -107,7 +107,7 @@ Deno.test("done Ticket can retain immutable approval while current requirement e
       source_ref_observation: { status: "not_required" },
     }],
   });
-  assertEquals(ticket.state, "done");
+  assertEquals(ticket.state, "closed");
   assertEquals(ticket.evidence.complete_for_integration, false);
   assertEquals(
     currentRequirementApprovalStatus(ticket.evidence),
@@ -128,14 +128,14 @@ Deno.test("done Ticket can retain immutable approval while current requirement e
     currentRequirementApprovalStatus(recovered.evidence),
     "approved",
   );
-  assertEquals(recovered.state, "done");
+  assertEquals(recovered.state, "closed");
   assertEquals(
     summarySourceReviewStatus(ticket.merge_requests[0]!),
     "Integration approval recorded for immutable merged source source-1.",
   );
 });
 
-Deno.test("Ticket route separates current requirement evidence from immutable integration approval without cancelling done", async () => {
+Deno.test("Ticket route separates current requirement evidence from immutable integration approval without changing case closure", async () => {
   const source = await Deno.readTextFile(
     new URL(
       "../../routes/w/[workspaceId]/tickets/[ticketId]/+page.svelte",
@@ -144,15 +144,15 @@ Deno.test("Ticket route separates current requirement evidence from immutable in
   );
   for (
     const required of [
-      "Current requirement evidence",
+      "MR requirement evidence",
       "ticket.evidence.complete_for_integration",
       "Current requirement approval:</strong> {currentRequirementApprovalStatus(ticket.evidence)}",
       "ticket.evidence.missing",
       "summarySourceReviewStatus(mergeRequest)",
       "Immutable integration evidence",
       "Integration evidence error:",
-      '{#if ticket.state === "done"}',
-      "Incomplete current requirement evidence does not cancel recorded completion.",
+      '{#if ticket.state === "closed"}',
+      "Incomplete MR evidence does not alter the recorded case judgment.",
     ]
   ) {
     if (!source.includes(required)) {

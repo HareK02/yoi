@@ -217,7 +217,7 @@ mod tests {
     async fn authority() -> (TempDir, SqliteWorkspaceAuthority) {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("workspace.db");
-        let store = SqliteWorkspaceStore::open(&db_path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&db_path).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-test".to_string(),

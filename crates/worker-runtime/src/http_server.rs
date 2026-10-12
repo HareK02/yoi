@@ -5,6 +5,10 @@
 //! command surface for a trusted backend/proxy. Browsers must not connect to the
 //! Runtime process directly; a backend is expected to own any browser-facing
 //! credentials, registration, and policy.
+//!
+//! Workdir list/detail/removal offload synchronous provider work to blocking workers.
+//! Removal reserves only its target under the Runtime state mutex, releasing it before
+//! filesystem/Git inspection and unlink; conflicting target use is rejected promptly.
 
 mod runtime_management_api;
 

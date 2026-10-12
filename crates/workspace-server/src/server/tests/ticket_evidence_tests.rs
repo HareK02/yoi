@@ -47,7 +47,6 @@ impl EvidenceApiFixture {
         assert!(!temp.path().join(".git").exists());
         let backend = browser_ticket_backend(&api).unwrap();
         let mut input = ticket::NewTicket::new("T716 remote immutable evidence");
-        input.workflow_state = Some(TicketWorkflowState::InProgress);
         input.targets = vec![ticket::TicketTarget {
             repository_key: "test-repository".into(),
             ref_selector: Some("develop".into()),
@@ -191,12 +190,16 @@ impl EvidenceApiFixture {
             .unwrap()
     }
 
-    fn completion(&self, _approval: &ReviewEvent) -> ticket::TicketCompletion {
-        ticket::TicketCompletion {
-            operation_key: "evidence-ticket-completion".into(),
+    fn closure(&self) -> ticket::TicketCaseUpdate {
+        ticket::TicketCaseUpdate {
+            operation_key: "evidence-ticket-closure".into(),
             expected_content_digest: self.content_digest(),
-            expected_state: TicketWorkflowState::InProgress,
-            reason: "Implementation judged complete independently of MR attestation".into(),
+            expected_state: ticket::TicketState::Open,
+            expected_closure_operation_key: None,
+            action: ticket::TicketCaseAction::Close {
+                reason: ticket::TicketClosureReason::Completed,
+            },
+            explanation: "Implementation judged complete independently of MR attestation".into(),
             references: Vec::new(),
             author: Some("fixture".into()),
         }
@@ -297,14 +300,14 @@ impl EvidenceApiFixture {
 }
 
 #[tokio::test]
-async fn done_merged_remote_ticket_uses_immutable_result_in_show_query_list_and_paged_detail() {
+async fn closed_merged_remote_ticket_uses_immutable_result_in_show_query_list_and_paged_detail() {
     let fixture = EvidenceApiFixture::new().await;
     let approval = fixture.approve("integration");
     let merge = fixture.integrate(&approval);
     let content_digest = fixture.content_digest();
     let completion = fixture
         .backend
-        .complete(&fixture.ticket_id, fixture.completion(&approval))
+        .update_case(&fixture.ticket_id, fixture.closure())
         .unwrap();
     assert_eq!(ticket::ticket_content_digest(&completion), content_digest);
     assert!(
@@ -325,7 +328,7 @@ async fn done_merged_remote_ticket_uses_immutable_result_in_show_query_list_and_
     );
 
     let shown = fixture.show().await;
-    assert_eq!(shown.state, "done");
+    assert_eq!(shown.state.as_str(), "closed");
     assert_eq!(shown.content_digest, content_digest);
     assert!(
         shown.evidence.complete_for_integration,
@@ -395,15 +398,15 @@ async fn latest_postmerge_approval_requires_exact_content_and_stored_source_resu
             .contains(&"review_after_rescope".into())
     );
     fixture.assert_filters(false, true, true).await;
-    let mut outdated_completion = fixture.completion(&integration);
-    outdated_completion.expected_content_digest = integration.ticket_content_digest.clone();
+    let mut outdated_closure = fixture.closure();
+    outdated_closure.expected_content_digest = integration.ticket_content_digest.clone();
     assert!(
         fixture
             .backend
-            .complete(&fixture.ticket_id, outdated_completion)
+            .update_case(&fixture.ticket_id, outdated_closure)
             .is_err()
     );
-    assert_eq!(fixture.show().await.state, "inprogress");
+    assert_eq!(fixture.show().await.state.as_str(), "open");
 
     let latest = fixture.approve("latest-content");
     assert_eq!(latest.created_at, integration.created_at);
@@ -467,7 +470,7 @@ async fn latest_postmerge_approval_requires_exact_content_and_stored_source_resu
     assert!(wrong.evidence.approved_current_subject);
     assert!(!wrong.evidence.complete_for_integration);
     fixture.assert_filters(false, true, true).await;
-    assert_eq!(fixture.show().await.state, "inprogress");
+    assert_eq!(fixture.show().await.state.as_str(), "open");
 
     let repaired = fixture.approve("exact-snapshot");
     fixture.assert_filters(true, false, false).await;
@@ -488,10 +491,10 @@ async fn latest_postmerge_approval_requires_exact_content_and_stored_source_resu
     assert_eq!(detail.target.resolved_ref.as_deref(), Some(EVIDENCE_TARGET));
     let completion = fixture
         .backend
-        .complete(&fixture.ticket_id, fixture.completion(&repaired))
+        .update_case(&fixture.ticket_id, fixture.closure())
         .unwrap();
     assert_eq!(ticket::ticket_content_digest(&completion), content_digest);
-    assert_eq!(fixture.show().await.state, "done");
+    assert_eq!(fixture.show().await.state.as_str(), "closed");
     fixture.assert_filters(true, false, false).await;
 }
 
@@ -645,14 +648,18 @@ async fn closing_ticket_with_open_unreviewed_mr_does_not_change_its_proof_or_sta
         .unwrap();
     fixture
         .backend
-        .update_state(
+        .update_case(
             &fixture.ticket_id,
-            ticket::TicketStateUpdate {
+            ticket::TicketCaseUpdate {
                 operation_key: "close-with-open-mr".into(),
                 expected_content_digest: fixture.content_digest(),
-                expected_state: TicketWorkflowState::InProgress,
-                state: TicketWorkflowState::Closed,
-                reason: "The request was withdrawn; no integration or approval is asserted".into(),
+                expected_state: ticket::TicketState::Open,
+                expected_closure_operation_key: None,
+                action: ticket::TicketCaseAction::Close {
+                    reason: ticket::TicketClosureReason::NotPlanned,
+                },
+                explanation: "The request was withdrawn; no integration or approval is asserted"
+                    .into(),
                 references: Vec::new(),
                 author: Some("workspace-user".into()),
             },
@@ -667,13 +674,13 @@ async fn closing_ticket_with_open_unreviewed_mr_does_not_change_its_proof_or_sta
         serde_json::to_value(before).unwrap()
     );
     let shown = fixture.show().await;
-    assert_eq!(shown.state, "closed");
+    assert_eq!(shown.state.as_str(), "closed");
     assert!(!shown.evidence.approved_current_subject);
     assert_eq!(shown.merge_requests[0].state, "open");
 }
 
 #[tokio::test]
-async fn mrless_completion_is_a_ticket_judgment_not_approved_or_missing_merge_evidence() {
+async fn mrless_completed_closure_is_a_ticket_judgment_not_approved_or_missing_merge_evidence() {
     let temp = tempfile::tempdir().unwrap();
     let api = test_api_with_remote_repository(temp.path()).await;
     let backend = browser_ticket_backend(&api).unwrap();
@@ -682,13 +689,17 @@ async fn mrless_completion_is_a_ticket_judgment_not_approved_or_missing_merge_ev
         .unwrap();
     let ticket = backend.show(reference.id.clone().into()).unwrap();
     backend
-        .complete(
+        .update_case(
             &reference.id,
-            ticket::TicketCompletion {
+            ticket::TicketCaseUpdate {
                 operation_key: "research-result".into(),
                 expected_content_digest: ticket::ticket_content_digest(&ticket),
-                expected_state: TicketWorkflowState::Planning,
-                reason: "Answer recorded in the Ticket thread".into(),
+                expected_state: ticket::TicketState::Open,
+                expected_closure_operation_key: None,
+                action: ticket::TicketCaseAction::Close {
+                    reason: ticket::TicketClosureReason::Completed,
+                },
+                explanation: "Answer recorded in the Ticket thread".into(),
                 references: Vec::new(),
                 author: Some("workspace-user".into()),
             },
@@ -703,7 +714,7 @@ async fn mrless_completion_is_a_ticket_judgment_not_approved_or_missing_merge_ev
         .await,
     )
     .unwrap();
-    assert_eq!(shown.state, "done");
+    assert_eq!(shown.state.as_str(), "closed");
     assert!(!shown.evidence.has_merge_request);
     assert!(!shown.evidence.approved_current_subject);
     assert!(!shown.evidence.complete_for_integration);
@@ -728,8 +739,27 @@ async fn mrless_completion_is_a_ticket_judgment_not_approved_or_missing_merge_ev
     }
 }
 
+// Exercise the generated handler's JSON/CAS boundary, then reread the real
+// Ticket authority. Supply the actor normally established by middleware; signed
+// case-route tests cover real authentication. No live Runtime/provider runs.
+fn case_actor_router(api: WorkspaceApi) -> Router {
+    build_inner_router(api).layer(Extension(test_browser_request_actor()))
+}
+
+fn case_request(before: &ticket::Ticket, operation_key: &str, action: Value) -> Value {
+    json!({
+        "operation_key": operation_key,
+        "expected_content_digest": ticket::ticket_content_digest(before),
+        "expected_state": before.meta.workflow_state,
+        "expected_closure_operation_key": before.closure_operation_key,
+        "action": action,
+        "explanation": "Explicit user case judgment",
+        "references": [{"kind": "ticket", "target": "T-42"}],
+    })
+}
+
 #[tokio::test]
-async fn all_public_state_and_close_routes_require_explicit_cas_and_operation_receipts() {
+async fn case_route_rejects_missing_cas_client_author_and_removed_workflow_routes() {
     let temp = tempfile::tempdir().unwrap();
     let api = test_api_with_remote_repository(temp.path()).await;
     let backend = browser_ticket_backend(&api).unwrap();
@@ -737,85 +767,328 @@ async fn all_public_state_and_close_routes_require_explicit_cas_and_operation_re
         .create(ticket::NewTicket::new("Transport decisions"))
         .unwrap();
     let before = backend.show(reference.id.clone().into()).unwrap();
-    let app = build_inner_router(api);
-    let path = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{}", reference.id);
-    for suffix in ["workflow-state", "state-changes", "state-fields/state"] {
+    let app = case_actor_router(api);
+    let path = format!(
+        "/workspaces/{TEST_WORKSPACE_ID}/tickets/{}/case",
+        reference.id
+    );
+    let request = case_request(
+        &before,
+        "close",
+        json!({"action": "close", "reason": "completed"}),
+    );
+    for field in [
+        "operation_key",
+        "expected_content_digest",
+        "expected_state",
+        "action",
+        "explanation",
+    ] {
+        let mut missing = request.clone();
+        missing.as_object_mut().unwrap().remove(field);
         request_json(
             app.clone(),
             "POST",
-            &format!("{path}/{suffix}"),
-            Some(json!({
-                "from":"planning","to":"done","reason":"old unguarded request","body":""
-            })),
+            &path,
+            Some(missing),
             StatusCode::UNPROCESSABLE_ENTITY,
         )
         .await;
     }
+    for (field, value) in [
+        ("author", json!("spoofed-client-author")),
+        ("expected_state", json!("done")),
+        ("action", json!({"action": "close", "reason": "invented"})),
+    ] {
+        let mut invalid = request.clone();
+        invalid[field] = value;
+        request_json(
+            app.clone(),
+            "POST",
+            &path,
+            Some(invalid),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+        .await;
+    }
+    let legacy = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{}", reference.id);
+    for suffix in [
+        "workflow-state",
+        "state-changes",
+        "state-fields/state",
+        "workflow/close",
+        "complete",
+    ] {
+        // A surviving GET catch-all can produce 405 rather than 404 for an
+        // absent POST route. Neither status authorizes a legacy mutation.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("{legacy}/{suffix}"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                response.status(),
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "legacy POST {suffix}: {}",
+            response.status()
+        );
+    }
+    request_json(
+        app,
+        "POST",
+        &format!(
+            "/workspaces/019d0000-0000-7000-8000-0000000000bb/tickets/{}/case",
+            reference.id
+        ),
+        Some(request),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert_eq!(backend.show(reference.id.into()).unwrap(), before);
+}
+
+#[tokio::test]
+async fn case_route_preserves_corrected_history_replay_and_reopen_aba_guard_without_mr() {
+    let temp = tempfile::tempdir().unwrap();
+    let api = test_api_with_remote_repository(temp.path()).await;
+    let backend = browser_ticket_backend(&api).unwrap();
+    let reference = backend
+        .create(ticket::NewTicket::new(
+            "Case judgments without repository work",
+        ))
+        .unwrap();
+    let before = backend.show(reference.id.clone().into()).unwrap();
+    let digest = ticket::ticket_content_digest(&before);
+    let app = case_actor_router(api);
+    let path = format!(
+        "/workspaces/{TEST_WORKSPACE_ID}/tickets/{}/case",
+        reference.id
+    );
+    let detail_path = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{}", reference.id);
+    let close = case_request(
+        &before,
+        "guarded-close",
+        json!({"action": "close", "reason": "completed"}),
+    );
+    let response = request_json(
+        app.clone(),
+        "POST",
+        &path,
+        Some(close.clone()),
+        StatusCode::OK,
+    )
+    .await;
+    let summary: server_api::TicketSummary = serde_json::from_value(response).unwrap();
+    assert_eq!(summary.0.workflow_state, ticket::TicketState::Closed);
+    let closed = backend.show(reference.id.clone().into()).unwrap();
+    let actor = test_browser_request_actor();
+    let expected_author = format!(
+        "workspace-user:{}",
+        serde_json::to_string(&(&actor.account_id, &actor.user_id)).unwrap()
+    );
+    assert_eq!(
+        closed.current_closure.as_ref().unwrap().author,
+        expected_author
+    );
+    let event = closed.events.last().unwrap();
+    assert_eq!(event.attributes["source_account_id"], actor.account_id);
+    assert_eq!(event.attributes["source_user_id"], actor.user_id);
+    assert_eq!(
+        closed.current_closure.as_ref().unwrap().reason,
+        ticket::TicketClosureReason::Completed
+    );
+    assert_eq!(closed.case_history.len(), 1);
+    assert_eq!(
+        closed.case_history[0].references,
+        closed.current_closure.as_ref().unwrap().references
+    );
+
+    let correction = case_request(
+        &closed,
+        "correct-closure",
+        json!({"action": "correct_closure", "reason": {"other": "Answer superseded by user decision"}}),
+    );
     request_json(
         app.clone(),
         "POST",
-        &format!("{path}/workflow/close"),
-        Some(json!("unguarded close")),
-        StatusCode::UNPROCESSABLE_ENTITY,
+        &path,
+        Some(correction.clone()),
+        StatusCode::OK,
     )
     .await;
-    let close = json!({
-        "operation_key":"guarded-close","expected_content_digest":ticket::ticket_content_digest(&before),
-        "expected_state":"planning","reason":"No further work required","author":"spoofed-client-author"
-    });
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("{path}/workflow/close"))
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(close.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let closed = backend.show(reference.id.clone().into()).unwrap();
-    assert_eq!(closed.meta.workflow_state, TicketWorkflowState::Closed);
-    let receipt = closed.events.last().unwrap();
-    assert_eq!(receipt.author.as_deref(), Some("workspace-user"));
-    assert_eq!(receipt.from.as_deref(), Some("planning"));
+    let corrected = backend.show(reference.id.clone().into()).unwrap();
+    assert_eq!(corrected.case_history.len(), 2);
+    assert_eq!(corrected.case_history[0], closed.case_history[0]);
     assert_eq!(
-        receipt.attributes.get("operation_key"),
-        Some(&"guarded-close".to_string())
+        corrected.current_closure.as_ref().unwrap().reason,
+        ticket::TicketClosureReason::Other("Answer superseded by user decision".into())
     );
-    let reopen = json!({
-        "operation_key":"reopen","expected_content_digest":ticket::ticket_content_digest(&closed),
-        "expected_state":"closed","state":"planning","reason":"A new question arrived"
-    });
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("{path}/workflow-state"))
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(reopen.to_string()))
-                .unwrap(),
-        )
-        .await
+    assert_eq!(
+        corrected.closure_operation_key.as_deref(),
+        Some("correct-closure")
+    );
+    let detail: TicketDetail =
+        serde_json::from_value(get_json(app.clone(), &detail_path).await).unwrap();
+    assert_eq!(detail.current_closure, corrected.current_closure);
+    assert_eq!(detail.closure_history, corrected.case_history);
+    assert_eq!(
+        detail.closure_operation_key,
+        corrected.closure_operation_key
+    );
+    assert!(detail.legacy_handoff.is_none());
+    assert!(detail.merge_requests.is_empty());
+
+    // Same state and content are insufficient after correcting a closure.
+    let stale_correction = case_request(
+        &closed,
+        "stale-correction",
+        json!({"action": "correct_closure", "reason": "duplicate"}),
+    );
+    request_json(
+        app.clone(),
+        "POST",
+        &path,
+        Some(stale_correction),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    let reopen = case_request(&corrected, "reopen", json!({"action": "reopen"}));
+    request_json(
+        app.clone(),
+        "POST",
+        &path,
+        Some(reopen.clone()),
+        StatusCode::OK,
+    )
+    .await;
+    let reopened = backend.show(reference.id.clone().into()).unwrap();
+    assert_eq!(reopened.meta.workflow_state, ticket::TicketState::Open);
+    assert!(reopened.current_closure.is_none());
+    assert_eq!(
+        reopened.closure_operation_key,
+        corrected.closure_operation_key
+    );
+    assert_eq!(reopened.case_history.len(), 3);
+    assert_eq!(ticket::ticket_content_digest(&reopened), digest);
+
+    // Exact replay returns current authority, not the old closed response.
+    for replay in [close.clone(), correction, reopen] {
+        let result = request_json(app.clone(), "POST", &path, Some(replay), StatusCode::OK).await;
+        let summary: server_api::TicketSummary = serde_json::from_value(result).unwrap();
+        assert_eq!(summary.0.workflow_state, ticket::TicketState::Open);
+        assert_eq!(backend.show(reference.id.clone().into()).unwrap(), reopened);
+    }
+    let mut changed_replay = close.clone();
+    changed_replay["explanation"] = json!("Different judgment under the same operation key");
+    request_json(
+        app.clone(),
+        "POST",
+        &path,
+        Some(changed_replay),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    let mut aba_close = close;
+    aba_close["operation_key"] = json!("stale-open-close");
+    request_json(
+        app.clone(),
+        "POST",
+        &path,
+        Some(aba_close),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(backend.show(reference.id.clone().into()).unwrap(), reopened);
+    let second_close = case_request(
+        &reopened,
+        "second-close",
+        json!({"action": "close", "reason": "not_planned"}),
+    );
+    request_json(
+        app.clone(),
+        "POST",
+        &path,
+        Some(second_close),
+        StatusCode::OK,
+    )
+    .await;
+    let final_ticket = backend.show(reference.id.into()).unwrap();
+    assert_eq!(
+        final_ticket.meta.workflow_state,
+        ticket::TicketState::Closed
+    );
+    assert_eq!(final_ticket.case_history.len(), 4);
+    assert_eq!(final_ticket.case_history[..3], reopened.case_history);
+    assert_eq!(
+        final_ticket.closure_operation_key.as_deref(),
+        Some("second-close")
+    );
+    assert_eq!(ticket::ticket_content_digest(&final_ticket), digest);
+}
+
+#[tokio::test]
+async fn case_route_rejects_stale_content_state_and_invalid_actions_without_audit_side_effects() {
+    let temp = tempfile::tempdir().unwrap();
+    let api = test_api_with_remote_repository(temp.path()).await;
+    let backend = browser_ticket_backend(&api).unwrap();
+    let reference = backend
+        .create(ticket::NewTicket::new("CAS decision"))
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    // Exact replay of the old close is a receipt lookup, not another close.
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("{path}/workflow/close"))
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(close.to_string()))
-                .unwrap(),
+    let before = backend.show(reference.id.clone().into()).unwrap();
+    let app = case_actor_router(api);
+    let path = format!(
+        "/workspaces/{TEST_WORKSPACE_ID}/tickets/{}/case",
+        reference.id
+    );
+    let close = case_request(
+        &before,
+        "close",
+        json!({"action": "close", "reason": "unknown"}),
+    );
+    for (field, value) in [
+        ("expected_content_digest", json!("stale-content")),
+        ("expected_state", json!("closed")),
+        ("action", json!({"action": "reopen"})),
+        (
+            "action",
+            json!({"action": "correct_closure", "reason": "duplicate"}),
+        ),
+    ] {
+        let mut invalid = close.clone();
+        invalid[field] = value;
+        request_json(
+            app.clone(),
+            "POST",
+            &path,
+            Some(invalid),
+            StatusCode::CONFLICT,
         )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let reopened = backend.show(reference.id.into()).unwrap();
-    assert_eq!(reopened.meta.workflow_state, TicketWorkflowState::Planning);
-    assert_eq!(reopened.events.len(), closed.events.len() + 1);
+        .await;
+        assert_eq!(backend.show(reference.id.clone().into()).unwrap(), before);
+    }
+    request_json(app.clone(), "POST", &path, Some(close), StatusCode::OK).await;
+    let closed = backend.show(reference.id.clone().into()).unwrap();
+    let duplicate_close = case_request(
+        &closed,
+        "duplicate-close",
+        json!({"action": "close", "reason": "completed"}),
+    );
+    request_json(
+        app,
+        "POST",
+        &path,
+        Some(duplicate_close),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(backend.show(reference.id.into()).unwrap(), closed);
 }

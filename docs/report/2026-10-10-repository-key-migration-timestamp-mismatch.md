@@ -7,7 +7,7 @@
 
 ## 原因
 
-`crates/workspace-server/src/frozen_repository_key_migration.rs:262–266`のcredential candidate移行は、旧credential ID/revisionから`repository_key_cutover`へLEFT JOINし、`m.fingerprint`を新しいNOT NULL列に挿入する。
+`crates/workspace-server/src/frozen_repository_key_migration.rs:262–266`のcredential candidate移行は、旧credential IDと保存counterの組から`repository_key_cutover`へLEFT JOINし、`m.fingerprint`を新しいNOT NULL列に挿入する。
 
 JOIN条件の`m.created_at <= o.updated_at`が、RFC3339の鍵作成時刻とepoch-millis文字列のWorkdir更新時刻を、そのままTEXTとして比較している。日時としての順序を判定していないため、有効な古い鍵のJOINが外れ、fingerprintがNULLになる。
 
@@ -30,7 +30,7 @@ JOIN条件の`m.created_at <= o.updated_at`が、RFC3339の鍵作成時刻とepo
 | 項目 | 値 |
 | --- | --- |
 | operation | `call_mgmyCNofdQMZ8uyI5tg0mBhv` |
-| credential | `workspace-default`、旧revision 1 |
+| credential | `workspace-default`、旧保存counter 1 |
 | 鍵created_at | `2026-09-16T18:44:56.736Z` |
 | Workdir updated_at | `1790173821030` |
 | Workdir updated_atを日時に変換 | `2026-09-23T14:30:21.030Z` |
@@ -42,7 +42,7 @@ JOIN条件の`m.created_at <= o.updated_at`が、RFC3339の鍵作成時刻とepo
 ## 修正方針（この調査では未実装）
 
 - frozen migration内で旧データの時刻形式を明示的に読み、同じ時刻型/epoch-millisへ正規化して比較する。文字列比較やSQLの安易なCASTに頼らない。
-- `created_at <= updated_at`の安全確認そのものは削除しない。旧ID/revisionが削除後に再利用された鍵を、過去のcandidateに誤って結び付けることを防ぐ条件である。
+- `created_at <= updated_at`の安全確認そのものは削除しない。旧IDと保存counterが削除後に再利用された鍵を、過去のcandidateに誤って結び付けることを防ぐ条件である。
 - candidateだけでなくoperation本体のcredential/host trust等、同じ境界の比較を確認する。
 - 正規化不能・不正な時刻や真に必要な証拠が欠落した場合は、NOT NULLエラーになる前に文脈付きで拒否し、transactionをrollbackする。
 

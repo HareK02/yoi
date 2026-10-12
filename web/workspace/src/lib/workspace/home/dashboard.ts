@@ -35,9 +35,7 @@ export type Dashboard = {
 };
 
 const states: Record<string, string> = {
-  inprogress: "In progress",
-  queued: "Queued",
-  done: "Done",
+  open: "Open",
   closed: "Closed",
   active: "Active",
   completed: "Completed",
@@ -90,8 +88,8 @@ export function recentRows(rows: DashboardRow[]): DashboardRow[] {
     .slice(0, HOME_LIMIT);
 }
 
-// These are bounded, read-only browser endpoints. QueryTicket/QueryObjective are
-// tool-only capabilities and must not be approximated by guessed HTTP routes.
+// Homeは件数を絞ったread-onlyの一覧を使う。Ticketの検索・絞込みはTickets側の
+// 公開query APIが担い、Homeで取得した一部分をWorkspace全体の検索結果にしない。
 export function loadDashboard(
   fetchFn: typeof fetch,
   workspaceId: string,
@@ -113,8 +111,7 @@ export function loadDashboard(
       })}`,
       parseTicketListResponse,
     );
-  const activeResult = tickets("inprogress,queued");
-  const doneResult = tickets("done");
+  const activeResult = tickets("open");
   const closedResult = tickets("closed");
   const objectivesResult = get(
     `/objectives?limit=${HOME_LIMIT}`,
@@ -179,7 +176,7 @@ export function loadDashboard(
           }
           const current = detail.data;
           // A concurrent transition can remove a Ticket from this snapshot's scope.
-          if (!["inprogress", "queued"].includes(current.state)) {
+          if (current.state !== "open") {
             return { changed: true };
           }
           const blockers = current.relations.blockers;
@@ -218,17 +215,14 @@ export function loadDashboard(
           : result.data.page.has_more || result.data.page.source_truncated
           ? `Showing ${
             Math.min(result.data.items.length, HOME_LIMIT)
-          } active tickets, with in-progress work first.`
+          } open tickets.`
           : undefined,
       };
     }),
-    recent: Promise.all([doneResult, closedResult, objectivesResult]).then((
-      [done, closed, objectives],
+    recent: Promise.all([closedResult, objectivesResult]).then((
+      [closed, objectives],
     ): DashboardFeed => ({
       rows: recentRows([
-        ...(done.data?.items ?? []).map((ticket) =>
-          ticketRow(workspaceId, ticket)
-        ),
         ...(closed.data?.items ?? []).map((ticket) =>
           ticketRow(workspaceId, ticket)
         ),
@@ -243,21 +237,17 @@ export function loadDashboard(
         })),
       ]),
       errors: [
-        ...(!done.data ? [failure("Done tickets", done.error)] : []),
         ...(!closed.data ? [failure("Closed tickets", closed.error)] : []),
         ...(!objectives.data ? [failure("Objectives", objectives.error)] : []),
-        ...([done.data, closed.data, objectives.data].some((data) =>
+        ...([closed.data, objectives.data].some((data) =>
             data?.invalid_records.length
           )
           ? ["Some records could not be read."]
           : []),
       ],
-      notice:
-        [done.data, closed.data, objectives.data].some((data) =>
-            data?.items.length
-          )
-          ? "Up to 5 latest updates to done / closed tickets and Objectives."
-          : undefined,
+      notice: [closed.data, objectives.data].some((data) => data?.items.length)
+        ? "Up to 5 latest updates to closed tickets and Objectives."
+        : undefined,
     })),
   };
 }

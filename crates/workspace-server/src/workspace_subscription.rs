@@ -1,6 +1,14 @@
+//! Workspace multiplexer over the shared identity-bound Worker method sender.
+//!
+//! Separate bounded control/protocol lanes preserve control priority. Writer deadline/exit
+//! cancels receive/admission even while waiting for session ownership or control capacity;
+//! receive exit aborts/joins writer and subscriptions rather than draining a congested wire.
+//! Caller cancellation owns abort-on-drop tasks. Bridge overflow reports Lagged when a terminal
+//! control frame can be delivered, never normal resource disappearance. Reconnect/resubscribe
+//! for a fresh snapshot; termination proves neither method non-execution nor Worker shutdown.
 use std::collections::HashMap;
 
-use axum::extract::ws::{Message as WsMessage, WebSocket};
+use axum::extract::ws::Message as WsMessage;
 use futures::{SinkExt, StreamExt};
 use protocol::subscription::{
     EventSubscriptionSelector, SubscriptionEvent, SubscriptionEventPayload, SubscriptionFrame,
@@ -12,27 +20,43 @@ use worker_runtime::identity::RuntimeWorkerRef;
 
 use crate::runtime_subscription::RuntimeSubscriptionBroker;
 use crate::server::{
-    WorkerOperationContext, WorkspaceApi, WorkspaceWorker, WorkspaceWorkerMethodSender,
+    WorkerOperationContext, WorkerProtocolEnd, WorkspaceApi, WorkspaceWorker,
+    WorkspaceWorkerMethodSender,
 };
 
 const OUTBOUND_CAPACITY: usize = 256;
 const WORKER_PROTOCOL_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+// Every spawned writer/subscription is connection-owned, including caller cancellation.
+struct SubscriptionTask(tokio::task::JoinHandle<()>);
+impl Drop for SubscriptionTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 struct ActiveSubscription {
-    task: tokio::task::JoinHandle<()>,
+    task: SubscriptionTask,
     methods: Option<WorkspaceWorkerMethodSender>,
 }
 
-pub(crate) async fn serve_workspace_subscription(
+pub(crate) async fn serve_workspace_subscription<S>(
     api: WorkspaceApi,
-    socket: WebSocket,
+    socket: S,
     context: WorkerOperationContext,
-) {
+) where
+    S: futures::Stream<Item = Result<WsMessage, axum::Error>>
+        + futures::Sink<WsMessage>
+        + Unpin
+        + Send
+        + 'static,
+    S::Error: Send,
+{
     let broker = api.runtime_subscription_broker().clone();
     let (mut socket_sender, mut socket_receiver) = socket.split();
     let (control_outbound, mut control_receiver) = mpsc::channel::<WsMessage>(OUTBOUND_CAPACITY);
     let (protocol_outbound, mut protocol_receiver) = mpsc::channel::<WsMessage>(OUTBOUND_CAPACITY);
-    let writer = tokio::spawn(async move {
+    let (writer_done, finished) = tokio::sync::oneshot::channel();
+    let mut writer = SubscriptionTask(tokio::spawn(async move {
         loop {
             let message = tokio::select! {
                 biased;
@@ -40,160 +64,181 @@ pub(crate) async fn serve_workspace_subscription(
                 message = protocol_receiver.recv() => message,
             };
             let Some(message) = message else { break };
-            if socket_sender.send(message).await.is_err() {
+            if !matches!(
+                tokio::time::timeout(
+                    WORKER_PROTOCOL_SNAPSHOT_TIMEOUT,
+                    socket_sender.send(message)
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
                 break;
             }
         }
-    });
+        let _ = writer_done.send(());
+    }));
     let mut next_subscription_id = 1_u64;
     let mut subscriptions = HashMap::<SubscriptionId, ActiveSubscription>::new();
 
-    while let Some(message) = socket_receiver.next().await {
-        let Ok(message) = message else { break };
-        match message {
-            WsMessage::Text(text) => {
-                let Ok(frame) = serde_json::from_str::<SubscriptionFrame>(text.as_str()) else {
-                    break;
-                };
-                if frame.validate().is_err() {
-                    break;
-                }
-                subscriptions.retain(|_, subscription| !subscription.task.is_finished());
-                match frame.payload {
-                    SubscriptionFramePayload::Request(SubscriptionRequest::SubscribeEvents {
-                        request_id,
-                        selector,
-                    }) => {
-                        let subscription_id = SubscriptionId::new(format!(
-                            "workspace-subscription-{next_subscription_id}"
-                        ))
-                        .expect("generated Workspace subscription id is valid");
-                        next_subscription_id = next_subscription_id.saturating_add(1);
-                        match selector {
-                            EventSubscriptionSelector::WorkspaceWorkers => {
-                                let task = tokio::spawn(run_workspace_workers(
-                                    api.clone(),
-                                    broker.clone(),
-                                    request_id,
-                                    subscription_id.clone(),
-                                    control_outbound.clone(),
-                                ));
-                                subscriptions.insert(
-                                    subscription_id,
-                                    ActiveSubscription {
-                                        task,
-                                        methods: None,
-                                    },
-                                );
-                            }
-                            EventSubscriptionSelector::WorkerProtocol {
-                                worker_id,
-                                runtime_id: Some(runtime_id),
-                            } => {
-                                let connection = match WorkspaceWorker::resolve(
-                                    &api,
-                                    &runtime_id,
-                                    worker_id.as_str(),
-                                ) {
-                                    Ok(worker) => worker
-                                        .connect_protocol(&context)
-                                        .await
-                                        .map_err(|error| error.to_string()),
-                                    Err(error) => Err(error.to_string()),
-                                };
-                                match connection {
-                                    Ok(connection) => {
-                                        let methods = connection.sender.clone();
-                                        let task = tokio::spawn(run_worker_protocol(
-                                            request_id,
-                                            subscription_id.clone(),
-                                            runtime_id,
-                                            worker_id,
-                                            connection.events,
-                                            control_outbound.clone(),
-                                            protocol_outbound.clone(),
-                                        ));
-                                        subscriptions.insert(
-                                            subscription_id,
-                                            ActiveSubscription {
-                                                task,
-                                                methods: Some(methods),
-                                            },
-                                        );
-                                    }
-                                    Err(error) => {
-                                        let _ = send_rejected(
-                                            &control_outbound,
-                                            request_id,
-                                            SubscriptionRejectionCode::ResourceNotFound,
-                                            error.to_string(),
-                                        )
-                                        .await;
+    let receiving = async {
+        while let Some(message) = socket_receiver.next().await {
+            let Ok(message) = message else { break };
+            match message {
+                WsMessage::Text(text) => {
+                    let Ok(frame) = serde_json::from_str::<SubscriptionFrame>(text.as_str()) else {
+                        break;
+                    };
+                    if frame.validate().is_err() {
+                        break;
+                    }
+                    subscriptions.retain(|_, subscription| !subscription.task.0.is_finished());
+                    match frame.payload {
+                        SubscriptionFramePayload::Request(
+                            SubscriptionRequest::SubscribeEvents {
+                                request_id,
+                                selector,
+                            },
+                        ) => {
+                            let subscription_id = SubscriptionId::new(format!(
+                                "workspace-subscription-{next_subscription_id}"
+                            ))
+                            .expect("generated Workspace subscription id is valid");
+                            next_subscription_id = next_subscription_id.saturating_add(1);
+                            match selector {
+                                EventSubscriptionSelector::WorkspaceWorkers => {
+                                    let task = tokio::spawn(run_workspace_workers(
+                                        api.clone(),
+                                        broker.clone(),
+                                        request_id,
+                                        subscription_id.clone(),
+                                        control_outbound.clone(),
+                                    ));
+                                    subscriptions.insert(
+                                        subscription_id,
+                                        ActiveSubscription {
+                                            task: SubscriptionTask(task),
+                                            methods: None,
+                                        },
+                                    );
+                                }
+                                EventSubscriptionSelector::WorkerProtocol {
+                                    worker_id,
+                                    runtime_id: Some(runtime_id),
+                                } => {
+                                    let connection = match WorkspaceWorker::resolve_async(
+                                        &api,
+                                        &runtime_id,
+                                        worker_id.as_str(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(worker) => worker
+                                            .connect_protocol(&context)
+                                            .await
+                                            .map_err(|error| error.to_string()),
+                                        Err(error) => Err(error.to_string()),
+                                    };
+                                    match connection {
+                                        Ok(connection) => {
+                                            let methods = connection.sender.clone();
+                                            let task = tokio::spawn(run_worker_protocol(
+                                                request_id,
+                                                subscription_id.clone(),
+                                                runtime_id,
+                                                worker_id,
+                                                connection.events,
+                                                methods.end_status(),
+                                                control_outbound.clone(),
+                                                protocol_outbound.clone(),
+                                            ));
+                                            subscriptions.insert(
+                                                subscription_id,
+                                                ActiveSubscription {
+                                                    task: SubscriptionTask(task),
+                                                    methods: Some(methods),
+                                                },
+                                            );
+                                        }
+                                        Err(error) => {
+                                            let _ = send_rejected(
+                                                &control_outbound,
+                                                request_id,
+                                                SubscriptionRejectionCode::ResourceNotFound,
+                                                error.to_string(),
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
-                            }
-                            _ => {
-                                let _ = send_rejected(
+                                _ => {
+                                    let _ = send_rejected(
                                     &control_outbound, request_id, SubscriptionRejectionCode::UnsupportedSelector,
                                     "Workspace clients may subscribe only to workspace_workers or a runtime-scoped worker_protocol selector".to_string(),
                                 ).await;
+                                }
                             }
                         }
-                    }
-                    SubscriptionFramePayload::Request(SubscriptionRequest::UnsubscribeEvents {
-                        request_id,
-                        subscription_id,
-                    }) => {
-                        if let Some(subscription) = subscriptions.remove(&subscription_id) {
-                            subscription.task.abort();
+                        SubscriptionFramePayload::Request(
+                            SubscriptionRequest::UnsubscribeEvents {
+                                request_id,
+                                subscription_id,
+                            },
+                        ) => {
+                            if let Some(mut subscription) = subscriptions.remove(&subscription_id) {
+                                subscription.task.0.abort();
+                                let _ = (&mut subscription.task.0).await;
+                            }
+                            if send_frame(
+                                &control_outbound,
+                                SubscriptionFrame::new(SubscriptionFramePayload::Response(
+                                    SubscriptionResponse::Unsubscribed {
+                                        request_id,
+                                        subscription_id,
+                                    },
+                                )),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break;
+                            }
                         }
-                        if send_frame(
-                            &control_outbound,
-                            SubscriptionFrame::new(SubscriptionFramePayload::Response(
-                                SubscriptionResponse::Unsubscribed {
-                                    request_id,
-                                    subscription_id,
-                                },
-                            )),
-                        )
-                        .await
-                        .is_err()
-                        {
+                        SubscriptionFramePayload::WorkerProtocol(message) => {
+                            let Some(methods) = subscriptions
+                                .get(&message.subscription_id)
+                                .and_then(|value| value.methods.clone())
+                            else {
+                                break;
+                            };
+                            if methods.send(&context, message.method).await.is_err() {
+                                break;
+                            }
+                        }
+                        SubscriptionFramePayload::Response(_)
+                        | SubscriptionFramePayload::Event(_) => {
                             break;
                         }
                     }
-                    SubscriptionFramePayload::WorkerProtocol(message) => {
-                        let Some(methods) = subscriptions
-                            .get(&message.subscription_id)
-                            .and_then(|value| value.methods.clone())
-                        else {
-                            break;
-                        };
-                        if methods.send(&context, message.method).await.is_err() {
-                            break;
-                        }
-                    }
-                    SubscriptionFramePayload::Response(_) | SubscriptionFramePayload::Event(_) => {
+                }
+                WsMessage::Ping(value) => {
+                    if control_outbound.send(WsMessage::Pong(value)).await.is_err() {
                         break;
                     }
                 }
+                WsMessage::Pong(_) => {}
+                WsMessage::Close(_) | WsMessage::Binary(_) => break,
             }
-            WsMessage::Ping(value) => {
-                if control_outbound.send(WsMessage::Pong(value)).await.is_err() {
-                    break;
-                }
-            }
-            WsMessage::Pong(_) => {}
-            WsMessage::Close(_) | WsMessage::Binary(_) => break,
         }
+    };
+    // Writer termination also preempts method authorization/control queue waits.
+    tokio::select! { _ = receiving => {}, _ = finished => {} }
+    for (_, mut subscription) in subscriptions {
+        subscription.task.0.abort();
+        let _ = (&mut subscription.task.0).await;
     }
-
-    for (_, subscription) in subscriptions {
-        subscription.task.abort();
-    }
-    drop(control_outbound);
-    drop(protocol_outbound);
-    let _ = writer.await;
+    // Never wait for a congested writer to drain after disconnect or admission failure.
+    writer.0.abort();
+    let _ = (&mut writer.0).await;
 }
 
 async fn send_rejected(
@@ -222,6 +267,7 @@ async fn run_worker_protocol(
     runtime_id: String,
     worker_id: protocol::subscription::SubscriptionWorkerId,
     mut events: mpsc::Receiver<protocol::Event>,
+    end_status: tokio::sync::watch::Receiver<Option<WorkerProtocolEnd>>,
     control_outbound: mpsc::Sender<WsMessage>,
     protocol_outbound: mpsc::Sender<WsMessage>,
 ) {
@@ -313,8 +359,8 @@ async fn run_worker_protocol(
         SubscriptionFrame::new(SubscriptionFramePayload::Event(
             SubscriptionEvent::SubscriptionClosed {
                 subscription_id,
-                code: SubscriptionTerminationCode::ResourceGone,
-                message: "Worker protocol stream closed".to_string(),
+                code: if matches!(*end_status.borrow(), Some(WorkerProtocolEnd::EventOverflow | WorkerProtocolEnd::MethodOverflow)) { SubscriptionTerminationCode::Lagged } else { SubscriptionTerminationCode::ResourceGone },
+                message: "Worker protocol stream ended; pending method delivery may be unknown; resubscribe with a fresh snapshot, no automatic retry".to_string(),
             },
         )),
     )
@@ -330,7 +376,8 @@ async fn run_workspace_workers(
 ) {
     let Ok(mut projection) = api
         .worker_projection
-        .subscribe_ordered(api.config.max_records.max(1))
+        .subscribe_ordered_async(api.config.max_records.max(1))
+        .await
     else {
         let _ = send_rejected(
             &outbound,
@@ -341,11 +388,22 @@ async fn run_workspace_workers(
         .await;
         return;
     };
-    let mut workers = projection
-        .take_snapshot()
-        .into_iter()
-        .filter_map(|record| project_registry_worker(&api, record))
-        .collect::<Vec<_>>();
+    let Ok(mut workers) = project_registry_workers_async(
+        api.store.clone(),
+        api.config.workspace_id.clone(),
+        projection.take_snapshot(),
+    )
+    .await
+    else {
+        let _ = send_rejected(
+            &outbound,
+            request_id,
+            SubscriptionRejectionCode::Internal,
+            "failed to enrich durable Worker projection".to_string(),
+        )
+        .await;
+        return;
+    };
     sort_workers(&mut workers);
     if send_frame(
         &outbound,
@@ -370,7 +428,29 @@ async fn run_workspace_workers(
                 for change in event.changes {
                     let payload = match change {
                         crate::worker_projection::WorkerProjectionChange::Upsert(record) => {
-                            let Some(worker) = project_registry_worker(&api, record) else {
+                            let workers = project_registry_workers_async(
+                                api.store.clone(),
+                                api.config.workspace_id.clone(),
+                                vec![record],
+                            )
+                            .await;
+                            let Ok(mut workers) = workers else {
+                                // Admission failure cannot silently lose a live
+                                // update: terminate and require a fresh snapshot.
+                                let _ = send_frame(
+                                    &outbound,
+                                    SubscriptionFrame::new(SubscriptionFramePayload::Event(
+                                        SubscriptionEvent::SubscriptionClosed {
+                                            subscription_id: subscription_id.clone(),
+                                            code: SubscriptionTerminationCode::Lagged,
+                                            message: "Worker projection enrichment unavailable; reconnect for a fresh snapshot".to_string(),
+                                        },
+                                    )),
+                                )
+                                .await;
+                                return;
+                            };
+                            let Some(worker) = workers.pop() else {
                                 continue;
                             };
                             SubscriptionEventPayload::WorkerUpserted { worker }
@@ -414,8 +494,28 @@ async fn run_workspace_workers(
     }
 }
 
+async fn project_registry_workers_async(
+    store: std::sync::Arc<dyn crate::store::ControlPlaneStore>,
+    workspace_id: String,
+    records: Vec<crate::store::WorkerRegistryProjectionRecord>,
+) -> crate::Result<Vec<SubscriptionWorker>> {
+    store
+        .db_executor()
+        .run(move || {
+            // Keep the committed Worker payload; only the existing Workspace-scoped
+            // workdir/history/repository enrichment reads occur inside this job.
+            Ok(records
+                .into_iter()
+                .filter_map(|record| project_registry_worker(store.as_ref(), &workspace_id, record))
+                .collect())
+        })
+        .await
+}
+
+// Synchronous helpers stay synchronous; they run only inside the job above.
 fn project_registry_worker(
-    api: &WorkspaceApi,
+    store: &dyn crate::store::ControlPlaneStore,
+    workspace_id: &str,
     record: crate::store::WorkerRegistryProjectionRecord,
 ) -> Option<SubscriptionWorker> {
     let runtime_id = record.registry.worker.runtime_id.clone();
@@ -455,29 +555,25 @@ fn project_registry_worker(
             attempt_id: job.attempt_id,
             purpose: job.purpose,
         });
-    if !project_working_directory(api, &record.registry.worker, &mut worker) {
+    if !project_working_directory(store, workspace_id, &record.registry.worker, &mut worker) {
         return None;
     }
     Some(worker)
 }
 
 fn project_working_directory(
-    api: &WorkspaceApi,
+    store: &dyn crate::store::ControlPlaneStore,
+    workspace_id: &str,
     worker_ref: &RuntimeWorkerRef,
     worker: &mut SubscriptionWorker,
 ) -> bool {
-    let Ok(links) = api
-        .store
-        .list_worker_workdir_links(&api.config.workspace_id, worker_ref)
-    else {
+    let Ok(links) = store.list_worker_workdir_links(workspace_id, worker_ref) else {
         return false;
     };
     if !links.is_empty() {
         let mut attachments = Vec::with_capacity(links.len());
         for link in links {
-            let Ok(Some(workdir)) = api
-                .store
-                .get_workdir_registry(&api.config.workspace_id, &link.workdir_id)
+            let Ok(Some(workdir)) = store.get_workdir_registry(workspace_id, &link.workdir_id)
             else {
                 return false;
             };
@@ -497,9 +593,8 @@ fn project_working_directory(
         }
         worker.workdir_attachments = attachments;
     } else {
-        let Ok(has_link_history) = api
-            .store
-            .worker_workdir_link_history_exists(&api.config.workspace_id, worker_ref)
+        let Ok(has_link_history) =
+            store.worker_workdir_link_history_exists(workspace_id, worker_ref)
         else {
             return false;
         };
@@ -507,13 +602,17 @@ fn project_working_directory(
             worker.workdir_attachments.clear();
         }
     }
-    project_repository_keys(api, worker)
+    project_repository_keys(store, workspace_id, worker)
 }
 
-fn project_repository_keys(api: &WorkspaceApi, worker: &mut SubscriptionWorker) -> bool {
+fn project_repository_keys(
+    store: &dyn crate::store::ControlPlaneStore,
+    workspace_id: &str,
+    worker: &mut SubscriptionWorker,
+) -> bool {
     project_repository_keys_with(worker, |repository_id| {
-        api.store
-            .get_repository(&api.config.workspace_id, repository_id)
+        store
+            .get_repository(workspace_id, repository_id)
             .ok()
             .flatten()
             .map(|repository| repository.repository_key)
@@ -598,9 +697,8 @@ mod tests {
         protocol::subscription::SubscriptionWorkerId::new("worker-1").unwrap()
     }
 
-    #[test]
-    fn external_workdir_attachment_does_not_remove_workspace_worker() {
-        let mut worker = SubscriptionWorker {
+    fn external_worker() -> SubscriptionWorker {
+        SubscriptionWorker {
             restore_observation_token: None,
             worker_id: worker_id(),
             runtime_id: Some("runtime-1".to_string()),
@@ -624,8 +722,12 @@ mod tests {
                     .unwrap(),
                 },
             ],
-        };
+        }
+    }
 
+    #[test]
+    fn external_workdir_attachment_does_not_remove_workspace_worker() {
+        let mut worker = external_worker();
         assert!(project_repository_keys_with(&mut worker, |_| {
             panic!("External Workdir must not require Repository projection")
         }));
@@ -634,6 +736,110 @@ mod tests {
         assert_eq!(
             worker.workdir_attachments[0].working_directory_id.as_str(),
             "external-workdir-1"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_enrichment_preserves_committed_worker_and_external_attachment_but_hides_unresolved_repository()
+     {
+        use crate::store::{
+            AccountRecord, ControlPlaneStore, SqliteWorkspaceStore, WorkerRegistryRecord,
+            WorkspaceRecord,
+        };
+        let store = std::sync::Arc::new(
+            SqliteWorkspaceStore::in_memory_for_test()
+                .unwrap()
+                .with_db_executor(crate::db_executor::DbExecutor::new(Default::default()).unwrap()),
+        );
+        store
+            .upsert_account(&AccountRecord {
+                account_id: "owner".into(),
+                kind: "user".into(),
+                handle: "owner".into(),
+                display_name: "Owner".into(),
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            })
+            .unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "workspace-1".into(),
+                owner_account_id: "owner".into(),
+                display_name: "Enrichment".into(),
+                state: "active".into(),
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            })
+            .await
+            .unwrap();
+        let worker_ref = RuntimeWorkerRef::new("runtime-1", "worker-1");
+        store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: "workspace-1".into(),
+                worker: worker_ref.clone(),
+                display_name: "Durable name".into(),
+                profile: Some("builtin:coder".into()),
+                retention_state: "normal".into(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            })
+            .unwrap();
+        store
+            .apply_worker_registry_observation("workspace-1", "runtime-1", &external_worker(), "2")
+            .unwrap();
+        let committed = store
+            .worker_registry_projection("workspace-1", &worker_ref)
+            .unwrap()
+            .unwrap();
+        // Change authority after capturing the payload, as can happen while async
+        // enrichment is queued. It must not re-query and replace the committed Worker.
+        let mut later = external_worker();
+        later.state = protocol::subscription::SubscriptionWorkerState::Running;
+        store
+            .apply_worker_registry_observation("workspace-1", "runtime-1", &later, "3")
+            .unwrap();
+        let projected = project_registry_workers_async(
+            store.clone(),
+            "workspace-1".into(),
+            vec![committed.clone()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(projected.len(), 1);
+        let worker = &projected[0];
+        assert_eq!(
+            worker.state,
+            protocol::subscription::SubscriptionWorkerState::Idle
+        );
+        assert_eq!(
+            worker.availability,
+            protocol::subscription::SubscriptionWorkerAvailability::Observed
+        );
+        assert_eq!(worker.display_name.as_deref(), Some("Durable name"));
+        assert_eq!(worker.profile.as_deref(), Some("builtin:coder"));
+        assert_eq!(worker.runtime_id.as_deref(), Some("runtime-1"));
+        assert_eq!(worker.workspace_id.as_deref(), Some("workspace-1"));
+        assert_eq!(
+            worker.workdir_attachments,
+            external_worker().workdir_attachments
+        );
+        let mut unresolved = committed;
+        unresolved
+            .observation
+            .as_mut()
+            .unwrap()
+            .worker
+            .workdir_attachments[0]
+            .repository_id = Some("missing-repository".into());
+        assert!(
+            project_registry_workers_async(store, "workspace-1".into(), vec![unresolved])
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -646,6 +852,7 @@ mod tests {
             "runtime-1".to_string(),
             worker_id(),
             events,
+            tokio::sync::watch::channel(None).1,
             control_outbound,
             protocol_outbound,
         )
@@ -658,6 +865,81 @@ mod tests {
             panic!("expected subscription response");
         };
         response
+    }
+
+    #[tokio::test]
+    async fn worker_bridge_overflow_is_serialized_as_lagged_not_resource_disappearance() {
+        for (reason, expected) in [
+            (
+                WorkerProtocolEnd::EventOverflow,
+                SubscriptionTerminationCode::Lagged,
+            ),
+            (
+                WorkerProtocolEnd::MethodOverflow,
+                SubscriptionTerminationCode::Lagged,
+            ),
+            (
+                WorkerProtocolEnd::Disconnected,
+                SubscriptionTerminationCode::ResourceGone,
+            ),
+        ] {
+            let (event_sender, events) = mpsc::channel(1);
+            event_sender
+                .try_send(protocol::Event::Snapshot {
+                    session: protocol::SessionSnapshot {
+                        entries: vec![],
+                        pending_submissions: Default::default(),
+                    },
+                    greeting: protocol::Greeting {
+                        worker_name: "worker-1".into(),
+                        cwd: String::new(),
+                        provider: "fixture".into(),
+                        model: "fixture".into(),
+                        reasoning: None,
+                        scope_summary: String::new(),
+                        tools: vec![],
+                        context_window: 0,
+                        context_tokens: 0,
+                        context_usage: None,
+                    },
+                    state: protocol::WorkerStateSnapshot::initial(),
+                    in_flight: Default::default(),
+                    internal_workers: vec![],
+                })
+                .unwrap();
+            drop(event_sender);
+            let (control, mut receiver) = mpsc::channel(2);
+            let (protocol, _events) = mpsc::channel(1);
+            run_worker_protocol(
+                request_id(),
+                subscription_id(),
+                "runtime-1".into(),
+                worker_id(),
+                events,
+                tokio::sync::watch::channel(Some(reason)).1,
+                control,
+                protocol,
+            )
+            .await;
+            let WsMessage::Text(snapshot) = receiver.recv().await.unwrap() else {
+                panic!("expected snapshot response");
+            };
+            let snapshot: SubscriptionFrame = serde_json::from_str(snapshot.as_str()).unwrap();
+            assert!(matches!(
+                snapshot.payload,
+                SubscriptionFramePayload::Response(SubscriptionResponse::Subscribed { .. })
+            ));
+            let WsMessage::Text(closed) = receiver.recv().await.unwrap() else {
+                panic!("expected terminal control frame");
+            };
+            let frame: SubscriptionFrame = serde_json::from_str(closed.as_str()).unwrap();
+            frame.validate().unwrap();
+            assert!(
+                matches!(frame.payload, SubscriptionFramePayload::Event(SubscriptionEvent::SubscriptionClosed { code, message, .. })
+                if code == expected && message.contains("unknown") && message.contains("fresh snapshot")),
+                "{closed}"
+            );
+        }
     }
 
     #[tokio::test]

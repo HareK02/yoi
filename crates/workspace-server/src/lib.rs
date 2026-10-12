@@ -6,6 +6,7 @@ pub mod backend_job;
 pub mod companion;
 pub mod config;
 pub mod config_source;
+pub mod db_executor;
 pub mod feature_storage;
 pub mod hosts;
 pub mod memory_backend;
@@ -155,6 +156,12 @@ pub enum Error {
     WorkspaceSigningIdentity { code: String, message: String },
     #[error("Workspace Drive error: {0}")]
     Drive(#[from] workspace_drive::Error),
+    #[error("DB execution capacity exceeded")]
+    DbCapacityExceeded,
+    #[error("DB executor unavailable")]
+    DbExecutorUnavailable,
+    #[error("DB operation outcome unknown; do not automatically retry")]
+    DbOperationOutcomeUnknown,
     #[error("store error: {0}")]
     Store(String),
 }

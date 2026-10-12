@@ -1,7 +1,9 @@
 //! Exploration domain for immutable Session captures, with no Workspace/Memory mutation capability.
 //!
 //! A capture is an ordered projection of committed entries; exploration excludes reasoning and
-//! system prompts. Overview, search, bounded reads, and evidence conversion share `SessionEntryRef`.
+//! system prompts, including Host compaction summaries and other derived context. Full inherited
+//! summary input belongs to compaction, not public observation or Memory evidence. Overview,
+//! search, bounded reads, and evidence conversion share `SessionEntryRef`.
 //! References identify entries in the selected Session and cannot be reused for another subject.
 //! Appends preserve existing entry identities. Sparse real user/assistant anchors and intervening
 //! entry counts index long histories. Search with an empty filter also provides bounded range lists.
@@ -734,7 +736,9 @@ fn public_provenance(origin: &WorkerHistoryProvenance) -> SessionEntryProvenance
         }
         WorkerHistoryProvenance::ModelOutput { .. } => SessionEntryProvenance::ModelOutput,
         WorkerHistoryProvenance::ToolOutput { .. } => SessionEntryProvenance::ToolOutput,
-        WorkerHistoryProvenance::DerivedSummary => SessionEntryProvenance::DerivedSummary,
+        WorkerHistoryProvenance::CompactionSummary | WorkerHistoryProvenance::DerivedSummary => {
+            SessionEntryProvenance::DerivedSummary
+        }
         WorkerHistoryProvenance::LegacyUnknown => SessionEntryProvenance::LegacyUnknown,
     }
 }
@@ -885,6 +889,60 @@ mod tests {
             after.evidence_for(expected_ref.as_str()).unwrap().entry_ref,
             expected_ref
         );
+    }
+
+    #[test]
+    fn host_summary_remains_private_to_compaction_not_observation_or_memory_evidence() {
+        let entries = [
+            (
+                Item::system_message("host-summary-secret"),
+                WorkerHistoryProvenance::CompactionSummary,
+            ),
+            (
+                Item::system_message("other-derived-secret"),
+                WorkerHistoryProvenance::DerivedSummary,
+            ),
+            (
+                Item::system_message("raw-system-secret"),
+                WorkerHistoryProvenance::LegacyUnknown,
+            ),
+            (
+                Item::reasoning("reasoning-secret"),
+                WorkerHistoryProvenance::LegacyUnknown,
+            ),
+        ]
+        .into_iter()
+        .map(|(item, origin)| crate::session_history::history_entry(item, origin))
+        .collect::<Vec<_>>();
+        let refs = entries
+            .iter()
+            .map(|entry| SessionEntryRef::from_history_entry_id(&entry.annotation.entry_id))
+            .collect::<Vec<_>>();
+        let capture = SessionCapture::from_history_entries("segment", entries);
+        assert!(capture.overview().is_empty());
+        assert!(
+            capture
+                .search(&SearchOptions {
+                    query: "secret".into(),
+                    ..SearchOptions::default()
+                })
+                .is_empty()
+        );
+        assert!(
+            capture
+                .read(ReadSelector::EntryRange([0, 3]), ReadOptions::default())
+                .entries
+                .is_empty()
+        );
+        for reference in refs {
+            assert!(capture.evidence_for(reference.as_str()).is_none());
+            assert!(
+                capture
+                    .read(ReadSelector::Id(reference.as_str()), ReadOptions::default())
+                    .entries
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

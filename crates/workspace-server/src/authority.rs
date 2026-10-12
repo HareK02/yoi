@@ -1,8 +1,9 @@
 //! Projects Workspace Tickets, Objectives, and Memory from domain records to API resources.
 //!
 //! Normal Backend reads use Workspace-scoped SQLite/domain authority, not a Ticket backend
-//! chosen from Worker cwd or legacy repository file layouts. The ticket crate owns Ticket state,
-//! relations, and content; the Workspace store owns assignments and Runtime Worker links.
+//! chosen from Worker cwd or legacy repository file layouts. The ticket crate owns case state,
+//! content, relations and delegation/handling records; Workspace composes those schemas and
+//! owns operational Worker links, work releases and startup/delivery fences.
 //! Builds bounded detail, thread, relation, assignment, and evidence projections, not full
 //! execution sessions as substitute records for domain decisions.
 //!
@@ -10,7 +11,10 @@
 //! Evidence filters use current projections excluding closed MRs: commit requires a settled source;
 //! approved_review requires approval tied to the current Ticket content digest and all target MR
 //! sources/results. Merged MRs use stored integration evidence, so provider outages alone do not
-//! invalidate approval.
+//! invalidate approval. Evidence is a read-side attestation, never a case-close or handling gate.
+//! An MRless Ticket has no applicable MR evidence, not missing review merely because it is closed.
+//! Evidence predicates use the full projection after observation; bounded candidate scans can
+//! return an empty page with more candidates. Continue its cursor rather than assuming exhaustion.
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -21,11 +25,11 @@ use merge_request::{
     MergeRequest, MergeRequestState, MergeRequestStore, MergeRequestThreadEvent, ReviewDecision,
 };
 use project_record::{allocate_record_id, unix_epoch_millis_now};
-use rusqlite::{params_from_iter, types::Value as SqlValue};
+use rusqlite::{OptionalExtension, params, params_from_iter, types::Value as SqlValue};
 
 use ticket::{
     SqliteTicketBackend, SqliteTicketListCursor, SqliteTicketListItem, SqliteTicketListPageQuery,
-    TicketBackend, TicketEvent, TicketIdOrSlug, TicketWorkflowState, TicketWorkspaceActionPriority,
+    TicketBackend, TicketEvent, TicketIdOrSlug, TicketState, TicketWorkspaceActionPriority,
     project_ticket_workspace_item,
 };
 
@@ -252,6 +256,20 @@ impl SqliteWorkspaceAuthority {
         })
     }
 
+    /// Assignment self-report enrichment is a separate projection so retained
+    /// responsibility and existing Ticket constructors stay distinct from status.
+    pub fn ticket_assignment_tracking(
+        &self,
+        reference: &str,
+    ) -> Result<Vec<ticket::TicketAssignmentTrackingProjection>> {
+        let ticket = self
+            .ticket_backend
+            .show(TicketIdOrSlug::from(reference))
+            .map_err(Error::from)?;
+        self.store
+            .list_current_ticket_assignment_tracking(&self.workspace_id, &ticket.meta.id)
+    }
+
     pub fn with_source_commit_resolver(
         mut self,
         source_commit_resolver: Arc<dyn TicketSourceCommitResolver>,
@@ -296,7 +314,7 @@ impl SqliteWorkspaceAuthority {
                 id: ticket.id,
                 resource_key: ticket.resource_key,
                 title: ticket.title,
-                state: ticket.state,
+                state: ticket.state.as_str().into(),
             })
             .collect::<Vec<_>>();
         let resources = self
@@ -401,9 +419,72 @@ impl SqliteWorkspaceAuthority {
             let states = query
                 .states
                 .iter()
-                .map(|state| bind(SqlValue::Text(state.clone())))
+                .map(|state| bind(SqlValue::Text(state.as_str().into())))
                 .collect::<Vec<_>>();
             predicates.push(format!("t.workflow_state IN ({})", states.join(",")));
+        }
+        if let Some(reason) = &query.closure_reason {
+            let encoded =
+                serde_json::to_string(reason).map_err(|e| Error::InvalidInput(e.to_string()))?;
+            let value = bind(SqlValue::Text(encoded));
+            predicates.push(format!("t.workflow_state='closed' AND EXISTS (SELECT 1 FROM typed_ticket_case_metadata m JOIN typed_ticket_case_history h ON h.workspace_id=m.workspace_id AND h.ticket_id=m.ticket_id AND h.operation_key=m.closure_operation_key WHERE m.workspace_id=t.workspace_id AND m.ticket_id=t.ticket_id AND json_extract(h.judgment_json,'$.action.reason')=json_extract({value},'$'))"));
+        }
+        if query.assigned_principal.is_some() || query.handling_status.is_some() {
+            let mut assignment = vec![
+                "a.workspace_id=t.workspace_id".to_string(),
+                "a.ticket_id=t.ticket_id".to_string(),
+            ];
+            if let Some(principal) = &query.assigned_principal {
+                match principal {
+                    ticket::TicketAssignmentPrincipalSnapshot::WorkspaceAgent { agent_key } => {
+                        let value = bind(SqlValue::Text(agent_key.clone()));
+                        assignment.push(format!(
+                            "a.principal_kind='workspace_agent' AND a.principal_id={value}"
+                        ));
+                    }
+                    ticket::TicketAssignmentPrincipalSnapshot::User { account_id } => {
+                        let value = bind(SqlValue::Text(account_id.clone()));
+                        assignment.push(format!(
+                            "a.principal_kind='user' AND a.principal_id={value}"
+                        ));
+                    }
+                    ticket::TicketAssignmentPrincipalSnapshot::Worker {
+                        runtime_id,
+                        worker_id,
+                    } => {
+                        let runtime = bind(SqlValue::Text(runtime_id.clone()));
+                        let worker = bind(SqlValue::Text(worker_id.clone()));
+                        assignment.push(format!("a.principal_kind='worker' AND a.runtime_id={runtime} AND a.worker_id={worker}"));
+                    }
+                }
+            }
+            if let Some(status) = &query.handling_status {
+                let value = match status {
+                    ticket::TicketAssignmentTrackingStatus::Waiting => "waiting",
+                    ticket::TicketAssignmentTrackingStatus::Inprogress => "inprogress",
+                    ticket::TicketAssignmentTrackingStatus::Done => "done",
+                };
+                let value = bind(SqlValue::Text(value.into()));
+                assignment.push(format!(
+                    "a.role='orchestrator' AND json_extract(a.tracking_json,'$.status')={value}"
+                ));
+            }
+            predicates.push(format!("EXISTS (SELECT 1 FROM ticket_current_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.assignment_id=c.assignment_id WHERE {})",assignment.join(" AND ")));
+        }
+        for id in &query.tag_ids {
+            let id = bind(SqlValue::Text(id.clone()));
+            predicates.push(format!("EXISTS (SELECT 1 FROM typed_ticket_tags l JOIN workspace_tags tag ON tag.workspace_id=l.workspace_id AND tag.tag_id=l.tag_id WHERE l.workspace_id=t.workspace_id AND l.ticket_id=t.ticket_id AND l.tag_id={id} AND tag.deleted=0)"));
+        }
+        for (ids, negate) in [(&query.tag_ids_any, false), (&query.tag_ids_none, true)] {
+            if !ids.is_empty() {
+                let ids = ids
+                    .iter()
+                    .map(|id| bind(SqlValue::Text(id.clone())))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let not = if negate { "NOT " } else { "" };
+                predicates.push(format!("{not}EXISTS (SELECT 1 FROM typed_ticket_tags l JOIN workspace_tags tag ON tag.workspace_id=l.workspace_id AND tag.tag_id=l.tag_id WHERE l.workspace_id=t.workspace_id AND l.ticket_id=t.ticket_id AND l.tag_id IN ({ids}) AND tag.deleted=0)"));
+            }
         }
         if let Some(text) = query.query.as_deref().filter(|text| !text.is_empty()) {
             let pattern = bind(SqlValue::Text(format!("%{}%", text.to_lowercase())));
@@ -411,7 +492,9 @@ impl SqliteWorkspaceAuthority {
                 "(lower(t.title) LIKE {p} OR lower(t.body) LIKE {p} OR EXISTS (
                     SELECT 1 FROM typed_ticket_events e
                     WHERE e.workspace_id=t.workspace_id AND e.ticket_id=t.ticket_id
-                      AND lower(e.body) LIKE {p}))",
+                      AND lower(e.body) LIKE {p}) OR EXISTS (
+                    SELECT 1 FROM typed_ticket_case_history h WHERE h.workspace_id=t.workspace_id AND h.ticket_id=t.ticket_id
+                    AND lower(CAST(json_extract(h.judgment_json,'$.action.reason') AS TEXT)) LIKE {p}))",
                 p = pattern
             ));
         }
@@ -452,14 +535,7 @@ impl SqliteWorkspaceAuthority {
             WHERE relation.workspace_id=t.workspace_id
               AND ((relation.ticket_id=t.ticket_id AND relation.kind='depends_on')
                 OR (relation.target=t.ticket_id AND relation.kind='blocks'))
-              AND blocker.workflow_state NOT IN ('done','closed'))";
-        let active_blocker = "EXISTS (SELECT 1 FROM typed_ticket_relations relation
-            JOIN typed_tickets blocker ON blocker.workspace_id=relation.workspace_id
-             AND blocker.ticket_id=CASE WHEN relation.ticket_id=t.ticket_id THEN relation.target ELSE relation.ticket_id END
-            WHERE relation.workspace_id=t.workspace_id
-              AND ((relation.ticket_id=t.ticket_id AND relation.kind='depends_on')
-                OR (relation.target=t.ticket_id AND relation.kind='blocks'))
-              AND blocker.workflow_state NOT IN ('queued','inprogress','done','closed'))";
+              AND blocker.workflow_state = 'open')";
         if !query.event_kinds.is_empty() {
             let event_kinds = query
                 .event_kinds
@@ -473,17 +549,13 @@ impl SqliteWorkspaceAuthority {
         // a primary-MR/latest-request or implementation-report heuristic loses candidates.
         for attention in &query.attention {
             match attention.as_str() {
-                "done_not_closed" => predicates.push("t.workflow_state='done'".into()),
                 "blocked" => predicates.push(blocker.into()),
                 "unblocked" => predicates.push(format!("NOT {blocker}")),
-                "ready" => predicates.push(format!("t.workflow_state='ready' AND NOT {blocker}")),
                 _ => {} // live evidence is evaluated after observation
             }
         }
         let rank_expression = match sort {
-            TicketQuerySort::Priority => format!(
-                "CASE WHEN t.workflow_state='ready' AND NOT {active_blocker} THEN 0 WHEN t.workflow_state IN ('queued','inprogress') THEN 1 ELSE 2 END"
-            ),
+            TicketQuerySort::Priority => "0".to_string(),
             TicketQuerySort::Relevance => {
                 if let Some(text) = query.query.as_deref().filter(|text| !text.is_empty()) {
                     let pattern = bind(SqlValue::Text(format!("%{}%", text.to_lowercase())));
@@ -779,12 +851,12 @@ impl SqliteWorkspaceAuthority {
                 })
             })
             .transpose()?;
-        // Responsibility remains visible after work ends; action eligibility must
-        // use only active unfinished work, including after a Ticket is reopened.
+        // Work start eligibility uses unfinished work. Delegation authoring and
+        // clearing use the retained current pointer, including after close.
         let active_role_assignments = self
             .store
             .list_active_ticket_role_assignments(&self.workspace_id, id)?;
-        let has_orchestrator = active_role_assignments
+        let has_orchestrator = role_assignments
             .iter()
             .any(|assignment| assignment.role == TicketAssignmentRole::Orchestrator);
         let has_worker = active_role_assignments
@@ -807,7 +879,6 @@ impl SqliteWorkspaceAuthority {
             })
             .collect::<Result<Vec<_>>>()?;
         let write_repository_keys = ticket_write_target_repository_keys(&targets);
-        let has_blockers = !ticket.relations.blockers.is_empty();
         let mut assignment_diagnostics = Vec::new();
         if let Some(legacy_assignee) = ticket
             .meta
@@ -821,25 +892,20 @@ impl SqliteWorkspaceAuthority {
         }
         let action_blockers = Vec::new();
         let action_eligibility = TicketActionEligibility {
-            can_assign_orchestrator: matches!(
-                ticket.meta.workflow_state,
-                TicketWorkflowState::Planning | TicketWorkflowState::Ready
-            ) && !has_orchestrator
-                && !has_worker,
-            can_unassign_orchestrator: has_orchestrator
-                && matches!(
-                    ticket.meta.workflow_state,
-                    TicketWorkflowState::Planning | TicketWorkflowState::Ready
-                ),
-            can_queue: true,
-            can_start_manual_worker: matches!(
-                ticket.meta.workflow_state,
-                TicketWorkflowState::Planning
-                    | TicketWorkflowState::Ready
-                    | TicketWorkflowState::Queued
-                    | TicketWorkflowState::InProgress
-            ) && !has_worker
-                && !has_blockers,
+            // Case openness is not readiness. These are explicit operations;
+            // occupancy remains an independent resource constraint.
+            // Delegation neither occupies nor transfers existing Worker work.
+            // Start eligibility below separately retains unfinished-work guards.
+            // A fresh operation explicitly delegates/reissues even to the same
+            // principal. Expected-assignment CAS (when supplied) and source
+            // authority are checked by the mutation, not by Ticket phase.
+            can_assign_orchestrator: true,
+            can_unassign_orchestrator: has_orchestrator,
+            can_queue: ticket.meta.workflow_state == TicketState::Open,
+            // Unfinished dependencies remain relation diagnostics, not a blanket
+            // start refusal. Backend start/assign still validates authorization,
+            // resource grants, reservations and actual unfinished work.
+            can_start_manual_worker: ticket.meta.workflow_state == TicketState::Open && !has_worker,
             queue_tickets: dependency_check.queue_tickets.clone(),
             blockers: action_blockers,
         };
@@ -926,20 +992,29 @@ impl SqliteWorkspaceAuthority {
                 &blocker.blocking_ticket,
             )?;
         }
+        let assignment_tracking = self
+            .store
+            .list_current_ticket_assignment_tracking(&self.workspace_id, &ticket.meta.id)?;
         Ok(TicketDetail {
+            assignment_tracking,
             id: ticket.meta.id,
             resource_key,
             title: ticket.meta.title,
-            state: ticket.meta.workflow_state.as_str().to_string(),
+            state: ticket.meta.workflow_state.into(),
             readiness: ticket.meta.readiness,
             priority: ticket.meta.priority,
             created_at: ticket.meta.created_at,
             updated_at: ticket.meta.updated_at,
             content_digest,
+            closure_operation_key: ticket.closure_operation_key.clone(),
+            current_closure: ticket.current_closure.clone(),
+            closure_history: ticket.case_history.clone(),
+            legacy_handoff: ticket.legacy_workflow_snapshot.clone(),
             queued_by: ticket.meta.queued_by,
             queued_at: ticket.meta.queued_at,
             targets,
             risk_flags: ticket.meta.risk_flags,
+            tags: ticket.tags,
             body,
             body_truncated,
             event_count: ticket.events.len(),
@@ -977,6 +1052,44 @@ impl SqliteWorkspaceAuthority {
     }
 }
 
+impl SqliteWorkspaceAuthority {
+    /// Bounded list projection: read only one immutable closure record and the
+    /// migration handoff, never the full body or event history for every row.
+    fn populate_ticket_summary_case_fields(&self, summary: &mut TicketSummary) -> Result<()> {
+        self.store.with_conn(|conn| {
+            summary.closure_operation_key = conn.query_row(
+                "SELECT closure_operation_key FROM typed_ticket_case_metadata WHERE workspace_id=?1 AND ticket_id=?2",
+                params![self.workspace_id, summary.id], |row| row.get(0)
+            ).optional()?.flatten();
+            if summary.state == server_api::BrowserTicketState::Closed {
+                if let Some(key) = &summary.closure_operation_key {
+                    let json: Option<String> = conn.query_row(
+                        "SELECT judgment_json FROM typed_ticket_case_history WHERE workspace_id=?1 AND ticket_id=?2 AND operation_key=?3",
+                        params![self.workspace_id, summary.id, key], |row| row.get(0)
+                    ).optional()?;
+                    if let Some(json) = json {
+                        let entry: ticket::TicketCaseHistoryEntry = serde_json::from_str(&json).map_err(|e| Error::Store(e.to_string()))?;
+                        let reason = match entry.action {
+                            ticket::TicketCaseAction::Close { reason } | ticket::TicketCaseAction::CorrectClosure { reason } => reason,
+                            ticket::TicketCaseAction::Reopen => return Err(Error::Store("Closure key names a reopen receipt".into())),
+                        };
+                        summary.current_closure = Some(ticket::TicketClosureJudgment {
+                            operation_key: entry.operation_key, reason, explanation: entry.explanation,
+                            references: entry.references, author: entry.author, at: entry.at,
+                        });
+                    }
+                }
+            }
+            let snapshot: Option<String> = conn.query_row(
+                "SELECT snapshot_json FROM typed_ticket_legacy_workflow_snapshot WHERE workspace_id=?1 AND ticket_id=?2",
+                params![self.workspace_id, summary.id], |row| row.get(0)
+            ).optional()?;
+            summary.legacy_handoff = snapshot.map(|json| serde_json::from_str(&json).map_err(|e| Error::Store(e.to_string()))).transpose()?;
+            Ok(())
+        })
+    }
+}
+
 impl TicketAuthority for SqliteWorkspaceAuthority {
     fn list_tickets(&self, limit: usize) -> Result<ProjectRecordList<TicketSummary>> {
         let projection = self.ticket_backend.list_workspace_projection(limit)?;
@@ -984,24 +1097,9 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
             .items
             .into_iter()
             .map(|item| {
-                let projection =
-                    project_ticket_workspace_item(&item.summary, &item.relation_blockers, None);
-                let resource_key = item.summary.resource_key.clone().ok_or_else(|| {
-                    Error::Store(format!("missing resource key for {}", item.summary.id))
-                })?;
-                Ok::<_, Error>(TicketSummary {
-                    resource_key,
-                    id: item.summary.id,
-                    title: item.summary.title,
-                    state: item.summary.workflow_state.as_str().to_string(),
-                    priority: item.summary.priority,
-                    updated_at: item.summary.updated_at,
-                    queued_by: item.summary.queued_by,
-                    queued_at: item.summary.queued_at,
-                    workspace_action_priority: workspace_action_priority_name(projection.priority)
-                        .to_string(),
-                    record_source: "sqlite_yoi_ticket".to_string(),
-                })
+                let mut summary = ticket_summary_from_sqlite_item(item)?;
+                self.populate_ticket_summary_case_fields(&mut summary)?;
+                Ok(summary)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(ProjectRecordList {
@@ -1019,7 +1117,7 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
         let parsed_states = states
             .iter()
             .map(|state| {
-                TicketWorkflowState::parse(state).ok_or_else(|| {
+                TicketState::parse(state).ok_or_else(|| {
                     Error::InvalidRecordId(format!("unsupported ticket state `{state}`"))
                 })
             })
@@ -1043,7 +1141,11 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
         let items = page
             .items
             .into_iter()
-            .map(ticket_summary_from_sqlite_item)
+            .map(|item| {
+                let mut summary = ticket_summary_from_sqlite_item(item)?;
+                self.populate_ticket_summary_case_fields(&mut summary)?;
+                Ok(summary)
+            })
             .collect::<Result<Vec<_>>>()?;
         let next_cursor = page
             .next
@@ -1087,6 +1189,7 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
             let summary = ticket_summary_from_ticket(&authoritative)?;
             let authoritative_body = authoritative.document.body.clone();
             let authoritative_events = authoritative.events.clone();
+            let authoritative_case_history = authoritative.case_history.clone();
             let detail = self.ticket_detail_from_ticket(
                 authoritative,
                 TicketShowRequest {
@@ -1100,6 +1203,7 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
                 &detail,
                 authoritative_body.as_str(),
                 &authoritative_events,
+                &authoritative_case_history,
                 &query,
             );
             let item = ticket_query_item(
@@ -1107,6 +1211,7 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
                 &detail,
                 authoritative_body.as_str(),
                 &authoritative_events,
+                &authoritative_case_history,
                 &query,
             );
             last_scanned_cursor = Some(make_ticket_cursor(&item, sort, &fingerprint));
@@ -1959,11 +2064,38 @@ fn ticket_evidence_summary(
 }
 
 fn validate_ticket_query(query: &TicketQueryRequest) -> Result<()> {
-    for state in &query.states {
-        if ticket::TicketWorkflowState::parse(state).is_none() {
-            return Err(Error::InvalidRecordId(format!(
-                "unsupported Ticket workflow state `{state}`"
-            )));
+    if let Some(ticket::TicketClosureReason::Other(text)) = &query.closure_reason
+        && (text.trim().is_empty() || text.len() > 1024 || text.contains('\0'))
+    {
+        return Err(Error::InvalidInput(
+            "Closure reason Other must be nonblank and at most 1024 bytes without NUL".into(),
+        ));
+    }
+    if let Some(principal) = &query.assigned_principal {
+        let ids: Vec<&str> = match principal {
+            ticket::TicketAssignmentPrincipalSnapshot::User { account_id } => vec![account_id],
+            ticket::TicketAssignmentPrincipalSnapshot::WorkspaceAgent { agent_key } => {
+                vec![agent_key]
+            }
+            ticket::TicketAssignmentPrincipalSnapshot::Worker {
+                runtime_id,
+                worker_id,
+            } => vec![runtime_id, worker_id],
+        };
+        if ids
+            .iter()
+            .any(|id| id.trim().is_empty() || id.len() > 1024 || id.chars().any(char::is_control))
+        {
+            return Err(Error::InvalidInput(
+                "Assigned principal requires bounded stable identities".into(),
+            ));
+        }
+    }
+    for ids in [&query.tag_ids, &query.tag_ids_any, &query.tag_ids_none] {
+        if ids.len() > 100 || ids.iter().any(|id| id.is_empty() || id.len() > 128) {
+            return Err(Error::InvalidInput(
+                "tag filters require at most 100 nonempty stable IDs of at most 128 bytes".into(),
+            ));
         }
     }
     for evidence in &query.evidence {
@@ -1973,25 +2105,6 @@ fn validate_ticket_query(query: &TicketQueryRequest) -> Result<()> {
         ) {
             return Err(Error::InvalidRecordId(format!(
                 "unsupported Ticket evidence filter `{evidence}`"
-            )));
-        }
-    }
-    for attention in &query.attention {
-        if !matches!(
-            attention.as_str(),
-            "done_not_closed"
-                | "unresolved_review"
-                | "missing_commit"
-                | "blocked"
-                | "unblocked"
-                | "ready"
-                | "awaiting_review"
-                | "unresolved_changes"
-                | "stale_after_rescope"
-                | "missing_evidence"
-        ) {
-            return Err(Error::InvalidRecordId(format!(
-                "unsupported Ticket attention filter `{attention}`"
             )));
         }
     }
@@ -2139,19 +2252,17 @@ fn ticket_evidence_matches(evidence: &TicketEvidenceSummary, filter: &str) -> bo
 }
 
 fn ticket_attention_matches(
-    state: &str,
+    _state: &str,
     evidence: &TicketEvidenceSummary,
     is_blocked: bool,
     authoritative_events: &[TicketEvent],
     attention: &str,
 ) -> bool {
     match attention {
-        "done_not_closed" => state == "done",
         "unresolved_review" => evidence.unresolved_request_changes,
         "missing_commit" => !evidence.has_commit,
         "blocked" => is_blocked,
         "unblocked" => !is_blocked,
-        "ready" => state == "ready" && !is_blocked,
         "awaiting_review" => {
             evidence.has_review_request && evidence.review_status.as_deref() == Some("pending")
         }
@@ -2168,14 +2279,42 @@ fn ticket_attention_matches(
     }
 }
 
+fn closure_reason_text(action: &ticket::TicketCaseAction) -> Option<String> {
+    let reason = match action {
+        ticket::TicketCaseAction::Close { reason }
+        | ticket::TicketCaseAction::CorrectClosure { reason } => reason,
+        ticket::TicketCaseAction::Reopen => return None,
+    };
+    Some(match reason {
+        ticket::TicketClosureReason::Completed => "completed".into(),
+        ticket::TicketClosureReason::NotPlanned => "not_planned".into(),
+        ticket::TicketClosureReason::Duplicate => "duplicate".into(),
+        ticket::TicketClosureReason::Unknown => "unknown".into(),
+        ticket::TicketClosureReason::Other(text) => format!("other {text}"),
+    })
+}
+
 fn ticket_matches_query(
     summary: &TicketSummary,
     detail: &TicketDetail,
     authoritative_body: &str,
     authoritative_events: &[TicketEvent],
+    authoritative_case_history: &[ticket::TicketCaseHistoryEntry],
     query: &TicketQueryRequest,
 ) -> bool {
-    if !query.states.is_empty() && !query.states.iter().any(|state| state == &summary.state) {
+    let has_tag = |id: &String| detail.tags.iter().any(|tag| &tag.id == id);
+    if !query.tag_ids.iter().all(has_tag)
+        || (!query.tag_ids_any.is_empty() && !query.tag_ids_any.iter().any(has_tag))
+        || query.tag_ids_none.iter().any(has_tag)
+    {
+        return false;
+    }
+    if !query.states.is_empty()
+        && !query
+            .states
+            .iter()
+            .any(|state| server_api::BrowserTicketState::from(*state) == summary.state)
+    {
         return false;
     }
     if query
@@ -2223,11 +2362,11 @@ fn ticket_matches_query(
     }
     if !query.attention.iter().all(|attention| {
         ticket_attention_matches(
-            &summary.state,
+            summary.state.as_str(),
             &detail.evidence,
             !detail.relations.blockers.is_empty(),
             authoritative_events,
-            attention,
+            attention.as_str(),
         )
     }) {
         return false;
@@ -2286,7 +2425,10 @@ fn ticket_matches_query(
     }
     query.query.as_ref().is_none_or(|text| {
         let needle = text.to_lowercase();
-        summary.title.to_lowercase().contains(&needle)
+        authoritative_case_history.iter().any(|entry| {
+            closure_reason_text(&entry.action)
+                .is_some_and(|reason| reason.to_lowercase().contains(&needle))
+        }) || summary.title.to_lowercase().contains(&needle)
             || authoritative_body.to_lowercase().contains(&needle)
             || authoritative_events
                 .iter()
@@ -2299,6 +2441,7 @@ fn ticket_query_item(
     detail: &TicketDetail,
     authoritative_body: &str,
     authoritative_events: &[TicketEvent],
+    authoritative_case_history: &[ticket::TicketCaseHistoryEntry],
     query: &TicketQueryRequest,
 ) -> TicketQueryItem {
     let mut matched_fields = Vec::new();
@@ -2306,6 +2449,14 @@ fn ticket_query_item(
     let mut matching_event = None;
     if let Some(text) = query.query.as_ref() {
         let needle = text.to_lowercase();
+        if let Some(reason) = authoritative_case_history
+            .iter()
+            .filter_map(|entry| closure_reason_text(&entry.action))
+            .find(|reason| reason.to_lowercase().contains(&needle))
+        {
+            matched_fields.push("closure_reason".into());
+            snippet = Some(reason);
+        }
         if summary.title.to_lowercase().contains(&needle) {
             matched_fields.push("title".to_string());
             snippet = Some(summary.title.clone());
@@ -2328,15 +2479,20 @@ fn ticket_query_item(
         }
     }
     TicketQueryItem {
+        assignment_tracking: detail.assignment_tracking.clone(),
         id: summary.id,
         resource_key: summary.resource_key,
         title: summary.title,
         state: summary.state,
         readiness: detail.readiness.clone(),
+        tags: detail.tags.clone(),
         priority: summary.priority,
         created_at: detail.created_at.clone(),
         updated_at: summary.updated_at,
         content_digest: detail.content_digest.clone(),
+        closure_operation_key: detail.closure_operation_key.clone(),
+        current_closure: detail.current_closure.clone(),
+        legacy_handoff: detail.legacy_handoff.clone(),
         workspace_action_priority: summary.workspace_action_priority,
         matched_fields,
         snippet: snippet.map(|value| truncate_body(&value, 512).0),
@@ -2689,6 +2845,7 @@ fn ticket_summary_from_ticket(ticket: &ticket::Ticket) -> Result<TicketSummary> 
         kind: ticket.meta.kind.clone(),
         priority: ticket.meta.priority.clone(),
         labels: ticket.meta.labels.clone(),
+        tags: ticket.tags.clone(),
         readiness: ticket.meta.readiness.clone(),
         workflow_state: ticket.meta.workflow_state,
         workflow_state_explicit: ticket.meta.workflow_state_explicit,
@@ -2696,10 +2853,14 @@ fn ticket_summary_from_ticket(ticket: &ticket::Ticket) -> Result<TicketSummary> 
         queued_at: ticket.meta.queued_at.clone(),
         updated_at: ticket.meta.updated_at.clone(),
     };
-    ticket_summary_from_sqlite_item(SqliteTicketListItem {
+    let mut summary = ticket_summary_from_sqlite_item(SqliteTicketListItem {
         summary,
         relation_blockers: ticket.relations.blockers.clone(),
-    })
+    })?;
+    summary.closure_operation_key = ticket.closure_operation_key.clone();
+    summary.current_closure = ticket.current_closure.clone();
+    summary.legacy_handoff = ticket.legacy_workflow_snapshot.clone();
+    Ok(summary)
 }
 
 fn ticket_summary_from_sqlite_item(item: SqliteTicketListItem) -> Result<TicketSummary> {
@@ -2713,13 +2874,17 @@ fn ticket_summary_from_sqlite_item(item: SqliteTicketListItem) -> Result<TicketS
         resource_key,
         id: item.summary.id,
         title: item.summary.title,
-        state: item.summary.workflow_state.as_str().to_string(),
+        state: item.summary.workflow_state.into(),
         priority: item.summary.priority,
         updated_at: item.summary.updated_at,
+        tags: item.summary.tags,
         queued_by: item.summary.queued_by,
         queued_at: item.summary.queued_at,
         workspace_action_priority: workspace_action_priority_name(projection.priority).to_string(),
         record_source: "sqlite_yoi_ticket".to_string(),
+        closure_operation_key: None,
+        current_closure: None,
+        legacy_handoff: None,
     })
 }
 
@@ -3199,10 +3364,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unfinished_dependencies_remain_diagnostic_without_disabling_manual_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.db");
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "w".into(),
+                owner_account_id: "owner-account".into(),
+                display_name: "W".into(),
+                state: "active".into(),
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            })
+            .await
+            .unwrap();
+        let backend = SqliteTicketBackend::open_verified(&path, "w").unwrap();
+        let dependent = backend
+            .create(ticket::NewTicket::new(
+                "Partial investigation without resources",
+            ))
+            .unwrap();
+        let prerequisite = backend
+            .create(ticket::NewTicket::new("Unfinished prerequisite"))
+            .unwrap();
+        backend
+            .add_ticket_relation(
+                dependent.id.clone().into(),
+                ticket::NewTicketRelation {
+                    kind: ticket::TicketRelationKind::DependsOn,
+                    target: prerequisite.id.clone(),
+                    note: Some("Partial work can proceed".into()),
+                    author: Some("owner-account".into()),
+                },
+            )
+            .unwrap();
+        let authority = SqliteWorkspaceAuthority::new(&path, "w").unwrap();
+        let detail = authority.ticket(&dependent.id).unwrap();
+        assert!(detail.targets.is_empty());
+        assert!(detail.action_eligibility.can_start_manual_worker);
+        assert!(detail.action_eligibility.blockers.is_empty());
+        assert_eq!(detail.relations.blockers.len(), 1);
+        assert_eq!(
+            detail.relations.blockers[0].blocking_ticket,
+            prerequisite.id
+        );
+        assert_eq!(detail.relations.outgoing[0].kind, "depends_on");
+        let blocked = authority
+            .query_tickets(TicketQueryRequest {
+                attention: vec![server_api::TicketAttention::Blocked],
+                ..TicketQueryRequest::default()
+            })
+            .unwrap();
+        assert_eq!(blocked.items.len(), 1);
+        assert_eq!(blocked.items[0].id, dependent.id);
+        assert_eq!(blocked.items[0].unresolved_blocker_count, 1);
+        let prerequisite_detail = authority.ticket(&prerequisite.id).unwrap();
+        assert!(prerequisite_detail.assignments.is_empty());
+        assert_eq!(prerequisite_detail.state.as_str(), "open");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE typed_tickets SET workflow_state='closed' WHERE ticket_id=?1",
+                [&dependent.id],
+            )
+            .unwrap();
+        assert!(
+            !authority
+                .ticket(&dependent.id)
+                .unwrap()
+                .action_eligibility
+                .can_start_manual_worker
+        );
+    }
+
+    #[tokio::test]
     async fn manual_worker_eligibility_accepts_explicit_states_without_reviving_released_work() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("workspace.db");
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "w".into(),
@@ -3236,14 +3476,7 @@ mod tests {
             .create(ticket::NewTicket::new("Explicit work"))
             .unwrap();
         let authority = SqliteWorkspaceAuthority::new(&path, "w").unwrap();
-        for (state, allowed) in [
-            ("planning", true),
-            ("ready", true),
-            ("queued", true),
-            ("inprogress", true),
-            ("done", false),
-            ("closed", false),
-        ] {
+        for (state, allowed) in [("open", true), ("closed", false)] {
             conn.execute(
                 "UPDATE typed_tickets SET workflow_state=?1 WHERE ticket_id=?2",
                 rusqlite::params![state, ticket.id],
@@ -3260,7 +3493,7 @@ mod tests {
             );
         }
         conn.execute(
-            "UPDATE typed_tickets SET workflow_state='planning' WHERE ticket_id=?1",
+            "UPDATE typed_tickets SET workflow_state='open' WHERE ticket_id=?1",
             [&ticket.id],
         )
         .unwrap();
@@ -3316,7 +3549,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "UPDATE typed_tickets SET workflow_state='planning' WHERE ticket_id=?1",
+            "UPDATE typed_tickets SET workflow_state='open' WHERE ticket_id=?1",
             [&ticket.id],
         )
         .unwrap();
@@ -3342,7 +3575,7 @@ mod tests {
         write_ticket(dir.path(), "00000000001J5", "Second ticket", "queued");
         write_ticket(dir.path(), "00000000001J6", "Third ticket", "planning");
         let db_path = dir.path().join("workspace.db");
-        let store = SqliteWorkspaceStore::open(&db_path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&db_path).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-test".to_string(),
@@ -3367,11 +3600,11 @@ INSERT INTO typed_tickets (
 ) VALUES
     ('workspace-test', '00000000001J2', '00000000001J2', 'Read bridge', 'open', 'ticket', 'P2',
      'Ticket body. Deep Ticket marker. This body is intentionally long enough for bounded projection tests.',
-     '2026-01-01T00:00:00Z', '2026-01-03T00:00:00Z', 'ready', 1),
+     '2026-01-01T00:00:00Z', '2026-01-03T00:00:00Z', 'open', 1),
     ('workspace-test', '00000000001J5', '00000000001J5', 'Second ticket', 'open', 'ticket', 'P2',
-     'Ticket body', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', 'queued', 1),
+     'Ticket body', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', 'open', 1),
     ('workspace-test', '00000000001J6', '00000000001J6', 'Third ticket', 'open', 'ticket', 'P2',
-     'Ticket body', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'planning', 1);
+     'Ticket body', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'open', 1);
 
 INSERT INTO typed_ticket_events (
     workspace_id, ticket_id, event_index, kind, author, at, heading, body
@@ -3510,11 +3743,8 @@ VALUES ('workspace-test', 'ticket', 4);
         assert_eq!(tickets.record_authority, "workspace-sqlite");
         assert_eq!(tickets.items[0].record_source, "sqlite_yoi_ticket");
         assert_eq!(tickets.items[0].id, "00000000001J2");
-        assert_eq!(tickets.items[0].state, "ready");
-        assert_eq!(
-            tickets.items[0].workspace_action_priority,
-            "ready_for_queue"
-        );
+        assert_eq!(tickets.items[0].state.as_str(), "open");
+        assert_eq!(tickets.items[0].workspace_action_priority, "background");
         let ticket_by_key = authority.ticket(&tickets.items[0].resource_key).unwrap();
         assert_eq!(ticket_by_key.id, tickets.items[0].id);
 
@@ -3530,9 +3760,9 @@ VALUES ('workspace-test', 'ticket', 4);
         let ticket_query = authority
             .query_tickets(TicketQueryRequest {
                 query: Some("Deep Ticket marker".to_string()),
-                states: vec!["ready".to_string()],
+                states: vec![ticket::TicketState::Open],
                 linked_objective_id: Some("00000000001J3".to_string()),
-                attention: vec!["missing_commit".to_string()],
+                attention: vec![server_api::TicketAttention::MissingCommit],
                 limit: Some(1),
                 ..TicketQueryRequest::default()
             })
@@ -3631,7 +3861,7 @@ VALUES ('workspace-test', 'ticket', 4);
         assert_eq!(incoming_relation.items[0].id, "00000000001J5");
         let summary_page = authority
             .list_ticket_page(TicketListProjectionRequest {
-                states: vec!["planning".to_string(), "ready".to_string()],
+                states: vec!["open".to_string()],
                 limit: Some(1),
                 cursor: None,
             })
@@ -3639,7 +3869,7 @@ VALUES ('workspace-test', 'ticket', 4);
         assert_eq!(summary_page.items.len(), 1);
         assert!(summary_page.page.has_more);
         let mismatched_summary_cursor = authority.list_ticket_page(TicketListProjectionRequest {
-            states: vec!["done".to_string()],
+            states: vec!["closed".to_string()],
             limit: Some(1),
             cursor: summary_page.page.next_cursor,
         });
@@ -3708,7 +3938,7 @@ VALUES ('workspace-test', 'ticket', 4);
         let objective = authority.objective("00000000001J3").unwrap();
         assert!(objective.body.contains("Objective body"));
         assert_eq!(objective.linked_ticket_summaries[0].id, "00000000001J2");
-        assert_eq!(objective.linked_ticket_summaries[0].state, "ready");
+        assert_eq!(objective.linked_ticket_summaries[0].state, "open");
         let linked_ticket_key = objective.linked_ticket_summaries[0].resource_key.clone();
         let objective_query = authority
             .query_objectives(ObjectiveQueryRequest {
@@ -3777,7 +4007,7 @@ VALUES ('workspace-test', 'ticket', 4);
     async fn objective_mutations_write_sqlite_records_and_audit_events() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("workspace.db");
-        let store = SqliteWorkspaceStore::open(&db_path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&db_path).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-test".to_string(),
@@ -3797,8 +4027,8 @@ INSERT INTO typed_tickets (
     workspace_id, ticket_id, slug, title, status, kind, priority, body,
     workflow_state, workflow_state_explicit
 ) VALUES
-    ('workspace-test', '00000000001J2', 'ticket-j2', 'Ticket J2', 'open', 'task', 'normal', '', 'planning', 1),
-    ('workspace-test', '00000000001J3', 'ticket-j3', 'Ticket J3', 'open', 'task', 'normal', '', 'planning', 1);
+    ('workspace-test', '00000000001J2', 'ticket-j2', 'Ticket J2', 'open', 'task', 'normal', '', 'open', 1),
+    ('workspace-test', '00000000001J3', 'ticket-j3', 'Ticket J3', 'open', 'task', 'normal', '', 'open', 1);
 INSERT INTO workspace_resource_keys (
     workspace_id, resource_kind, resource_id, sequence, resource_key, allocated_at
 ) VALUES

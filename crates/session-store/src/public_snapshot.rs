@@ -1888,7 +1888,8 @@ fn provenance(origin: &LoggedSessionHistoryOrigin) -> SessionEntryProvenance {
         }
         LoggedSessionHistoryOrigin::ModelOutput { .. } => SessionEntryProvenance::ModelOutput,
         LoggedSessionHistoryOrigin::ToolOutput { .. } => SessionEntryProvenance::ToolOutput,
-        LoggedSessionHistoryOrigin::DerivedSummary => SessionEntryProvenance::DerivedSummary,
+        LoggedSessionHistoryOrigin::CompactionSummary
+        | LoggedSessionHistoryOrigin::DerivedSummary => SessionEntryProvenance::DerivedSummary,
         LoggedSessionHistoryOrigin::LegacyUnknown => SessionEntryProvenance::LegacyUnknown,
     }
 }
@@ -2559,6 +2560,12 @@ mod tests {
                 user_message(10),
                 assistant_message(10, "final"),
                 synthetic_compaction_input,
+                history_message(
+                    "host-summary",
+                    LoggedRole::System,
+                    "[Compacted context summary]\n\nprivate inherited context",
+                    LoggedSessionHistoryOrigin::CompactionSummary,
+                ),
             ],
             None,
             Some(SegmentOrigin {

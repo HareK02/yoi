@@ -69,6 +69,12 @@
         },
         "type": "array"
       },
+      "Array_of_TicketAssignmentTrackingProjection": {
+        "items": {
+          "$ref": "#/components/schemas/TicketAssignmentTrackingProjection"
+        },
+        "type": "array"
+      },
       "Array_of_TicketRelation": {
         "items": {
           "$ref": "#/components/schemas/TicketRelation"
@@ -78,6 +84,12 @@
       "Array_of_TicketSummary": {
         "items": {
           "$ref": "#/components/schemas/TicketSummary"
+        },
+        "type": "array"
+      },
+      "Array_of_WorkspaceTag": {
+        "items": {
+          "$ref": "#/components/schemas/WorkspaceTag"
         },
         "type": "array"
       },
@@ -298,30 +310,6 @@
         ],
         "type": "object"
       },
-      "BrowserCloseTicketRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "expected_content_digest": {
-            "type": "string"
-          },
-          "expected_state": {
-            "$ref": "#/components/schemas/BrowserTicketWorkflowState"
-          },
-          "operation_key": {
-            "type": "string"
-          },
-          "resolution": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "operation_key",
-          "expected_content_digest",
-          "expected_state",
-          "resolution"
-        ],
-        "type": "object"
-      },
       "BrowserCreateWorkerResponse": {
         "additionalProperties": false,
         "properties": {
@@ -411,6 +399,13 @@
         "additionalProperties": false,
         "type": "object"
       },
+      "BrowserTicketState": {
+        "enum": [
+          "open",
+          "closed"
+        ],
+        "type": "string"
+      },
       "BrowserTicketTargetEdit": {
         "oneOf": [
           {
@@ -456,51 +451,6 @@
           "implementation_report"
         ],
         "type": "string"
-      },
-      "BrowserTicketWorkflowState": {
-        "enum": [
-          "planning",
-          "ready",
-          "queued",
-          "inprogress",
-          "done",
-          "closed"
-        ],
-        "type": "string"
-      },
-      "BrowserTransitionTicketStateRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "body": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "expected_content_digest": {
-            "type": "string"
-          },
-          "expected_state": {
-            "$ref": "#/components/schemas/BrowserTicketWorkflowState"
-          },
-          "operation_key": {
-            "type": "string"
-          },
-          "reason": {
-            "type": "string"
-          },
-          "state": {
-            "$ref": "#/components/schemas/BrowserTicketWorkflowState"
-          }
-        },
-        "required": [
-          "state",
-          "operation_key",
-          "expected_content_digest",
-          "expected_state",
-          "reason"
-        ],
-        "type": "object"
       },
       "BrowserWorkerWorkingDirectorySelection": {
         "additionalProperties": false,
@@ -1091,37 +1041,6 @@
         ],
         "type": "object"
       },
-      "CompleteTicketRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "expected_content_digest": {
-            "type": "string"
-          },
-          "expected_state": {
-            "$ref": "#/components/schemas/TicketWorkflowState"
-          },
-          "operation_key": {
-            "type": "string"
-          },
-          "reason": {
-            "type": "string"
-          },
-          "references": {
-            "default": [],
-            "items": {
-              "$ref": "#/components/schemas/TicketReference"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "operation_key",
-          "expected_content_digest",
-          "expected_state",
-          "reason"
-        ],
-        "type": "object"
-      },
       "CompletionContext": {
         "properties": {
           "argument": {
@@ -1686,6 +1605,13 @@
         "properties": {
           "operation_id": {
             "type": "string"
+          },
+          "orchestrator_assignment_id": {
+            "description": "Observed delegation required for Orchestrator Ticket starts; manual starts omit it.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "ticket_id": {
             "type": "string"
@@ -5633,7 +5559,7 @@
           "workflow_state": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/TicketWorkflowState"
+                "$ref": "#/components/schemas/TicketState"
               },
               {
                 "type": "null"
@@ -9034,6 +8960,13 @@
           "operation_id": {
             "type": "string"
           },
+          "orchestrator_assignment_id": {
+            "description": "Observed delegation required for Orchestrator Ticket starts; manual starts omit it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ticket_id": {
             "type": "string"
           }
@@ -9384,6 +9317,13 @@
           },
           "operation_id": {
             "type": "string"
+          },
+          "orchestrator_assignment_id": {
+            "description": "Observed delegation required for Orchestrator Ticket starts; manual starts omit it.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "principal": {
             "$ref": "#/components/schemas/TicketAssignmentPrincipal"
@@ -10512,6 +10452,27 @@
         ],
         "type": "string"
       },
+      "TagListRequest": {
+        "description": "Active tags in ascending ID order, strictly after `after`; default/max 200.\nLarger limits are clamped to 200; zero returns an empty page.",
+        "properties": {
+          "after": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "uint",
+            "maximum": 200,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "Ticket": {
         "properties": {
           "artifacts": {
@@ -10519,6 +10480,29 @@
               "$ref": "#/components/schemas/TicketArtifactRef"
             },
             "type": "array"
+          },
+          "case_history": {
+            "items": {
+              "$ref": "#/components/schemas/TicketCaseHistoryEntry"
+            },
+            "type": "array"
+          },
+          "closure_operation_key": {
+            "description": "Last closure/correction operation key; retained when reopened (ABA guard).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current_closure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketClosureJudgment"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "document": {
             "$ref": "#/components/schemas/TicketDocument"
@@ -10528,6 +10512,16 @@
               "$ref": "#/components/schemas/TicketEvent"
             },
             "type": "array"
+          },
+          "legacy_workflow_snapshot": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketLegacyWorkflowSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "meta": {
             "$ref": "#/components/schemas/TicketMeta"
@@ -10544,6 +10538,13 @@
                 "type": "null"
               }
             ]
+          },
+          "tags": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceTag"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -10551,7 +10552,8 @@
           "document",
           "events",
           "artifacts",
-          "relations"
+          "relations",
+          "case_history"
         ],
         "type": "object"
       },
@@ -10602,6 +10604,171 @@
         },
         "required": [
           "relative_path"
+        ],
+        "type": "object"
+      },
+      "TicketAssignmentAnswer": {
+        "additionalProperties": false,
+        "properties": {
+          "assignment_id": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          },
+          "expected_last_event_id": {
+            "type": "string"
+          },
+          "operation_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "assignment_id",
+          "expected_last_event_id",
+          "operation_key",
+          "body"
+        ],
+        "type": "object"
+      },
+      "TicketAssignmentAnswerReceipt": {
+        "properties": {
+          "assignment_id": {
+            "type": "string"
+          },
+          "event_index": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "input_event_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "assignment_id",
+          "input_event_id",
+          "event_index"
+        ],
+        "type": "object"
+      },
+      "TicketAssignmentDiagnosticsPage": {
+        "properties": {
+          "actionable": {
+            "description": "Noncurrent/done/closed/released records are history, not pending work.",
+            "type": "boolean"
+          },
+          "assignment_id": {
+            "type": "string"
+          },
+          "current": {
+            "type": "boolean"
+          },
+          "input_origin_known": {
+            "type": "boolean"
+          },
+          "inputs": {
+            "items": {
+              "$ref": "#/components/schemas/TicketAssignmentInputDiagnostic"
+            },
+            "type": "array"
+          },
+          "next_input_event_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_start_operation_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "starts": {
+            "description": "Assignment-scoped admission evidence; not attributed to individual input.",
+            "items": {
+              "$ref": "#/components/schemas/TicketAssignmentStartDiagnostic"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "assignment_id",
+          "current",
+          "input_origin_known",
+          "actionable",
+          "inputs",
+          "starts"
+        ],
+        "type": "object"
+      },
+      "TicketAssignmentDiagnosticsQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "after_input_event_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "after_start_operation_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "assignment_id": {
+            "type": "string"
+          },
+          "limit": {
+            "format": "uint",
+            "maximum": 100,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "assignment_id"
+        ],
+        "type": "object"
+      },
+      "TicketAssignmentInputDeliveryState": {
+        "enum": [
+          "not_reserved",
+          "reserved",
+          "request_persisted",
+          "runtime_accepted"
+        ],
+        "type": "string"
+      },
+      "TicketAssignmentInputDiagnostic": {
+        "properties": {
+          "acceptance_outcome_unknown": {
+            "description": "Absence of a Runtime ack is not proof of failed external delivery.",
+            "type": "boolean"
+          },
+          "delivery_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "input_event_id": {
+            "type": "string"
+          },
+          "notification": {
+            "$ref": "#/components/schemas/TicketAssignmentInputDeliveryState"
+          }
+        },
+        "required": [
+          "input_event_id",
+          "notification",
+          "acceptance_outcome_unknown"
         ],
         "type": "object"
       },
@@ -10664,6 +10831,122 @@
           }
         ]
       },
+      "TicketAssignmentPrincipalSnapshot": {
+        "description": "Immutable principal as stored at Assign, not live Worker availability.",
+        "oneOf": [
+          {
+            "properties": {
+              "account_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "user",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "account_id"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "worker",
+                "type": "string"
+              },
+              "runtime_id": {
+                "type": "string"
+              },
+              "worker_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "runtime_id",
+              "worker_id"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "agent_key": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "workspace_agent",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "agent_key"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "TicketAssignmentRelease": {
+        "description": "Release is an independent immutable assignment audit event. Last tracking\nremains unchanged, including unknown legacy tracking; it is never made done.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/TicketAssignmentReleaseAction"
+          },
+          "actor": {
+            "type": "string"
+          },
+          "at": {
+            "type": "string"
+          },
+          "event_id": {
+            "type": "string"
+          },
+          "last_tracking": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketAssignmentTracking"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "operation_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replacement_assignment_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action",
+          "event_id",
+          "actor",
+          "at"
+        ],
+        "type": "object"
+      },
+      "TicketAssignmentReleaseAction": {
+        "enum": [
+          "unassigned",
+          "replaced"
+        ],
+        "type": "string"
+      },
       "TicketAssignmentRole": {
         "enum": [
           "orchestrator",
@@ -10672,6 +10955,45 @@
           "contributor"
         ],
         "type": "string"
+      },
+      "TicketAssignmentStartDiagnostic": {
+        "properties": {
+          "actual_processing_unknown": {
+            "description": "Existing records do not attest that a model processed a particular input.",
+            "type": "boolean"
+          },
+          "assignment_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "claim_state": {
+            "description": "Durable start/assignment reservation result, not Worker liveness.",
+            "type": "string"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "runtime_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "worker_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "operation_id",
+          "claim_state",
+          "actual_processing_unknown"
+        ],
+        "type": "object"
       },
       "TicketAssignmentSummary": {
         "additionalProperties": false,
@@ -10699,6 +11021,294 @@
         ],
         "type": "object"
       },
+      "TicketAssignmentTracking": {
+        "additionalProperties": false,
+        "properties": {
+          "next_action": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "progress": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "result": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/TicketAssignmentTrackingStatus"
+          },
+          "waiting_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "TicketAssignmentTrackingHistoryEntry": {
+        "properties": {
+          "at": {
+            "type": "string"
+          },
+          "event_id": {
+            "type": "string"
+          },
+          "operation_key": {
+            "type": "string"
+          },
+          "source_context": true,
+          "tracking": {
+            "$ref": "#/components/schemas/TicketAssignmentTracking"
+          }
+        },
+        "required": [
+          "event_id",
+          "operation_key",
+          "tracking",
+          "source_context",
+          "at"
+        ],
+        "type": "object"
+      },
+      "TicketAssignmentTrackingHistoryPage": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/TicketAssignmentTrackingHistoryEntry"
+            },
+            "type": "array"
+          },
+          "next_event_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "TicketAssignmentTrackingHistoryQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "after_event_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "assignment_id": {
+            "type": "string"
+          },
+          "limit": {
+            "format": "uint",
+            "maximum": 100,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "assignment_id"
+        ],
+        "type": "object"
+      },
+      "TicketAssignmentTrackingProjection": {
+        "description": "Enrichment is separate from the established assignment record. `None`\ntracking means a retained historical relationship with insufficient delegation\nevidence, not waiting/done. Removal/replacement does not alter last tracking.",
+        "properties": {
+          "assigned_at": {
+            "type": "string"
+          },
+          "assigned_by": {
+            "type": "string"
+          },
+          "assignment_id": {
+            "type": "string"
+          },
+          "current": {
+            "type": "boolean"
+          },
+          "last_event_id": {
+            "description": "Tracking event, or the existing immutable Assign audit observation for a\nretained current relationship with no tracking yet. This baseline does\nnot imply a handling status, delegation intent, or tracking timestamp.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "migration_diagnostic": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "principal": {
+            "$ref": "#/components/schemas/TicketAssignmentPrincipalSnapshot"
+          },
+          "release": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketAssignmentRelease"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "role": {
+            "type": "string"
+          },
+          "ticket_id": {
+            "type": "string"
+          },
+          "tracking": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketAssignmentTracking"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "ticket_id",
+          "assignment_id",
+          "role",
+          "principal",
+          "assigned_by",
+          "assigned_at",
+          "current"
+        ],
+        "type": "object"
+      },
+      "TicketAssignmentTrackingQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "assignment_id": {
+            "description": "Omit for the current delegation; provide to inspect a retained assignment.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "TicketAssignmentTrackingStatus": {
+        "enum": [
+          "waiting",
+          "inprogress",
+          "done"
+        ],
+        "type": "string"
+      },
+      "TicketAssignmentTrackingUpdate": {
+        "additionalProperties": false,
+        "description": "Replaces the complete handling payload against this delegation's observed event,\nnot status alone. Exact retry compares full input and authenticated sender/binding.",
+        "properties": {
+          "assignment_id": {
+            "type": "string"
+          },
+          "expected_last_event_id": {
+            "type": "string"
+          },
+          "operation_key": {
+            "type": "string"
+          },
+          "tracking": {
+            "$ref": "#/components/schemas/TicketAssignmentTracking"
+          }
+        },
+        "required": [
+          "assignment_id",
+          "expected_last_event_id",
+          "operation_key",
+          "tracking"
+        ],
+        "type": "object"
+      },
+      "TicketAssignmentsPage": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/TicketAssignmentTrackingProjection"
+            },
+            "type": "array"
+          },
+          "next_assignment_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "TicketAssignmentsQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "after_assignment_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "uint",
+            "maximum": 100,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "TicketAttention": {
+        "enum": [
+          "unresolved_review",
+          "missing_commit",
+          "blocked",
+          "unblocked",
+          "awaiting_review",
+          "unresolved_changes",
+          "stale_after_rescope",
+          "missing_evidence"
+        ],
+        "type": "string"
+      },
       "TicketBodyReplacement": {
         "properties": {
           "new_string": {
@@ -10718,12 +11328,106 @@
         ],
         "type": "object"
       },
-      "TicketCompletion": {
-        "additionalProperties": false,
-        "description": "Audited completion independent of repositories, Git, or Merge Requests.",
+      "TicketCaseAction": {
+        "description": "Close requires an open case; reopen and correction require a closed case.\nReopen clears the current judgment but retains its history and last closure key.\nCorrection appends a new judgment without rewriting the old one.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "const": "close",
+                "type": "string"
+              },
+              "reason": {
+                "$ref": "#/components/schemas/TicketClosureReason"
+              }
+            },
+            "required": [
+              "action",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "const": "reopen",
+                "type": "string"
+              }
+            },
+            "required": [
+              "action"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "const": "correct_closure",
+                "type": "string"
+              },
+              "reason": {
+                "$ref": "#/components/schemas/TicketClosureReason"
+              }
+            },
+            "required": [
+              "action",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "TicketCaseHistoryEntry": {
+        "description": "Immutable case decision, including reopening and corrections. A correction\nadds a new judgment; it never overwrites the old reason, actor or references.",
         "properties": {
+          "action": {
+            "$ref": "#/components/schemas/TicketCaseAction"
+          },
+          "at": {
+            "type": "string"
+          },
           "author": {
-            "default": null,
+            "type": "string"
+          },
+          "explanation": {
+            "type": "string"
+          },
+          "operation_key": {
+            "type": "string"
+          },
+          "previous_closure_operation_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "references": {
+            "items": {
+              "$ref": "#/components/schemas/TicketReference"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "operation_key",
+          "action",
+          "explanation",
+          "references",
+          "author",
+          "at"
+        ],
+        "type": "object"
+      },
+      "TicketCaseUpdateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/TicketCaseAction"
+          },
+          "expected_closure_operation_key": {
             "type": [
               "string",
               "null"
@@ -10733,12 +11437,12 @@
             "type": "string"
           },
           "expected_state": {
-            "$ref": "#/components/schemas/TicketWorkflowState"
+            "$ref": "#/components/schemas/TicketState"
           },
-          "operation_key": {
+          "explanation": {
             "type": "string"
           },
-          "reason": {
+          "operation_key": {
             "type": "string"
           },
           "references": {
@@ -10752,10 +11456,72 @@
         "required": [
           "expected_content_digest",
           "expected_state",
+          "expected_closure_operation_key",
           "operation_key",
-          "reason"
+          "action",
+          "explanation"
         ],
         "type": "object"
+      },
+      "TicketClosureJudgment": {
+        "properties": {
+          "at": {
+            "type": "string"
+          },
+          "author": {
+            "type": "string"
+          },
+          "explanation": {
+            "type": "string"
+          },
+          "operation_key": {
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/TicketClosureReason"
+          },
+          "references": {
+            "items": {
+              "$ref": "#/components/schemas/TicketReference"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "operation_key",
+          "reason",
+          "explanation",
+          "references",
+          "author",
+          "at"
+        ],
+        "type": "object"
+      },
+      "TicketClosureReason": {
+        "description": "Reason attached to a closure judgment, not a classification tag or success inference.\nOnly `Completed` asserts fulfillment; the other reasons can end an unfulfilled case.\n`Other` must be nonblank, at most 1024 UTF-8 bytes, and contain no NUL.",
+        "oneOf": [
+          {
+            "enum": [
+              "completed",
+              "not_planned",
+              "duplicate",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "other": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "other"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "TicketDependencyCheck": {
         "properties": {
@@ -10814,6 +11580,12 @@
             },
             "type": "array"
           },
+          "assignment_tracking": {
+            "items": {
+              "$ref": "#/components/schemas/TicketAssignmentTrackingProjection"
+            },
+            "type": "array"
+          },
           "assignments": {
             "items": {
               "$ref": "#/components/schemas/TicketRoleAssignmentSummary"
@@ -10826,6 +11598,19 @@
           "body_truncated": {
             "type": "boolean"
           },
+          "closure_history": {
+            "items": {
+              "$ref": "#/components/schemas/TicketCaseHistoryEntry"
+            },
+            "type": "array"
+          },
+          "closure_operation_key": {
+            "description": "Last closure/correction key, retained across reopening for ABA-safe CAS.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "content_digest": {
             "type": "string"
           },
@@ -10833,6 +11618,16 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "current_closure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketClosureJudgment"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "current_worker": {
@@ -10871,6 +11666,17 @@
               "$ref": "#/components/schemas/TicketEvidenceEvent"
             },
             "type": "array"
+          },
+          "legacy_handoff": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketLegacyWorkflowSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Original migration handoff; not another current state authority."
           },
           "linked_objectives": {
             "items": {
@@ -10937,7 +11743,13 @@
             "type": "array"
           },
           "state": {
-            "type": "string"
+            "$ref": "#/components/schemas/BrowserTicketState"
+          },
+          "tags": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceTag"
+            },
+            "type": "array"
           },
           "targets": {
             "items": {
@@ -10957,6 +11769,7 @@
         },
         "required": [
           "id",
+          "tags",
           "resource_key",
           "title",
           "state",
@@ -10975,11 +11788,13 @@
           "linked_objectives",
           "implementation_reports",
           "assignments",
+          "assignment_tracking",
           "assignment_diagnostics",
           "action_eligibility",
           "merge_requests",
           "evidence",
-          "record_source"
+          "record_source",
+          "closure_history"
         ],
         "type": "object"
       },
@@ -11393,6 +12208,7 @@
               "decision",
               "implementation_report",
               "state_changed",
+              "tags_changed",
               "intake_summary",
               "status_changed",
               "close"
@@ -11618,6 +12434,44 @@
         },
         "type": "object"
       },
+      "TicketLegacyWorkflowSnapshot": {
+        "description": "Original migration snapshot for downstream routing/tracking handoff only.\nThis is not a second current state authority.",
+        "properties": {
+          "queued_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "queued_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolution": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "workflow_state": {
+            "type": "string"
+          },
+          "workflow_state_explicit": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "workflow_state",
+          "workflow_state_explicit",
+          "status"
+        ],
+        "type": "object"
+      },
       "TicketListHttpQuery": {
         "additionalProperties": false,
         "properties": {
@@ -11648,8 +12502,36 @@
       "TicketListItemSummary": {
         "additionalProperties": false,
         "properties": {
+          "closure_operation_key": {
+            "description": "Last closure/correction key, retained across reopening for ABA-safe CAS.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current_closure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketClosureJudgment"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "id": {
             "type": "string"
+          },
+          "legacy_handoff": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketLegacyWorkflowSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Original migration handoff; not another current state authority."
           },
           "priority": {
             "type": "string"
@@ -11673,7 +12555,14 @@
             "type": "string"
           },
           "state": {
-            "type": "string"
+            "$ref": "#/components/schemas/BrowserTicketState"
+          },
+          "tags": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceTag"
+            },
+            "type": "array"
           },
           "title": {
             "type": "string"
@@ -11936,7 +12825,8 @@
             ]
           },
           "workflow_state": {
-            "$ref": "#/components/schemas/TicketWorkflowState"
+            "$ref": "#/components/schemas/TicketState",
+            "description": "Case state only; field name retained temporarily, never execution progress."
           },
           "workflow_state_explicit": {
             "type": "boolean"
@@ -11986,11 +12876,24 @@
       "TicketQueryItem": {
         "additionalProperties": false,
         "properties": {
+          "assignment_tracking": {
+            "items": {
+              "$ref": "#/components/schemas/TicketAssignmentTrackingProjection"
+            },
+            "type": "array"
+          },
           "blocker_count": {
             "format": "uint",
             "maximum": 9007199254740991,
             "minimum": 0,
             "type": "integer"
+          },
+          "closure_operation_key": {
+            "description": "Last closure/correction key, retained across reopening for ABA-safe CAS.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "content_digest": {
             "type": "string"
@@ -11999,6 +12902,16 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "current_closure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketClosureJudgment"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "current_worker": {
@@ -12016,6 +12929,17 @@
           },
           "id": {
             "type": "string"
+          },
+          "legacy_handoff": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketLegacyWorkflowSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Original migration handoff; not another current state authority."
           },
           "linked_objective_ids": {
             "items": {
@@ -12086,7 +13010,13 @@
             ]
           },
           "state": {
-            "type": "string"
+            "$ref": "#/components/schemas/BrowserTicketState"
+          },
+          "tags": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceTag"
+            },
+            "type": "array"
           },
           "title": {
             "type": "string"
@@ -12115,6 +13045,7 @@
         },
         "required": [
           "id",
+          "tags",
           "resource_key",
           "title",
           "state",
@@ -12128,6 +13059,7 @@
           "blocker_count",
           "unresolved_blocker_count",
           "unresolved_review_count",
+          "assignment_tracking",
           "evidence",
           "merge_requests"
         ],
@@ -12136,12 +13068,34 @@
       "TicketQueryRequest": {
         "additionalProperties": false,
         "properties": {
+          "assigned_principal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketAssignmentPrincipalSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Exact current assigned principal; retained relationships do not match."
+          },
           "attention": {
             "default": [],
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/TicketAttention"
             },
             "type": "array"
+          },
+          "closure_reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketClosureReason"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Exact reason of the current closed-case judgment; reopened/history-only reasons do not match."
           },
           "cursor": {
             "type": [
@@ -12162,6 +13116,17 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "handling_status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketAssignmentTrackingStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Explicit self-reported handling only; never inferred from Worker state."
           },
           "limit": {
             "format": "uint",
@@ -12210,6 +13175,30 @@
           },
           "states": {
             "default": [],
+            "items": {
+              "$ref": "#/components/schemas/TicketState"
+            },
+            "type": "array"
+          },
+          "tag_ids": {
+            "default": [],
+            "description": "Match tickets containing every supplied tag ID (AND).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tag_ids_any": {
+            "default": [],
+            "description": "Match tickets containing at least one supplied tag ID (OR).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tag_ids_none": {
+            "default": [],
+            "description": "Exclude tickets containing any supplied tag ID (NOT).",
             "items": {
               "type": "string"
             },
@@ -12371,7 +13360,7 @@
       "TicketRelationBlocker": {
         "properties": {
           "blocking_state": {
-            "$ref": "#/components/schemas/TicketWorkflowState"
+            "$ref": "#/components/schemas/TicketState"
           },
           "blocking_ticket": {
             "type": "string"
@@ -12684,48 +13673,12 @@
           }
         ]
       },
-      "TicketStateUpdate": {
-        "additionalProperties": false,
-        "description": "External state mutation with content/state CAS and an immutable operation receipt.\nExact replay returns the current authoritative Ticket without a new event or\nreapplying the recorded state, even after later edits or reopening.\nSetting `state` to Closed also stores `reason` as the resolution; reopening\nchanges Ticket metadata only and never revives released work identities.",
-        "properties": {
-          "author": {
-            "default": null,
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "expected_content_digest": {
-            "type": "string"
-          },
-          "expected_state": {
-            "$ref": "#/components/schemas/TicketWorkflowState"
-          },
-          "operation_key": {
-            "type": "string"
-          },
-          "reason": {
-            "type": "string"
-          },
-          "references": {
-            "default": [],
-            "items": {
-              "$ref": "#/components/schemas/TicketReference"
-            },
-            "type": "array"
-          },
-          "state": {
-            "$ref": "#/components/schemas/TicketWorkflowState"
-          }
-        },
-        "required": [
-          "expected_content_digest",
-          "expected_state",
-          "state",
-          "operation_key",
-          "reason"
+      "TicketState": {
+        "enum": [
+          "open",
+          "closed"
         ],
-        "type": "object"
+        "type": "string"
       },
       "TicketStatus": {
         "enum": [
@@ -12781,6 +13734,13 @@
           "status": {
             "$ref": "#/components/schemas/ExtensibleTicketStatus"
           },
+          "tags": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceTag"
+            },
+            "type": "array"
+          },
           "title": {
             "type": "string"
           },
@@ -12791,7 +13751,8 @@
             ]
           },
           "workflow_state": {
-            "$ref": "#/components/schemas/TicketWorkflowState"
+            "$ref": "#/components/schemas/TicketState",
+            "description": "Case state only; field name retained temporarily, never execution progress."
           },
           "workflow_state_explicit": {
             "type": "boolean"
@@ -12829,6 +13790,33 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "TicketTagSetRequest": {
+        "additionalProperties": false,
+        "description": "Compare entire active ID set, then replace it atomically. IDs must be unique;\ninput order is immaterial to CAS, but remains significant for exact replay.",
+        "properties": {
+          "expected_tag_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "operation_key": {
+            "type": "string"
+          },
+          "tag_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "expected_tag_ids",
+          "tag_ids",
+          "operation_key"
+        ],
         "type": "object"
       },
       "TicketTarget": {
@@ -12915,17 +13903,6 @@
           "connection_id"
         ],
         "type": "object"
-      },
-      "TicketWorkflowState": {
-        "enum": [
-          "planning",
-          "ready",
-          "queued",
-          "in_progress",
-          "done",
-          "closed"
-        ],
-        "type": "string"
       },
       "TicketWorkspaceNextAction": {
         "enum": [
@@ -15933,6 +16910,117 @@
         ],
         "type": "object"
       },
+      "WorkspaceTag": {
+        "description": "Workspace-scoped immutable identity with a mutable display name.\nNames are Unicode-whitespace trimmed, limited to 128 UTF-8 bytes, and\ndeduplicated among active tags using Rust Unicode lowercase (not full case\nfolding or NFC/NFKC). Empty names and any input control characters are invalid.",
+        "properties": {
+          "deleted": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "last_operation_key": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "id",
+          "name",
+          "last_operation_key",
+          "deleted"
+        ],
+        "type": "object"
+      },
+      "WorkspaceTagAction": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "create",
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "name"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "expected_last_operation_key": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "rename",
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "tag_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "tag_id",
+              "expected_last_operation_key",
+              "name"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "expected_last_operation_key": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "delete",
+                "type": "string"
+              },
+              "tag_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "tag_id",
+              "expected_last_operation_key"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WorkspaceTagMutation": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/WorkspaceTagAction"
+          },
+          "operation_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_key",
+          "action"
+        ],
+        "type": "object"
+      },
       "WorkspaceWorkerDiscoveryItem": {
         "additionalProperties": false,
         "description": "Bounded, model-safe projection used by privileged Workspace Worker discovery.\nRuntime placement appears only in the typed subject required by Worker\ncontrol operations; provider and launch internals are intentionally omitted.",
@@ -16026,7 +17114,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:a23a7b9989d37fd08459929a4e726396a33334489207799e02d45302e8d4c238"
+    "x-yoi-source-digest": "sha256:73f7d252fbedf2efbc7d36a36259c72850cfaaede4693009800fb1bec3f295cb"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -32604,6 +33692,208 @@
         ]
       }
     },
+    "/api/w/{workspace_id}/ticket-tags": {
+      "get": {
+        "operationId": "workspace_ticket_tag_list",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "request",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TagListRequest"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Array_of_WorkspaceTag"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "post": {
+        "operationId": "workspace_ticket_tag_mutate",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceTagMutation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceTag"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
     "/api/w/{workspace_id}/tickets": {
       "get": {
         "operationId": "ticket_list",
@@ -33909,260 +35199,6 @@
             "description": "Error response"
           },
           "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
-    "/api/w/{workspace_id}/tickets/{id}/close": {
-      "post": {
-        "operationId": "ticket_close",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/BrowserCloseTicketRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TicketDetail"
-                }
-              }
-            },
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
-    "/api/w/{workspace_id}/tickets/{id}/complete": {
-      "post": {
-        "operationId": "ticket_complete",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CompleteTicketRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Ticket"
-                }
-              }
-            },
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "422": {
             "content": {
               "application/json": {
                 "schema": {
@@ -35635,9 +36671,9 @@
         ]
       }
     },
-    "/api/w/{workspace_id}/tickets/{id}/state": {
-      "post": {
-        "operationId": "ticket_state_transition",
+    "/api/w/{workspace_id}/tickets/{id}/tags": {
+      "put": {
+        "operationId": "ticket_tags_set",
         "parameters": [
           {
             "explode": false,
@@ -35664,7 +36700,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/BrowserTransitionTicketStateRequest"
+                "$ref": "#/components/schemas/TicketTagSetRequest"
               }
             }
           },
@@ -35675,7 +36711,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/TicketDetail"
+                  "$ref": "#/components/schemas/Array_of_WorkspaceTag"
                 }
               }
             },
@@ -35722,393 +36758,6 @@
             "description": "Error response"
           },
           "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
-    "/api/w/{workspace_id}/tickets/{id}/state-changes": {
-      "post": {
-        "operationId": "ticket_state_change_add",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TicketStateUpdate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
-    "/api/w/{workspace_id}/tickets/{id}/state-fields/{field}": {
-      "post": {
-        "operationId": "ticket_state_field_set",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "field",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TicketStateUpdate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
-    "/api/w/{workspace_id}/tickets/{id}/state-update": {
-      "post": {
-        "operationId": "ticket_state_update",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TicketStateUpdate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Ticket"
-                }
-              }
-            },
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "422": {
             "content": {
               "application/json": {
                 "schema": {
@@ -36219,246 +36868,6 @@
             "description": "Error response"
           },
           "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
-    "/api/w/{workspace_id}/tickets/{id}/workflow-state": {
-      "post": {
-        "operationId": "ticket_workflow_state_set",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TicketStateUpdate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
-    "/api/w/{workspace_id}/tickets/{id}/workflow/close": {
-      "post": {
-        "operationId": "ticket_close_record",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TicketCompletion"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "422": {
             "content": {
               "application/json": {
                 "schema": {
@@ -36683,6 +37092,347 @@
             "description": "Error response"
           },
           "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/tickets/{ticket_id}/assignment-answer": {
+      "post": {
+        "operationId": "ticket_assignment_answer_browser",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TicketAssignmentAnswer"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketAssignmentAnswerReceipt"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/tickets/{ticket_id}/assignment-diagnostics": {
+      "get": {
+        "operationId": "ticket_assignment_diagnostics_browser",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TicketAssignmentDiagnosticsQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketAssignmentDiagnosticsPage"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/tickets/{ticket_id}/assignment-tracking/assignments": {
+      "get": {
+        "operationId": "ticket_assignments_page_browser",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TicketAssignmentsQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketAssignmentsPage"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
             "content": {
               "application/json": {
                 "schema": {
@@ -38766,6 +39516,813 @@
             "description": "Error response"
           }
         }
+      }
+    },
+    "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-answer": {
+      "post": {
+        "operationId": "ticket_assignment_answer",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TicketAssignmentAnswer"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketAssignmentAnswerReceipt"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-diagnostics": {
+      "get": {
+        "operationId": "ticket_assignment_diagnostics",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TicketAssignmentDiagnosticsQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketAssignmentDiagnosticsPage"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking": {
+      "get": {
+        "operationId": "ticket_assignment_tracking_get",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TicketAssignmentTrackingQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Array_of_TicketAssignmentTrackingProjection"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "post": {
+        "operationId": "ticket_assignment_tracking_update",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TicketAssignmentTrackingUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketAssignmentTrackingProjection"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking/assignments": {
+      "get": {
+        "operationId": "ticket_assignments_page",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TicketAssignmentsQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketAssignmentsPage"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking/history": {
+      "get": {
+        "operationId": "ticket_assignment_tracking_history",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TicketAssignmentTrackingHistoryQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketAssignmentTrackingHistoryPage"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/workspaces/{workspace_id}/tickets/{ticket_id}/case": {
+      "post": {
+        "operationId": "ticket_case_update",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TicketCaseUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketSummary"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
       }
     }
   }

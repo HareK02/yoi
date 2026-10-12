@@ -31,13 +31,15 @@ Workspace Webは、Workspaceの確定した状態を確認し、注意が必要�
 
 同じ項目をリソース間で比較する一覧には、平坦なlistまたはtableを使う。人が読む名前とcanonical keyを最初の列に置く。providerの詳細、変更ID、digestは比較用の列へ常設せず、詳細表示や診断用の開閉領域へ置く。
 
-詳細では、対象の識別情報、現在の状態、注意が必要な事項を最初に示し、本文や履歴を主領域に置く。関連、target、review、workflowの状態をそれぞれ別の主体が確定する場合は、独立したsectionに分ける。
+詳細では、対象の識別情報、現在の状態、注意が必要な事項を最初に示し、本文や履歴を主領域に置く。関連、target、review、案件判断、担当のhandlingをそれぞれ別の主体が確定する場合は、独立したsectionに分ける。
 
 ## Ticket board
 
-boardは横方向にlaneを比較する作業面とする。laneはworkflow stateを表し、隣接laneとの関係を維持する。狭い画面でもboard内の横スクロールで比較できるようにする。
+boardのlaneは案件状態の`open`／`closed`を表し、狭い画面では縦に並べる。`open`を着手可能・queue済み、`closed`を要求実現済みと読み替えない。終了理由と説明を案件の判断として示し、再開・訂正でも過去の判断を残す。
 
-各Ticketにはkey、title、優先判断を変える情報を表示する。blockerとattentionは文字でも示す。
+各Ticketにはkey、title、優先判断を変える情報を表示する。分類タグ、担当principal、自己申告のhandlingを案件状態と分けて示す。検索と絞込みは取得済みの一部分ではなく、Backendのqueryへ適用してからページを取得する。
+
+Orchestratorのhandlingは、担当ごとの自己申告として示す。`done`を案件の終了やMR承認と読み替えず、再依頼は新しい担当、回答・継続は現在の担当への入力として区別する。担当の保存、通知の受理、実作業の着手、Workerの現在状態は独立して示し、未観測・結果不明を成功で補わない。分類、案件判断、担当変更からWorker制御や権限付与を推測しない。
 
 ## Settingsと編集
 
@@ -57,5 +59,7 @@ Consoleは会話と実行の履歴を主領域とする。コマンド出力はt
 
 - 直接のSubWorkerの履歴を表示している間も、Composerと実行制御の対象は親Workerのままとする。
 - OverviewとNormalの切替では見せ方だけを変え、操作対象や権限を変えない。
+- Composerの下書きは、Workerの状態、切断、送信の受付待ちにかかわらず編集できるようにする。編集可能性と送信・実行制御の可否を分け、受付待ちの入力に後続の編集を混ぜない。
+- rewind先は親Workerの会話履歴にあるユーザー入力から選び、適用前に対象を示す。履歴を戻しても、実行済みtoolの外部副作用は取り消されないことを明示する。
 - 現在のWorker状態はWorkerの確定したsnapshotから表示し、WebSocketの接続状態や一時的なeventで置き換えない。
 - 非公開の推論と生のsystem promptは、debug表示でも公開しない。

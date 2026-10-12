@@ -10,10 +10,11 @@
 //! Resource clones held by sessions and commands maintain that protection. Deletion invalidates
 //! the materialization generation, so recreating the same ID cannot activate old bindings.
 //!
-//! Deletion is a provider operation checking current identity, mounts, and remaining content.
-//! Partial-deletion witnesses are stored outside the tree. CleanupPending/unknown inventory status
-//! does not guarantee current cleanliness. Detailed inspection and remaining-content checks
-//! are limited to cleanup retries.
+//! Deletion checks current identity, mounts, Git cleanliness when needed, and surviving entry
+//! metadata. Durable metadata authority lives outside the tree; cleanup performs no content-hash
+//! scan or byte-equality verification. CleanupPending/unknown inventory checks saved identity only,
+//! not current cleanliness. Normal retries recheck safety; a failed attempt grants no deletion
+//! permission and does not permanently forbid normal reattachment to a usable same-identity checkout.
 
 use crate::catalog::{
     MaterializerKind, RepositoryRefObservation, RepositoryRefObservationRequest,
@@ -758,22 +759,12 @@ impl RuntimeGitMaterializer {
         // Frozen evidence normalization can write the record. Keep it inside
         // use admission so observational reads cannot race physical cleanup.
         let _use_lease = self.occupancy.acquire_use(working_directory_id)?;
-        self.read_binding_record(working_directory_id, true)
-    }
-
-    fn read_binding_for_cleanup(
-        &self,
-        working_directory_id: &str,
-    ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
-        // Cleanup already owns exclusive admission and validates the original
-        // bytes. Its witnessed status write performs any canonicalization.
-        self.read_binding_record(working_directory_id, false)
+        self.read_binding_record(working_directory_id)
     }
 
     fn read_binding_record(
         &self,
         working_directory_id: &str,
-        migrate: bool,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
         let working_directory_root = self.working_directory_root(working_directory_id);
         let path = working_directory_root.join(MATERIALIZATION_RECORD);
@@ -810,7 +801,7 @@ impl RuntimeGitMaterializer {
                 "materialization evidence is invalid",
             )
         })?;
-        if migrate && canonical != raw {
+        if canonical != raw {
             let temporary = path.with_extension(format!("migration-{}.tmp", uuid::Uuid::now_v7()));
             let result = (|| -> std::io::Result<()> {
                 let mut file = fs::OpenOptions::new()
@@ -4800,9 +4791,16 @@ mod tests {
             materializer.read_binding(id).unwrap_err().code,
             "working_directory_cleanup_resource_busy"
         );
-        materializer.read_binding_for_cleanup(id).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), original);
         drop(cleanup);
+        // Actual cleanup admission reads the legacy record without rewriting it
+        // before change protection has admitted removal.
+        fs::write(binding.root.join("README.md"), "preserve change").unwrap();
+        assert_eq!(
+            materializer.cleanup_working_directory(id).unwrap_err().code,
+            "working_directory_cleanup_changes_present"
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        git(binding.root(), &["restore", "README.md"]);
 
         materializer.read_binding(id).unwrap();
         let canonical: serde_json::Value =

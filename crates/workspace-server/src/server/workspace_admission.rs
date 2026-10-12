@@ -13,7 +13,10 @@
 //!
 //! Drop releases leases and temporary deletion fences. Cancelling a deletion wait reopens normal
 //! admission, but durable Workspace state blocks admission after deletion reservation succeeds.
-//! Leases cover HTTP responses, not the full lifetime of upgraded WS or background work.
+//! Accepted bounded jobs retain the admitted request lease through execution and result cleanup,
+//! even after the HTTP waiter is cancelled. Synchronous child submissions retain that source too;
+//! detached tasks do not inherit it. Leases do not cover an upgraded WS's entire lifetime or all
+//! background work. Only explicitly allowed callback routes may reenter deletion drain.
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard};
@@ -78,6 +81,28 @@ impl WorkspaceAdmission {
 pub(super) struct RequestLease {
     gate: Arc<WorkspaceAdmission>,
     callback: bool,
+}
+
+impl crate::db_executor::DbOperationLifetime for RequestLease {
+    fn retain(&self) -> Box<dyn Send> {
+        // This is continuation of an already admitted request, not fresh admission.
+        // Retain its drain responsibility before transferring work to the DB owner;
+        // dropping/aborting the HTTP waiter must not allow deletion past live SQL.
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .expect("Workspace admission poisoned");
+        if self.callback {
+            state.callbacks += 1;
+        } else {
+            state.requests += 1;
+        }
+        Box::new(RequestLease {
+            gate: self.gate.clone(),
+            callback: self.callback,
+        })
+    }
 }
 
 impl Drop for RequestLease {

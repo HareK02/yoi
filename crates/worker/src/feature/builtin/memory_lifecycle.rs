@@ -574,6 +574,7 @@ impl MemoryLifecycleTask {
                     .extraction
                     .worker_max_turns
                     .or(manifest::defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS),
+                compaction_budget: None,
                 engine_configurator: None,
                 features,
                 required_tools: &[

@@ -21,7 +21,7 @@ use crate::feature::{
 
 const FEATURE_ID: &str = "orchestration";
 const TOOL_NAME: &str = "SpawnTicketWorker";
-const TOOL_DESCRIPTION: &str = "Spawn and atomically assign a generic Ticket Worker for the natural-language initial request. Profile is optional (defaults to builtin:ticket-worker); Flow and repository/Workdir attachments are optional. Results and return choices follow user intent, not a universal approval or MR gate. Backend validates claims and derives attachment access from Ticket targets; acceptance follows spawn, initial input, assignment, and resource finalization. Profile/Flow selection grants neither trusted review nor merge authority.";
+const TOOL_DESCRIPTION: &str = "Spawn and atomically assign a generic Ticket Worker for the natural-language initial request. Profile is optional (defaults to builtin:ticket-worker); Flow and repository/Workdir attachments are optional. Results and return choices follow user intent, not a universal approval or MR gate. Orchestrator starts must supply the observed orchestrator_assignment_id; stale delegations cannot start new work. Assign is enough (no Queue/ready); unresolved dependencies are diagnostics for partial work and never start implicitly. Backend validates claims and derives attachment access from Ticket targets; acceptance follows spawn, initial input, assignment, and resource finalization. Profile/Flow selection grants neither trusted review nor merge authority.";
 
 #[derive(Debug, Default)]
 pub struct OrchestrationFeature;
@@ -78,6 +78,9 @@ struct SpawnTicketWorkerWorkdirInput {
 #[serde(deny_unknown_fields)]
 struct SpawnTicketWorkerInput {
     ticket_id: String,
+    /// Observed current delegation identity. Required by Backend for an Orchestrator start; manual callers omit it.
+    #[serde(default)]
+    orchestrator_assignment_id: Option<String>,
     runtime_id: String,
     /// Optional registered profile selector; omitted/null selects builtin:ticket-worker.
     /// Backend resolves the profile and validates claims, not natural-language satisfaction.
@@ -132,6 +135,10 @@ impl Tool for SpawnTicketWorkerTool {
         let response = self
             .worker_service
             .spawn(WorkerLifecycleSpawnRequest {
+                orchestrator_assignment_id: input
+                    .orchestrator_assignment_id
+                    .map(|id| authority_id(id, "orchestrator_assignment_id"))
+                    .transpose()?,
                 runtime_id,
                 workdir_attachments,
                 profile,
@@ -247,13 +254,13 @@ fn validate_relative_cwd(value: String) -> Result<String, ToolError> {
 mod tests {
     use std::sync::Mutex;
 
-    use ticket::{TicketError, TicketWorkflowState};
+    use ticket::{TicketError, TicketState};
 
     use super::*;
     use crate::feature::builtin::ticket::TicketHandoff;
     use crate::worker::{WorkspaceClientError, WorkspaceResponse};
 
-    struct FixedTicketService(TicketWorkflowState);
+    struct FixedTicketService(TicketState);
 
     impl TicketService for FixedTicketService {
         fn ticket_handoff(&self, ticket_ref: &str) -> Result<TicketHandoff, TicketError> {
@@ -295,7 +302,7 @@ mod tests {
         })
     }
 
-    fn tool(service: Arc<RecordingService>, state: TicketWorkflowState) -> SpawnTicketWorkerTool {
+    fn tool(service: Arc<RecordingService>, state: TicketState) -> SpawnTicketWorkerTool {
         SpawnTicketWorkerTool {
             ticket_service: Arc::new(FixedTicketService(state)),
             worker_service: service,
@@ -307,6 +314,7 @@ mod tests {
         let service = Arc::new(RecordingService::default());
         let mut input = input();
         input["flow"] = serde_json::json!("project:investigation");
+        input["orchestrator_assignment_id"] = serde_json::json!("delegation-742");
         input["workdir_attachments"] = serde_json::json!([
             {
                 "alias": "checkout",
@@ -315,7 +323,7 @@ mod tests {
             },
             {"alias": "docs", "working_directory_id": "workdir-2"}
         ]);
-        let output = tool(service.clone(), TicketWorkflowState::Queued)
+        let output = tool(service.clone(), TicketState::Open)
             .execute(
                 &input.to_string(),
                 ToolExecutionContext::new("call-7", "batch-1", 0),
@@ -327,6 +335,10 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         assert_eq!(request.runtime_id, "runtime-1");
+        assert_eq!(
+            request.orchestrator_assignment_id.as_deref(),
+            Some("delegation-742")
+        );
         assert_eq!(request.profile, "project:ticket-worker");
         assert_eq!(request.ticket_id.as_deref(), Some("00001KZXN51C7"));
         assert_eq!(
@@ -372,7 +384,7 @@ mod tests {
                 input["workdir_attachments"] = serde_json::json!([]);
                 input["flow"] = serde_json::Value::Null;
             }
-            tool(service.clone(), TicketWorkflowState::Queued)
+            tool(service.clone(), TicketState::Open)
                 .execute(
                     &input.to_string(),
                     ToolExecutionContext::new("call-empty", "batch-1", 0),
@@ -395,7 +407,7 @@ mod tests {
     async fn spawn_ticket_worker_omitted_profile_uses_general_worker_without_flow_or_repository() {
         let service = Arc::new(RecordingService::default());
         let definition = definition(
-            Arc::new(FixedTicketService(TicketWorkflowState::Ready)),
+            Arc::new(FixedTicketService(TicketState::Open)),
             service.clone(),
         );
         let (meta, tool) = definition();
@@ -434,33 +446,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_ticket_worker_defers_claim_eligibility_to_backend() {
-        let service = Arc::new(RecordingService {
-            response: Some(WorkspaceResponse {
-                status: 409,
-                body: "Backend rejected Ticket claim".into(),
-            }),
-            ..Default::default()
-        });
-        let error = tool(service.clone(), TicketWorkflowState::Planning)
-            .execute(
-                &input().to_string(),
-                ToolExecutionContext::new("call-claim", "batch-1", 0),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(service.requests.lock().unwrap().len(), 1);
-        assert!(
-            error
-                .to_string()
-                .contains("HTTP 409: Backend rejected Ticket claim")
-        );
+    async fn spawn_ticket_worker_defers_claim_eligibility_to_backend_not_case_state() {
+        for state in [TicketState::Open, TicketState::Closed] {
+            let service = Arc::new(RecordingService {
+                response: Some(WorkspaceResponse {
+                    status: 409,
+                    body: "Backend rejected Ticket claim".into(),
+                }),
+                ..Default::default()
+            });
+            let error = tool(service.clone(), state)
+                .execute(
+                    &input().to_string(),
+                    ToolExecutionContext::new("call-claim", "batch-1", 0),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(service.requests.lock().unwrap().len(), 1);
+            assert!(
+                error
+                    .to_string()
+                    .contains("HTTP 409: Backend rejected Ticket claim")
+            );
+        }
     }
 
     #[tokio::test]
     async fn spawn_ticket_worker_rejects_invalid_input_before_worker_side_effect() {
         let service = Arc::new(RecordingService::default());
-        let tool = tool(service.clone(), TicketWorkflowState::Queued);
+        let tool = tool(service.clone(), TicketState::Open);
         let cases = [
             (
                 "profile",
@@ -473,6 +487,16 @@ mod tests {
                 "initial_request must not be empty",
             ),
             ("flow", serde_json::json!(" "), "flow must not be empty"),
+            (
+                "orchestrator_assignment_id",
+                serde_json::json!("http://invalid/id"),
+                "orchestrator_assignment_id must be an authority id",
+            ),
+            (
+                "orchestrator_assignment_id",
+                serde_json::json!(" "),
+                "orchestrator_assignment_id must not be empty",
+            ),
             (
                 "runtime_id",
                 serde_json::json!("runtime/1"),
@@ -603,7 +627,7 @@ mod tests {
     #[test]
     fn spawn_ticket_worker_schema_exposes_configuration_not_claim_or_review_grants() {
         let definition = definition(
-            Arc::new(FixedTicketService(TicketWorkflowState::Queued)),
+            Arc::new(FixedTicketService(TicketState::Open)),
             Arc::new(RecordingService::default()),
         );
         let (meta, _) = definition();

@@ -1,8 +1,10 @@
 //! Asynchronous advisory checks of saved Ticket content using Backend Jobs.
 //!
 //! Authenticated Worker Create/EditItem paths freeze check input and reserve a Job after saving.
-//! Failed preparation, execution, or delivery does not roll back the save or change Ticket state,
-//! Queue, or assignments. Direct browser edits have no notification Worker and start no check.
+//! Failed preparation, execution, or delivery does not roll back the save or change case state
+//! or assignments. Direct browser edits have no notification Worker and start no check.
+//! Dispatch and timeout processing use bounded admission; overload retains the saved reservation
+//! or deadline for diagnosis. An unknown DB outcome is never automatically retried.
 //!
 //! Input is limited to saved title/body, content digest, and the prior body/replacement context
 //! needed for that edit, excluding conversation, user agreements, and external facts. Content

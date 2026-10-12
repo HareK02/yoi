@@ -2545,16 +2545,24 @@ where
                 }
             }
             method => {
-                let result = self.send_method(
-                    WorkerExecutionOperation::ProtocolMethod,
-                    execution.handle.clone(),
-                    method,
-                );
-                if result.is_accepted() {
+                // The connected protocol owns this bounded admission wait. The old
+                // generic adapter waiter could time out while leaving a detached send
+                // task alive; it might deliver later after the connection had ended.
+                // Join cancellation before releasing endpoint exclusion. A send which
+                // raced cancellation remains delivery-unknown, never automatically retried.
+                let handle = execution.handle.clone();
+                self.run_cancellable_on_adapter_runtime(USER_INPUT_TASK_TIMEOUT, async move {
+                    handle.send(method).await.map_err(|error| {
+                        format!("connected Worker method delivery failed or is unknown: {error}")
+                    })?;
                     Ok(Vec::new())
-                } else {
-                    Err(result)
-                }
+                })
+                .map_err(|message| {
+                    WorkerExecutionResult::errored(
+                        WorkerExecutionOperation::ProtocolMethod,
+                        message,
+                    )
+                })
             }
         }
     }
@@ -7903,6 +7911,48 @@ mod tests {
         assert!(backend.stop_worker(&worker_ref).is_accepted());
         #[cfg(feature = "ws-server")]
         assert!(backend.worker_snapshot(&worker_ref).is_none());
+    }
+
+    #[test]
+    fn connected_protocol_admission_timeout_joins_pending_send_before_capacity_reopens() {
+        // This is the adapter's cancellation/join policy boundary used by the
+        // captured protocol endpoint, not an execution-side-effect rollback.
+        let backend = WorkerRuntimeExecutionBackend::new(FailingFactory).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender.try_send(Method::ListPendingSubmissions).unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        struct PendingSendDrop(Arc<AtomicBool>);
+        impl Drop for PendingSendDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let owned = PendingSendDrop(dropped.clone());
+        let error = backend
+            .run_cancellable_on_adapter_runtime(Duration::from_millis(5), async move {
+                let _owned = owned;
+                sender
+                    .send(Method::ListWorkers)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap_err();
+        assert!(error.contains("was cancelled"), "{error}");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "must join task cancellation before returning"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Method::ListPendingSubmissions)
+        ));
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ),
+            "timeout must not leave an admission task capable of a late send"
+        );
     }
 
     #[test]

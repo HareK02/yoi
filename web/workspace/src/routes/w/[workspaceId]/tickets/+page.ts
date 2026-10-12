@@ -2,62 +2,52 @@ import { parseBrowserWorkspaceOrchestratorResponse } from "#lib/workspace/api/wo
 import { loadWorkspaceRepositoryList } from "#lib/workspace/api/repositories.ts";
 import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 import {
-  parseTicketListResponse,
+  parseTicketQueryResponse,
   TICKET_BROWSER_API_LOAD_POLICY,
 } from "#lib/workspace/api/ticket-browser.ts";
-import type { TicketListResponse } from "#lib/generated/ticket-api.ts";
-import type { WorkspaceOrchestratorStatus } from "#lib/workspace/tickets/ticket-panel.ts";
+import { parseTags } from "#lib/workspace/api/ticket-operations.ts";
+import {
+  readTicketFilters,
+  ticketQueryRequest,
+} from "#lib/workspace/tickets/ticket-panel.ts";
+import type { TicketState } from "#lib/generated/ticket-api.ts";
 import type { PageLoad } from "./$types";
 
-const LANE_STATES = {
-  "ready-planning": ["ready", "planning"],
-  "inprogress-queued": ["inprogress", "queued"],
-  "done-closed": ["done", "closed"],
-} as const;
-
-export type TicketLaneId = keyof typeof LANE_STATES;
-
-export type TicketLanePage = {
-  states: readonly string[];
-  response: TicketListResponse;
-};
-
-async function loadLane(
-  fetchFn: typeof fetch,
-  workspaceId: string,
-  laneId: TicketLaneId,
-): Promise<TicketLanePage> {
-  const states = LANE_STATES[laneId];
-  const search = new URLSearchParams({
-    limit: "30",
-    states: states.join(","),
-  });
-  const result = await loadJson(
-    fetchFn,
-    `/api/w/${encodeURIComponent(workspaceId)}/tickets?${search}`,
-    undefined,
-    parseTicketListResponse,
-    TICKET_BROWSER_API_LOAD_POLICY,
-  );
-  if (!result.data) {
-    throw new Error(result.error ?? `failed to load ${laneId} Ticket lane`);
-  }
-  return { states: [...states], response: result.data };
-}
-
-export const load: PageLoad = async ({ fetch, params }) => {
+export const load: PageLoad = async ({ fetch, params, url }) => {
   const workspaceId = params.workspaceId;
-  const [
-    readyPlanning,
-    inprogressQueued,
-    doneClosed,
-    orchestrator,
-    repositories,
-  ] = await Promise.all([
-    loadLane(fetch, workspaceId, "ready-planning"),
-    loadLane(fetch, workspaceId, "inprogress-queued"),
-    loadLane(fetch, workspaceId, "done-closed"),
-    loadJson<WorkspaceOrchestratorStatus>(
+  const filters = readTicketFilters(url.searchParams);
+  const loadLane = async (state: TicketState) => {
+    if (filters.caseState !== "all" && filters.caseState !== state) return null;
+    try {
+      return await loadJson(
+        fetch,
+        workspaceApiPath(workspaceId, "/tickets/query"),
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(ticketQueryRequest(filters, [state])),
+        },
+        parseTicketQueryResponse,
+        TICKET_BROWSER_API_LOAD_POLICY,
+      );
+    } catch (error) {
+      return {
+        data: null,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  };
+  const [open, closed, tags, orchestrator, repositories] = await Promise.all([
+    loadLane("open"),
+    loadLane("closed"),
+    loadJson(
+      fetch,
+      workspaceApiPath(workspaceId, "/ticket-tags"),
+      undefined,
+      parseTags,
+      TICKET_BROWSER_API_LOAD_POLICY,
+    ),
+    loadJson(
       fetch,
       workspaceApiPath(workspaceId, "/orchestrator"),
       undefined,
@@ -65,14 +55,11 @@ export const load: PageLoad = async ({ fetch, params }) => {
     ),
     loadWorkspaceRepositoryList(fetch, workspaceId),
   ]);
-
   return {
     workspaceId,
-    ticketLanes: {
-      "ready-planning": readyPlanning,
-      "inprogress-queued": inprogressQueued,
-      "done-closed": doneClosed,
-    },
+    filters,
+    ticketLanes: { open, closed },
+    tags,
     orchestrator,
     repositories,
   };

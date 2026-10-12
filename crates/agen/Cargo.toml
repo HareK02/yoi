@@ -37,6 +37,7 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 agen-macros = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 tempfile = { workspace = true }
 dotenv = "0.15"

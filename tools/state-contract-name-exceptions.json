@@ -1,16 +1,5 @@
 [
   {
-    "path": "AGENTS.md",
-    "kind": "naming_policy",
-    "reason": "命名禁止の原語を明示する規則そのもの。消すと大小文字・複合語を含む禁止対象が曖昧になる。現行状態モデルの名称ではない。",
-    "lines": [
-      {
-        "sha256": "b24c8ab3aabb18044f1011eda6cab552a47c735e6d6bc9ebf52df32a39eb6d2c",
-        "count": 1
-      }
-    ]
-  },
-  {
     "path": "crates/manifest/src/lib.rs",
     "kind": "saved_data",
     "reason": "read_persisted_worker_manifest_snapshot の無version・schema 2/3 readerが旧Memory設定keyを検証してschema 4へ変換するための綴りとそのfixture。削除するとWorkspace identity・language・実行設定を持つ既存Worker manifestを復元できず、部分設定やmixed authorityの拒否検証も失う。現行manifestのwriterは旧keyを出さない。",
@@ -559,9 +548,9 @@
     ]
   },
   {
-    "path": "crates/ticket/src/lib.rs",
+    "path": "crates/ticket/tests/migration.rs",
     "kind": "saved_data",
-    "reason": "frozen_counter_receipts_remain_immutable_and_cannot_be_reinterpreted_as_content_requestsの旧completion receipt属性fixture。保存済み旧fingerprintを新content requestの証拠に昇格せず、移行後も履歴を不変に保つ保証。keyを任意語に変えると実在したreceipt形式での回帰検出を失う。",
+    "reason": "旧Ticket完了receiptの実在したcounter入力keyを新schema7→9移行fixtureへ移設した。過去のfingerprintと全attributeを不変保持し、同じoperation keyを現行content/state/closure-key判断へ再解釈できないことを検証する。旧lib.rsの削除されたfixture例外を同じ1行へ移したもので、現行writer/APIには導入しない。",
     "lines": [
       {
         "sha256": "060994ddcd0e463815b01cd11b19723fd3652bd4c741fccdb33628e97691f092",
@@ -1235,7 +1224,7 @@
   {
     "path": "crates/workspace-server/src/frozen_repository_key_migration.rs",
     "kind": "saved_data",
-    "reason": "schema 86から87の旧SSH key/secret/operation/retention/source列名。旧secret AADと暗号化payloadを開き新key identityへresealし、元operation fingerprint・retention・auditを対応付けるconsumerがある。削除すると既存秘密鍵を復号できず、SSH retry/retentionやauditを失う。曖昧な対応はrollbackし原文archiveを保持する。",
+    "reason": "schema 86から87の旧SSH key/secret/operation/retention/source列名。旧secret AADと暗号化payloadを開き新key identityへresealし、元operation fingerprint・retention・auditを対応付けるconsumerがある。削除すると既存秘密鍵を復号できず、SSH retry/retentionやauditを失う。曖昧な対応はrollbackし原文archiveを保持する。 時刻修正でhashが変わったcredential/host trust/候補の3 JOIN行は同じ旧保存列を読み、鍵作成UTC秒・ナノ秒を操作時刻と比較する。旧列を変えると実DBのSSH snapshotを対応付けられないため、この3行の例外だけを同期した。",
     "lines": [
       {
         "sha256": "95284617f203ea22df2ba1fe49903db531a0dd68dbf8654981505516a07dfcce",
@@ -1354,15 +1343,15 @@
         "count": 1
       },
       {
-        "sha256": "8948263f582419232838423d99d269c423dee4b21c8189d97fde3de97afc2104",
+        "sha256": "a69d60581d924b868edf66ad6bfe63a47f44483aed13d7467df3303ad4b5d3c5",
         "count": 1
       },
       {
-        "sha256": "9b2d38cea48eaf100fdcd2444036da17a0a8104090b429e6c64e56255d45d9c0",
+        "sha256": "1397df3babbcbfdb0c3a7e12ce1a5bcaf396ef295880b4d2885bcd0b54fb6d1b",
         "count": 1
       },
       {
-        "sha256": "f8333763f67f3a40ae3e245f523e2b0dca6a7b6c1b42d5aa61273bcbf649c5f2",
+        "sha256": "291ea2e36bf20850c631eed6a64064c193c90d2fe2b346b0a13bc5031a1dbde9",
         "count": 1
       },
       {
@@ -1404,14 +1393,14 @@
   {
     "path": "crates/workspace-server/src/frozen_repository_key_tests.rs",
     "kind": "saved_data",
-    "reason": "legacy_repository_keysの旧SSH key/暗号secret/operation/retention/Workdir fixtureとrollback SQL。旧AADを本当に開いてresealし、元fingerprintでのreplay、retention、audit、不可逆な旧Workdirのarchiveを保持することを検証する。綴りを変えると既存secretの復号可能性と不整合rollbackの検証を失う。",
+    "reason": "legacy_repository_keysの旧SSH key/暗号secret/operation/retention/Workdir fixtureとrollback SQL。旧AADを本当に開いてresealし、元fingerprintでのreplay、retention、audit、不可逆な旧Workdirのarchiveを保持することを検証する。綴りを変えると既存secretの復号可能性と不整合rollbackの検証を失う。 既存fixtureの5 INSERT行は偽時刻からRFC3339へ変更されたためhashのみ同期した。旧credential/host trust表とcounterの綴り・実AAD入力は不変であり、移行成功と別鍵retention/欠けたreceiptのrollbackを同じ旧形式で検証する。",
     "lines": [
       {
         "sha256": "a62f153e1748caa20f7cb81656b8c6b29d32b01bf533a3ffaf36fb5be9a5ae3b",
         "count": 1
       },
       {
-        "sha256": "de6b3a38afad3d08bc4bcb534c1374446ae59b28ed08235643fd61c3b42992fd",
+        "sha256": "59be6fd4e7c21afa91e2618bde39dbf7b2325be929723cabc19d75eebc0fe606",
         "count": 1
       },
       {
@@ -1427,11 +1416,11 @@
         "count": 1
       },
       {
-        "sha256": "af41b9c5edf66189130020a79568cad6b86b56835935e06969d34a4cc0569e93",
+        "sha256": "d7a003785fdc9de68e8f980f9ccc49360b5ecf9c382a9d34b348d3070cca724c",
         "count": 1
       },
       {
-        "sha256": "9ec9ccf2b8e304c1cb1ef9b755a5cfe4d203879a9787394a9c6edca59c6fddca",
+        "sha256": "3ce073da6367a945e80717f01b342a6ec3eb6495fce1f8bf651ce9406584d8b3",
         "count": 1
       },
       {
@@ -1475,7 +1464,7 @@
         "count": 1
       },
       {
-        "sha256": "b2495afb6d5b32f13e77eb7a7fa4866f12531d3ed059aa44288ccb69d0fa4e26",
+        "sha256": "04ea12161ed1f19d3edd90d0619d03e80a9aaa5c9854b46e437e3c87852ec0ff",
         "count": 1
       },
       {
@@ -1483,7 +1472,7 @@
         "count": 1
       },
       {
-        "sha256": "4a4ea05d99ba512fbe0ecb7c31d176a08c59bb6e8b1156624bee907ad4dfc103",
+        "sha256": "906649318474b0ef47fa35be64c7f9b7f6fe1e50aa477d6bb424137afe079fb2",
         "count": 1
       },
       {
@@ -1905,7 +1894,7 @@
   {
     "path": "crates/workspace-server/src/migration_entrypoint_tests.rs",
     "kind": "saved_data",
-    "reason": "schema-87 retention/removal policyとschema-86 SSH key fixture。public migrate_database/open entrypointが旧DBのpolicy binding・terminal worker evidence・暗号鍵を移すことを検証する。旧SQLを現行名へ変えると公開入口を通る実データ保持/rollbackの証明を失う。",
+    "reason": "schema-87 retention/removal policyとschema-86 SSH key fixture。public migrate_database/open entrypointが旧DBのpolicy binding・terminal worker evidence・暗号鍵を移すことを検証する。旧SQLを現行名へ変えると公開入口を通る実データ保持/rollbackの証明を失う。 公開dry-run/applyのcredential保存行は偽時刻からRFC3339へ変更されたためhashのみ同期した。元暗号AADとkey receiptに結び付いた旧表名を維持し、旧DBを公開入口から移す証明を残す。",
     "lines": [
       {
         "sha256": "2a4cb9f8dacaf637103fe369c8ce5106bbb442097e644483c3900cdd98fade81",
@@ -1924,7 +1913,7 @@
         "count": 1
       },
       {
-        "sha256": "de6b3a38afad3d08bc4bcb534c1374446ae59b28ed08235643fd61c3b42992fd",
+        "sha256": "59be6fd4e7c21afa91e2618bde39dbf7b2325be929723cabc19d75eebc0fe606",
         "count": 1
       }
     ]
@@ -2155,6 +2144,87 @@
     "lines": [
       {
         "sha256": "edad9af3a2d7cecad990c8908ea38a496fb7413a707c8b6acd72d1ab660e2806",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/frozen_repository_key_migration.rs",
+    "kind": "saved_data",
+    "reason": "prepare_repository_cutover_timesの旧schema86 snapshot照合SQL3行（credential operation、host trust operation、credential candidate）。それぞれ実在した旧保存counter列を取り出し、鍵作成時刻が操作時刻より新しい再利用鍵や証拠欠落をコピー前に拒否する。綴りを現行列へ置換すると旧DBを読めず、NULL fingerprint挿入前の安全なrollbackとretained SSH retry証拠の保持を失う。新writerの状態名として使わない。",
+    "lines": [
+      {
+        "sha256": "fdd4d8fa9046d50591afa726d7d12c455020571a5b74f1e6c748556b36f50db6",
+        "count": 1
+      },
+      {
+        "sha256": "765772579ddb0b8e014bed913836f722a25f97a4293abcc823e2d23ab7d0b3b4",
+        "count": 1
+      },
+      {
+        "sha256": "c368d019ed0698f769513bf2da22f2f8894f66ebfa4242554544d5ca05316773",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/frozen_repository_key_tests.rs",
+    "kind": "saved_data",
+    "reason": "legacy_ssh_snapshot_timesとnewer_reused_snapshot_keys/invalid_authority_timestampsの旧保存入力。credential時刻UPDATE3箇所とhost trust時刻UPDATE2箇所は混在形式の成功・操作より新しい鍵の拒否・不正時刻のrollbackを分けて検証する。host INSERTとfailed Workdir snapshot UPDATEは実旧receiptを作り、main credentialをNULLにする1行は候補だけの不整合を隔離する。credential/host trustのsource文字列とmatch各2行は不正値を実旧表のcreated_atへ入れて文脈付き拒否を確認する。旧列/表の綴りを変えるとfixtureを操作できず、過去のSSH snapshotに別鍵を結び付けない検証を失う。",
+    "lines": [
+      {
+        "sha256": "f49461fbbb42bf1a13996379f031645d31ab7f794e64c6cc66fe6a5e5d14ecf8",
+        "count": 3
+      },
+      {
+        "sha256": "651e611e62c3be58f95b2c5aae3f95f98ea3858180b77132968bef7ae4616165",
+        "count": 1
+      },
+      {
+        "sha256": "f78c4397f9e4c8058fa8d320949e0cc23ef8c47c37a643cf73e91cb84c4d4b38",
+        "count": 1
+      },
+      {
+        "sha256": "0c49320a2fcff35a9fffd8eb02517c97e538006c614b6243d02757fd12c23727",
+        "count": 2
+      },
+      {
+        "sha256": "4e64ea62da159a158270bb0e6f9c1086090a73deb826f4b8df02438f8065fd2d",
+        "count": 1
+      },
+      {
+        "sha256": "48ffab07c0e4a66b82944f7001e6cc8ffef8a964f01a1b348db14537204f6a7f",
+        "count": 1
+      },
+      {
+        "sha256": "18341cc32d7711507e0ec849ba9291c7265944149d9b7814c72a6310272546f4",
+        "count": 1
+      },
+      {
+        "sha256": "739474845828016af6993686f70b3d716fbe2f37cba59aa0f2e9a3659e40ce2c",
+        "count": 1
+      },
+      {
+        "sha256": "cc05720883982d4345c5059aebbfc6f2dfc4d07126d2ee0425acde502c4a762b",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/frozen_repository_key_tests.rs",
+    "kind": "saved_data",
+    "reason": "assert_timestamp_cutover_rolls_backの旧credential表存在と旧retention件数の2行、およびrepository_key_cutover_rejects_orphan_candidates_without_dropping_source_evidenceの旧表存在1行。失敗後にもschema86の秘密鍵・retained retry参照・候補が消えないことを実旧表名で確認する保存データ保持のassertionであり、旧名を現行出力に許可する契約ではない。削除するとtimestamp/candidate拒否時の部分移行やデータ喪失を検出できなくなる。",
+    "lines": [
+      {
+        "sha256": "d7080c861537f04caf0ddddc36c166eb965b74bc8dbd57f5d4a3ef8232804c66",
+        "count": 1
+      },
+      {
+        "sha256": "821421c002e9020248029b8a74b6b86ab3abd9c37d719cd3bf2572b096f54e9f",
+        "count": 1
+      },
+      {
+        "sha256": "1378598b848b6e444d643deb72f7403281d548885557ba819822d838a8148d81",
         "count": 1
       }
     ]

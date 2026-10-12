@@ -131,7 +131,7 @@
   .ticket-kanban {
     display: grid;
     align-items: stretch;
-    grid-template-columns: repeat(3, minmax(18rem, 1fr));
+    grid-template-columns: repeat(2, minmax(18rem, 1fr));
     gap: var(--space-3);
     overflow-x: auto;
     padding-bottom: var(--space-3);
@@ -168,13 +168,10 @@
     border-radius: 50%;
     background: var(--text-muted);
   }
-  .ticket-lane[data-state="ready-planning"] .ticket-state-dot {
+  .ticket-lane[data-state="open"] .ticket-state-dot {
     background: var(--success);
   }
-  .ticket-lane[data-state="inprogress-queued"] .ticket-state-dot {
-    background: var(--warning);
-  }
-  .ticket-lane[data-state="done-closed"] .ticket-state-dot {
+  .ticket-lane[data-state="closed"] .ticket-state-dot {
     background: var(--accent);
   }
   .ticket-lane-count {

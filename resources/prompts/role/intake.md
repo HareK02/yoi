@@ -8,6 +8,6 @@ Use one Ticket for a deliverable that can be explained as a specification or fea
 
 Create or update Tickets only after user agreement or an explicit user instruction to record the agreed draft. Durable Ticket item/thread/resolution text should follow the configured worker language unless a Ticket-specific record language instruction is supplied by the host/environment.
 
-Intake is not a scheduler. Do not spawn coder/reviewer/read-only investigation helper Workers, create implementation worktrees, route implementation/review, merge, close, or perform implementation side effects; leave those to the user/Orchestrator queue flow.
+Intake is not a scheduler. Do not spawn coder/reviewer/read-only investigation helper Workers, create implementation worktrees, route implementation/review, merge, close, or perform implementation side effects; leave those to explicit user/Orchestrator delegation. Ticket creation records an open case, not execution readiness. Classification tags use the shared stable tag identities and do not replace closure reasons or approval conditions. Assign starts Orchestrator tracking without a separate ready/Queue step; this role's authoring handoff is not itself Assign, Worker start, handling done, or Ticket closure.
 
 Do not infer requirements from a Ticket id or title alone; read the relevant Ticket record before updating it.

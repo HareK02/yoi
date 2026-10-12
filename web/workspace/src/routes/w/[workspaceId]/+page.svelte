@@ -31,8 +31,8 @@
   {#if refreshError}<p class="home-error" role="alert">{refreshError}</p>{/if}
   <div class="home-columns">
     <DashboardSection id="home-attention" title="Needs attention" empty="No open Merge Requests." result={data.dashboard.reviews} />
-    <DashboardSection id="home-active" title="In progress" empty="No in-progress or queued tickets." result={data.dashboard.active} />
-    <DashboardSection id="home-recent" title="Recent updates" empty="No done / closed tickets or Objectives yet." result={data.dashboard.recent} />
+    <DashboardSection id="home-active" title="Open tickets" empty="No open tickets." result={data.dashboard.active} />
+    <DashboardSection id="home-recent" title="Recent updates" empty="No closed tickets or Objectives yet." result={data.dashboard.recent} />
   </div>
 </div>
 

@@ -1,4 +1,5 @@
 import type {
+  BrowserTicketState,
   InvalidProjectRecord,
   MergeRequestDetailResponse,
   MergeRequestLinkedTicketResponse,
@@ -19,7 +20,14 @@ import type {
   ReviewFinding,
   TicketActionEligibility,
   TicketAssignmentPrincipal,
+  TicketAssignmentRelease,
   TicketAssignmentSummary,
+  TicketAssignmentTracking,
+  TicketAssignmentTrackingProjection,
+  TicketCaseAction,
+  TicketCaseHistoryEntry,
+  TicketClosureJudgment,
+  TicketClosureReason,
   TicketDetail,
   TicketDetailDerivedRelation,
   TicketDetailRelation,
@@ -29,15 +37,21 @@ import type {
   TicketEventDetail,
   TicketEvidenceEvent,
   TicketEvidenceSummary,
+  TicketLegacyWorkflowSnapshot,
   TicketListItemSummary,
   TicketListResponse,
   TicketMergeRequestSummary,
+  TicketQueryItem,
+  TicketQueryResponse,
   TicketQueueOutcome,
   TicketRef,
+  TicketReference,
   TicketRoleAssignmentMutationResponse,
   TicketRoleAssignmentRecord,
   TicketRoleAssignmentSummary,
+  TicketSummary,
   TicketTarget,
+  WorkspaceTag,
 } from "#lib/generated/ticket-api.ts";
 
 export const TICKET_BROWSER_API_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
@@ -183,12 +197,238 @@ function parseInvalidProjectRecord(
   };
 }
 
+function parseTicketState(value: unknown, label: string): BrowserTicketState {
+  if (value !== "open" && value !== "closed") {
+    throw new Error(`${label} is invalid`);
+  }
+  return value;
+}
+
+function parseClosureReason(
+  value: unknown,
+  label: string,
+): TicketClosureReason {
+  if (
+    typeof value === "string" &&
+    ["completed", "not_planned", "duplicate", "unknown"].includes(value)
+  ) {
+    return value as TicketClosureReason;
+  }
+  const item = object(value, label);
+  exact(item, ["other"], label);
+  return { other: string(item.other, `${label}.other`) };
+}
+
+function parseCaseAction(value: unknown, label: string): TicketCaseAction {
+  const item = object(value, label);
+  if (item.action === "reopen") {
+    exact(item, ["action"], label);
+    return { action: "reopen" };
+  }
+  if (item.action !== "close" && item.action !== "correct_closure") {
+    throw new Error(`${label}.action is invalid`);
+  }
+  exact(item, ["action", "reason"], label);
+  return {
+    action: item.action,
+    reason: parseClosureReason(item.reason, `${label}.reason`),
+  };
+}
+
+function parseReference(value: unknown, label: string): TicketReference {
+  const item = object(value, label);
+  exact(item, ["kind", "target"], label);
+  return {
+    kind: string(item.kind, `${label}.kind`),
+    target: string(item.target, `${label}.target`),
+  };
+}
+
+function parseClosure(value: unknown, label: string): TicketClosureJudgment {
+  const item = object(value, label);
+  exact(item, [
+    "operation_key",
+    "reason",
+    "explanation",
+    "references",
+    "author",
+    "at",
+  ], label);
+  return {
+    operation_key: string(item.operation_key, `${label}.operation_key`),
+    reason: parseClosureReason(item.reason, `${label}.reason`),
+    explanation: string(item.explanation, `${label}.explanation`),
+    references: array(item.references, `${label}.references`, parseReference),
+    author: string(item.author, `${label}.author`),
+    at: string(item.at, `${label}.at`),
+  };
+}
+
+function parseCaseHistory(
+  value: unknown,
+  label: string,
+): TicketCaseHistoryEntry {
+  const item = object(value, label);
+  exact(item, [
+    "operation_key",
+    "previous_closure_operation_key",
+    "action",
+    "explanation",
+    "references",
+    "author",
+    "at",
+  ], label);
+  return {
+    operation_key: string(item.operation_key, `${label}.operation_key`),
+    previous_closure_operation_key: optionalNullableString(
+      item.previous_closure_operation_key,
+      `${label}.previous_closure_operation_key`,
+    ),
+    action: parseCaseAction(item.action, `${label}.action`),
+    explanation: string(item.explanation, `${label}.explanation`),
+    references: array(item.references, `${label}.references`, parseReference),
+    author: string(item.author, `${label}.author`),
+    at: string(item.at, `${label}.at`),
+  };
+}
+
+function parseLegacyHandoff(
+  value: unknown,
+  label: string,
+): TicketLegacyWorkflowSnapshot {
+  const item = object(value, label);
+  exact(item, [
+    "workflow_state",
+    "workflow_state_explicit",
+    "status",
+    "queued_by",
+    "queued_at",
+    "resolution",
+  ], label);
+  return {
+    workflow_state: string(item.workflow_state, `${label}.workflow_state`),
+    workflow_state_explicit: boolean(
+      item.workflow_state_explicit,
+      `${label}.workflow_state_explicit`,
+    ),
+    status: string(item.status, `${label}.status`),
+    queued_by: optionalNullableString(item.queued_by, `${label}.queued_by`),
+    queued_at: optionalNullableString(item.queued_at, `${label}.queued_at`),
+    resolution: optionalNullableString(item.resolution, `${label}.resolution`),
+  };
+}
+
+function caseProjection(item: Record<string, unknown>, label: string) {
+  return {
+    closure_operation_key: optionalNullableString(
+      item.closure_operation_key,
+      `${label}.closure_operation_key`,
+    ),
+    current_closure: item.current_closure === undefined
+      ? undefined
+      : item.current_closure === null
+      ? null
+      : parseClosure(item.current_closure, `${label}.current_closure`),
+    legacy_handoff: item.legacy_handoff === undefined
+      ? undefined
+      : item.legacy_handoff === null
+      ? null
+      : parseLegacyHandoff(item.legacy_handoff, `${label}.legacy_handoff`),
+  };
+}
+
+export function parseWorkspaceTag(
+  value: unknown,
+  label = "Workspace tag",
+): WorkspaceTag {
+  const item = object(value, label);
+  exact(item, [
+    "workspace_id",
+    "id",
+    "name",
+    "last_operation_key",
+    "deleted",
+  ], label);
+  const id = string(item.id, `${label}.id`);
+  if (id.trim().length === 0 || new TextEncoder().encode(id).length > 128) {
+    throw new Error(`${label}.id must be nonempty and at most 128 UTF-8 bytes`);
+  }
+  return {
+    workspace_id: string(item.workspace_id, `${label}.workspace_id`),
+    id,
+    name: string(item.name, `${label}.name`),
+    last_operation_key: string(
+      item.last_operation_key,
+      `${label}.last_operation_key`,
+    ),
+    deleted: boolean(item.deleted, `${label}.deleted`),
+  };
+}
+
+export function parseTicketSummary(value: unknown): TicketSummary {
+  const label = "Ticket summary";
+  const item = object(value, label);
+  exact(item, [
+    "id",
+    "kind",
+    "labels",
+    "priority",
+    "queued_at",
+    "queued_by",
+    "readiness",
+    "resource_key",
+    "slug",
+    "status",
+    "tags",
+    "title",
+    "updated_at",
+    "workflow_state",
+    "workflow_state_explicit",
+  ], label);
+  let status: TicketSummary["status"];
+  if (item.status === "Open" || item.status === "Closed") status = item.status;
+  else {
+    const other = object(item.status, `${label}.status`);
+    exact(other, ["Other"], `${label}.status`);
+    status = { Other: string(other.Other, `${label}.status.Other`) };
+  }
+  return {
+    id: string(item.id, `${label}.id`),
+    kind: string(item.kind, `${label}.kind`),
+    labels: strings(item.labels, `${label}.labels`),
+    priority: string(item.priority, `${label}.priority`),
+    queued_at: optionalNullableString(item.queued_at, `${label}.queued_at`),
+    queued_by: optionalNullableString(item.queued_by, `${label}.queued_by`),
+    readiness: optionalNullableString(item.readiness, `${label}.readiness`),
+    resource_key: optionalNullableString(
+      item.resource_key,
+      `${label}.resource_key`,
+    ),
+    slug: string(item.slug, `${label}.slug`),
+    status,
+    tags: array(item.tags, `${label}.tags`, parseWorkspaceTag),
+    title: string(item.title, `${label}.title`),
+    updated_at: optionalNullableString(item.updated_at, `${label}.updated_at`),
+    workflow_state: parseTicketState(
+      item.workflow_state,
+      `${label}.workflow_state`,
+    ),
+    workflow_state_explicit: boolean(
+      item.workflow_state_explicit,
+      `${label}.workflow_state_explicit`,
+    ),
+  };
+}
+
 function parseTicketListItem(
   value: unknown,
   label: string,
 ): TicketListItemSummary {
   const item = object(value, label);
   exact(item, [
+    "closure_operation_key",
+    "current_closure",
+    "legacy_handoff",
     "id",
     "priority",
     "queued_at",
@@ -196,18 +436,21 @@ function parseTicketListItem(
     "record_source",
     "resource_key",
     "state",
+    "tags",
     "title",
     "updated_at",
     "workspace_action_priority",
   ], label);
   return {
+    ...caseProjection(item, label),
     id: string(item.id, `${label}.id`),
     priority: string(item.priority, `${label}.priority`),
     queued_at: optionalNullableString(item.queued_at, `${label}.queued_at`),
     queued_by: optionalNullableString(item.queued_by, `${label}.queued_by`),
     record_source: string(item.record_source, `${label}.record_source`),
     resource_key: string(item.resource_key, `${label}.resource_key`),
-    state: string(item.state, `${label}.state`),
+    state: parseTicketState(item.state, `${label}.state`),
+    tags: array(item.tags, `${label}.tags`, parseWorkspaceTag),
     title: string(item.title, `${label}.title`),
     updated_at: optionalNullableString(item.updated_at, `${label}.updated_at`),
     workspace_action_priority: string(
@@ -411,6 +654,130 @@ function parseTicketRoleAssignmentRecord(
     role: role as TicketRoleAssignmentRecord["role"],
     ticket_id: string(item.ticket_id, `${label}.ticket_id`),
     workspace_id: string(item.workspace_id, `${label}.workspace_id`),
+  };
+}
+
+export function parseAssignmentTracking(
+  value: unknown,
+  label: string,
+): TicketAssignmentTracking {
+  const item = object(value, label);
+  exact(
+    item,
+    ["status", "waiting_reason", "progress", "next_action", "result"],
+    label,
+  );
+  const status = string(item.status, `${label}.status`);
+  if (status !== "waiting" && status !== "inprogress" && status !== "done") {
+    throw new Error(`${label}.status is invalid`);
+  }
+  return {
+    status,
+    waiting_reason: optionalNullableString(
+      item.waiting_reason,
+      `${label}.waiting_reason`,
+    ),
+    progress: optionalNullableString(item.progress, `${label}.progress`),
+    next_action: optionalNullableString(
+      item.next_action,
+      `${label}.next_action`,
+    ),
+    result: optionalNullableString(item.result, `${label}.result`),
+  };
+}
+
+function parseAssignmentRelease(
+  value: unknown,
+  label: string,
+): TicketAssignmentRelease {
+  const item = object(value, label);
+  exact(item, [
+    "action",
+    "event_id",
+    "operation_key",
+    "actor",
+    "at",
+    "reason",
+    "replacement_assignment_id",
+    "last_tracking",
+  ], label);
+  const action = string(item.action, `${label}.action`);
+  if (action !== "unassigned" && action !== "replaced") {
+    throw new Error(`${label}.action is invalid`);
+  }
+  return {
+    action,
+    event_id: string(item.event_id, `${label}.event_id`),
+    operation_key: optionalNullableString(
+      item.operation_key,
+      `${label}.operation_key`,
+    ),
+    actor: string(item.actor, `${label}.actor`),
+    at: string(item.at, `${label}.at`),
+    reason: optionalNullableString(item.reason, `${label}.reason`),
+    replacement_assignment_id: optionalNullableString(
+      item.replacement_assignment_id,
+      `${label}.replacement_assignment_id`,
+    ),
+    last_tracking: item.last_tracking === undefined
+      ? undefined
+      : item.last_tracking === null
+      ? null
+      : parseAssignmentTracking(item.last_tracking, `${label}.last_tracking`),
+  };
+}
+
+export function parseAssignmentTrackingProjection(
+  value: unknown,
+  label: string,
+): TicketAssignmentTrackingProjection {
+  const item = object(value, label);
+  exact(item, [
+    "workspace_id",
+    "ticket_id",
+    "assignment_id",
+    "role",
+    "principal",
+    "assigned_by",
+    "assigned_at",
+    "release",
+    "current",
+    "tracking",
+    "last_event_id",
+    "updated_at",
+    "migration_diagnostic",
+  ], label);
+  return {
+    workspace_id: string(item.workspace_id, `${label}.workspace_id`),
+    ticket_id: string(item.ticket_id, `${label}.ticket_id`),
+    assignment_id: string(item.assignment_id, `${label}.assignment_id`),
+    role: string(item.role, `${label}.role`),
+    principal: parseTicketAssignmentPrincipal(
+      item.principal,
+      `${label}.principal`,
+    ),
+    assigned_by: string(item.assigned_by, `${label}.assigned_by`),
+    assigned_at: string(item.assigned_at, `${label}.assigned_at`),
+    release: item.release === undefined
+      ? undefined
+      : item.release === null
+      ? null
+      : parseAssignmentRelease(item.release, `${label}.release`),
+    current: boolean(item.current, `${label}.current`),
+    tracking: item.tracking === undefined
+      ? undefined
+      : item.tracking === null
+      ? null
+      : parseAssignmentTracking(item.tracking, `${label}.tracking`),
+    last_event_id: optionalNullableString(
+      item.last_event_id,
+      `${label}.last_event_id`,
+    ),
+    updated_at: optionalNullableString(item.updated_at, `${label}.updated_at`),
+    migration_diagnostic: optionalNullableString(
+      item.migration_diagnostic,
+      `${label}.migration_diagnostic`,
+    ),
   };
 }
 
@@ -726,7 +1093,9 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     "artifact_count",
     "artifacts",
     "assignment_diagnostics",
+    "assignment_tracking",
     "assignments",
+    "closure_history",
     "body",
     "body_truncated",
     "created_at",
@@ -735,6 +1104,9 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     "event_page",
     "events",
     "evidence",
+    "closure_operation_key",
+    "current_closure",
+    "legacy_handoff",
     "id",
     "implementation_reports",
     "content_digest",
@@ -751,11 +1123,18 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     "resource_key",
     "risk_flags",
     "state",
+    "tags",
     "targets",
     "title",
     "updated_at",
   ], label);
   return {
+    ...caseProjection(item, label),
+    closure_history: array(
+      item.closure_history,
+      `${label}.closure_history`,
+      parseCaseHistory,
+    ),
     action_eligibility: parseActionEligibility(
       item.action_eligibility,
       `${label}.action_eligibility`,
@@ -765,6 +1144,11 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     assignment_diagnostics: strings(
       item.assignment_diagnostics,
       `${label}.assignment_diagnostics`,
+    ),
+    assignment_tracking: array(
+      item.assignment_tracking,
+      `${label}.assignment_tracking`,
+      parseAssignmentTrackingProjection,
     ),
     assignments: array(
       item.assignments,
@@ -820,7 +1204,8 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     resolution: optionalNullableString(item.resolution, `${label}.resolution`),
     resource_key: string(item.resource_key, `${label}.resource_key`),
     risk_flags: strings(item.risk_flags, `${label}.risk_flags`),
-    state: string(item.state, `${label}.state`),
+    state: parseTicketState(item.state, `${label}.state`),
+    tags: array(item.tags, `${label}.tags`, parseWorkspaceTag),
     targets: array(item.targets, `${label}.targets`, parseTicketTarget),
     title: string(item.title, `${label}.title`),
     updated_at: optionalNullableString(item.updated_at, `${label}.updated_at`),
@@ -1368,5 +1753,154 @@ export function parseMergeRequestDetailResponse(
     ticket_ids: strings(item.ticket_ids, `${label}.ticket_ids`),
     updated_at: string(item.updated_at, `${label}.updated_at`),
     workspace_id: string(item.workspace_id, `${label}.workspace_id`),
+  };
+}
+
+export function parseTicketQueryResponse(value: unknown): TicketQueryResponse {
+  const label = "Ticket query response";
+  const page = object(value, label);
+  exact(page, ["items", "page", "record_authority"], label);
+  return {
+    page: parseQueryPage(page.page, `${label}.page`),
+    record_authority: string(
+      page.record_authority,
+      `${label}.record_authority`,
+    ),
+    items: array(
+      page.items,
+      `${label}.items`,
+      (value, label): TicketQueryItem => {
+        const item = object(value, label);
+        exact(item, [
+          "assignment_tracking",
+          "blocker_count",
+          "closure_operation_key",
+          "content_digest",
+          "created_at",
+          "current_closure",
+          "current_worker",
+          "evidence",
+          "id",
+          "legacy_handoff",
+          "linked_objective_ids",
+          "linked_objective_keys",
+          "matched_fields",
+          "matching_event",
+          "merge_request",
+          "merge_requests",
+          "priority",
+          "readiness",
+          "relation_count",
+          "resource_key",
+          "snippet",
+          "state",
+          "tags",
+          "title",
+          "unresolved_blocker_count",
+          "unresolved_review_count",
+          "updated_at",
+          "workspace_action_priority",
+        ], label);
+        return {
+          id: string(item.id, `${label}.id`),
+          resource_key: string(item.resource_key, `${label}.resource_key`),
+          title: string(item.title, `${label}.title`),
+          state: parseTicketState(item.state, `${label}.state`),
+          priority: string(item.priority, `${label}.priority`),
+          assignment_tracking: array(
+            item.assignment_tracking,
+            `${label}.assignment_tracking`,
+            parseAssignmentTrackingProjection,
+          ),
+          tags: array(item.tags, `${label}.tags`, parseWorkspaceTag),
+          blocker_count: integer(item.blocker_count, `${label}.blocker_count`),
+          unresolved_blocker_count: integer(
+            item.unresolved_blocker_count,
+            `${label}.unresolved_blocker_count`,
+          ),
+          unresolved_review_count: integer(
+            item.unresolved_review_count,
+            `${label}.unresolved_review_count`,
+          ),
+          relation_count: integer(
+            item.relation_count,
+            `${label}.relation_count`,
+          ),
+          content_digest: string(
+            item.content_digest,
+            `${label}.content_digest`,
+          ),
+          created_at: optionalNullableString(
+            item.created_at,
+            `${label}.created_at`,
+          ),
+          updated_at: optionalNullableString(
+            item.updated_at,
+            `${label}.updated_at`,
+          ),
+          closure_operation_key: optionalNullableString(
+            item.closure_operation_key,
+            `${label}.closure_operation_key`,
+          ),
+          current_closure: item.current_closure == null
+            ? item.current_closure as null | undefined
+            : parseClosure(item.current_closure, `${label}.current_closure`),
+          current_worker: item.current_worker == null
+            ? item.current_worker as null | undefined
+            : parseTicketAssignmentSummary(
+              item.current_worker,
+              `${label}.current_worker`,
+            ),
+          evidence: parseTicketEvidenceSummary(
+            item.evidence,
+            `${label}.evidence`,
+          ),
+          legacy_handoff: item.legacy_handoff == null
+            ? item.legacy_handoff as null | undefined
+            : parseLegacyHandoff(
+              item.legacy_handoff,
+              `${label}.legacy_handoff`,
+            ),
+          linked_objective_ids: strings(
+            item.linked_objective_ids,
+            `${label}.linked_objective_ids`,
+          ),
+          linked_objective_keys: strings(
+            item.linked_objective_keys,
+            `${label}.linked_objective_keys`,
+          ),
+          matched_fields: strings(
+            item.matched_fields,
+            `${label}.matched_fields`,
+          ),
+          matching_event: item.matching_event == null
+            ? item.matching_event as null | undefined
+            : parseTicketEvidenceEvent(
+              item.matching_event,
+              `${label}.matching_event`,
+            ),
+          merge_request: item.merge_request == null
+            ? item.merge_request as null | undefined
+            : parseTicketMergeRequestSummary(
+              item.merge_request,
+              `${label}.merge_request`,
+            ),
+          merge_requests: array(
+            item.merge_requests,
+            `${label}.merge_requests`,
+            parseTicketMergeRequestSummary,
+          ),
+          readiness: optionalNullableString(
+            item.readiness,
+            `${label}.readiness`,
+          ),
+          snippet: optionalNullableString(item.snippet, `${label}.snippet`),
+          workspace_action_priority: string(
+            item.workspace_action_priority,
+            `${label}.workspace_action_priority`,
+          ),
+        };
+      },
+    ),
   };
 }

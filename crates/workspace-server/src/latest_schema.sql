@@ -328,31 +328,7 @@ CREATE TABLE server_secret_objects (
                 REFERENCES repository_ssh_credential_keys(workspace_id, credential_id, operation_id)
                 ON DELETE CASCADE
         );
-CREATE TABLE ticket_assignment_operations (
-            workspace_id TEXT NOT NULL,
-            operation_id TEXT NOT NULL,
-            action TEXT NOT NULL CHECK (action IN ('assign', 'reassign', 'unassign')),
-            ticket_id TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'worker'
-                CHECK(role IN ('orchestrator', 'worker', 'owner', 'contributor')),
-            principal_kind TEXT NOT NULL DEFAULT 'worker'
-                CHECK(principal_kind IN ('user', 'worker', 'workspace_agent')),
-            principal_id TEXT,
-            runtime_id TEXT,
-            worker_id TEXT,
-            assignment_id TEXT,
-            expected_assignment_id TEXT,
-            created_at TEXT NOT NULL,
-            request_fingerprint TEXT,
-            claim_state TEXT NOT NULL DEFAULT 'committed'
-                CHECK(claim_state IN ('pending', 'failed', 'committed')),
-            failure_reason TEXT,
-            binding_recovery_json TEXT,
-            PRIMARY KEY (workspace_id, operation_id),
-            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-            CHECK(claim_state = 'committed' OR assignment_id IS NULL),
-            CHECK((claim_state = 'failed') = (failure_reason IS NOT NULL))
-        );
+-- Ticket-owned assignment schema is composed by store.rs.
 CREATE TABLE ticket_assignment_ticket_tombstones (
     workspace_id TEXT NOT NULL,
     ticket_id TEXT NOT NULL,
@@ -368,72 +344,9 @@ CREATE TABLE ticket_assignment_worker_tombstones (
     PRIMARY KEY (workspace_id, runtime_id, worker_id),
     FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
 );
-CREATE TABLE ticket_current_worker_assignments (
-            workspace_id TEXT NOT NULL,
-            ticket_id TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'worker'
-                CHECK(role IN ('orchestrator', 'worker', 'owner', 'contributor')),
-            assignment_id TEXT NOT NULL,
-            principal_kind TEXT NOT NULL DEFAULT 'worker'
-                CHECK(principal_kind IN ('user', 'worker', 'workspace_agent')),
-            principal_id TEXT,
-            runtime_id TEXT,
-            worker_id TEXT,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, ticket_id, role, assignment_id),
-            UNIQUE (workspace_id, assignment_id),
-            FOREIGN KEY (workspace_id, ticket_id, role, assignment_id)
-                REFERENCES ticket_worker_assignments(workspace_id, ticket_id, role, assignment_id)
-                ON DELETE CASCADE,
-            FOREIGN KEY (workspace_id, ticket_id)
-                REFERENCES typed_tickets(workspace_id, ticket_id)
-                ON DELETE CASCADE,
-            CHECK(
-                (principal_kind = 'worker' AND runtime_id IS NOT NULL AND worker_id IS NOT NULL AND principal_id IS NULL)
-                OR
-                (principal_kind != 'worker' AND runtime_id IS NULL AND worker_id IS NULL AND principal_id IS NOT NULL AND length(trim(principal_id)) > 0)
-            )
-        );
-CREATE TABLE ticket_worker_assignment_events (
-            workspace_id TEXT NOT NULL,
-            ticket_id TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'worker'
-                CHECK(role IN ('orchestrator', 'worker', 'owner', 'contributor')),
-            event_id TEXT NOT NULL,
-            action TEXT NOT NULL CHECK (action IN ('assigned', 'reassigned', 'unassigned')),
-            assignment_id TEXT,
-            previous_assignment_id TEXT,
-            actor TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            operation_id TEXT,
-            reason TEXT,
-            PRIMARY KEY (workspace_id, event_id),
-            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
-        );
-CREATE TABLE ticket_worker_assignments (
-            workspace_id TEXT NOT NULL,
-            ticket_id TEXT NOT NULL,
-            assignment_id TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'worker'
-                CHECK(role IN ('orchestrator', 'worker', 'owner', 'contributor')),
-            principal_kind TEXT NOT NULL DEFAULT 'worker'
-                CHECK(principal_kind IN ('user', 'worker', 'workspace_agent')),
-            principal_id TEXT,
-            runtime_id TEXT,
-            worker_id TEXT,
-            assigned_by TEXT NOT NULL,
-            assigned_at TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, assignment_id),
-            UNIQUE (workspace_id, ticket_id, assignment_id),
-            UNIQUE (workspace_id, ticket_id, role, assignment_id),
-            UNIQUE (workspace_id, ticket_id, role, assignment_id, principal_kind, principal_id, runtime_id, worker_id),
-            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-            CHECK(
-                (principal_kind = 'worker' AND runtime_id IS NOT NULL AND worker_id IS NOT NULL AND principal_id IS NULL)
-                OR
-                (principal_kind != 'worker' AND runtime_id IS NULL AND worker_id IS NULL AND principal_id IS NOT NULL AND length(trim(principal_id)) > 0)
-            )
-        );
+
+
+
 CREATE TABLE workspace_runtime_bindings (
     workspace_id TEXT NOT NULL,
     runtime_id TEXT NOT NULL,
@@ -1165,14 +1078,10 @@ CREATE INDEX idx_repository_ssh_credentials_workspace_status
             ON repository_ssh_credentials(workspace_id, status, credential_id);
 CREATE INDEX idx_repository_ssh_host_trusts_workspace_host
             ON repository_ssh_host_trusts(workspace_id, hostname, port);
-CREATE INDEX idx_ticket_assignment_operations_ticket
-            ON ticket_assignment_operations(workspace_id, ticket_id, role, created_at DESC);
-CREATE INDEX idx_ticket_worker_assignment_events_ticket
-            ON ticket_worker_assignment_events(workspace_id, ticket_id, role, created_at DESC);
-CREATE INDEX idx_ticket_worker_assignments_principal
-            ON ticket_worker_assignments(workspace_id, role, principal_kind, principal_id, runtime_id, worker_id, assigned_at DESC);
-CREATE INDEX idx_ticket_worker_assignments_ticket
-            ON ticket_worker_assignments(workspace_id, ticket_id, role, assigned_at DESC);
+
+
+
+
 CREATE INDEX idx_workspace_runtime_bindings_workspace
             ON workspace_runtime_bindings(workspace_id, revoked_at, runtime_id);
 CREATE INDEX idx_typed_ticket_relations_workspace_target
@@ -1202,11 +1111,8 @@ CREATE INDEX idx_workspace_resource_keys_reverse
             ON workspace_resource_keys(workspace_id, resource_kind, resource_key);
 CREATE INDEX repositories_workspace_provider_idx
             ON repositories(workspace_id, provider);
-CREATE INDEX ticket_current_principal_idx
-            ON ticket_current_worker_assignments(workspace_id, principal_kind, principal_id, runtime_id, worker_id);
-CREATE UNIQUE INDEX ticket_current_singleton_role_idx
-            ON ticket_current_worker_assignments(workspace_id, ticket_id, role)
-            WHERE role IN ('orchestrator', 'worker');
+
+
 CREATE INDEX typed_ticket_events_workspace_kind_ticket
             ON typed_ticket_events(workspace_id, kind, ticket_id, event_index);
 CREATE UNIQUE INDEX ux_worker_workdir_attachment_reservation_id
@@ -1683,3 +1589,114 @@ CREATE TABLE repository_secret_legacy_receipts (
     FOREIGN KEY (workspace_id, operation_id)
         REFERENCES repository_secret_operations(workspace_id, operation_id) ON DELETE CASCADE
 );
+
+-- T715: responsibility is retained; closing irreversibly releases an assignment identity.
+CREATE TABLE IF NOT EXISTS ticket_assignment_work_releases (
+    workspace_id TEXT NOT NULL,
+    assignment_id TEXT NOT NULL,
+    released_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, assignment_id),
+    FOREIGN KEY (workspace_id, assignment_id)
+        REFERENCES ticket_worker_assignments(workspace_id, assignment_id) ON DELETE CASCADE
+);
+-- Ticket case assignment work constraints (schema 91).
+DROP VIEW IF EXISTS ticket_active_worker_assignments;
+CREATE VIEW ticket_active_worker_assignments AS
+    SELECT current.* FROM ticket_current_worker_assignments AS current
+    JOIN typed_tickets AS ticket
+      ON ticket.workspace_id = current.workspace_id AND ticket.ticket_id = current.ticket_id
+    WHERE ticket.workflow_state = 'open'
+      AND NOT EXISTS (SELECT 1 FROM ticket_assignment_work_releases AS released
+        WHERE released.workspace_id = current.workspace_id
+          AND released.assignment_id = current.assignment_id);
+DROP TRIGGER IF EXISTS ticket_terminal_releases_work;
+CREATE TRIGGER ticket_terminal_releases_work
+AFTER UPDATE OF workflow_state ON typed_tickets
+WHEN NEW.workflow_state = 'closed'
+BEGIN
+    INSERT OR IGNORE INTO ticket_assignment_work_releases
+        SELECT workspace_id, assignment_id, COALESCE(NEW.updated_at, updated_at)
+        FROM ticket_current_worker_assignments
+        WHERE workspace_id = NEW.workspace_id AND ticket_id = NEW.ticket_id;
+END;
+DROP TRIGGER IF EXISTS ticket_terminal_assignment_releases_work_insert;
+CREATE TRIGGER ticket_terminal_assignment_releases_work_insert
+AFTER INSERT ON ticket_current_worker_assignments
+WHEN EXISTS (SELECT 1 FROM typed_tickets WHERE workspace_id = NEW.workspace_id
+    AND ticket_id = NEW.ticket_id AND workflow_state = 'closed')
+BEGIN
+    INSERT OR IGNORE INTO ticket_assignment_work_releases
+        VALUES (NEW.workspace_id, NEW.assignment_id, NEW.updated_at);
+END;
+DROP TRIGGER IF EXISTS ticket_terminal_assignment_releases_work_update;
+CREATE TRIGGER ticket_terminal_assignment_releases_work_update
+AFTER UPDATE ON ticket_current_worker_assignments
+WHEN EXISTS (SELECT 1 FROM typed_tickets WHERE workspace_id = NEW.workspace_id
+    AND ticket_id = NEW.ticket_id AND workflow_state = 'closed')
+BEGIN
+    INSERT OR IGNORE INTO ticket_assignment_work_releases
+        VALUES (NEW.workspace_id, NEW.assignment_id, NEW.updated_at);
+END;
+DROP TRIGGER IF EXISTS ticket_active_worker_role_insert;
+CREATE TRIGGER ticket_active_worker_role_insert
+BEFORE INSERT ON ticket_current_worker_assignments
+WHEN NEW.principal_kind = 'worker'
+ AND EXISTS (SELECT 1 FROM typed_tickets WHERE workspace_id = NEW.workspace_id
+    AND ticket_id = NEW.ticket_id AND workflow_state = 'open')
+ AND NOT EXISTS (SELECT 1 FROM ticket_assignment_work_releases
+    WHERE workspace_id = NEW.workspace_id AND assignment_id = NEW.assignment_id)
+ AND EXISTS (SELECT 1 FROM ticket_active_worker_assignments
+    WHERE workspace_id = NEW.workspace_id AND role = NEW.role
+      AND runtime_id = NEW.runtime_id AND worker_id = NEW.worker_id
+      AND assignment_id != NEW.assignment_id)
+BEGIN SELECT RAISE(ABORT, 'Worker already has unfinished Ticket work in this role'); END;
+DROP TRIGGER IF EXISTS ticket_active_worker_role_update;
+CREATE TRIGGER ticket_active_worker_role_update
+BEFORE UPDATE ON ticket_current_worker_assignments
+WHEN NEW.principal_kind = 'worker'
+ AND EXISTS (SELECT 1 FROM typed_tickets WHERE workspace_id = NEW.workspace_id
+    AND ticket_id = NEW.ticket_id AND workflow_state = 'open')
+ AND NOT EXISTS (SELECT 1 FROM ticket_assignment_work_releases
+    WHERE workspace_id = NEW.workspace_id AND assignment_id = NEW.assignment_id)
+ AND EXISTS (SELECT 1 FROM ticket_active_worker_assignments
+    WHERE workspace_id = NEW.workspace_id AND role = NEW.role
+      AND runtime_id = NEW.runtime_id AND worker_id = NEW.worker_id
+      AND assignment_id != OLD.assignment_id)
+BEGIN SELECT RAISE(ABORT, 'Worker already has unfinished Ticket work in this role'); END;
+-- Keep archived responsibilities valid after Worker removal, but never allow
+-- newly installed identities to refer to a removed / removal-reserved Worker.
+DROP TRIGGER IF EXISTS ticket_active_worker_principal_insert;
+CREATE TRIGGER ticket_active_worker_principal_insert
+BEFORE INSERT ON ticket_current_worker_assignments
+WHEN NEW.principal_kind = 'worker' AND (
+ NOT EXISTS (SELECT 1 FROM worker_registry WHERE workspace_id = NEW.workspace_id
+    AND runtime_id = NEW.runtime_id AND worker_id = NEW.worker_id)
+ OR EXISTS (SELECT 1 FROM worker_removal_operations WHERE workspace_id = NEW.workspace_id
+    AND runtime_id = NEW.runtime_id AND worker_id = NEW.worker_id
+    AND state IN ('executing', 'failed', 'succeeded')))
+BEGIN SELECT RAISE(ABORT, 'Worker is missing or removal is reserved'); END;
+DROP TRIGGER IF EXISTS ticket_active_worker_principal_update;
+CREATE TRIGGER ticket_active_worker_principal_update
+BEFORE UPDATE ON ticket_current_worker_assignments
+WHEN NEW.principal_kind = 'worker' AND (
+ NOT EXISTS (SELECT 1 FROM worker_registry WHERE workspace_id = NEW.workspace_id
+    AND runtime_id = NEW.runtime_id AND worker_id = NEW.worker_id)
+ OR EXISTS (SELECT 1 FROM worker_removal_operations WHERE workspace_id = NEW.workspace_id
+    AND runtime_id = NEW.runtime_id AND worker_id = NEW.worker_id
+    AND state IN ('executing', 'failed', 'succeeded')))
+BEGIN SELECT RAISE(ABORT, 'Worker is missing or removal is reserved'); END;
+DROP TRIGGER IF EXISTS ticket_unfinished_work_blocks_worker_delete;
+CREATE TRIGGER ticket_unfinished_work_blocks_worker_delete
+BEFORE DELETE ON worker_registry
+WHEN EXISTS (SELECT 1 FROM ticket_active_worker_assignments
+    WHERE workspace_id = OLD.workspace_id AND runtime_id = OLD.runtime_id
+      AND worker_id = OLD.worker_id)
+BEGIN SELECT RAISE(ABORT, 'Worker has unfinished Ticket work'); END;
+DROP TRIGGER IF EXISTS ticket_unfinished_work_blocks_worker_move;
+CREATE TRIGGER ticket_unfinished_work_blocks_worker_move
+BEFORE UPDATE OF runtime_id, worker_id, workspace_id ON worker_registry
+WHEN (OLD.runtime_id != NEW.runtime_id OR OLD.worker_id != NEW.worker_id OR OLD.workspace_id != NEW.workspace_id)
+ AND EXISTS (SELECT 1 FROM ticket_active_worker_assignments
+    WHERE workspace_id = OLD.workspace_id AND runtime_id = OLD.runtime_id
+      AND worker_id = OLD.worker_id)
+BEGIN SELECT RAISE(ABORT, 'Worker has unfinished Ticket work'); END;

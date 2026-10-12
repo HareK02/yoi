@@ -574,6 +574,7 @@ where
                 attempt.instance_id, attempt.attempt_id
             )),
             max_turns: Some(12),
+            compaction_budget: None,
             engine_configurator: None,
             features,
             required_tools: &[

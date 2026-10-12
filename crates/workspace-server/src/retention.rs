@@ -1116,7 +1116,7 @@ mod tests {
         WorkerId::from_legacy_u64(1)
     }
     fn setup() -> SqliteWorkspaceStore {
-        let s = SqliteWorkspaceStore::in_memory().unwrap();
+        let s = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         s.with_conn(|c| {
             c.execute(
                 "INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at) \
@@ -1136,7 +1136,7 @@ mod tests {
             )?;
             c.execute(
                 "INSERT INTO typed_tickets (workspace_id, ticket_id, slug, title, status, kind, priority, body, workflow_state, workflow_state_explicit) \
-                 VALUES ('w', 'ticket', 'ticket', 'Ticket', 'open', 'task', 'normal', '', 'planning', 1)",
+                 VALUES ('w', 'ticket', 'ticket', 'Ticket', 'open', 'task', 'normal', '', 'open', 1)",
                 [],
             )?;
             Ok(())
@@ -1398,7 +1398,7 @@ mod tests {
         })
         .unwrap();
         s.with_conn(|conn| {
-            conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit) VALUES('w','ticket-old','ticket-old','Old Ticket','open','task','normal','','planning',1)", [])?;
+            conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit) VALUES('w','ticket-old','ticket-old','Old Ticket','open','task','normal','','open',1)", [])?;
             conn.execute("INSERT INTO worker_registry(workspace_id,worker_id,runtime_id,display_name,profile,retention_state,created_at,updated_at) VALUES('w','1','r','old worker','builtin:coder','normal','created','2026-08-24T00:00:00Z')", [])?;
             conn.execute("INSERT INTO worker_create_reservations(workspace_id,allocation_key,worker_id,runtime_id,create_fingerprint,state,created_at,updated_at) VALUES('w','allocation-old',?1,'r','fingerprint','created','created','created')", [worker_id().to_string()])?;
             conn.execute("INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,runtime_id,worker_id,assigned_by,assigned_at) VALUES('w','ticket-old','assignment-old','r','1','test','t')", [])?;
@@ -1522,24 +1522,38 @@ mod tests {
         install_current_assignment(s, "assignment").unwrap();
     }
 
-    fn reopened_terminal_assignment_store(terminal_state: &str) -> SqliteWorkspaceStore {
+    fn reopened_terminal_assignment_store() -> SqliteWorkspaceStore {
         let store = setup();
         seed_current_assignment(&store);
         store
             .with_conn(|conn| {
                 conn.execute(
-                    "UPDATE typed_tickets SET workflow_state=?1
+                    "UPDATE typed_tickets SET status='closed', workflow_state='closed'
                      WHERE workspace_id='w' AND ticket_id='ticket'",
-                    [terminal_state],
+                    [],
                 )?;
                 conn.execute(
-                    "UPDATE typed_tickets SET workflow_state='planning'
+                    "UPDATE typed_tickets SET status='open', workflow_state='open'
                      WHERE workspace_id='w' AND ticket_id='ticket'",
                     [],
                 )?;
                 Ok(())
             })
             .unwrap();
+        // Narrow lifecycle-schema evidence: closing durably releases work,
+        // while reopening retains routing without reviving that assignment.
+        let released: i64 = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM ticket_assignment_work_releases
+                WHERE workspace_id='w' AND assignment_id='assignment'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::from)
+            })
+            .unwrap();
+        assert_eq!(released, 1);
         store
     }
 
@@ -1646,103 +1660,93 @@ mod tests {
 
     #[test]
     fn terminal_retained_assignment_allows_worker_removal_even_after_reopen() {
-        for (status, workflow_state) in [("closed", "closed"), ("open", "done")] {
-            for reopen in [false, true] {
-                let store = setup();
-                seed_current_assignment(&store);
-                store
-                    .with_conn(|conn| {
-                        conn.execute(
-                            "UPDATE typed_tickets SET status=?1, workflow_state=?2
+        for reopen in [false, true] {
+            let store = setup();
+            seed_current_assignment(&store);
+            store
+                .with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE typed_tickets SET status='closed', workflow_state='closed'
                              WHERE workspace_id='w' AND ticket_id='ticket'",
-                            params![status, workflow_state],
-                        )?;
-                        if reopen {
-                            conn.execute(
-                                "UPDATE typed_tickets SET status='open', workflow_state='planning'
+                        [],
+                    )?;
+                    if reopen {
+                        conn.execute(
+                            "UPDATE typed_tickets SET status='open', workflow_state='open'
                                  WHERE workspace_id='w' AND ticket_id='ticket'",
-                                [],
-                            )?;
-                        }
-                        Ok(())
-                    })
-                    .unwrap();
-                store
-                    .update_worker_retention_policy(
-                        "w",
-                        &store
-                            .worker_retention_policy("w")
-                            .unwrap()
-                            .unwrap()
-                            .policy_digest,
-                        &WorkerRetentionPolicyUpdate {
-                            policy_id: "purge".into(),
-                            session_disposition: SessionDisposition::Purge,
-                            metadata_disposition: MetadataDisposition::Tombstone,
-                            archive_retention: ArchiveRetention::Forever,
-                            diagnostics_disposition: DiagnosticsDisposition::Purge,
-                            diagnostics_retention_seconds: None,
-                        },
-                    )
-                    .unwrap();
-                let plan = store.plan_worker_removal(&req(), &inv()).unwrap();
-                assert!(
-                    plan.blockers.is_empty(),
-                    "{status}/{workflow_state}, reopened={reopen}"
-                );
-                store
-                    .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
-                    .unwrap();
-                let result = WorkerRetentionExecutionResult {
-                    operation_id: plan.operation_id.clone(),
-                    input_fingerprint: plan.input_fingerprint.clone(),
-                    worker_id: worker_id(),
-                    session_disposition: plan.session_disposition,
-                    diagnostics_disposition: plan.diagnostics_disposition,
-                    archive: None,
-                    source_removed: true,
-                    diagnostics_retained: false,
-                };
-                let committed = store
-                    .commit_worker_removal(
-                        "w",
-                        &plan.operation_id,
-                        &plan.input_fingerprint,
-                        &result,
-                    )
-                    .unwrap();
-                assert_eq!(committed.plan.state, WorkerRemovalPlanState::Succeeded);
-                assert!(
-                    store
-                        .get_worker_registry("w", &plan.worker)
+                            [],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            store
+                .update_worker_retention_policy(
+                    "w",
+                    &store
+                        .worker_retention_policy("w")
                         .unwrap()
-                        .is_none()
-                );
-                assert!(store.worker_tombstone("w", &plan.worker).unwrap().is_some());
-                let (retained, historical): (i64, i64) = store
-                    .with_conn(|conn| {
-                        Ok((
-                            conn.query_row(
-                                "SELECT COUNT(*) FROM ticket_current_worker_assignments
+                        .unwrap()
+                        .policy_digest,
+                    &WorkerRetentionPolicyUpdate {
+                        policy_id: "purge".into(),
+                        session_disposition: SessionDisposition::Purge,
+                        metadata_disposition: MetadataDisposition::Tombstone,
+                        archive_retention: ArchiveRetention::Forever,
+                        diagnostics_disposition: DiagnosticsDisposition::Purge,
+                        diagnostics_retention_seconds: None,
+                    },
+                )
+                .unwrap();
+            let plan = store.plan_worker_removal(&req(), &inv()).unwrap();
+            assert!(plan.blockers.is_empty(), "closed case, reopened={reopen}");
+            store
+                .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+                .unwrap();
+            let result = WorkerRetentionExecutionResult {
+                operation_id: plan.operation_id.clone(),
+                input_fingerprint: plan.input_fingerprint.clone(),
+                worker_id: worker_id(),
+                session_disposition: plan.session_disposition,
+                diagnostics_disposition: plan.diagnostics_disposition,
+                archive: None,
+                source_removed: true,
+                diagnostics_retained: false,
+            };
+            let committed = store
+                .commit_worker_removal("w", &plan.operation_id, &plan.input_fingerprint, &result)
+                .unwrap();
+            assert_eq!(committed.plan.state, WorkerRemovalPlanState::Succeeded);
+            assert!(
+                store
+                    .get_worker_registry("w", &plan.worker)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(store.worker_tombstone("w", &plan.worker).unwrap().is_some());
+            let (retained, historical): (i64, i64) = store
+                .with_conn(|conn| {
+                    Ok((
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM ticket_current_worker_assignments
                                  WHERE workspace_id='w' AND assignment_id='assignment'",
-                                [],
-                                |row| row.get(0),
-                            )?,
-                            conn.query_row(
-                                "SELECT COUNT(*) FROM ticket_worker_assignments
+                            [],
+                            |row| row.get(0),
+                        )?,
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM ticket_worker_assignments
                                  WHERE workspace_id='w' AND assignment_id='assignment'",
-                                [],
-                                |row| row.get(0),
-                            )?,
-                        ))
-                    })
-                    .unwrap();
-                assert_eq!(
-                    (retained, historical),
-                    (1, 1),
-                    "assignment history must survive removal"
-                );
-            }
+                            [],
+                            |row| row.get(0),
+                        )?,
+                    ))
+                })
+                .unwrap();
+            assert_eq!(
+                (retained, historical),
+                (1, 1),
+                "assignment history must survive removal"
+            );
         }
     }
 
@@ -1768,42 +1772,40 @@ mod tests {
 
     #[test]
     fn distinct_assignment_after_terminal_end_blocks_preparation() {
-        for terminal_state in ["done", "closed"] {
-            let store = reopened_terminal_assignment_store(terminal_state);
-            let plan = store.plan_worker_removal(&req(), &inv()).unwrap();
-            assert!(plan.blockers.is_empty());
-            install_current_assignment(&store, "new-assignment").unwrap();
-            let blocked = store.plan_worker_removal(&req(), &inv()).unwrap();
-            assert_eq!(
-                blocked.blockers,
-                vec![WorkerRemovalBlocker::UnfinishedWork {
-                    assignment_id: "new-assignment".into(),
-                    ticket_id: "ticket".into(),
-                }]
-            );
-            let replay = store.plan_worker_removal(&req(), &inv()).unwrap();
-            assert_eq!(replay.plan_id, blocked.plan_id);
-            assert_eq!(replay.input_fingerprint, blocked.input_fingerprint);
-            assert_ne!(blocked.plan_id, plan.plan_id);
-            let error = store
-                .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
-                .unwrap_err();
-            assert!(
-                matches!(error, WorkerRetentionError::StalePlan { reason, .. }
+        let store = reopened_terminal_assignment_store();
+        let plan = store.plan_worker_removal(&req(), &inv()).unwrap();
+        assert!(plan.blockers.is_empty());
+        install_current_assignment(&store, "new-assignment").unwrap();
+        let blocked = store.plan_worker_removal(&req(), &inv()).unwrap();
+        assert_eq!(
+            blocked.blockers,
+            vec![WorkerRemovalBlocker::UnfinishedWork {
+                assignment_id: "new-assignment".into(),
+                ticket_id: "ticket".into(),
+            }]
+        );
+        let replay = store.plan_worker_removal(&req(), &inv()).unwrap();
+        assert_eq!(replay.plan_id, blocked.plan_id);
+        assert_eq!(replay.input_fingerprint, blocked.input_fingerprint);
+        assert_ne!(blocked.plan_id, plan.plan_id);
+        let error = store
+            .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+            .unwrap_err();
+        assert!(
+            matches!(error, WorkerRetentionError::StalePlan { reason, .. }
                 if reason == "unfinished work added")
-            );
-            assert!(
-                store
-                    .get_worker_registry("w", &plan.worker)
-                    .unwrap()
-                    .is_some()
-            );
-        }
+        );
+        assert!(
+            store
+                .get_worker_registry("w", &plan.worker)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
     fn prepared_removal_fences_distinct_assignment_after_terminal_end() {
-        let store = reopened_terminal_assignment_store("done");
+        let store = reopened_terminal_assignment_store();
         let plan = store.plan_worker_removal(&req(), &inv()).unwrap();
         store
             .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
@@ -1837,7 +1839,7 @@ mod tests {
 
     #[test]
     fn commit_rechecks_distinct_assignment_independently_of_admission_fence() {
-        let store = reopened_terminal_assignment_store("done");
+        let store = reopened_terminal_assignment_store();
         let plan = store.plan_worker_removal(&req(), &inv()).unwrap();
         store
             .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
@@ -1938,7 +1940,7 @@ mod tests {
         store
             .with_conn(|conn| {
                 conn.execute(
-                    "UPDATE typed_tickets SET workflow_state='done'
+                    "UPDATE typed_tickets SET status='closed', workflow_state='closed'
                      WHERE workspace_id='w' AND ticket_id='ticket'",
                     [],
                 )?;

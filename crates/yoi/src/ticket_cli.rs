@@ -4,9 +4,10 @@ use std::path::PathBuf;
 
 use client::{BackendWorkspaceProductClient, ResolvedTarget};
 use ticket::{
-    MarkdownText, NewTicket, NewTicketEvent, NewTicketRelation, TicketBackend,
-    TicketDoctorSeverity, TicketEventKind, TicketIdOrSlug, TicketListQuery, TicketListState,
-    TicketRelationKind, TicketSummary, TicketWorkflowState,
+    NewTicket, NewTicketEvent, NewTicketRelation, TicketBackend, TicketCaseAction,
+    TicketCaseUpdate, TicketClosureReason, TicketDoctorSeverity, TicketEventKind, TicketIdOrSlug,
+    TicketListQuery, TicketListState, TicketReference, TicketRelationKind, TicketState,
+    TicketSummary,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -26,8 +27,7 @@ pub enum TicketCommand {
     List(ListOptions),
     Show { query: String },
     Comment(CommentOptions),
-    State(StateOptions),
-    Close(CloseOptions),
+    Case(CaseOptions),
     Relation(RelationOptions),
     Doctor,
 }
@@ -57,26 +57,20 @@ pub struct CommentOptions {
     pub body: BodySource,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StateTarget {
-    Planning,
-    Ready,
-    Queued,
-    InProgress,
-    Done,
-    Closed,
-}
-
+/// Explicit preconditions are required instead of silently refreshing them from
+/// show. Repeating the same argv (and file bytes) submits the exact same request,
+/// even after the original action changed the case state or closure key.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StateOptions {
+pub struct CaseOptions {
     pub query: String,
-    pub state: StateTarget,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CloseOptions {
-    pub query: String,
-    pub resolution: BodySource,
+    pub expected_content_digest: String,
+    pub expected_state: TicketState,
+    pub expected_closure_operation_key: Option<String>,
+    pub operation_key: String,
+    pub action: TicketCaseAction,
+    pub explanation: BodySource,
+    pub references: Vec<TicketReference>,
+    pub author: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,8 +151,9 @@ pub fn parse_ticket_args(args: &[String]) -> Result<TicketCli, TicketCliError> {
             query: parse_one_positional("show", &args[1..])?,
         },
         "comment" => TicketCommand::Comment(parse_comment(&args[1..])?),
-        "state" => TicketCommand::State(parse_state(&args[1..])?),
-        "close" => TicketCommand::Close(parse_close(&args[1..])?),
+        "close" | "reopen" | "correct-closure" => {
+            TicketCommand::Case(parse_case(&args[0], &args[1..])?)
+        }
         "relation" => TicketCommand::Relation(parse_relation(&args[1..])?),
         "doctor" => {
             if args.len() != 1 {
@@ -211,8 +206,7 @@ fn run_backend_command(
         TicketCommand::List(options) => list(backend, options),
         TicketCommand::Show { query } => show(backend, query),
         TicketCommand::Comment(options) => comment(backend, options),
-        TicketCommand::State(options) => state(backend, options),
-        TicketCommand::Close(options) => close(backend, options),
+        TicketCommand::Case(options) => update_case(backend, options),
         TicketCommand::Relation(options) => relation(backend, options),
         TicketCommand::Doctor => doctor(backend),
     }
@@ -272,6 +266,19 @@ fn show(backend: &dyn TicketBackend, query: String) -> Result<TicketCliOutput, T
     stdout.push_str(&format!("# {}\n\n", ticket.meta.title));
     stdout.push_str(&format!("State: {}\n", ticket.meta.workflow_state.as_str()));
     stdout.push_str(&format!("ID: {}\n", ticket.meta.id));
+    stdout.push_str(&format!(
+        "Content digest: {}\nClosure operation key: {}\n",
+        ticket::ticket_content_digest(&ticket),
+        closure_key_token(ticket.closure_operation_key.as_deref())
+    ));
+    if let Some(closure) = &ticket.current_closure {
+        stdout.push_str(&format!(
+            "Closure reason: {}\nClosure author: {}\nClosure explanation: {}\n",
+            closure_reason_label(&closure.reason),
+            closure.author,
+            closure.explanation
+        ));
+    }
     if let Some(updated_at) = &ticket.meta.updated_at {
         stdout.push_str(&format!("Updated: {updated_at}\n"));
     }
@@ -393,6 +400,16 @@ fn show(backend: &dyn TicketBackend, query: String) -> Result<TicketCliOutput, T
     Ok(success(stdout))
 }
 
+// Escape reserved tokens so show supplies usable CAS even when an actual key
+// equals "none" or begins with the literal-key prefix.
+fn closure_key_token(key: Option<&str>) -> String {
+    match key {
+        None => "none".into(),
+        Some(key) if key == "none" || key.starts_with("key:") => format!("key:{key}"),
+        Some(key) => key.into(),
+    }
+}
+
 fn is_obsolete_ticket_frontmatter_key(key: &str) -> bool {
     matches!(
         key,
@@ -411,63 +428,52 @@ fn comment(
     Ok(success(format!("appended\t{}\t{}\n", options.query, role)))
 }
 
-fn state(
+fn update_case(
     backend: &dyn TicketBackend,
-    options: StateOptions,
+    options: CaseOptions,
 ) -> Result<TicketCliOutput, TicketCliError> {
-    let id = TicketIdOrSlug::Query(options.query.clone());
-    let target_state = match options.state {
-        StateTarget::Planning => TicketWorkflowState::Planning,
-        StateTarget::Ready => {
-            return Err(TicketCliError::new(
-                "ready requires Workspace repository authority; use the Browser Mark ready action or TicketMarkReady",
-            ));
-        }
-        StateTarget::Queued => {
-            return Err(TicketCliError::new(
-                "queued is an Orchestrator operation; use TicketQueue after MarkReady succeeds",
-            ));
-        }
-        StateTarget::InProgress => TicketWorkflowState::InProgress,
-        StateTarget::Done => {
-            return Err(TicketCliError::new(
-                "done is guarded by CompleteMergeRequest with an approved exact source ref and operation_id",
-            ));
-        }
-        StateTarget::Closed => {
-            return Err(TicketCliError::new(
-                "yoi ticket state <ticket> closed cannot write resolution.md; use `yoi ticket close <ticket> --resolution <text>` instead",
-            ));
-        }
+    let explanation = match &options.explanation {
+        BodySource::Message(text) => text.clone(),
+        BodySource::File(path) => fs::read_to_string(path).map_err(|error| {
+            TicketCliError::new(format!("failed to read {}: {error}", path.display()))
+        })?,
     };
-    let current = backend.show(id.clone())?;
-    let ticket_id = current.meta.id.clone();
-    let from = current.meta.workflow_state;
-    let change = ticket::TicketStateChange {
-        from: from.as_str().to_string(),
-        to: target_state.as_str().to_string(),
-        reason: "cli_state".to_string(),
-        author: Some("yoi ticket".to_string()),
-        body: format!("State changed to `{}`.\n", target_state.as_str()).into(),
-        references: Vec::new(),
-    };
-    backend.set_workflow_state(id, change)?;
+    require_nonblank("explanation", &explanation)?;
+    // Resolve identity only. Never rewrite the explicit CAS with this snapshot:
+    // doing so would change the fingerprint of an exact replay.
+    let current = backend.show(TicketIdOrSlug::Query(options.query))?;
+    let operation_key = options.operation_key.clone();
+    let updated = backend.update_case(
+        &current.meta.id,
+        TicketCaseUpdate {
+            expected_content_digest: options.expected_content_digest,
+            expected_state: options.expected_state,
+            expected_closure_operation_key: options.expected_closure_operation_key,
+            operation_key: options.operation_key,
+            action: options.action,
+            explanation,
+            references: options.references,
+            author: Some(options.author),
+        },
+    )?;
+    // A replay returns current authority, which may already have been reopened.
+    // Report that state, not an inferred "closed"/"completed" success.
     Ok(success(format!(
-        "state\t{}\t{}\n",
-        ticket_id,
-        target_state.as_str()
+        "case\t{}\t{}\toperation-key:{}\n",
+        updated.meta.id,
+        updated.meta.workflow_state.as_str(),
+        operation_key
     )))
 }
 
-fn close(
-    backend: &dyn TicketBackend,
-    options: CloseOptions,
-) -> Result<TicketCliOutput, TicketCliError> {
-    backend.close(
-        TicketIdOrSlug::Query(options.query.clone()),
-        MarkdownText::new(read_body_source(&options.resolution)?),
-    )?;
-    Ok(success(format!("closed\t{}\n", options.query)))
+fn closure_reason_label(reason: &TicketClosureReason) -> String {
+    match reason {
+        TicketClosureReason::Completed => "completed".into(),
+        TicketClosureReason::NotPlanned => "not_planned".into(),
+        TicketClosureReason::Duplicate => "duplicate".into(),
+        TicketClosureReason::Unknown => "unknown".into(),
+        TicketClosureReason::Other(text) => format!("other:{text}"),
+    }
 }
 
 fn relation(
@@ -721,47 +727,152 @@ fn parse_comment(args: &[String]) -> Result<CommentOptions, TicketCliError> {
     })
 }
 
-fn parse_state(args: &[String]) -> Result<StateOptions, TicketCliError> {
-    if args.len() != 2 {
-        return Err(TicketCliError::new(
-            "state requires <id> <planning|ready|queued|inprogress|done|closed>",
-        ));
-    }
-    Ok(StateOptions {
-        query: args[0].clone(),
-        state: parse_state_target(&args[1])?,
-    })
-}
-
-fn parse_close(args: &[String]) -> Result<CloseOptions, TicketCliError> {
+fn parse_case(command: &str, args: &[String]) -> Result<CaseOptions, TicketCliError> {
     if args.is_empty() || args[0].starts_with('-') {
-        return Err(TicketCliError::new("close requires <id>"));
+        return Err(TicketCliError::new(format!("{command} requires <id>")));
     }
     let query = args[0].clone();
+    let mut digest = None;
+    let mut state = None;
+    let mut closure_key = None;
+    let mut operation_key = None;
+    let mut reason = None;
+    let mut explanation = None;
     let mut file = None;
-    let mut resolution = None;
+    let mut references = Vec::new();
+    let mut author = None;
+    let mut seen = std::collections::BTreeSet::new();
     let mut i = 1;
     while i < args.len() {
-        match option_with_value(args, &mut i)? {
-            Some(("--resolution", value)) => resolution = Some(value),
-            Some(("--file", value)) => file = Some(PathBuf::from(value)),
-            Some((name, _)) => {
-                return Err(TicketCliError::new(format!(
-                    "unknown close argument: {name}"
-                )));
+        let Some((name, value)) = option_with_value(args, &mut i)? else {
+            return Err(TicketCliError::new(format!(
+                "unknown {command} argument: {}",
+                args[i]
+            )));
+        };
+        if name != "--reference" && !seen.insert(name) {
+            return Err(TicketCliError::new(format!(
+                "{name} may only be supplied once"
+            )));
+        }
+        require_nonblank(name, &value)?;
+        match name {
+            "--expected-content-digest" => {
+                if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(TicketCliError::new(
+                        "--expected-content-digest requires a SHA-256 hex digest",
+                    ));
+                }
+                digest = Some(value);
             }
-            None => {
+            "--expected-state" => {
+                state = Some(TicketState::parse(&value).ok_or_else(|| {
+                    TicketCliError::new("--expected-state requires open or closed")
+                })?)
+            }
+            "--expected-closure-operation-key" => {
+                closure_key = Some(if value == "none" {
+                    None
+                } else {
+                    let key = value.strip_prefix("key:").unwrap_or(&value);
+                    require_nonblank("closure operation key", key)?;
+                    Some(key.to_string())
+                });
+            }
+            "--operation-key" => operation_key = Some(value),
+            "--reason" if command != "reopen" => reason = Some(parse_closure_reason(&value)?),
+            "--explanation" => explanation = Some(value),
+            "--file" => file = Some(PathBuf::from(value)),
+            "--reference" => {
+                let (kind, target) = value
+                    .split_once(':')
+                    .ok_or_else(|| TicketCliError::new("--reference requires <kind>:<target>"))?;
+                require_nonblank("reference kind", kind)?;
+                require_nonblank("reference target", target)?;
+                references.push(TicketReference {
+                    kind: kind.into(),
+                    target: target.into(),
+                });
+            }
+            "--author" => author = Some(value),
+            _ => {
                 return Err(TicketCliError::new(format!(
-                    "unknown close argument: {}",
-                    args[i]
+                    "unknown {command} argument: {name}"
                 )));
             }
         }
     }
-    Ok(CloseOptions {
+    let action = match command {
+        "reopen" => TicketCaseAction::Reopen,
+        "close" => TicketCaseAction::Close {
+            reason: reason.ok_or_else(|| TicketCliError::new("close requires --reason"))?,
+        },
+        "correct-closure" => TicketCaseAction::CorrectClosure {
+            reason: reason
+                .ok_or_else(|| TicketCliError::new("correct-closure requires --reason"))?,
+        },
+        _ => unreachable!("case command is selected by the command parser"),
+    };
+    let explanation = match (file, explanation) {
+        (Some(path), None) => BodySource::File(path),
+        (None, Some(text)) => BodySource::Message(text),
+        _ => {
+            return Err(TicketCliError::new(format!(
+                "{command} requires exactly one of --explanation or --file"
+            )));
+        }
+    };
+    Ok(CaseOptions {
         query,
-        resolution: exactly_one_body("close", file, resolution)?,
+        expected_content_digest: digest
+            .ok_or_else(|| TicketCliError::new("case action requires --expected-content-digest"))?,
+        expected_state: state
+            .ok_or_else(|| TicketCliError::new("case action requires --expected-state"))?,
+        expected_closure_operation_key: closure_key.ok_or_else(|| {
+            TicketCliError::new("case action requires --expected-closure-operation-key <key|none>")
+        })?,
+        operation_key: operation_key
+            .ok_or_else(|| TicketCliError::new("case action requires --operation-key"))?,
+        action,
+        explanation,
+        references,
+        // A stable default keeps retries independent of process environment.
+        author: author.unwrap_or_else(|| "yoi ticket".into()),
     })
+}
+
+fn require_nonblank(name: &str, value: &str) -> Result<(), TicketCliError> {
+    if value.trim().is_empty() || value.contains('\0') {
+        Err(TicketCliError::new(format!(
+            "{name} must be nonblank and contain no NUL"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_closure_reason(value: &str) -> Result<TicketClosureReason, TicketCliError> {
+    match value {
+        "completed" => Ok(TicketClosureReason::Completed),
+        "not_planned" => Ok(TicketClosureReason::NotPlanned),
+        "duplicate" => Ok(TicketClosureReason::Duplicate),
+        "unknown" => Ok(TicketClosureReason::Unknown),
+        _ => {
+            if let Some(text) = value.strip_prefix("other:") {
+                require_nonblank("other reason", text)?;
+                if text.len() > 1024 {
+                    return Err(TicketCliError::new(
+                        "other reason must be at most 1024 UTF-8 bytes",
+                    ));
+                }
+                Ok(TicketClosureReason::Other(text.into()))
+            } else {
+                Err(TicketCliError::new(
+                    "--reason requires completed, not_planned, duplicate, unknown, or other:<text>",
+                ))
+            }
+        }
+    }
 }
 
 fn parse_one_positional(command: &str, args: &[String]) -> Result<String, TicketCliError> {
@@ -783,7 +894,14 @@ fn option_with_value(
         "--role",
         "--file",
         "--message",
-        "--resolution",
+        "--reason",
+        "--explanation",
+        "--expected-content-digest",
+        "--expected-state",
+        "--expected-closure-operation-key",
+        "--operation-key",
+        "--reference",
+        "--author",
         "--ticket",
         "--kind",
         "--target",
@@ -831,7 +949,7 @@ fn parse_list_state(raw: &str) -> Result<ListState, TicketCliError> {
         .any(|token| *token == "active" || *token == "all")
     {
         return Err(TicketCliError::new(
-            "--state active/all cannot be mixed with workflow states",
+            "--state active/all cannot be mixed with case states",
         ));
     }
 
@@ -839,7 +957,7 @@ fn parse_list_state(raw: &str) -> Result<ListState, TicketCliError> {
     for token in tokens {
         let state = TicketListState::parse(token).ok_or_else(|| {
             TicketCliError::new(format!(
-                "invalid state: {token}; expected active, all, planning, ready, queued, inprogress, done, closed"
+                "invalid state: {token}; expected active, all, open, closed"
             ))
         })?;
         if !states.contains(&state) {
@@ -878,18 +996,6 @@ fn truncate_inline(text: &str, max_chars: usize) -> String {
     out
 }
 
-fn parse_state_target(value: &str) -> Result<StateTarget, TicketCliError> {
-    match value {
-        "planning" => Ok(StateTarget::Planning),
-        "ready" => Ok(StateTarget::Ready),
-        "queued" => Ok(StateTarget::Queued),
-        "inprogress" => Ok(StateTarget::InProgress),
-        "done" => Ok(StateTarget::Done),
-        "closed" => Ok(StateTarget::Closed),
-        _ => Err(TicketCliError::new(format!("invalid state: {value}"))),
-    }
-}
-
 fn parse_comment_role(value: &str) -> Result<TicketEventKind, TicketCliError> {
     match value {
         "comment" => Ok(TicketEventKind::Comment),
@@ -909,12 +1015,12 @@ fn exactly_one_body(
 ) -> Result<BodySource, TicketCliError> {
     match (file, message) {
         (Some(_), Some(_)) => Err(TicketCliError::new(format!(
-            "{command} accepts exactly one of --file or --message/--resolution"
+            "{command} accepts exactly one of --file or --message"
         ))),
         (Some(path), None) => Ok(BodySource::File(path)),
         (None, Some(message)) => Ok(BodySource::Message(ensure_trailing_newline(message))),
         (None, None) => Err(TicketCliError::new(format!(
-            "{command} requires --file or --message/--resolution"
+            "{command} requires --file or --message"
         ))),
     }
 }
@@ -942,7 +1048,48 @@ fn default_author() -> String {
 }
 
 fn help_text() -> &'static str {
-    "yoi ticket\n\nUsage:\n  yoi ticket create --title <title>\n  yoi ticket list [--state active|all|planning|ready|queued|inprogress|done|closed[,..]] [--limit <n>]\n  yoi ticket show <id>\n  yoi ticket comment <id> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket state <id> <planning|ready|queued|inprogress|closed>\n  yoi ticket close <id> (--resolution <text>|--file <path>)\n  yoi ticket relation add --ticket <id> --kind <depends_on|blocks|related|supersedes|duplicate_of> --target <id> [--note <text>]\n  yoi ticket relation list [--ticket <id>] [--kind <kind>]\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nTargets:\n  Ticket commands require the Workspace-scoped Backend selected by the shared client Target.\n  Standalone never falls back to repository-local Ticket storage.\n"
+    "yoi ticket
+
+Usage:
+  yoi ticket create --title <title>
+  yoi ticket list [--state active|all|open|closed[,..]] [--limit <n>]
+  yoi ticket show <id>
+  yoi ticket comment <id> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)
+  yoi ticket close <id> --reason <reason> <case-options>
+  yoi ticket reopen <id> <case-options>
+  yoi ticket correct-closure <id> --reason <reason> <case-options>
+  yoi ticket relation add --ticket <id> --kind <depends_on|blocks|related|supersedes|duplicate_of> --target <id> [--note <text>]
+  yoi ticket relation list [--ticket <id>] [--kind <kind>]
+  yoi ticket doctor
+
+Case options (required for close, reopen, correct-closure):
+  --expected-content-digest <sha256>   Content digest from show
+  --expected-state <open|closed>       Observed case state
+  --expected-closure-operation-key <key|none>   Last closure key from show, retained after reopening
+  --operation-key <key>               Stable key for this decision
+  --explanation <text> | --file <path> Exactly one nonblank explanation source
+  --reference <kind>:<target>          Optional; repeat for multiple references
+  --author <author>                    Optional; defaults to yoi ticket
+
+Closure reasons:
+  completed | not_planned | duplicate | unknown | other:<text>
+  Closing does not imply completion; a reason must be explicitly supplied.
+
+Replay:
+  Repeat the same operation key, CAS values, reason, explanation bytes, references,
+  and author for an exact replay. Do not refresh CAS values on a retry.
+  Keep --file contents unchanged. Output reports current Backend case state,
+  which may differ from the original action after subsequent decisions.
+  The literal none denotes an absent closure key; active lists open cases.
+  Prefix a closure key with key: to use a literal value (e.g. key:none or key:key:foo).
+
+Options:
+  -h, --help    Print help
+
+Targets:
+  Ticket commands require the Workspace-scoped Backend selected by the shared client Target.
+  Standalone never falls back to repository-local Ticket storage.
+"
 }
 
 #[cfg(test)]
@@ -973,5 +1120,545 @@ mod tests {
         let output = run(TicketCli::Help, ResolvedTarget::Standalone).unwrap();
         assert!(output.stdout.contains("Workspace-scoped Backend"));
         assert!(!output.stdout.contains("repository-file Ticket backend"));
+    }
+
+    fn case_args(command: &str, reason: Option<&str>) -> Vec<String> {
+        let mut argv = args(&[
+            command,
+            "example",
+            "--expected-content-digest",
+            &"a".repeat(64),
+            "--expected-state",
+            "open",
+            "--expected-closure-operation-key",
+            "none",
+            "--operation-key",
+            "decision-1",
+            "--explanation",
+            "Intentional decision.",
+        ]);
+        if let Some(reason) = reason {
+            argv.extend(args(&["--reason", reason]));
+        }
+        argv
+    }
+
+    fn command(argv: &[String]) -> TicketCommand {
+        match parse_ticket_args(argv).unwrap() {
+            TicketCli::Command(command) => command,
+            TicketCli::Help => panic!("expected command"),
+        }
+    }
+
+    fn replace_value(argv: &mut [String], flag: &str, value: &str) {
+        let index = argv.iter().position(|arg| arg == flag).unwrap();
+        argv[index + 1] = value.into();
+    }
+
+    #[test]
+    fn case_commands_require_explicit_reason_and_explanation_with_replay_preconditions() {
+        for name in ["close", "reopen", "correct-closure"] {
+            let reason = (name != "reopen").then_some("unknown");
+            let argv = case_args(name, reason);
+            assert!(parse_ticket_args(&argv).is_ok(), "{name}");
+            for flag in [
+                "--expected-content-digest",
+                "--expected-state",
+                "--expected-closure-operation-key",
+                "--operation-key",
+                "--explanation",
+            ] {
+                let mut missing = argv.clone();
+                let index = missing.iter().position(|arg| arg == flag).unwrap();
+                missing.drain(index..index + 2);
+                assert!(
+                    parse_ticket_args(&missing).is_err(),
+                    "{name} missing {flag}"
+                );
+                let mut blank = argv.clone();
+                replace_value(&mut blank, flag, " \n ");
+                assert!(parse_ticket_args(&blank).is_err(), "{name} blank {flag}");
+            }
+        }
+        for name in ["close", "correct-closure"] {
+            assert!(
+                parse_ticket_args(&case_args(name, None))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires --reason")
+            );
+        }
+        assert!(parse_ticket_args(&case_args("reopen", Some("completed"))).is_err());
+        for name in ["state", "complete"] {
+            assert!(parse_ticket_args(&args(&[name, "example", "closed"])).is_err());
+        }
+    }
+
+    #[test]
+    fn close_and_correction_parse_each_reason_without_a_success_default() {
+        for name in ["close", "correct-closure"] {
+            for (raw, expected) in [
+                ("completed", TicketClosureReason::Completed),
+                ("not_planned", TicketClosureReason::NotPlanned),
+                ("duplicate", TicketClosureReason::Duplicate),
+                ("unknown", TicketClosureReason::Unknown),
+                (
+                    "other:Deferred pending budget",
+                    TicketClosureReason::Other("Deferred pending budget".into()),
+                ),
+            ] {
+                let TicketCommand::Case(options) = command(&case_args(name, Some(raw))) else {
+                    panic!()
+                };
+                let actual = match options.action {
+                    TicketCaseAction::Close { reason }
+                    | TicketCaseAction::CorrectClosure { reason } => reason,
+                    TicketCaseAction::Reopen => panic!(),
+                };
+                assert_eq!(actual, expected);
+            }
+            for raw in [
+                "success",
+                "other:",
+                "other:  ",
+                "other:\0",
+                &format!("other:{}", "é".repeat(513)),
+            ] {
+                assert!(
+                    parse_ticket_args(&case_args(name, Some(raw))).is_err(),
+                    "{raw:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn case_parser_rejects_ambiguous_or_malformed_requests() {
+        let base = case_args("close", Some("not_planned"));
+        for (flag, value) in [
+            ("--expected-content-digest", "not-a-digest"),
+            ("--expected-state", "running"),
+            ("--operation-key", "key\0"),
+            ("--reference", "missing-separator"),
+            ("--reference", ":target"),
+            ("--reference", "result:"),
+            ("--author", " "),
+        ] {
+            let mut argv = base.clone();
+            if argv.iter().any(|arg| arg == flag) {
+                replace_value(&mut argv, flag, value);
+            } else {
+                argv.extend(args(&[flag, value]));
+            }
+            assert!(parse_ticket_args(&argv).is_err(), "{flag} {value:?}");
+        }
+        for extra in [
+            args(&["--file", "explanation.md"]),
+            args(&["--operation-key", "second"]),
+            args(&["--resolution", "old untyped close"]),
+        ] {
+            let mut argv = base.clone();
+            argv.extend(extra);
+            assert!(parse_ticket_args(&argv).is_err());
+        }
+    }
+
+    #[test]
+    fn list_accepts_only_case_states_and_active_means_open() {
+        for (raw, expected) in [
+            ("active", ListState::Active),
+            ("all", ListState::All),
+            ("open", ListState::States(vec![TicketListState::Open])),
+            ("closed", ListState::States(vec![TicketListState::Closed])),
+            (
+                "open,closed,open",
+                ListState::States(vec![TicketListState::Open, TicketListState::Closed]),
+            ),
+        ] {
+            let TicketCommand::List(options) = command(&args(&["list", "--state", raw])) else {
+                panic!()
+            };
+            assert_eq!(options.state, expected);
+        }
+        for raw in ["running", "active,closed", "all,open"] {
+            assert!(parse_ticket_args(&args(&["list", "--state", raw])).is_err());
+        }
+        let fake = FakeBackend::new();
+        run_backend_command(command(&args(&["list"])), &fake).unwrap();
+        assert_eq!(
+            fake.list_filter.borrow().as_ref(),
+            Some(&TicketListQuery::active())
+        );
+    }
+
+    // Narrow in-memory adapter: no Workspace, product process, network, or
+    // filesystem Ticket storage. Unused authority methods panic so no fallback
+    // event/state/storage operation can make these runtime tests pass.
+    struct FakeBackend {
+        current: std::cell::RefCell<ticket::Ticket>,
+        receipts: std::cell::RefCell<std::collections::BTreeMap<String, TicketCaseUpdate>>,
+        requests: std::cell::RefCell<Vec<(String, TicketCaseUpdate)>>,
+        list_filter: std::cell::RefCell<Option<TicketListQuery>>,
+    }
+
+    fn fixture() -> ticket::Ticket {
+        ticket::Ticket {
+            meta: ticket::TicketMeta {
+                id: "T-example".into(),
+                resource_key: None,
+                slug: "example".into(),
+                title: "Case judgment".into(),
+                status: ticket::ExtensibleTicketStatus::Open,
+                kind: "task".into(),
+                priority: "normal".into(),
+                labels: vec![],
+                created_at: None,
+                updated_at: None,
+                assignee: None,
+                readiness: None,
+                risk_flags: vec![],
+                workflow_state: TicketState::Open,
+                workflow_state_explicit: true,
+                queued_by: None,
+                queued_at: None,
+                targets: vec![],
+                raw: Default::default(),
+            },
+            document: ticket::TicketDocument {
+                body: "Requirements".into(),
+                raw_frontmatter: Default::default(),
+            },
+            events: vec![],
+            artifacts: vec![],
+            relations: Default::default(),
+            resolution: None,
+            closure_operation_key: None,
+            current_closure: None,
+            case_history: vec![],
+            legacy_workflow_snapshot: None,
+            tags: vec![],
+        }
+    }
+
+    impl FakeBackend {
+        fn new() -> Self {
+            Self {
+                current: std::cell::RefCell::new(fixture()),
+                receipts: Default::default(),
+                requests: Default::default(),
+                list_filter: Default::default(),
+            }
+        }
+
+        fn argv(&self, action: &str, reason: Option<&str>, key: &str) -> Vec<String> {
+            let current = self.current.borrow();
+            let mut argv = case_args(action, reason);
+            replace_value(
+                &mut argv,
+                "--expected-content-digest",
+                &ticket::ticket_content_digest(&current),
+            );
+            replace_value(
+                &mut argv,
+                "--expected-state",
+                current.meta.workflow_state.as_str(),
+            );
+            replace_value(
+                &mut argv,
+                "--expected-closure-operation-key",
+                &closure_key_token(current.closure_operation_key.as_deref()),
+            );
+            replace_value(&mut argv, "--operation-key", key);
+            argv
+        }
+    }
+
+    macro_rules! unused_backend_methods {
+        ($(fn $name:ident(&self $(, $arg:ident: $ty:ty)*) -> $ret:ty;)*) => {
+            $(fn $name(&self $(, _: $ty)*) -> $ret { panic!("unexpected authority method: {}", stringify!($name)) })*
+        };
+    }
+
+    impl TicketBackend for FakeBackend {
+        fn list(&self, filter: TicketListQuery) -> ticket::Result<Vec<TicketSummary>> {
+            self.list_filter.replace(Some(filter));
+            Ok(vec![])
+        }
+        fn show(&self, _: TicketIdOrSlug) -> ticket::Result<ticket::Ticket> {
+            Ok(self.current.borrow().clone())
+        }
+        fn update_case(
+            &self,
+            id: &str,
+            request: TicketCaseUpdate,
+        ) -> ticket::Result<ticket::Ticket> {
+            self.requests
+                .borrow_mut()
+                .push((id.into(), request.clone()));
+            let mut current = self.current.borrow_mut();
+            if let Some(receipt) = self.receipts.borrow().get(&request.operation_key) {
+                if receipt != &request {
+                    return Err(ticket::TicketError::OperationFingerprintMismatch {
+                        operation_key: request.operation_key,
+                    });
+                }
+                return Ok(current.clone());
+            }
+            let digest = ticket::ticket_content_digest(&current);
+            if request.expected_content_digest != digest {
+                return Err(ticket::TicketError::StaleContent {
+                    expected: request.expected_content_digest,
+                    actual: digest,
+                });
+            }
+            if request.expected_state != current.meta.workflow_state {
+                return Err(ticket::TicketError::StaleWorkflowState {
+                    expected: request.expected_state.to_string(),
+                    actual: current.meta.workflow_state.to_string(),
+                });
+            }
+            if request.expected_closure_operation_key != current.closure_operation_key {
+                return Err(ticket::TicketError::StaleClosureOperationKey {
+                    expected: request.expected_closure_operation_key,
+                    actual: current.closure_operation_key.clone(),
+                });
+            }
+            match &request.action {
+                TicketCaseAction::Close { reason }
+                | TicketCaseAction::CorrectClosure { reason } => {
+                    current.meta.workflow_state = TicketState::Closed;
+                    current.closure_operation_key = Some(request.operation_key.clone());
+                    current.current_closure = Some(ticket::TicketClosureJudgment {
+                        operation_key: request.operation_key.clone(),
+                        reason: reason.clone(),
+                        explanation: request.explanation.clone(),
+                        references: request.references.clone(),
+                        author: request.author.clone().unwrap(),
+                        at: "fixture-time".into(),
+                    });
+                }
+                TicketCaseAction::Reopen => {
+                    current.meta.workflow_state = TicketState::Open;
+                    current.current_closure = None;
+                }
+            }
+            self.receipts
+                .borrow_mut()
+                .insert(request.operation_key.clone(), request);
+            Ok(current.clone())
+        }
+        unused_backend_methods! {
+            fn list_workspace_tags(&self, request: ticket::TagListRequest) -> ticket::Result<Vec<ticket::WorkspaceTag>>;
+            fn mutate_workspace_tag(&self, request: ticket::WorkspaceTagMutation) -> ticket::Result<ticket::WorkspaceTag>;
+            fn set_ticket_tags(&self, id: TicketIdOrSlug, request: ticket::TicketTagSetRequest) -> ticket::Result<Vec<ticket::WorkspaceTag>>;
+            fn default_intake_ready_state_change_body(&self, from: &str) -> String;
+            fn create(&self, input: NewTicket) -> ticket::Result<ticket::TicketRef>;
+            fn edit_item(&self, id: TicketIdOrSlug, edit: ticket::TicketItemEdit) -> ticket::Result<ticket::Ticket>;
+            fn dependency_check(&self, id: TicketIdOrSlug) -> ticket::Result<ticket::TicketDependencyCheck>;
+            fn add_event(&self, id: TicketIdOrSlug, event: NewTicketEvent) -> ticket::Result<()>;
+            fn add_state_changed(&self, id: TicketIdOrSlug, change: ticket::TicketStateChange) -> ticket::Result<()>;
+            fn add_intake_summary(&self, id: TicketIdOrSlug, summary: ticket::TicketIntakeSummary) -> ticket::Result<()>;
+            fn mark_ready(&self, id: TicketIdOrSlug, request: ticket::TicketMarkReady) -> ticket::Result<ticket::Ticket>;
+            fn queue_ready(&self, id: TicketIdOrSlug, queued_by: &str) -> ticket::Result<ticket::TicketQueueOutcome>;
+            fn add_ticket_relation(&self, id: TicketIdOrSlug, relation: NewTicketRelation) -> ticket::Result<ticket::TicketRelation>;
+            fn remove_ticket_relation(&self, id: TicketIdOrSlug, kind: TicketRelationKind, target: TicketIdOrSlug) -> ticket::Result<ticket::TicketRelation>;
+            fn query_ticket_relations(&self, id: Option<TicketIdOrSlug>, kind: Option<TicketRelationKind>) -> ticket::Result<Vec<ticket::TicketRelation>>;
+            fn relation_view(&self, id: TicketIdOrSlug) -> ticket::Result<ticket::TicketRelationView>;
+            fn add_orchestration_plan_record(&self, id: TicketIdOrSlug, record: ticket::NewOrchestrationPlanRecord) -> ticket::Result<ticket::OrchestrationPlanRecord>;
+            fn query_orchestration_plan_records(&self, id: Option<TicketIdOrSlug>, kind: Option<ticket::OrchestrationPlanKind>) -> ticket::Result<Vec<ticket::OrchestrationPlanRecord>>;
+            fn doctor(&self) -> ticket::Result<ticket::TicketDoctorReport>;
+        }
+    }
+
+    #[test]
+    fn reasoned_actions_use_update_case_and_replay_reports_current_authority() {
+        let fake = FakeBackend::new();
+        let mut close = fake.argv("close", Some("not_planned"), "close-1");
+        close.extend(args(&[
+            "--author",
+            "human:alice",
+            "--reference",
+            "document:https://example.invalid/result",
+            "--reference",
+            "ticket:T-other",
+        ]));
+        let output = run_backend_command(command(&close), &fake).unwrap();
+        assert_eq!(
+            output.stdout,
+            "case\tT-example\tclosed\toperation-key:close-1\n"
+        );
+        let (id, request) = fake.requests.borrow()[0].clone();
+        assert_eq!(id, "T-example");
+        assert_eq!(request.explanation, "Intentional decision.");
+        assert_eq!(request.author.as_deref(), Some("human:alice"));
+        assert_eq!(request.references.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["action"],
+            serde_json::json!({"action": "close", "reason": "not_planned"})
+        );
+        assert_eq!(
+            request.references[0].target,
+            "https://example.invalid/result"
+        );
+        assert_eq!(
+            request.action,
+            TicketCaseAction::Close {
+                reason: TicketClosureReason::NotPlanned
+            }
+        );
+        let correct = fake.argv("correct-closure", Some("duplicate"), "correct-1");
+        run_backend_command(command(&correct), &fake).unwrap();
+        assert_eq!(
+            fake.current
+                .borrow()
+                .current_closure
+                .as_ref()
+                .unwrap()
+                .reason,
+            TicketClosureReason::Duplicate
+        );
+        let reopen = fake.argv("reopen", None, "reopen-1");
+        run_backend_command(command(&reopen), &fake).unwrap();
+        let output = run_backend_command(command(&close), &fake).unwrap();
+        assert_eq!(
+            output.stdout,
+            "case\tT-example\topen\toperation-key:close-1\n"
+        );
+        assert_eq!(fake.requests.borrow().last().unwrap().1, request);
+        assert_eq!(fake.receipts.borrow().len(), 3);
+        assert_eq!(
+            fake.current.borrow().closure_operation_key.as_deref(),
+            Some("correct-1")
+        );
+        let mut changed = close;
+        replace_value(&mut changed, "--explanation", "A different judgment.");
+        let error = run_backend_command(command(&changed), &fake).unwrap_err();
+        assert!(error.to_string().contains("different request fingerprint"));
+        assert_eq!(fake.current.borrow().meta.workflow_state, TicketState::Open);
+    }
+
+    #[test]
+    fn stale_case_preconditions_propagate_backend_rejection_without_retry_or_success() {
+        for (flag, value, diagnostic) in [
+            (
+                "--expected-content-digest",
+                "b".repeat(64),
+                "stale ticket content",
+            ),
+            (
+                "--expected-state",
+                "closed".into(),
+                "stale ticket workflow state",
+            ),
+            (
+                "--expected-closure-operation-key",
+                "unobserved".into(),
+                "stale Ticket closure operation key",
+            ),
+        ] {
+            let fake = FakeBackend::new();
+            let before = fake.current.borrow().clone();
+            let mut argv = fake.argv("close", Some("completed"), "decision-1");
+            replace_value(&mut argv, flag, &value);
+            let error = run_backend_command(command(&argv), &fake).unwrap_err();
+            assert!(error.to_string().contains(diagnostic), "{error}");
+            assert_eq!(*fake.current.borrow(), before);
+            assert_eq!(fake.requests.borrow().len(), 1);
+            assert!(fake.receipts.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn explanation_file_preserves_bytes_and_blank_files_never_submit_a_case_action() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("explanation.md");
+        let fake = FakeBackend::new();
+        let mut argv = fake.argv("close", Some("unknown"), "close-file");
+        let index = argv.iter().position(|arg| arg == "--explanation").unwrap();
+        argv[index] = "--file".into();
+        argv[index + 1] = path.display().to_string();
+        fs::write(&path, " \n ").unwrap();
+        assert!(run_backend_command(command(&argv), &fake).is_err());
+        assert!(fake.requests.borrow().is_empty());
+        fs::write(&path, "Decision without trailing newline").unwrap();
+        run_backend_command(command(&argv), &fake).unwrap();
+        run_backend_command(command(&argv), &fake).unwrap();
+        assert_eq!(
+            fake.requests.borrow()[0].1.explanation,
+            "Decision without trailing newline"
+        );
+        assert_eq!(fake.requests.borrow()[0].1, fake.requests.borrow()[1].1);
+    }
+
+    #[test]
+    fn show_exposes_case_cas_and_explicit_closure_reason() {
+        let fake = FakeBackend::new();
+        let output = run_backend_command(command(&args(&["show", "example"])), &fake).unwrap();
+        assert!(output.stdout.contains(&format!(
+            "Content digest: {}",
+            ticket::ticket_content_digest(&fake.current.borrow())
+        )));
+        assert!(output.stdout.contains("Closure operation key: none"));
+        let argv = fake.argv("close", Some("not_planned"), "close-show");
+        run_backend_command(command(&argv), &fake).unwrap();
+        let output = run_backend_command(command(&args(&["show", "example"])), &fake).unwrap();
+        assert!(output.stdout.contains("State: closed"));
+        assert!(output.stdout.contains("Closure operation key: close-show"));
+        assert!(output.stdout.contains("Closure reason: not_planned"));
+        assert!(
+            output
+                .stdout
+                .contains("Closure explanation: Intentional decision.")
+        );
+        assert!(!output.stdout.contains("Closure reason: completed"));
+    }
+
+    #[test]
+    fn help_documents_reasoned_case_actions_and_exact_replay_not_bare_state_mutation() {
+        let help = help_text();
+        for snippet in [
+            "yoi ticket close",
+            "yoi ticket reopen",
+            "yoi ticket correct-closure",
+            "--reason",
+            "--explanation",
+            "--operation-key",
+            "Do not refresh CAS values on a retry.",
+            "active lists open cases",
+        ] {
+            assert!(help.contains(snippet), "{snippet}");
+        }
+        assert!(!help.contains("yoi ticket state"));
+        assert!(!help.contains("--resolution"));
+    }
+
+    #[test]
+    fn literal_closure_keys_and_tagged_actions_preserve_the_update_case_wire_contract() {
+        for (token, key) in [
+            ("none", None),
+            ("key:none", Some("none")),
+            ("key:key:example", Some("key:example")),
+            ("close-1", Some("close-1")),
+        ] {
+            let mut argv = case_args("reopen", None);
+            replace_value(&mut argv, "--expected-closure-operation-key", token);
+            let TicketCommand::Case(options) = command(&argv) else {
+                panic!()
+            };
+            assert_eq!(options.expected_closure_operation_key.as_deref(), key);
+            assert_eq!(
+                serde_json::to_value(&options.action).unwrap(),
+                serde_json::json!({"action": "reopen"})
+            );
+        }
+        let TicketCommand::Case(options) =
+            command(&case_args("correct-closure", Some("other:Budget changed")))
+        else {
+            panic!()
+        };
+        assert_eq!(
+            serde_json::to_value(&options.action).unwrap(),
+            serde_json::json!({"action": "correct_closure", "reason": {"other": "Budget changed"}})
+        );
     }
 }

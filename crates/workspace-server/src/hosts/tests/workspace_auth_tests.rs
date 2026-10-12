@@ -32,7 +32,8 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
-        let store = Arc::new(SqliteWorkspaceStore::open(temp.path().join("server.db")).unwrap());
+        let store =
+            Arc::new(SqliteWorkspaceStore::open_for_test(temp.path().join("server.db")).unwrap());
         store
             .upsert_account(&AccountRecord {
                 account_id: "owner".into(),

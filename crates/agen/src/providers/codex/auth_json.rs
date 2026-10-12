@@ -106,15 +106,23 @@ pub async fn load(path: &Path) -> Result<AuthSnapshot, CodexAuthError> {
 /// Reload the existing file, update `tokens.{id_token,access_token,refresh_token}`
 /// and `last_refresh`, and write it back. Equivalent to Codex CLI's `persist_tokens`.
 ///
-/// Reload and merge before writing to preserve fields if a concurrent
-/// Codex CLI / another process has already refreshed.
+/// Reload and merge before writing to preserve fields updated by a concurrent
+/// Codex CLI / another process. Account and refresh token must still match the
+/// request's input: merge unrelated fields, but return the current snapshot
+/// without writing if another login or token rotation is observed.
 pub async fn persist_refreshed(
     path: &Path,
+    refresh_input: &AuthSnapshot,
     new_id_token: Option<String>,
     new_access_token: Option<String>,
     new_refresh_token: Option<String>,
 ) -> Result<AuthSnapshot, CodexAuthError> {
     let mut current = load(path).await?;
+    if current.account_id != refresh_input.account_id
+        || current.refresh_token != refresh_input.refresh_token
+    {
+        return Ok(current);
+    }
     let raw = &mut current.raw;
     let tokens = raw
         .get_mut("tokens")
@@ -243,10 +251,16 @@ mod tests {
               "agent_identity":{"workspace_id":"w","agent_runtime_id":"r","agent_private_key":"k","registered_at":"x"}
             }"#,
         );
-        let updated =
-            persist_refreshed(&path, None, Some("new-acc".into()), Some("new-ref".into()))
-                .await
-                .unwrap();
+        let input = load(&path).await.unwrap();
+        let updated = persist_refreshed(
+            &path,
+            &input,
+            None,
+            Some("new-acc".into()),
+            Some("new-ref".into()),
+        )
+        .await
+        .unwrap();
         assert_eq!(updated.access_token, "new-acc");
         assert_eq!(updated.refresh_token, "new-ref");
         // The unknown field agent_identity is preserved
@@ -266,7 +280,8 @@ mod tests {
         );
         // Change the existing file to 644, then persist → check that it returns to 600
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        persist_refreshed(&path, None, Some("a2".into()), None)
+        let input = load(&path).await.unwrap();
+        persist_refreshed(&path, &input, None, Some("a2".into()), None)
             .await
             .unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

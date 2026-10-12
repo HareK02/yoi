@@ -42,17 +42,7 @@ async fn explicit_existing_worker_claim_accepts_no_resources_and_preserves_assig
             },
         )
         .unwrap();
-    backend
-        .set_workflow_state(
-            fixture.ticket_id.clone().into(),
-            TicketStateChange::new(
-                "ready",
-                "planning",
-                "Explicit investigation",
-                "No repository resources required",
-            ),
-        )
-        .unwrap();
+    let before = backend.show(fixture.ticket_id.clone().into()).unwrap();
     let request = manual_worker_assignment_request(&fixture, "claim-without-resources");
     assert!(request.workdir_bindings.is_empty());
     let Json(first) = claim(&fixture, request.clone()).await.unwrap();
@@ -67,8 +57,16 @@ async fn explicit_existing_worker_claim_accepts_no_resources_and_preserves_assig
             .authority
             .ticket(&fixture.ticket_id)
             .unwrap()
-            .state,
-        "inprogress"
+            .state
+            .as_str(),
+        "open"
+    );
+    let after = backend.show(fixture.ticket_id.clone().into()).unwrap();
+    assert_eq!(after.meta.workflow_state, before.meta.workflow_state);
+    assert_eq!(after.case_history, before.case_history);
+    assert_eq!(
+        ticket::ticket_content_digest(&after),
+        ticket::ticket_content_digest(&before)
     );
     assert_eq!(*fixture.runtime.restore_attempts.lock().unwrap(), 1);
     assert!(
@@ -282,8 +280,9 @@ async fn ambiguous_existing_worker_restore_keeps_claim_pending_until_accepted_re
             .authority
             .ticket(&fixture.ticket_id)
             .unwrap()
-            .state,
-        "ready"
+            .state
+            .as_str(),
+        "open"
     );
     assert!(
         fixture
@@ -313,8 +312,9 @@ async fn ambiguous_existing_worker_restore_keeps_claim_pending_until_accepted_re
             .authority
             .ticket(&fixture.ticket_id)
             .unwrap()
-            .state,
-        "inprogress"
+            .state
+            .as_str(),
+        "open"
     );
     assert_eq!(*fixture.runtime.restore_attempts.lock().unwrap(), 3);
     assert_eq!(
@@ -435,8 +435,7 @@ async fn pending_manual_worker_claim_reconciles_same_runtime_restore_and_commits
             .is_empty()
     );
     let backend = browser_ticket_backend(&api).unwrap();
-    let mut input = ticket::NewTicket::new("Manual investigation without resources");
-    input.workflow_state = Some(TicketWorkflowState::Ready);
+    let input = ticket::NewTicket::new("Manual investigation without resources");
     let ticket_id = backend.create(input).unwrap().id;
     backend
         .edit_item(
@@ -447,19 +446,9 @@ async fn pending_manual_worker_claim_reconciles_same_runtime_restore_and_commits
             },
         )
         .unwrap();
-    backend
-        .set_workflow_state(
-            ticket_id.clone().into(),
-            TicketStateChange::new(
-                "ready",
-                "planning",
-                "Explicit investigation",
-                "No repository resources required",
-            ),
-        )
-        .unwrap();
     let admitted_content_digest = api.authority.ticket(&ticket_id).unwrap().content_digest;
     let request = server_api::SetTicketRoleAssignmentRequest {
+        orchestrator_assignment_id: None,
         operation_id: "claim-runtime-reconciliation".into(),
         principal: server_api::TicketAssignmentPrincipal::Worker {
             runtime_id: worker.runtime_id.clone(),
@@ -503,7 +492,10 @@ async fn pending_manual_worker_claim_reconciles_same_runtime_restore_and_commits
     assert!(pending.assignment_id.is_none());
     assert_eq!(pending.worker, Some(worker.clone()));
     assert!(pending.request_fingerprint.is_some());
-    assert_eq!(api.authority.ticket(&ticket_id).unwrap().state, "planning");
+    assert_eq!(
+        api.authority.ticket(&ticket_id).unwrap().state.as_str(),
+        "open"
+    );
     assert!(
         api.store
             .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket_id)
@@ -601,8 +593,8 @@ async fn pending_manual_worker_claim_reconciles_same_runtime_restore_and_commits
     );
     assert_eq!(committed.request_fingerprint, pending.request_fingerprint);
     assert_eq!(
-        api.authority.ticket(&ticket_id).unwrap().state,
-        "inprogress"
+        api.authority.ticket(&ticket_id).unwrap().state.as_str(),
+        "open"
     );
     assert_eq!(
         api.store

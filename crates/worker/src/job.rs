@@ -224,6 +224,7 @@ impl PreparedInternalJob {
                 run_id: uuid::Uuid::now_v7(),
             },
             max_turns: engine_policy.max_turns.map(|n| n.get()),
+            compaction_budget: None,
             engine_configurator: Some(Box::new(move |engine| {
                 crate::apply_worker_manifest(engine, &engine_policy);
             })),

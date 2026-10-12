@@ -11,6 +11,9 @@
 //! accepted only after the initialize/initialized handshake. Shutdown closes stdin,
 //! waits for exit within a deadline, and kills/waits to reap the process if needed.
 //! Startup failures also trigger cleanup; killing on Drop is a last resort.
+//! A request shares one deadline across stdin ownership, write/flush, and matching response;
+//! synchronous result decode is outside that wait. Interrupted write/flush closes stdin.
+//! After a fully flushed frame, a missing response leaves execution unknown, not retry-safe.
 //!
 //! This module preserves Tool/resource/prompt wire values. `worker::feature::mcp`
 //! owns Yoi naming, schema acceptance, model output limits, and Feature registration.
@@ -28,11 +31,11 @@ use secrets::SecretStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, timeout};
+use tokio::time::{Instant, timeout, timeout_at};
 
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 const CLIENT_NAME: &str = "yoi";
@@ -48,8 +51,11 @@ pub struct McpStdioLimits {
     pub max_diagnostic_lines: usize,
     pub max_protocol_bytes: usize,
     pub startup_timeout: Duration,
+    /// One budget for stdin ownership, frame write/flush, and response wait.
     pub request_timeout: Duration,
+    /// Shared budget for stdin ownership/close and graceful process exit.
     pub shutdown_timeout: Duration,
+    /// Budget for each fallback wait: terminate, then forced kill/reap.
     pub kill_timeout: Duration,
 }
 
@@ -587,6 +593,30 @@ pub fn resolve_stdio_server(
     Ok(spec)
 }
 
+// The mutex orders entire frames, including replies emitted by the stdout reader.
+type SharedStdin = Arc<Mutex<Option<Box<dyn AsyncWrite + Send + Unpin>>>>;
+
+/// Last boundary reached by a failed request. A flushed frame does not prove
+/// that the server executed the method; callers must not blindly retry it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpRequestStage {
+    WaitingForStdin,
+    WritingFrame,
+    FlushingFrame,
+    AwaitingResponse,
+}
+
+impl fmt::Display for McpRequestStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::WaitingForStdin => "stdin ownership (method not sent)",
+            Self::WritingFrame => "frame write (delivery unknown; stdin closed)",
+            Self::FlushingFrame => "frame flush (delivery unknown; stdin closed)",
+            Self::AwaitingResponse => "response (frame flushed; execution unknown; do not retry)",
+        })
+    }
+}
+
 /// A running initialized stdio MCP client.
 pub struct McpStdioClient {
     server_name: String,
@@ -594,7 +624,7 @@ pub struct McpStdioClient {
     redactor: Redactor,
     diagnostics: Arc<Mutex<BoundedDiagnostics>>,
     list_changes: Arc<Mutex<BoundedListChanged>>,
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    stdin: SharedStdin,
     child: Option<Child>,
     responses: mpsc::Receiver<ReaderEvent>,
     reader_task: JoinHandle<()>,
@@ -680,7 +710,7 @@ impl McpStdioClient {
             )
         })?;
 
-        let stdin = Arc::new(Mutex::new(Some(stdin)));
+        let stdin: SharedStdin = Arc::new(Mutex::new(Some(Box::new(stdin))));
         let diagnostics = Arc::new(Mutex::new(BoundedDiagnostics::new(
             spec.name.clone(),
             limits.max_diagnostic_lines,
@@ -764,6 +794,12 @@ impl McpStdioClient {
     /// The caller is responsible for applying Yoi tool permissions before this
     /// method is reached and for bounding/serializing the untrusted result before
     /// it is exposed to model-visible tool history.
+    ///
+    /// Timeout or cancellation after writing begins can leave execution unknown;
+    /// this method never retries. Interrupted write/flush closes stdin, and the
+    /// caller must shut down the process rather than reuse that connection. A
+    /// fully flushed frame permits later *different* requests with distinct IDs,
+    /// but is not permission to replay this call when its response is missing.
     pub async fn call_tool(
         &mut self,
         request: CallToolRequest,
@@ -919,23 +955,35 @@ impl McpStdioClient {
             method,
             params,
         };
-        self.write_protocol(phase, &request).await?;
-        let response = match timeout(
-            self.limits.request_timeout,
-            self.wait_for_response(id, phase),
-        )
+        if self.shutdown_started {
+            return Err(McpClientError::new(
+                &self.server_name,
+                phase,
+                McpErrorKind::Io("client shutdown has started".into()),
+            ));
+        }
+        let deadline = Instant::now() + self.limits.request_timeout;
+        let mut stage = McpRequestStage::WaitingForStdin;
+        // One budget covers ownership, write, flush, and the matching response.
+        let response = match timeout_at(deadline, async {
+            self.write_protocol(phase, &request, &mut stage).await?;
+            stage = McpRequestStage::AwaitingResponse;
+            self.wait_for_response(id, phase).await
+        })
         .await
         {
-            Ok(result) => result?,
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => return Err(err.with_request_stage(stage)),
             Err(_) => {
                 return Err(McpClientError::new(
                     &self.server_name,
                     phase,
                     McpErrorKind::Timeout {
-                        operation: method.to_owned(),
+                        operation: self.redactor.redact(method),
                         elapsed: self.limits.request_timeout,
                     },
                 )
+                .with_request_stage(stage)
                 .with_diagnostics(self.snapshot_diagnostics().await));
             }
         };
@@ -1000,6 +1048,7 @@ impl McpStdioClient {
         method: &str,
         params: T,
     ) -> Result<(), McpClientError> {
+        let mut stage = McpRequestStage::WaitingForStdin;
         self.write_protocol(
             phase,
             &ClientNotification {
@@ -1007,6 +1056,7 @@ impl McpStdioClient {
                 method,
                 params,
             },
+            &mut stage,
         )
         .await
     }
@@ -1015,6 +1065,7 @@ impl McpStdioClient {
         &mut self,
         phase: McpPhase,
         value: &T,
+        stage: &mut McpRequestStage,
     ) -> Result<(), McpClientError> {
         write_json_line(
             &self.server_name,
@@ -1023,6 +1074,7 @@ impl McpStdioClient {
             value,
             self.limits.max_protocol_bytes,
             &self.redactor,
+            stage,
         )
         .await
     }
@@ -1030,15 +1082,23 @@ impl McpStdioClient {
     /// Close stdin and wait for process exit, falling back to terminate and kill.
     pub async fn shutdown(&mut self) -> Result<ShutdownReport, McpClientError> {
         self.shutdown_started = true;
-        {
-            let mut stdin = self.stdin.lock().await;
-            stdin.take();
-        }
+        let deadline = Instant::now() + self.limits.shutdown_timeout;
+        // Ownership and EOF share one graceful budget. A reader reply may own
+        // stdin indefinitely; its lock is never required to terminate/kill.
+        let closed = timeout_at(deadline, async {
+            self.stdin.lock().await.take();
+        })
+        .await
+        .is_ok();
 
         let mut child = match self.child.take() {
             Some(child) => child,
             None => return Ok(ShutdownReport::already_finished()),
         };
+        if !closed {
+            self.reader_task.abort();
+            return self.terminate_then_kill(child).await;
+        }
 
         if let Ok(Some(status)) = child.try_wait() {
             self.reader_task.abort();
@@ -1050,7 +1110,7 @@ impl McpStdioClient {
             });
         }
 
-        match timeout(self.limits.shutdown_timeout, child.wait()).await {
+        match timeout_at(deadline, child.wait()).await {
             Ok(Ok(status)) => {
                 self.reader_task.abort();
                 self.stderr_task.abort();
@@ -1212,12 +1272,13 @@ pub struct McpDiagnostics {
 }
 
 #[derive(Debug, Error, Clone)]
-#[error("MCP stdio server `{server_name}` failed during phase `{phase}`: {kind}")]
+#[error("MCP stdio server `{server_name}` failed during phase `{phase}`: {kind}{stage_detail}", stage_detail = request_stage.map(|stage| format!("; {stage}")).unwrap_or_default())]
 pub struct McpClientError {
     pub server_name: String,
     pub phase: McpPhase,
     pub kind: McpErrorKind,
     diagnostics: Option<McpDiagnostics>,
+    request_stage: Option<McpRequestStage>,
 }
 
 impl McpClientError {
@@ -1227,6 +1288,7 @@ impl McpClientError {
             phase,
             kind,
             diagnostics: None,
+            request_stage: None,
         }
     }
 
@@ -1238,6 +1300,15 @@ impl McpClientError {
     pub fn with_diagnostics(mut self, diagnostics: McpDiagnostics) -> Self {
         self.diagnostics = Some(diagnostics);
         self
+    }
+
+    fn with_request_stage(mut self, stage: McpRequestStage) -> Self {
+        self.request_stage = Some(stage);
+        self
+    }
+
+    pub fn request_stage(&self) -> Option<McpRequestStage> {
+        self.request_stage
     }
 
     pub fn diagnostics(&self) -> Option<&McpDiagnostics> {
@@ -1328,7 +1399,7 @@ struct ErrorObject<'a> {
 fn spawn_stdout_reader(
     server_name: String,
     stdout: ChildStdout,
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    stdin: SharedStdin,
     tx: mpsc::Sender<ReaderEvent>,
     limits: McpStdioLimits,
     redactor: Redactor,
@@ -1385,7 +1456,7 @@ fn spawn_stdout_reader(
 
 async fn handle_incoming_message(
     server_name: &str,
-    stdin: &Arc<Mutex<Option<ChildStdin>>>,
+    stdin: &SharedStdin,
     tx: &mpsc::Sender<ReaderEvent>,
     limits: &McpStdioLimits,
     redactor: &Redactor,
@@ -1409,6 +1480,7 @@ async fn handle_incoming_message(
                 &response,
                 limits.max_protocol_bytes,
                 redactor,
+                &mut McpRequestStage::WaitingForStdin,
             )
             .await;
         }
@@ -1501,10 +1573,11 @@ fn spawn_stderr_reader(
 async fn write_json_line<T: Serialize>(
     server_name: &str,
     phase: McpPhase,
-    stdin: &Arc<Mutex<Option<ChildStdin>>>,
+    stdin: &SharedStdin,
     value: &T,
     max_protocol_bytes: usize,
     redactor: &Redactor,
+    stage: &mut McpRequestStage,
 ) -> Result<(), McpClientError> {
     let mut bytes = serde_json::to_vec(value).map_err(|err| {
         McpClientError::new(
@@ -1524,27 +1597,34 @@ async fn write_json_line<T: Serialize>(
     }
     bytes.push(b'\n');
     let mut guard = stdin.lock().await;
-    let Some(stdin) = guard.as_mut() else {
+    let Some(mut writer) = guard.take() else {
         return Err(McpClientError::new(
             server_name,
             phase,
             McpErrorKind::Io("child stdin is closed".into()),
         ));
     };
-    stdin.write_all(&bytes).await.map_err(|err| {
+    // Keep ownership out of the slot across both awaits. Timeout/cancel or
+    // I/O error drops the writer, closing the connection instead of allowing
+    // the next frame to append to an unverified partial JSON line.
+    *stage = McpRequestStage::WritingFrame;
+    writer.write_all(&bytes).await.map_err(|err| {
         McpClientError::new(
             server_name,
             phase,
             McpErrorKind::Io(redactor.redact(&err.to_string())),
         )
     })?;
-    stdin.flush().await.map_err(|err| {
+    *stage = McpRequestStage::FlushingFrame;
+    writer.flush().await.map_err(|err| {
         McpClientError::new(
             server_name,
             phase,
             McpErrorKind::Io(redactor.redact(&err.to_string())),
         )
-    })
+    })?;
+    *guard = Some(writer);
+    Ok(())
 }
 
 async fn read_protocol_line<R: AsyncRead + Unpin>(
@@ -1701,3 +1781,6 @@ fn send_terminate(child: &mut Child) -> Result<(), ()> {
 fn send_terminate(child: &mut Child) -> Result<(), ()> {
     child.start_kill().map_err(|_| ())
 }
+
+#[cfg(test)]
+mod deadline_tests;

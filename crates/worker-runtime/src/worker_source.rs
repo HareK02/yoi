@@ -18,6 +18,15 @@ use crate::auth::{
 use crate::runtime::RuntimeWorkspaceScope;
 use crate::worker_backend::WorkspacePromptProjectionCache;
 
+fn ticket_assignment_role_segment(role: server_api::TicketAssignmentRole) -> &'static str {
+    match role {
+        server_api::TicketAssignmentRole::Orchestrator => "orchestrator",
+        server_api::TicketAssignmentRole::Worker => "worker",
+        server_api::TicketAssignmentRole::Owner => "owner",
+        server_api::TicketAssignmentRole::Contributor => "contributor",
+    }
+}
+
 pub const DEFAULT_WORKER_MUTATION_SOURCE_TTL_SECONDS: u64 = 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -590,6 +599,62 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
                     .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
                 runtime.block_on(async move {
                     match operation {
+                        WorkspaceServerOperation::TicketAssignmentSet {
+                            ticket_id,
+                            role,
+                            request,
+                        } => {
+                            let role = ticket_assignment_role_segment(role);
+                            generated_workspace_response(
+                                client
+                                    .ticket_assignment_set(
+                                        workspace_id,
+                                        ticket_id,
+                                        role.to_owned(),
+                                        request,
+                                    )
+                                    .await,
+                            )
+                        }
+                        WorkspaceServerOperation::TicketAssignmentClear {
+                            ticket_id,
+                            role,
+                            query,
+                        } => {
+                            let role = ticket_assignment_role_segment(role);
+                            generated_workspace_response(
+                                client
+                                    .ticket_assignment_clear(
+                                        workspace_id,
+                                        ticket_id,
+                                        role.to_owned(),
+                                        query,
+                                    )
+                                    .await,
+                            )
+                        }
+                        WorkspaceServerOperation::TicketAssignmentsPage { ticket_id, query } => {
+                            generated_workspace_response(
+                                client
+                                    .ticket_assignments_page(workspace_id, ticket_id, query)
+                                    .await,
+                            )
+                        }
+                        WorkspaceServerOperation::TicketAssignmentDiagnostics {
+                            ticket_id,
+                            query,
+                        } => generated_workspace_response(
+                            client
+                                .ticket_assignment_diagnostics(workspace_id, ticket_id, query)
+                                .await,
+                        ),
+                        WorkspaceServerOperation::TicketAssignmentAnswer { ticket_id, request } => {
+                            generated_workspace_response(
+                                client
+                                    .ticket_assignment_answer(workspace_id, ticket_id, request)
+                                    .await,
+                            )
+                        }
                         WorkspaceServerOperation::WorkerControlList => {
                             generated_workspace_response(
                                 client.worker_control_list(workspace_id).await,
@@ -880,6 +945,125 @@ mod tests {
             (head, body)
         });
         (base_url, server)
+    }
+
+    #[test]
+    fn generated_ticket_assignment_transport_signs_exact_authoring_and_bounded_read_subjects() {
+        use crate::auth::{RuntimeRequestSourceExpectation, verify_runtime_request_source};
+        let identity = RuntimeIdentityMaterial::generate("runtime-a").unwrap();
+        let assignment_result =
+            serde_json::json!({"workspace_id":"workspace-a", "ticket_id":"T-1", "assignment":null});
+        let answer: server_api::TicketAssignmentAnswerRequest = serde_json::from_value(serde_json::json!({ "assignment_id": "delegation", "expected_last_event_id": "observed", "operation_key": "answer-op", "body": "User answer\ncontinued" })).unwrap();
+        let cases = vec![
+            (
+                WorkspaceServerOperation::TicketAssignmentSet {
+                    ticket_id: "T-1".into(),
+                    role: server_api::TicketAssignmentRole::Orchestrator,
+                    request: server_api::SetTicketRoleAssignmentRequest {
+                        operation_id: "assign-op".into(),
+                        expected_assignment_id: Some("delegation".into()),
+                        orchestrator_assignment_id: None,
+                        principal: server_api::TicketAssignmentPrincipal::WorkspaceAgent {
+                            agent_key: "workspace-orchestrator".into(),
+                        },
+                        workdir_bindings: vec![],
+                    },
+                },
+                "PUT",
+                "/api/w/workspace-a/tickets/T-1/assignments/orchestrator",
+                assignment_result.clone(),
+            ),
+            (
+                WorkspaceServerOperation::TicketAssignmentClear {
+                    ticket_id: "T-1".into(),
+                    role: server_api::TicketAssignmentRole::Orchestrator,
+                    query: server_api::ClearTicketRoleAssignmentQuery {
+                        operation_id: Some("clear-op".into()),
+                        assignment_id: Some("delegation".into()),
+                    },
+                },
+                "DELETE",
+                "/api/w/workspace-a/tickets/T-1/assignments/orchestrator?operation_id=clear-op&assignment_id=delegation",
+                assignment_result,
+            ),
+            (
+                WorkspaceServerOperation::TicketAssignmentsPage {
+                    ticket_id: "T-1".into(),
+                    query: server_api::TicketAssignmentsQuery {
+                        after_assignment_id: Some("old id".into()),
+                        limit: Some(1),
+                    },
+                },
+                "GET",
+                "/workspaces/workspace-a/tickets/T-1/assignment-tracking/assignments?after_assignment_id=old+id&limit=1",
+                serde_json::json!({"items":[],"next_assignment_id":null}),
+            ),
+            (
+                WorkspaceServerOperation::TicketAssignmentDiagnostics {
+                    ticket_id: "T-1".into(),
+                    query: server_api::TicketAssignmentDiagnosticsQuery {
+                        assignment_id: "delegation".into(),
+                        after_input_event_id: Some("ticket-event:1".into()),
+                        after_start_operation_id: None,
+                        limit: Some(1),
+                    },
+                },
+                "GET",
+                "/workspaces/workspace-a/tickets/T-1/assignment-diagnostics?assignment_id=delegation&after_input_event_id=ticket-event%3A1&limit=1",
+                serde_json::json!({"assignment_id":"delegation","current":true,"input_origin_known":true,"actionable":true,"inputs":[],"starts":[],"next_input_event_id":null,"next_start_operation_id":null}),
+            ),
+            (
+                WorkspaceServerOperation::TicketAssignmentAnswer {
+                    ticket_id: "T-1".into(),
+                    request: answer.clone(),
+                },
+                "POST",
+                "/workspaces/workspace-a/tickets/T-1/assignment-answer",
+                serde_json::json!({"assignment_id":"delegation","input_event_id":"ticket-event:1","event_index":1}),
+            ),
+        ];
+        for (operation, method, path, reply) in cases {
+            let reply = reply.to_string();
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", reply.len(), reply).into_bytes();
+            let (url, server) = binary_loopback(response);
+            let client =
+                RuntimeOwnedWorkspaceClient::new("workspace-a", url, "runtime-a", "worker-a")
+                    .with_runtime_request_source(&identity, "server-a");
+            let result = client.execute_server_operation(operation).unwrap();
+            assert_eq!(result.status, 200);
+            let (head, body) = server.join().unwrap();
+            assert!(
+                head.starts_with(&format!("{method} {path} HTTP/1.1\r\n")),
+                "unexpected request: {head}"
+            );
+            let token = head
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case(RUNTIME_REQUEST_SOURCE_PROOF_HEADER)
+                        .then(|| value.trim())
+                })
+                .unwrap();
+            let digest = request_body_digest(&body);
+            let expected = RuntimeRequestSourceExpectation {
+                identity_id: "runtime-a",
+                audience: "server-a",
+                workspace_id: "workspace-a",
+                worker_id: Some("worker-a"),
+                permission: WORKSPACE_REQUEST_PERMISSION,
+                method,
+                path,
+                body_digest: &digest,
+                now_unix: unix_now_seconds() as i64,
+            };
+            verify_runtime_request_source(token, &identity.public_key, &expected).unwrap();
+            if method == "POST" {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                    serde_json::to_value(&answer).unwrap()
+                );
+            }
+        }
     }
 
     #[test]

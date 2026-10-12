@@ -6,6 +6,6 @@ Does not search Repository documents or handle Git integration.
 ## Main entry points
 
 - [`TicketBackend`], [`SqliteTicketBackend`]: operation boundary and persistence
-- [`TicketBackend::complete`], [`TicketBackend::update_state`]: completion decisions and state updates
+- [`TicketBackend::update_case`]: reasoned close, reopen, and closure correction
 - [`ticket_content_digest`]: requirement-content comparison condition
 - [`tool`]: Worker-facing operation definitions

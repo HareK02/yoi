@@ -965,7 +965,7 @@ async fn connect_runtime(
     let mut request = endpoint
         .into_client_request()
         .map_err(|error| format!("invalid Runtime subscription endpoint: {error}"))?;
-    if let Some(token) = runtime_token(config, workspace_id)? {
+    if let Some(token) = runtime_token(config, workspace_id).await? {
         request.headers_mut().insert(
             "authorization",
             format!("Bearer {token}")
@@ -1021,13 +1021,20 @@ fn runtime_endpoint(base_url: &str) -> String {
         format!("{base}/v1/protocol/ws")
     }
 }
-fn runtime_token(
+async fn runtime_token(
     config: &RemoteRuntimeConfig,
     _workspace_id: &str,
 ) -> Result<Option<String>, String> {
     if let Some(authorization) = config.workspace_authorization.as_ref() {
         return authorization
-            .issue("GET", "/v1/protocol/ws", "workers:list", None, &[])
+            .issue_async(
+                "GET".to_string(),
+                "/v1/protocol/ws".to_string(),
+                "workers:list".to_string(),
+                None,
+                Vec::new(),
+            )
+            .await
             .map(Some)
             .map_err(|error| error.message);
     }

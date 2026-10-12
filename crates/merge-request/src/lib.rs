@@ -610,7 +610,9 @@ pub struct CompleteMergeRequest {
     pub now: DateTime<Utc>,
 }
 /// Historical MR-owned Ticket completion payload, retained for reading existing events.
-/// Canonical Ticket completion is owned by the Ticket domain.
+/// Current close/reopen/correction judgments belong to the Ticket domain and require no
+/// universal MR evidence gate. This archived payload is neither a current case operation nor
+/// authority to infer closure, self-reported handling, work release, or Worker termination.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketCompletionEvent {
     pub operation_id: String,
@@ -1171,18 +1173,9 @@ impl MergeRequestStore {
                 "approval predates the current Ticket digest; fresh review is required".into(),
             ));
         }
-        let state: Option<String> = connection
-            .query_row(
-                "SELECT workflow_state FROM typed_tickets WHERE workspace_id=?1 AND ticket_id=?2",
-                params![mr.workspace_id, i.ticket_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if state.as_deref() != Some("inprogress") {
-            return Err(MergeRequestError::Conflict(
-                "Ticket must be inprogress".into(),
-            ));
-        }
+        // Case openness is not an integration phase. Exact source approval,
+        // current Ticket content and active assignment fencing above remain
+        // the independent MR integration guards.
         Ok(())
     }
 
@@ -1254,18 +1247,9 @@ impl MergeRequestStore {
                 "approval predates the current Ticket digest; fresh review is required".into(),
             ));
         }
-        let state: Option<String> = transaction
-            .query_row(
-                "SELECT workflow_state FROM typed_tickets WHERE workspace_id=?1 AND ticket_id=?2",
-                params![mr.workspace_id, i.ticket_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if state.as_deref() != Some("inprogress") {
-            return Err(MergeRequestError::Conflict(
-                "Ticket must be inprogress".into(),
-            ));
-        }
+        // Case openness is not an integration phase. Exact source approval,
+        // current Ticket content and active assignment fencing above remain
+        // the independent MR integration guards.
         let issued_grants = {
             let mut statement = transaction.prepare(
                 "SELECT request_event_id,subject_ref,capability_token

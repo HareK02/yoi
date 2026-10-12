@@ -4,6 +4,13 @@
 //! keeping host-specific policy out of the Engine. Additional model input must go
 //! through history appends: inserting new facts only into an in-flight request
 //! would make its input impossible to reconstruct from stored history.
+//!
+//! Tool pre/post policy and assistant-turn-end waits are interruptible by Cancel or Pause;
+//! Cancel wins when both are observed. Pending policy futures may be dropped, not replayed, so
+//! hosts must not depend on their completion for cleanup of already-owned effects. The Engine
+//! drains owned tool attempts through their original fences. Terminal tool history and result
+//! publication precede post-tool policy; interruption cannot erase that result. Pause draining
+//! bounds post-tool waits by the existing safe-boundary deadline.
 
 use std::sync::Arc;
 

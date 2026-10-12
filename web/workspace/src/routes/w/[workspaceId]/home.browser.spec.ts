@@ -86,7 +86,7 @@ test("loader only uses bounded read-only supported endpoints and advertises expl
   );
   await Promise.all(Object.values(result!.dashboard));
   expect(depends).toHaveBeenCalledWith("workspace:home");
-  expect(fetch).toHaveBeenCalledTimes(7);
+  expect(fetch).toHaveBeenCalledTimes(6);
   for (const [path, init] of fetch.mock.calls) {
     const url = new URL(String(path), "https://example.test");
     expect(init?.method ?? "GET").toBe("GET");
@@ -96,7 +96,7 @@ test("loader only uses bounded read-only supported endpoints and advertises expl
       expect(url.searchParams.get("limit")).toBe("5");
     }
   }
-  expect(fetch.mock.calls.some(([url]) => String(url).includes("states=done")))
+  expect(fetch.mock.calls.some(([url]) => String(url).includes("states=open")))
     .toBe(true);
   expect(
     fetch.mock.calls.some(([url]) => String(url).includes("states=closed")),
@@ -152,7 +152,7 @@ test("one recent source failure preserves the other records and does not assert 
   expect((await screen.findByRole("alert")).textContent).toContain(
     "Objectives",
   );
-  expect(screen.queryByText("No done / closed tickets or Objectives yet."))
+  expect(screen.queryByText("No closed tickets or Objectives yet."))
     .toBeNull();
 });
 
@@ -169,7 +169,7 @@ test("a concurrent Ticket transition leaves the active scope with a refresh noti
   const fallback = fixtureFetch();
   const fetchFn: typeof fetch = (path, init) =>
     String(path).endsWith("/tickets/T-101")
-      ? Promise.resolve(Response.json({ ...fixtureDetail(), state: "done" }))
+      ? Promise.resolve(Response.json({ ...fixtureDetail(), state: "closed" }))
       : fallback(path, init);
   const feed = await data("home-owner", fetchFn).dashboard.active;
   expect(feed.rows.map((row) => row.reference)).toEqual(["T-102"]);
@@ -179,9 +179,9 @@ test("a concurrent Ticket transition leaves the active scope with a refresh noti
 test("empty resources have scoped empty states and no fabricated totals", async () => {
   mount(data("home-empty"));
   expect(await screen.findByText("No open Merge Requests.")).toBeTruthy();
-  expect(await screen.findByText("No in-progress or queued tickets."))
+  expect(await screen.findByText("No open tickets."))
     .toBeTruthy();
-  expect(await screen.findByText("No done / closed tickets or Objectives yet."))
+  expect(await screen.findByText("No closed tickets or Objectives yet."))
     .toBeTruthy();
   expect(screen.queryAllByRole("link")).toHaveLength(0);
 });

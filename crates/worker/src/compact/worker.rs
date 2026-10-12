@@ -1,9 +1,22 @@
 //! Summarization and reference-file selection by the compaction Internal Worker.
 //!
-//! Summary input is a bounded history projection; it does not rewrite the original history.
+//! Ordinary history uses a bounded overview plus exploration, while the previous Host-produced
+//! `CompactionSummary` is mandatory full-text input independent of overview and retention budgets.
+//! The replacement supersedes that old summary; it is excluded from both ordinary overview and
+//! retained tail. Other derived context remains subject to normal retention. Current tasks and
+//! recent progress support continuity, but do not replace original goals or completion conditions.
+//!
+//! The full inherited summary still counts against the hard compactor input cap. Before provider
+//! measurements exist, occupancy includes input, system prompt, and installed tools. The normal
+//! Worker interceptor enforces this cap, including persisted budget warnings; overflow fails
+//! without activating a replacement rather than clipping mandatory material. Provider failures
+//! likewise leave the source active. Estimates are not exact model-token guarantees.
+//!
 //! Results collect in [`CompactWorkerContext`]; [`crate::Worker::compact`] validates, saves,
-//! and activates them. Missing summaries or hard-limit violations fail compaction, unlike
-//! targets or warning-only thresholds.
+//! and activates them. Missing summaries and hard input/output limits fail compaction. An oversized
+//! output gets a bounded rewrite attempt. The assembled replacement's result-context threshold is
+//! advisory: a warning neither drops content nor bypasses subsequent request-time safety checks.
+//! Deterministic transport/retention tests do not prove a model's semantic retention of user intent.
 //!
 //! Auto-read accepts only UTF-8 text through the current WorkdirSession, checking scope and
 //! the aggregate budget. Images, binary data, and truncated content stay out of the body;
@@ -372,6 +385,7 @@ pub(crate) struct CompactWorkerInterceptor {
     pub on_warning: Option<Arc<dyn Fn(String) + Send + Sync>>,
     warning_sent: AtomicBool,
     last_remaining_tokens: AtomicU64,
+    request_shape: Option<(String, agen::tool_server::ToolServerHandle)>,
 }
 
 impl CompactWorkerInterceptor {
@@ -390,7 +404,19 @@ impl CompactWorkerInterceptor {
             on_warning,
             warning_sent: AtomicBool::new(false),
             last_remaining_tokens: AtomicU64::new(max_input_tokens),
+            request_shape: None,
         }
+    }
+
+    pub(crate) fn with_request_shape(
+        mut self,
+        system_prompt: String,
+        tools: agen::tool_server::ToolServerHandle,
+    ) -> Self {
+        // Features install after engine configuration. This shared handle sees
+        // the final installed tool definitions at the actual request boundary.
+        self.request_shape = Some((system_prompt, tools));
+        self
     }
 
     fn maybe_emit_warning(&self, remaining: u64) -> Option<Item> {
@@ -405,7 +431,12 @@ impl CompactWorkerInterceptor {
         let message = format!(
             "compact worker context budget is low ({remaining}/{} tokens remaining). \
              Stop broad exploration now, read only if absolutely necessary, then call \
-             `write_summary` with the final structured summary.",
+             `write_summary` with the final structured summary. Preserve ongoing goals and \
+             user directives from the full initial summary and segment. Compress duplicate \
+             explanations and old work details first, not scope, prohibitions, completion \
+             conditions or exception-reporting duties. Apply explicit later changes/retractions \
+             and retain uncertainty; recovery procedures and recent progress do not replace \
+             the original request.",
             self.max_input_tokens
         );
         if let Some(cb) = self.on_warning.as_ref() {
@@ -426,17 +457,38 @@ impl<A: Send + Sync> Interceptor<A> for CompactWorkerInterceptor {
         let context = context.items;
         let records = self.usage_tracker.records();
         let estimate = agen::token_counter::total_tokens(context, &records);
-        if estimate.tokens > self.max_input_tokens {
+        // Before the first provider measurement, include the system and tool
+        // shape as well as *all* mandatory summary/input bytes. Later exact
+        // input measurements already include that shape; do not double charge.
+        let shape_tokens = if records.is_empty() {
+            self.request_shape.as_ref().map_or(0, |(system, tools)| {
+                let tool_bytes = serde_json::to_vec(&tools.tool_definitions_sorted())
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0);
+                estimate_tokens(system.len().saturating_add(tool_bytes))
+            })
+        } else {
+            0
+        };
+        let input_tokens = estimate.tokens.saturating_add(shape_tokens);
+        if input_tokens > self.max_input_tokens {
             return Ok(PreRequestAction::Cancel(format!(
-                "compact worker input occupancy exceeded {} tokens",
+                "compact worker input occupancy (including mandatory full initial summary) exceeded {} tokens; no summary was truncated",
                 self.max_input_tokens
             )));
         }
 
-        let remaining = self.max_input_tokens.saturating_sub(estimate.tokens);
+        let remaining = self.max_input_tokens.saturating_sub(input_tokens);
         self.last_remaining_tokens
             .store(remaining, Ordering::Release);
         if let Some(item) = self.maybe_emit_warning(remaining) {
+            let warning_tokens =
+                agen::token_counter::total_tokens(std::slice::from_ref(&item), &[]).tokens;
+            if input_tokens.saturating_add(warning_tokens) > self.max_input_tokens {
+                return Ok(PreRequestAction::Cancel(
+                    "compact worker input occupancy cannot fit budget warning alongside mandatory full input; no summary was truncated".into(),
+                ));
+            }
             self.usage_tracker.note_request(context.len() + 1);
             return Ok(PreRequestAction::ContinueWith(vec![item]));
         }
@@ -536,14 +588,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_worker_warning_policy_keeps_user_intent_and_fails_if_warning_cannot_fit() {
+        let interceptor =
+            CompactWorkerInterceptor::new(Arc::new(UsageTracker::new()), 100, 100, 0, None);
+        let mut context = vec![Item::user_message("full input")];
+        let result = interceptor
+            .pre_llm_request(PreLlmRequestContext::<()> {
+                invocation: Default::default(),
+                items: &mut context,
+                history: &[],
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, PreRequestAction::Cancel(message) if message.contains("no summary was truncated"))
+        );
+        let interceptor =
+            CompactWorkerInterceptor::new(Arc::new(UsageTracker::new()), 1000, 1000, 0, None);
+        let result = interceptor
+            .pre_llm_request(PreLlmRequestContext::<()> {
+                invocation: Default::default(),
+                items: &mut context,
+                history: &[],
+            })
+            .await
+            .unwrap();
+        let PreRequestAction::ContinueWith(items) = result else {
+            panic!("expected persisted warning")
+        };
+        let warning = items[0].as_text().unwrap();
+        for policy in [
+            "full initial summary and segment",
+            "prohibitions",
+            "completion conditions",
+            "exception-reporting duties",
+            "changes/retractions",
+            "uncertainty",
+            "Compress duplicate",
+        ] {
+            assert!(warning.contains(policy), "missing warning policy: {policy}");
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_worker_initial_request_counts_system_shape_but_measurements_do_not_double_count()
+     {
+        let tracker = Arc::new(UsageTracker::new());
+        let interceptor = CompactWorkerInterceptor::new(tracker.clone(), 100, 0, 0, None)
+            .with_request_shape(
+                "system".repeat(100),
+                agen::tool_server::ToolServerHandle::default(),
+            );
+        let mut context = vec![Item::user_message("full input")];
+        assert!(matches!(
+            interceptor
+                .pre_llm_request(PreLlmRequestContext::<()> {
+                    invocation: Default::default(),
+                    items: &mut context,
+                    history: &[],
+                })
+                .await
+                .unwrap(),
+            PreRequestAction::Cancel(_)
+        ));
+        tracker.note_request(context.len());
+        tracker.record_usage(&make_usage(50));
+        assert!(matches!(
+            interceptor
+                .pre_llm_request(PreLlmRequestContext::<()> {
+                    invocation: Default::default(),
+                    items: &mut context,
+                    history: &[],
+                })
+                .await
+                .unwrap(),
+            PreRequestAction::Continue
+        ));
+    }
+
+    #[tokio::test]
     async fn compact_worker_interceptor_warns_before_hard_cap() {
         let tracker = Arc::new(UsageTracker::new());
         let warnings = Arc::new(Mutex::new(Vec::new()));
         let captured = warnings.clone();
         let interceptor = CompactWorkerInterceptor::new(
             tracker.clone(),
-            150,
-            60,
+            500,
+            410,
             20,
             Some(Arc::new(move |message| {
                 captured.lock().unwrap().push(message);

@@ -144,7 +144,7 @@ impl LaunchFixture {
     async fn new(remote: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let config = test_server_config(temp.path());
-        let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
         let backend = Arc::new(LaunchExecutionBackend::default());
         let api =
             WorkspaceApi::new_with_execution_backend(config, Arc::new(store), backend.clone())
@@ -267,15 +267,34 @@ impl LaunchFixture {
         fixture
     }
 
-    fn ticket(&self, state: TicketWorkflowState) -> String {
-        let mut input =
-            ticket::NewTicket::new(format!("Explicit Worker launch from {}", state.as_str()));
-        input.workflow_state = Some(state);
+    fn ticket(&self) -> String {
         browser_ticket_backend(&self.api)
             .unwrap()
-            .create(input)
+            .create(ticket::NewTicket::new(
+                "Explicit Worker launch on an open case",
+            ))
             .unwrap()
             .id
+    }
+
+    fn case_action(&self, ticket_id: &str, operation_key: &str, action: ticket::TicketCaseAction) {
+        let backend = browser_ticket_backend(&self.api).unwrap();
+        let before = backend.show(ticket_id.into()).unwrap();
+        backend
+            .update_case(
+                ticket_id,
+                ticket::TicketCaseUpdate {
+                    expected_content_digest: ticket::ticket_content_digest(&before),
+                    expected_state: before.meta.workflow_state,
+                    expected_closure_operation_key: before.closure_operation_key,
+                    operation_key: operation_key.into(),
+                    action,
+                    explanation: "Explicit fixture case judgment".into(),
+                    references: Vec::new(),
+                    author: Some("fixture".into()),
+                },
+            )
+            .unwrap();
     }
 
     fn payload(&self, ticket_id: &str, operation_id: &str, profile: &str, flow: bool) -> Value {
@@ -361,24 +380,40 @@ impl LaunchFixture {
             Some(current.assignment_id.as_str())
         );
         assert_eq!(
-            self.api.authority.ticket(ticket_id).unwrap().state,
-            "inprogress"
+            self.api.authority.ticket(ticket_id).unwrap().state.as_str(),
+            "open"
         );
         current
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn embedded_explicit_worker_starts_each_active_state_without_targets_flow_or_orchestrator() {
+async fn embedded_explicit_worker_starts_open_cases_without_phase_transitions_or_queue_requirement()
+{
     let fixture = LaunchFixture::new(false).await;
-    for state in [
-        TicketWorkflowState::Planning,
-        TicketWorkflowState::Ready,
-        TicketWorkflowState::Queued,
-        TicketWorkflowState::InProgress,
-    ] {
-        let ticket_id = fixture.ticket(state);
-        let operation_id = format!("explicit-{}", state.as_str());
+    for context in ["unqueued", "queued", "reopened"] {
+        let ticket_id = fixture.ticket();
+        let backend = browser_ticket_backend(&fixture.api).unwrap();
+        if context == "queued" {
+            backend
+                .queue_ready(ticket_id.clone().into(), "fixture")
+                .unwrap();
+        } else if context == "reopened" {
+            fixture.case_action(
+                &ticket_id,
+                "fixture-close",
+                ticket::TicketCaseAction::Close {
+                    reason: ticket::TicketClosureReason::NotPlanned,
+                },
+            );
+            fixture.case_action(
+                &ticket_id,
+                "fixture-reopen",
+                ticket::TicketCaseAction::Reopen,
+            );
+        }
+        let before = backend.show(ticket_id.clone().into()).unwrap();
+        let operation_id = format!("explicit-{context}");
         assert!(
             fixture
                 .api
@@ -393,8 +428,16 @@ async fn embedded_explicit_worker_starts_each_active_state_without_targets_flow_
         );
         let payload = fixture.payload(&ticket_id, &operation_id, "builtin:companion", false);
         let (status, body) = fixture.post(TEST_WORKSPACE_ID, payload).await;
-        assert_eq!(status, StatusCode::OK, "{}: {body}", state.as_str());
+        assert_eq!(status, StatusCode::OK, "{context}: {body}");
         let assignment = fixture.assert_assigned(&ticket_id, &operation_id, &body);
+        let after = backend.show(ticket_id.clone().into()).unwrap();
+        assert_eq!(after.meta.workflow_state, before.meta.workflow_state);
+        assert_eq!(after.case_history, before.case_history);
+        assert_eq!(after.closure_operation_key, before.closure_operation_key);
+        assert_eq!(
+            ticket::ticket_content_digest(&after),
+            ticket::ticket_content_digest(&before)
+        );
         assert_eq!(body["worker"]["profile"], "builtin:companion", "{body}");
         let creates = fixture.backend.creates_for(&assignment.worker.worker_id);
         assert_eq!(creates.len(), 1);
@@ -413,7 +456,7 @@ async fn embedded_explicit_worker_starts_each_active_state_without_targets_flow_
 async fn real_runtime_http_worker_launch_preserves_optional_flow_profile_submit_and_assignment() {
     let fixture = LaunchFixture::new(true).await;
     for (profile, flow) in [("builtin:intake", false), ("builtin:coder", true)] {
-        let ticket_id = fixture.ticket(TicketWorkflowState::Planning);
+        let ticket_id = fixture.ticket();
         let operation_id = format!("real-http-{flow}");
         let payload = fixture.payload(&ticket_id, &operation_id, profile, flow);
         let expected_submit = payload["initial_submit"].clone();
@@ -489,7 +532,7 @@ async fn worker_launch_uses_published_project_profile_and_workspace_default_on_r
         .commit_evaluated_workspace_config(TEST_WORKSPACE_ID, &candidate)
         .unwrap();
     for explicit in [true, false] {
-        let ticket_id = fixture.ticket(TicketWorkflowState::Ready);
+        let ticket_id = fixture.ticket();
         let operation_id = format!("project-profile-{explicit}");
         let mut payload = fixture.payload(&ticket_id, &operation_id, "project:research", false);
         if !explicit {
@@ -511,21 +554,35 @@ async fn worker_launch_uses_published_project_profile_and_workspace_default_on_r
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn completed_or_closed_ticket_launch_rejects_before_runtime_or_assignment_reservation() {
+async fn closed_ticket_launch_rejects_before_runtime_or_assignment_reservation() {
     let fixture = LaunchFixture::new(false).await;
-    for state in [TicketWorkflowState::Done, TicketWorkflowState::Closed] {
-        let ticket_id = fixture.ticket(state);
-        let operation_id = format!("terminal-{}", state.as_str());
+    for (label, reason) in [
+        ("completed", ticket::TicketClosureReason::Completed),
+        ("not-planned", ticket::TicketClosureReason::NotPlanned),
+    ] {
+        let ticket_id = fixture.ticket();
+        fixture.case_action(
+            &ticket_id,
+            "fixture-close",
+            ticket::TicketCaseAction::Close { reason },
+        );
+        let operation_id = format!("terminal-{label}");
         let payload = fixture.payload(&ticket_id, &operation_id, "builtin:companion", false);
         let (status, body) = fixture.post(TEST_WORKSPACE_ID, payload).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert!(
-            body["message"].as_str().unwrap().contains(state.as_str()),
+            body["message"].as_str().unwrap().contains("closed"),
             "{body}"
         );
         assert_eq!(
-            fixture.api.authority.ticket(&ticket_id).unwrap().state,
-            state.as_str()
+            fixture
+                .api
+                .authority
+                .ticket(&ticket_id)
+                .unwrap()
+                .state
+                .as_str(),
+            "closed"
         );
         assert!(
             fixture
@@ -551,7 +608,7 @@ async fn completed_or_closed_ticket_launch_rejects_before_runtime_or_assignment_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_exact_launch_replays_keep_one_worker_and_committed_assignment() {
     let fixture = Arc::new(LaunchFixture::new(false).await);
-    let ticket_id = fixture.ticket(TicketWorkflowState::Planning);
+    let ticket_id = fixture.ticket();
     let payload = fixture.payload(&ticket_id, "concurrent-launch", "builtin:companion", false);
     let barrier = Arc::new(tokio::sync::Barrier::new(5));
     let mut tasks = Vec::new();
@@ -596,7 +653,7 @@ async fn concurrent_exact_launch_replays_keep_one_worker_and_committed_assignmen
 #[tokio::test(flavor = "multi_thread")]
 async fn undispatched_launch_rejection_settles_claim_and_allows_corrected_operation() {
     let fixture = LaunchFixture::new(false).await;
-    let ticket_id = fixture.ticket(TicketWorkflowState::Planning);
+    let ticket_id = fixture.ticket();
     let mut rejected = fixture.payload(&ticket_id, "invalid-resources", "builtin:companion", false);
     rejected["workdir_attachments"] =
         json!([{"alias":"checkout","working_directory_id":"missing-workdir"}]);
@@ -629,7 +686,7 @@ async fn undispatched_launch_rejection_settles_claim_and_allows_corrected_operat
 #[tokio::test(flavor = "multi_thread")]
 async fn worker_launch_retry_reuses_assignment_and_does_not_repeat_initial_submit() {
     let fixture = LaunchFixture::new(false).await;
-    let ticket_id = fixture.ticket(TicketWorkflowState::Ready);
+    let ticket_id = fixture.ticket();
     let payload = fixture.payload(&ticket_id, "worker-retry", "builtin:companion", false);
     let (status, first) = fixture.post(TEST_WORKSPACE_ID, payload.clone()).await;
     assert_eq!(status, StatusCode::OK, "{first}");
@@ -682,7 +739,7 @@ async fn worker_launch_retry_reuses_assignment_and_does_not_repeat_initial_submi
 async fn generic_ticket_worker_unknown_input_outcome_preserves_assignment_and_launch_retry_identity()
  {
     let fixture = LaunchFixture::new(false).await;
-    let ticket_id = fixture.ticket(TicketWorkflowState::Planning);
+    let ticket_id = fixture.ticket();
     let payload = fixture.payload(
         &ticket_id,
         "worker-unknown-input",
@@ -745,7 +802,7 @@ async fn generic_ticket_worker_unknown_input_outcome_preserves_assignment_and_la
 #[tokio::test(flavor = "multi_thread")]
 async fn scoped_worker_launch_rejects_foreign_workspace_and_unpublished_profile_with_body() {
     let fixture = LaunchFixture::new(false).await;
-    let ticket_id = fixture.ticket(TicketWorkflowState::Planning);
+    let ticket_id = fixture.ticket();
     let payload = fixture.payload(&ticket_id, "scope-rejected", "builtin:companion", false);
     let (status, body) = fixture
         .post("019d0000-0000-7000-8000-0000000000bb", payload.clone())
@@ -904,10 +961,10 @@ async fn read_only_ticket_targets_allow_extra_external_grants_without_widening_c
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn worker_assignment_finalize_failure_compensates_real_embedded_runtime_and_preserves_planning()
+async fn worker_assignment_finalize_failure_compensates_real_embedded_runtime_and_preserves_open_case()
  {
     let fixture = LaunchFixture::new(false).await;
-    let ticket_id = fixture.ticket(TicketWorkflowState::Planning);
+    let ticket_id = fixture.ticket();
     rusqlite::Connection::open(&fixture.api.config.database_path)
         .unwrap()
         .execute_batch(
@@ -966,8 +1023,14 @@ async fn worker_assignment_finalize_failure_compensates_real_embedded_runtime_an
             .is_none()
     );
     assert_eq!(
-        fixture.api.authority.ticket(&ticket_id).unwrap().state,
-        "planning"
+        fixture
+            .api
+            .authority
+            .ticket(&ticket_id)
+            .unwrap()
+            .state
+            .as_str(),
+        "open"
     );
     let counts: (i64, i64) = fixture.api.config_store.with_conn(|conn| Ok((
         conn.query_row("SELECT COUNT(*) FROM worker_registry WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3", rusqlite::params![TEST_WORKSPACE_ID, fixture.runtime_id, worker_id], |row| row.get(0))?,
@@ -979,7 +1042,7 @@ async fn worker_assignment_finalize_failure_compensates_real_embedded_runtime_an
 #[tokio::test(flavor = "multi_thread")]
 async fn choosing_reviewer_profile_does_not_register_a_reviewer_child_or_grant_mr_review() {
     let fixture = LaunchFixture::new(false).await;
-    let ticket_id = fixture.ticket(TicketWorkflowState::Planning);
+    let ticket_id = fixture.ticket();
     let payload = fixture.payload(&ticket_id, "ordinary-reviewer", "builtin:reviewer", false);
     let (status, body) = fixture.post(TEST_WORKSPACE_ID, payload).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1215,7 +1278,140 @@ async fn uncertain_launch_replay_after_target_edit_keeps_claim_and_blocks_compet
             .authority
             .ticket(&fixture.ticket_id)
             .unwrap()
-            .state,
-        "ready"
+            .state
+            .as_str(),
+        "open"
+    );
+}
+
+// Direct policy composition is intentional: this protects routing interest,
+// independently of the transport/Runtime launch assertions above.
+#[tokio::test(flavor = "multi_thread")]
+async fn assignment_inputs_replace_queue_interest_without_reviving_released_work() {
+    let fixture = LaunchFixture::new(false).await;
+    let backend = browser_ticket_backend(&fixture.api).unwrap();
+    let queued_id = fixture.ticket();
+    assign_test_orchestrator(&fixture.api, &queued_id);
+    assert!(
+        fixture
+            .api
+            .store
+            .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
+            .unwrap()
+            .iter()
+            .any(|input| input.ticket_id == queued_id)
+            == true
+    );
+    backend
+        .queue_ready(queued_id.clone().into(), "fixture")
+        .unwrap();
+    assert!(
+        fixture
+            .api
+            .store
+            .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
+            .unwrap()
+            .iter()
+            .any(|input| input.ticket_id == queued_id)
+            == true
+    );
+    fixture.case_action(
+        &queued_id,
+        "queue-case-close",
+        ticket::TicketCaseAction::Close {
+            reason: ticket::TicketClosureReason::Completed,
+        },
+    );
+    assert!(
+        fixture
+            .api
+            .store
+            .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
+            .unwrap()
+            .iter()
+            .any(|input| input.ticket_id == queued_id)
+            == false
+    );
+    fixture.case_action(
+        &queued_id,
+        "queue-case-reopen",
+        ticket::TicketCaseAction::Reopen,
+    );
+    assert!(
+        fixture
+            .api
+            .store
+            .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
+            .unwrap()
+            .iter()
+            .any(|input| input.ticket_id == queued_id)
+            == false
+    );
+
+    let active_id = fixture.ticket();
+    assign_test_orchestrator(&fixture.api, &active_id);
+    let payload = fixture.payload(
+        &active_id,
+        "routing-active-work",
+        "builtin:companion",
+        false,
+    );
+    let (status, body) = fixture.post(TEST_WORKSPACE_ID, payload).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    fixture.assert_assigned(&active_id, "routing-active-work", &body);
+    let active = backend.show(active_id.clone().into()).unwrap();
+    assert!(
+        active
+            .events
+            .iter()
+            .all(|event| !event.attributes.contains_key("queue_root_ticket"))
+    );
+    assert!(
+        fixture
+            .api
+            .store
+            .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
+            .unwrap()
+            .iter()
+            .any(|input| input.ticket_id == active_id)
+            == true
+    );
+    fixture.case_action(
+        &active_id,
+        "active-case-close",
+        ticket::TicketCaseAction::Close {
+            reason: ticket::TicketClosureReason::NotPlanned,
+        },
+    );
+    fixture.case_action(
+        &active_id,
+        "active-case-reopen",
+        ticket::TicketCaseAction::Reopen,
+    );
+    assert!(
+        fixture
+            .api
+            .store
+            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &active_id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        fixture
+            .api
+            .store
+            .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &active_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fixture
+            .api
+            .store
+            .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
+            .unwrap()
+            .iter()
+            .any(|input| input.ticket_id == active_id)
+            == false
     );
 }

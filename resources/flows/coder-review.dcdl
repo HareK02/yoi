@@ -53,7 +53,7 @@
         };
 
         done = {
-            instructions = "The approved implementation has been handed off for Orchestrator-owned readiness, target integration, and `CompleteMergeRequest`. Flow terminal state only reflects that handoff.";
+            instructions = "The approved implementation has been handed off for Orchestrator-owned readiness, target integration, and `CompleteMergeRequest`. Flow terminal state only reflects that handoff; it is neither Ticket closed nor an assignment handling done self-report, work release, unassignment, or Worker stop. Generic Ticket closure has no universal MR gate; explicit user approval conditions and guarded MR integration remain separate.";
             terminal = true;
         };
     };

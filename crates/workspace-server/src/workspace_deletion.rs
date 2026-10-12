@@ -45,6 +45,11 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "repository_ssh_host_trust_keys",
     "repository_ssh_host_trusts",
     "server_secret_objects",
+    "ticket_assignment_delivery_acknowledgements",
+    "ticket_assignment_delivery_requests",
+    "ticket_assignment_deliveries",
+    "ticket_assignment_delivery_origins",
+    "ticket_assignment_operation_fences",
     "ticket_assignment_operations",
     "ticket_assignment_work_releases",
     "ticket_assignment_ticket_tombstones",
@@ -52,6 +57,11 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "ticket_current_worker_assignments",
     "ticket_worker_assignment_events",
     "ticket_worker_assignments",
+    "typed_ticket_assignment_tracking_history",
+    "typed_ticket_assignment_tracking_operations",
+    "typed_ticket_case_history",
+    "typed_ticket_case_metadata",
+    "typed_ticket_legacy_workflow_snapshot",
     "typed_ticket_artifacts",
     "typed_ticket_event_attributes",
     "typed_ticket_event_references",
@@ -62,6 +72,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "typed_ticket_relations",
     "typed_ticket_risk_flags",
     "typed_ticket_targets",
+    "typed_ticket_tags",
     "typed_tickets",
     "workdir_create_credential_candidates",
     "workdir_create_credential_retentions",
@@ -93,6 +104,8 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "workspace_config_tree_history",
     "workspace_config_trees",
     "workspace_create_operations",
+    "workspace_tag_operations",
+    "workspace_tags",
     "workspace_memory_documents",
     "workspace_memory_settings",
     "workspace_resource_key_counters",
@@ -223,7 +236,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 "Workspace deletion request exceeds bounded field limits".to_string(),
             ));
         }
-        self.with_transaction(|tx| {
+        self.with_immediate_transaction(|tx| {
             if let Some(existing) = read_operation(tx, &request.operation_id)? {
                 if existing.actor_account_id != actor_account_id {
                     return Err(Error::WorkspacePermissionDenied(
@@ -356,7 +369,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
         child_operation_id: &str,
     ) -> Result<WorkspaceDeletionOperationResponse> {
         validate_operation_id(child_operation_id)?;
-        self.with_transaction(|tx| {
+        self.with_immediate_transaction(|tx| {
             let operation = read_operation(tx, operation_id)?
                 .ok_or_else(|| Error::InvalidInput("Workspace deletion operation".to_string()))?
                 .response;
@@ -398,7 +411,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
         failure_category: Option<&str>,
     ) -> Result<WorkspaceDeletionOperationResponse> {
         validate_operation_projection(child_operation_ids, blockers)?;
-        self.with_transaction(|tx| {
+        self.with_immediate_transaction(|tx| {
             let current = read_operation(tx, operation_id)?
                 .ok_or_else(|| Error::InvalidInput("Workspace deletion operation".to_string()))?
                 .response;
@@ -449,7 +462,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
         &self,
         operation_id: &str,
     ) -> Result<WorkspaceDeletionOperationResponse> {
-        self.with_transaction(|tx| {
+        self.with_immediate_transaction(|tx| {
             tx.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
             let operation = read_operation(tx, operation_id)?
                 .ok_or_else(|| Error::InvalidInput("Workspace deletion operation".to_string()))?;
@@ -458,6 +471,37 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
             }
             let workspace_id = operation.response.workspace_id.clone();
 
+            // Ticket case/assignment judgments and their operation receipts are
+            // immutable under ordinary domain operations, including Ticket
+            // deletion and FK cascades. Only this owner-authorized whole-Workspace
+            // purge may discard them.
+            // SQLite transactional DDL holds the writer lock: no concurrent writer
+            // can observe the suspended guards, and any error rolls back both
+            // data and schema. Restore the exact schema-owned definitions before
+            // commit; update guards remain installed throughout.
+            let mut ticket_delete_guards = Vec::new();
+            for (table, trigger) in [
+                ("ticket_worker_assignments", "typed_ticket_assignment_identity_no_delete"),
+                ("ticket_worker_assignment_events", "typed_ticket_assignment_events_no_delete"),
+                ("ticket_assignment_operations", "typed_ticket_assignment_receipt_no_delete"),
+                ("ticket_assignment_deliveries", "ticket_assignment_delivery_payload_no_delete"),
+                ("ticket_assignment_delivery_requests", "ticket_assignment_delivery_request_no_delete"),
+                ("ticket_assignment_delivery_acknowledgements", "ticket_assignment_delivery_ack_no_delete"),
+                ("ticket_assignment_delivery_origins", "ticket_assignment_delivery_origin_no_delete"),
+                ("ticket_assignment_operation_fences", "ticket_assignment_operation_fence_no_delete"),
+                ("typed_ticket_assignment_tracking_history", "typed_ticket_assignment_tracking_history_no_delete"),
+                ("typed_ticket_assignment_tracking_operations", "typed_ticket_assignment_tracking_operations_no_delete"),
+                ("typed_ticket_case_history", "typed_ticket_case_history_no_delete"),
+                ("typed_ticket_legacy_workflow_snapshot", "typed_ticket_legacy_workflow_no_delete"),
+            ] {
+                let definition: String = tx.query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1 AND tbl_name=?2",
+                    params![trigger, table],
+                    |row| row.get(0),
+                )?;
+                tx.execute_batch(&format!("DROP TRIGGER \"{trigger}\";"))?;
+                ticket_delete_guards.push(definition);
+            }
             for table in WORKSPACE_DELETION_PURGE_TABLES {
                 tx.execute(
                     &format!("DELETE FROM \"{table}\" WHERE workspace_id = ?1"),
@@ -472,6 +516,9 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 return Err(Error::WorkspaceConfigConflict(
                     "Workspace disappeared before deletion finalized".to_string(),
                 ));
+            }
+            for definition in ticket_delete_guards {
+                tx.execute_batch(&definition)?;
             }
             let now = Utc::now().to_rfc3339();
             tx.execute(
@@ -875,8 +922,10 @@ mod tests {
     use tempfile::tempdir;
 
     fn setup() -> (SqliteWorkspaceStore, String, String) {
-        let dir = tempdir().expect("tempdir");
-        let store = SqliteWorkspaceStore::open(dir.path().join("server.db")).expect("store");
+        seed_workspaces(SqliteWorkspaceStore::in_memory_for_test().expect("store"))
+    }
+
+    fn seed_workspaces(store: SqliteWorkspaceStore) -> (SqliteWorkspaceStore, String, String) {
         store.with_conn(|conn| {
             let now = Utc::now().to_rfc3339();
             conn.execute(
@@ -930,6 +979,252 @@ mod tests {
                 Ok(())
             })
             .expect("purge inventory");
+    }
+
+    #[test]
+    fn workspace_purge_preserves_other_cases_and_restores_immutability_after_commit_or_rollback() {
+        use ticket::TicketBackend;
+
+        for inject_failure in [false, true] {
+            let dir = tempdir().expect("tempdir");
+            let path = dir.path().join("server.db");
+            let (store, owner, workspace_id) =
+                seed_workspaces(SqliteWorkspaceStore::open_for_test(&path).expect("store"));
+            for workspace in ["workspace-a", "workspace-b"] {
+                let backend = ticket::SqliteTicketBackend::open_verified(&path, workspace).unwrap();
+                let initial = backend
+                    .create_with_snapshot(ticket::NewTicket::new("Case evidence"))
+                    .unwrap()
+                    .1;
+                let assignment_id = format!("delegation-{workspace}");
+                store
+                    .set_current_ticket_role_assignment(
+                        &crate::store::TicketRoleAssignmentRecord {
+                            workspace_id: workspace.into(),
+                            ticket_id: initial.meta.id.clone(),
+                            assignment_id: assignment_id.clone(),
+                            role: crate::store::TicketAssignmentRole::Orchestrator,
+                            principal: crate::store::TicketAssignmentPrincipal::WorkspaceAgent {
+                                agent_key: "workspace-orchestrator".into(),
+                            },
+                            assigned_by: "owner".into(),
+                            assigned_at: "2026-01-01T00:00:00Z".into(),
+                        },
+                        None,
+                        "assigned",
+                        "assign",
+                        false,
+                    )
+                    .unwrap();
+                // Seed domain handling evidence under a transaction. This fixture
+                // exercises owner purge, not singleton authentication or delivery.
+                store
+                    .with_immediate_transaction(|tx| {
+                        ticket::sqlite_update_ticket_assignment_tracking_in_transaction(
+                            tx,
+                            workspace,
+                            &initial.meta.id,
+                            &ticket::TicketAssignmentTrackingUpdate {
+                                assignment_id: assignment_id.clone(),
+                                expected_last_event_id: "assigned".into(),
+                                operation_key: "reported".into(),
+                                tracking: ticket::TicketAssignmentTracking {
+                                    status: ticket::TicketAssignmentTrackingStatus::Done,
+                                    waiting_reason: None,
+                                    progress: None,
+                                    next_action: None,
+                                    result: Some("Returned result".into()),
+                                },
+                            },
+                            &ticket::TicketAssignmentTrackingSourceContext {
+                                actor: "orchestrator".into(),
+                                runtime_id: "fixture-runtime".into(),
+                                worker_id: "fixture-worker".into(),
+                                agent_key: "workspace-orchestrator".into(),
+                                authentication_binding_id: "fixture-binding".into(),
+                            },
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+                backend
+                    .update_case(
+                        &initial.meta.id,
+                        ticket::TicketCaseUpdate {
+                            expected_content_digest: ticket::ticket_content_digest(&initial),
+                            expected_state: initial.meta.workflow_state,
+                            expected_closure_operation_key: initial.closure_operation_key,
+                            operation_key: "close".into(),
+                            action: ticket::TicketCaseAction::Close {
+                                reason: ticket::TicketClosureReason::Completed,
+                            },
+                            explanation: "Requested result satisfied".into(),
+                            references: vec![],
+                            author: Some("owner".into()),
+                        },
+                    )
+                    .unwrap();
+                // Seed only the opaque retained snapshot for the deletion boundary;
+                // migration and legacy phase interpretation are tested by the store.
+                let snapshot = ticket::TicketLegacyWorkflowSnapshot {
+                    workflow_state: "closed".into(),
+                    workflow_state_explicit: true,
+                    status: "closed".into(),
+                    queued_by: None,
+                    queued_at: None,
+                    resolution: None,
+                };
+                store
+                    .with_conn(|conn| {
+                        conn.execute(
+                            "INSERT INTO typed_ticket_legacy_workflow_snapshot
+                        (workspace_id,ticket_id,snapshot_json) VALUES (?1,?2,?3)",
+                            params![
+                                workspace,
+                                initial.meta.id,
+                                serde_json::to_string(&snapshot).unwrap()
+                            ],
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let assert_immutable = |workspace: &str| {
+                store.with_conn(|conn| {
+                    for table in ["typed_ticket_case_history", "typed_ticket_legacy_workflow_snapshot", "ticket_worker_assignment_events", "typed_ticket_assignment_tracking_history", "typed_ticket_assignment_tracking_operations", "ticket_assignment_operations"] {
+                        assert!(conn.execute(&format!("DELETE FROM {table} WHERE workspace_id=?1"), [workspace]).is_err());
+                        assert!(conn.execute(&format!("UPDATE {table} SET ticket_id=ticket_id WHERE workspace_id=?1"), [workspace]).is_err());
+                    }
+                    assert!(conn.execute("DELETE FROM typed_tickets WHERE workspace_id=?1", [workspace]).is_err(),
+                        "ordinary Ticket deletion must not cascade away case evidence");
+                    Ok(())
+                }).unwrap();
+            };
+            assert_immutable("workspace-a");
+            assert_immutable("workspace-b");
+            let preflight = store
+                .workspace_deletion_preflight(&owner, &workspace_id)
+                .unwrap();
+            let operation = store
+                .reserve_workspace_deletion(
+                    &owner,
+                    &workspace_id,
+                    &WorkspaceDeletionRequest {
+                        operation_id: "delete-cases".into(),
+                        expected_workspace_updated_at: preflight.expected_workspace_updated_at,
+                        confirmation: "Alpha".into(),
+                    },
+                )
+                .unwrap()
+                .operation;
+            let tables = [
+                "typed_ticket_case_history",
+                "typed_ticket_case_metadata",
+                "typed_ticket_legacy_workflow_snapshot",
+                "ticket_worker_assignments",
+                "ticket_worker_assignment_events",
+                "ticket_assignment_operations",
+                "typed_ticket_assignment_tracking_history",
+                "typed_ticket_assignment_tracking_operations",
+            ];
+            let other_before: Vec<Option<String>> = store
+                .with_conn(|conn| {
+                    tables
+                        .iter()
+                        .map(|table| {
+                            conn.query_row(
+                                &format!("SELECT * FROM {table} WHERE workspace_id='workspace-b'"),
+                                [],
+                                |row| row.get(row.as_ref().column_count() - 1),
+                            )
+                            .map_err(Into::into)
+                        })
+                        .collect()
+                })
+                .unwrap();
+            if inject_failure {
+                store
+                    .with_conn(|conn| {
+                        conn.execute_batch(
+                            "CREATE TRIGGER reject_workspace_purge BEFORE DELETE ON workspaces
+                        BEGIN SELECT RAISE(ABORT, 'injected purge failure'); END;",
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+                assert!(
+                    store
+                        .finalize_workspace_deletion(&operation.operation_id)
+                        .is_err()
+                );
+                assert_immutable("workspace-a");
+                assert_immutable("workspace-b");
+                store
+                    .with_conn(|conn| {
+                        for table in tables {
+                            let count: i64 = conn.query_row(
+                                &format!(
+                                    "SELECT COUNT(*) FROM {table} WHERE workspace_id='workspace-a'"
+                                ),
+                                [],
+                                |row| row.get(0),
+                            )?;
+                            let expected = if table == "typed_ticket_assignment_tracking_history" {
+                                2
+                            } else {
+                                1
+                            };
+                            assert_eq!(count, expected, "rollback must restore {table}");
+                        }
+                        conn.execute_batch("DROP TRIGGER reject_workspace_purge;")?;
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_ne!(
+                    store
+                        .workspace_deletion_operation_for_recovery(&operation.operation_id)
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    WorkspaceDeletionState::Succeeded
+                );
+            }
+            let completed = store
+                .finalize_workspace_deletion(&operation.operation_id)
+                .unwrap();
+            assert_eq!(completed.state, WorkspaceDeletionState::Succeeded);
+            assert_eq!(
+                store
+                    .finalize_workspace_deletion(&operation.operation_id)
+                    .unwrap(),
+                completed
+            );
+            assert_immutable("workspace-b");
+            store
+                .with_conn(|conn| {
+                    for (table, before) in tables.iter().zip(&other_before) {
+                        let count: i64 = conn.query_row(
+                            &format!(
+                                "SELECT COUNT(*) FROM {table} WHERE workspace_id='workspace-a'"
+                            ),
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        assert_eq!(count, 0, "purge must remove {table}");
+                        let after: Option<String> = conn.query_row(
+                            &format!("SELECT * FROM {table} WHERE workspace_id='workspace-b'"),
+                            [],
+                            |row| row.get(row.as_ref().column_count() - 1),
+                        )?;
+                        assert_eq!(
+                            &after, before,
+                            "other Workspace {table} evidence must remain unchanged"
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
     }
 
     #[test]

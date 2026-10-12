@@ -1,6 +1,6 @@
 import "./base.dcdl" // {
     slug = "orchestrator";
-    description = "Intent-led Ticket orchestration with separate guarded MR integration authority.";
+    description = "Intent-led Ticket delegation and self-reported assignment handling; case closure and guarded MR integration are separate.";
     scope = "workspace_write";
     engine = { instruction = "role.orchestrator"; };
 

@@ -74,6 +74,7 @@ async fn call_hook_before_deadline<E: HookEventKind>(
 }
 
 pub(crate) struct WorkerInterceptor {
+    compaction_budget: Option<Arc<crate::compact::worker::CompactWorkerInterceptor>>,
     registry: Arc<HookRegistry>,
     compact_state: Option<Arc<CompactState>>,
     /// Shared view of the cumulative UsageRecord timeline. Used with the
@@ -157,6 +158,7 @@ impl WorkerInterceptor {
         pending_committed_history: Arc<Mutex<VecDeque<HistoryEntry<SessionHistoryMetadata>>>>,
     ) -> Self {
         Self {
+            compaction_budget: None,
             registry,
             compact_state,
             usage_history,
@@ -173,6 +175,14 @@ impl WorkerInterceptor {
             next_turn_index: AtomicUsize::new(0),
             tool_calls_this_turn: AtomicUsize::new(0),
         }
+    }
+
+    pub(crate) fn with_compaction_budget(
+        mut self,
+        budget: Option<Arc<crate::compact::worker::CompactWorkerInterceptor>>,
+    ) -> Self {
+        self.compaction_budget = budget;
+        self
     }
 
     pub(crate) fn with_notification_committer(
@@ -552,6 +562,8 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
         &self,
         context: PreLlmRequestContext<'_, SessionHistoryMetadata>,
     ) -> InterceptorResult<PreRequestAction> {
+        let context_invocation = context.invocation;
+        let context_history = context.history;
         let context = context.items;
         let initial_tokens = self.estimated_tokens(context);
         if let Some(action) =
@@ -616,7 +628,7 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
                 .expect("pending hook system-item queue poisoned"),
         );
         self.attach_prompt_provenance(&mut system_items);
-        let appended_items: Vec<Item> = system_items
+        let mut appended_items: Vec<Item> = system_items
             .iter()
             .map(SystemItem::to_history_item)
             .collect();
@@ -652,10 +664,28 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
             });
         }
 
-        if let Some(usage_tracker) = self.usage_tracker.as_ref() {
-            usage_tracker.note_request(effective_context.len());
+        // Internal compaction safety must survive the normal Worker interceptor
+        // installation. Run it on the complete request after durable hook additions;
+        // Engine persists any returned warning through its normal append path.
+        if let Some(budget) = self.compaction_budget.as_ref() {
+            let mut budget_context = effective_context.into_owned();
+            match budget
+                .pre_llm_request(PreLlmRequestContext {
+                    invocation: context_invocation,
+                    items: &mut budget_context,
+                    history: context_history,
+                })
+                .await?
+            {
+                PreRequestAction::Continue => {}
+                PreRequestAction::ContinueWith(warnings) => appended_items.extend(warnings),
+                action => return Ok(action),
+            }
         }
-        if system_items.is_empty() {
+        if let Some(usage_tracker) = self.usage_tracker.as_ref() {
+            usage_tracker.note_request(context.len() + appended_items.len());
+        }
+        if appended_items.is_empty() {
             return Ok(PreRequestAction::Continue);
         }
         Ok(match self.commit_system_items(&system_items) {
@@ -699,6 +729,12 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
         denials.sort();
         if let Some(reason) = denials.into_iter().next() {
             return Ok(HookPreToolAction::Deny(reason).into_worker_action(summary.call_id.clone()));
+        }
+        if let Some(budget) = self.compaction_budget.as_ref() {
+            match budget.pre_tool_call(info).await? {
+                PreToolAction::Continue => {}
+                action => return Ok(action),
+            }
         }
         self.tool_calls_this_turn.fetch_add(1, Ordering::Relaxed);
         Ok(PreToolAction::Continue)

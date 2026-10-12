@@ -131,8 +131,7 @@ async fn generated_cancellation_errors_preserve_response_and_log_details() {
         })
         .unwrap();
     let backend = browser_ticket_backend(&api).unwrap();
-    let mut input = ticket::NewTicket::new("Cancellation logging");
-    input.workflow_state = Some(TicketWorkflowState::InProgress);
+    let input = ticket::NewTicket::new("Cancellation logging");
     let ticket = backend.create(input).unwrap();
     api.store
         .set_current_ticket_worker_assignment(
@@ -197,8 +196,8 @@ async fn generated_cancellation_errors_preserve_response_and_log_details() {
         "{diagnostics}"
     );
     assert_eq!(
-        api.authority.ticket(&ticket.id).unwrap().state,
-        "inprogress"
+        api.authority.ticket(&ticket.id).unwrap().state.as_str(),
+        "open"
     );
 
     // Errors without diagnostics still carry a useful kind and message.
@@ -213,7 +212,32 @@ async fn generated_cancellation_errors_preserve_response_and_log_details() {
     *execution.cancel_failure.lock().unwrap() = None;
     let (status, body, events) = request_with_logs(app, request("body-secret")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["state"], "ready");
+    assert_eq!(body["state"], "open");
+    assert!(
+        api.store
+            .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        api.store
+            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket.id)
+            .unwrap()
+            .is_none()
+    );
+    let assignment_history = api
+        .store
+        .list_ticket_worker_assignment_events(TEST_WORKSPACE_ID, &ticket.id, 10)
+        .unwrap();
+    assert!(
+        assignment_history
+            .iter()
+            .any(|event| event.action == "unassigned"
+                && event.previous_assignment_id.as_deref() == Some("logging-assignment"))
+    );
+    let after = backend.show(ticket.id.into()).unwrap();
+    assert!(after.case_history.is_empty());
+    assert!(after.current_closure.is_none());
     assert!(
         events.is_empty(),
         "successful cancellation logged as failure: {events:?}"
@@ -782,7 +806,19 @@ async fn self_workdir_post_start_registration_failure_does_not_claim_pre_dispatc
             .unwrap();
     };
     let ((status, body, events), ()) = tokio::join!(
-        request_with_logs(build_router(fixture.api.clone()), request),
+        async {
+            let result = request_with_logs(build_router(fixture.api.clone()), request).await;
+            // A pre-dispatch rejection leaves the fake provider waiting on an
+            // open channel. Fail with the actual response here instead of
+            // hanging join! until the outer suite timeout hides that cause.
+            assert_eq!(
+                result.0,
+                StatusCode::BAD_GATEWAY,
+                "early command-start response: {}",
+                result.1
+            );
+            result
+        },
         provider
     );
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
@@ -807,4 +843,79 @@ async fn self_workdir_post_start_registration_failure_does_not_claim_pre_dispatc
         commands.try_recv().is_err(),
         "post-dispatch failure was retried"
     );
+}
+
+#[tokio::test]
+async fn saturated_host_before_command_start_returns_availability_without_a_provider_operation() {
+    let mut fixture = manual_worker_assignment_fixture().await;
+    let identity =
+        worker_runtime::auth::RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id)
+            .unwrap();
+    configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
+    let (sender, mut commands) = tokio::sync::mpsc::channel(1);
+    let connection = Arc::new(ExternalProviderConnection {
+        grant_id: "overload-grant".into(),
+        workdir_id: fixture.main_workdir_id.clone(),
+        provider_instance_id: "overload-provider".into(),
+        generation: 1,
+        expires_at: None,
+        capabilities: workdir::WorkdirSessionCapabilities::ALL,
+        admission: Arc::new(tokio::sync::Semaphore::new(1)),
+        shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        sender,
+    });
+    fixture.runtime.workdir_session_factory = Some(Arc::new(move |_| {
+        Ok(Arc::new(ExternalProviderWorkdirSession::new(
+            connection.clone(),
+            None,
+        )) as WorkdirSessionHandle)
+    }));
+    fixture
+        .api
+        .runtime
+        .register_or_replace(fixture.runtime.clone());
+    let host = fixture.api.host_executors.host().unwrap();
+    host.drain().await.unwrap();
+    let mut releases = Vec::new(); // dropping senders also releases jobs on panic
+    for _ in 0..2 {
+        let (release, permit) = std::sync::mpsc::channel::<()>();
+        releases.push(release);
+        let (started, accepted) = tokio::sync::oneshot::channel();
+        host.dispatch(move || {
+            let _ = started.send(());
+            let _ = permit.recv_timeout(std::time::Duration::from_secs(10));
+        })
+        .unwrap();
+        accepted.await.unwrap();
+    }
+    for _ in 0..16 {
+        host.dispatch(|| {}).unwrap();
+    }
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-session/operations");
+    let request = runtime_source_request(
+        &identity,
+        Some(&fixture.worker.worker_id),
+        "POST",
+        &path,
+        serde_json::to_vec(&json!({
+            "target_workdir": "checkout",
+            "operation": {"operation": "command_start", "request": {
+                "command": "not-dispatched", "timeout_secs": 1, "output_limit": 1024,
+                "cwd": "", "spill_dir": null, "tool_call_id": "not-dispatched"
+            }}
+        }))
+        .unwrap(),
+    );
+    let (status, body, _) = request_with_logs(build_router(fixture.api.clone()), request).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.to_string().contains("db_capacity_exceeded"), "{body}");
+    // The response is already final but the live fake-provider receiver remains
+    // Pending. An unbounded join of those two futures hid this causal rejection
+    // behind the original 600-second suite timeout. No process or command ran.
+    let provider_command = commands.recv();
+    tokio::pin!(provider_command);
+    assert!(futures::poll!(provider_command.as_mut()).is_pending());
+    drop(releases);
+    host.drain().await.unwrap();
+    fixture.api.store.db_executor().drain().await.unwrap();
 }

@@ -37,7 +37,10 @@ use std::{
 };
 use workdir::{
     Workdir, WorkdirError, WorkdirSessionHandle,
-    http::{OpenWorkdirSessionRequest, RemoteWorkdirSession, WorkdirHttpAuthorization},
+    http::{
+        OpenWorkdirSessionRequest, RemoteWorkdirSession, WorkdirHttpAuthorization,
+        WorkdirHttpAuthorizationFuture,
+    },
 };
 use worker_runtime::RuntimeWorkspaceScope;
 use worker_runtime::catalog::{
@@ -464,6 +467,10 @@ pub struct WorkerSpawnWorkingDirectoryRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerTicketAssignmentRequest {
+    /// Observed delegation required for Orchestrator Ticket starts; manual starts omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_assignment_id: Option<String>,
+
     pub ticket_id: String,
     pub operation_id: String,
 }
@@ -1300,11 +1307,13 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         })
     }
 
+    /// Absence means unsupported observation, not failed authorization. Live binding/signing
+    /// and bounded admission failures propagate explicitly, never as None or bearer fallback.
     fn observation_source(
         &self,
         _worker_id: &str,
-    ) -> Option<crate::observation::RuntimeObservationSource> {
-        None
+    ) -> Result<Option<crate::observation::RuntimeObservationSource>, RuntimeDiagnostic> {
+        Ok(None)
     }
 
     fn send_input(&self, worker_id: &str, _request: WorkerInputRequest) -> WorkerInputResult {
@@ -2242,6 +2251,11 @@ impl RuntimeRegistry {
         let runtime = self.runtime(runtime_id)?;
         runtime
             .observation_source(worker_id)
+            .map_err(|diagnostic| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.to_owned(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+            })?
             .ok_or_else(|| RuntimeRegistryError::UnknownWorker {
                 worker: worker.clone(),
             })
@@ -3209,17 +3223,21 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
     fn observation_source(
         &self,
         worker_id: &str,
-    ) -> Option<crate::observation::RuntimeObservationSource> {
-        let worker_ref = self.worker_ref(worker_id)?;
+    ) -> Result<Option<crate::observation::RuntimeObservationSource>, RuntimeDiagnostic> {
+        let Some(worker_ref) = self.worker_ref(worker_id) else {
+            return Ok(None);
+        };
         if self.runtime.worker_detail(&worker_ref).is_err() {
-            return None;
+            return Ok(None);
         }
-        Some(crate::observation::RuntimeObservationSource::embedded(
-            crate::observation::EmbeddedRuntimeObservationSource {
-                worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
-                runtime: self.runtime.clone(),
-                worker_ref,
-            },
+        Ok(Some(
+            crate::observation::RuntimeObservationSource::embedded(
+                crate::observation::EmbeddedRuntimeObservationSource {
+                    worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
+                    runtime: self.runtime.clone(),
+                    worker_ref,
+                },
+            ),
         ))
     }
 
@@ -3485,6 +3503,41 @@ impl WorkspaceRuntimeAuthorization {
         }
     }
 
+    /// Offload the complete live-binding check and request signing operation.
+    /// Claims are minted inside the bounded job, not cached before admission. Async subscription
+    /// and Workdir callbacks await this stage before network sends; stale/unavailable authority
+    /// must not fall back to a configured bearer. Synchronous adapters keep their explicit
+    /// blocking boundary, not a synchronous signing callback invoked directly on Tokio.
+    pub(crate) async fn issue_async(
+        &self,
+        method: String,
+        path_and_query: String,
+        operation: String,
+        worker_id: Option<String>,
+        body: Vec<u8>,
+    ) -> Result<String, RuntimeDiagnostic> {
+        let executor = self.store.db_executor();
+        let authorization = self.clone();
+        executor
+            .run(move || {
+                Ok::<_, Error>(authorization.issue(
+                    &method,
+                    &path_and_query,
+                    &operation,
+                    worker_id.as_deref(),
+                    &body,
+                ))
+            })
+            .await
+            .map_err(|error| {
+                diagnostic(
+                    "workspace_runtime_authorization_unavailable",
+                    HostDiagnosticSeverity::Error,
+                    error.to_string(),
+                )
+            })?
+    }
+
     pub(crate) fn issue(
         &self,
         method: &str,
@@ -3657,25 +3710,24 @@ impl std::fmt::Debug for RemoteWorkdirAuthorization {
 impl WorkdirHttpAuthorization for RemoteWorkdirAuthorization {
     fn bearer_token(
         &self,
-        method: &str,
-        path_and_query: &str,
-        body: &[u8],
-    ) -> Result<String, WorkdirError> {
-        if let Some(authorization) = &self.workspace_authorization {
-            return authorization
-                .issue(
-                    method,
-                    path_and_query,
-                    workspace_runtime_operation(method, path_and_query),
-                    None,
-                    body,
+        method: String,
+        path_and_query: String,
+        body: Vec<u8>,
+    ) -> WorkdirHttpAuthorizationFuture {
+        let authorization = self.clone();
+        Box::pin(async move {
+            if let Some(authorizer) = &authorization.workspace_authorization {
+                let operation = workspace_runtime_operation(&method, &path_and_query).to_string();
+                return authorizer
+                    .issue_async(method, path_and_query, operation, None, body)
+                    .await
+                    .map_err(|error| WorkdirError::Unavailable(error.message));
+            }
+            authorization.fallback_bearer_token.ok_or_else(|| {
+                WorkdirError::Unavailable(
+                    "remote Runtime does not have bearer authorization configured".to_string(),
                 )
-                .map_err(|error| WorkdirError::Unavailable(error.message));
-        }
-        self.fallback_bearer_token.clone().ok_or_else(|| {
-            WorkdirError::Unavailable(
-                "remote Runtime does not have bearer authorization configured".to_string(),
-            )
+            })
         })
     }
 }
@@ -5298,20 +5350,22 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
     fn observation_source(
         &self,
         worker_id: &str,
-    ) -> Option<crate::observation::RuntimeObservationSource> {
+    ) -> Result<Option<crate::observation::RuntimeObservationSource>, RuntimeDiagnostic> {
         let path = format!("/v1/workers/{worker_id}/protocol/ws");
         let bearer_token = match &self.workspace_authorization {
-            Some(authorization) => authorization
-                .issue("GET", &path, "workers:protocol", Some(worker_id), &[])
-                .ok(),
+            Some(authorization) => {
+                Some(authorization.issue("GET", &path, "workers:protocol", Some(worker_id), &[])?)
+            }
             None => self.bearer_token.clone(),
         };
-        Some(crate::observation::RuntimeObservationSource::remote_ws(
-            crate::observation::RuntimeObservationSourceConfig {
-                worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
-                endpoint: self.ws_endpoint(worker_id),
-                bearer_token,
-            },
+        Ok(Some(
+            crate::observation::RuntimeObservationSource::remote_ws(
+                crate::observation::RuntimeObservationSourceConfig {
+                    worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
+                    endpoint: self.ws_endpoint(worker_id),
+                    bearer_token,
+                },
+            ),
         ))
     }
 
@@ -6354,6 +6408,79 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    #[tokio::test]
+    async fn async_workdir_authorization_uses_store_capacity_without_bearer_fallback() {
+        use crate::db_executor::{DbExecutor, DbExecutorLimits};
+        use crate::store::{SqliteWorkspaceStore, WorkspaceRuntimeBinding};
+        use crate::workspace_signing_identity::InMemoryWorkspaceSigningMaterialStore;
+
+        let executor = DbExecutor::new(DbExecutorLimits {
+            workers: std::num::NonZeroUsize::new(1).unwrap(),
+            queued: std::num::NonZeroUsize::new(1).unwrap(),
+        })
+        .unwrap();
+        let store = Arc::new(
+            SqliteWorkspaceStore::in_memory_for_test()
+                .unwrap()
+                .with_db_executor(executor.clone()),
+        );
+        let service = WorkspaceSigningIdentityService::new(
+            store.clone(),
+            Arc::new(InMemoryWorkspaceSigningMaterialStore::default()),
+        );
+        let authorization = RemoteWorkdirAuthorization {
+            workspace_authorization: Some(WorkspaceRuntimeAuthorization::new(
+                store,
+                service,
+                "https://backend.test",
+                WorkspaceRuntimeBinding {
+                    workspace_id: "workspace".into(),
+                    runtime_id: "runtime".into(),
+                    display_name: "Runtime".into(),
+                    base_url: "https://runtime.test".into(),
+                    public_key_fingerprint: "unused".into(),
+                    public_key: "unused".into(),
+                    binding_id: "binding".into(),
+                    authentication_mode: WorkspaceRuntimeAuthenticationMode::WorkspaceIdentity,
+                    created_at: "1".into(),
+                    updated_at: "1".into(),
+                    revoked_at: None,
+                },
+            )),
+            fallback_bearer_token: Some("must-not-be-used".into()),
+        };
+
+        // Hold the running slot and fill the only queue slot. The callback must
+        // reject admission, not run inline or silently switch authentication.
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (started, running) = tokio::sync::oneshot::channel();
+        executor
+            .dispatch(move || {
+                let _ = started.send(());
+                let _ = wait.recv_timeout(Duration::from_secs(5));
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        executor.dispatch(|| {}).unwrap();
+        let error = authorization
+            .bearer_token(
+                "POST".into(),
+                "/v1/workdir-sessions/s/operations".into(),
+                b"{}".to_vec(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WorkdirError::Unavailable(message) if message == Error::DbCapacityExceeded.to_string()
+        ));
+        drop(release);
+        executor.drain().await.unwrap();
+    }
 
     #[test]
     fn ticket_worker_spawn_intent_uses_worker_wire_role() {
@@ -7556,6 +7683,7 @@ mod tests {
     fn worker_spawn_idempotency_fingerprint_covers_canonical_initial_submit() {
         let mut request = embedded_spawn_request();
         request.ticket_assignment = Some(WorkerTicketAssignmentRequest {
+            orchestrator_assignment_id: None,
             ticket_id: "00001KVZSGT0Q".to_string(),
             operation_id: "operation-1".to_string(),
         });

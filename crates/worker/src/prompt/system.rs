@@ -335,18 +335,27 @@ mod tests {
         role: &str,
         mr_config: MergeRequestFeatureConfig,
     ) -> (String, Vec<agen::tool::ToolMeta>) {
+        ticket_fixture_with_access(
+            role,
+            mr_config,
+            TicketFeatureAccess {
+                thread: true,
+                workflow: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn ticket_fixture_with_access(
+        role: &str,
+        mr_config: MergeRequestFeatureConfig,
+        access: TicketFeatureAccess,
+    ) -> (String, Vec<agen::tool::ToolMeta>) {
         let client = Arc::new(TestWorkspaceHttpClient::new("workspace", "http://unused"));
         let mut tools = Vec::new();
         let mut hooks = HookRegistryBuilder::default();
         let report = FeatureRegistryBuilder::new()
-            .with_module(TicketFeature::new(
-                client.clone(),
-                TicketFeatureAccess {
-                    thread: true,
-                    workflow: true,
-                    ..Default::default()
-                },
-            ))
+            .with_module(TicketFeature::new(client.clone(), access))
             .with_module(MergeRequestFeature::new(client, mr_config))
             .install_into_pending(&mut tools, &mut hooks);
         assert!(!report.has_errors(), "{}", report.error_message());
@@ -384,12 +393,12 @@ mod tests {
         assert!(!tools.iter().any(|meta| meta.name == "ReviewMergeRequest"));
         let complete = tools
             .iter()
-            .find(|meta| meta.name == "CompleteTicket")
+            .find(|meta| meta.name == "TicketCaseUpdate")
             .unwrap();
         assert!(
             complete
                 .description
-                .contains("Merge Requests and approvals are not prerequisites")
+                .contains("Repository, Merge Request and approval evidence are not prerequisites")
         );
         assert!(complete.description.contains("not real judgment"));
         assert!(
@@ -461,12 +470,153 @@ mod tests {
             );
             let complete = tools
                 .iter()
-                .find(|meta| meta.name == "CompleteTicket")
+                .find(|meta| meta.name == "TicketCaseUpdate")
                 .unwrap();
             assert!(
                 complete
                     .description
-                    .contains("return without conclusion need not call this tool")
+                    .contains("Return without conclusion need not call this tool")
+            );
+        }
+    }
+
+    #[test]
+    fn effective_ticket_instructions_separate_case_handling_and_delegation_retries() {
+        for role in [
+            "role.ticket_worker",
+            "role.coder",
+            "role.orchestrator",
+            "role.intake",
+        ] {
+            let (prompt, tools) =
+                ticket_workflow_fixture(role, MergeRequestFeatureConfig::default());
+            for policy in [
+                "only `open`",
+                "stable tag IDs, not display names",
+                "no ready step or separate Queue is required",
+                "Orchestrator's self-reported handling",
+                "Answers during waiting or ongoing handling continue the same assignment row",
+                "explicit reissue creates a new row/assignment_id",
+                "Respect an explicit user approval condition",
+                "done does not require unassignment",
+                "expected_last_event_id",
+                "Exact retries retain the same key and full input",
+                "Assign persistence, notification delivery, Runtime acceptance and actual work start",
+                "concrete API insufficiency",
+            ] {
+                assert!(prompt.contains(policy), "{role}: missing {policy}");
+            }
+            let update = tools
+                .iter()
+                .find(|meta| meta.name == "TicketAssignmentTrackingUpdate")
+                .unwrap();
+            for policy in [
+                "self-reported",
+                "same row",
+                "new Assign row",
+                "complete tracking payload",
+                "different input with that key is rejected",
+                "reread current authority",
+                "exact retry receipts are not fresh observations",
+            ] {
+                assert!(
+                    update.description.contains(policy),
+                    "{role}: missing {policy}"
+                );
+            }
+            assert!(!tools.iter().any(|meta| matches!(
+                meta.name.as_str(),
+                "TicketMarkReady"
+                    | "TicketQueue"
+                    | "TicketIntakeReady"
+                    | "CompleteTicket"
+                    | "TicketWorkflowState"
+                    | "TicketClose"
+            )));
+            if role == "role.orchestrator" {
+                assert!(prompt.contains("observed current `orchestrator_assignment_id`"));
+                assert!(prompt.contains(
+                    "generic `WorkerSpawn` Ticket starts and existing-Worker assignment"
+                ));
+            }
+        }
+    }
+
+    // Scripted policy/input fixtures: they do not run a model or certify its judgment.
+    #[test]
+    fn effective_return_wait_answer_and_close_fixtures_match_resolved_profile_tools_without_repo_or_mr()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = manifest::ProfileResolver::new()
+            .with_workspace_base(dir.path())
+            .resolve(
+                &manifest::ProfileSelector::parse_cli("builtin:orchestrator"),
+                manifest::ProfileResolveOptions::with_worker_name("orchestrator-fixture"),
+            )
+            .unwrap();
+        let config = resolved.manifest.feature.ticket;
+        // Omit MR feature for the no-repository/no-MR work fixture; profile selection
+        // makes it available, not mandatory to exercise for every Ticket.
+        let (prompt, tools) = ticket_fixture_with_access(
+            &resolved.manifest.engine.instruction,
+            MergeRequestFeatureConfig::default(),
+            TicketFeatureAccess {
+                authoring: config.authoring,
+                thread: config.thread,
+                intake: config.intake,
+                workflow: config.workflow,
+            },
+        );
+        assert!(!tools.iter().any(|meta| matches!(
+            meta.name.as_str(),
+            "OpenMergeRequest" | "ReviewMergeRequest" | "CompleteMergeRequest"
+        )));
+        for (policy, name, input) in [
+            (
+                "Use `TicketOrchestratorAssign` for explicit initial delegation or reissue",
+                "TicketOrchestratorAssign",
+                serde_json::json!({"ticket":"T-743","principal":{"kind":"workspace_agent","agent_key":"workspace-orchestrator"},"expected_assignment_id":null,"operation_id":"delegate-research"}),
+            ),
+            (
+                "research returned to a human can be `open` + handling `done`",
+                "TicketAssignmentTrackingUpdate",
+                serde_json::json!({"ticket":"T-743", "assignment_id":"delegation", "expected_last_event_id":"assigned", "operation_key":"return-options", "tracking":{"status":"done", "result":"Options returned", "next_action":"Human decision"}}),
+            ),
+            (
+                "Respect an explicit user approval condition",
+                "TicketAssignmentTrackingUpdate",
+                serde_json::json!({"ticket":"T-743", "assignment_id":"delegation", "expected_last_event_id":"assigned", "operation_key":"wait-for-answer", "tracking":{"status":"waiting", "waiting_reason":"User requested confirmation first", "next_action":"Read the user's answer on this assignment"}}),
+            ),
+            (
+                "use `TicketAssignmentAnswer` with that `assignment_id`",
+                "TicketAssignmentAnswer",
+                serde_json::json!({"ticket":"T-743","assignment_id":"delegation","expected_last_event_id":"waiting","operation_key":"answer-on-same-row","body":"Option A approved; continue within scope"}),
+            ),
+            (
+                "No Merge Request or approval is a prerequisite for a generic Ticket decision",
+                "TicketCaseUpdate",
+                serde_json::json!({"ticket":"T-743", "expected_content_digest":"observed-digest", "expected_state":"open", "expected_closure_operation_key":null, "operation_key":"fulfilled-close", "action":{"action":"close", "reason":"completed"}, "explanation":"The whole bounded request is fulfilled and closure was requested"}),
+            ),
+        ] {
+            assert!(prompt.contains(policy), "missing {policy}");
+            let meta = tools.iter().find(|meta| meta.name == name).unwrap();
+            let validator = jsonschema::validator_for(&meta.input_schema).unwrap();
+            assert!(validator.is_valid(&input), "{name} rejected {input}");
+            let required = meta.input_schema["required"].as_array().unwrap();
+            assert!(!required.iter().any(|field| matches!(
+                field.as_str(),
+                Some(
+                    "repository_key"
+                        | "merge_request_id"
+                        | "approval_event_id"
+                        | "workdir_attachments"
+                )
+            )));
+            let mut forged = input;
+            forged["actor"] = serde_json::json!("workspace-orchestrator");
+            assert!(
+                !validator.is_valid(&forged),
+                "model-supplied authority accepted"
             );
         }
     }

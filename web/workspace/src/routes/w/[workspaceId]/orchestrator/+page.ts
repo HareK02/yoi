@@ -1,0 +1,55 @@
+import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
+import {
+  parseTicketQueryResponse,
+  TICKET_BROWSER_API_LOAD_POLICY,
+} from "#lib/workspace/api/ticket-browser.ts";
+import { parseBrowserWorkspaceOrchestratorResponse } from "#lib/workspace/api/workers.ts";
+import {
+  HANDLING_STATES,
+  readTicketFilters,
+  ticketQueryRequest,
+} from "#lib/workspace/tickets/ticket-panel.ts";
+import type { TicketAssignmentTrackingStatus } from "#lib/generated/ticket-api.ts";
+import type { PageLoad } from "./$types";
+
+export const load: PageLoad = async ({ fetch, params, url }) => {
+  const workspaceId = params.workspaceId;
+  const filters = {
+    ...readTicketFilters(url.searchParams),
+    principal: "orchestrator" as const,
+    tagIds: [],
+    closureReason: "all" as const,
+    closureText: "",
+  };
+  const input = url.searchParams.get("handling");
+  const handling =
+    HANDLING_STATES.includes(input as TicketAssignmentTrackingStatus)
+      ? input as TicketAssignmentTrackingStatus
+      : null;
+  const request = ticketQueryRequest(
+    filters,
+    filters.caseState === "all" ? [] : [filters.caseState],
+    null,
+    handling,
+  );
+  const [tickets, orchestrator] = await Promise.all([
+    loadJson(
+      fetch,
+      workspaceApiPath(workspaceId, "/tickets/query"),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(request),
+      },
+      parseTicketQueryResponse,
+      TICKET_BROWSER_API_LOAD_POLICY,
+    ),
+    loadJson(
+      fetch,
+      workspaceApiPath(workspaceId, "/orchestrator"),
+      undefined,
+      parseBrowserWorkspaceOrchestratorResponse,
+    ),
+  ]);
+  return { workspaceId, filters, handling, tickets, orchestrator };
+};

@@ -302,14 +302,11 @@ impl_openapi_schema!(
     SkillDetailResponse,
     SkillActivationResponse,
     BrowserAppendTicketEventRequest,
-    BrowserCloseTicketRequest,
     BrowserEditTicketRequest,
     BrowserQueueTicketRequest,
-    BrowserTransitionTicketStateRequest,
     CancelTicketImplementationRequest,
     ClearTicketRoleAssignmentQuery,
     CompleteMergeRequestRequest,
-    CompleteTicketRequest,
     CreateTicketOrchestrationPlanRequest,
     CreateTicketRecordRequest,
     CreateTicketRelationRequest,
@@ -343,9 +340,16 @@ impl_openapi_schema!(
     SetTicketRoleAssignmentRequest,
     SubmitMergeRequestReviewRequest,
     TextResponse,
-    TicketCloseRecordRequest,
     TicketDependencyCheckResponse,
     TicketDetail,
+    TicketCaseUpdateRequest,
+    TicketAssignmentTrackingUpdateRequest,
+    TicketAssignmentTrackingRecord,
+    TicketAssignmentTrackingList,
+    TicketAssignmentTrackingQuery,
+    TicketAssignmentTrackingHistoryQuery,
+    TicketAssignmentTrackingHistoryPage,
+    TicketSummary,
     TicketDoctorResponse,
     TicketIntakeSummaryRequest,
     TicketListHttpQuery,
@@ -354,6 +358,12 @@ impl_openapi_schema!(
     TicketOrchestrationPlanRecord,
     TicketOrchestrationPlanRecordList,
     TicketOrchestrationPlanSearchRequest,
+    TicketAssignmentsQuery,
+    TicketAssignmentsPage,
+    TicketAssignmentAnswerRequest,
+    TicketAssignmentAnswerResponse,
+    TicketAssignmentDiagnosticsQuery,
+    TicketAssignmentDiagnosticsPage,
     TicketQueryRequest,
     TicketQueryResponse,
     TicketQueueResponse,
@@ -368,10 +378,13 @@ impl_openapi_schema!(
     TicketRoleAssignmentMutationResponse,
     TicketRoleAssignmentsResponse,
     TicketShowRequest,
-    TicketStateChangeRequest,
-    TicketStateUpdateRequest,
     TicketSummarySearchQuery,
     TicketThreadEventRequest,
+    WorkspaceTicketTagListRequest,
+    WorkspaceTicketTagMutationRequest,
+    TicketTagsSetRequest,
+    WorkspaceTicketTagList,
+    WorkspaceTicketTag,
     RuntimeManagementApiError,
     RuntimeWorkersQuery,
     RuntimeWorkerSpawnRequest,
@@ -1977,6 +1990,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_create_alias(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] runtime_id: String,
         #[body] request: RuntimeWorkerSpawnRequest,
     ) -> Result<RuntimeWorkerSpawnResponse, RepositoryApiError>;
@@ -2006,6 +2020,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_create(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[body] request: RuntimeWorkerSpawnRequest,
@@ -2983,6 +2998,31 @@ pub trait ServerApi {
         #[body] request: CreateTicketRecordRequest,
     ) -> Result<TicketRecordRef, RepositoryApiError>;
 
+    #[get("/api/w/{workspace_id}/ticket-tags", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn workspace_ticket_tag_list(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] request: WorkspaceTicketTagListRequest,
+    ) -> Result<WorkspaceTicketTagList, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/ticket-tags", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn workspace_ticket_tag_mutate(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: WorkspaceTicketTagMutationRequest,
+    ) -> Result<WorkspaceTicketTag, RepositoryApiError>;
+
+    #[put("/api/w/{workspace_id}/tickets/{id}/tags", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_tags_set(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: TicketTagsSetRequest,
+    ) -> Result<WorkspaceTicketTagList, RepositoryApiError>;
+
     #[post("/api/w/{workspace_id}/tickets/query", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_query(
         &self,
@@ -3058,14 +3098,6 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: TicketThreadEventRequest,
     ) -> Result<(), RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/state-changes", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_state_change_add(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-        #[body] request: TicketStateChangeRequest,
-    ) -> Result<(), RepositoryApiError>;
     #[post("/api/w/{workspace_id}/tickets/{id}/intake-summaries", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_intake_summary_add(
         &self,
@@ -3074,31 +3106,6 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: TicketIntakeSummaryRequest,
     ) -> Result<(), RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/state-fields/{field}", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_state_field_set(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-        #[path] field: String,
-        #[body] request: TicketStateChangeRequest,
-    ) -> Result<(), RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/workflow-state", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_workflow_state_set(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-        #[body] request: TicketStateChangeRequest,
-    ) -> Result<(), RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/state-update", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_state_update(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-        #[body] request: TicketStateUpdateRequest,
-    ) -> Result<TicketRecord, RepositoryApiError>;
     #[post("/api/w/{workspace_id}/tickets/{id}/workflow/mark-ready", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_mark_ready_record(
         &self,
@@ -3196,22 +3203,92 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: CompleteMergeRequestRequest,
     ) -> Result<MergeEvent, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/complete", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_complete(
+    #[post("/workspaces/{workspace_id}/tickets/{ticket_id}/case", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_case_update(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
-        #[path] id: String,
-        #[body] request: CompleteTicketRequest,
-    ) -> Result<TicketRecord, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/workflow/close", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_close_record(
+        #[path] ticket_id: String,
+        #[body] request: TicketCaseUpdateRequest,
+    ) -> Result<TicketSummary, RepositoryApiError>;
+    #[get("/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking/assignments", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignments_page(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
-        #[path] id: String,
-        #[body] request: TicketCloseRecordRequest,
-    ) -> Result<(), RepositoryApiError>;
+        #[path] ticket_id: String,
+        #[query] query: TicketAssignmentsQuery,
+    ) -> Result<TicketAssignmentsPage, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/tickets/{ticket_id}/assignment-tracking/assignments", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignments_page_browser(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[query] query: TicketAssignmentsQuery,
+    ) -> Result<TicketAssignmentsPage, RepositoryApiError>;
+
+    #[get("/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-diagnostics", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignment_diagnostics(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[query] query: TicketAssignmentDiagnosticsQuery,
+    ) -> Result<TicketAssignmentDiagnosticsPage, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/tickets/{ticket_id}/assignment-diagnostics", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignment_diagnostics_browser(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[query] query: TicketAssignmentDiagnosticsQuery,
+    ) -> Result<TicketAssignmentDiagnosticsPage, RepositoryApiError>;
+
+    #[post("/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-answer", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignment_answer(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[body] request: TicketAssignmentAnswerRequest,
+    ) -> Result<TicketAssignmentAnswerResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{ticket_id}/assignment-answer", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignment_answer_browser(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[body] request: TicketAssignmentAnswerRequest,
+    ) -> Result<TicketAssignmentAnswerResponse, RepositoryApiError>;
+
+    #[get("/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignment_tracking_get(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[query] query: TicketAssignmentTrackingQuery,
+    ) -> Result<TicketAssignmentTrackingList, RepositoryApiError>;
+    #[post("/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignment_tracking_update(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[body] request: TicketAssignmentTrackingUpdateRequest,
+    ) -> Result<TicketAssignmentTrackingRecord, RepositoryApiError>;
+    #[get("/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking/history", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignment_tracking_history(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[query] query: TicketAssignmentTrackingHistoryQuery,
+    ) -> Result<TicketAssignmentTrackingHistoryPage, RepositoryApiError>;
     #[get("/api/w/{workspace_id}/tickets/{id}/relation-view", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_relation_view(
         &self,
@@ -3276,6 +3353,7 @@ pub trait ServerApi {
     #[put("/api/w/{workspace_id}/tickets/{id}/assignments/{role}", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_assignment_set(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
         #[path] role: String,
@@ -3285,6 +3363,7 @@ pub trait ServerApi {
     #[delete("/api/w/{workspace_id}/tickets/{id}/assignments/{role}", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_assignment_clear(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
         #[path] role: String,
@@ -3297,15 +3376,6 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] id: String,
         #[body] request: CancelTicketImplementationRequest,
-    ) -> Result<TicketDetail, RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/{id}/state", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_state_transition(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-        #[body] request: BrowserTransitionTicketStateRequest,
     ) -> Result<TicketDetail, RepositoryApiError>;
 
     #[post("/api/w/{workspace_id}/tickets/{id}/ready", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
@@ -3334,14 +3404,6 @@ pub trait ServerApi {
         #[body] request: BrowserQueueTicketRequest,
     ) -> Result<TicketQueueResponse, RepositoryApiError>;
 
-    #[post("/api/w/{workspace_id}/tickets/{id}/close", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_close(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-        #[body] request: BrowserCloseTicketRequest,
-    ) -> Result<TicketDetail, RepositoryApiError>;
     #[get("/api/objectives", status = 200, error_status = 400, additional_error_statuses = [500], bearer_auth = true, browser_auth = true)]
     async fn objective_list_alias(
         &self,
@@ -3610,6 +3672,9 @@ pub struct ServerWorkerSource {
 pub struct ServerRuntimeSource {
     pub runtime_id: String,
     pub worker_id: Option<String>,
+    /// Binding whose public key authenticated this request. Retain the verified
+    /// identity through mutation CAS/replay checks; a later lookup is not proof.
+    pub authentication_binding_id: String,
 }
 
 /// Request context built by Server authentication adapters, not authority selected via public JSON.
@@ -7274,16 +7339,29 @@ pub struct InvalidProjectRecord {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct TicketListItemSummary {
+    #[serde(default)]
+    #[cfg_attr(feature = "typescript", ts(type = "Array<WorkspaceTag>"))]
+    pub tags: Vec<ticket::WorkspaceTag>,
     pub id: String,
     pub resource_key: String,
     pub title: String,
-    pub state: String,
+    pub state: BrowserTicketState,
     pub priority: String,
     pub updated_at: Option<String>,
     pub queued_by: Option<String>,
     pub queued_at: Option<String>,
     pub workspace_action_priority: String,
     pub record_source: String,
+    /// Last closure/correction key, retained across reopening for ABA-safe CAS.
+    pub closure_operation_key: Option<String>,
+    #[cfg_attr(feature = "typescript", ts(type = "TicketClosureJudgment | null"))]
+    pub current_closure: Option<ticket::TicketClosureJudgment>,
+    /// Original migration handoff; not another current state authority.
+    #[cfg_attr(
+        feature = "typescript",
+        ts(type = "TicketLegacyWorkflowSnapshot | null")
+    )]
+    pub legacy_handoff: Option<ticket::TicketLegacyWorkflowSnapshot>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -7567,20 +7645,74 @@ pub struct TicketEvidenceSummary {
     pub missing: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum TicketAttention {
+    UnresolvedReview,
+    MissingCommit,
+    Blocked,
+    Unblocked,
+    AwaitingReview,
+    UnresolvedChanges,
+    StaleAfterRescope,
+    MissingEvidence,
+}
+
+impl TicketAttention {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::UnresolvedReview => "unresolved_review",
+            Self::MissingCommit => "missing_commit",
+            Self::Blocked => "blocked",
+            Self::Unblocked => "unblocked",
+            Self::AwaitingReview => "awaiting_review",
+            Self::UnresolvedChanges => "unresolved_changes",
+            Self::StaleAfterRescope => "stale_after_rescope",
+            Self::MissingEvidence => "missing_evidence",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct TicketQueryRequest {
+    /// Exact reason of the current closed-case judgment; reopened/history-only reasons do not match.
+    #[cfg_attr(feature = "typescript", ts(type = "TicketClosureReason | null"))]
+    pub closure_reason: Option<ticket::TicketClosureReason>,
+    /// Exact current assigned principal; retained relationships do not match.
+    #[cfg_attr(
+        feature = "typescript",
+        ts(type = "TicketAssignmentPrincipalSnapshot | null")
+    )]
+    pub assigned_principal: Option<ticket::TicketAssignmentPrincipalSnapshot>,
+    /// Explicit self-reported handling only; never inferred from Worker state.
+    #[cfg_attr(
+        feature = "typescript",
+        ts(type = "TicketAssignmentTrackingStatus | null")
+    )]
+    pub handling_status: Option<ticket::TicketAssignmentTrackingStatus>,
     pub query: Option<String>,
     #[serde(default)]
-    pub states: Vec<String>,
+    #[cfg_attr(feature = "typescript", ts(type = "Array<BrowserTicketState>"))]
+    pub states: Vec<ticket::TicketState>,
     #[serde(default)]
     pub event_kinds: Vec<String>,
     #[serde(default)]
     pub evidence: Vec<String>,
     pub review_status: Option<String>,
     #[serde(default)]
-    pub attention: Vec<String>,
+    pub attention: Vec<TicketAttention>,
+    /// Match tickets containing every supplied tag ID (AND).
+    #[serde(default)]
+    pub tag_ids: Vec<String>,
+    /// Match tickets containing at least one supplied tag ID (OR).
+    #[serde(default)]
+    pub tag_ids_any: Vec<String>,
+    /// Exclude tickets containing any supplied tag ID (NOT).
+    #[serde(default)]
+    pub tag_ids_none: Vec<String>,
     pub related_ticket_id: Option<String>,
     pub relation_kind: Option<String>,
     pub linked_objective_id: Option<String>,
@@ -7597,9 +7729,11 @@ pub struct TicketQueryRequest {
 #[serde(deny_unknown_fields)]
 pub struct TicketQueryItem {
     pub id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "Array<WorkspaceTag>"))]
+    pub tags: Vec<ticket::WorkspaceTag>,
     pub resource_key: String,
     pub title: String,
-    pub state: String,
+    pub state: BrowserTicketState,
     pub readiness: Option<String>,
     pub priority: String,
     pub created_at: Option<String>,
@@ -7623,10 +7757,25 @@ pub struct TicketQueryItem {
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub unresolved_review_count: usize,
+    #[cfg_attr(
+        feature = "typescript",
+        ts(type = "Array<TicketAssignmentTrackingProjection>")
+    )]
+    pub assignment_tracking: Vec<ticket::TicketAssignmentTrackingProjection>,
     pub evidence: TicketEvidenceSummary,
     pub merge_requests: Vec<TicketMergeRequestSummary>,
     pub merge_request: Option<TicketMergeRequestSummary>,
     pub current_worker: Option<TicketAssignmentSummary>,
+    /// Last closure/correction key, retained across reopening for ABA-safe CAS.
+    pub closure_operation_key: Option<String>,
+    #[cfg_attr(feature = "typescript", ts(type = "TicketClosureJudgment | null"))]
+    pub current_closure: Option<ticket::TicketClosureJudgment>,
+    /// Original migration handoff; not another current state authority.
+    #[cfg_attr(
+        feature = "typescript",
+        ts(type = "TicketLegacyWorkflowSnapshot | null")
+    )]
+    pub legacy_handoff: Option<ticket::TicketLegacyWorkflowSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -7652,9 +7801,11 @@ pub struct TicketShowRequest {
 #[serde(deny_unknown_fields)]
 pub struct TicketDetail {
     pub id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "Array<WorkspaceTag>"))]
+    pub tags: Vec<ticket::WorkspaceTag>,
     pub resource_key: String,
     pub title: String,
-    pub state: String,
+    pub state: BrowserTicketState,
     pub readiness: Option<String>,
     pub priority: String,
     pub created_at: Option<String>,
@@ -7680,6 +7831,11 @@ pub struct TicketDetail {
     pub linked_objectives: Vec<ObjectiveLinkSummary>,
     pub implementation_reports: Vec<TicketEvidenceEvent>,
     pub assignments: Vec<TicketRoleAssignmentSummary>,
+    #[cfg_attr(
+        feature = "typescript",
+        ts(type = "Array<TicketAssignmentTrackingProjection>")
+    )]
+    pub assignment_tracking: Vec<ticket::TicketAssignmentTrackingProjection>,
     pub current_worker: Option<TicketAssignmentSummary>,
     pub assignment_diagnostics: Vec<String>,
     pub action_eligibility: TicketActionEligibility,
@@ -7688,6 +7844,18 @@ pub struct TicketDetail {
     pub evidence: TicketEvidenceSummary,
     pub resolution: Option<String>,
     pub record_source: String,
+    /// Last closure/correction key, retained across reopening for ABA-safe CAS.
+    pub closure_operation_key: Option<String>,
+    #[cfg_attr(feature = "typescript", ts(type = "TicketClosureJudgment | null"))]
+    pub current_closure: Option<ticket::TicketClosureJudgment>,
+    /// Original migration handoff; not another current state authority.
+    #[cfg_attr(
+        feature = "typescript",
+        ts(type = "TicketLegacyWorkflowSnapshot | null")
+    )]
+    pub legacy_handoff: Option<ticket::TicketLegacyWorkflowSnapshot>,
+    #[cfg_attr(feature = "typescript", ts(type = "Array<TicketCaseHistoryEntry>"))]
+    pub closure_history: Vec<ticket::TicketCaseHistoryEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -7717,6 +7885,145 @@ macro_rules! transparent_ticket_dto {
 }
 
 transparent_ticket_dto!(TicketRecord, ticket::Ticket);
+transparent_ticket_dto!(TicketSummary, ticket::TicketSummary);
+
+/// Authorized case judgment. Author comes from authenticated Workspace authority,
+/// never from the request. All three actions share content/state/closure-key CAS.
+fn deserialize_case_closure_observation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer)
+}
+
+fn case_closure_observation_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    generator.subschema_for::<Option<String>>()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketCaseUpdateRequest {
+    pub expected_content_digest: String,
+    pub expected_state: ticket::TicketState,
+    #[serde(deserialize_with = "deserialize_case_closure_observation")]
+    #[schemars(required, schema_with = "case_closure_observation_schema")]
+    pub expected_closure_operation_key: Option<String>,
+    pub operation_key: String,
+    pub action: ticket::TicketCaseAction,
+    pub explanation: String,
+    #[serde(default)]
+    pub references: Vec<ticket::TicketReference>,
+}
+transparent_ticket_dto!(
+    TicketAssignmentTrackingUpdateRequest,
+    ticket::TicketAssignmentTrackingUpdate
+);
+transparent_ticket_dto!(
+    TicketAssignmentTrackingRecord,
+    ticket::TicketAssignmentTrackingProjection
+);
+transparent_ticket_dto!(
+    TicketAssignmentTrackingList,
+    Vec<ticket::TicketAssignmentTrackingProjection>
+);
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketAssignmentTrackingQuery {
+    /// Omit for the current delegation; provide to inspect a retained assignment.
+    pub assignment_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketAssignmentTrackingHistoryQuery {
+    pub assignment_id: String,
+    pub after_event_id: Option<String>,
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketAssignmentTrackingHistoryPage {
+    pub items: Vec<ticket::TicketAssignmentTrackingHistoryEntry>,
+    pub next_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketAssignmentsQuery {
+    pub after_assignment_id: Option<String>,
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<usize>,
+}
+transparent_ticket_dto!(TicketAssignmentsPage, ticket::TicketAssignmentsPage);
+transparent_ticket_dto!(
+    TicketAssignmentAnswerRequest,
+    ticket::TicketAssignmentAnswer
+);
+transparent_ticket_dto!(
+    TicketAssignmentAnswerResponse,
+    ticket::TicketAssignmentAnswerReceipt
+);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketAssignmentDiagnosticsQuery {
+    pub assignment_id: String,
+    pub after_input_event_id: Option<String>,
+    pub after_start_operation_id: Option<String>,
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<usize>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketAssignmentInputDeliveryState {
+    NotReserved,
+    Reserved,
+    RequestPersisted,
+    RuntimeAccepted,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct TicketAssignmentInputDiagnostic {
+    pub input_event_id: String,
+    pub delivery_id: Option<String>,
+    pub notification: TicketAssignmentInputDeliveryState,
+    /// Absence of a Runtime ack is not proof of failed external delivery.
+    pub acceptance_outcome_unknown: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct TicketAssignmentStartDiagnostic {
+    pub operation_id: String,
+    /// Durable start/assignment reservation result, not Worker liveness.
+    pub claim_state: String,
+    pub assignment_id: Option<String>,
+    pub runtime_id: Option<String>,
+    pub worker_id: Option<String>,
+    /// Existing records do not attest that a model processed a particular input.
+    pub actual_processing_unknown: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct TicketAssignmentDiagnosticsPage {
+    pub assignment_id: String,
+    pub current: bool,
+    pub input_origin_known: bool,
+    /// Noncurrent/done/closed/released records are history, not pending work.
+    pub actionable: bool,
+    pub inputs: Vec<TicketAssignmentInputDiagnostic>,
+    pub next_input_event_id: Option<String>,
+    /// Assignment-scoped admission evidence; not attributed to individual input.
+    pub starts: Vec<TicketAssignmentStartDiagnostic>,
+    pub next_start_operation_id: Option<String>,
+}
+
+transparent_ticket_dto!(WorkspaceTicketTagListRequest, ticket::TagListRequest);
+transparent_ticket_dto!(
+    WorkspaceTicketTagMutationRequest,
+    ticket::WorkspaceTagMutation
+);
+transparent_ticket_dto!(TicketTagsSetRequest, ticket::TicketTagSetRequest);
+transparent_ticket_dto!(WorkspaceTicketTagList, Vec<ticket::WorkspaceTag>);
+transparent_ticket_dto!(WorkspaceTicketTag, ticket::WorkspaceTag);
 transparent_ticket_dto!(TicketRecordRef, ticket::TicketRef);
 transparent_ticket_dto!(TicketRecordSummaryList, Vec<ticket::TicketSummary>);
 transparent_ticket_dto!(TicketDependencyCheckResponse, ticket::TicketDependencyCheck);
@@ -7736,10 +8043,7 @@ transparent_ticket_dto!(
 transparent_ticket_dto!(CreateTicketRecordRequest, ticket::NewTicket);
 transparent_ticket_dto!(EditTicketRecordItemRequest, ticket::TicketItemEdit);
 transparent_ticket_dto!(TicketThreadEventRequest, ticket::NewTicketEvent);
-transparent_ticket_dto!(TicketStateChangeRequest, ticket::TicketStateUpdate);
-transparent_ticket_dto!(TicketStateUpdateRequest, ticket::TicketStateUpdate);
 transparent_ticket_dto!(TicketIntakeSummaryRequest, ticket::TicketIntakeSummary);
-transparent_ticket_dto!(TicketCloseRecordRequest, ticket::TicketCompletion);
 transparent_ticket_dto!(CreateTicketRelationRequest, ticket::NewTicketRelation);
 transparent_ticket_dto!(
     CreateTicketOrchestrationPlanRequest,
@@ -7794,6 +8098,10 @@ pub struct TicketWorkerAttachmentBinding {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct SetTicketRoleAssignmentRequest {
+    /// Observed delegation required for Orchestrator Ticket starts; manual starts omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_assignment_id: Option<String>,
+
     pub operation_id: String,
     pub principal: TicketAssignmentPrincipal,
     pub expected_assignment_id: Option<String>,
@@ -7851,13 +8159,27 @@ pub enum BrowserTicketTargetEdit {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
-pub enum BrowserTicketWorkflowState {
-    Planning,
-    Ready,
-    Queued,
-    Inprogress,
-    Done,
+pub enum BrowserTicketState {
+    Open,
     Closed,
+}
+
+impl BrowserTicketState {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+impl From<ticket::TicketState> for BrowserTicketState {
+    fn from(state: ticket::TicketState) -> Self {
+        match state {
+            ticket::TicketState::Open => Self::Open,
+            ticket::TicketState::Closed => Self::Closed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -7872,18 +8194,6 @@ pub struct BrowserEditTicketRequest {
     pub replace_all: bool,
     pub target: Option<BrowserTicketTargetEdit>,
     pub author: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct BrowserTransitionTicketStateRequest {
-    pub state: BrowserTicketWorkflowState,
-    pub operation_key: String,
-    pub expected_content_digest: String,
-    pub expected_state: BrowserTicketWorkflowState,
-    pub reason: String,
-    pub body: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -7909,16 +8219,6 @@ pub struct BrowserAppendTicketEventRequest {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct BrowserQueueTicketRequest {}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct BrowserCloseTicketRequest {
-    pub operation_key: String,
-    pub expected_content_digest: String,
-    pub expected_state: BrowserTicketWorkflowState,
-    pub resolution: String,
-}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -8292,17 +8592,6 @@ pub struct CompleteMergeRequestRequest {
     pub resolution: ConflictResolution,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CompleteTicketRequest {
-    pub operation_key: String,
-    pub expected_content_digest: String,
-    pub expected_state: ticket::TicketWorkflowState,
-    pub reason: String,
-    #[serde(default)]
-    pub references: Vec<ticket::TicketReference>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeManagementApiError {
@@ -8453,6 +8742,10 @@ pub enum RuntimeWorkerSpawnAcceptanceRequirement {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerTicketAssignmentRequest {
+    /// Observed delegation required for Orchestrator Ticket starts; manual starts omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_assignment_id: Option<String>,
+
     pub ticket_id: String,
     pub operation_id: String,
 }
@@ -9782,6 +10075,10 @@ pub struct BrowserWorkerWorkingDirectorySelection {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct CreateWorkspaceWorkerTicketAssignmentRequest {
+    /// Observed delegation required for Orchestrator Ticket starts; manual starts omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_assignment_id: Option<String>,
+
     pub ticket_id: String,
     pub operation_id: String,
 }
@@ -11084,6 +11381,210 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ticket_tag_query_filters_default_empty_and_roundtrip() {
+        let request: TicketQueryRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(request.tag_ids.is_empty());
+        assert!(request.tag_ids_any.is_empty());
+        assert!(request.tag_ids_none.is_empty());
+        let request: TicketQueryRequest = serde_json::from_value(serde_json::json!({
+            "states": ["open", "closed"],
+            "tag_ids": ["tag-a", "tag-b"],
+            "tag_ids_any": ["tag-c", "tag-d"],
+            "tag_ids_none": ["tag-e"]
+        }))
+        .unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["tag_ids"], serde_json::json!(["tag-a", "tag-b"]));
+        assert_eq!(value["tag_ids_any"], serde_json::json!(["tag-c", "tag-d"]));
+        assert_eq!(value["tag_ids_none"], serde_json::json!(["tag-e"]));
+        assert_eq!(value["states"], serde_json::json!(["open", "closed"]));
+    }
+
+    #[test]
+    fn ticket_tag_mutations_require_operation_keys_and_observed_cas() {
+        for action in [
+            serde_json::json!({"kind": "create", "name": "bug"}),
+            serde_json::json!({"kind": "rename", "tag_id": "tag-a", "expected_last_operation_key": "observed", "name": "defect"}),
+            serde_json::json!({"kind": "delete", "tag_id": "tag-a", "expected_last_operation_key": "observed"}),
+        ] {
+            let value = serde_json::json!({"operation_key": "new-operation", "action": action});
+            let parsed: WorkspaceTicketTagMutationRequest =
+                serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+            let mut missing_operation = value.clone();
+            missing_operation
+                .as_object_mut()
+                .unwrap()
+                .remove("operation_key");
+            assert!(
+                serde_json::from_value::<WorkspaceTicketTagMutationRequest>(missing_operation)
+                    .is_err()
+            );
+            if action["kind"] != "create" {
+                let mut missing_cas = value;
+                missing_cas["action"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("expected_last_operation_key");
+                assert!(
+                    serde_json::from_value::<WorkspaceTicketTagMutationRequest>(missing_cas)
+                        .is_err()
+                );
+            }
+        }
+        let value = serde_json::json!({
+            "operation_key": "replace-tags",
+            "expected_tag_ids": ["tag-a", "tag-b"],
+            "tag_ids": ["tag-b", "tag-c"]
+        });
+        let parsed: TicketTagsSetRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+        for key in ["operation_key", "expected_tag_ids", "tag_ids"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                serde_json::from_value::<TicketTagsSetRequest>(missing).is_err(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn ticket_tag_list_and_responses_are_transparent() {
+        let query = serde_json::json!({"after": "tag-a", "limit": 200});
+        let parsed: WorkspaceTicketTagListRequest = serde_json::from_value(query.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), query);
+        let tag = serde_json::json!({
+            "workspace_id": "workspace-a", "id": "tag-a", "name": "bug",
+            "last_operation_key": "create-tag", "deleted": false
+        });
+        let parsed: WorkspaceTicketTag = serde_json::from_value(tag.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), tag);
+        let list = serde_json::json!([tag]);
+        let parsed: WorkspaceTicketTagList = serde_json::from_value(list.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), list);
+        for schema in [
+            schemars::schema_for!(TicketDetail),
+            schemars::schema_for!(TicketQueryItem),
+            schemars::schema_for!(TicketListItemSummary),
+        ] {
+            let schema = serde_json::to_value(schema).unwrap();
+            assert_eq!(schema["properties"]["tags"]["type"], "array");
+            assert_eq!(
+                schema["properties"]["tags"]["items"]["$ref"],
+                "#/$defs/WorkspaceTag"
+            );
+            for field in ["closure_operation_key", "current_closure", "legacy_handoff"] {
+                assert!(schema["properties"].get(field).is_some(), "{field}");
+            }
+            assert_eq!(
+                schema["$defs"]["BrowserTicketState"]["enum"],
+                serde_json::json!(["open", "closed"])
+            );
+        }
+        let detail = serde_json::to_value(schemars::schema_for!(TicketDetail)).unwrap();
+        assert!(detail["properties"]["closure_history"].is_object());
+    }
+
+    #[test]
+    fn ticket_classification_requests_reject_case_judgments_and_actor_claims() {
+        let mutation = serde_json::json!({"operation_key":"classify", "action":{"kind":"create", "name":"closed"}});
+        let set = serde_json::json!({"operation_key":"classify", "expected_tag_ids":[], "tag_ids":["tag-1"]});
+        for (field, value) in [
+            ("author", serde_json::json!("orchestrator")),
+            ("expected_state", serde_json::json!("closed")),
+            ("expected_content_digest", serde_json::json!("digest")),
+            ("reason", serde_json::json!("completed")),
+        ] {
+            let mut invalid_mutation = mutation.clone();
+            invalid_mutation[field] = value.clone();
+            assert!(
+                serde_json::from_value::<WorkspaceTicketTagMutationRequest>(invalid_mutation)
+                    .is_err(),
+                "mutation {field}"
+            );
+            let mut invalid_set = set.clone();
+            invalid_set[field] = value;
+            assert!(
+                serde_json::from_value::<TicketTagsSetRequest>(invalid_set).is_err(),
+                "set {field}"
+            );
+        }
+        let query = serde_json::json!({"states":["closed"], "tag_ids":["tag-1"], "tag_ids_any":["tag-2"], "tag_ids_none":["tag-3"]});
+        assert!(serde_json::from_value::<TicketQueryRequest>(query.clone()).is_ok());
+        for state in [
+            "planning",
+            "ready",
+            "queued",
+            "inprogress",
+            "done",
+            "invalid",
+        ] {
+            let mut invalid = query.clone();
+            invalid["states"] = serde_json::json!([state]);
+            assert!(
+                serde_json::from_value::<TicketQueryRequest>(invalid).is_err(),
+                "{state}"
+            );
+        }
+    }
+
+    #[test]
+    fn ticket_tag_operations_are_typed_workspace_routes() {
+        for (name, method, path) in [
+            (
+                "workspace_ticket_tag_list",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/ticket-tags",
+            ),
+            (
+                "workspace_ticket_tag_mutate",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/ticket-tags",
+            ),
+            (
+                "ticket_tags_set",
+                HttpMethod::Put,
+                "/api/w/{workspace_id}/tickets/{id}/tags",
+            ),
+        ] {
+            let operation = ServerApiMetadata::OPERATIONS
+                .iter()
+                .find(|operation| operation.operation_id == name)
+                .unwrap();
+            assert_eq!(operation.method, method);
+            assert_eq!(operation.path, path);
+        }
+        let contract = canonical_openapi_document().unwrap().to_json().unwrap();
+        let contract: serde_json::Value = serde_json::from_str(&contract).unwrap();
+        for (path, method) in [
+            ("/api/w/{workspace_id}/ticket-tags", "post"),
+            ("/api/w/{workspace_id}/tickets/{id}/tags", "put"),
+        ] {
+            let operation = &contract["paths"][path][method];
+            assert!(
+                operation["responses"].get("409").is_some(),
+                "CAS conflict must be documented"
+            );
+            assert!(operation["requestBody"]["required"].as_bool().unwrap());
+        }
+    }
+
+    #[cfg(feature = "typescript")]
+    #[test]
+    fn ticket_tag_typescript_references_are_registered() {
+        use ts_rs::TS;
+        let config = ts_rs::Config::default();
+        assert!(TicketDetail::decl(&config).contains("tags: Array<WorkspaceTag>"));
+        assert!(TicketQueryItem::decl(&config).contains("tags: Array<WorkspaceTag>"));
+        let contract = canonical_openapi_document().unwrap().to_json().unwrap();
+        let generated =
+            repository_openapi_typescript::generate_ticket_browser_typescript(&contract).unwrap();
+        assert!(generated.contains("export type WorkspaceTag ="));
+        assert!(generated.contains("tags: Array<WorkspaceTag>"));
+    }
+
+    #[test]
     fn ticket_role_assignment_request_defaults_empty_bindings_and_requires_each_selected_connection()
      {
         let base = serde_json::json!({"operation_id":"claim", "principal":{"kind":"worker","runtime_id":"r","worker_id":"w"}, "expected_assignment_id":null});
@@ -11512,14 +12013,9 @@ mod tests {
         );
         for (operation_id, method, path) in [
             (
-                "ticket_state_update",
+                "ticket_case_update",
                 HttpMethod::Post,
-                "/api/w/{workspace_id}/tickets/{id}/state-update",
-            ),
-            (
-                "ticket_complete",
-                HttpMethod::Post,
-                "/api/w/{workspace_id}/tickets/{id}/complete",
+                "/workspaces/{workspace_id}/tickets/{ticket_id}/case",
             ),
             (
                 "ticket_relation_query",
@@ -12712,31 +13208,178 @@ mod tests {
     }
 
     #[test]
-    fn ticket_completion_wire_requires_cas_and_judgment_not_merge_evidence() {
+    fn ticket_case_wire_requires_cas_and_judgment_without_client_author() {
         let request = serde_json::json!({
-            "operation_key": "investigation-done",
+            "operation_key": "question-answered",
             "expected_content_digest": "ticket:1",
-            "expected_state": "planning",
-            "reason": "Question answered in the thread"
+            "expected_state": "open",
+            "expected_closure_operation_key": null,
+            "action": {"action": "close", "reason": "completed"},
+            "explanation": "Question answered in the thread"
         });
-        let parsed: CompleteTicketRequest = serde_json::from_value(request.clone()).unwrap();
+        let parsed: TicketCaseUpdateRequest = serde_json::from_value(request.clone()).unwrap();
         assert!(parsed.references.is_empty());
+        assert_eq!(parsed.expected_state, ticket::TicketState::Open);
         for field in [
             "operation_key",
             "expected_content_digest",
             "expected_state",
-            "reason",
+            "expected_closure_operation_key",
+            "action",
+            "explanation",
         ] {
             let mut missing = request.clone();
             missing.as_object_mut().unwrap().remove(field);
             assert!(
-                serde_json::from_value::<CompleteTicketRequest>(missing).is_err(),
+                serde_json::from_value::<TicketCaseUpdateRequest>(missing).is_err(),
                 "{field}"
             );
         }
-        let mut old = request;
-        old["requirement_approval_event_id"] = serde_json::json!("not-a-judgment");
-        assert!(serde_json::from_value::<CompleteTicketRequest>(old).is_err());
+        for (field, value) in [
+            ("author", serde_json::json!("untrusted-author")),
+            (
+                "requirement_approval_event_id",
+                serde_json::json!("not-a-judgment"),
+            ),
+            ("expected_state", serde_json::json!("done")),
+        ] {
+            let mut rejected = request.clone();
+            rejected[field] = value;
+            assert!(
+                serde_json::from_value::<TicketCaseUpdateRequest>(rejected).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn ticket_case_wire_preserves_actions_and_externally_tagged_other_reason() {
+        for action in [
+            serde_json::json!({"action": "close", "reason": "not_planned"}),
+            serde_json::json!({"action": "reopen"}),
+            serde_json::json!({"action": "correct_closure", "reason": {"other": "Deferred by user"}}),
+        ] {
+            let request = serde_json::json!({
+                "operation_key": "case-decision",
+                "expected_content_digest": "ticket:2",
+                "expected_state": "closed",
+                "expected_closure_operation_key": "previous-close",
+                "action": action,
+                "explanation": "Explicit user decision",
+                "references": [{"kind": "ticket", "target": "T-2"}]
+            });
+            let parsed: TicketCaseUpdateRequest = serde_json::from_value(request.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+        }
+    }
+
+    #[test]
+    fn ticket_assignment_tracking_wire_has_explicit_event_cas_without_actor_claims() {
+        for status in ["waiting", "inprogress", "done"] {
+            let input = serde_json::json!({"assignment_id":"delegation", "expected_last_event_id":"observed-event", "operation_key":"handling", "tracking":{"status":status, "waiting_reason":null, "progress":"Investigated", "next_action":null, "result":null}});
+            let request: TicketAssignmentTrackingUpdateRequest =
+                serde_json::from_value(input.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), input);
+            for field in [
+                "assignment_id",
+                "expected_last_event_id",
+                "operation_key",
+                "tracking",
+            ] {
+                let mut missing = input.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                assert!(
+                    serde_json::from_value::<TicketAssignmentTrackingUpdateRequest>(missing)
+                        .is_err(),
+                    "{field}"
+                );
+            }
+            for field in [
+                "author",
+                "role",
+                "source_context",
+                "runtime_id",
+                "worker_id",
+            ] {
+                let mut invalid = input.clone();
+                invalid[field] = serde_json::json!("orchestrator");
+                assert!(
+                    serde_json::from_value::<TicketAssignmentTrackingUpdateRequest>(invalid)
+                        .is_err(),
+                    "{field}"
+                );
+            }
+            let mut invalid = input.clone();
+            invalid["tracking"]["status"] = serde_json::json!("running");
+            assert!(
+                serde_json::from_value::<TicketAssignmentTrackingUpdateRequest>(invalid).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn ticket_query_accepts_only_case_states_and_current_attention_filters() {
+        let parsed: TicketQueryRequest = serde_json::from_value(serde_json::json!({
+            "states": ["open", "closed"], "attention": ["blocked", "missing_evidence"]
+        }))
+        .unwrap();
+        assert_eq!(parsed.states[0], ticket::TicketState::Open);
+        for state in [
+            "planning",
+            "ready",
+            "queued",
+            "inprogress",
+            "in_progress",
+            "done",
+        ] {
+            assert!(
+                serde_json::from_value::<TicketQueryRequest>(
+                    serde_json::json!({"states": [state]})
+                )
+                .is_err(),
+                "{state}"
+            );
+        }
+        for attention in ["done_not_closed", "ready"] {
+            assert!(
+                serde_json::from_value::<TicketQueryRequest>(
+                    serde_json::json!({"attention": [attention]})
+                )
+                .is_err(),
+                "{attention}"
+            );
+        }
+    }
+
+    #[test]
+    fn ticket_case_route_replaces_all_legacy_case_judgment_bypasses() {
+        let operations = ServerApiMetadata::OPERATIONS;
+        for removed in [
+            "ticket_complete",
+            "ticket_close",
+            "ticket_close_record",
+            "ticket_state_update",
+            "ticket_state_transition",
+            "ticket_state_change_add",
+            "ticket_state_field_set",
+            "ticket_workflow_state_set",
+        ] {
+            assert!(
+                !operations
+                    .iter()
+                    .any(|operation| operation.operation_id == removed),
+                "{removed}"
+            );
+        }
+        let operation = operations
+            .iter()
+            .find(|operation| operation.operation_id == "ticket_case_update")
+            .unwrap();
+        assert_eq!(operation.method, HttpMethod::Post);
+        assert_eq!(
+            operation.path,
+            "/workspaces/{workspace_id}/tickets/{ticket_id}/case"
+        );
     }
 
     #[cfg(feature = "typescript")]

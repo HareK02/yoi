@@ -732,6 +732,28 @@ pub struct WorkspaceWorkerDiscoveryRequest {
 
 #[derive(Debug, Clone)]
 pub enum WorkspaceServerOperation {
+    TicketAssignmentSet {
+        ticket_id: String,
+        role: server_api::TicketAssignmentRole,
+        request: server_api::SetTicketRoleAssignmentRequest,
+    },
+    TicketAssignmentClear {
+        ticket_id: String,
+        role: server_api::TicketAssignmentRole,
+        query: server_api::ClearTicketRoleAssignmentQuery,
+    },
+    TicketAssignmentsPage {
+        ticket_id: String,
+        query: server_api::TicketAssignmentsQuery,
+    },
+    TicketAssignmentDiagnostics {
+        ticket_id: String,
+        query: server_api::TicketAssignmentDiagnosticsQuery,
+    },
+    TicketAssignmentAnswer {
+        ticket_id: String,
+        request: server_api::TicketAssignmentAnswerRequest,
+    },
     WorkerControlList,
     WorkerControlSpawn(server_api::CreateWorkspaceWorkerRequest),
     WorkerControlInput {
@@ -787,6 +809,45 @@ fn encode_workspace_path_segment(value: &str) -> String {
     encoded
 }
 
+fn workspace_server_query_request<T: serde::Serialize>(
+    method: WorkspaceRequestMethod,
+    path: String,
+    query: &T,
+) -> Result<WorkspaceRequest, WorkspaceClientError> {
+    let query = serde_json::to_value(query)
+        .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
+    let fields = query.as_object().ok_or_else(|| {
+        WorkspaceClientError::Request("Workspace query must serialize to an object".into())
+    })?;
+    let mut pairs = Vec::new();
+    for (name, value) in fields {
+        let value = match value {
+            serde_json::Value::Null => continue,
+            serde_json::Value::String(value) => value.clone(),
+            serde_json::Value::Number(value) => value.to_string(),
+            _ => {
+                return Err(WorkspaceClientError::Request(
+                    "Workspace query fields must be scalar".into(),
+                ));
+            }
+        };
+        pairs.push(format!(
+            "{}={}",
+            encode_workspace_path_segment(name),
+            encode_workspace_path_segment(&value)
+        ));
+    }
+    Ok(WorkspaceRequest {
+        method,
+        path: if pairs.is_empty() {
+            path
+        } else {
+            format!("{path}?{}", pairs.join("&"))
+        },
+        body: None,
+    })
+}
+
 fn workspace_server_operation_request(
     workspace_id: &str,
     operation: WorkspaceServerOperation,
@@ -794,6 +855,76 @@ fn workspace_server_operation_request(
     let workspace_id = encode_workspace_path_segment(workspace_id);
     let base = format!("/api/w/{workspace_id}");
     match operation {
+        WorkspaceServerOperation::TicketAssignmentSet {
+            ticket_id,
+            role,
+            request,
+        } => {
+            let role = match role {
+                server_api::TicketAssignmentRole::Orchestrator => "orchestrator",
+                server_api::TicketAssignmentRole::Worker => "worker",
+                server_api::TicketAssignmentRole::Owner => "owner",
+                server_api::TicketAssignmentRole::Contributor => "contributor",
+            };
+            Ok(WorkspaceRequest::json(
+                WorkspaceRequestMethod::Put,
+                format!(
+                    "{base}/tickets/{}/assignments/{role}",
+                    encode_workspace_path_segment(&ticket_id)
+                ),
+                serde_json::to_string(&request)
+                    .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
+            ))
+        }
+        WorkspaceServerOperation::TicketAssignmentClear {
+            ticket_id,
+            role,
+            query,
+        } => {
+            let role = match role {
+                server_api::TicketAssignmentRole::Orchestrator => "orchestrator",
+                server_api::TicketAssignmentRole::Worker => "worker",
+                server_api::TicketAssignmentRole::Owner => "owner",
+                server_api::TicketAssignmentRole::Contributor => "contributor",
+            };
+            workspace_server_query_request(
+                WorkspaceRequestMethod::Delete,
+                format!(
+                    "{base}/tickets/{}/assignments/{role}",
+                    encode_workspace_path_segment(&ticket_id)
+                ),
+                &query,
+            )
+        }
+        WorkspaceServerOperation::TicketAssignmentsPage { ticket_id, query } => {
+            workspace_server_query_request(
+                WorkspaceRequestMethod::Get,
+                format!(
+                    "/workspaces/{workspace_id}/tickets/{}/assignment-tracking/assignments",
+                    encode_workspace_path_segment(&ticket_id)
+                ),
+                &query,
+            )
+        }
+        WorkspaceServerOperation::TicketAssignmentDiagnostics { ticket_id, query } => {
+            workspace_server_query_request(
+                WorkspaceRequestMethod::Get,
+                format!(
+                    "/workspaces/{workspace_id}/tickets/{}/assignment-diagnostics",
+                    encode_workspace_path_segment(&ticket_id)
+                ),
+                &query,
+            )
+        }
+        WorkspaceServerOperation::TicketAssignmentAnswer { ticket_id, request } => {
+            workspace_server_json_request(
+                format!(
+                    "/workspaces/{workspace_id}/tickets/{}/assignment-answer",
+                    encode_workspace_path_segment(&ticket_id)
+                ),
+                &request,
+            )
+        }
         WorkspaceServerOperation::WorkerControlList => Ok(WorkspaceRequest::get(format!(
             "{base}/worker-control/workers"
         ))),
@@ -2804,6 +2935,7 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// manifest-derived lifecycle Features before controller startup.
     manifest_lifecycle_features_enabled: bool,
     interceptor_installed: bool,
+    compaction_service_budget: Option<Arc<crate::compact::worker::CompactWorkerInterceptor>>,
     /// Shared compaction state (present when threshold is configured).
     compact_state: Option<Arc<CompactState>>,
     /// Per-LLM-request Usage tracker. Always present after construction.
@@ -3148,6 +3280,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             feature_invocations: FeatureInvocationRegistry::default(),
             manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
+            compaction_service_budget: None,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
             metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
@@ -4188,6 +4321,24 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.callback_socket.as_ref()
     }
 
+    pub(crate) fn install_compaction_budget(
+        &mut self,
+        budget: Option<crate::compact::worker::CompactWorkerInterceptor>,
+    ) {
+        self.assert_hooks_open();
+        self.compaction_service_budget = budget.map(|budget| {
+            Arc::new(
+                budget.with_request_shape(
+                    self.engine()
+                        .get_system_prompt()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    self.engine().tool_server_handle(),
+                ),
+            )
+        });
+    }
+
     // --- Hook registration ---
 
     fn assert_hooks_open(&self) {
@@ -4283,6 +4434,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 self.log_writer.clone(),
                 self.pending_committed_history.clone(),
             )
+            .with_compaction_budget(self.compaction_service_budget.clone())
             .with_notification_committer(self.notification_committer.clone())
             .with_usage_tracker(self.usage_tracker.clone())
             .with_metrics_tracker(self.metrics_tracker.clone())
@@ -6603,7 +6755,15 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
 
         let history_entries = self.session.history().entries();
         let retain_from = cut.index.min(history_entries.len());
-        let retained_history_entries = history_entries[retain_from..].to_vec();
+        let initial_summary = initial_compaction_summary(history_entries)?;
+        // The old summary is consumed in full by the compaction service even when
+        // the cut falls before it. The replacement summary supersedes it: retaining
+        // it as well would duplicate inherited context on every compact.
+        let retained_history_entries = history_entries[retain_from..]
+            .iter()
+            .filter(|entry| entry.annotation.origin != WorkerHistoryProvenance::CompactionSummary)
+            .cloned()
+            .collect::<Vec<_>>();
         let mut retained_items = retained_history_entries
             .iter()
             .map(|entry| entry.item.clone())
@@ -6616,7 +6776,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             project_compaction_attachments(&mut retained_items, default_workdir_alias.as_deref());
         // The compactor explores summaries, text details, and ViewImage call arguments. It
         // never needs durable image bodies; relevant images are nominated with add_reference.
-        let mut entries_to_summarise = history_entries[..retain_from].to_vec();
+        let mut entries_to_summarise = history_entries[..retain_from]
+            .iter()
+            .filter(|entry| entry.annotation.origin != WorkerHistoryProvenance::CompactionSummary)
+            .cloned()
+            .collect::<Vec<_>>();
         project_compactor_capture_attachments(&mut entries_to_summarise);
         let items_to_summarise = entries_to_summarise
             .iter()
@@ -6681,11 +6845,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             Vec::new()
         };
 
-        // Input text fed to the compact worker. Includes the default
-        // references, current TaskStore snapshot, current TaskStore snapshot, and the (pruned) conversation text.
+        // The full Host summary is mandatory input, separate from the bounded
+        // prefix overview and current TaskStore snapshot.
         let task_snapshot_text = self.task_feature.snapshot_text();
         let summary_input = build_summary_input(
             &items_to_summarise,
+            initial_summary.as_deref(),
             &default_refs,
             Some(task_snapshot_text.as_str()),
             SummaryInputOptions {
@@ -6797,12 +6962,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 input: summary_input.text.clone(),
                 cache_key: Some(self.segment_id().to_string()),
                 max_turns: worker_max_turns,
+                compaction_budget: Some(interceptor),
                 engine_configurator: Some(Box::new(move |engine| {
                     let tracker = tracker_for_engine;
                     engine.on_usage(move |event| {
                         tracker.record_usage(event);
                     });
-                    engine.set_interceptor(interceptor);
                 })),
                 features,
                 required_tools,
@@ -6862,7 +7027,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 Some(
                     "You have not called `write_summary` yet. Deliver the structured \
                      summary now (Completed Tasks / Active Task / Key Decisions / \
-                     User Directives / Current Work) and nominate any files the next \
+                     User Directives / Current Work), preserving ongoing goals and user \
+                     directives from the initial summary and segment. Nominate any files the next \
                      session needs with `mark_read_required` for UTF-8 text or \
                      `add_reference` for images, binary files, and on-demand reads."
                         .to_string(),
@@ -6894,11 +7060,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .ok_or(WorkerError::CompactSummaryMissing)?;
         let mut summary_tokens = estimate_text_tokens(summary_text.len());
         if summary_max_tokens > 0 && summary_tokens > summary_max_tokens {
-            let prompt = format!(
-                "Your `write_summary` output is too large (≈{summary_tokens} tokens; max \
-                 {summary_max_tokens}). Rewrite it now with `write_summary`, preserving the \
-                 same five sections but making it concise. Target ≈{summary_target_tokens} tokens."
-            );
+            let prompt =
+                summary_shrink_prompt(summary_tokens, summary_max_tokens, summary_target_tokens);
             handle
                 .send(prompt)
                 .await
@@ -7007,8 +7170,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         );
         let mut compact_introduced_system_messages =
             Vec::with_capacity(2 + auto_read_messages.len() + reference_message.is_some() as usize);
-        let summary_message =
-            Item::system_message(format!("[Compacted context summary]\n\n{summary_text}"));
+        let summary_message = Item::system_message(format!(
+            "{}{summary_text}",
+            crate::session_history::COMPACTION_SUMMARY_HEADER
+        ));
         compact_introduced_system_messages.push(summary_message.clone());
         compact_introduced_system_messages.extend(auto_read_messages.iter().cloned());
         if let Some(msg) = reference_message.as_ref() {
@@ -7065,8 +7230,19 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let compacted_history_entries = new_history
             .iter()
             .cloned()
-            .map(|item| {
-                if let Some((offset, original)) = original_entries[original_cursor..]
+            .enumerate()
+            .map(|(index, item)| {
+                if index == 0 {
+                    HistoryEntry::new(
+                        item,
+                        new_history_metadata(
+                            WorkerHistoryProvenance::CompactionSummary,
+                            Some(SessionHistoryDerivation {
+                                sources: derived_sources.clone(),
+                            }),
+                        ),
+                    )
+                } else if let Some((offset, original)) = original_entries[original_cursor..]
                     .iter()
                     .enumerate()
                     .find(|(_, original)| original.item == item)
@@ -7482,6 +7658,7 @@ where
             feature_invocations: FeatureInvocationRegistry::default(),
             manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
+            compaction_service_budget: None,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
             metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
@@ -7821,6 +7998,7 @@ where
             feature_invocations: FeatureInvocationRegistry::default(),
             manifest_lifecycle_features_enabled: false,
             interceptor_installed: false,
+            compaction_service_budget: None,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
             metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
@@ -7950,6 +8128,7 @@ where
             feature_invocations: FeatureInvocationRegistry::default(),
             manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
+            compaction_service_budget: None,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
             metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
@@ -8335,6 +8514,7 @@ where
             feature_invocations: FeatureInvocationRegistry::default(),
             manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
+            compaction_service_budget: None,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
             metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
@@ -8733,6 +8913,61 @@ fn build_related_file_message(
     )))
 }
 
+fn summary_shrink_prompt(
+    summary_tokens: u64,
+    summary_max_tokens: u64,
+    summary_target_tokens: u64,
+) -> String {
+    format!(
+        "Your `write_summary` output is too large (≈{summary_tokens} tokens; max \
+         {summary_max_tokens}). Rewrite it now with `write_summary`, preserving the \
+         same five sections. Compress duplicate explanations and old work details \
+         first; preserve ongoing goals and user directives from the initial summary \
+         and segment, including scope, prohibitions, completion conditions and \
+         exception-reporting duties. Apply explicit later changes/retractions and \
+         retain uncertainty; do not replace the original request with recovery \
+         procedures or recent progress. Target ≈{summary_target_tokens} tokens."
+    )
+}
+
+/// Select only the Host's typed summary, never a marker in ordinary content.
+/// Invalid/duplicate Host summaries are a broken seed contract, not permission
+/// to silently omit inherited instructions.
+fn initial_compaction_summary(
+    entries: &[HistoryEntry<SessionHistoryMetadata>],
+) -> Result<Option<String>, WorkerError> {
+    let mut summaries = entries
+        .iter()
+        .filter(|entry| entry.annotation.origin == WorkerHistoryProvenance::CompactionSummary);
+    let Some(entry) = summaries.next() else {
+        return Ok(None);
+    };
+    if summaries.next().is_some() {
+        return Err(WorkerError::InvalidState(
+            "multiple Host compaction summaries in active history".into(),
+        ));
+    }
+    if !matches!(
+        &entry.item,
+        Item::Message {
+            role: agen::Role::System,
+            ..
+        }
+    ) {
+        return Err(WorkerError::InvalidState(
+            "Host compaction summary must be a system message".into(),
+        ));
+    }
+    let body = entry
+        .item
+        .as_text()
+        .and_then(|text| text.strip_prefix(crate::session_history::COMPACTION_SUMMARY_HEADER))
+        .ok_or_else(|| {
+            WorkerError::InvalidState("Host compaction summary header is missing".into())
+        })?;
+    Ok(Some(body.to_string()))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SummaryInputOptions {
     overview_target_tokens: u64,
@@ -8749,11 +8984,12 @@ struct SummaryInputBuild {
     deadline_fallback_used: bool,
 }
 
-/// Build the compact worker's input: default-reference instructions,
-/// the list of recently-touched files, task snapshot,
-/// and a bounded overview rather than a prefix-wide transcript.
+/// Build mandatory full Host-summary input plus a bounded prefix overview,
+/// recently-touched files and current tasks. Overview budgets never apply to
+/// the summary; the complete request is checked by the compaction interceptor.
 fn build_summary_input(
     items: &[Item],
+    initial_summary: Option<&str>,
     default_refs: &[PathBuf],
     task_snapshot: Option<&str>,
     options: SummaryInputOptions,
@@ -8779,10 +9015,20 @@ fn build_summary_input(
     out.push_str(&format!(
         "Summarise this session into a structured summary of about {} tokens and \
          nominate files the next session needs. The conversation below is a \
-         bounded overview/index, not the full transcript. Use tools to inspect \
+         bounded overview/index, not the full transcript. A separately supplied initial \
+         compaction summary is complete, mandatory source material. Preserve ongoing \
+         user goals and directives from it and from this segment's user messages; \
+         confirm important wording with exploration rather than reconstructing the \
+         request from recent progress. Retained tail entries remain verbatim in the \
+         next session and are outside this prefix overview. Use tools to inspect \
          current files when deciding auto-read/reference output.\n\n",
         options.summary_target_tokens
     ));
+    if let Some(summary) = initial_summary {
+        out.push_str("## Initial compaction summary (full text)\n");
+        out.push_str(summary);
+        out.push_str("\n\n## End initial compaction summary\n\n");
+    }
     if !default_refs.is_empty() {
         out.push_str(
             "These files were touched recently in this session. Use `read_file` \
@@ -8801,7 +9047,8 @@ fn build_summary_input(
         out.push_str(
             "## Current Session TaskStore\n\
              This is the full current task list. Use it as source material for the \
-             summary, especially active (pending/inprogress) tasks, but do not edit tasks \
+             summary, especially active (pending/inprogress) tasks, but not as a \
+             replacement for user goals, directives or completion conditions. Do not edit tasks \
              from the compact worker.\n",
         );
         out.push_str(task_snapshot);
@@ -10081,6 +10328,7 @@ mod build_summary_prompt_tests {
     fn test_summary_input(items: &[Item]) -> String {
         build_summary_input(
             items,
+            None,
             &[],
             None,
             SummaryInputOptions {
@@ -10091,6 +10339,72 @@ mod build_summary_prompt_tests {
             },
         )
         .text
+    }
+
+    #[test]
+    fn compact_prompt_and_shrink_policy_prioritize_continuing_user_intent() {
+        // The builtin resource is the default model-visible compaction contract.
+        let prompt = include_str!("../../../resources/prompts/internal/compact_system.md");
+        for policy in [
+            "initial compaction summary in full",
+            "segment's user messages",
+            "prohibitions",
+            "completion conditions",
+            "explicit changes or retractions",
+            "Preserve uncertainty",
+            "retained tail stays verbatim",
+            "TaskStore",
+        ] {
+            assert!(prompt.contains(policy), "missing prompt policy: {policy}");
+        }
+        let shrink = summary_shrink_prompt(2_000, 1_000, 500);
+        for policy in [
+            "initial summary",
+            "and segment",
+            "Compress duplicate",
+            "prohibitions",
+            "completion conditions",
+            "exception-reporting duties",
+            "changes/retractions",
+            "uncertainty",
+            "recovery",
+        ] {
+            assert!(shrink.contains(policy), "missing shrink policy: {policy}");
+        }
+        let input = test_summary_input(&[Item::user_message("keep original scope")]);
+        assert!(input.contains("Preserve ongoing user goals and directives"));
+        assert!(input.contains("Retained tail entries remain verbatim"));
+    }
+
+    #[test]
+    fn malformed_or_duplicate_host_summaries_fail_instead_of_omitting_context() {
+        use crate::session_history::history_entry;
+        let valid = history_entry(
+            Item::system_message(format!(
+                "{}body",
+                crate::session_history::COMPACTION_SUMMARY_HEADER
+            )),
+            WorkerHistoryProvenance::CompactionSummary,
+        );
+        assert_eq!(
+            initial_compaction_summary(std::slice::from_ref(&valid))
+                .unwrap()
+                .as_deref(),
+            Some("body")
+        );
+        assert!(initial_compaction_summary(&[valid.clone(), valid]).is_err());
+        for item in [
+            Item::user_message("pasted"),
+            Item::system_message("missing marker"),
+        ] {
+            assert!(
+                initial_compaction_summary(&[history_entry(
+                    item,
+                    WorkerHistoryProvenance::CompactionSummary
+                )])
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -10193,6 +10507,7 @@ mod build_summary_prompt_tests {
         let items = vec![Item::user_message("x".repeat(4_000))];
         let built = build_summary_input(
             &items,
+            None,
             &[],
             None,
             SummaryInputOptions {
@@ -10212,6 +10527,7 @@ mod build_summary_prompt_tests {
         let items = vec![Item::user_message("x".repeat(4_000))];
         let built = build_summary_input(
             &items,
+            None,
             &[],
             None,
             SummaryInputOptions {
