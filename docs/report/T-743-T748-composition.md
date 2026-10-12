@@ -1,3 +1,7 @@
+> Historical evidence: the user withdrew composition/wait instructions below.
+> Current standalone correction and fresh validation/review evidence:
+> `T-743-standalone-correction.md`. The original body is retained, not a T-748 return gate.
+
 # T-743 / T-748 composition: execution-boundary evidence
 
 ## Source and status
