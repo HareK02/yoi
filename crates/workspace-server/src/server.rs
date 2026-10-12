@@ -9403,62 +9403,70 @@ impl server_api::ServerApi for ServerApiContractService {
                 "expected_binding_id must contain between 1 and 256 bytes",
             )));
         }
-        let now = Utc::now().to_rfc3339();
-        if let Err(error) = api
-            .store
-            .revoke_workspace_runtime_binding_key(
-                &workspace_id,
-                &runtime_id,
-                &request.expected_binding_id,
-                &actor.account_id,
-                &now,
-            )
-            .await
-        {
-            let kind = match error {
-                Error::RuntimeBindingIdConflict { .. } => {
-                    Some(server_api::RuntimeTrustConflictKind::StaleBinding)
-                }
-                Error::RuntimeBindingFingerprintConflict { .. } => {
-                    Some(server_api::RuntimeTrustConflictKind::FingerprintInUse)
-                }
-                _ => None,
-            };
-            if let Some(kind) = kind {
-                let current = api
-                    .store
-                    .get_workspace_runtime_binding(&workspace_id, &runtime_id)
-                    .await
-                    .map_err(|error| map_error(ApiError::from(error)))?;
-                return Err(server_api::RuntimeManagementApiError::trust_conflict(
-                    server_api::RuntimeTrustConflictResponse {
-                        error: kind,
-                        message: match kind {
-                            server_api::RuntimeTrustConflictKind::StaleBinding => {
-                                "the Runtime trust binding changed; reload before retrying".to_string()
-                            }
-                            server_api::RuntimeTrustConflictKind::FingerprintInUse => {
-                                "the public key is already bound to another Runtime in this Workspace".to_string()
-                            }
+        // Own the whole revoke outcome through local publication and response.
+        // The accepted DB mutation outlives a cancelled HTTP waiter; its Host
+        // parent must also remove expectations and terminate subscriptions.
+        // SQL keeps its independent owner, and response reads stay on this Host
+        // workflow rather than attempting nested admission to the same lane.
+        run_host_workflow(api.host_executors.host()?, async move {
+            let now = Utc::now().to_rfc3339();
+            if let Err(error) = api
+                .store
+                .revoke_workspace_runtime_binding_key(
+                    &workspace_id,
+                    &runtime_id,
+                    &request.expected_binding_id,
+                    &actor.account_id,
+                    &now,
+                )
+                .await
+            {
+                let kind = match error {
+                    Error::RuntimeBindingIdConflict { .. } => {
+                        Some(server_api::RuntimeTrustConflictKind::StaleBinding)
+                    }
+                    Error::RuntimeBindingFingerprintConflict { .. } => {
+                        Some(server_api::RuntimeTrustConflictKind::FingerprintInUse)
+                    }
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    let current = api
+                        .store
+                        .get_workspace_runtime_binding(&workspace_id, &runtime_id)
+                        .await
+                        .map_err(|error| map_error(ApiError::from(error)))?;
+                    return Err(server_api::RuntimeManagementApiError::trust_conflict(
+                        server_api::RuntimeTrustConflictResponse {
+                            error: kind,
+                            message: match kind {
+                                server_api::RuntimeTrustConflictKind::StaleBinding => {
+                                    "the Runtime trust binding changed; reload before retrying".to_string()
+                                }
+                                server_api::RuntimeTrustConflictKind::FingerprintInUse => {
+                                    "the public key is already bound to another Runtime in this Workspace".to_string()
+                                }
+                            },
+                            current_binding_id: current.as_ref().map(|binding| binding.binding_id.clone()),
+                            current_fingerprint: current
+                                .as_ref()
+                                .map(|binding| binding.public_key_fingerprint.clone()),
                         },
-                        current_binding_id: current.as_ref().map(|binding| binding.binding_id.clone()),
-                        current_fingerprint: current
-                            .as_ref()
-                            .map(|binding| binding.public_key_fingerprint.clone()),
-                    },
-                ));
+                    ));
+                }
+                return Err(map_error(ApiError::from(error)));
             }
-            return Err(map_error(ApiError::from(error)));
-        }
-        api.runtime_binding_expectations
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&(workspace_id.clone(), runtime_id.clone()));
-        api.runtime_subscription_broker
-            .unregister_runtime(&runtime_id);
-        workspace_runtime_detail(&api, &workspace_id, &runtime_id)
-            .await
-            .map_err(map_error)
+            api.runtime_binding_expectations
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&(workspace_id.clone(), runtime_id.clone()));
+            api.runtime_subscription_broker
+                .unregister_runtime(&runtime_id);
+            workspace_runtime_detail_on_host(&api, &workspace_id, &runtime_id)
+                .await
+                .map_err(map_error)
+        })
+        .await
     }
 
     async fn runtime_connection_test(
@@ -34712,6 +34720,12 @@ impl From<merge_request::MergeRequestError> for ApiError {
 impl From<Error> for server_api::RepositoryApiError {
     fn from(error: Error) -> Self {
         ApiError::from(error).into_repository_api_error()
+    }
+}
+
+impl From<Error> for server_api::RuntimeManagementApiError {
+    fn from(error: Error) -> Self {
+        Self::from(server_api::RepositoryApiError::from(error))
     }
 }
 

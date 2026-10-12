@@ -1371,6 +1371,228 @@ async fn runtime_connection_post_ping_sql_waits_off_tokio_while_host_control_pro
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn saturated_host_rejects_runtime_key_revoke_without_mutating_trust() {
+    let fixture = Fixture::new().await;
+    fixture.api.worker_projection.shutdown_async().await;
+    observed(fixture.executor.drain()).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let binding = install_remote_fixture(
+        &fixture,
+        "revoke-runtime",
+        &format!("http://{}", listener.local_addr().unwrap()),
+        true,
+    );
+    fixture
+        .api
+        .runtime_binding_expectations
+        .write()
+        .unwrap()
+        .insert(
+            (WORKSPACE.into(), binding.runtime_id.clone()),
+            binding.clone(),
+        );
+    let initial_registrations = fixture.api.runtime_subscription_broker.runtime_ids();
+    // Sender Drop also releases each controlled job if a route assertion panics.
+    let mut releases: Vec<mpsc::Sender<()>> = Vec::new();
+    let (started, running) = oneshot::channel();
+    let (release, permit) = mpsc::channel();
+    releases.push(release);
+    fixture
+        .host_executor
+        .dispatch(move || {
+            let _ = started.send(());
+            let _ = permit.recv_timeout(WATCHDOG);
+        })
+        .unwrap();
+    observed(running).await.unwrap();
+    let (release, permit) = mpsc::channel();
+    releases.push(release);
+    fixture
+        .host_executor
+        .dispatch(move || {
+            let _ = permit.recv_timeout(WATCHDOG);
+        })
+        .unwrap();
+    let body = response_json(
+        observed(fixture.dispatch(Fixture::request(
+            "DELETE",
+            "/api/w/db-execution/runtimes/revoke-runtime/trust-key",
+            serde_json::json!({"expected_binding_id": binding.binding_id}),
+        )))
+        .await
+        .unwrap(),
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+    .await;
+    assert!(body.to_string().contains("db_capacity_exceeded"), "{body}");
+    assert_eq!(
+        fixture
+            .store
+            .get_workspace_runtime_binding(WORKSPACE, &binding.runtime_id)
+            .unwrap()
+            .unwrap(),
+        binding
+    );
+    assert!(
+        fixture
+            .store
+            .list_workspace_runtime_binding_audit(WORKSPACE, &binding.runtime_id, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        fixture.api.runtime_subscription_broker.runtime_ids(),
+        initial_registrations
+    );
+    assert_eq!(
+        fixture
+            .api
+            .runtime_binding_expectations
+            .read()
+            .unwrap()
+            .get(&(WORKSPACE.into(), binding.runtime_id.clone())),
+        Some(&binding)
+    );
+    drop(releases);
+    observed(fixture.host_executor.drain()).await.unwrap();
+    observed(fixture.executor.drain()).await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_runtime_key_revoke_commits_audit_and_removes_broker_registration() {
+    let fixture = Fixture::new().await;
+    // Stop unrelated projection writes before observing this mutation's SQLite
+    // wait. Keep the original runtime alive through actual workflow cleanup.
+    fixture.api.worker_projection.shutdown_async().await;
+    observed(fixture.executor.drain()).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let binding = install_remote_fixture(
+        &fixture,
+        "revoke-runtime",
+        &format!("http://{}", listener.local_addr().unwrap()),
+        true,
+    );
+    fixture
+        .api
+        .runtime_binding_expectations
+        .write()
+        .unwrap()
+        .insert(
+            (WORKSPACE.into(), binding.runtime_id.clone()),
+            binding.clone(),
+        );
+    let mut config = remote_runtime_config_from_binding(&binding).unwrap();
+    config.workspace_authorization = Some(WorkspaceRuntimeAuthorization::new(
+        fixture.store.clone(),
+        fixture.api.signing_identities.clone(),
+        "http://localhost:8787",
+        binding.clone(),
+    ));
+    fixture
+        .api
+        .runtime_subscription_broker
+        .register_remote_runtime(config);
+    let mut subscription = fixture
+        .api
+        .runtime_subscription_broker
+        .subscribe(
+            &binding.runtime_id,
+            protocol::subscription::EventSubscriptionSelector::RuntimeWorkers,
+        )
+        .unwrap();
+    let (mut busy, waiting) = BusyObservation::install_store(fixture.store.clone());
+    let mut lock = WriteLock::acquire(fixture.api.config.database_path.clone());
+    let server = fixture.server.clone();
+    let request = Fixture::request(
+        "DELETE",
+        "/api/w/db-execution/runtimes/revoke-runtime/trust-key",
+        serde_json::json!({"expected_binding_id": binding.binding_id}),
+    );
+    let revoke =
+        tokio::spawn(async move { dispatch_workspace_request(State(server), request).await });
+    observed(waiting).await.unwrap(); // Actual authenticated revoke reached BEGIN IMMEDIATE.
+    runtime_progress_while_locked(&lock).await;
+    revoke.abort();
+    assert!(revoke.await.unwrap_err().is_cancelled());
+    let admission = fixture.server.admission_for_workspace(WORKSPACE).await;
+    let mut deletion = Box::pin(admission.lock_deletion());
+    assert!(
+        futures::poll!(&mut deletion).is_pending(),
+        "cancelled HTTP must retain actual revoke ownership until publication"
+    );
+    assert!(
+        fixture
+            .api
+            .runtime_subscription_broker
+            .runtime_ids()
+            .contains(&binding.runtime_id)
+    );
+    lock.release();
+    busy.resume();
+    observed(fixture.host_executor.drain()).await.unwrap();
+    observed(fixture.executor.drain()).await.unwrap();
+    let _deletion = observed(deletion).await;
+    let saved = fixture
+        .store
+        .get_workspace_runtime_binding(WORKSPACE, &binding.runtime_id)
+        .unwrap()
+        .unwrap();
+    assert!(saved.revoked_at.is_some());
+    assert_ne!(saved.binding_id, binding.binding_id);
+    let audit = fixture
+        .store
+        .list_workspace_runtime_binding_audit(WORKSPACE, &binding.runtime_id, 10)
+        .unwrap();
+    assert_eq!(
+        audit.len(),
+        1,
+        "cancelled mutation must commit one audit without retry"
+    );
+    assert_eq!(audit[0].action, "revoked");
+    assert_eq!(audit[0].actor_account_id, format!("account-{WORKSPACE}"));
+    assert_eq!(audit[0].binding_id, saved.binding_id);
+    assert_eq!(audit[0].at, saved.revoked_at.unwrap());
+    assert!(
+        !fixture
+            .api
+            .runtime_subscription_broker
+            .runtime_ids()
+            .contains(&binding.runtime_id),
+        "committed revoke must unregister even after HTTP waiter cancellation"
+    );
+    assert!(
+        !fixture
+            .api
+            .runtime_binding_expectations
+            .read()
+            .unwrap()
+            .contains_key(&(WORKSPACE.into(), binding.runtime_id.clone()))
+    );
+    // Exercise downstream termination at the broker protocol boundary, not a
+    // product process or complete browser/Runtime E2E flow.
+    observed(async {
+        loop {
+            match subscription.recv().await {
+                Some(crate::runtime_subscription::BrokerSubscriptionEvent::Closed {
+                    code, ..
+                }) => {
+                    assert_eq!(
+                        code,
+                        protocol::subscription::SubscriptionTerminationCode::ServerShutdown
+                    );
+                    break;
+                }
+                Some(crate::runtime_subscription::BrokerSubscriptionEvent::Disconnected {
+                    ..
+                }) => {}
+                event => panic!("expected revoke shutdown, got {event:?}"),
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn cancelled_runtime_metadata_mutation_keeps_commit_and_registration_publication_owned() {
     let fixture = Fixture::new().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
