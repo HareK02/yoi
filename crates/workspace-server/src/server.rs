@@ -13555,8 +13555,8 @@ async fn scoped_get_ticket(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRecordPath>,
 ) -> ApiResult<Json<TicketDetail>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             browser_ticket_detail(&api, &path.id)
@@ -13569,8 +13569,8 @@ async fn scoped_query_tickets(
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     Json(query): Json<TicketQueryRequest>,
 ) -> ApiResult<Json<TicketQueryResponse>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             Ok(Json(api.authority.query_tickets(query)?))
@@ -13583,8 +13583,8 @@ async fn scoped_show_ticket(
     AxumPath(path): AxumPath<ScopedRecordPath>,
     Json(query): Json<TicketShowRequest>,
 ) -> ApiResult<Json<TicketDetail>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let backend = browser_ticket_backend(&api)?;
@@ -13668,8 +13668,8 @@ async fn scoped_list_ticket_assignments(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRecordPath>,
 ) -> ApiResult<Json<server_api::TicketRoleAssignmentsResponse>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let ticket = api.authority.ticket(&path.id)?;
@@ -14337,8 +14337,8 @@ async fn apply_set_ticket_assignment(
     let prep_api = api.clone();
     let prep_workspace = workspace_id.clone();
     let (ticket, role, operation_id, expected_assignment_id, record, workdir_bindings) = api
-        .store
-        .db_executor()
+        .host_executors
+        .host()?
         .run(move || {
             let api = &prep_api;
             let workspace_id = prep_workspace;
@@ -14488,8 +14488,8 @@ async fn apply_clear_ticket_assignment(
     author: String,
     source: Option<crate::store::TicketOrchestratorAssignmentSourceContext>,
 ) -> ApiResult<Json<server_api::TicketRoleAssignmentMutationResponse>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &workspace_id)?;
             let ticket = api.authority.ticket(&id)?;
@@ -14560,60 +14560,65 @@ async fn scoped_cancel_ticket_implementation(
     Json(request): Json<server_api::CancelTicketImplementationRequest>,
 ) -> ApiResult<Json<TicketDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let ticket = api.authority.ticket(&path.id)?;
-    let operation_id = require_ticket_assignment_value("operation_id", request.operation_id)?;
-    let assignment_id = require_ticket_assignment_value("assignment_id", request.assignment_id)?;
-    let reason = require_ticket_assignment_value("reason", request.reason)?;
-    if reason.len() > 512 {
-        return Err(Error::InvalidInput(
-            "implementation cancellation reason must be at most 512 bytes".to_string(),
-        )
-        .into());
-    }
+    // Runtime cancel and session cleanup are mixed work. One accepted Host
+    // owner retains authority through the whole cancellation transaction/detail.
+    run_host_workflow(api.host_executors.host()?, async move {
+        let ticket = api.authority.ticket(&path.id)?;
+        let operation_id = require_ticket_assignment_value("operation_id", request.operation_id)?;
+        let assignment_id = require_ticket_assignment_value("assignment_id", request.assignment_id)?;
+        let reason = require_ticket_assignment_value("reason", request.reason)?;
+        if reason.len() > 512 {
+            return Err(Error::InvalidInput(
+                "implementation cancellation reason must be at most 512 bytes".to_string(),
+            )
+            .into());
+        }
 
-    let current = api.store.get_active_ticket_role_assignment(
-        &path.workspace_id,
-        &ticket.id,
-        TicketAssignmentRole::Worker,
-    )?;
-    if let Some(assignment) = current.filter(|value| value.assignment_id == assignment_id)
-        && let TicketAssignmentPrincipal::Worker {
-            runtime_id,
-            worker_id,
-        } = assignment.principal
-    {
-        if api
-            .store
-            .get_ticket_assignment_operation(&path.workspace_id, &operation_id)?
-            .is_some()
+        let current = api.store.get_active_ticket_role_assignment(
+            &path.workspace_id,
+            &ticket.id,
+            TicketAssignmentRole::Worker,
+        )?;
+        if let Some(assignment) = current.filter(|value| value.assignment_id == assignment_id)
+            && let TicketAssignmentPrincipal::Worker {
+                runtime_id,
+                worker_id,
+            } = assignment.principal
         {
+            if api
+                .store
+                .get_ticket_assignment_operation(&path.workspace_id, &operation_id)?
+                .is_some()
+            {
+                return Err(Error::TicketAssignmentConflict(format!(
+                    "operation `{operation_id}` was already used for another Ticket assignment mutation"
+                ))
+                .into());
+            }
+            let worker = RuntimeWorkerRef::new(runtime_id, worker_id);
+            cancel_ticket_worker(&api, &worker, &reason).await?;
+        }
+
+        let cancelled = api.store.cancel_current_ticket_worker_assignment(
+            &path.workspace_id,
+            &ticket.id,
+            &assignment_id,
+            &new_id("tasev"),
+            &new_id("tev"),
+            &operation_id,
+            "workspace-web",
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            &reason,
+        )?;
+        if !cancelled {
             return Err(Error::TicketAssignmentConflict(format!(
-                "operation `{operation_id}` was already used for another Ticket assignment mutation"
+                "assignment `{assignment_id}` is not the current Coder implementation"
             ))
             .into());
         }
-        let worker = RuntimeWorkerRef::new(runtime_id, worker_id);
-        cancel_ticket_worker(&api, &worker, &reason).await?;
-    }
-
-    let cancelled = api.store.cancel_current_ticket_worker_assignment(
-        &path.workspace_id,
-        &ticket.id,
-        &assignment_id,
-        &new_id("tasev"),
-        &new_id("tev"),
-        &operation_id,
-        "workspace-web",
-        &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-        &reason,
-    )?;
-    if !cancelled {
-        return Err(Error::TicketAssignmentConflict(format!(
-            "assignment `{assignment_id}` is not the current Coder implementation"
-        ))
-        .into());
-    }
-    browser_ticket_detail(&api, &ticket.id)
+        browser_ticket_detail(&api, &ticket.id)
+    })
+    .await
 }
 
 async fn cancel_ticket_worker(
@@ -15070,8 +15075,8 @@ async fn scoped_edit_ticket_item(
     AxumPath(path): AxumPath<ScopedRecordPath>,
     Json(request): Json<server_api::BrowserEditTicketRequest>,
 ) -> ApiResult<Json<TicketDetail>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let mut targets = request.target.map(|target| match target {
@@ -15125,8 +15130,8 @@ async fn scoped_append_ticket_event(
     AxumPath(path): AxumPath<ScopedRecordPath>,
     Json(request): Json<server_api::BrowserAppendTicketEventRequest>,
 ) -> ApiResult<Json<TicketDetail>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let role = match request.role {
@@ -15154,14 +15159,32 @@ async fn scoped_mark_ticket_ready_from_browser(
     Json(request): Json<InternalTicketMarkReadyRequest>,
 ) -> ApiResult<Json<TicketDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let _ = scoped_mark_ticket_ready(
-        State(api.clone()),
-        AxumPath((path.workspace_id.clone(), path.id.clone())),
-        headers,
-        Json(request),
-    )
-    .await?;
-    browser_ticket_detail(&api, &path.id)
+    api.host_executors
+        .host()?
+        .run(move || {
+            let result = execute_ticket_rest_operation_on_host(
+                &api,
+                &path.workspace_id,
+                headers,
+                None,
+                TicketBackendOperation::MarkReady {
+                    id: TicketIdOrSlug::Query(path.id.clone()),
+                    request: ticket::TicketMarkReady {
+                        operation_key: request.operation_key,
+                        reason: request.reason,
+                        author: None,
+                        intake_summary: request.intake_summary,
+                    },
+                },
+            )?;
+            // Preserve result validation before projecting the committed detail.
+            let _ = ticket_rest_result(result, |result| match result {
+                TicketBackendOperationResult::Ticket(ticket) => Some(ticket),
+                _ => None,
+            })?;
+            browser_ticket_detail(&api, &path.id)
+        })
+        .await
 }
 
 async fn scoped_queue_ticket(
@@ -15357,7 +15380,7 @@ async fn execute_ticket_rest_operation_with_context(
     workspace_id: &str,
     headers: HeaderMap,
     context: Option<&server_api::ServerRequestContext>,
-    mut operation: TicketBackendOperation,
+    operation: TicketBackendOperation,
 ) -> ApiResult<TicketBackendOperationResult> {
     validate_workspace_scope(api, workspace_id)?;
     if let TicketBackendOperation::UpdateCase { ticket, request } = operation {
@@ -15379,10 +15402,25 @@ async fn execute_ticket_rest_operation_with_context(
     let job_api = api.clone();
     let workspace_id = workspace_id.to_owned();
     let context = context.cloned();
-    api.host_executors.host()?.run(move || {
-        let api = &job_api;
-        let workspace_id = workspace_id.as_str();
-        let context = context.as_ref();
+    api.host_executors
+        .host()?
+        .run(move || {
+            let api = &job_api;
+            let workspace_id = workspace_id.as_str();
+            let context = context.as_ref();
+            execute_ticket_rest_operation_on_host(api, workspace_id, headers, context, operation)
+        })
+        .await
+}
+
+// Already-owned callers must not re-admit to the occupied Host lane.
+fn execute_ticket_rest_operation_on_host(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    headers: HeaderMap,
+    context: Option<&server_api::ServerRequestContext>,
+    mut operation: TicketBackendOperation,
+) -> ApiResult<TicketBackendOperationResult> {
     validate_ticket_operation_repository_keys(api, workspace_id, &operation)?;
     let mut backend = SqliteTicketBackend::open_verified(
         api.config.database_path.clone(),
@@ -15580,7 +15618,6 @@ async fn execute_ticket_rest_operation_with_context(
         }
     }
     Ok(result)
-    }).await
 }
 
 #[cfg(test)]
@@ -17044,37 +17081,46 @@ async fn scoped_repair_merge_request_selector(
     if !input.explicit_confirmation {
         return Err(Error::BrowserReopenConfirmationRequired.into());
     }
-    let store = merge_request_store(&api, &workspace_id)?;
-    let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
-    let ticket_id = merge_request_ticket_id(&mr)?;
-    let assignment = api
-        .store
-        .get_active_ticket_worker_assignment(&workspace_id, &ticket_id)?
-        .ok_or_else(|| {
-            Error::TicketAssignmentConflict("Ticket has no active Coder work assignment".into())
-        })?;
-    let resolved_subject_ref = observe_published_source_ref(
-        &api,
-        &workspace_id,
-        &assignment.worker.runtime_id,
-        &mr.repository_id,
-        &input.selector_from,
-    )?
-    .resolved_ref;
-    let repaired = store.repair_selector_from(merge_request::RepairSelectorFrom {
-        workspace_id: workspace_id.clone(),
-        merge_request_id,
-        ticket_id,
-        selector_from: input.selector_from,
-        resolved_subject_ref,
-        repaired_by: merge_request::WorkerIdentity {
-            runtime_id: "browser".into(),
-            worker_id: "authenticated-user".into(),
-        },
-        reason: input.reason,
-        now: Utc::now(),
-    })?;
-    Ok(Json(public_merge_request(&api, &workspace_id, repaired)?))
+    // Provider observation and intact repair/audit SQL share an accepted owner;
+    // authentication's earlier DB await does not offload this mixed stage.
+    api.host_executors
+        .host()?
+        .run(move || {
+            let store = merge_request_store(&api, &workspace_id)?;
+            let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
+            let ticket_id = merge_request_ticket_id(&mr)?;
+            let assignment = api
+                .store
+                .get_active_ticket_worker_assignment(&workspace_id, &ticket_id)?
+                .ok_or_else(|| {
+                    Error::TicketAssignmentConflict(
+                        "Ticket has no active Coder work assignment".into(),
+                    )
+                })?;
+            let resolved_subject_ref = observe_published_source_ref(
+                &api,
+                &workspace_id,
+                &assignment.worker.runtime_id,
+                &mr.repository_id,
+                &input.selector_from,
+            )?
+            .resolved_ref;
+            let repaired = store.repair_selector_from(merge_request::RepairSelectorFrom {
+                workspace_id: workspace_id.clone(),
+                merge_request_id,
+                ticket_id,
+                selector_from: input.selector_from,
+                resolved_subject_ref,
+                repaired_by: merge_request::WorkerIdentity {
+                    runtime_id: "browser".into(),
+                    worker_id: "authenticated-user".into(),
+                },
+                reason: input.reason,
+                now: Utc::now(),
+            })?;
+            Ok(Json(public_merge_request(&api, &workspace_id, repaired)?))
+        })
+        .await
 }
 
 async fn scoped_register_reviewer_child_session(
@@ -17473,8 +17519,8 @@ async fn scoped_ticket_assignment_tracking_update_with_context(
     Json(update): Json<ticket::TicketAssignmentTrackingUpdate>,
 ) -> ApiResult<Json<ticket::TicketAssignmentTrackingProjection>> {
     let context = context.clone();
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || {
             let context = &context;
 
@@ -17623,7 +17669,7 @@ async fn apply_ticket_case_update(
     Json(mut request): Json<ticket::TicketCaseUpdate>,
 ) -> ApiResult<Json<ticket::Ticket>> {
     let actor = actor.cloned();
-    api.store.db_executor().run(move || {
+    api.host_executors.host()?.run(move || {
         let actor = actor.as_ref();
 
     validate_workspace_scope(&api, &workspace_id)?;
@@ -18222,6 +18268,20 @@ fn authenticate_worker_mutation_source(
         )));
     }
     Ok(worker)
+}
+
+async fn authenticate_worker_mutation_source_owned(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    headers: &HeaderMap,
+) -> Result<WorkerMutationSource> {
+    let api = api.clone();
+    let workspace_id = workspace_id.to_owned();
+    let headers = headers.clone();
+    api.host_executors
+        .host()?
+        .run(move || authenticate_worker_mutation_source(&api, &workspace_id, &headers))
+        .await
 }
 
 fn current_worker_identity(
@@ -24031,7 +24091,8 @@ async fn send_known_worker_input(
     Json(request): Json<server_api::RuntimeWorkerInputRequest>,
 ) -> ApiResult<Json<server_api::RuntimeWorkerInputResult>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
+    let source =
+        authenticate_worker_mutation_source_owned(&api, &path.workspace_id, &headers).await?;
     let context = WorkerOperationContext::WorkerControl {
         controller: RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id),
     };
@@ -24069,7 +24130,8 @@ async fn cancel_known_worker(
     Json(request): Json<server_api::RuntimeWorkerLifecycleRequest>,
 ) -> ApiResult<Json<server_api::RuntimeWorkerLifecycleResult>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
+    let source =
+        authenticate_worker_mutation_source_owned(&api, &path.workspace_id, &headers).await?;
     let context = WorkerOperationContext::WorkerControl {
         controller: RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id),
     };
@@ -24090,7 +24152,8 @@ async fn stop_known_worker(
     Json(request): Json<server_api::RuntimeWorkerLifecycleRequest>,
 ) -> ApiResult<Json<server_api::RuntimeWorkerLifecycleResult>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
+    let source =
+        authenticate_worker_mutation_source_owned(&api, &path.workspace_id, &headers).await?;
     let context = WorkerOperationContext::WorkerControl {
         controller: RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id),
     };
@@ -24111,7 +24174,8 @@ async fn restore_known_worker(
     request: server_api::WorkerRestoreRequest,
 ) -> ApiResult<Json<server_api::WorkerRestoreResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
+    let source =
+        authenticate_worker_mutation_source_owned(&api, &path.workspace_id, &headers).await?;
     let context = WorkerOperationContext::WorkerControl {
         controller: RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id),
     };
@@ -24179,7 +24243,8 @@ async fn scoped_capture_worker_observation_session(
     Json(subject): Json<server_api::WorkerObservationSubjectRef>,
 ) -> ApiResult<Json<server_api::WorkerObservationCaptureResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
+    let source =
+        authenticate_worker_mutation_source_owned(&api, &path.workspace_id, &headers).await?;
     let server_api::WorkerObservationSubjectRef::RuntimeWorker {
         runtime_id,
         worker_id,
@@ -24191,20 +24256,47 @@ async fn scoped_capture_worker_observation_session(
     };
     let target = RuntimeWorkerRef::new(runtime_id, worker_id);
     let controller = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
-    let grant = authorize_known_worker_permission(
-        &api,
-        &path.workspace_id,
-        &controller,
-        &target,
-        "observe",
-    )?;
+    let grant_api = api.clone();
+    let grant_controller = controller.clone();
+    let grant_target = target.clone();
+    let workspace_id = path.workspace_id.clone();
+    let grant = api
+        .store
+        .db_executor()
+        .run(move || {
+            authorize_known_worker_permission(
+                &grant_api,
+                &workspace_id,
+                &grant_controller,
+                &grant_target,
+                "observe",
+            )
+        })
+        .await?;
     let lock = worker_control_lock(&api, &grant.grant_id);
-    let _guard = lock.lock().await;
-    authorize_known_worker_permission(&api, &path.workspace_id, &controller, &target, "observe")?;
-    let target_summary = api
-        .runtime
-        .worker(&target)
-        .map_err(|error| error.into_error())?;
+    let guard = lock.lock_owned().await;
+    let lookup_api = api.clone();
+    let lookup_target = target.clone();
+    let (_guard, target_summary) = api
+        .host_executors
+        .host()?
+        .run(move || {
+            // Retain the control guard during the actual re-fence and live lookup,
+            // even if the observation caller cancels its wait.
+            authorize_known_worker_permission(
+                &lookup_api,
+                &path.workspace_id,
+                &controller,
+                &lookup_target,
+                "observe",
+            )?;
+            let target_summary = lookup_api
+                .runtime
+                .worker(&lookup_target)
+                .map_err(|error| error.into_error())?;
+            Ok::<_, Error>((guard, target_summary))
+        })
+        .await?;
     if matches!(
         target_summary.state.as_str(),
         "stopped" | "failed" | "rejected" | "disconnected"
@@ -28973,8 +29065,8 @@ async fn get_ticket(
     State(api): State<WorkspaceApi>,
     AxumPath(id): AxumPath<String>,
 ) -> ApiResult<Json<TicketDetail>> {
-    api.store
-        .db_executor()
+    api.host_executors
+        .host()?
         .run(move || Ok(Json(api.authority.ticket(&id)?)))
         .await
 }
@@ -30705,45 +30797,81 @@ async fn restore_runtime_worker_with_context(
     request: server_api::WorkerRestoreRequest,
 ) -> ApiResult<Json<server_api::WorkerRestoreResponse>> {
     let worker = WorkspaceWorker::resolve_async(&api, &runtime_id, &worker_id).await?;
-    let mut result = worker.restore(&context, request).await?;
-    let projected_worker = if let Some(worker) = result.worker.as_ref() {
-        // A replayed terminal receipt is historical evidence, not a new Runtime observation.
-        let record = api
-            .store
-            .get_worker_registry(api.workspace_id(), &worker.worker)?
-            .ok_or_else(|| Error::UnknownWorker {
-                worker: worker.worker.clone(),
-            })?;
-        let links = api
-            .store
-            .list_worker_workdir_links(&api.config.workspace_id, &record.worker)?;
-        let workdirs = api
-            .store
-            .list_workdir_registry(&api.config.workspace_id, 500)?;
-        match project_worker_registry_projection(&api, Some(worker), &record, links, &workdirs) {
-            Ok(worker) => Some(worker),
-            Err(error) => {
-                result.diagnostics.push(RuntimeDiagnostic::new(
-                    "worker_restore_current_projection_unavailable",
-                    "warning",
-                    sanitize_backend_error(&error.error.to_string()),
-                ));
+    let result = worker.restore(&context, request).await?;
+    project_worker_restore_response_owned(api, runtime_id, worker_id, result).await
+}
+
+// Post-restore stored projection is its own whole DB stage. Historical terminal
+// receipts are never turned into a fresh Runtime observation or registry write.
+async fn project_worker_restore_response_owned(
+    api: WorkspaceApi,
+    runtime_id: String,
+    worker_id: String,
+    mut result: crate::hosts::InternalWorkerRestoreResult,
+) -> ApiResult<Json<server_api::WorkerRestoreResponse>> {
+    // A terminal result without a Worker has no stored projection to read.
+    // Do not turn that pure response into a new availability failure on DB overload.
+    if result.worker.is_none() {
+        return Ok(Json(server_api::WorkerRestoreResponse {
+            workspace_id: api.workspace_id().to_string(),
+            runtime_id,
+            worker_id,
+            result: server_api::WorkerRestoreResult {
+                state: result.state,
+                worker: None,
+                diagnostics: result.diagnostics.into_iter().map(Into::into).collect(),
+            },
+        }));
+    }
+    api.store
+        .db_executor()
+        .run(move || {
+            let projected_worker = if let Some(worker) = result.worker.as_ref() {
+                // A replayed terminal receipt is historical evidence, not a new Runtime observation.
+                let record = api
+                    .store
+                    .get_worker_registry(api.workspace_id(), &worker.worker)?
+                    .ok_or_else(|| Error::UnknownWorker {
+                        worker: worker.worker.clone(),
+                    })?;
+                let links = api
+                    .store
+                    .list_worker_workdir_links(&api.config.workspace_id, &record.worker)?;
+                let workdirs = api
+                    .store
+                    .list_workdir_registry(&api.config.workspace_id, 500)?;
+                match project_worker_registry_projection(
+                    &api,
+                    Some(worker),
+                    &record,
+                    links,
+                    &workdirs,
+                ) {
+                    Ok(worker) => Some(worker),
+                    Err(error) => {
+                        result.diagnostics.push(RuntimeDiagnostic::new(
+                            "worker_restore_current_projection_unavailable",
+                            "warning",
+                            sanitize_backend_error(&error.error.to_string()),
+                        ));
+                        None
+                    }
+                }
+            } else {
                 None
-            }
-        }
-    } else {
-        None
-    };
-    Ok(Json(server_api::WorkerRestoreResponse {
-        workspace_id: api.workspace_id().to_string(),
-        runtime_id: runtime_id.clone(),
-        worker_id: worker_id.clone(),
-        result: server_api::WorkerRestoreResult {
-            state: result.state,
-            worker: projected_worker,
-            diagnostics: result.diagnostics.into_iter().map(Into::into).collect(),
-        },
-    }))
+            };
+            Ok(Json(server_api::WorkerRestoreResponse {
+                workspace_id: api.workspace_id().to_string(),
+                runtime_id: runtime_id.clone(),
+                worker_id: worker_id.clone(),
+                result: server_api::WorkerRestoreResult {
+                    state: result.state,
+                    worker: projected_worker,
+                    diagnostics: result.diagnostics.into_iter().map(Into::into).collect(),
+                },
+            }))
+        })
+        .await
 }
 
 fn reject_workdir_for_embedded_runtime(runtime_id: &str, has_workdir: bool) -> ApiResult<()> {

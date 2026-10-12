@@ -1,4 +1,6 @@
 //! Real SQLite waits at the HTTP/authority boundary (not mock executor jobs).
+#[path = "server_residual_execution_tests.rs"]
+mod residual;
 use super::*;
 use crate::SqliteWorkspaceStore;
 use crate::db_executor::{DbExecutor, DbExecutorLimits, DbOperationLifetime};
@@ -36,6 +38,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_repositories(Vec::new()).await
+    }
+
+    async fn with_repositories(repositories: Vec<ConfiguredRepository>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let executor = DbExecutor::new(DbExecutorLimits {
             workers: NonZeroUsize::new(1).unwrap(),
@@ -59,7 +65,7 @@ impl Fixture {
                 cookie_name: "db_execution_session".into(),
             },
             max_records: 100,
-            repositories: Vec::new(),
+            repositories,
             runtime_event_sources: Vec::new(),
             remote_runtime_sources: Vec::new(),
             backend_base_url: Some("http://localhost:8787".into()),
@@ -72,6 +78,24 @@ impl Fixture {
         seed_test_registered_workspace(store.as_ref(), &config)
             .await
             .unwrap();
+        for repository in &config.repositories {
+            store
+                .upsert_repository(&crate::store::RepositoryRecord {
+                    workspace_id: WORKSPACE.into(),
+                    repository_id: repository.id.clone(),
+                    repository_key: repository.repository_key.clone(),
+                    kind: "git".into(),
+                    provider: Some(repository.provider.clone()),
+                    source: repository.source.clone(),
+                    default_ref: repository.default_selector.clone(),
+                    source_fingerprint: repository.source_fingerprint.clone(),
+                    observed_status: repository.observed_status.clone(),
+                    observed_at: repository.observed_at.clone(),
+                    created_at: config.workspace_created_at.clone(),
+                    updated_at: config.workspace_created_at.clone(),
+                })
+                .unwrap();
+        }
         store
             .upsert_user(&UserRecord {
                 user_id: "fixture-user".into(),
@@ -924,6 +948,12 @@ struct HeldRuntimeReply {
 }
 impl HeldRuntimeReply {
     fn new() -> Self {
+        Self::with_held_path(None)
+    }
+    fn for_path(path: &str) -> Self {
+        Self::with_held_path(Some(path.to_owned()))
+    }
+    fn with_held_path(path: Option<String>) -> Self {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -932,25 +962,33 @@ impl HeldRuntimeReply {
         let upstream_released = Arc::new(AtomicBool::new(false));
         let flag = upstream_released.clone();
         let thread = std::thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            stream.set_read_timeout(Some(WATCHDOG)).unwrap();
-            let mut buf = [0; 4096];
-            let Ok(n) = stream.read(&mut buf) else { return };
-            if n == 0 {
-                return;
-            }
-            let _ = entered.send(
-                String::from_utf8_lossy(&buf[..n])
+            loop {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                stream.set_read_timeout(Some(WATCHDOG)).unwrap();
+                let mut buf = [0; 4096];
+                let Ok(n) = stream.read(&mut buf) else { return };
+                if n == 0 {
+                    return;
+                }
+                let request = String::from_utf8_lossy(&buf[..n])
                     .lines()
                     .next()
                     .unwrap()
-                    .to_owned(),
-            );
-            let _ = permit.recv_timeout(WATCHDOG);
-            flag.store(true, Ordering::SeqCst);
-            let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    .to_owned();
+                if path.as_ref().is_some_and(|path| !request.contains(path)) {
+                    // Ready's best-effort notification lookup precedes its detail
+                    // source observation. Deny it promptly; hold only the named stage.
+                    let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    continue;
+                }
+                let _ = entered.send(request);
+                let _ = permit.recv_timeout(WATCHDOG);
+                flag.store(true, Ordering::SeqCst);
+                let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                break;
+            }
         });
         Self {
             address,
