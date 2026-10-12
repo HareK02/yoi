@@ -257,8 +257,62 @@ original default-parallel Server **963 passed / 0 failed / 1 existing ignored**,
 executor panics appeared, with no residual test processes. Workdir default153 /
 http-client156, fmt/diff and naming558/0/0 passed. The isolated candidate cache
 remains in use. Logs: `target/t748-callback-{root-check,full-suite,workdir-default,workdir-http}.log`.
-The following docs-only publication changes no tested code. Its exact normally
-advanced MR source still needs a fresh independent verdict; seq5 is not approval.
+The docs-only publication `27b6c688` changed no tested code. MR seq7 independently
+confirmed the callback fix and earlier fixes, but identified another direct async
+caller; its independent verdict was `request_changes`, not approval.
+
+## Worker discovery and adjacent metadata caller audit
+
+MR seq7 major `T748-ASYNC-WORKER-DISCOVERY` traced async discovery directly into
+synchronous `workers_response`. That helper acquires the shared SQL connection
+for the Worker projection snapshot, Workdir registry/links and authority projection.
+The Reviewer's independently compiled public snapshot helper reproduced a
+300.246ms shared-mutex stall while its Tokio timer could not progress. This was
+helper-boundary evidence, not an authenticated endpoint/E2E run.
+
+Fix `dbcea6c3` awaits the **whole existing** `workers_response` on the independent
+bounded DB owner. Source-proof requirement, Workspace/query/cursor validation,
+visibility filtering, pagination and control-grant behavior are unchanged. The
+other production callers were traced: Worker list/resource detail already use DB;
+mixed Runtime cleanup plans use Host. No network work is added to the DB owner.
+
+The adjacent metadata audit found async `workspace_runtime_resources_response`
+also directly calling synchronous Runtime summaries (including remote signed HTTP
+and its awaited DB authorization). This call now uses finite Host ownership,
+then the existing independent async binding read. Runtime list/detail share this
+boundary. Whole SQL helpers, admission budgets and authentication fallback rules
+are not changed.
+
+The permanent post-auth discovery handler regression uses a separate SQLite
+IMMEDIATE writer and busy observer to hold the actual shared connection mutex.
+While the accepted discovery read is queued, current-thread timer and independent
+Host control progress. A second read receives 503/`db_capacity_exceeded`; a source
+without proof receives 403 before admission. Cancellation retains the actual
+queued read's lease/budget until result cleanup; ordinary completion preserves the
+empty filtered catalog response. Signed route proof verification remains covered
+by the existing dedicated-permission test, separately from this post-auth policy
+boundary so middleware's own DB wait cannot hide the handler bug.
+
+Restoring the exact old discovery call fails its first-poll assertion after the
+fixture watchdog releases the synchronous mutex wait. Restoring only the old
+Runtime-summary placement fails because Tokio cannot observe the real loopback
+request until the upstream watchdog releases it. Fixed summary placement lets
+SQL/timer/control progress during the held signed upstream request and keeps the
+actual Host lease after cancellation. Explicit upstream-release observation
+prevents watchdog failure cleanup from masquerading as progress. Logs:
+`target/t748-discovery-old-placement-red.log`,
+`target/t748-runtime-summary-old-placement-red.log`,
+`target/t748-discovery-summary-fixed-boundaries.log` (12 passed),
+`target/t748-discovery-summary-policy.log` (4), and callbacks (5).
+
+Exact code `dbcea6c34ba55453ce588d68272df238cde19f47` passed root `cargo check` and
+original default-parallel Server **965 passed / 0 failed / 1 existing ignored**,
+11 binary tests; library duration **175.00 seconds**. Only three deliberate
+executor panics appeared, with no residual test processes. Workdir default153 /
+http-client156 and fmt/diff/naming558/0/0 passed. Logs use the same isolated
+candidate cache: `target/t748-discovery-summary-{root-check,full-suite,workdir-default,workdir-http}.log`.
+The following docs-only publication changes no tested code; fresh exact-source
+independent review is required before an approved handoff.
 
 No latency benchmark, production incident measurement, target integration,
 Ticket conclusion, or running-environment update is claimed. T743 has now

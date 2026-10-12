@@ -112,6 +112,15 @@ whole transaction helpers. Additional assignment diagnostics, answer mutations,
 and Ticket queries use the same owned caller boundary; do not add a second ledger
 or reconstruct processing evidence from Worker liveness.
 
+Worker discovery uses the same whole `workers_response` DB stage as Worker list
+and resource detail: projection snapshot, Workdir registry/links, and authority
+projection never acquire the shared connection on Tokio. Source-proof requirement
+and pure query/cursor validation still precede admission; overload remains 503.
+Runtime resource list/detail use a finite Host stage for synchronous Runtime
+summary I/O, then await the independent DB binding read. Do not confuse a Runtime
+summary callback with the pure stored Worker projection or run network waits on
+the sole DB worker.
+
 ## Regression evidence
 
 - `db_executor::tests`: real SQLite IMMEDIATE write contention while a current-thread
