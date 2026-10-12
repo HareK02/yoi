@@ -148,7 +148,7 @@ The fresh candidate build listed the expected executor tests and total test coun
 
 ## Validation and remaining composition boundary
 
-Final code source `49bfbfb2` passed the full default-parallel Server suite,
+Pre-review code source `49bfbfb2` passed the full default-parallel Server suite,
 including the command-overload case: 960 passed, zero failures, one existing
 ignored migration fixture; 11 binary tests, library duration 175.29 seconds.
 The only captured panics were the three deliberate unknown-outcome tests.
@@ -158,6 +158,49 @@ and state-contract names (558 matches, zero unapproved, zero stale exceptions).
 These commands used the isolated candidate artifact directory; libtest default
 parallelism and the production budgets were unchanged. The MR records the exact
 published source, which also includes this report and the boundary document.
+
+## Post-publication independent review and causal fixes
+
+MR `01a12d3f-e90c-7b02-9ed9-cf3bd2e822a1` seq3 independently reviewed published
+source `66bb9d0b` and requested changes despite the successful original suite.
+Its two major findings exposed boundaries the earlier tests did not prove:
+
+- `T748-DB-NETWORK-LANE`: mixed Subjektiv helpers could wait for synchronous
+  Runtime HTTP on the sole DB worker. Fix `d3fcfb29` places session read/search,
+  subject projection, memory staging, and legacy consolidation-scope helpers on
+  the existing finite Host owner; pure DB-resident operations keep DB placement.
+  Whole transaction helpers remain intact, and no Runtime I/O is introduced
+  inside a SQL transaction.
+- `T748-ASYNC-PROTOCOL-SIGNING`: cold protocol source lookup called live binding
+  checks and signing directly on Tokio. Fix `c0223a0d` awaits the owned DB stage.
+  The source API now propagates failure explicitly: an invalid live binding or
+  signing/admission failure cannot be hidden as `None` or a legacy bearer fallback.
+
+Permanent real loopback HTTP regressions hold upstream Runtime replies during
+session read/search, subject and legacy-scope requests, while independently
+observing SQL, timer and control progress. Cancelling waiters retains the actual
+Host lifecycle lease until completion. Cold protocol source tests control another
+SQLite writer and shared connection mutex wait, and verify bounded overload,
+fresh signing and revocation without fallback. Existing queue/cancellation and
+deletion evidence now observes the actual mutation owner; the mixed fixtures
+explicitly inject a small finite Host budget. Production budgets are unchanged.
+
+Focused boundary tests passed (10). Restoring the old placement produced a
+failing regression, and fixed placement passed; an earlier syntax-rejected
+instrumentation attempt is excluded from evidence. Diagnostic artifacts under
+`target/` are not production source or replacement domain implementations.
+
+Exact code source `c0223a0d` then passed root `cargo check` and the original
+**default-parallel** Server suite: **962 passed, zero failed, one pre-existing
+ignored**, 11 binary tests; library duration **173.36 seconds**. Only the three
+intentional executor panic diagnostics appeared, with no residual test processes.
+Workdir default (153) and `http-client` (156) full suites, format/diff checks and
+state-contract naming (558 matching lines, zero unapproved, zero stale) passed.
+All used the isolated `target/t748-candidate-build` artifact directory. Logs:
+`target/t748-review-fix-{root-check,full-suite,workdir-default,workdir-http,format,names}.log`.
+The following documentation-only commit does not change that tested code.
+Fresh independent review of the normally advanced same MR source is still
+required; previous `request_changes` evidence is not approval of this fix.
 
 No latency benchmark, production incident measurement, target integration,
 Ticket conclusion, or running-environment update is claimed. T743 has now

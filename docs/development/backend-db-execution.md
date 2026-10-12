@@ -58,6 +58,11 @@ owned workflow needs async resource locks, `run_host_workflow` polls it on a Hos
 worker using the original Tokio handle; do not build a replacement runtime for
 cached services and do not submit to and await the Host lane from inside itself.
 Control/session guards needed by an accepted mutation belong to that actual job.
+Subjektiv session Read/Search, subject response projection, memory staging and
+legacy consolidation-scope helpers also use Host ownership: they can synchronously
+call Runtime/network services outside their SQL transactions. Pure DB-resident
+Subjektiv scope and memory projection helpers stay on the DB lane. Host admission
+must not be acquired again from an already-owned Host workflow.
 
 Backend Job cleanup has a third finite lane (two workers, 16 queued jobs), so a
 long Run teardown wait cannot starve ordinary Host control/stop requests. It is
@@ -69,9 +74,14 @@ unknown DB outcome. Runtime teardown is still its own lifecycle fence, not proof
 of model processing.
 
 Remote subscription and Workdir authorization are async callbacks: their complete
-live binding check and fresh request signing are offloaded together. A queue error
-must not fall back to a configured bearer token. Synchronous CLI/migration callers
-and existing synchronous Runtime adapters retain their explicit blocking boundary.
+live binding check and fresh request signing are offloaded together. Cold protocol
+source lookup in `connect_workspace_worker_protocol` is also awaited as an owned
+DB stage, rather than invoking its synchronous signing callback on Tokio.
+`WorkspaceWorkerRuntime::observation_source` is fallible: live binding/signing
+failure and bounded admission errors propagate explicitly, not as a missing
+source or a fallback to a configured bearer token. Synchronous CLI/migration
+callers and existing synchronous Runtime adapters retain their explicit blocking
+boundary.
 
 ## Caller recipe (including assignment APIs)
 
