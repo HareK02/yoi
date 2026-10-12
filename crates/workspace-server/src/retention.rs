@@ -1116,7 +1116,7 @@ mod tests {
         WorkerId::from_legacy_u64(1)
     }
     fn setup() -> SqliteWorkspaceStore {
-        let s = SqliteWorkspaceStore::in_memory().unwrap();
+        let s = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         s.with_conn(|c| {
             c.execute(
                 "INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at) \

@@ -45,7 +45,7 @@ fn evidence_column_cutover_preserves_all_values_and_current_schema_names() {
     let artifacts = evidence_rows(&conn, "artifacts");
     let receipts = evidence_rows(&conn, "repository_secret_legacy_receipts");
     drop(conn);
-    let upgraded = SqliteWorkspaceStore::open(&path).unwrap();
+    let upgraded = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     upgraded
         .with_conn(|conn| {
             assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
@@ -73,7 +73,7 @@ fn evidence_column_cutover_preserves_all_values_and_current_schema_names() {
             Ok(())
         })
         .unwrap();
-    for store in [upgraded, SqliteWorkspaceStore::in_memory().unwrap()] {
+    for store in [upgraded, SqliteWorkspaceStore::in_memory_for_test().unwrap()] {
         store.with_conn(|conn| {
             let mut stmt = conn.prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'")?;
             let objects = stmt.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;

@@ -2,6 +2,12 @@
 
 ## Source identity and composition
 
+This is the retained pre-composition caller inventory published with T-743
+`9b0d42fdbc2920736c3418bb894f26140e962bbc`. Its descriptions of direct callers
+below identify the work to move, not the current execution placement. The later
+normal merge, actual DB/Host placement, ten new regressions, full-suite evidence
+and unresolved upstream review findings are in `T-743-T748-composition.md`.
+
 This inventory belongs to the T-743 commit carrying this file on `work/T-743-ticket-public-surfaces` (T-742 base `56795fb92cb9def9bcd701bd51d92e99526f8eff`). Its exact published SHA and MR ID are recorded in the Ticket publication handoff. It is not a copy of the unpublished T-748 adapter and is not evidence that async DB execution has been integrated or reviewed.
 
 Normal-merge the validated public T-748 source into this existing work branch. Keep the MR's source/target selectors. Recheck the concrete new call graph below against the merged implementation; no placeholder executor, second connection authority, transaction split, fresh integration branch or force push is needed.

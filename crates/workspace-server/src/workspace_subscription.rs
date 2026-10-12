@@ -117,11 +117,13 @@ pub(crate) async fn serve_workspace_subscription<S>(
                                     worker_id,
                                     runtime_id: Some(runtime_id),
                                 } => {
-                                    let connection = match WorkspaceWorker::resolve(
+                                    let connection = match WorkspaceWorker::resolve_async(
                                         &api,
                                         &runtime_id,
                                         worker_id.as_str(),
-                                    ) {
+                                    )
+                                    .await
+                                    {
                                         Ok(worker) => worker
                                             .connect_protocol(&context)
                                             .await
@@ -366,7 +368,8 @@ async fn run_workspace_workers(
 ) {
     let Ok(mut projection) = api
         .worker_projection
-        .subscribe_ordered(api.config.max_records.max(1))
+        .subscribe_ordered_async(api.config.max_records.max(1))
+        .await
     else {
         let _ = send_rejected(
             &outbound,
@@ -377,11 +380,22 @@ async fn run_workspace_workers(
         .await;
         return;
     };
-    let mut workers = projection
-        .take_snapshot()
-        .into_iter()
-        .filter_map(|record| project_registry_worker(&api, record))
-        .collect::<Vec<_>>();
+    let Ok(mut workers) = project_registry_workers_async(
+        api.store.clone(),
+        api.config.workspace_id.clone(),
+        projection.take_snapshot(),
+    )
+    .await
+    else {
+        let _ = send_rejected(
+            &outbound,
+            request_id,
+            SubscriptionRejectionCode::Internal,
+            "failed to enrich durable Worker projection".to_string(),
+        )
+        .await;
+        return;
+    };
     sort_workers(&mut workers);
     if send_frame(
         &outbound,
@@ -406,7 +420,29 @@ async fn run_workspace_workers(
                 for change in event.changes {
                     let payload = match change {
                         crate::worker_projection::WorkerProjectionChange::Upsert(record) => {
-                            let Some(worker) = project_registry_worker(&api, record) else {
+                            let workers = project_registry_workers_async(
+                                api.store.clone(),
+                                api.config.workspace_id.clone(),
+                                vec![record],
+                            )
+                            .await;
+                            let Ok(mut workers) = workers else {
+                                // Admission failure cannot silently lose a live
+                                // update: terminate and require a fresh snapshot.
+                                let _ = send_frame(
+                                    &outbound,
+                                    SubscriptionFrame::new(SubscriptionFramePayload::Event(
+                                        SubscriptionEvent::SubscriptionClosed {
+                                            subscription_id: subscription_id.clone(),
+                                            code: SubscriptionTerminationCode::Lagged,
+                                            message: "Worker projection enrichment unavailable; reconnect for a fresh snapshot".to_string(),
+                                        },
+                                    )),
+                                )
+                                .await;
+                                return;
+                            };
+                            let Some(worker) = workers.pop() else {
                                 continue;
                             };
                             SubscriptionEventPayload::WorkerUpserted { worker }
@@ -450,8 +486,28 @@ async fn run_workspace_workers(
     }
 }
 
+async fn project_registry_workers_async(
+    store: std::sync::Arc<dyn crate::store::ControlPlaneStore>,
+    workspace_id: String,
+    records: Vec<crate::store::WorkerRegistryProjectionRecord>,
+) -> crate::Result<Vec<SubscriptionWorker>> {
+    store
+        .db_executor()
+        .run(move || {
+            // Keep the committed Worker payload; only the existing Workspace-scoped
+            // workdir/history/repository enrichment reads occur inside this job.
+            Ok(records
+                .into_iter()
+                .filter_map(|record| project_registry_worker(store.as_ref(), &workspace_id, record))
+                .collect())
+        })
+        .await
+}
+
+// Synchronous helpers stay synchronous; they run only inside the job above.
 fn project_registry_worker(
-    api: &WorkspaceApi,
+    store: &dyn crate::store::ControlPlaneStore,
+    workspace_id: &str,
     record: crate::store::WorkerRegistryProjectionRecord,
 ) -> Option<SubscriptionWorker> {
     let runtime_id = record.registry.worker.runtime_id.clone();
@@ -491,29 +547,25 @@ fn project_registry_worker(
             attempt_id: job.attempt_id,
             purpose: job.purpose,
         });
-    if !project_working_directory(api, &record.registry.worker, &mut worker) {
+    if !project_working_directory(store, workspace_id, &record.registry.worker, &mut worker) {
         return None;
     }
     Some(worker)
 }
 
 fn project_working_directory(
-    api: &WorkspaceApi,
+    store: &dyn crate::store::ControlPlaneStore,
+    workspace_id: &str,
     worker_ref: &RuntimeWorkerRef,
     worker: &mut SubscriptionWorker,
 ) -> bool {
-    let Ok(links) = api
-        .store
-        .list_worker_workdir_links(&api.config.workspace_id, worker_ref)
-    else {
+    let Ok(links) = store.list_worker_workdir_links(workspace_id, worker_ref) else {
         return false;
     };
     if !links.is_empty() {
         let mut attachments = Vec::with_capacity(links.len());
         for link in links {
-            let Ok(Some(workdir)) = api
-                .store
-                .get_workdir_registry(&api.config.workspace_id, &link.workdir_id)
+            let Ok(Some(workdir)) = store.get_workdir_registry(workspace_id, &link.workdir_id)
             else {
                 return false;
             };
@@ -533,9 +585,8 @@ fn project_working_directory(
         }
         worker.workdir_attachments = attachments;
     } else {
-        let Ok(has_link_history) = api
-            .store
-            .worker_workdir_link_history_exists(&api.config.workspace_id, worker_ref)
+        let Ok(has_link_history) =
+            store.worker_workdir_link_history_exists(workspace_id, worker_ref)
         else {
             return false;
         };
@@ -543,13 +594,17 @@ fn project_working_directory(
             worker.workdir_attachments.clear();
         }
     }
-    project_repository_keys(api, worker)
+    project_repository_keys(store, workspace_id, worker)
 }
 
-fn project_repository_keys(api: &WorkspaceApi, worker: &mut SubscriptionWorker) -> bool {
+fn project_repository_keys(
+    store: &dyn crate::store::ControlPlaneStore,
+    workspace_id: &str,
+    worker: &mut SubscriptionWorker,
+) -> bool {
     project_repository_keys_with(worker, |repository_id| {
-        api.store
-            .get_repository(&api.config.workspace_id, repository_id)
+        store
+            .get_repository(workspace_id, repository_id)
             .ok()
             .flatten()
             .map(|repository| repository.repository_key)
@@ -634,9 +689,8 @@ mod tests {
         protocol::subscription::SubscriptionWorkerId::new("worker-1").unwrap()
     }
 
-    #[test]
-    fn external_workdir_attachment_does_not_remove_workspace_worker() {
-        let mut worker = SubscriptionWorker {
+    fn external_worker() -> SubscriptionWorker {
+        SubscriptionWorker {
             restore_observation_token: None,
             worker_id: worker_id(),
             runtime_id: Some("runtime-1".to_string()),
@@ -660,8 +714,12 @@ mod tests {
                     .unwrap(),
                 },
             ],
-        };
+        }
+    }
 
+    #[test]
+    fn external_workdir_attachment_does_not_remove_workspace_worker() {
+        let mut worker = external_worker();
         assert!(project_repository_keys_with(&mut worker, |_| {
             panic!("External Workdir must not require Repository projection")
         }));
@@ -670,6 +728,110 @@ mod tests {
         assert_eq!(
             worker.workdir_attachments[0].working_directory_id.as_str(),
             "external-workdir-1"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_enrichment_preserves_committed_worker_and_external_attachment_but_hides_unresolved_repository()
+     {
+        use crate::store::{
+            AccountRecord, ControlPlaneStore, SqliteWorkspaceStore, WorkerRegistryRecord,
+            WorkspaceRecord,
+        };
+        let store = std::sync::Arc::new(
+            SqliteWorkspaceStore::in_memory_for_test()
+                .unwrap()
+                .with_db_executor(crate::db_executor::DbExecutor::new(Default::default()).unwrap()),
+        );
+        store
+            .upsert_account(&AccountRecord {
+                account_id: "owner".into(),
+                kind: "user".into(),
+                handle: "owner".into(),
+                display_name: "Owner".into(),
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            })
+            .unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "workspace-1".into(),
+                owner_account_id: "owner".into(),
+                display_name: "Enrichment".into(),
+                state: "active".into(),
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            })
+            .await
+            .unwrap();
+        let worker_ref = RuntimeWorkerRef::new("runtime-1", "worker-1");
+        store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: "workspace-1".into(),
+                worker: worker_ref.clone(),
+                display_name: "Durable name".into(),
+                profile: Some("builtin:coder".into()),
+                retention_state: "normal".into(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            })
+            .unwrap();
+        store
+            .apply_worker_registry_observation("workspace-1", "runtime-1", &external_worker(), "2")
+            .unwrap();
+        let committed = store
+            .worker_registry_projection("workspace-1", &worker_ref)
+            .unwrap()
+            .unwrap();
+        // Change authority after capturing the payload, as can happen while async
+        // enrichment is queued. It must not re-query and replace the committed Worker.
+        let mut later = external_worker();
+        later.state = protocol::subscription::SubscriptionWorkerState::Running;
+        store
+            .apply_worker_registry_observation("workspace-1", "runtime-1", &later, "3")
+            .unwrap();
+        let projected = project_registry_workers_async(
+            store.clone(),
+            "workspace-1".into(),
+            vec![committed.clone()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(projected.len(), 1);
+        let worker = &projected[0];
+        assert_eq!(
+            worker.state,
+            protocol::subscription::SubscriptionWorkerState::Idle
+        );
+        assert_eq!(
+            worker.availability,
+            protocol::subscription::SubscriptionWorkerAvailability::Observed
+        );
+        assert_eq!(worker.display_name.as_deref(), Some("Durable name"));
+        assert_eq!(worker.profile.as_deref(), Some("builtin:coder"));
+        assert_eq!(worker.runtime_id.as_deref(), Some("runtime-1"));
+        assert_eq!(worker.workspace_id.as_deref(), Some("workspace-1"));
+        assert_eq!(
+            worker.workdir_attachments,
+            external_worker().workdir_attachments
+        );
+        let mut unresolved = committed;
+        unresolved
+            .observation
+            .as_mut()
+            .unwrap()
+            .worker
+            .workdir_attachments[0]
+            .repository_id = Some("missing-repository".into());
+        assert!(
+            project_registry_workers_async(store, "workspace-1".into(), vec![unresolved])
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

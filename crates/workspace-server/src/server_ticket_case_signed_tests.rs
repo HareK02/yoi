@@ -724,7 +724,7 @@ async fn catalog_case_dispatch_authenticates_and_routes_the_canonical_workspace_
             reason: ticket::TicketClosureReason::Completed,
         },
     );
-    let catalog = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
+    let catalog = WorkspaceServerApi::new_for_test(api.config.clone(), api.store.clone());
     // Retain only this in-process fixture: do not create a real Runtime or a
     // background Orchestrator hook while testing catalog authentication/routing.
     catalog

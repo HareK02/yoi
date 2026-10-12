@@ -57,6 +57,19 @@ impl WorkerOperationContext {
         }
         Ok(())
     }
+    pub(super) async fn from_request_async(
+        api: &WorkspaceApi,
+        context: &server_api::ServerRequestContext,
+    ) -> std::result::Result<Self, server_api::RepositoryApiError> {
+        let owned_api = api.clone();
+        let context = context.clone();
+        api.store
+            .db_executor()
+            .run(move || Ok::<_, Error>(Self::from_request(&owned_api, &context)))
+            .await
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?
+    }
+
     pub(super) fn from_request(
         api: &WorkspaceApi,
         context: &server_api::ServerRequestContext,
@@ -162,8 +175,20 @@ impl<Services> WorkspaceWorker<Services> {
         source: crate::worker_source::VerifiedWorkerMutationSource,
         reason: &str,
     ) -> std::result::Result<worker::WorkspaceResponse, String> {
-        self.current_record()
-            .map_err(|error| error.error.to_string())?;
+        let removal = self.removal.clone();
+        let identity = self.identity.clone();
+        self.removal
+            .store
+            .db_executor()
+            .run(move || {
+                removal
+                    .store
+                    .get_worker_registry(&removal.workspace_id, &identity)?
+                    .ok_or_else(|| Error::UnknownWorker { worker: identity })
+                    .map(drop)
+            })
+            .await
+            .map_err(|error| error.to_string())?;
         self.removal
             .execute_async(
                 source,
@@ -225,6 +250,20 @@ impl crate::worker_source::VerifiedWorkerRemoveExecutor for EmbeddedWorkspaceWor
 }
 
 impl WorkspaceWorker {
+    pub(crate) async fn resolve_async(
+        api: &WorkspaceApi,
+        runtime_id: &str,
+        reference: &str,
+    ) -> Result<Self> {
+        let owned_api = api.clone();
+        let runtime_id = runtime_id.to_owned();
+        let reference = reference.to_owned();
+        api.store
+            .db_executor()
+            .run(move || Self::resolve(&owned_api, &runtime_id, &reference))
+            .await
+    }
+
     pub(crate) fn resolve(api: &WorkspaceApi, runtime_id: &str, reference: &str) -> Result<Self> {
         Self::resolve_with_services(
             api.clone(),
@@ -239,7 +278,36 @@ impl WorkspaceWorker {
         context: &WorkerOperationContext,
         permission: &str,
     ) -> ApiResult<Option<tokio::sync::OwnedMutexGuard<()>>> {
-        self.current_record()?;
+        let worker = self.clone();
+        let initial_context = context.clone();
+        let permission = permission.to_owned();
+        let initial_permission = permission.clone();
+        let grant = self
+            .api
+            .store
+            .db_executor()
+            .run(move || -> ApiResult<Option<WorkerControlGrantRecord>> {
+                worker.current_record()?;
+                let WorkerOperationContext::WorkerControl { controller } = initial_context else {
+                    return Ok(None);
+                };
+                if worker
+                    .api
+                    .store
+                    .get_worker_registry(worker.api.workspace_id(), &controller)?
+                    .is_none()
+                {
+                    return Err(Error::UnknownWorker { worker: controller }.into());
+                }
+                Ok(Some(authorize_known_worker_permission(
+                    &worker.api,
+                    worker.api.workspace_id(),
+                    &controller,
+                    &worker.identity,
+                    &initial_permission,
+                )?))
+            })
+            .await?;
         match context {
             #[cfg(test)]
             WorkerOperationContext::Backend => Ok(None),
@@ -248,42 +316,35 @@ impl WorkspaceWorker {
                 Ok(None)
             }
             WorkerOperationContext::WorkerControl { controller } => {
-                if self
-                    .api
-                    .store
-                    .get_worker_registry(self.api.workspace_id(), controller)?
-                    .is_none()
-                {
-                    return Err(Error::UnknownWorker {
-                        worker: controller.clone(),
-                    }
-                    .into());
-                }
-                let grant = authorize_known_worker_permission(
-                    &self.api,
-                    self.api.workspace_id(),
-                    controller,
-                    &self.identity,
-                    permission,
-                )?;
+                let grant = grant.expect("Worker control context resolved a grant");
+                // Await admission outside the DB lane; the recheck owns the guard
+                // until it finishes, even if its async waiter is cancelled.
                 let guard = worker_control_lock(&self.api, &grant.grant_id)
                     .lock_owned()
                     .await;
-                self.current_record()?;
-                let current_grant = authorize_known_worker_permission(
-                    &self.api,
-                    self.api.workspace_id(),
-                    controller,
-                    &self.identity,
-                    permission,
-                )?;
-                if current_grant.grant_id != grant.grant_id {
-                    return Err(Error::RepositoryConflict(
-                        "Worker control grant changed while waiting for admission".into(),
-                    )
-                    .into());
-                }
-                Ok(Some(guard))
+                let worker = self.clone();
+                let controller = controller.clone();
+                self.api
+                    .store
+                    .db_executor()
+                    .run(move || -> ApiResult<_> {
+                        worker.current_record()?;
+                        let current_grant = authorize_known_worker_permission(
+                            &worker.api,
+                            worker.api.workspace_id(),
+                            &controller,
+                            &worker.identity,
+                            &permission,
+                        )?;
+                        if current_grant.grant_id != grant.grant_id {
+                            return Err(Error::RepositoryConflict(
+                                "Worker control grant changed while waiting for admission".into(),
+                            )
+                            .into());
+                        }
+                        Ok(Some(guard))
+                    })
+                    .await
             }
         }
     }
@@ -293,8 +354,16 @@ impl WorkspaceWorker {
         context: &WorkerOperationContext,
         request: server_api::WorkerRestoreRequest,
     ) -> ApiResult<InternalWorkerRestoreResult> {
-        let _guard = self.authorize_operation(context, "restore").await?;
-        self.restore_internal(request)
+        let guard = self.authorize_operation(context, "restore").await?;
+        let worker = self.clone();
+        self.api
+            .host_executors
+            .host()?
+            .run(move || {
+                let _guard = guard;
+                worker.restore_internal(request)
+            })
+            .await
     }
 
     /// Trusted Backend callers still supply an explicit observed intent. Runtime
@@ -312,27 +381,48 @@ impl WorkspaceWorker {
         context: &WorkerOperationContext,
         request: WorkerLifecycleRequest,
     ) -> ApiResult<WorkerLifecycleResult> {
-        let _guard = self.authorize_operation(context, "stop").await?;
-        let result = self
+        let guard = self.authorize_operation(context, "stop").await?;
+        let worker = self.clone();
+        let (result, guard) = self
             .api
-            .runtime
-            .stop_worker(&self.identity, request)
-            .map_err(|e| e.into_error())?;
+            .host_executors
+            .host()?
+            .run(move || -> ApiResult<_> {
+                let result = worker
+                    .api
+                    .runtime
+                    .stop_worker(&worker.identity, request)
+                    .map_err(|e| e.into_error())?;
+                Ok((result, guard))
+            })
+            .await?;
         if result.state != InternalWorkerOperationState::Accepted {
             return Ok(result);
         }
         parse_runtime_worker_id_for_registry(&self.identity.worker_id)?;
         let session_lock = current_worker_session_lock(&self.api, &self.identity);
-        let _session_guard = session_lock.lock().await;
+        let session_guard = session_lock.lock_owned().await;
         close_current_worker_session_locked(&self.api, &self.identity).await?;
-        if let Some(record) = self
-            .api
-            .store
-            .get_worker_registry(self.api.workspace_id(), &self.identity)?
-        {
-            sync_linked_workdir_after_worker_stop(&self.api, &self.identity.runtime_id, &record)?;
-        }
-        Ok(result)
+        let worker = self.clone();
+        self.api
+            .host_executors
+            .host()?
+            .run(move || -> ApiResult<_> {
+                let (_control, _session) = (guard, session_guard);
+                if let Some(record) = worker
+                    .api
+                    .store
+                    .get_worker_registry(worker.api.workspace_id(), &worker.identity)?
+                {
+                    sync_linked_workdir_after_worker_stop(
+                        &worker.api,
+                        &worker.identity.runtime_id,
+                        &record,
+                    )?;
+                }
+                Ok(result)
+            })
+            .await
     }
 
     pub(super) async fn cancel(
@@ -340,12 +430,20 @@ impl WorkspaceWorker {
         context: &WorkerOperationContext,
         request: WorkerLifecycleRequest,
     ) -> ApiResult<WorkerLifecycleResult> {
-        let _guard = self.authorize_operation(context, "cancel").await?;
-        Ok(self
-            .api
-            .runtime
-            .cancel_worker(&self.identity, request)
-            .map_err(|e| e.into_error())?)
+        let guard = self.authorize_operation(context, "cancel").await?;
+        let worker = self.clone();
+        self.api
+            .host_executors
+            .host()?
+            .run(move || -> ApiResult<_> {
+                let _guard = guard;
+                Ok(worker
+                    .api
+                    .runtime
+                    .cancel_worker(&worker.identity, request)
+                    .map_err(|e| e.into_error())?)
+            })
+            .await
     }
 
     pub(super) async fn input(
@@ -358,46 +456,61 @@ impl WorkspaceWorker {
         } else {
             "send_input"
         };
-        let _guard = self.authorize_operation(context, permission).await?;
+        let guard = self.authorize_operation(context, permission).await?;
         let session_lock = current_worker_session_lock(&self.api, &self.identity);
-        let _session_guard = session_lock.lock().await;
-        self.ensure_interactive()?;
+        let session_guard = session_lock.lock_owned().await;
+        self.ensure_interactive().await?;
         if matches!(context, WorkerOperationContext::WorkerControl { .. })
             && request.kind == WorkerInputKind::User
         {
             request.kind = WorkerInputKind::UserIfIdle;
         }
-        Ok(self
-            .api
-            .runtime
-            .send_input(&self.identity, request)
-            .map_err(|e| e.into_error())?)
+        let worker = self.clone();
+        self.api
+            .host_executors
+            .host()?
+            .run(move || -> ApiResult<_> {
+                let (_control, _session) = (guard, session_guard);
+                Ok(worker
+                    .api
+                    .runtime
+                    .send_input(&worker.identity, request)
+                    .map_err(|e| e.into_error())?)
+            })
+            .await
     }
 
-    fn ensure_interactive(&self) -> ApiResult<()> {
-        if let Some(claim) = self
-            .api
+    async fn ensure_interactive(&self) -> ApiResult<()> {
+        let worker = self.clone();
+        self.api
             .store
-            .get_pending_ticket_assignment_operation_for_worker(
-                self.api.workspace_id(),
-                &self.identity,
-            )?
-        {
-            return Err(Error::TicketAssignmentConflict(format!(
-                "Worker has pending Ticket claim {}; reconcile that exact operation before admitting input",
-                claim.operation_id,
-            )).into());
-        }
-        if self
-            .api
-            .store
-            .worker_registry_projection(self.api.workspace_id(), &self.identity)?
-            .and_then(|projection| projection.job)
-            .is_some()
-        {
-            return Err(Error::InvalidInput("Backend Job Workers accept only their Backend-owned immutable input; Console is read-only".into()).into());
-        }
-        Ok(())
+            .db_executor()
+            .run(move || -> ApiResult<()> {
+                if let Some(claim) = worker
+                    .api
+                    .store
+                    .get_pending_ticket_assignment_operation_for_worker(
+                        worker.api.workspace_id(),
+                        &worker.identity,
+                    )?
+                {
+                    return Err(Error::TicketAssignmentConflict(format!(
+                        "Worker has pending Ticket claim {}; reconcile that exact operation before admitting input",
+                        claim.operation_id,
+                    )).into());
+                }
+                if worker
+                    .api
+                    .store
+                    .worker_registry_projection(worker.api.workspace_id(), &worker.identity)?
+                    .and_then(|projection| projection.job)
+                    .is_some()
+                {
+                    return Err(Error::InvalidInput("Backend Job Workers accept only their Backend-owned immutable input; Console is read-only".into()).into());
+                }
+                Ok(())
+            })
+            .await
     }
 
     pub(super) async fn set_pinned(
@@ -405,33 +518,44 @@ impl WorkspaceWorker {
         context: &WorkerOperationContext,
         pinned: bool,
     ) -> ApiResult<WorkerRetentionResponse> {
-        let _guard = self.authorize_operation(context, "pin").await?;
-        let retention_state = if pinned { "pinned" } else { "normal" };
-        let changed = self.api.worker_projection.publish_ordered(|| {
-            self.api
-                .store
-                .update_worker_retention(
-                    self.api.workspace_id(),
-                    &self.identity,
-                    retention_state,
-                    now_registry_timestamp().as_str(),
-                )
-                .map(|commit| (!commit.changes.is_empty(), commit))
-        })?;
-        if !changed {
-            return Err(cleanup_api_error(
-                &self.identity.runtime_id,
-                "workspace_worker_retention_unknown_worker",
-                "Worker is not known to the Backend registry",
-            ));
-        }
-        Ok(WorkerRetentionResponse {
-            workspace_id: self.api.workspace_id().to_owned(),
-            runtime_id: self.identity.runtime_id.clone(),
-            worker_id: self.identity.worker_id.clone(),
-            pinned,
-            retention_state: retention_state.into(),
-        })
+        let guard = self.authorize_operation(context, "pin").await?;
+        let worker = self.clone();
+        self.api
+            .store
+            .db_executor()
+            .run(move || -> ApiResult<WorkerRetentionResponse> {
+                // Publication and its DB mutation are one owned stage. Accepted
+                // work retains control admission through commit and publication.
+                let _guard = guard;
+                let retention_state = if pinned { "pinned" } else { "normal" };
+                let changed = worker.api.worker_projection.publish_ordered(|| {
+                    worker
+                        .api
+                        .store
+                        .update_worker_retention(
+                            worker.api.workspace_id(),
+                            &worker.identity,
+                            retention_state,
+                            now_registry_timestamp().as_str(),
+                        )
+                        .map(|commit| (!commit.changes.is_empty(), commit))
+                })?;
+                if !changed {
+                    return Err(cleanup_api_error(
+                        &worker.identity.runtime_id,
+                        "workspace_worker_retention_unknown_worker",
+                        "Worker is not known to the Backend registry",
+                    ));
+                }
+                Ok(WorkerRetentionResponse {
+                    workspace_id: worker.api.workspace_id().to_owned(),
+                    runtime_id: worker.identity.runtime_id.clone(),
+                    worker_id: worker.identity.worker_id.clone(),
+                    pinned,
+                    retention_state: retention_state.into(),
+                })
+            })
+            .await
     }
 
     /// The caller owns the full cleanup-plan digest check. The removal service
@@ -611,7 +735,7 @@ impl WorkspaceWorkerMethodSender {
             .await?;
         let session_lock = current_worker_session_lock(&self.worker.api, &self.worker.identity);
         let _session_guard = session_lock.lock().await;
-        self.worker.ensure_interactive()?;
+        self.worker.ensure_interactive().await?;
         let WorkerOperationContext::Browser { source, .. } = context else {
             return Err(Error::WorkspacePermissionDenied(
                 "Browser Worker protocol context required".into(),

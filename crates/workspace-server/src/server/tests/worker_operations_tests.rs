@@ -830,7 +830,11 @@ async fn grant_replacement_while_admission_waits_cannot_use_another_grants_lock(
     };
     let admission = handle.set_pinned(&context, true);
     tokio::pin!(admission);
-    // Poll deterministically to the held lock before replacing grant authority.
+    // The first poll can now be waiting for the offloaded authority read, not
+    // the held grant lock. Drain this fixture's actual SQL, then poll its saved
+    // reply to reach admission before replacing authority.
+    assert!(futures::poll!(admission.as_mut()).is_pending());
+    api.store.db_executor().drain().await.unwrap();
     assert!(futures::poll!(admission.as_mut()).is_pending());
     api.store
         .revoke_worker_control_grant(
@@ -1329,8 +1333,9 @@ async fn restore_guard_internal_stale_conflict_retires_intent_for_later_explicit
         );
         assert_eq!(api.runtime.worker(&identity).unwrap().state, "stopped");
         // Retirement, unlike in-memory refresh, must survive caller journal restart.
-        api.config_store =
-            Arc::new(SqliteWorkspaceStore::open(api.config.database_path.clone()).unwrap());
+        api.config_store = Arc::new(
+            SqliteWorkspaceStore::open_for_test(api.config.database_path.clone()).unwrap(),
+        );
         let fresh = api.runtime.worker(&identity).unwrap();
         let next = api
             .config_store
@@ -1490,7 +1495,7 @@ async fn restore_guard_internal_intent_survives_client_store_restart_without_rep
     );
     // Reopen the durable caller journal, discarding all client-side memory of request identity.
     api.config_store =
-        Arc::new(SqliteWorkspaceStore::open(api.config.database_path.clone()).unwrap());
+        Arc::new(SqliteWorkspaceStore::open_for_test(api.config.database_path.clone()).unwrap());
     let pinned = api
         .config_store
         .pin_internal_worker_restore_intent(
@@ -1599,7 +1604,7 @@ async fn restore_guard_cross_runtime_ssh_completion_retries_pinned_snapshot_at_w
         crate::repository_source::repository_source_fingerprint(&source);
     config.repositories[0].source = source;
     config.repositories[0].path = None;
-    let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+    let store = SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
     let execution = Arc::new(DeterministicExecutionBackend::default());
     execution.accept_restores();
     let api = WorkspaceApi::new_with_execution_backend(config, Arc::new(store), execution.clone())

@@ -27,7 +27,7 @@ async fn subject_session_callback_completes_while_create_and_deletion_are_waitin
         )
         .unwrap();
     let worker_id = reserved.worker_id.to_string();
-    let server = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
+    let server = WorkspaceServerApi::new_for_test(api.config.clone(), api.store.clone());
     // Reuse the fixture API, but exercise the real outer dispatcher and both auth layers.
     server
         .apis

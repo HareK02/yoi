@@ -26,7 +26,7 @@ Canonical `/workspaces/{workspace_id}/tickets/{ticket_id}` and `/api/w/{workspac
 
 ## Validation
 
-Passed on the combined working snapshot:
+Passed on the initial T-743 public-surface snapshot (before T-748 composition); later combined execution-boundary evidence is in `T-743-T748-composition.md`:
 
 - Root `cargo check` (normal TUI/Server compile closure).
 - `cargo test --no-fail-fast -p ticket -p worker-runtime -p worker -p yoi-workspace-server -p server-api`: all selected crate targets passed. Library counts: server-api 98; ticket 99; worker 994; worker-runtime 417; workspace-server 946 with one existing ignored test. Included integration/binary targets also passed. Log: `target/t743-changed-crates-final.log`.
@@ -51,7 +51,7 @@ List/Orchestrator final evidence: `t743-list-final-reviewed-light` and `t743-lis
 
 ## Explicit remaining work and limits
 
-T-748's DB execution facade is **not** copied or integrated. Its latest notified candidate is local-only and its full Server suite has unresolved failures. When T-748 publishes a validated source, normal-merge it, place each new whole synchronous domain helper/authority query into the common bounded DB execution boundary, keep the answer transaction intact, and leave Runtime/network waiting off the DB worker. Recheck cancellation/overload and commit-before-publication at the combined boundary. The exact combined published source then needs independent trusted review.
+The published T-748 source `66bb9d0b825d72e20923003b273b787007f3aed8` has now been normally merged into the same T-743 source and the added callers connected to its existing bounded owner. The answer transaction remains intact; Runtime live discovery and post-commit dispatch use the finite Host lane. Combined full Server/Workdir and ten new boundary regressions pass; see `T-743-T748-composition.md` for exact proof and distinctions. However T-748 MR seq3 has two unresolved major findings on other Subjektiv/network and cold protocol signing paths. A validated upstream fix source, normal composition/revalidation and fresh independent exact combined-source review remain necessary. This is not final approval.
 
 Current evidence does not attest actual model judgment quality. Prompt/Tool fixtures are scripted inclusion/schema/transport tests; Chromium uses a loopback API fixture. The real-Worker Server fixture uses a scripted model with actual Controller/session/Runtime acceptance and canonical processing synchronization. None is a live migration/rollout, proof of actual processing for every production delivery, or completion of T-744's full real-path validation.
 
