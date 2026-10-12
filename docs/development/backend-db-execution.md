@@ -122,8 +122,12 @@ mixed Runtime/config helpers and use Host, not the sole DB worker. Runtime
 registration validates its signing identity in a whole DB stage, scans existing
 Workers on Host, then owns SQL key/CAS mutation, local registration publication
 and response observation in one accepted workflow. Metadata updates likewise keep
-commit and publication together after waiter cancellation. Public resource/detail
-helpers admit Host ownership; already-owned workflows call their `_on_host`
+commit and publication together after waiter cancellation. Trust-key revoke also
+owns whole CAS/audit SQL, expectation removal, broker unregister/Shutdown and
+response observation in one accepted Host workflow. Future request proof denial
+alone does not terminate existing subscriptions. Host admission must precede the
+mutation, so overload cannot commit a revoke then fail on response admission.
+Public resource/detail helpers admit Host ownership; already-owned workflows call their `_on_host`
 variants directly, never await another admission to the same occupied lane.
 Connection tests ping on finite Host ownership and then await the whole current
 binding fence on DB. A replaced/revoked binding cannot attest the earlier ping.

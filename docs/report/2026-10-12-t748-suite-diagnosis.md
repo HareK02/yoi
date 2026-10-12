@@ -374,7 +374,63 @@ original default-parallel Server **969 passed / 0 failed / 1 existing ignored**,
 executor panics appeared, with no residual test processes. Workdir default153 /
 http-client156, fmt/diff/naming558/0/0 passed. Same isolated cache; evidence logs:
 `target/t748-management-{root-check,full-suite,workdir-default,workdir-http}.log`.
-The following docs-only publication changes no tested code and still requires a
+Docs-only publication `6d8c49b7` changed no tested code. MR seq11 independently
+confirmed those fixes and repeated the full validation, but requested changes for
+cancelled trust-key revocation; it did not approve the complete snapshot.
+
+## Trust-key revocation must own post-commit subscription termination
+
+Seq11 major `T748-RUNTIME-REVOKE-CANCEL-PUBLICATION` reproduced the authenticated
+public DELETE trust-key route waiting for an actual SQLite writer. Cancelling its
+HTTP waiter did not cancel accepted SQL: revoke, binding-ID replacement and audit
+committed, but waiter-owned expectation removal and broker unregister were lost.
+The independent artifact used the normal public Server library's inner router,
+not outer Workspace dispatch or live-stream/E2E. New signed requests still fail
+the live binding fence; that does not shut down an already connected subscription.
+
+Fix `1a065db0` gives the whole key-revoke outcome one accepted finite Host owner:
+intact CAS/audit SQL on the independent DB lane, local expectation removal, broker
+unregister/Shutdown, and response observation. Owner/scope/input preflight, typed
+trust conflicts and current-binding error responses remain unchanged. Response
+reads use the already-owned `_on_host` detail helper, with no nested Host admission.
+Admission/unknown-outcome errors retain the normal typed availability mapping;
+there is no transaction split, new queue budget or automatic mutation retry.
+The adjacent key-mutation caller audit confirms registration and metadata already
+own publication and this is the sole production key-revoke caller.
+
+The permanent cancellation regression exercises the **real outer Workspace
+dispatch**, owner browser cookie, generated DELETE route, whole store mutation and
+broker. Projection producers stop before the write lock is acquired, so the
+fixture-local busy observer identifies this actual revoke transaction, not startup
+SQL. Timer/control progress before the watchdog releases SQLite. After waiter
+cancellation, the real admitted RequestLease keeps deletion Pending. Releasing the
+writer and draining actual Host/DB owners persists exactly one revoke audit,
+changes binding ID, removes expectations and broker registration, and delivers
+`Closed/ServerShutdown` to the downstream. The loopback endpoint holds a WebSocket
+handshake; this proves broker termination, not an established upstream socket or
+complete product E2E. Existing broker protocol tests cover socket replacement.
+
+A separate full-Host route regression observes 503 before mutation and unchanged
+binding, audit and publication. Restoring only the exact old revoke method fails
+both permanent tests: the cancelled job leaves broker registration behind, and
+under overload the old handler commits revoke before its response helper returns
+503. Fixed code passes both without retry or reduced parallelism. Evidence:
+`target/t748-revoke-final-old-publication-red.log`,
+`target/t748-revoke-fixed-boundaries.log` (18), `target/t748-revoke-policy.log` (3),
+`target/t748-revoke-binding-policy.log` (16).
+An initial counter probe outside dispatch was invalid because dispatch replaces it
+with the real RequestLease; it was corrected to observe actual deletion drain.
+A test-only overload channel type-inference compile rejection was corrected with
+an explicit unit channel. Neither setup error is counted as semantic evidence.
+
+Exact code `1a065db0fc5d07e2dcc1b9dac2fcfc0607b9a23c` passed root `cargo check` and
+the original default-parallel Server **971 passed / 0 failed / 1 existing ignored**,
+11 binary tests; library duration **173.05 seconds**. Only three deliberate executor
+panic diagnostics appeared, and no retained test/repro processes were observed.
+Workdir default153/http-client156, fmt/diff and naming558/0/0 passed. All Cargo
+checks/tests use the isolated candidate cache. Logs:
+`target/t748-revoke-{root-check,full-suite,workdir-default,workdir-http,fmt,names}.log`.
+The following documentation-only publication changes no tested code and needs a
 fresh exact-source independent verdict before an approved handoff.
 
 No latency benchmark, production incident measurement, target integration,
