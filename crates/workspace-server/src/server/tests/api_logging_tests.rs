@@ -806,7 +806,19 @@ async fn self_workdir_post_start_registration_failure_does_not_claim_pre_dispatc
             .unwrap();
     };
     let ((status, body, events), ()) = tokio::join!(
-        request_with_logs(build_router(fixture.api.clone()), request),
+        async {
+            let result = request_with_logs(build_router(fixture.api.clone()), request).await;
+            // A pre-dispatch rejection leaves the fake provider waiting on an
+            // open channel. Fail with the actual response here instead of
+            // hanging join! until the outer suite timeout hides that cause.
+            assert_eq!(
+                result.0,
+                StatusCode::BAD_GATEWAY,
+                "early command-start response: {}",
+                result.1
+            );
+            result
+        },
         provider
     );
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
@@ -831,4 +843,79 @@ async fn self_workdir_post_start_registration_failure_does_not_claim_pre_dispatc
         commands.try_recv().is_err(),
         "post-dispatch failure was retried"
     );
+}
+
+#[tokio::test]
+async fn saturated_host_before_command_start_returns_availability_without_a_provider_operation() {
+    let mut fixture = manual_worker_assignment_fixture().await;
+    let identity =
+        worker_runtime::auth::RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id)
+            .unwrap();
+    configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
+    let (sender, mut commands) = tokio::sync::mpsc::channel(1);
+    let connection = Arc::new(ExternalProviderConnection {
+        grant_id: "overload-grant".into(),
+        workdir_id: fixture.main_workdir_id.clone(),
+        provider_instance_id: "overload-provider".into(),
+        generation: 1,
+        expires_at: None,
+        capabilities: workdir::WorkdirSessionCapabilities::ALL,
+        admission: Arc::new(tokio::sync::Semaphore::new(1)),
+        shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        sender,
+    });
+    fixture.runtime.workdir_session_factory = Some(Arc::new(move |_| {
+        Ok(Arc::new(ExternalProviderWorkdirSession::new(
+            connection.clone(),
+            None,
+        )) as WorkdirSessionHandle)
+    }));
+    fixture
+        .api
+        .runtime
+        .register_or_replace(fixture.runtime.clone());
+    let host = fixture.api.host_executors.host().unwrap();
+    host.drain().await.unwrap();
+    let mut releases = Vec::new(); // dropping senders also releases jobs on panic
+    for _ in 0..2 {
+        let (release, permit) = std::sync::mpsc::channel::<()>();
+        releases.push(release);
+        let (started, accepted) = tokio::sync::oneshot::channel();
+        host.dispatch(move || {
+            let _ = started.send(());
+            let _ = permit.recv_timeout(std::time::Duration::from_secs(10));
+        })
+        .unwrap();
+        accepted.await.unwrap();
+    }
+    for _ in 0..16 {
+        host.dispatch(|| {}).unwrap();
+    }
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-session/operations");
+    let request = runtime_source_request(
+        &identity,
+        Some(&fixture.worker.worker_id),
+        "POST",
+        &path,
+        serde_json::to_vec(&json!({
+            "target_workdir": "checkout",
+            "operation": {"operation": "command_start", "request": {
+                "command": "not-dispatched", "timeout_secs": 1, "output_limit": 1024,
+                "cwd": "", "spill_dir": null, "tool_call_id": "not-dispatched"
+            }}
+        }))
+        .unwrap(),
+    );
+    let (status, body, _) = request_with_logs(build_router(fixture.api.clone()), request).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.to_string().contains("db_capacity_exceeded"), "{body}");
+    // The response is already final but the live fake-provider receiver remains
+    // Pending. An unbounded join of those two futures hid this causal rejection
+    // behind the original 600-second suite timeout. No process or command ran.
+    let provider_command = commands.recv();
+    tokio::pin!(provider_command);
+    assert!(futures::poll!(provider_command.as_mut()).is_pending());
+    drop(releases);
+    host.drain().await.unwrap();
+    fixture.api.store.db_executor().drain().await.unwrap();
 }

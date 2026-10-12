@@ -597,7 +597,7 @@ async fn real_attention_worker_start_restore(lose_response: bool) {
     let dir = tempfile::tempdir().unwrap();
     init_clean_git_workspace(dir.path());
     let config = test_server_config(dir.path());
-    let store = Arc::new(SqliteWorkspaceStore::open(&config.database_path).unwrap());
+    let store = Arc::new(SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap());
     seed_test_registered_workspace(store.as_ref(), &config)
         .await
         .unwrap();

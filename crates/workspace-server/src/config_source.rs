@@ -795,7 +795,7 @@ mod tests {
     }
 
     async fn open_store() -> SqliteWorkspaceStore {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         store.upsert_workspace(&workspace()).await.unwrap();
         store
     }
@@ -1454,7 +1454,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_candidate_is_never_persisted() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         store.upsert_workspace(&workspace()).await.unwrap();
         let current = store.load_workspace_config("w-config").unwrap().unwrap();
         let main = current.snapshot.get(&path(MAIN_CONFIG_ENTRYPOINT)).unwrap();
@@ -1478,7 +1478,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_candidate_commits_snapshot_content_and_provenance_atomically() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         store.upsert_workspace(&workspace()).await.unwrap();
         let current = store.load_workspace_config("w-config").unwrap().unwrap();
         let committed = store
@@ -1496,7 +1496,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_cas_cannot_overwrite_newer_tree() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         store.upsert_workspace(&workspace()).await.unwrap();
         let current = store.load_workspace_config("w-config").unwrap().unwrap();
         let request = commit_request(&current, vec![update_main(&current, "{ answer = 42; }")]);
@@ -1514,7 +1514,7 @@ mod tests {
 
     #[tokio::test]
     async fn committed_content_remains_retrievable_after_later_commit() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         store.upsert_workspace(&workspace()).await.unwrap();
         let current = store.load_workspace_config("w-config").unwrap().unwrap();
         let first = store
@@ -1772,7 +1772,7 @@ mod tests {
 
     #[test]
     fn migration_creates_config_authority_tables() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         store
             .with_conn(|conn| {
                 for table in [

@@ -78,7 +78,7 @@ async fn tracking_store_every_replay_fences_current_singleton_and_authenticated_
         );
         // Model the authority change after authenticated source capture, before
         // BEGIN IMMEDIATE on a second connection. Receipt presence cannot bypass it.
-        let second = SqliteWorkspaceStore::open(directory.path().join("workspace.db")).unwrap();
+        let second = SqliteWorkspaceStore::open_for_test(directory.path().join("workspace.db")).unwrap();
         second.with_conn_mut(|conn| {
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             match change {
@@ -233,7 +233,7 @@ async fn tracking_store_same_principal_reissue_and_exact_retries_keep_original_r
             .is_err()
     );
     drop(store);
-    let reopened = SqliteWorkspaceStore::open(directory.path().join("workspace.db")).unwrap();
+    let reopened = SqliteWorkspaceStore::open_for_test(directory.path().join("workspace.db")).unwrap();
     assert_eq!(
         reopened
             .get_ticket_assignment_tracking("w", "tracking", "a")
@@ -441,7 +441,7 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
             .collect::<Vec<_>>(),
         vec![92, 93]
     );
-    let store = SqliteWorkspaceStore::open(&path).unwrap();
+    let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     store
         .with_conn(|conn| {
             assert_eq!(current_schema_version(conn)?, 93);
@@ -525,7 +525,7 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
         .list_ticket_assignment_tracking_history("w", "pending", "a-pending")
         .unwrap();
     drop(store);
-    let reopened = SqliteWorkspaceStore::open(&path).unwrap();
+    let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     assert_eq!(
         reopened
             .list_ticket_assignment_tracking_history("w", "pending", "a-pending")
@@ -550,7 +550,7 @@ fn tracking_store_schema91_closed_unknown_assignment_uses_assign_audit_for_first
         let releases_before = stored_fixture_rows(&conn, "ticket_assignment_work_releases");
         drop(conn);
 
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         let backend = ticket::SqliteTicketBackend::open_verified(&path, "w").unwrap();
         let reopen = || {
             let observed = backend.show("historical-done".into()).unwrap();
@@ -645,7 +645,7 @@ fn tracking_store_schema91_closed_unknown_assignment_uses_assign_audit_for_first
         );
         // A second observer holds the same Assign baseline. Only the first
         // explicit writer may consume it; BEGIN IMMEDIATE serializes the CAS.
-        let second = SqliteWorkspaceStore::open(&path).unwrap();
+        let second = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         assert_eq!(
             second
                 .get_ticket_assignment_tracking("w", "historical-done", "a-historical-done")
@@ -740,7 +740,7 @@ fn tracking_store_schema91_closed_unknown_assignment_uses_assign_audit_for_first
         }).unwrap();
         drop(second);
         drop(store);
-        let reopened_store = SqliteWorkspaceStore::open(&path).unwrap();
+        let reopened_store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         assert_eq!(
             reopened_store
                 .get_ticket_assignment_tracking("w", "historical-done", "a-historical-done")
@@ -796,7 +796,7 @@ fn tracking_store_schema91_missing_assign_audit_remains_unknown_without_cas_base
     )
     .unwrap();
     drop(conn);
-    let store = SqliteWorkspaceStore::open(&path).unwrap();
+    let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     let unknown = store
         .get_ticket_assignment_tracking("w", "historical-done", "a-historical-done")
         .unwrap()
@@ -1068,7 +1068,7 @@ async fn orchestrator_assignment_all_runtime_retries_fence_singleton_and_binding
                 &source,
             )
             .unwrap();
-        let second = SqliteWorkspaceStore::open(directory.path().join("workspace.db")).unwrap();
+        let second = SqliteWorkspaceStore::open_for_test(directory.path().join("workspace.db")).unwrap();
         second.with_conn_mut(|conn| {let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;match change {
             "replace" => {tx.execute("UPDATE worker_singleton_owners SET worker_id='replacement',generation=2 WHERE workspace_id='w'",[])?;},
             "revoke" => {tx.execute("UPDATE workspace_runtime_bindings SET revoked_at='revoked' WHERE workspace_id='w'",[])?;},

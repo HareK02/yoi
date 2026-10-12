@@ -2290,7 +2290,7 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("server.db");
-        let store = Arc::new(SqliteWorkspaceStore::open(&database).unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::open_for_test(&database).unwrap());
         let timestamp = now();
         for workspace_id in ["workspace-a", "workspace-b"] {
             futures::executor::block_on(store.upsert_workspace(&WorkspaceRecord {

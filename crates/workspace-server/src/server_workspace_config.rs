@@ -47,7 +47,10 @@ pub(super) fn pre_error(error: impl Into<ApiError>) -> Failure {
 fn mutation_error(error: Error) -> Failure {
     // Storage/service failures at a mutation boundary may include a commit
     // acknowledgement failure. Never describe those as a guaranteed rollback.
-    if matches!(&error, Error::Sqlite(_) | Error::Store(_)) {
+    if matches!(
+        &error,
+        Error::Sqlite(_) | Error::Store(_) | Error::DbOperationOutcomeUnknown
+    ) {
         unknown()
     } else {
         pre_error(error)
@@ -59,7 +62,7 @@ fn unknown() -> Failure {
         ..fail(500, "outcome_unknown")
     }
 }
-pub(super) fn identity(
+pub(super) async fn identity(
     api: &WorkspaceApi,
     context: &server_api::ServerRequestContext,
     workspace_id: &str,
@@ -67,7 +70,9 @@ pub(super) fn identity(
     validate_workspace_scope(api, workspace_id).map_err(pre_error)?;
     let headers =
         current_worker_contract_headers(context).map_err(|_| fail(403, "access_denied"))?;
-    current_worker_identity(api, workspace_id, &headers).map_err(pre_error)
+    authenticate_worker_mutation_source_owned(api, workspace_id, &headers)
+        .await
+        .map_err(pre_error)
 }
 async fn lock(
     api: &WorkspaceApi,
@@ -186,9 +191,23 @@ pub(super) async fn get(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
 ) -> ConfigResult<Option<WorkspaceConfigAttachment>> {
-    let _guard = lock(api, worker).await?;
-    let grant = grant_for_worker(api, worker)?;
-    Ok(active_link(api, worker, &grant, None)?.map(|link| attachment(&grant, &link, true)))
+    let guard = lock(api, worker).await?;
+    let executor = api.store.db_executor();
+    let api = api.clone();
+    let worker = worker.clone();
+    executor
+        .run(move || {
+            let _guard = guard;
+            Ok::<_, Error>((|| {
+                let grant = grant_for_worker(&api, &worker)?;
+                Ok::<_, Failure>(
+                    active_link(&api, &worker, &grant, None)?
+                        .map(|link| attachment(&grant, &link, true)),
+                )
+            })())
+        })
+        .await
+        .map_err(pre_error)?
 }
 pub(super) async fn attach(
     api: &WorkspaceApi,
@@ -198,46 +217,59 @@ pub(super) async fn attach(
     if request.alias.as_deref().is_some_and(|alias| alias != ALIAS) {
         return Err(fail(400, "invalid_alias"));
     }
-    let _guard = lock(api, worker).await?;
-    let grant = grant_for_worker(api, worker)?;
-    let access = request.access.unwrap_or(grant.access);
-    if access == Access::ReadWrite && grant.access != Access::ReadWrite {
-        return Err(fail(403, "access_denied"));
-    }
-    if let Some(mut link) = active_link(api, worker, &grant, None)? {
-        // Same active alias/identity is idempotent; explicit write never silently downgrades.
-        if request.access == Some(Access::ReadWrite)
-            && effective_access(&grant, &link) != Access::ReadWrite
-        {
-            return Err(fail(403, "access_denied"));
-        }
-        if access == Access::ReadOnly && effective_access(&grant, &link) != Access::ReadOnly {
-            link.capabilities = access_capabilities(access);
-            link = api
-                .store
-                .attach_worker_workdir(&link)
-                .map_err(mutation_error)?;
-        }
-        return Ok(attachment(&grant, &link, true));
-    }
-    let link = api
-        .store
-        .attach_worker_workdir(&WorkerWorkdirLinkRecord {
-            connection_id: String::new(),
-            workspace_id: grant.workspace_id.clone(),
-            worker: worker.clone(),
-            workdir_id: grant.working_directory_id.clone(),
-            alias: ALIAS.into(),
-            capabilities: access_capabilities(access),
-            linked_at: now_registry_timestamp(),
-            unlinked_at: None,
+    let guard = lock(api, worker).await?;
+    let executor = api.store.db_executor();
+    let api = api.clone();
+    let worker = worker.clone();
+    executor
+        .run(move || {
+            let _guard = guard;
+            Ok::<_, Error>((|| {
+                let grant = grant_for_worker(&api, &worker)?;
+                let access = request.access.unwrap_or(grant.access);
+                if access == Access::ReadWrite && grant.access != Access::ReadWrite {
+                    return Err(fail(403, "access_denied"));
+                }
+                if let Some(mut link) = active_link(&api, &worker, &grant, None)? {
+                    // Same active alias/identity is idempotent; explicit write never silently downgrades.
+                    if request.access == Some(Access::ReadWrite)
+                        && effective_access(&grant, &link) != Access::ReadWrite
+                    {
+                        return Err(fail(403, "access_denied"));
+                    }
+                    if access == Access::ReadOnly
+                        && effective_access(&grant, &link) != Access::ReadOnly
+                    {
+                        link.capabilities = access_capabilities(access);
+                        link = api
+                            .store
+                            .attach_worker_workdir(&link)
+                            .map_err(mutation_error)?;
+                    }
+                    return Ok(attachment(&grant, &link, true));
+                }
+                let link = api
+                    .store
+                    .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+                        connection_id: String::new(),
+                        workspace_id: grant.workspace_id.clone(),
+                        worker: worker.clone(),
+                        workdir_id: grant.working_directory_id.clone(),
+                        alias: ALIAS.into(),
+                        capabilities: access_capabilities(access),
+                        linked_at: now_registry_timestamp(),
+                        unlinked_at: None,
+                    })
+                    .map_err(mutation_error)?;
+                // No Runtime filesystem/session synchronization for a logical config target.
+                api.worker_projection
+                    .refresh(&worker)
+                    .map_err(|_| unknown())?;
+                Ok(attachment(&grant, &link, false))
+            })())
         })
-        .map_err(mutation_error)?;
-    // No Runtime filesystem/session synchronization for a logical config target.
-    api.worker_projection
-        .refresh(worker)
-        .map_err(|_| unknown())?;
-    Ok(attachment(&grant, &link, false))
+        .await
+        .map_err(mutation_error)?
 }
 fn resolve(
     api: &WorkspaceApi,
@@ -313,9 +345,22 @@ pub(super) async fn observe(
     for path in &request.paths {
         path_valid(path, true)?;
     }
-    let _guard = lock(api, worker).await?;
-    let (grant, link) = resolve(api, worker, &request.connection_id)?;
-    let state = tree(api)?;
+    let guard = lock(api, worker).await?;
+    let resolution_api = api.clone();
+    let resolution_worker = worker.clone();
+    let connection_id = request.connection_id.clone();
+    let (grant, link, state, _guard) = api
+        .store
+        .db_executor()
+        .run(move || {
+            Ok::<_, Error>((|| {
+                let (grant, link) = resolve(&resolution_api, &resolution_worker, &connection_id)?;
+                let state = tree(&resolution_api)?;
+                Ok::<_, Failure>((grant, link, state, guard))
+            })())
+        })
+        .await
+        .map_err(pre_error)??;
     let schema_fingerprint = api
         .config_schema_registry
         .compose()
@@ -427,9 +472,22 @@ pub(super) async fn read(
     request: WorkspaceConfigReadRequest,
 ) -> ConfigResult<WorkspaceConfigReadResponse> {
     path_valid(&request.path, false)?;
-    let _guard = lock(api, worker).await?;
-    let (grant, link) = resolve(api, worker, &request.connection_id)?;
-    let state = tree(api)?;
+    let guard = lock(api, worker).await?;
+    let resolution_api = api.clone();
+    let resolution_worker = worker.clone();
+    let connection_id = request.connection_id.clone();
+    let (grant, link, state, _guard) = api
+        .store
+        .db_executor()
+        .run(move || {
+            Ok::<_, Error>((|| {
+                let (grant, link) = resolve(&resolution_api, &resolution_worker, &connection_id)?;
+                let state = tree(&resolution_api)?;
+                Ok::<_, Failure>((grant, link, state, guard))
+            })())
+        })
+        .await
+        .map_err(pre_error)??;
     let schema_fingerprint = api
         .config_schema_registry
         .compose()
@@ -482,12 +540,25 @@ pub(super) async fn commit(
             server_api::ConfigTreeChange::Delete { path, .. } => path_valid(path, false)?,
         }
     }
-    let _guard = lock(api, worker).await?;
-    let (grant, link) = resolve(api, worker, &request.connection_id)?;
-    if effective_access(&grant, &link) != Access::ReadWrite {
-        return Err(fail(403, "access_denied"));
-    }
-    let state = tree(api)?;
+    let guard = lock(api, worker).await?;
+    let resolution_api = api.clone();
+    let resolution_worker = worker.clone();
+    let connection_id = request.connection_id.clone();
+    let (grant, link, state, guard) = api
+        .store
+        .db_executor()
+        .run(move || {
+            Ok::<_, Error>((|| {
+                let (grant, link) = resolve(&resolution_api, &resolution_worker, &connection_id)?;
+                if effective_access(&grant, &link) != Access::ReadWrite {
+                    return Err(fail(403, "access_denied"));
+                }
+                let state = tree(&resolution_api)?;
+                Ok::<_, Failure>((grant, link, state, guard))
+            })())
+        })
+        .await
+        .map_err(pre_error)??;
     let schema_fingerprint = api
         .config_schema_registry
         .compose()
@@ -501,17 +572,19 @@ pub(super) async fn commit(
     // Evaluation/semantic validation are pure preparation. Bound this stage
     // without ever dispatching persistence in a timed-out background task.
     let preparation_api = api.clone();
-    let preparation = tokio::task::spawn_blocking(move || {
-        prepare_workspace_config_tree(
+    let executor = api.store.db_executor();
+    let preparation = executor.run(move || {
+        // Timeout/cancellation releases exclusion only after actual preparation ends.
+        let candidate = prepare_workspace_config_tree(
             &preparation_api,
             &preparation_api.config.workspace_id,
             &canonical,
-        )
+        )?;
+        Ok::<_, Error>((candidate, guard))
     });
-    let candidate = tokio::time::timeout(DEADLINE, preparation)
+    let (candidate, guard) = tokio::time::timeout(DEADLINE, preparation)
         .await
         .map_err(|_| fail(503, "evaluation_timeout"))?
-        .map_err(|_| fail(500, "evaluation_unavailable"))?
         .map_err(pre_error)?;
     if candidate.base_digest != state.snapshot.digest
         || candidate.base_toolchain_fingerprint != state.contract.fingerprint
@@ -520,15 +593,78 @@ pub(super) async fn commit(
     {
         return Err(fail(409, "stale_validator"));
     }
-    // Recheck durable authority before the first auxiliary/canonical effects.
-    let (current_grant, current_link) = resolve(api, worker, &request.connection_id)?;
-    if current_grant != grant || current_link.capabilities != link.capabilities {
-        return Err(fail(409, "authority_changed"));
+    let persistence_api = api.clone();
+    let worker = worker.clone();
+    let connection_id = request.connection_id.clone();
+    let expected_grant = grant.clone();
+    let expected_link = link.clone();
+    let (state, publication) = api
+        .store
+        .db_executor()
+        .run(move || {
+            Ok::<_, Error>((|| {
+                let (current_grant, current_link) =
+                    resolve(&persistence_api, &worker, &connection_id)?;
+                if current_grant != expected_grant
+                    || current_link.capabilities != expected_link.capabilities
+                {
+                    return Err(fail(409, "authority_changed"));
+                }
+                // Preserve the shared helper's ordering and atomic CAS, but never
+                // run its remote Runtime publication on the sole DB worker.
+                project_repository_access_candidate(
+                    &*persistence_api.store,
+                    &persistence_api.repository_secrets,
+                    &persistence_api.config.workspace_id,
+                    &candidate,
+                )
+                .map_err(|_| unknown())?;
+                let state = persistence_api
+                    .config_store
+                    .commit_evaluated_workspace_config(
+                        &persistence_api.config.workspace_id,
+                        &candidate,
+                    )
+                    .map_err(|_| unknown())?;
+                let publication = persistence_api
+                    .prompt_projection_cache
+                    .resolve(&persistence_api.config.workspace_id, &state)
+                    .ok()
+                    .and_then(|projection| {
+                        // Dispatch from the actual persistence owner even if its
+                        // waiter was cancelled. Runtime I/O owns exclusion, not
+                        // a DB worker or an open SQL transaction.
+                        let (complete, publication) = tokio::sync::oneshot::channel();
+                        let runtime = persistence_api.runtime.clone();
+                        let admission = persistence_api.host_executors.host().and_then(|executor| {
+                            executor.dispatch(move || {
+                                let _guard = guard;
+                                let _diagnostics = runtime
+                                    .observe_workspace_prompt_projection((*projection).clone());
+                                let _ = complete.send(());
+                            })
+                        });
+                        match admission {
+                            Ok(()) => Some(publication),
+                            Err(error) => {
+                                tracing::warn!(
+                                    workspace_id = %persistence_api.config.workspace_id,
+                                    %error,
+                                    "Workspace config committed but Runtime publication was not admitted"
+                                );
+                                None
+                            }
+                        }
+                    });
+                Ok((state, publication))
+            })())
+        })
+        .await
+        .map_err(mutation_error)??;
+    if let Some(publication) = publication {
+        // Publication is best effort and cannot turn an acknowledged CAS into an error.
+        let _ = publication.await;
     }
-    // From this boundary repository credential projection may have side effects.
-    // Never falsely claim rollback or automatically replay a failed/uncertain save.
-    let state = persist_workspace_config_candidate(api, &api.config.workspace_id, &candidate)
-        .map_err(|_| unknown())?;
     Ok(WorkspaceConfigCommitResponse {
         validator: validator(&grant, &link, &state, &schema_fingerprint, ""),
         digest: state.snapshot.digest,
@@ -544,37 +680,61 @@ pub(super) async fn create_grant(
         .await
         .map_err(pre_error)?;
     let worker = RuntimeWorkerRef::new(&request.runtime_id, &request.worker_id);
-    let _guard = lock(api, &worker).await?;
-    let summary = api
-        .runtime
-        .worker(&worker)
-        .map_err(|_| fail(404, "worker_not_found"))?;
+    let guard = lock(api, &worker).await?;
+    let runtime = api.runtime.clone();
+    let lookup_worker = worker.clone();
+    let (summary, guard) = api
+        .host_executors
+        .host()
+        .map_err(pre_error)?
+        .run(move || {
+            Ok::<_, Error>((|| {
+                let summary = runtime
+                    .worker(&lookup_worker)
+                    .map_err(|_| fail(404, "worker_not_found"))?;
+                Ok::<_, Failure>((summary, guard))
+            })())
+        })
+        .await
+        .map_err(pre_error)??;
     if summary.workspace.workspace_id.as_deref() != Some(workspace_id) {
         return Err(fail(403, "access_denied"));
     }
-    if let Some(grant) = api
-        .store
-        .current_workspace_config_grant(workspace_id, &worker)
-        .map_err(pre_error)?
-    {
-        if grant.access != request.access {
-            return Err(fail(409, "grant_exists_revoke_first"));
-        }
-        return Ok(grant);
-    }
-    let grant = WorkspaceConfigGrantResponse {
-        grant_id: Uuid::now_v7().to_string(),
-        workspace_id: workspace_id.into(),
-        runtime_id: worker.runtime_id,
-        worker_id: worker.worker_id,
-        working_directory_id: Uuid::now_v7().to_string(),
-        access: request.access,
-        revoked: false,
-    };
-    api.store
-        .create_workspace_config_grant(&grant, &actor.account_id)
-        .map_err(mutation_error)?;
-    Ok(grant)
+    let executor = api.store.db_executor();
+    let api = api.clone();
+    let workspace_id = workspace_id.to_owned();
+    let account_id = actor.account_id.clone();
+    executor
+        .run(move || {
+            let _guard = guard;
+            Ok::<_, Error>((|| {
+                if let Some(grant) = api
+                    .store
+                    .current_workspace_config_grant(&workspace_id, &worker)
+                    .map_err(pre_error)?
+                {
+                    if grant.access != request.access {
+                        return Err(fail(409, "grant_exists_revoke_first"));
+                    }
+                    return Ok(grant);
+                }
+                let grant = WorkspaceConfigGrantResponse {
+                    grant_id: Uuid::now_v7().to_string(),
+                    workspace_id,
+                    runtime_id: worker.runtime_id,
+                    worker_id: worker.worker_id,
+                    working_directory_id: Uuid::now_v7().to_string(),
+                    access: request.access,
+                    revoked: false,
+                };
+                api.store
+                    .create_workspace_config_grant(&grant, &account_id)
+                    .map_err(mutation_error)?;
+                Ok(grant)
+            })())
+        })
+        .await
+        .map_err(mutation_error)?
 }
 pub(super) async fn revoke_grant(
     api: &WorkspaceApi,
@@ -585,39 +745,60 @@ pub(super) async fn revoke_grant(
     require_workspace_owner(api, workspace_id, actor, "Workspace config grants")
         .await
         .map_err(pre_error)?;
+    let lookup_api = api.clone();
+    let lookup_workspace_id = workspace_id.to_owned();
+    let lookup_grant_id = grant_id.to_owned();
     let mut grant = api
         .store
-        .get_workspace_config_grant(workspace_id, grant_id)
+        .db_executor()
+        .run(move || {
+            lookup_api
+                .store
+                .get_workspace_config_grant(&lookup_workspace_id, &lookup_grant_id)
+        })
+        .await
         .map_err(pre_error)?
         .ok_or_else(|| fail(404, "not_found"))?;
     let worker = RuntimeWorkerRef::new(&grant.runtime_id, &grant.worker_id);
-    let _guard = lock(api, &worker).await?;
-    api.store
-        .revoke_workspace_config_grant(workspace_id, grant_id)
-        .map_err(mutation_error)?;
-    grant.revoked = true;
-    // Revocation is durable before unlink; a failed cleanup cannot restore access.
-    if let Some(link) = api
-        .store
-        .list_workdir_worker_links(workspace_id, &grant.working_directory_id)
-        .map_err(|_| unknown())?
-        .into_iter()
-        .find(|link| link.unlinked_at.is_none() && link.worker == worker)
-    {
-        api.store
-            .detach_worker_workdir_connection(
-                workspace_id,
-                &worker,
-                &link.alias,
-                &link.connection_id,
-                &now_registry_timestamp(),
-            )
-            .map_err(|_| unknown())?;
-    }
-    api.worker_projection
-        .refresh(&worker)
-        .map_err(|_| unknown())?;
-    Ok(grant)
+    let guard = lock(api, &worker).await?;
+    let executor = api.store.db_executor();
+    let api = api.clone();
+    let workspace_id = workspace_id.to_owned();
+    let grant_id = grant_id.to_owned();
+    executor
+        .run(move || {
+            let _guard = guard;
+            Ok::<_, Error>((|| {
+                api.store
+                    .revoke_workspace_config_grant(&workspace_id, &grant_id)
+                    .map_err(mutation_error)?;
+                grant.revoked = true;
+                // Revocation is durable before unlink; a failed cleanup cannot restore access.
+                if let Some(link) = api
+                    .store
+                    .list_workdir_worker_links(&workspace_id, &grant.working_directory_id)
+                    .map_err(|_| unknown())?
+                    .into_iter()
+                    .find(|link| link.unlinked_at.is_none() && link.worker == worker)
+                {
+                    api.store
+                        .detach_worker_workdir_connection(
+                            &workspace_id,
+                            &worker,
+                            &link.alias,
+                            &link.connection_id,
+                            &now_registry_timestamp(),
+                        )
+                        .map_err(|_| unknown())?;
+                }
+                api.worker_projection
+                    .refresh(&worker)
+                    .map_err(|_| unknown())?;
+                Ok(grant)
+            })())
+        })
+        .await
+        .map_err(mutation_error)?
 }
 
 pub(super) fn summary(
@@ -655,7 +836,11 @@ pub(super) fn summary(
 mod tests {
     use super::*;
     #[test]
-    fn workspace_config_mutation_storage_failures_are_conservatively_unknown() {
+    fn workspace_config_mutation_storage_or_executor_failures_are_conservatively_unknown() {
+        assert_eq!(
+            mutation_error(Error::DbOperationOutcomeUnknown).classification,
+            Classification::Unknown
+        );
         assert_eq!(
             mutation_error(Error::Sqlite(rusqlite::Error::InvalidQuery)).classification,
             Classification::Unknown

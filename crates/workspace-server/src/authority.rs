@@ -3349,7 +3349,7 @@ mod tests {
     async fn unfinished_dependencies_remain_diagnostic_without_disabling_manual_start() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("workspace.db");
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "w".into(),
@@ -3424,7 +3424,7 @@ mod tests {
     async fn manual_worker_eligibility_accepts_explicit_states_without_reviving_released_work() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("workspace.db");
-        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "w".into(),
@@ -3557,7 +3557,7 @@ mod tests {
         write_ticket(dir.path(), "00000000001J5", "Second ticket", "queued");
         write_ticket(dir.path(), "00000000001J6", "Third ticket", "planning");
         let db_path = dir.path().join("workspace.db");
-        let store = SqliteWorkspaceStore::open(&db_path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&db_path).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-test".to_string(),
@@ -3989,7 +3989,7 @@ VALUES ('workspace-test', 'ticket', 4);
     async fn objective_mutations_write_sqlite_records_and_audit_events() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("workspace.db");
-        let store = SqliteWorkspaceStore::open(&db_path).unwrap();
+        let store = SqliteWorkspaceStore::open_for_test(&db_path).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-test".to_string(),

@@ -750,7 +750,7 @@ mod tests {
 
     #[test]
     fn retry_keeps_resolved_config_and_credential_candidates_after_fallback_moves() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
         futures::executor::block_on(store.upsert_workspace(&WorkspaceRecord {
             workspace_id: "workspace".to_string(),
             owner_account_id: "owner-account".to_string(),
