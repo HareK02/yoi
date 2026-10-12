@@ -27608,30 +27608,44 @@ async fn scoped_update_remote_runtime(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(&path.runtime_id);
-    let binding = api
-        .store
-        .update_workspace_runtime_binding_metadata(
-            &path.workspace_id,
-            &path.runtime_id,
-            display_name,
-            endpoint.as_str().trim_end_matches('/'),
-            &Utc::now().to_rfc3339(),
-        )
-        .await?;
-    api.runtime_binding_expectations
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            (path.workspace_id.clone(), path.runtime_id.clone()),
-            binding.clone(),
-        );
-    api.runtime_subscription_broker
-        .unregister_runtime(&path.runtime_id);
-    api.register_workspace_runtime_binding(binding)?;
-    Ok(Json(
-        workspace_runtime_detail(&api, &path.workspace_id, &path.runtime_id).await?,
-    ))
+        .unwrap_or(&path.runtime_id)
+        .to_owned();
+    update_remote_runtime_metadata_owned(
+        api,
+        path.workspace_id,
+        path.runtime_id,
+        display_name,
+        endpoint.as_str().trim_end_matches('/').to_owned(),
+    )
+    .await
+}
+
+// Post-auth mutation boundary: cancellation cannot split SQL completion from
+// publication or discard the accepted workflow's request/resource authority.
+async fn update_remote_runtime_metadata_owned(
+    api: WorkspaceApi,
+    workspace_id: String,
+    runtime_id: String,
+    display_name: String,
+    endpoint: String,
+) -> ApiResult<Json<WorkspaceRuntimeDetail>> {
+    run_host_workflow(api.host_executors.host()?, async move {
+        let binding = api
+            .store
+            .update_workspace_runtime_binding_metadata(
+                &workspace_id,
+                &runtime_id,
+                &display_name,
+                &endpoint,
+                &Utc::now().to_rfc3339(),
+            )
+            .await?;
+        publish_workspace_runtime_binding(&api, binding)?;
+        Ok(Json(
+            workspace_runtime_detail_on_host(&api, &workspace_id, &runtime_id).await?,
+        ))
+    })
+    .await
 }
 
 async fn scoped_reveal_runtime_trust_key(
@@ -29116,6 +29130,75 @@ async fn list_workers(
         .await
 }
 
+async fn require_active_runtime_registration_identity(api: &WorkspaceApi) -> ApiResult<()> {
+    let identities = api.signing_identities.clone();
+    let workspace_id = api.config.workspace_id.clone();
+    api.store
+        .db_executor()
+        .run(move || {
+            let identity = identities.get_validated(&workspace_id)?;
+            if identity.state != "active" {
+                return Err(settings_bad_request(
+                    "workspace_signing_identity_unavailable",
+                    "an active Workspace signing identity is required before registering a Runtime",
+                ));
+            }
+            Ok(())
+        })
+        .await
+}
+
+async fn scan_runtime_registration_workers(api: &WorkspaceApi, runtime_id: &str) -> ApiResult<()> {
+    let runtime = api.runtime.clone();
+    let runtime_id = runtime_id.to_owned();
+    let limit = api.config.max_records.min(200);
+    api.host_executors.host()?.run(move || {
+        match runtime.list_workers_for_runtime(&runtime_id, limit) {
+            Ok(workers) if !workers.items.is_empty() => Err(Error::RuntimeBindingConflict(format!(
+                "Runtime `{runtime_id}` still has {} active worker(s) and cannot replace its connection",
+                workers.items.len()
+            )).into()),
+            Ok(_) | Err(RuntimeRegistryError::UnknownRuntime(_)) => Ok(()),
+            Err(error) => Err(error.into_error().into()),
+        }
+    }).await
+}
+
+fn publish_workspace_runtime_binding(
+    api: &WorkspaceApi,
+    binding: WorkspaceRuntimeBinding,
+) -> Result<()> {
+    api.runtime_binding_expectations
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            (binding.workspace_id.clone(), binding.runtime_id.clone()),
+            binding.clone(),
+        );
+    api.runtime_subscription_broker
+        .unregister_runtime(&binding.runtime_id);
+    api.register_workspace_runtime_binding(binding)
+}
+
+async fn require_current_runtime_test_binding(
+    api: &WorkspaceApi,
+    binding: WorkspaceRuntimeBinding,
+) -> ApiResult<WorkspaceRuntimeBinding> {
+    let store = api.store.clone();
+    api.store
+        .db_executor()
+        .run(move || {
+            if !store.workspace_runtime_binding_matches(&binding)? {
+                return Err(Error::RuntimeBindingConflict(
+                    "Runtime connection changed while the connection test was running".to_string(),
+                )
+                .into());
+            }
+            Ok(binding)
+        })
+        .await
+}
+
 async fn create_remote_runtime(
     State(api): State<WorkspaceApi>,
     Extension(actor): Extension<RequestActor>,
@@ -29136,33 +29219,13 @@ async fn create_remote_runtime(
             "the embedded Runtime is built in and cannot be managed as a remote Runtime",
         ));
     }
-    let identity = api
-        .signing_identities
-        .get_validated(&api.config.workspace_id)?;
-    if identity.state != "active" {
-        return Err(settings_bad_request(
-            "workspace_signing_identity_unavailable",
-            "an active Workspace signing identity is required before registering a Runtime",
-        ));
-    }
+    require_active_runtime_registration_identity(&api).await?;
     // Protect observed active Workers without removing the current connection.
     // This scan is not proof of idleness: an unavailable/auth-failing endpoint
     // must remain repairable by an owner using binding-ID CAS below. Replacement
     // neither stops nor deletes Workers; Runtime removal has separate preflight.
     // Rejected key/CAS mutations must leave the current registration usable.
-    match api
-        .runtime
-        .list_workers_for_runtime(&runtime_id, api.config.max_records.min(200))
-    {
-        Ok(workers) if !workers.items.is_empty() => {
-            return Err(Error::RuntimeBindingConflict(format!(
-                "Runtime `{runtime_id}` still has {} active worker(s) and cannot replace its connection",
-                workers.items.len()
-            )).into());
-        }
-        Ok(_) | Err(RuntimeRegistryError::UnknownRuntime(_)) => {}
-        Err(error) => return Err(error.into_error().into()),
-    }
+    scan_runtime_registration_workers(&api, &runtime_id).await?;
     let now = Utc::now().to_rfc3339();
     let record = WorkspaceRuntimeBinding {
         workspace_id: api.config.workspace_id.clone(),
@@ -29183,30 +29246,32 @@ async fn create_remote_runtime(
         updated_at: now,
         revoked_at: None,
     };
-    let (mutation, binding) = api
-        .store
-        .put_workspace_runtime_binding_key(
-            record,
-            request.expected_binding_id.as_deref(),
-            &actor.account_id,
+    let mutation_api = api.clone();
+    // One accepted owner keeps SQL commit, local registration and its response
+    // observation together even when the HTTP waiter disappears. Resource reads
+    // call the on-Host helper directly, never re-admit to the occupied Host lane.
+    let (mutation, resource) = run_host_workflow(api.host_executors.host()?, async move {
+        let (mutation, binding) = mutation_api
+            .store
+            .put_workspace_runtime_binding_key(
+                record,
+                request.expected_binding_id.as_deref(),
+                &actor.account_id,
+            )
+            .await?;
+        publish_workspace_runtime_binding(&mutation_api, binding)?;
+        let resource = workspace_runtime_resources_response_on_host(
+            &mutation_api,
+            mutation_api.workspace_id(),
         )
-        .await?;
-    api.runtime_binding_expectations
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            (api.config.workspace_id.clone(), runtime_id.clone()),
-            binding.clone(),
-        );
-    api.runtime_subscription_broker
-        .unregister_runtime(&runtime_id);
-    api.register_workspace_runtime_binding(binding)?;
-    let resource = workspace_runtime_resources_response(&api, &api.config.workspace_id)
         .await?
         .items
         .into_iter()
         .find(|resource| resource.runtime.runtime_id == runtime_id)
         .ok_or_else(|| Error::UnknownRuntime(runtime_id.clone()))?;
+        Ok::<_, ApiError>((mutation, resource))
+    })
+    .await?;
     let status = if mutation == WorkspaceRuntimeBindingMutation::Created {
         StatusCode::CREATED
     } else {
@@ -29563,22 +29628,15 @@ async fn test_runtime_connection(
     let checked_at = Utc::now().to_rfc3339();
     let runtime = api.runtime.clone();
     let ping_runtime_id = runtime_id.clone();
-    let ping = tokio::task::spawn_blocking(move || runtime.ping(&ping_runtime_id))
-        .await
-        .map_err(|_| Error::RuntimeOperationFailed {
-            runtime_id: runtime_id.clone(),
-            code: "runtime_connection_test_unavailable".to_string(),
-            message: "Runtime connection test could not be completed".to_string(),
-        })?;
+    let ping = api
+        .host_executors
+        .host()?
+        .run(move || Ok::<_, ApiError>(runtime.ping(&ping_runtime_id)))
+        .await?;
 
-    // The ping runs outside the store lock. A replaced/revoked connection must
-    // not be reported as an observation of the earlier binding.
-    if !api.store.workspace_runtime_binding_matches(&binding)? {
-        return Err(Error::RuntimeBindingConflict(
-            "Runtime connection changed while the connection test was running".to_string(),
-        )
-        .into());
-    }
+    // The ping runs outside the store lock. Recheck the entire live binding on
+    // the independent DB owner, never acquire its mutex on the Tokio waiter.
+    let binding = require_current_runtime_test_binding(&api, binding).await?;
     let mut result =
         runtime_connection_test_response(api.workspace_id(), &runtime_id, checked_at, ping);
     // This result describes this attempt, not permission for a future request.
@@ -29590,8 +29648,10 @@ async fn test_runtime_connection(
 async fn get_worker_launch_options(
     State(api): State<WorkspaceApi>,
 ) -> ApiResult<Json<WorkerLaunchOptionsResponse>> {
-    api.store
-        .db_executor()
+    // Runtime summaries can call back into DB signing/authority. Profile config
+    // reads are synchronous too, but this mixed helper must not occupy sole DB.
+    api.host_executors
+        .host()?
         .run(move || Ok(Json(worker_launch_options_response(&api)?)))
         .await
 }
@@ -32162,13 +32222,22 @@ async fn workspace_runtime_resources_response(
     api: &WorkspaceApi,
     workspace_id: &str,
 ) -> ApiResult<server_api::WorkspaceRuntimeListResponse> {
+    let api = api.clone();
+    let workspace_id = workspace_id.to_owned();
+    run_host_workflow(api.host_executors.host()?, async move {
+        workspace_runtime_resources_response_on_host(&api, &workspace_id).await
+    })
+    .await
+}
+
+// Already-owned Runtime workflows call this directly; re-admission to Host would
+// wait behind the same parents. DB binding helpers still use their own DB owner.
+async fn workspace_runtime_resources_response_on_host(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+) -> ApiResult<server_api::WorkspaceRuntimeListResponse> {
     let limit = api.config.max_records.min(200);
-    let runtime = api.runtime.clone();
-    let runtimes = api
-        .host_executors
-        .host()?
-        .run(move || Ok::<_, ApiError>(runtime.list_runtimes(limit)))
-        .await?;
+    let runtimes = api.runtime.list_runtimes(limit);
     let bindings = api
         .store
         .list_workspace_runtime_bindings(workspace_id, true)
@@ -32268,11 +32337,25 @@ async fn workspace_runtime_detail(
     workspace_id: &str,
     runtime_id: &str,
 ) -> ApiResult<WorkspaceRuntimeDetail> {
+    let api = api.clone();
+    let workspace_id = workspace_id.to_owned();
+    let runtime_id = runtime_id.to_owned();
+    run_host_workflow(api.host_executors.host()?, async move {
+        workspace_runtime_detail_on_host(&api, &workspace_id, &runtime_id).await
+    })
+    .await
+}
+
+async fn workspace_runtime_detail_on_host(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    runtime_id: &str,
+) -> ApiResult<WorkspaceRuntimeDetail> {
     let binding = api
         .store
         .get_workspace_runtime_binding(workspace_id, runtime_id)
         .await?;
-    let mut resource = workspace_runtime_resources_response(api, workspace_id)
+    let mut resource = workspace_runtime_resources_response_on_host(api, workspace_id)
         .await?
         .items
         .into_iter()

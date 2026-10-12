@@ -1189,12 +1189,12 @@ async fn subjektiv_runtime_waits_leave_db_and_control_free_and_cancel_retains_th
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn runtime_resource_summary_waits_off_tokio_and_db_and_retains_cancelled_host_ownership() {
+async fn runtime_registration_scan_keeps_sql_and_tokio_free_and_retains_cancelled_host_budget() {
     let fixture = Fixture::new().await;
     let mut reply = HeldRuntimeReply::new();
     install_remote_fixture(
         &fixture,
-        "summary-runtime",
+        "scan-runtime",
         &format!("http://{}", reply.address),
         true,
     );
@@ -1202,40 +1202,301 @@ async fn runtime_resource_summary_waits_off_tokio_and_db_and_retains_cancelled_h
     let api = fixture.api.clone();
     let task = tokio::spawn(crate::db_executor::with_operation_lifetime(
         Arc::new(CountJobLifetime(leases.clone())),
-        async move { workspace_runtime_resources_response(&api, WORKSPACE).await },
+        async move { scan_runtime_registration_workers(&api, "scan-runtime").await },
     ));
     let request = observed(reply.entered.take().unwrap()).await.unwrap();
-    assert!(request.contains("/v1/runtime"), "{request}");
+    assert!(request.contains("/v1/workers"), "{request}");
     assert!(
         !reply.upstream_released.load(Ordering::SeqCst),
-        "upstream watchdog released before Tokio could observe the request"
+        "registration scan blocked Tokio until watchdog bailout"
     );
-    let read_store = fixture.store.clone();
+    let store = fixture.store.clone();
     observed(
         fixture
             .executor
-            .run(move || read_store.get_workspace_memory_settings(WORKSPACE)),
+            .run(move || store.get_workspace_memory_settings(WORKSPACE)),
     )
     .await
     .unwrap();
-    assert_eq!(
-        observed(tokio::spawn(async { "control" })).await.unwrap(),
-        "control"
-    );
-    observed(tokio::time::sleep(StdDuration::from_millis(1))).await; // timer contract only
-    assert!(!reply.upstream_released.load(Ordering::SeqCst));
-    assert!(!task.is_finished());
+    observed(tokio::time::sleep(StdDuration::from_millis(1))).await;
+    let mut queued_control = Box::pin(fixture.host_executor.run(|| Ok::<_, Error>(())));
+    assert!(futures::poll!(&mut queued_control).is_pending());
+    let rejected = scan_runtime_registration_workers(&fixture.api, "scan-runtime")
+        .await
+        .unwrap_err();
+    response_json(rejected.into_response(), StatusCode::SERVICE_UNAVAILABLE).await;
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
-    assert_eq!(
-        leases.load(Ordering::SeqCst),
-        1,
-        "cancel released actual Runtime summary owner"
-    );
+    assert_eq!(leases.load(Ordering::SeqCst), 1);
+    assert!(!reply.upstream_released.load(Ordering::SeqCst));
     reply.finish();
+    observed(queued_control).await.unwrap();
     observed(fixture.host_executor.drain()).await.unwrap();
     assert_eq!(leases.load(Ordering::SeqCst), 0);
     fixture.executor.drain().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_management_authority_waits_off_tokio_and_retains_cancelled_db_admission() {
+    for stage in ["identity", "binding"] {
+        let fixture = Fixture::new().await;
+        let binding =
+            install_remote_fixture(&fixture, "authority-runtime", "http://127.0.0.1:9", true);
+        let (mut busy, waiting) = BusyObservation::install_store(fixture.store.clone());
+        let mut lock = WriteLock::acquire(fixture.api.config.database_path.clone());
+        let writer = fixture.store.clone();
+        fixture
+            .executor
+            .dispatch(move || {
+                writer
+                    .mark_api_token_used("missing-token", "2026-01-01T00:00:00Z")
+                    .unwrap();
+            })
+            .unwrap();
+        observed(waiting).await.unwrap();
+        let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let api = fixture.api.clone();
+        let expected = binding.clone();
+        let mut authority = Box::pin(crate::db_executor::with_operation_lifetime(
+            Arc::new(CountJobLifetime(leases.clone())),
+            async move {
+                if stage == "identity" {
+                    require_active_runtime_registration_identity(&api).await
+                } else {
+                    require_current_runtime_test_binding(&api, expected)
+                        .await
+                        .map(|_| ())
+                }
+            },
+        ));
+        assert!(
+            futures::poll!(&mut authority).is_pending(),
+            "{stage}: authority must queue without blocking Tokio on the shared mutex"
+        );
+        runtime_progress_while_locked(&lock).await;
+        let overload = if stage == "identity" {
+            require_active_runtime_registration_identity(&fixture.api)
+                .await
+                .unwrap_err()
+        } else {
+            require_current_runtime_test_binding(&fixture.api, binding.clone())
+                .await
+                .unwrap_err()
+        };
+        response_json(overload.into_response(), StatusCode::SERVICE_UNAVAILABLE).await;
+        drop(authority);
+        assert_eq!(
+            leases.load(Ordering::SeqCst),
+            1,
+            "{stage}: cancelled DB authority lost its lease"
+        );
+        lock.release();
+        busy.resume();
+        observed(fixture.executor.drain()).await.unwrap();
+        assert_eq!(leases.load(Ordering::SeqCst), 0);
+        require_active_runtime_registration_identity(&fixture.api)
+            .await
+            .unwrap();
+        assert_eq!(
+            require_current_runtime_test_binding(&fixture.api, binding.clone())
+                .await
+                .unwrap()
+                .binding_id,
+            binding.binding_id
+        );
+        fixture
+            .store
+            .revoke_workspace_runtime_binding(
+                WORKSPACE,
+                &binding.runtime_id,
+                "2026-01-02T00:00:00Z",
+            )
+            .unwrap();
+        let stale = require_current_runtime_test_binding(&fixture.api, binding)
+            .await
+            .unwrap_err();
+        response_json(stale.into_response(), StatusCode::CONFLICT).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_connection_post_ping_sql_waits_off_tokio_while_host_control_progresses() {
+    let fixture = Fixture::new().await;
+    let mut reply = HeldRuntimeReply::new();
+    let binding = install_remote_fixture(
+        &fixture,
+        "ping-runtime",
+        &format!("http://{}", reply.address),
+        true,
+    );
+    let mut test = Box::pin(test_runtime_connection(
+        State(fixture.api.clone()),
+        AxumPath(binding.runtime_id.clone()),
+    ));
+    assert!(futures::poll!(&mut test).is_pending());
+    observed(fixture.executor.drain()).await.unwrap();
+    assert!(futures::poll!(&mut test).is_pending());
+    let request = observed(reply.entered.take().unwrap()).await.unwrap();
+    assert!(request.contains("/ping"), "{request}");
+    let (mut busy, waiting) = BusyObservation::install_store(fixture.store.clone());
+    let mut lock = WriteLock::acquire(fixture.api.config.database_path.clone());
+    let writer = fixture.store.clone();
+    fixture
+        .executor
+        .dispatch(move || {
+            writer
+                .mark_api_token_used("missing-token", "2026-01-01T00:00:00Z")
+                .unwrap();
+        })
+        .unwrap();
+    observed(waiting).await.unwrap();
+    reply.finish();
+    observed(fixture.host_executor.drain()).await.unwrap();
+    assert!(
+        futures::poll!(&mut test).is_pending(),
+        "post-ping binding fence must await DB without a synchronous mutex wait"
+    );
+    runtime_progress_while_locked(&lock).await;
+    assert_eq!(
+        observed(fixture.host_executor.run(|| Ok::<_, Error>("control")))
+            .await
+            .unwrap(),
+        "control"
+    );
+    lock.release();
+    busy.resume();
+    let Json(result) = observed(test).await.unwrap();
+    assert_eq!(result.binding_id, binding.binding_id);
+    fixture.executor.drain().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_runtime_metadata_mutation_keeps_commit_and_registration_publication_owned() {
+    let fixture = Fixture::new().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().fallback(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        )
+        .await
+        .unwrap();
+    });
+    install_remote_fixture(&fixture, "metadata-runtime", &endpoint, true);
+    let (mut busy, waiting) = BusyObservation::install_store(fixture.store.clone());
+    let mut lock = WriteLock::acquire(fixture.api.config.database_path.clone());
+    let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut update = Box::pin(crate::db_executor::with_operation_lifetime(
+        Arc::new(CountJobLifetime(leases.clone())),
+        update_remote_runtime_metadata_owned(
+            fixture.api.clone(),
+            WORKSPACE.into(),
+            "metadata-runtime".into(),
+            "updated metadata".into(),
+            endpoint,
+        ),
+    ));
+    assert!(futures::poll!(&mut update).is_pending());
+    observed(waiting).await.unwrap(); // The real metadata SQL mutation is waiting.
+    runtime_progress_while_locked(&lock).await;
+    drop(update);
+    assert_eq!(
+        leases.load(Ordering::SeqCst),
+        2,
+        "actual Host workflow and its accepted SQL both retain authority"
+    );
+    lock.release();
+    busy.resume();
+    observed(fixture.host_executor.drain()).await.unwrap();
+    observed(fixture.executor.drain()).await.unwrap();
+    assert_eq!(leases.load(Ordering::SeqCst), 0);
+    let saved = fixture
+        .store
+        .get_workspace_runtime_binding(WORKSPACE, "metadata-runtime")
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.display_name, "updated metadata");
+    let published = fixture
+        .api
+        .runtime_binding_expectations
+        .read()
+        .unwrap()
+        .get(&(WORKSPACE.into(), "metadata-runtime".into()))
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        published, saved,
+        "SQL completion must publish even after waiter cancellation"
+    );
+    fixture
+        .api
+        .runtime_subscription_broker
+        .unregister_runtime("metadata-runtime");
+    fixture.api.worker_projection.shutdown_async().await;
+    fixture.executor.drain().await.unwrap();
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_metadata_reads_wait_off_tokio_and_db_and_retain_cancelled_host_ownership() {
+    for read in ["resources", "launch_options"] {
+        let fixture = Fixture::new().await;
+        let mut reply = HeldRuntimeReply::new();
+        install_remote_fixture(
+            &fixture,
+            "summary-runtime",
+            &format!("http://{}", reply.address),
+            true,
+        );
+        let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let api = fixture.api.clone();
+        let task = tokio::spawn(crate::db_executor::with_operation_lifetime(
+            Arc::new(CountJobLifetime(leases.clone())),
+            async move {
+                if read == "resources" {
+                    workspace_runtime_resources_response(&api, WORKSPACE)
+                        .await
+                        .map(|_| ())
+                } else {
+                    get_worker_launch_options(State(api)).await.map(|_| ())
+                }
+            },
+        ));
+        let request = observed(reply.entered.take().unwrap()).await.unwrap();
+        assert!(request.contains("/v1/runtime"), "{request}");
+        assert!(
+            !reply.upstream_released.load(Ordering::SeqCst),
+            "upstream watchdog released before Tokio could observe the request"
+        );
+        let read_store = fixture.store.clone();
+        observed(
+            fixture
+                .executor
+                .run(move || read_store.get_workspace_memory_settings(WORKSPACE)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            observed(tokio::spawn(async { "control" })).await.unwrap(),
+            "control"
+        );
+        observed(tokio::time::sleep(StdDuration::from_millis(1))).await; // timer contract only
+        assert!(!reply.upstream_released.load(Ordering::SeqCst));
+        assert!(!task.is_finished());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            leases.load(Ordering::SeqCst),
+            1,
+            "cancel released actual Runtime summary owner"
+        );
+        reply.finish();
+        observed(fixture.host_executor.drain()).await.unwrap();
+        assert_eq!(leases.load(Ordering::SeqCst), 0);
+        fixture.executor.drain().await.unwrap();
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
