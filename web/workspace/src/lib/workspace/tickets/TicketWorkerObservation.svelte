@@ -27,11 +27,12 @@
   }
   $effect(() => { void ticket.current_worker?.worker_resource_key; untrack(() => { void load(); }); });
 </script>
-<section class="ticket-detail-section ticket-worker-observation">
-  <div class="ticket-section-heading"><h2>Related Worker — actual state</h2><button class="workspace-secondary-button" disabled={loading} onclick={() => void load()}>Refresh Worker observation</button></div>
+<details class="ticket-detail-section ticket-worker-observation">
+  <summary>Related Worker — actual state</summary>
+  <button class="workspace-secondary-button" disabled={loading} onclick={() => void load()}>Refresh Worker observation</button>
   {#if loading}<p role="status">Loading Worker observation…</p>{/if}
   {#if error}<p role="alert" class="workspace-callout is-error">Worker observation unavailable: {error}</p>{/if}
   {#if worker}<p>{worker.runtime_id}/{worker.worker_id}: <strong>{worker.state}</strong> · availability {worker.availability}</p><a href={workerHref(workspaceId, { resource_key: worker.resource_key, display_name: worker.display_name ?? worker.label })}>Open Worker</a>
   {:else}<p class="workspace-empty-copy">{ticket.current_worker ? "Retained Worker identity; live state not observed." : "No related Worker recorded."}</p>{/if}
   <p class="workspace-empty-copy">Worker state does not determine Ticket case state or self-reported handling.</p>
-</section>
+</details>

@@ -495,6 +495,20 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketDetail")],
         },
         OperationContract {
+            path: "/api/w/{workspace_id}/tickets/{id}/posts/{event_ref}",
+            method: "get",
+            operation_id: "ticket_post_get",
+            request: None,
+            successes: &[("200", "TicketEventDetail")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/tickets/{id}/posts/{event_ref}",
+            method: "patch",
+            operation_id: "ticket_post_edit",
+            request: Some("TicketPostEditRequest"),
+            successes: &[("200", "TicketDetail")],
+        },
+        OperationContract {
             path: "/api/w/{workspace_id}/tickets/{id}/assignments/{role}",
             method: "put",
             operation_id: "ticket_assignment_set",

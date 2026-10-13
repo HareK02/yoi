@@ -51,7 +51,7 @@ fn standalone_schema7_migration_preserves_six_state_snapshot_and_evidence_withou
             .unwrap();
     }
     // Snapshot evidence before migration, including untyped `done` and existing MR references.
-    let historical_events: Vec<_> = connection.prepare("SELECT ticket_id, from_state, to_state, reason, author, body FROM typed_ticket_events ORDER BY ticket_id").unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?))).unwrap().collect::<std::result::Result<_, _>>().unwrap();
+    let historical_events: Vec<_> = connection.prepare("SELECT ticket_id, from_state, to_state, reason, author, body FROM typed_ticket_events WHERE event_index >= 0 ORDER BY ticket_id").unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?))).unwrap().collect::<std::result::Result<_, _>>().unwrap();
     let old_attributes: Vec<(String, String, String)> = connection
         .prepare(
             "SELECT ticket_id,key,value FROM typed_ticket_event_attributes ORDER BY ticket_id,key",
@@ -79,7 +79,7 @@ fn standalone_schema7_migration_preserves_six_state_snapshot_and_evidence_withou
         })
         .unwrap();
     assert_eq!(marker, 10);
-    let after_events: Vec<_> = connection.prepare("SELECT ticket_id, from_state, to_state, reason, author, body FROM typed_ticket_events ORDER BY ticket_id").unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?))).unwrap().collect::<std::result::Result<_, _>>().unwrap();
+    let after_events: Vec<_> = connection.prepare("SELECT ticket_id, from_state, to_state, reason, author, body FROM typed_ticket_events WHERE event_index >= 0 ORDER BY ticket_id").unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?))).unwrap().collect::<std::result::Result<_, _>>().unwrap();
     assert_eq!(after_events, historical_events);
     let store = SqliteTicketBackend::open_verified(&path, "workspace").unwrap();
     for state in [
@@ -129,11 +129,11 @@ fn standalone_schema7_migration_preserves_six_state_snapshot_and_evidence_withou
         assert_eq!(legacy.resolution.as_deref(), Some("Original decision text"));
         assert_eq!(ticket.meta.assignee.as_deref(), Some("retained-assignee"));
         assert_eq!(ticket.meta.targets[0].repository_key, "main");
-        assert_eq!(ticket.events[0].from.as_deref(), Some("planning"));
-        assert_eq!(ticket.events[0].to.as_deref(), Some(state));
-        assert_eq!(ticket.events[0].references[0].target, "MR-existing");
+        assert_eq!(ticket.events[1].from.as_deref(), Some("planning"));
+        assert_eq!(ticket.events[1].to.as_deref(), Some(state));
+        assert_eq!(ticket.events[1].references[0].target, "MR-existing");
         assert_eq!(
-            ticket.events[0].attributes["request_fingerprint"],
+            ticket.events[1].attributes["request_fingerprint"],
             "legacy-fingerprint"
         );
         if expected_state == TicketState::Closed {
@@ -254,8 +254,26 @@ fn falsely_numbered_schema8_without_tags_is_rejected_without_writes() {
 // Read actual SQLite values, not merely counts: receipt JSON, original context,
 // name snapshots and event/reference/attribute rows must survive byte-for-byte.
 fn rows(connection: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    // Compare the retained v7-v11 payload, excluding the new initial post and metadata.
+    let modern: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('typed_tickets') WHERE name='created_by')", [], |r| r.get(0)).unwrap();
+    let projection = match table {
+        "typed_tickets" if modern => {
+            "workspace_id,ticket_id,slug,title,status,kind,priority,(SELECT body FROM typed_ticket_events e WHERE e.workspace_id=typed_tickets.workspace_id AND e.ticket_id=typed_tickets.ticket_id AND e.event_index=-1),created_at,updated_at,assignee,readiness,workflow_state,workflow_state_explicit,queued_by,queued_at,resolution"
+        }
+        "typed_ticket_events" => {
+            "workspace_id,ticket_id,event_index,kind,author,at,status,from_state,to_state,reason,state_field,heading,body"
+        }
+        _ => "*",
+    };
+    let filter = if table.starts_with("typed_ticket_event") {
+        "WHERE event_index >= 0"
+    } else {
+        ""
+    };
     let mut stmt = connection
-        .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+        .prepare(&format!(
+            "SELECT {projection} FROM {table} {filter} ORDER BY rowid"
+        ))
         .unwrap();
     let count = stmt.column_count();
     stmt.query_map([], |row| (0..count).map(|i| row.get(i)).collect())
@@ -272,11 +290,24 @@ fn copy_tables(connection: &Connection, source: &std::path::Path, tables: &[&str
         )
         .unwrap();
     for table in tables {
-        connection
-            .execute_batch(&format!(
-                "INSERT INTO {table} SELECT * FROM fixture_source.{table}"
-            ))
+        let columns = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
+        let selection = columns.iter().map(|column| {
+            if *table == "typed_tickets" && column == "body" {
+                "(SELECT body FROM fixture_source.typed_ticket_events e WHERE e.workspace_id=t.workspace_id AND e.ticket_id=t.ticket_id AND e.event_index=-1)".to_owned()
+            } else { format!("t.{column}") }
+        }).collect::<Vec<_>>().join(",");
+        let filter = if table.starts_with("typed_ticket_event") {
+            "WHERE t.event_index >= 0"
+        } else {
+            ""
+        };
+        connection.execute_batch(&format!("INSERT INTO {table} ({}) SELECT {selection} FROM fixture_source.{table} t {filter}", columns.join(","))).unwrap();
     }
     connection
         .execute_batch("DETACH DATABASE fixture_source")
@@ -559,12 +590,23 @@ fn independent_case_schema9_adds_only_tags_without_reapplying_judgments_or_recei
             ),
         )
         .unwrap();
-    let reopened = source
+    let mut reopened = source
         .update_case(
             &id,
             case_request(&corrected, "reopen", TicketCaseAction::Reopen),
         )
         .unwrap();
+    reopened.events[0]
+        .attributes
+        .retain(|key, _| matches!(key.as_str(), "event_id" | "event_sequence"));
+    // The frozen v9 copy has no persisted event_id attributes. Its published
+    // fallback was a zero-based ordinal, not the source v12 persisted identity.
+    for (ordinal, event) in reopened.events.iter_mut().skip(1).enumerate() {
+        event.event_ref = format!("sequence:{ordinal}");
+        event
+            .attributes
+            .insert("event_id".into(), event.event_ref.clone());
+    }
     let path = temp.path().join("retained9.db");
     let connection = Connection::open(&path).unwrap();
     schema7(&connection);

@@ -9,7 +9,19 @@ fn db() -> Connection {
 }
 
 fn seed_ticket(conn: &Connection, workspace: &str, ticket: &str) {
-    conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit) VALUES (?1,?2,?2,'Title','open','task','P2','body','open',1)",params![workspace,ticket]).unwrap();
+    let legacy: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('typed_tickets') WHERE name='body')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    if legacy {
+        conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit) VALUES (?1,?2,?2,'Title','open','task','P2','body','open',1)",params![workspace,ticket]).unwrap();
+    } else {
+        conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,workflow_state,workflow_state_explicit) VALUES (?1,?2,?2,'Title','open','task','P2','open',1)",params![workspace,ticket]).unwrap();
+        conn.execute("INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,event_ref,kind,body) VALUES (?1,?2,-1,?2 || ':-1','comment','body')",params![workspace,ticket]).unwrap();
+    }
 }
 
 fn assign(conn: &Connection, id: &str, event: &str) {
@@ -396,7 +408,7 @@ fn migration_preserves_original_records_and_only_reconciles_current_fenced_deleg
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
-            11
+            12
         );
         let value = sqlite_ticket_assignment_tracking(&conn, "w", "t", "a")
             .unwrap()
@@ -753,15 +765,21 @@ fn assignment_answer_commits_one_audited_input_and_exact_receipt_without_trackin
     assert_eq!(result.input_event_id, "ticket-event:0");
     assert_eq!(apply(&answer).unwrap(), result);
     assert_eq!(
-        conn.query_row("SELECT count(*) FROM typed_ticket_events", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
+        conn.query_row(
+            "SELECT count(*) FROM typed_ticket_events WHERE event_index >= 0",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
         1
     );
     assert_eq!(
-        conn.query_row("SELECT body FROM typed_ticket_events", [], |r| r
-            .get::<_, String>(0))
-            .unwrap(),
+        conn.query_row(
+            "SELECT body FROM typed_ticket_events WHERE event_index >= 0",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
         answer.body
     );
     assert_eq!(conn.query_row("SELECT value FROM typed_ticket_event_attributes WHERE key='orchestrator_assignment_id'",[],|r| r.get::<_,String>(0)).unwrap(),"a");
@@ -823,9 +841,12 @@ fn assignment_answer_rejects_unbounded_body_and_malformed_identities_without_app
         conn.execute_batch("ROLLBACK").unwrap();
     }
     assert_eq!(
-        conn.query_row("SELECT count(*) FROM typed_ticket_events", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
+        conn.query_row(
+            "SELECT count(*) FROM typed_ticket_events WHERE event_index >= 0",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
         0
     );
 }

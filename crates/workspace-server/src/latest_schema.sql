@@ -437,6 +437,10 @@ CREATE TABLE typed_ticket_events (
     state_field TEXT,
     heading TEXT,
     body TEXT NOT NULL,
+    event_ref TEXT NOT NULL DEFAULT '',
+    edited_at TEXT,
+    edited_by TEXT,
+    archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
     PRIMARY KEY (workspace_id, ticket_id, event_index),
     FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
 );
@@ -493,7 +497,7 @@ CREATE TABLE "typed_tickets" (
     status TEXT NOT NULL,
     kind TEXT NOT NULL,
     priority TEXT NOT NULL,
-    body TEXT NOT NULL,
+    created_by TEXT,
     created_at TEXT,
     updated_at TEXT,
     assignee TEXT,
@@ -1113,6 +1117,7 @@ CREATE INDEX repositories_workspace_provider_idx
             ON repositories(workspace_id, provider);
 
 
+CREATE UNIQUE INDEX typed_ticket_events_ref ON typed_ticket_events(workspace_id, ticket_id, event_ref);
 CREATE INDEX typed_ticket_events_workspace_kind_ticket
             ON typed_ticket_events(workspace_id, kind, ticket_id, event_index);
 CREATE UNIQUE INDEX ux_worker_workdir_attachment_reservation_id

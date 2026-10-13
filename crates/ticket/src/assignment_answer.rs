@@ -94,7 +94,7 @@ pub fn sqlite_answer_ticket_assignment_in_transaction(
     }
     let index: i64 = conn.query_row("SELECT COALESCE(MAX(event_index),-1)+1 FROM typed_ticket_events WHERE workspace_id=?1 AND ticket_id=?2",params![workspace_id,ticket_id],|r| r.get(0)).map_err(sqlite_err)?;
     let at = now_utc();
-    conn.execute("INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,kind,author,at,heading,body) VALUES(?1,?2,?3,'assignment_answer',?4,?5,'Assignment answer',?6)", params![workspace_id,ticket_id,index,actor,at,answer.body]).map_err(sqlite_err)?;
+    conn.execute("INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,kind,author,at,heading,body,event_ref) VALUES(?1,?2,?3,'assignment_answer',?4,?5,'Assignment answer',?6,?2 || ':' || ?3)", params![workspace_id,ticket_id,index,actor,at,answer.body]).map_err(sqlite_err)?;
     for (key, value) in [
         ("orchestrator_assignment_id", answer.assignment_id.as_str()),
         (

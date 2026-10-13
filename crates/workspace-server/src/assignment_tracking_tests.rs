@@ -78,7 +78,8 @@ async fn tracking_store_every_replay_fences_current_singleton_and_authenticated_
         );
         // Model the authority change after authenticated source capture, before
         // BEGIN IMMEDIATE on a second connection. Receipt presence cannot bypass it.
-        let second = SqliteWorkspaceStore::open_for_test(directory.path().join("workspace.db")).unwrap();
+        let second =
+            SqliteWorkspaceStore::open_for_test(directory.path().join("workspace.db")).unwrap();
         second.with_conn_mut(|conn| {
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             match change {
@@ -233,7 +234,8 @@ async fn tracking_store_same_principal_reissue_and_exact_retries_keep_original_r
             .is_err()
     );
     drop(store);
-    let reopened = SqliteWorkspaceStore::open_for_test(directory.path().join("workspace.db")).unwrap();
+    let reopened =
+        SqliteWorkspaceStore::open_for_test(directory.path().join("workspace.db")).unwrap();
     assert_eq!(
         reopened
             .get_ticket_assignment_tracking("w", "tracking", "a")
@@ -300,10 +302,11 @@ fn tracking_schema91_fixture(path: &Path) -> Connection {
     // Genuine retained component-10 DDL, before assignment tracking existed.
     // The host structure is unchanged from Workspace 91: no tracking columns,
     // tracking tables/triggers, or component-11 marker are created here.
-    conn.execute_batch(include_str!("../../ticket/src/latest_schema.sql"))
+    conn.execute_batch(include_str!("frozen_ticket_schema_v10.sql"))
         .unwrap();
     conn.execute_batch("CREATE TABLE ticket_schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL); INSERT INTO ticket_schema_migrations VALUES(10,'ticket schema baseline','original-component10-time'); PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;").unwrap();
-    create_workspace_schema_structure(&conn).unwrap();
+    create_workspace_schema_structure_from_sql(&conn, include_str!("frozen_schema_v93.sql"), false)
+        .unwrap();
     conn.execute(
         "INSERT INTO __yoi_schema_migrations(version,name) VALUES(91,'workspace schema baseline')",
         [],
@@ -439,12 +442,12 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
             .iter()
             .map(|m| m.version)
             .collect::<Vec<_>>(),
-        vec![92, 93]
+        vec![92, 93, 94]
     );
     let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     store
         .with_conn(|conn| {
-            assert_eq!(current_schema_version(conn)?, 93);
+            assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
             assert_eq!(
                 conn.query_row(
                     "SELECT applied_at FROM ticket_schema_migrations WHERE version=10",
@@ -461,7 +464,8 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
                     (
                         93,
                         "Durable assignment deliveries and source-bound startup fences".into()
-                    )
+                    ),
+                    (94, "Canonical Ticket posts".into())
                 ]
             );
             for (table, rows) in retained.iter().zip(original.iter()) {
@@ -599,8 +603,8 @@ fn tracking_store_schema91_closed_unknown_assignment_uses_assign_audit_for_first
                 .is_empty()
         );
         store.with_conn(|conn| {
-            assert_eq!(current_schema_version(conn)?, 93);
-            assert_eq!(conn.query_row("SELECT MAX(version) FROM ticket_schema_migrations", [], |row| row.get::<_,i64>(0))?, 11);
+            assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
+            assert_eq!(conn.query_row("SELECT MAX(version) FROM ticket_schema_migrations", [], |row| row.get::<_,i64>(0))?, 12);
             assert_eq!(conn.query_row("SELECT workflow_state FROM typed_tickets WHERE ticket_id='historical-done'", [], |row| row.get::<_,String>(0))?, "closed");
             let stored: (Option<String>, Option<String>) = conn.query_row("SELECT tracking_json,last_tracking_event_id FROM ticket_worker_assignments WHERE assignment_id='a-historical-done'", [], |row| Ok((row.get(0)?,row.get(1)?)))?;
             assert_eq!(stored, (None, None), "read baseline must not manufacture tracking storage");
@@ -1068,7 +1072,8 @@ async fn orchestrator_assignment_all_runtime_retries_fence_singleton_and_binding
                 &source,
             )
             .unwrap();
-        let second = SqliteWorkspaceStore::open_for_test(directory.path().join("workspace.db")).unwrap();
+        let second =
+            SqliteWorkspaceStore::open_for_test(directory.path().join("workspace.db")).unwrap();
         second.with_conn_mut(|conn| {let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;match change {
             "replace" => {tx.execute("UPDATE worker_singleton_owners SET worker_id='replacement',generation=2 WHERE workspace_id='w'",[])?;},
             "revoke" => {tx.execute("UPDATE workspace_runtime_bindings SET revoked_at='revoked' WHERE workspace_id='w'",[])?;},
@@ -1364,7 +1369,7 @@ async fn tracking_history_pages_are_append_ordered_exact_scope_cursors_and_bound
         })
         .await
         .unwrap();
-    store.with_conn(|conn| {conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit) VALUES('other','tracking','tracking','Other','open','task','P2','','open',1)",[])?;Ok(())}).unwrap();
+    store.with_conn(|conn| {conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,workflow_state,workflow_state_explicit) VALUES('other','tracking','tracking','Other','open','task','P2','open',1)",[])?;conn.execute("INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,event_ref,kind,body) VALUES('other','tracking',-1,'tracking:-1','comment','')",[])?;Ok(())}).unwrap();
     let other_workspace = TicketRoleAssignmentRecord {
         workspace_id: "other".into(),
         ..orchestrator_mutation_record("history-a")

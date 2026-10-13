@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { extname, join, normalize } from "jsr:@std/path@1.1.4";
 import {
   fixtureDetail,
+  fixturePost,
   fixturePage,
 } from "../../../web/workspace/src/lib/workspace/home/dashboard.test-fixtures.ts";
 import type {
@@ -305,6 +306,27 @@ function ticket(key: string) {
         });
       }
     }
+    value.created_by = "Mika";
+    value.initial_post = fixturePost(value.body, { at: value.created_at, body_digest: createHash("sha256").update(value.body).digest("hex") });
+  if (key === "T-900") {
+    value.title = "Compare deployment options for the shared Workspace";
+    value.initial_post.body = "We need a deployment plan that the team can maintain without interrupting active Workers.\n\nPlease compare **a scheduled maintenance window** with **rolling replacement**, including recovery steps and how we preserve ongoing work. Return the trade-offs before choosing an approach.";
+    value.events = [
+      fixturePost("I checked the current deployment notes. A maintenance window is simpler to operate, but we would need to tell users when new work will pause.\n\nRolling replacement also needs a clear rule for existing sessions; replacing a process is not the same as completing its Ticket.", {
+        sequence: 1, event_ref: "discussion-rin", is_initial: false, author: "Rin", at: "2026-01-01T09:15:00Z", edited_at: "2026-01-01T10:05:00Z", edited_by: "Rin",
+      }),
+      fixturePost("Please include an explicit rollback checkpoint. We should be able to verify the new instance before moving traffic, and keep the original author and timestamp on these notes.\n\nThe final decision can wait until we have both estimates.", {
+        sequence: 2, event_ref: "discussion-mika", is_initial: false, author: "Mika", at: "2026-01-02T08:30:00Z",
+      }),
+      fixturePost("The comparison is ready for review. The two approaches differ mainly in operational complexity and the duration of the pause.\n\n- Maintenance window: lower complexity, visible interruption.\n- Rolling replacement: smaller interruption, more recovery coordination.\n\nNo deployment or case closure has been performed.", {
+        sequence: 3, event_ref: "discussion-worker", is_initial: false, author: "Workspace Orchestrator", at: "2026-01-02T11:45:00Z",
+      }),
+    ];
+    value.body = value.initial_post.body!;
+    for (const post of [value.initial_post, ...value.events]) post.body_digest = createHash("sha256").update(post.body ?? "").digest("hex");
+    value.event_count = value.events.length;
+    value.event_page = fixturePage(value.events.length);
+  }
     tickets.set(key, value);
   }
   const stored = tickets.get(key)!;
@@ -345,6 +367,8 @@ function projectedTicket(key: string, workspaceId: string) {
       workspace_id: workspaceId,
     }));
   if (workspaceId === "tickets-readonly") {
+    value.initial_post.editable = false;
+    value.events = value.events.map((post) => ({ ...post, editable: false }));
     value.action_eligibility = {
       blockers: ["Read-only fixture"],
       can_assign_orchestrator: false,
@@ -710,6 +734,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
       created.action_eligibility.can_unassign_orchestrator = false;
       created.title = body.title;
       created.body = body.body;
+      created.initial_post = fixturePost(body.body, { at: created.created_at, body_digest: createHash("sha256").update(body.body).digest("hex") });
       created.targets = body.targets ?? [];
       return Response.json({
         id: created.id,
@@ -751,6 +776,24 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
       const key = decodeURIComponent(tm[1]).match(/T-\d+/)?.[0] ?? "T-1";
       const stored = tickets.get(key) ?? (ticket(key), tickets.get(key)!);
       const suffix = tm[2];
+      if (suffix.startsWith("/posts/")) {
+        const eventRef = decodeURIComponent(suffix.slice("/posts/".length));
+        const post = [stored.initial_post, ...stored.events].find((post) => post.event_ref === eventRef);
+        if (!post) return Response.json({ message: "Post not found" }, { status: 404 });
+        if (request.method === "GET") return Response.json(post);
+        if (request.method !== "PATCH") return new Response(null, { status: 405 });
+        if (id === "tickets-readonly" || !post.editable || post.kind !== "comment") return new Response(null, { status: 403 });
+        const body = await request.json();
+        bodies.push({ path, method: request.method, body });
+        if (body.expected_body_digest !== post.body_digest) return Response.json({ message: "Post update conflict" }, { status: 409 });
+        post.body = body.body;
+        post.body_digest = createHash("sha256").update(body.body).digest("hex");
+        post.edited_at = "2026-01-04T12:30:00Z";
+        post.edited_by = "Rin";
+        if (post.is_initial) stored.body = post.body ?? "";
+        return Response.json(projectedTicket(key, id));
+      }
+
       if (
         request.method === "GET" &&
         suffix === "/assignment-tracking/assignments"
@@ -1021,6 +1064,8 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
               }, { status: 409 });
             }
             stored.events.push({
+              is_initial: false, edited_at: null, edited_by: null, body_truncated: false,
+              body_digest: createHash("sha256").update(body.body).digest("hex"), editable: false,
               event_ref: `ticket-event:${stored.events.length}`,
               kind: "assignment_answer",
               body: body.body,
@@ -1074,6 +1119,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
             });
           }
           const { action } = body;
+          const previousState = stored.state;
           stored.closure_history.push({
             action,
             at: "2026-01-03T00:00:00Z",
@@ -1098,6 +1144,25 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
               references: body.references ?? [],
             };
           }
+          stored.events.push({
+            is_initial: false, edited_at: null, edited_by: null, body_truncated: false,
+            body_digest: createHash("sha256").update(body.explanation).digest("hex"), editable: false,
+            sequence: stored.events.length,
+            kind: action.action === "close" ? "close" : "state_changed",
+            heading: action.action === "close" ? "Closed" : "State changed",
+            author: "fixture-owner",
+            at: "2026-01-03T00:00:00Z",
+            from: previousState,
+            to: stored.state,
+            status: stored.state,
+            state_field: "case",
+            reason: body.explanation,
+            body: body.explanation,
+            references: body.references ?? [],
+            attributes: { operation_key: operationKey },
+            event_ref: `event-${stored.events.length}`,
+          });
+          stored.event_count = stored.events.length;
           stored.action_eligibility.can_start_manual_worker =
             stored.state === "open";
           result = {
@@ -1147,6 +1212,9 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
         }
         if (tm[2] === "/events") {
           stored.events.push({
+            is_initial: false, edited_at: null, edited_by: null, body_truncated: false,
+            body_digest: createHash("sha256").update(body.body).digest("hex"), editable: body.role === "comment",
+            author: "Mika", at: "2026-01-03T00:00:00Z",
             sequence: stored.events.length,
             kind: body.role,
             body: body.body,

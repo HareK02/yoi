@@ -11620,6 +11620,12 @@
               "null"
             ]
           },
+          "created_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "current_closure": {
             "anyOf": [
               {
@@ -11666,6 +11672,9 @@
               "$ref": "#/components/schemas/TicketEvidenceEvent"
             },
             "type": "array"
+          },
+          "initial_post": {
+            "$ref": "#/components/schemas/TicketEventDetail"
           },
           "legacy_handoff": {
             "anyOf": [
@@ -11768,6 +11777,7 @@
           }
         },
         "required": [
+          "initial_post",
           "id",
           "tags",
           "resource_key",
@@ -12053,6 +12063,25 @@
           "body": {
             "$ref": "#/components/schemas/MarkdownText"
           },
+          "edited_at": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "edited_by": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "event_ref": {
+            "default": "",
+            "description": "Persisted identity, independent of display position and legacy event_id attributes.",
+            "type": "string"
+          },
           "from": {
             "type": [
               "string",
@@ -12064,6 +12093,10 @@
               "string",
               "null"
             ]
+          },
+          "is_initial": {
+            "default": false,
+            "type": "boolean"
           },
           "kind": {
             "$ref": "#/components/schemas/TicketEventKind"
@@ -12134,6 +12167,27 @@
               "null"
             ]
           },
+          "body_digest": {
+            "type": "string"
+          },
+          "body_truncated": {
+            "type": "boolean"
+          },
+          "editable": {
+            "type": "boolean"
+          },
+          "edited_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "edited_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "event_ref": {
             "type": "string"
           },
@@ -12148,6 +12202,9 @@
               "string",
               "null"
             ]
+          },
+          "is_initial": {
+            "type": "boolean"
           },
           "kind": {
             "type": "string"
@@ -12190,6 +12247,10 @@
           }
         },
         "required": [
+          "is_initial",
+          "body_digest",
+          "body_truncated",
+          "editable",
           "sequence",
           "event_ref",
           "kind",
@@ -12751,6 +12812,13 @@
               "null"
             ]
           },
+          "created_by": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "string"
           },
@@ -12871,6 +12939,22 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "TicketPostEditRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "type": "string"
+          },
+          "expected_body_digest": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "body",
+          "expected_body_digest"
+        ],
         "type": "object"
       },
       "TicketQueryItem": {
@@ -17114,7 +17198,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:73f7d252fbedf2efbc7d36a36259c72850cfaaede4693009800fb1bec3f295cb"
+    "x-yoi-source-digest": "sha256:1d6615147b8d7143484b9a2aaf163da6916fcabb7560c675c5b7bf4d94aa2214"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -35828,6 +35912,238 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/OrchestrationPlanRecord"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/tickets/{id}/posts/{event_ref}": {
+      "get": {
+        "operationId": "ticket_post_get",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "event_ref",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketEventDetail"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "patch": {
+        "operationId": "ticket_post_edit",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "event_ref",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TicketPostEditRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketDetail"
                 }
               }
             },

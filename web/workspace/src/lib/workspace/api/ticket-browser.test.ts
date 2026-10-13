@@ -2,7 +2,9 @@ declare const Deno: {
   test(name: string, fn: () => Promise<void> | void): void;
 };
 
+import { fixturePost } from "../home/dashboard.test-fixtures.ts";
 import {
+  parseTicketEvent,
   parseMergeRequestDetailResponse,
   parseMergeRequestListResponse,
   parseObjectiveListResponse,
@@ -40,6 +42,33 @@ const page = {
   source_limit: null,
   source_truncated: false,
 };
+
+Deno.test("Ticket post parser preserves author and edit metadata independently of pagination", () => {
+  const initial = fixturePost("Current initial post", { edited_at: "2026-10-13T10:00:00Z", edited_by: "Rin" });
+  const parsed = parseTicketDetail({ ...ticketDetailFixture(), initial_post: initial, events: [], event_page: { ...page, returned: 0, has_more: true } });
+  assertEquals(parsed.initial_post.author, initial.author);
+  assertEquals(parsed.initial_post.at, initial.at);
+  assertEquals(parsed.initial_post.edited_at, initial.edited_at);
+  assertEquals(parsed.initial_post.edited_by, "Rin");
+  assertEquals(parsed.initial_post.body_digest, initial.body_digest);
+  assertEquals(parsed.initial_post.is_initial, true);
+  assertEquals(parsed.created_by, null);
+  assertEquals(parsed.events, []);
+});
+
+Deno.test("Ticket post parser rejects absent safety fields and unknown wire fields", () => {
+  for (const field of ["is_initial", "body_digest", "body_truncated", "editable"]) {
+    const wire: Record<string, unknown> = { ...fixturePost("Post") };
+    delete wire[field];
+    assertThrows(() => parseTicketEvent(wire), field);
+  }
+  assertThrows(() => parseTicketEvent({ ...fixturePost("Post"), editable: "yes" }), "editable");
+  assertThrows(() => parseTicketEvent({ ...fixturePost("Post"), edited_by: 7 }), "edited_by");
+  assertThrows(() => parseTicketEvent({ ...fixturePost("Post"), surprise: true }), "unknown field surprise");
+  const detail: Record<string, unknown> = { ...ticketDetailFixture() };
+  delete detail.initial_post;
+  assertThrows(() => parseTicketDetail(detail), "initial_post");
+});
 
 Deno.test("Ticket Browser parser accepts the generated Ticket list shape", () => {
   const parsed = parseTicketListResponse({
@@ -145,6 +174,8 @@ function ticketDetailFixture() {
     closure_operation_key: null,
     current_closure: null,
     legacy_handoff: null,
+    created_by: null,
+    initial_post: fixturePost("Body"),
     body: "Body",
     body_truncated: false,
     current_worker: null,

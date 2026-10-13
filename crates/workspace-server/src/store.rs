@@ -73,7 +73,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 93;
+const LATEST_SCHEMA_VERSION: i64 = 94;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -345,6 +345,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 93,
         name: "Durable assignment deliveries and source-bound startup fences",
         apply: migrate_assignment_delivery_v92_to_v93,
+    },
+    Migration {
+        version: 94,
+        name: "Canonical Ticket posts",
+        apply: migrate_ticket_posts_v93_to_v94,
     },
 ];
 
@@ -8602,9 +8607,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             tx.execute(
                 "INSERT INTO typed_ticket_events (
                      workspace_id, ticket_id, event_index, kind, author, at,
-                     from_state, to_state, reason, state_field, heading, body
+                     from_state, to_state, reason, state_field, heading, body, event_ref
                  ) VALUES (?1, ?2, ?3, 'assignment', ?4, ?5, NULL, NULL,
-                           'manual Worker assignment accepted', NULL, 'Worker assigned', '')",
+                           'manual Worker assignment accepted', NULL, 'Worker assigned', '', ?2 || ':' || ?3)",
                 params![record.workspace_id, record.ticket_id, event_index,
                     record.assigned_by, record.assigned_at],
             )?;
@@ -13990,6 +13995,33 @@ fn migrate_assignment_delivery_v92_to_v93(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_ticket_posts_v93_to_v94(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 93 {
+        return Err(Error::Store(
+            "Ticket posts migration requires schema 93".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    ticket::migrate_sqlite_ticket_schema_in_transaction(&tx)
+        .map_err(|error| Error::Store(format!("Ticket posts migration failed: {error}")))?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(94,'Canonical Ticket posts')",
+        [],
+    )?;
+    verify_workspace_resource_constraints(&tx)?;
+    let violations: i64 =
+        tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if violations != 0 {
+        return Err(Error::Store(format!(
+            "Ticket posts migration left {violations} foreign-key violations"
+        )));
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     create_workspace_schema_structure(conn)?;
     assignment_delivery::install(conn)?;
@@ -14000,10 +14032,17 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     })
 }
 
-// Workspace 92 changes only the Ticket-owned assignment component. Retained
-// Workspace-91 fixtures compose this host structure with the genuine Ticket-10
-// schema, not a current database with lowered migration markers.
+// Fresh composition uses the posts contract. Retained fixtures pass frozen host
+// and component DDL to the shared cross-domain constraint composition below.
 fn create_workspace_schema_structure(conn: &Connection) -> Result<()> {
+    create_workspace_schema_structure_from_sql(conn, include_str!("latest_schema.sql"), true)
+}
+
+fn create_workspace_schema_structure_from_sql(
+    conn: &Connection,
+    schema_sql: &str,
+    ticket_posts: bool,
+) -> Result<()> {
     // The composed Workspace parent FK rebuild must not discard domain-owned
     // case guards. Retain their SQL from the shared fresh Ticket schema.
     let ticket_parent_triggers = conn
@@ -14021,12 +14060,11 @@ fn create_workspace_schema_structure(conn: &Connection) -> Result<()> {
     CREATE UNIQUE INDEX worker_restore_intent_pending_domain ON worker_restore_intents(workspace_id,runtime_id,worker_id,domain_key) WHERE settled=0;")?;
 
     conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_targets;")?;
-    conn.execute_batch(&include_str!("latest_schema.sql").replace(
+    conn.execute_batch(&schema_sql.replace(
         "-- Ticket-owned assignment schema is composed by store.rs.",
         ticket::TICKET_ASSIGNMENT_SCHEMA_SQL,
     ))?;
-    conn.execute_batch(
-        r#"
+    let composed_sql = r#"
         ALTER TABLE typed_tickets RENAME TO typed_tickets_legacy_v66;
         CREATE TABLE typed_tickets (
             workspace_id TEXT NOT NULL,
@@ -14088,8 +14126,13 @@ fn create_workspace_schema_structure(conn: &Connection) -> Result<()> {
             CHECK (capabilities IN (
                 'all', 'read_only', 'read_write', 'command_only', 'read_command'
             ));
-        "#,
-    )?;
+        "#;
+    let composed_sql = if ticket_posts {
+        composed_sql.replace("body TEXT NOT NULL,", "created_by TEXT,")
+    } else {
+        composed_sql.to_string()
+    };
+    conn.execute_batch(&composed_sql)?;
     install_ticket_case_assignment_work_schema(conn)?;
     for sql in ticket_parent_triggers {
         conn.execute_batch(&sql)?;
@@ -16849,6 +16892,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 
     include!("schema_equivalence_tests.rs");
     include!("ticket_tag_upgrade_tests.rs");
+    include!("ticket_post_upgrade_tests.rs");
     include!("migration_entrypoint_tests.rs");
     include!("legacy_evidence_column_tests.rs");
 
@@ -16869,7 +16913,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         configure_sqlite(&conn).unwrap();
         // Retained fixtures start from genuine pre-tracking Ticket DDL; current
         // component 11 would introduce assignment objects before frozen host 85.
-        conn.execute_batch(include_str!("../../ticket/src/latest_schema.sql"))
+        conn.execute_batch(include_str!("frozen_ticket_schema_v10.sql"))
             .unwrap();
         conn.execute_batch("CREATE TABLE ticket_schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL); INSERT INTO ticket_schema_migrations VALUES(10,'ticket schema baseline','fixture');").unwrap();
         merge_request::migrate(&conn).unwrap();
@@ -17181,6 +17225,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 },
                 WorkspaceSchemaMigrationStep {version:92, name:"Ticket-owned assignment tracking".into()},
                 WorkspaceSchemaMigrationStep {version:93, name:"Durable assignment deliveries and source-bound startup fences".into()},
+                WorkspaceSchemaMigrationStep {version:94, name:"Canonical Ticket posts".into()},
             ]
         );
 
@@ -17284,6 +17329,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (91, "Ticket open/closed cases and retained routing evidence".to_string()),
 (92, "Ticket-owned assignment tracking".to_string()),
 (93, "Durable assignment deliveries and source-bound startup fences".to_string()),
+(94, "Canonical Ticket posts".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -19696,6 +19742,12 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 
     fn stored_fixture_rows(conn: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
         // Compare preserved original assignment evidence, not newly added tracking columns.
+        if table == "typed_ticket_events" {
+            return fixture_query_rows(
+                conn,
+                "SELECT workspace_id,ticket_id,event_index,kind,author,at,status,from_state,to_state,reason,state_field,heading,body FROM typed_ticket_events WHERE event_index >= 0 ORDER BY rowid",
+            );
+        }
         let columns = if table == "ticket_worker_assignments" {
             "workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,runtime_id,worker_id,assigned_by,assigned_at"
         } else {
@@ -19881,9 +19933,9 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .map(|step| step.version)
                 .collect::<Vec<_>>(),
             if version == 89 {
-                vec![90, 91, 92, 93]
+                vec![90, 91, 92, 93, 94]
             } else {
-                vec![91, 92, 93]
+                vec![91, 92, 93, 94]
             }
         );
         drop(conn);
@@ -19899,7 +19951,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     vec![(90, "Runtime binding connection configuration and historical verification archive".into()),
                          (91, "Ticket open/closed cases and retained routing evidence".into()),
                          (92, "Ticket-owned assignment tracking".into()),
-                         (93, "Durable assignment deliveries and source-bound startup fences".into())]);
+                         (93, "Durable assignment deliveries and source-bound startup fences".into()),
+                         (94, "Canonical Ticket posts".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }
@@ -20295,11 +20348,12 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     VALUES('guard-owner','user','guard-owner','Owner','1','1');
                     INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at)
                     VALUES('guard-workspace','guard-owner','Guard','active','1','1');
-                    INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit)
-                    VALUES('guard-workspace','guard-ticket','guard-ticket','Guard','open','task','P2','','open',1);")?;
+                    INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,workflow_state,workflow_state_explicit)
+                    VALUES('guard-workspace','guard-ticket','guard-ticket','Guard','open','task','P2','open',1);
+                    INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,event_ref,kind,body) VALUES('guard-workspace','guard-ticket',-1,'guard-ticket:-1','comment','');")?;
                 assert!(conn.execute("UPDATE typed_tickets SET workflow_state='done' WHERE ticket_id='guard-ticket'", []).is_err());
-                assert!(conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit)
-                    VALUES('guard-workspace','bad-ticket','bad-ticket','Bad','open','task','P2','','planning',1)", []).is_err());
+                assert!(conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,workflow_state,workflow_state_explicit)
+                    VALUES('guard-workspace','bad-ticket','bad-ticket','Bad','open','task','P2','planning',1)", []).is_err());
                 assert!(conn.execute("INSERT INTO workspace_runtime_bindings(workspace_id,runtime_id,display_name,base_url,public_key,public_key_fingerprint,binding_id,authentication_mode,created_at,updated_at)
                     VALUES('guard-workspace','bad-runtime','Bad','https://invalid.invalid','key','fingerprint','binding','invalid-mode','1','1')", []).is_err());
                 Ok(())
@@ -20519,8 +20573,9 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 
     fn seed_manual_start_ticket(store: &SqliteWorkspaceStore, id: &str, state: &str) {
         store.with_conn(|conn| {
-            conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit,updated_at)
-                VALUES('w',?1,?1,'Ticket','open','task','normal','',?2,1,'1')", params![id,state])?;
+            conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,workflow_state,workflow_state_explicit,updated_at)
+                VALUES('w',?1,?1,'Ticket','open','task','normal',?2,1,'1')", params![id,state])?;
+            conn.execute("INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,event_ref,kind,body) VALUES('w',?1,-1,?1 || ':-1','comment','')", [id])?;
             Ok(())
         }).unwrap();
     }
@@ -20932,7 +20987,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         );
         reopened.with_conn(|conn| {
             conn.execute_batch("UPDATE typed_tickets SET title='Changed requirements' WHERE workspace_id='w' AND ticket_id='first';
-                INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,kind,body) VALUES('w','first',1,'item_edit','Ticket requirements changed');")?; Ok(())
+                UPDATE typed_ticket_events SET body='Ticket requirements changed',edited_at='2',edited_by='fixture-editor' WHERE workspace_id='w' AND ticket_id='first' AND event_index=-1;")?; Ok(())
         }).unwrap();
         assert!(
             reopened

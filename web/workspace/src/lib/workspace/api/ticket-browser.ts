@@ -495,9 +495,15 @@ export function parseTicketListResponse(value: unknown): TicketListResponse {
   };
 }
 
-function parseTicketEvent(value: unknown, label: string): TicketEventDetail {
+export function parseTicketEvent(value: unknown, label = "Ticket post"): TicketEventDetail {
   const item = object(value, label);
   exact(item, [
+    "is_initial",
+    "edited_at",
+    "edited_by",
+    "body_digest",
+    "body_truncated",
+    "editable",
     "at",
     "attributes",
     "author",
@@ -514,6 +520,12 @@ function parseTicketEvent(value: unknown, label: string): TicketEventDetail {
     "to",
   ], label);
   return {
+    is_initial: boolean(item.is_initial, `${label}.is_initial`),
+    edited_at: optionalNullableString(item.edited_at, `${label}.edited_at`),
+    edited_by: optionalNullableString(item.edited_by, `${label}.edited_by`),
+    body_digest: string(item.body_digest, `${label}.body_digest`),
+    body_truncated: boolean(item.body_truncated, `${label}.body_truncated`),
+    editable: boolean(item.editable, `${label}.editable`),
     at: optionalNullableString(item.at, `${label}.at`),
     attributes: stringMap(item.attributes, `${label}.attributes`),
     author: optionalNullableString(item.author, `${label}.author`),
@@ -1098,6 +1110,8 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     "closure_history",
     "body",
     "body_truncated",
+    "created_by",
+    "initial_post",
     "created_at",
     "current_worker",
     "event_count",
@@ -1157,6 +1171,8 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     ),
     body: string(item.body, `${label}.body`),
     body_truncated: boolean(item.body_truncated, `${label}.body_truncated`),
+    created_by: optionalNullableString(item.created_by, `${label}.created_by`),
+    initial_post: parseTicketEvent(item.initial_post, `${label}.initial_post`),
     created_at: optionalNullableString(item.created_at, `${label}.created_at`),
     current_worker: item.current_worker === undefined
       ? undefined

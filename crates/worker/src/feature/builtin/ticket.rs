@@ -670,6 +670,7 @@ const READ_ONLY_TOOL_NAMES: &[&str] = &[
 const AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketCreate",
     "TicketEditItem",
+    "TicketEditPost",
     "TicketCaseUpdate",
     "TicketRelationRecord",
     "TicketRelationRemove",
@@ -681,6 +682,7 @@ const THREAD_TOOL_NAMES: &[&str] = &["TicketComment"];
 const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketCreate",
     "TicketEditItem",
+    "TicketEditPost",
     "QueryTicket",
     "ShowTicket",
     "TicketComment",
@@ -1109,6 +1111,17 @@ impl WorkspaceHttpTicketBackend {
                 )?;
                 Ok(TicketBackendOperationResult::Ticket(ticket))
             }
+            TicketBackendOperation::EditPost { id, edit } => {
+                let (previous, current): (Ticket, Ticket) = Self::request(
+                    client,
+                    WorkspaceRequestMethod::Patch,
+                    format!("{base}/{}/posts", Self::ticket_path(&id)),
+                    Some(serde_json::to_value(edit).map_err(|error| {
+                        TicketError::Conflict(format!("serialize Ticket post edit: {error}"))
+                    })?),
+                )?;
+                Ok(TicketBackendOperationResult::TicketSnapshots { previous, current })
+            }
             TicketBackendOperation::DependencyCheck { id } => {
                 let check = Self::request(
                     client,
@@ -1289,6 +1302,21 @@ macro_rules! expect_ticket_result {
 }
 
 impl TicketBackend for WorkspaceHttpTicketBackend {
+    fn edit_post_with_snapshots(
+        &self,
+        id: TicketIdOrSlug,
+        edit: ticket::TicketPostEdit,
+    ) -> TicketResult<(Ticket, Ticket)> {
+        match self.invoke(TicketBackendOperation::EditPost { id, edit })? {
+            TicketBackendOperationResult::TicketSnapshots { previous, current } => {
+                Ok((previous, current))
+            }
+            other => Err(TicketError::Conflict(format!(
+                "unexpected ticket post response: {other:?}"
+            ))),
+        }
+    }
+
     fn list_workspace_tags(
         &self,
         request: ticket::TagListRequest,
@@ -1569,6 +1597,12 @@ fn native_ticket_operation(tool_name: &str) -> Option<NativeTicketOperation> {
         },
         "TicketEditItem" => NativeTicketOperation {
             operation: "edit",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: true,
+        },
+        "TicketEditPost" => NativeTicketOperation {
+            operation: "edit_post",
             surface: NativeTicketSurface::Item,
             identity_field: Some("ticket"),
             mutating: true,
@@ -2471,6 +2505,47 @@ mod tests {
     }
 
     #[test]
+    fn post_edit_backend_transports_atomic_snapshots_and_propagates_conflicts() {
+        let record: Ticket =
+            serde_json::from_str(&decision_client(200, TicketState::Open).response.body).unwrap();
+        let input = json!({
+            "event_ref": "post-reference",
+            "expected_body": "Observed post",
+            "body": "Updated post",
+            "author": "standalone"
+        });
+        for status in [200, 409] {
+            let client = Arc::new(DecisionClient {
+                requests: Mutex::new(Vec::new()),
+                response: crate::worker::WorkspaceResponse {
+                    status,
+                    body: serde_json::to_string(&(record.clone(), record.clone())).unwrap(),
+                },
+            });
+            let backend = WorkspaceHttpTicketBackend::new(client.clone());
+            let result = backend.edit_post_with_snapshots(
+                TicketIdOrSlug::from("T-739"),
+                serde_json::from_value(input.clone()).unwrap(),
+            );
+            if status == 200 {
+                let (previous, current) = result.unwrap();
+                assert_eq!(previous.meta.id, record.meta.id);
+                assert_eq!(current.meta.id, record.meta.id);
+            } else {
+                assert!(result.unwrap_err().to_string().contains("409"));
+            }
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].method, WorkspaceRequestMethod::Patch);
+            assert_eq!(requests[0].path, "/api/w/workspace/tickets/T-739/posts");
+            assert_eq!(
+                serde_json::from_str::<Value>(requests[0].body.as_deref().unwrap()).unwrap(),
+                input,
+            );
+        }
+    }
+
+    #[test]
     fn query_schema_allows_only_open_and_closed_case_states() {
         let client = decision_client(200, TicketState::Open);
         let (meta, _) = workspace_ticket_read_definition(client, WorkspaceTicketReadKind::Query)();
@@ -3242,6 +3317,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(workspace_tools.contains(&"TicketCreate"));
         assert!(workspace_tools.contains(&"TicketEditItem"));
+        assert!(workspace_tools.contains(&"TicketEditPost"));
         assert!(!workspace_tools.contains(&"TicketQueue"));
         assert!(workspace_tools.contains(&"TicketCaseUpdate"));
 
@@ -3257,6 +3333,7 @@ mod tests {
         assert!(orchestration_tools.contains(&"TicketRelationRecord"));
         assert!(orchestration_tools.contains(&"TicketOrchestrationPlanRecord"));
         assert!(!orchestration_tools.contains(&"TicketEditItem"));
+        assert!(!orchestration_tools.contains(&"TicketEditPost"));
         assert!(!orchestration_tools.contains(&"TicketQueue"));
 
         let work_report = workspace_feature(TicketFeatureAccess::work_report());
@@ -3315,6 +3392,18 @@ mod tests {
                 assert!(native.iter().all(|tool| tool.name != name), "{name}");
                 assert!(native_ticket_operation(name).is_none(), "{name}");
             }
+            assert_eq!(
+                normal
+                    .iter()
+                    .any(|definition| definition().0.name == "TicketEditPost"),
+                access.authoring,
+            );
+            assert_eq!(
+                native
+                    .iter()
+                    .any(|tool| tool.projection.operation == "edit_post"),
+                access.authoring,
+            );
             if access.authoring || access.thread || access.workflow {
                 assert!(
                     normal

@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
-  import type { TicketDetail, TicketAssignmentTrackingProjection, TicketAssignmentTrackingHistoryPage, TicketAssignmentsPage, TicketAssignmentDiagnosticsPage, TicketAssignmentPrincipalSnapshot } from "#lib/generated/ticket-api.ts";
+  import BevelLine from "#lib/workspace/ui/BevelLine.svelte";
+  import type { TicketDetail, TicketAssignmentTrackingProjection, TicketAssignmentTrackingHistoryPage, TicketAssignmentsPage, TicketAssignmentPrincipalSnapshot } from "#lib/generated/ticket-api.ts";
   import type { WorkspaceOrchestratorStatus } from "./ticket-panel.ts";
-  import { workspaceApiJson, workspaceApiJsonWithBody, workspaceApiPath, formatDate } from "#lib/workspace/api/http.ts";
+  import { workspaceApiJson, workspaceApiJsonWithBody, formatDate } from "#lib/workspace/api/http.ts";
   import { parseTicketRoleAssignmentMutationResponse, TICKET_BROWSER_API_MAX_RESPONSE_BYTES } from "#lib/workspace/api/ticket-browser.ts";
-  import { assignmentOperation, answerOperation, parseAnswerReceipt, parseAssignmentsPage, parseAssignmentDiagnostics, operationError, parseTracking, parseTrackingHistory, trackingPath, type ObservedOperation } from "#lib/workspace/api/ticket-operations.ts";
+  import { assignmentOperation, answerOperation, parseAnswerReceipt, parseAssignmentsPage, operationError, parseTracking, parseTrackingHistory, trackingPath, type ObservedOperation } from "#lib/workspace/api/ticket-operations.ts";
   let { workspaceId, ticket, orchestrator, refresh }: { workspaceId: string; ticket: TicketDetail; orchestrator: WorkspaceOrchestratorStatus | null; refresh: () => Promise<void> } = $props();
   const current = $derived(ticket.assignment_tracking.find((row) => row.current && row.role === "orchestrator"));
   let busy = $state(false);
@@ -14,10 +15,6 @@
   let pendingKind = $state<"assignment" | "answer">("assignment");
   let assignments = $state<TicketAssignmentsPage | null>(null);
   let assignmentPageBusy = $state(false);
-  let diagnostic = $state<TicketAssignmentDiagnosticsPage | null>(null);
-  let diagnosticError = $state<string | null>(null);
-  let diagnosticBusy = $state(false);
-  let diagnosticRead = 0;
   let answer = $state("");
   let principalKind = $state<"workspace_agent" | "user" | "worker">("workspace_agent");
   let accountId = $state("");
@@ -48,12 +45,11 @@
       } else {
         const result = await workspaceApiJsonWithBody(operation.path, { method: operation.method, body: operation.body }, parseTicketRoleAssignmentMutationResponse, TICKET_BROWSER_API_MAX_RESPONSE_BYTES);
         if (!alive) return;
-        savedNotice = `Assignment operation saved: ${result.assignment?.assignment_id ?? "released"}. Delivery and execution are separate.`;
+        savedNotice = `Assignment operation saved: ${result.assignment?.assignment_id ?? "released"}.`;
       }
       pending = null;
       await refresh();
       await readAssignments();
-      if (current) await readDiagnostics(current.assignment_id);
     } catch (cause) { if (alive) error = savedNotice ? `Operation saved; latest projection unavailable. ${operationError(cause)}` : operationError(cause); }
     finally { busy = false; }
   }
@@ -64,7 +60,7 @@
   async function reconcile() {
     if (busy) return;
     busy = true;
-    try { await refresh(); if (!alive) return; pending = null; error = null; savedNotice = null; await readAssignments(); if (current) await readDiagnostics(current.assignment_id); }
+    try { await refresh(); if (!alive) return; pending = null; error = null; savedNotice = null; await readAssignments(); }
     catch (cause) { if (alive) error = operationError(cause); }
     finally { busy = false; }
   }
@@ -96,36 +92,17 @@
     } catch (cause) { historyError = operationError(cause); }
     finally { assignmentPageBusy = false; }
   }
-  async function readDiagnostics(id: string, more = false) {
-    const read = ++diagnosticRead;
-    diagnosticBusy = true; diagnosticError = null;
-    try {
-      const query = new URLSearchParams({ assignment_id: id, limit: "20" });
-      if (more && diagnostic?.assignment_id === id) {
-        const inputCursor = diagnostic.next_input_event_id ?? diagnostic.inputs.at(-1)?.input_event_id;
-        const startCursor = diagnostic.next_start_operation_id ?? diagnostic.starts.at(-1)?.operation_id;
-        if (inputCursor) query.set("after_input_event_id", inputCursor);
-        if (startCursor) query.set("after_start_operation_id", startCursor);
-      }
-      const page = await workspaceApiJson(workspaceApiPath(workspaceId, "/tickets/" + encodeURIComponent(ticket.id) + "/assignment-diagnostics?") + query, parseAssignmentDiagnostics, TICKET_BROWSER_API_MAX_RESPONSE_BYTES);
-      if (!alive || read !== diagnosticRead) return;
-      diagnostic = more && diagnostic?.assignment_id === id ? { ...page, inputs: [...diagnostic.inputs, ...page.inputs], starts: [...diagnostic.starts, ...page.starts] } : page;
-    } catch (cause) { if (alive && read === diagnosticRead) diagnosticError = operationError(cause); }
-    finally { if (read === diagnosticRead) diagnosticBusy = false; }
-  }
   function submitAnswer(event: SubmitEvent) {
     event.preventDefault();
     if (!current || pending || !answer.trim()) return;
     void run(answerOperation(workspaceId, ticket.id, current, answer, crypto.randomUUID()), "answer");
   }
-  onMount(() => { void readAssignments(); if (current) void readDiagnostics(current.assignment_id); });
+  onMount(() => { void readAssignments(); });
 </script>
 <section class="ticket-detail-section ticket-handling">
   <div class="ticket-section-heading"><h2>Orchestrator handling</h2><a href={`/w/${encodeURIComponent(workspaceId)}/orchestrator`}>All handling</a></div>
   {#if current}
     <p><strong>Self-reported handling: {current.tracking?.status ?? "unknown"}</strong></p>
-    <p>Principal: {current.principal.kind === "workspace_agent" ? current.principal.agent_key : current.principal.kind === "worker" ? `${current.principal.runtime_id}/${current.principal.worker_id}` : current.principal.account_id}</p>
-    <p>Assignment <code>{current.assignment_id}</code> · assigned by {current.assigned_by} · {formatDate(current.assigned_at)}</p>
     {#if current.tracking}
       <dl>
         {#if current.tracking.waiting_reason}<dt>Waiting reason</dt><dd>{current.tracking.waiting_reason}</dd>{/if}
@@ -137,7 +114,10 @@
     {#if current.updated_at}<p>Updated {formatDate(current.updated_at)}</p>{/if}
     {#if current.migration_diagnostic}<p class="workspace-callout">{current.migration_diagnostic}</p>{/if}
     {#if current.tracking?.status === "done"}<p>This handling was returned. Ticket {ticket.state} is unchanged.</p>{/if}
-    <button class="workspace-secondary-button" disabled={historyBusy} onclick={() => void readHistory(current.assignment_id)}>View handling history</button>
+    <details class="ticket-assignment-details"><summary>Assignment details</summary>
+    <p>Principal: {current.principal.kind === "workspace_agent" ? current.principal.agent_key : current.principal.kind === "worker" ? `${current.principal.runtime_id}/${current.principal.worker_id}` : current.principal.account_id}</p>
+    <p>Assignment <code>{current.assignment_id}</code> · assigned by {current.assigned_by} · {formatDate(current.assigned_at)}</p>
+    </details>
   {:else}<p class="workspace-empty-copy">No current Orchestrator assignment.</p>{/if}
   {#if error}<p class="workspace-callout is-error" role="alert">{error}</p>{/if}
   {#if savedNotice}<p role="status">{savedNotice}</p>{/if}
@@ -175,6 +155,7 @@
     </form>
   {/if}
   <details class="ticket-assignment-history"><summary>Past assignment and release history</summary>
+    {#if current}<button class="workspace-secondary-button" disabled={historyBusy} onclick={() => void readHistory(current.assignment_id)}>View handling history</button>{/if}
     {#if assignmentPageBusy}<p role="status">Loading assignment history…</p>{/if}
     {#each assignments?.items ?? [] as row (row.assignment_id)}<p><button class="workspace-secondary-button" disabled={historyBusy} onclick={() => void readHistory(row.assignment_id)}>{row.current ? "Current" : "Past"} · {row.tracking?.status ?? "unknown"} · {formatDate(row.assigned_at)}</button> <code>{row.assignment_id}</code>{#if row.release} · {row.release.action}{/if}{#if row.tracking?.result} · {row.tracking.result}{/if}</p>{/each}
     {#if assignments?.next_assignment_id}<button class="workspace-secondary-button" disabled={assignmentPageBusy} onclick={() => void readAssignments(true)}>More assignments</button>{/if}
@@ -188,32 +169,17 @@
     {#if history}{#each history.items as entry (entry.event_id)}<article><p>{entry.tracking.status} · {formatDate(entry.at)}</p>{#if entry.tracking.waiting_reason}<p>Waiting reason: {entry.tracking.waiting_reason}</p>{/if}{#if entry.tracking.progress}<p>Progress: {entry.tracking.progress}</p>{/if}{#if entry.tracking.next_action}<p>Next action: {entry.tracking.next_action}</p>{/if}{#if entry.tracking.result}<p>Result: {entry.tracking.result}</p>{/if}</article>{/each}{#if history.next_event_id}<button class="workspace-secondary-button" disabled={historyBusy} onclick={() => void readHistory(historyId, true)}>More handling history</button>{/if}{/if}
   </details>
 </section>
-<section class="ticket-detail-section ticket-delivery">
-  <div class="ticket-section-heading"><h2>Delivery and execution</h2></div>
-  <p>Assignment persistence: {current ? "Saved: " + current.assignment_id : "No current assignment"}</p>
-  {#if current}<button class="workspace-secondary-button" disabled={diagnosticBusy} onclick={() => current && void readDiagnostics(current.assignment_id)}>Refresh delivery diagnostics</button>{/if}
-  {#if diagnosticError}<p class="workspace-callout is-error" role="alert">{diagnosticError}</p>{/if}
-  {#if diagnosticBusy}<p role="status">Loading delivery diagnostics…</p>{/if}
-  {#if diagnostic}
-    <p>Assignment <code>{diagnostic.assignment_id}</code> · {diagnostic.actionable ? "actionable input" : "retained history / not actionable"}</p>
-    {#if !diagnostic.input_origin_known}<p>Input origin unknown; not inferred from handling.</p>{/if}
-    {#each diagnostic.inputs as input (input.input_event_id)}
-      <article><p>Input <code>{input.input_event_id}</code></p><dl><dt>Notification</dt><dd>{input.notification.replaceAll("_", " ")}</dd><dt>Runtime acceptance</dt><dd>{input.notification === "runtime_accepted" ? "Accepted immutable notification" : input.acceptance_outcome_unknown ? "Outcome unknown — may already be accepted" : "No acceptance acknowledgement observed"}</dd></dl></article>
-    {:else}<p>No delivery input records in this page.</p>{/each}
-    <h3>Work start / admission evidence</h3>
-    {#each diagnostic.starts as start (start.operation_id)}<p><code>{start.operation_id}</code>: {start.claim_state} · {start.runtime_id ?? "runtime unknown"}/{start.worker_id ?? "worker unknown"}{#if start.actual_processing_unknown} · actual model processing not attested{/if}</p>{:else}<p>No work start records observed. This is not inferred from Worker state.</p>{/each}
-    {#if diagnostic.next_input_event_id || diagnostic.next_start_operation_id}<button class="workspace-secondary-button" disabled={diagnosticBusy} onclick={() => diagnostic && void readDiagnostics(diagnostic.assignment_id, true)}>More delivery / start records</button>{/if}
-  {:else}<p>Delivery / Runtime acceptance / work start not observed.</p>{/if}
-</section>
-<section class="ticket-detail-section ticket-orchestrator-worker">
-  <div class="ticket-section-heading"><h2>Orchestrator Worker</h2></div>
+<BevelLine decorative />
+<details class="ticket-detail-section ticket-orchestrator-worker">
+  <summary>Orchestrator Worker</summary>
   {#if orchestrator?.worker}<p>{orchestrator.worker.runtime_id}/{orchestrator.worker.worker_id} · actual state: <strong>{orchestrator.worker.state}</strong> · {orchestrator.online ? "online" : "offline"}</p><a href={`/w/${encodeURIComponent(workspaceId)}/workers/${encodeURIComponent(orchestrator.worker.worker_id)}?runtimeId=${encodeURIComponent(orchestrator.worker.runtime_id)}`}>Open Worker</a>{:else}<p>Worker observation unavailable. This does not change handling status.</p>{/if}
-</section>
+</details>
 <style>
   .assignment-principal fieldset { min-width: 0; margin: var(--space-3, 0.75rem) 0 0; padding: 0; border: 0; }
-  dl { display: grid; grid-template-columns: minmax(7rem, 1fr) minmax(0, 3fr); gap: 0.5rem 1rem; }
+  dl { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-1); }
+  dd + dt { margin-top: var(--space-2); }
   dt { color: var(--text-muted); } dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
   code { overflow-wrap: anywhere; } .handling-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-block: 1rem; }
   article + article { margin-top: 1rem; }
-  @media (max-width: 540px) { dl { grid-template-columns: 1fr; } }
+
 </style>

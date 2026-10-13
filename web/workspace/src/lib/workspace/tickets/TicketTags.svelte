@@ -92,8 +92,9 @@
   </details>
 </section>
 <style>
-  .ticket-tag-chips { display: flex; flex-wrap: wrap; gap: var(--space-2, 0.5rem); margin-block: 0.75rem; }
-  .ticket-tag-chip { padding: 0.2rem 0.5rem; background: var(--bg-subtle); border-radius: var(--radius-soft); overflow-wrap: anywhere; }
+  .ticket-tag-chips { display: flex; flex-wrap: wrap; gap: var(--space-3); margin-block: var(--space-3); }
+  .ticket-tag-chip { overflow-wrap: anywhere; }
+  fieldset { min-width: 0; border: 0; padding: 0; margin: var(--space-3) 0; }
   fieldset label { display: flex; align-items: center; gap: 0.5rem; }
   fieldset input { width: auto; }
   code { overflow-wrap: anywhere; }

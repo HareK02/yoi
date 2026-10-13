@@ -26,17 +26,15 @@ Deno.test("ticket detail synchronizes reused route data", () => {
 });
 
 Deno.test("ticket child operations reset across Workspaces even when the retained Ticket id matches", () => {
-  assertStringIncludes(
-    pageSource,
-    "{#key JSON.stringify([data.workspaceId, ticket.id])}",
-  );
-  const children = pageSource.slice(
-    pageSource.indexOf("{#key JSON.stringify([data.workspaceId, ticket.id])}"),
-    pageSource.indexOf("{/key}"),
-  );
-  assertStringIncludes(children, "<TicketTags");
-  assertStringIncludes(children, "<TicketHandling");
-  assertStringIncludes(children, "<TicketWorkerObservation");
+  const keyedChildren = [...pageSource.matchAll(
+    /\{#key JSON\.stringify\(\[data\.workspaceId, ticket\.id\]\)\}([\s\S]*?)\{\/key\}/g,
+  )].map((match) => match[1]);
+  for (const child of ["TicketTags", "TicketHandling", "TicketWorkerObservation"]) {
+    assert(
+      keyedChildren.some((block) => block.includes(`<${child}`)),
+      `${child} must reset for the Workspace and Ticket, whether in main or rail`,
+    );
+  }
 });
 
 Deno.test("ticket detail fences stale mutation responses", () => {
@@ -64,7 +62,7 @@ Deno.test("ticket detail fences stale mutation responses", () => {
 });
 
 Deno.test("ticket responsibility display does not claim Worker liveness or work authority", () => {
-  assertStringIncludes(pageSource, "Retained responsibility");
+  assertStringIncludes(pageSource, "Role assignments and manual Workers");
   assertStringIncludes(pageSource, "after work ends and Worker removal");
   assertStringIncludes(
     pageSource,

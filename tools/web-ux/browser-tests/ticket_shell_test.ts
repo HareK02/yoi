@@ -1,7 +1,12 @@
 import { assert, assertEquals } from "jsr:@std/assert@1.0.19";
+import { join } from "@std/path";
 import { type Browser, chromium, type Page } from "npm:playwright@1.59.1";
 import { loadScenario } from "../src/scenario.ts";
 import { startOwnedProcesses, stopOwnedProcesses } from "../src/processes.ts";
+
+function artifactPath(path: string): string {
+  return join(Deno.env.get("WEB_UX_TEST_ARTIFACTS") ?? new URL("../../../target/web-ux", import.meta.url).pathname, "t743-browser", path);
+}
 
 // Explicit browser boundary: production static build + loopback API fixture.
 // These tests prove UI/request semantics, not real Backend delivery or model judgment.
@@ -16,8 +21,7 @@ async function withFixture(
   const baseUrl = `http://127.0.0.1:${port}`;
   scenario.processes![0].args![4] = String(port);
   scenario.processes![0].readyUrl = `${baseUrl}/health`;
-  const logs = new URL(`../../../target/web-ux/t743-browser/${port}/logs`, import.meta.url)
-    .pathname;
+  const logs = artifactPath(`${port}/logs`);
   const processes = await startOwnedProcesses(
     scenario.processes!,
     scenarioPath,
@@ -335,6 +339,63 @@ Deno.test("assignee qualifiers send exact user and runtime-worker identities, no
   });
 });
 
+async function assertThreadLayout(page: Page) {
+  const main = page.getByRole("main", { name: "Ticket thread", exact: true });
+  const rail = page.getByRole("complementary", { name: "Ticket details" });
+  assertEquals(await main.locator(":scope > *").count(), 1);
+  assertEquals(await main.locator(".ticket-thread > *").evaluateAll((elements) =>
+    elements.map((element) => element.className)
+  ), ["ticket-timeline", "ticket-control-form ticket-thread-composer"]);
+  assertEquals(await main.locator(".ticket-timeline > :first-child").getAttribute("class"), "ticket-thread-event");
+  assertEquals(await main.locator(".ticket-thread-event[data-initial=true] header strong").textContent(), "Mika");
+  assert((await main.locator(".ticket-thread-event[data-initial=true] time").textContent())?.trim());
+  assertEquals(await main.getByRole("heading", { name: /^(Intent|Timeline)$/ }).count(), 0);
+  assertEquals(await main.locator(".ticket-timeline > *").evaluateAll((elements) =>
+    elements.every((element, index) => index === 0
+      ? element.matches("article.ticket-thread-event[data-initial=true]")
+      : index % 2 === 1 ? element.matches(".bevel-line") : element.matches("article.ticket-thread-event"))
+  ), true);
+  assert(await main.locator(".ticket-thread-composer").evaluate((element) =>
+    element.previousElementSibling?.matches(".ticket-timeline") &&
+    element.firstElementChild?.matches(".bevel-line")
+  ));
+  const metadata = ".ticket-handling, .ticket-tags, .ticket-relations, .ticket-orchestrator-worker, .ticket-worker-observation, .ticket-worker-card, .ticket-resources";
+  assertEquals(await main.locator(metadata).count(), 0);
+  assertEquals(await rail.locator(metadata).count(), 7);
+  assertEquals(await page.locator(".ticket-delivery").count(), 0);
+  assertEquals(await page.getByText("Delivery and execution", { exact: true }).count(), 0);
+  assertEquals(await rail.locator(".ticket-thread-event[data-initial=true], .ticket-thread-event, .ticket-thread-composer").count(), 0);
+  for (const selector of [".ticket-orchestrator-worker", ".ticket-worker-observation", ".ticket-worker-card", ".ticket-resources"]) {
+    const details = rail.locator(selector);
+    assertEquals(await details.evaluate((element) => element.tagName), "DETAILS");
+    assertEquals(await details.getAttribute("open"), null);
+    assert(await details.locator(":scope > summary").isVisible());
+  }
+  assertEquals(await rail.locator(".ticket-worker-card > summary").textContent(), "Role assignments and manual Workers");
+  assert(/^Repository resources \(\d+\)$/.test((await rail.locator(".ticket-resources > summary").textContent())!));
+  const evidence = rail.locator("details").filter({ has: page.locator("summary", { hasText: /^MR requirement evidence$/ }) });
+  if (await evidence.count()) assertEquals(await evidence.getAttribute("open"), null);
+}
+
+async function assertThreadDividers(page: Page) {
+  const lines = page.locator(".ticket-timeline > .bevel-line, .ticket-thread-composer > .bevel-line");
+  assertEquals(await lines.count(), await page.locator(".ticket-thread-event").count());
+  for (const line of await lines.all()) {
+    await line.scrollIntoViewIfNeeded();
+    assert(await line.isVisible());
+    assert(await line.evaluate((element) => {
+      const view = element.ownerDocument.defaultView!;
+      const style = view.getComputedStyle(element);
+      const bounds = element.getBoundingClientRect();
+      const content = element.nextElementSibling!.getBoundingClientRect();
+      return element.getAttribute("aria-hidden") === "true" &&
+        style.borderTopStyle === "solid" && parseFloat(style.borderTopWidth) > 0 &&
+        style.borderTopColor !== "rgba(0, 0, 0, 0)" && style.opacity !== "0" &&
+        Math.abs(bounds.left - content.left) < 1 && Math.abs(bounds.right - content.right) < 1;
+    }));
+  }
+}
+
 async function boundedGate(promise: Promise<void>) {
   let timer: number | undefined;
   try {
@@ -399,15 +460,14 @@ Deno.test("waiting answers retain a delegation, done reissue retains results, an
       .waitFor();
     const before = await detail(base, "T-2");
     const row = before.assignment_tracking[0];
-    await page.getByText("Record result or comment", { exact: true }).click();
-    await page.getByLabel("Body", { exact: true }).fill(
+    await page.getByLabel("Comment", { exact: true }).fill(
       "Ordinary retained discussion, not an answer input",
     );
     const eventResponse = page.waitForResponse((response) =>
       response.url().endsWith("/events") &&
       response.request().method() === "POST"
     );
-    await page.getByRole("button", { name: "Append event", exact: true })
+    await page.getByRole("button", { name: "Add comment", exact: true })
       .click();
     assertEquals((await eventResponse).request().postDataJSON(), {
       role: "comment",
@@ -486,7 +546,7 @@ Deno.test("waiting answers retain a delegation, done reissue retains results, an
     await page.goto(`${base}/w/tickets/tickets/T-4`);
     await page.getByText("Self-reported handling: done", { exact: true })
       .waitFor();
-    await page.locator(".ticket-case-card").getByLabel("Explanation", {
+    await page.locator(".ticket-thread-composer").getByLabel("Comment", {
       exact: true,
     }).fill("Reconsider the case without delegating again");
     const reopenResponse = page.waitForResponse((response) =>
@@ -498,20 +558,23 @@ Deno.test("waiting answers retain a delegation, done reissue retains results, an
     assertEquals(reopen.action, { action: "reopen" });
     assertEquals(reopen.expected_state, "closed");
     assertEquals(reopen.expected_closure_operation_key, "close-T-4");
-    await page.getByRole("button", { name: "Close ticket", exact: true })
+    await page.getByRole("button", { name: "Comment and close", exact: true })
       .waitFor();
     const reopened = await detail(base, "T-4");
     assertEquals(reopened.state, "open");
     assertEquals(reopened.assignment_tracking[0].tracking.status, "done");
     assertEquals(reopened.closure_history.length, 2);
-    await page.locator(".ticket-case-card").getByLabel("Explanation", {
+    await page.locator(".ticket-thread-composer").getByLabel("Comment", {
       exact: true,
     }).fill("The full requested investigation is delivered");
-    await page.locator(".ticket-case-card select").selectOption("completed");
+    await page.locator(".ticket-close-options > summary").click();
+    await page.locator(".ticket-thread-composer").getByRole("combobox", {
+      name: "Closure reason", exact: true,
+    }).selectOption("completed");
     const closeResponse = page.waitForResponse((response) =>
       response.url().endsWith("/case") && response.request().method() === "POST"
     );
-    await page.getByRole("button", { name: "Close ticket", exact: true })
+    await page.getByRole("button", { name: "Comment and close", exact: true })
       .click();
     const close = (await closeResponse).request().postDataJSON();
     assertEquals(close.action, { action: "close", reason: "completed" });
@@ -544,9 +607,119 @@ Deno.test("waiting answers retain a delegation, done reissue retains results, an
         .isVisible(),
     );
     const requests = await (await fetch(`${base}/fixture-state`)).json();
+    assert(!requests.some((r: { path: string }) => r.path.includes("assignment-diagnostics")));
+    assertEquals(await page.locator(".ticket-delivery").count(), 0);
+    assertEquals(await page.getByText("Delivery and execution", { exact: true }).count(), 0);
     assert(
       !requests.some((r: { path: string }) => /\/(queue|ready|state)$/.test(r.path)),
     );
+  });
+});
+
+Deno.test("timeline footer comments and closes with one case request, renders the comment once and still accepts closed-case comments", async () => {
+  await withFixture(async (browser, base) => {
+    const page = await browser.newPage();
+    await page.goto(`${base}/w/tickets/tickets/T-1`);
+    const composer = page.locator(".ticket-thread-composer");
+    await composer.waitFor();
+    assertEquals(await page.locator("aside .ticket-thread-composer").count(), 0);
+    assertEquals(await page.locator(".ticket-case-card").count(), 0);
+    assert(await composer.evaluate((element) => {
+      const timeline = element.parentElement?.querySelector(".ticket-timeline");
+      return !!timeline && !!element.closest("main") &&
+        !!(timeline.compareDocumentPosition(element) & 4);
+    }));
+    const comment = composer.getByLabel("Comment", { exact: true });
+    const add = composer.getByRole("button", { name: "Add comment", exact: true });
+    const close = composer.getByRole("button", { name: "Comment and close", exact: true });
+    assert(await add.isDisabled());
+    assert(await close.isDisabled());
+    await comment.fill("   \n  ");
+    assert(await add.isDisabled());
+    assert(await close.isDisabled());
+    const text = "The options are recorded; close this discussion without choosing one.";
+    await comment.fill(text);
+    assert(await add.isEnabled());
+    assert(await close.isEnabled());
+    const before = await detail(base, "T-1");
+    const response = page.waitForResponse((response) =>
+      response.url().endsWith("/case") && response.request().method() === "POST"
+    );
+    await close.click();
+    const request = (await response).request().postDataJSON();
+    assertEquals(request.explanation, text);
+    assertEquals(request.action, { action: "close", reason: "unknown" });
+    assertEquals(request.expected_state, "open");
+    assertEquals(request.expected_content_digest, before.content_digest);
+    assertEquals(request.expected_closure_operation_key, before.closure_operation_key);
+    assert(typeof request.operation_key === "string" && request.operation_key.length > 0);
+    await page.locator(".ticket-detail-header").getByText("Case: closed", {
+      exact: true,
+    }).waitFor();
+    const rendered = page.locator(".ticket-timeline").getByText(text, { exact: true });
+    await rendered.waitFor();
+    assertEquals(await rendered.count(), 1);
+    const closed = await detail(base, "T-1");
+    assertEquals(closed.state, "closed");
+    assertEquals(closed.current_closure.explanation, text);
+    assertEquals(closed.events.length, before.events.length + 1);
+    assertEquals(closed.events.at(-1).kind, "close");
+    assertEquals(closed.events.at(-1).body, text);
+    assertEquals(closed.events.at(-1).reason, text);
+    const requests = await (await fetch(`${base}/fixture-state`)).json();
+    assertEquals(requests.filter((row: { path: string }) => row.path.endsWith("/case")).length, 1);
+    assertEquals(requests.filter((row: { path: string }) => row.path.endsWith("/events")).length, 0);
+    assertEquals(await comment.inputValue(), "");
+    assert(await add.isDisabled());
+    const reopen = composer.getByRole("button", { name: "Reopen ticket", exact: true });
+    assert(await reopen.isDisabled());
+    await comment.fill("A retained comment after closure does not reopen the case.");
+    const eventResponse = page.waitForResponse((response) =>
+      response.url().endsWith("/events") && response.request().method() === "POST"
+    );
+    await add.click();
+    assertEquals((await eventResponse).request().postDataJSON(), {
+      role: "comment",
+      body: "A retained comment after closure does not reopen the case.",
+    });
+    await page.locator(".ticket-timeline").getByText(
+      "A retained comment after closure does not reopen the case.",
+      { exact: true },
+    ).waitFor();
+    assertEquals((await detail(base, "T-1")).state, "closed");
+  });
+});
+
+Deno.test("ambiguous comment-and-close retries exact case JSON without a duplicate timeline event", async () => {
+  await withFixture(async (browser, base) => {
+    const page = await browser.newPage();
+    await page.goto(`${base}/w/tickets/tickets/T-1`);
+    const composer = page.locator(".ticket-thread-composer");
+    await composer.waitFor();
+    const text = "Retain this close comment exactly once, even if the response is lost.";
+    const before = await detail(base, "T-1");
+    await composer.getByLabel("Comment", { exact: true }).fill(text);
+    await control(base, { failure: "unknown_saved" });
+    await composer.getByRole("button", { name: "Comment and close", exact: true }).click();
+    await page.getByRole("alert").filter({ hasText: /Outcome unknown/ }).waitFor();
+    assertEquals(await composer.getByRole("button", {
+      name: "Refresh and reconcile case", exact: true,
+    }).count(), 1);
+    await composer.getByRole("button", { name: "Retry exact case decision", exact: true }).click();
+    await page.locator(".ticket-detail-header").getByText("Case: closed", {
+      exact: true,
+    }).waitFor();
+    const rendered = page.locator(".ticket-timeline").getByText(text, { exact: true });
+    await rendered.waitFor();
+    assertEquals(await rendered.count(), 1);
+    const requests = await (await fetch(`${base}/fixture-state`)).json();
+    const attempts = requests.filter((row: { path: string }) => row.path.endsWith("/case"));
+    assertEquals(attempts.length, 2);
+    assertEquals(attempts[0].body, attempts[1].body);
+    assertEquals(requests.filter((row: { path: string }) => row.path.endsWith("/events")).length, 0);
+    const closed = await detail(base, "T-1");
+    assertEquals(closed.events.length, before.events.length + 1);
+    assertEquals(closed.closure_history.length, before.closure_history.length + 1);
   });
 });
 
@@ -762,10 +935,161 @@ Deno.test("ambiguous saved Assign retries exact JSON once, while stale and permi
   });
 });
 
+Deno.test("initial and later posts use the same editor and preserve authorship while title edit remains metadata-only", async () => {
+  await withFixture(async (browser, base) => {
+    const page = await browser.newPage();
+    await page.goto(`${base}/w/tickets/tickets/T-1`);
+    await page.locator(".ticket-detail-header").waitFor();
+    const composer = page.getByRole("form", { name: "Add a comment" });
+    await composer.getByLabel("Comment", { exact: true }).fill("A later discussion post");
+    await composer.getByRole("button", { name: "Add comment", exact: true }).click();
+    await page.locator(".ticket-timeline").getByText("A later discussion post", { exact: true }).waitFor();
+    for (const name of ["Initial post", "Discussion post"]) {
+      const article = page.getByRole("article", { name, exact: true });
+      const originalTime = await article.locator("time").first().getAttribute("datetime");
+      const originalAuthor = await article.locator("header strong").textContent();
+      await article.getByRole("button", { name: "Edit post", exact: true }).click();
+      await article.getByLabel("Post body", { exact: true }).fill(`Revised ${name}`);
+      await article.getByRole("button", { name: "Save post", exact: true }).click();
+      await article.getByText(`Revised ${name}`, { exact: true }).waitFor();
+      assertEquals(await article.locator("time").first().getAttribute("datetime"), originalTime);
+      assertEquals(await article.locator("header strong").textContent(), originalAuthor);
+      assert((await article.locator(".ticket-post-edited").textContent())?.includes("by Rin"));
+      assertEquals(await page.locator(".ticket-timeline article").count(), 2);
+    }
+    const rail = page.getByRole("complementary", { name: "Ticket details" });
+    await rail.getByRole("button", { name: "Edit title", exact: true }).click();
+    assertEquals(await rail.getByLabel("Post body", { exact: true }).count(), 0);
+    await rail.getByLabel("Title", { exact: true }).fill("A clearer Ticket title");
+    await rail.getByRole("button", { name: "Save title", exact: true }).click();
+    await page.getByRole("heading", { name: "A clearer Ticket title", exact: true }).waitFor();
+    const requests = await (await fetch(`${base}/fixture-state`)).json();
+    const edits = requests.filter((row: { path: string; method?: string }) => row.method === "PATCH" && row.path.includes("/posts/"));
+    assertEquals(edits.length, 2);
+    for (const edit of edits) assertEquals(Object.keys(edit.body).sort(), ["body", "expected_body_digest"]);
+    const metadata = requests.findLast((row: { body?: { title?: string } }) => row.body?.title === "A clearer Ticket title");
+    assertEquals(metadata.body, { title: "A clearer Ticket title" });
+    assertEquals(await page.locator(".ticket-timeline article").count(), 2);
+    await page.close();
+  });
+});
+
+Deno.test("canonical thread renders long initial post and chronological multiline events once with content-aligned dividers", async () => {
+  await withFixture(async (browser, base) => {
+    const output = artifactPath("thread");
+    await Deno.mkdir(output, { recursive: true });
+    const paragraphs = Array.from({ length: 8 }, (_, index) =>
+      `Initial post paragraph ${index + 1}: ` + "The requested investigation preserves context before any discussion. ".repeat(5)
+    );
+    const events = ["Initial findings", "Follow-up decision", "Final investigation result"].map((heading, index) => ({
+      is_initial: false, edited_at: null, edited_by: null, body_digest: "d".repeat(64), body_truncated: false, editable: index !== 1,
+      sequence: index + 1,
+      kind: index === 1 ? "decision" : "comment",
+      heading,
+      author: `Thread author ${index + 1}`,
+      at: `2026-10-13T0${index + 1}:00:00Z`,
+      body: `${heading} first paragraph.\n\n${heading} second paragraph with enough detail to wrap on narrow screens.\n\n- ${heading} evidence one\n- ${heading} evidence two`,
+      reason: null,
+      from: null,
+      to: null,
+      references: [],
+      attributes: {},
+      event_ref: `thread-fixture-${index + 1}`,
+    }));
+    for (const colorScheme of ["light", "dark"] as const) {
+      for (const width of [1440, 768, 390]) {
+        const page = await browser.newPage({ viewport: { width, height: 900 }, colorScheme, reducedMotion: "reduce" });
+        await page.route("**/api/w/tickets/tickets/T-1", async (route) => {
+          const response = await route.fetch();
+          const ticket = await response.json();
+          await route.fulfill({ response, json: {
+            ...ticket,
+            body: "Compatibility body must not render",
+            initial_post: { ...ticket.initial_post, body: paragraphs.join("\n\n"), at: "2026-10-12T12:00:00Z" },
+            created_at: "2026-10-12T12:00:00Z",
+            updated_at: events.at(-1)!.at,
+            events,
+            event_count: events.length,
+          } });
+        });
+        await page.goto(`${base}/w/tickets/tickets/T-1`);
+        await page.locator(".ticket-detail-header").waitFor();
+        await assertThreadLayout(page);
+        const timeline = page.locator(".ticket-timeline");
+        assertEquals(await timeline.locator("article header strong").allTextContents(), ["Mika", ...events.map((event) => event.author)]);
+        const expectedDates = ["2026-10-12T12:00:00Z", ...events.map((event) => event.at)];
+        assertEquals(await timeline.locator("article header time").allTextContents(), await page.evaluate((dates) => dates.map((date) => new Date(date).toLocaleString()), expectedDates));
+        for (const paragraph of paragraphs) assertEquals(await timeline.getByText(paragraph, { exact: true }).count(), 1);
+        for (const event of events) {
+          const article = timeline.locator(".ticket-thread-event").filter({ has: page.locator("header strong", { hasText: event.author }) });
+          assertEquals(await article.count(), 1);
+          assertEquals(await article.getByText(`${event.heading} first paragraph.`, { exact: true }).count(), 1);
+          assertEquals(await article.getByText(`${event.heading} second paragraph with enough detail to wrap on narrow screens.`, { exact: true }).count(), 1);
+          assertEquals(await article.locator("li").count(), 2);
+        }
+        await assertThreadDividers(page);
+        assertEquals(await page.evaluate("document.documentElement.scrollWidth > innerWidth"), false);
+        await page.screenshot({ path: `${output}/${colorScheme}-${width}-full.png`, fullPage: true });
+        await page.locator(".ticket-thread-event").first().scrollIntoViewIfNeeded();
+        await page.screenshot({ path: `${output}/${colorScheme}-${width}-events.png` });
+        await page.locator(".ticket-thread-composer").scrollIntoViewIfNeeded();
+        await page.screenshot({ path: `${output}/${colorScheme}-${width}-composer.png` });
+        await timeline.locator("article").first().getByRole("button", { name: "Edit post", exact: true }).click();
+        const description = timeline.locator(".ticket-thread-event[data-initial=true]");
+        await description.locator(".ticket-editor").waitFor();
+        assertEquals(await description.getByLabel("Post body", { exact: true }).inputValue(), paragraphs.join("\n\n"));
+        assertEquals(await page.locator("aside .ticket-editor").count(), 0);
+        await page.getByRole("button", { name: "Cancel post edit", exact: true }).click();
+        await description.getByText(paragraphs[0], { exact: true }).waitFor();
+        await page.close();
+      }
+    }
+  });
+});
+
+Deno.test("Ticket metadata stays in the rail with flat links, wrapping labels and keyboard navigation", async () => {
+  await withFixture(async (browser, base) => {
+    const output = artifactPath("metadata");
+    await Deno.mkdir(output, { recursive: true });
+    for (const colorScheme of ["light", "dark"] as const) {
+      for (const width of [1440, 768, 390]) {
+        const page = await browser.newPage({ viewport: { width, height: 900 }, colorScheme });
+        await page.route("**/api/w/tickets/tickets/T-1*", async (route) => {
+          const response = await route.fetch();
+          const body = await response.json();
+          if (body.resource_key === "T-1" && body.relations) {
+            body.tags[0].name = "Classification-with-a-long-name-".repeat(4);
+            body.relations.outgoing = [{ at: "2026-01-01T00:00:00Z", author: "fixture-owner", kind: "related", target: "internal-T-2", target_resource_key: "T-2", ticket_id: body.id, note: "Related investigation with a long note. ".repeat(5) }];
+          }
+          await route.fulfill({ response, json: body });
+        });
+        await page.goto(`${base}/w/tickets/tickets/T-1`);
+        const rail = page.getByRole("complementary", { name: "Ticket details" });
+        const link = rail.getByRole("link", { name: /T-2/ });
+        await link.waitFor();
+        assertEquals(await link.getAttribute("href"), "/w/tickets/tickets/T-2");
+        assertEquals(await page.locator(".ticket-detail-main .ticket-tags, .ticket-detail-main .ticket-relations").count(), 0);
+        assertEquals(await page.evaluate("document.documentElement.scrollWidth > innerWidth"), false);
+        assert(await rail.locator(".ticket-tag-chip, .ticket-relations-list a").evaluateAll((elements) => elements.every((element) => {
+          const style = element.ownerDocument.defaultView!.getComputedStyle(element);
+          return style.borderTopWidth === "0px" && style.borderRadius === "0px" && style.backgroundColor === "rgba(0, 0, 0, 0)";
+        })));
+        await link.focus();
+        assert(await link.evaluate((element) => element === element.ownerDocument.activeElement));
+        assert(await link.evaluate((element) => element.ownerDocument.defaultView!.getComputedStyle(element).outlineStyle !== "none"));
+        await page.screenshot({ path: `${output}/${colorScheme}-${width}.png` });
+        await link.press("Enter");
+        await page.waitForURL(/\/tickets\/T-2/);
+        await page.getByRole("heading", { name: "Read-only investigation", exact: true }).waitFor();
+        await page.close();
+      }
+    }
+  });
+});
+
 Deno.test("case and handling matrix renders without overflow in both themes and empty/error/unknown states stay distinct", async () => {
   await withFixture(async (browser, base) => {
-    const output = new URL("../../../target/web-ux/t743-browser/matrix", import.meta.url)
-      .pathname;
+    const output = artifactPath("matrix");
     await Deno.mkdir(output, { recursive: true });
     for (const colorScheme of ["light", "dark"] as const) {
       for (const width of [1440, 768, 390]) {
@@ -787,18 +1111,18 @@ Deno.test("case and handling matrix renders without overflow in both themes and 
               ["tickets-unknown", "orchestrator", ".orchestrator-assignment"],
               ["tickets-error", "tickets", "[role=alert]"],
               ["tickets", "tickets/T-1", ".ticket-detail-header"],
-              ["tickets", "tickets/T-2", ".ticket-worker-observation strong"],
-              ["tickets", "tickets/T-3", ".ticket-worker-observation strong"],
+              ["tickets", "tickets/T-2", ".ticket-detail-header"],
+              ["tickets", "tickets/T-3", ".ticket-detail-header"],
               ["tickets", "tickets/T-4", ".ticket-detail-header"],
               [
                 "tickets-readonly",
                 "tickets/T-2",
-                ".ticket-worker-observation strong",
+                ".ticket-detail-header",
               ],
               [
                 "tickets-running",
                 "tickets/T-2",
-                ".ticket-worker-observation strong",
+                ".ticket-detail-header",
               ],
             ]
           ) {
@@ -810,6 +1134,24 @@ Deno.test("case and handling matrix renders without overflow in both themes and 
               ),
               false,
             );
+            if (route.startsWith("tickets/")) {
+              await assertThreadLayout(page);
+              await assertThreadDividers(page);
+              const rail = page.getByRole("complementary", { name: "Ticket details" });
+              assertEquals(await rail.locator(".ticket-tags").count(), 1);
+              assertEquals(await rail.getByRole("heading", { name: "Relations", exact: true }).count(), 1);
+              assertEquals(await page.locator(".ticket-detail-main .ticket-tags, .ticket-detail-main .ticket-relations").count(), 0);
+              const sections = page.locator(".ticket-detail-page .ticket-detail-section, .ticket-detail-page .ticket-control-card");
+              assert(await sections.evaluateAll((elements) => elements.every((element) => {
+                const style = element.ownerDocument.defaultView!.getComputedStyle(element);
+                return [style.borderTopWidth, style.borderRightWidth, style.borderBottomWidth, style.borderLeftWidth, style.borderRadius].every((value) => value === "0px") && style.backgroundColor === "rgba(0, 0, 0, 0)";
+              })));
+              const mainBounds = await page.locator(".ticket-detail-main").boundingBox();
+              const railBounds = await rail.boundingBox();
+              assert(mainBounds && railBounds);
+              if (width === 1440) assert(railBounds.x >= mainBounds.x + mainBounds.width);
+              else assert(railBounds.y >= mainBounds.y + mainBounds.height);
+            }
             if (workspace === "tickets-empty") {
               assert(
                 await page.getByText(
@@ -837,6 +1179,10 @@ Deno.test("case and handling matrix renders without overflow in both themes and 
                 4,
               );
             }
+            if (["tickets/T-2", "tickets/T-3"].includes(route)) {
+              await page.locator("aside .ticket-worker-observation > summary").click();
+              await page.locator("aside .ticket-worker-observation strong").waitFor();
+            }
             if (route === "tickets/T-2") {
               assert(
                 await page.getByText("Self-reported handling: waiting", {
@@ -858,6 +1204,8 @@ Deno.test("case and handling matrix renders without overflow in both themes and 
                 );
               }
               if (workspace === "tickets-running") {
+                await page.locator("aside .ticket-orchestrator-worker > summary").click();
+                await page.locator("aside .ticket-orchestrator-worker strong").waitFor();
                 assert(
                   await page.locator(".ticket-orchestrator-worker").getByText(
                     "Running",
@@ -887,6 +1235,15 @@ Deno.test("case and handling matrix renders without overflow in both themes and 
               }.png`,
               fullPage: true,
             });
+            if (workspace === "tickets" && ["tickets/T-1", "tickets/T-4"].includes(route)) {
+              const composer = page.locator(".ticket-thread-composer");
+              await composer.waitFor();
+              assertEquals(await page.locator("aside .ticket-thread-composer").count(), 0);
+              await composer.scrollIntoViewIfNeeded();
+              await page.screenshot({
+                path: `${output}/${colorScheme}-${width}-${route.replaceAll("/", "-")}-footer.png`,
+              });
+            }
           }
           assertEquals(errors, []);
         } finally {

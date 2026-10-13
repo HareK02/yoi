@@ -43,6 +43,9 @@ pub(super) struct ModelTicketDetail {
     content_digest: String,
     title: String,
     body: String,
+    body_truncated: bool,
+    initial_post: ModelTicketEvent,
+    created_by: Option<String>,
     state: ticket::TicketState,
     closure_operation_key: Option<String>,
     current_closure: Option<ticket::TicketClosureJudgment>,
@@ -131,9 +134,17 @@ struct ModelTicketEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     tag_changes: Option<ModelTicketTagChange>,
     sequence: usize,
+    event_ref: String,
+    is_initial: bool,
     kind: String,
     body: Option<String>,
+    body_truncated: bool,
+    body_digest: String,
+    editable: bool,
+    author: Option<String>,
     created_at: Option<String>,
+    edited_at: Option<String>,
+    edited_by: Option<String>,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -335,6 +346,12 @@ pub(super) fn project_ticket_detail(value: Value) -> Result<ModelTicketDetail, S
         content_digest: string_field(root, "content_digest")?,
         title: string_field(root, "title")?,
         body: string_field(root, "body")?,
+        body_truncated: bool_field(root, "body_truncated")?,
+        initial_post: project_ticket_event(
+            root.get("initial_post")
+                .ok_or("Ticket detail response is missing initial_post")?,
+        )?,
+        created_by: optional_string(root, "created_by")?,
         state: typed_field(root, "state")?,
         closure_operation_key: typed_field(root, "closure_operation_key")?,
         current_closure: typed_field(root, "current_closure")?,
@@ -471,6 +488,14 @@ fn project_ticket_event(value: &Value) -> Result<ModelTicketEvent, String> {
     Ok(ModelTicketEvent {
         tag_changes,
         sequence: usize_field(event, "sequence")?,
+        event_ref: string_field(event, "event_ref")?,
+        is_initial: bool_field(event, "is_initial")?,
+        body_truncated: bool_field(event, "body_truncated")?,
+        body_digest: string_field(event, "body_digest")?,
+        editable: bool_field(event, "editable")?,
+        author: optional_string(event, "author")?,
+        edited_at: optional_string(event, "edited_at")?,
+        edited_by: optional_string(event, "edited_by")?,
         kind: string_field(event, "kind")?,
         body: match event.get("body") {
             None | Some(Value::Null) => None,
@@ -815,13 +840,24 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn post_fixture(initial: bool, body: &str) -> Value {
+        json!({
+            "sequence": if initial { 0 } else { 1 },
+            "event_ref": if initial { "post-initial" } else { "post-discussion" },
+            "is_initial": initial, "kind": "comment", "body": body,
+            "body_truncated": false, "body_digest": "a".repeat(64), "editable": true,
+            "author": "workspace-user:original", "at": "2026-01-01T00:00:00Z",
+            "edited_at": "2026-01-02T00:00:00Z", "edited_by": "workspace-user:editor"
+        })
+    }
+
     #[test]
     fn mrless_evidence_is_inapplicable_not_missing_or_vacuously_approved() {
         for state in ["open", "closed"] {
             let projected = project_ticket_detail(json!({
-                "resource_key": "T-718", "assignment_tracking": [], "tags": [], "content_digest": "rev-1", "title": "No Git required", "body": "Decision",
+                "resource_key": "T-718", "assignment_tracking": [], "tags": [], "content_digest": "rev-1", "title": "No Git required", "body": "Decision", "body_truncated": false, "initial_post": post_fixture(true, "Decision"),
                 "closure_operation_key": null, "current_closure": null, "closure_history": [], "legacy_handoff": null,
-                "state": state, "events": [{"sequence": 1, "kind": "completed", "body": "No Git needed"}],
+                "state": state, "events": [post_fixture(false, "No Git needed")],
                 "linked_objectives": [], "assignments": [], "implementation_reports": [],
                 "merge_requests": [], "merge_request": null,
                 "evidence": {
@@ -832,7 +868,7 @@ mod tests {
             })).unwrap();
             let projected = serde_json::to_value(projected).unwrap();
             assert_eq!(projected["state"], state);
-            assert_eq!(projected["thread"][0]["kind"], "completed");
+            assert_eq!(projected["thread"][0]["kind"], "comment");
             assert_eq!(projected["evidence"]["integration_applicable"], false);
             assert_eq!(projected["evidence"]["review_status"], Value::Null);
             assert_eq!(projected["evidence"]["approved_current_subject"], false);
@@ -862,7 +898,7 @@ mod tests {
         });
         let response = json!({
             "assignment_tracking": [], "tags": [{"workspace_id":"ws", "id":"tag-1", "name":"closed", "last_operation_key":"tag-create", "deleted":false}],
-            "resource_key": "T-739", "content_digest": "content-digest", "title": "Case", "body": "Requirements",
+            "resource_key": "T-739", "content_digest": "content-digest", "title": "Case", "body": "Requirements", "body_truncated": false, "initial_post": post_fixture(true, "Requirements"),
             "state": "open", "closure_operation_key": "close-1", "current_closure": null,
             "closure_history": history, "legacy_handoff": legacy,
             "events": [], "linked_objectives": [], "assignments": [], "implementation_reports": [],
@@ -1013,7 +1049,7 @@ mod tests {
             "content_digest": "ticket-content-digest",
                 "closure_operation_key": null, "current_closure": null, "closure_history": [], "legacy_handoff": null,
             "title": "Queued Submit",
-            "body": "Body",
+            "body": "Body", "body_truncated": false, "initial_post": post_fixture(true, "Body"),
             "state": "open",
             "readiness": null,
             "priority": "P2",
@@ -1117,7 +1153,7 @@ mod tests {
                 "content_digest": "current-ticket-content-digest",
                 "closure_operation_key": null, "current_closure": null, "closure_history": [], "legacy_handoff": null,
                 "title": "Source evidence",
-                "body": "Body",
+                "body": "Body", "body_truncated": false, "initial_post": post_fixture(true, "Body"),
                 "state": "open",
                 "events": [],
                 "linked_objectives": [],
@@ -1301,7 +1337,7 @@ mod tests {
         let closure = json!({"operation_key":"close-1", "reason":"not_planned", "explanation":"Not proceeding", "references":[{"kind":"ticket", "target":"T-12"}], "author":"workspace-user:alice", "at":"2026-01-01T00:00:00Z"});
         let history = json!([{"operation_key":"close-1", "previous_closure_operation_key":null, "action":{"action":"close", "reason":"not_planned"}, "explanation":"Not proceeding", "references":[{"kind":"ticket", "target":"T-12"}], "author":"workspace-user:alice", "at":"2026-01-01T00:00:00Z"}]);
         let detail = json!({
-            "resource_key":"T-739", "title":"Case", "body":"Requirements", "content_digest":"content-1",
+            "resource_key":"T-739", "title":"Case", "body":"Requirements", "body_truncated":false, "initial_post":post_fixture(true, "Requirements"), "created_by":"workspace-user:creator", "content_digest":"content-1",
             "state":"closed", "assignment_tracking": [tracking], "tags":[tag], "closure_operation_key":"close-1", "current_closure":closure,
             "legacy_handoff":null, "closure_history":history, "events":[], "linked_objectives":[], "assignments":[], "implementation_reports":[], "merge_requests":[]
         });
@@ -1348,6 +1384,41 @@ mod tests {
         }
         assert_eq!(projected_detail["closure_history"], history);
         assert_eq!(projected_detail["content_digest"], "content-1");
+        assert_eq!(projected_detail["created_by"], "workspace-user:creator");
+        assert_eq!(projected_detail["body_truncated"], false);
+        for initial in [true, false] {
+            let input = post_fixture(initial, "The same post contract");
+            let output = serde_json::to_value(project_ticket_event(&input).unwrap()).unwrap();
+            for field in [
+                "event_ref",
+                "is_initial",
+                "author",
+                "edited_at",
+                "edited_by",
+                "body",
+                "body_digest",
+                "body_truncated",
+                "editable",
+            ] {
+                assert_eq!(output[field], input[field], "post metadata {field}");
+            }
+            assert_eq!(output["created_at"], input["at"]);
+        }
+        assert_eq!(
+            projected_detail["initial_post"]["author"],
+            "workspace-user:original"
+        );
+        assert_eq!(
+            projected_detail["initial_post"]["edited_by"],
+            "workspace-user:editor"
+        );
+        let mut missing_post = detail.clone();
+        missing_post.as_object_mut().unwrap().remove("initial_post");
+        assert!(
+            project_ticket_detail(missing_post)
+                .unwrap_err()
+                .contains("initial_post")
+        );
         // Unknown observations must not be replaced with empty/null values.
         for field in [
             "tags",
@@ -1410,11 +1481,14 @@ mod tests {
     #[test]
     fn ticket_tag_history_projection_preserves_observed_names_and_identities() {
         let tag = serde_json::json!({"workspace_id":"ws","id":"tag-1","name":"Old name","last_operation_key":"create","deleted":false});
-        let event = serde_json::json!({"sequence":3,"kind":"tags_changed","body":"Ticket tags changed","at":"then","attributes":{"tags_before":serde_json::json!([tag.clone()]).to_string(),"tags_after":"[]"}});
+        let mut event = post_fixture(false, "Ticket tags changed");
+        event["kind"] = json!("tags_changed");
+        event["editable"] = json!(false);
+        event["attributes"] = serde_json::json!({"tags_before":serde_json::json!([tag.clone()]).to_string(),"tags_after":"[]"});
         let projected = serde_json::to_value(project_ticket_event(&event).unwrap()).unwrap();
         assert_eq!(projected["tag_changes"]["before"], serde_json::json!([tag]));
         assert_eq!(projected["tag_changes"]["after"], serde_json::json!([]));
-        let ordinary = serde_json::json!({"sequence":0,"kind":"comment","body":"hello","at":null});
+        let ordinary = post_fixture(false, "hello");
         assert!(
             serde_json::to_value(project_ticket_event(&ordinary).unwrap())
                 .unwrap()

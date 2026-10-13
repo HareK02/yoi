@@ -1,4 +1,5 @@
 import { assert, assertEquals } from "jsr:@std/assert@1.0.19";
+import { join } from "@std/path";
 import { chromium } from "npm:playwright@1.59.1";
 import { loadScenario } from "../src/scenario.ts";
 import { startOwnedProcesses, stopOwnedProcesses } from "../src/processes.ts";
@@ -18,7 +19,7 @@ Deno.test("principal replacement snapshots the target and observed assignment fo
   const processes = await startOwnedProcesses(
     scenario.processes!,
     scenarioPath,
-    new URL(`../../../target/web-ux/t743-principal/${port}`, import.meta.url).pathname,
+    join(Deno.env.get("WEB_UX_TEST_ARTIFACTS") ?? new URL("../../../target/web-ux", import.meta.url).pathname, "t743-principal", String(port)),
     [],
   );
   let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;

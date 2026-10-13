@@ -489,10 +489,10 @@ impl SqliteWorkspaceAuthority {
         if let Some(text) = query.query.as_deref().filter(|text| !text.is_empty()) {
             let pattern = bind(SqlValue::Text(format!("%{}%", text.to_lowercase())));
             predicates.push(format!(
-                "(lower(t.title) LIKE {p} OR lower(t.body) LIKE {p} OR EXISTS (
+                "(lower(t.title) LIKE {p} OR lower((SELECT initial.body FROM typed_ticket_events initial WHERE initial.workspace_id=t.workspace_id AND initial.ticket_id=t.ticket_id AND initial.event_index=-1 AND initial.archived=0)) LIKE {p} OR EXISTS (
                     SELECT 1 FROM typed_ticket_events e
                     WHERE e.workspace_id=t.workspace_id AND e.ticket_id=t.ticket_id
-                      AND lower(e.body) LIKE {p}) OR EXISTS (
+                      AND e.event_index >= 0 AND e.archived=0 AND lower(e.body) LIKE {p}) OR EXISTS (
                     SELECT 1 FROM typed_ticket_case_history h WHERE h.workspace_id=t.workspace_id AND h.ticket_id=t.ticket_id
                     AND lower(CAST(json_extract(h.judgment_json,'$.action.reason') AS TEXT)) LIKE {p}))",
                 p = pattern
@@ -542,7 +542,7 @@ impl SqliteWorkspaceAuthority {
                 .iter()
                 .map(|kind| bind(SqlValue::Text(kind.clone())))
                 .collect::<Vec<_>>();
-            predicates.push(format!("EXISTS (SELECT 1 FROM typed_ticket_events event WHERE event.workspace_id=t.workspace_id AND event.ticket_id=t.ticket_id AND event.kind IN ({}))", event_kinds.join(",")));
+            predicates.push(format!("EXISTS (SELECT 1 FROM typed_ticket_events event WHERE event.workspace_id=t.workspace_id AND event.ticket_id=t.ticket_id AND event.event_index >= 0 AND event.archived=0 AND event.kind IN ({}))", event_kinds.join(",")));
         }
         // SQL only narrows immutable Ticket metadata. Review/evidence filters
         // must use the same provider + complete linked-result projection as ShowTicket;
@@ -560,7 +560,7 @@ impl SqliteWorkspaceAuthority {
                 if let Some(text) = query.query.as_deref().filter(|text| !text.is_empty()) {
                     let pattern = bind(SqlValue::Text(format!("%{}%", text.to_lowercase())));
                     format!(
-                        "CASE WHEN lower(t.title) LIKE {pattern} THEN 0 WHEN lower(t.body) LIKE {pattern} THEN 1 WHEN EXISTS (SELECT 1 FROM typed_ticket_events event WHERE event.workspace_id=t.workspace_id AND event.ticket_id=t.ticket_id AND lower(event.body) LIKE {pattern}) THEN 2 ELSE 3 END"
+                        "CASE WHEN lower(t.title) LIKE {pattern} THEN 0 WHEN lower((SELECT initial.body FROM typed_ticket_events initial WHERE initial.workspace_id=t.workspace_id AND initial.ticket_id=t.ticket_id AND initial.event_index=-1 AND initial.archived=0)) LIKE {pattern} THEN 1 WHEN EXISTS (SELECT 1 FROM typed_ticket_events event WHERE event.workspace_id=t.workspace_id AND event.ticket_id=t.ticket_id AND event.event_index >= 0 AND event.archived=0 AND lower(event.body) LIKE {pattern}) THEN 2 ELSE 3 END"
                     )
                 } else {
                     "3".to_string()
@@ -762,8 +762,12 @@ impl SqliteWorkspaceAuthority {
         let id = ticket.meta.id.as_str();
         let dependency_check =
             dependency_backend.dependency_check(TicketIdOrSlug::Id(id.to_string()))?;
-        let (body, body_truncated) =
-            truncate_body(ticket.document.body.as_str(), DETAIL_BODY_LIMIT);
+        let initial = ticket.events.iter().find(|event| event.is_initial)
+            .ok_or_else(|| Error::Store("Ticket initial post is missing".into()))?;
+        let initial_post = ticket_event_detail(0, initial);
+        let body = initial_post.body.clone().unwrap_or_default();
+        let body_truncated = initial_post.body_truncated;
+        let subsequent_events = ticket.events.iter().filter(|event| !event.is_initial).collect::<Vec<_>>();
         let event_limit = request
             .event_limit
             .unwrap_or(TICKET_EVENT_LIMIT)
@@ -773,10 +777,10 @@ impl SqliteWorkspaceAuthority {
             .as_deref()
             .map(|cursor| parse_offset_cursor(cursor, "event_cursor"))
             .transpose()?
-            .unwrap_or(ticket.events.len())
-            .min(ticket.events.len());
+            .unwrap_or(subsequent_events.len())
+            .min(subsequent_events.len());
         let event_start = event_end.saturating_sub(event_limit);
-        let events = ticket.events[event_start..event_end]
+        let events = subsequent_events[event_start..event_end]
             .iter()
             .enumerate()
             .map(|(index, event)| ticket_event_detail(event_start + index, event))
@@ -795,8 +799,7 @@ impl SqliteWorkspaceAuthority {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let implementation_reports = ticket
-            .events
+        let implementation_reports = subsequent_events
             .iter()
             .enumerate()
             .filter(|(_, event)| event.kind.as_str() == "implementation_report")
@@ -996,6 +999,8 @@ impl SqliteWorkspaceAuthority {
             .store
             .list_current_ticket_assignment_tracking(&self.workspace_id, &ticket.meta.id)?;
         Ok(TicketDetail {
+            initial_post,
+            created_by: ticket.meta.created_by,
             assignment_tracking,
             id: ticket.meta.id,
             resource_key,
@@ -1017,7 +1022,7 @@ impl SqliteWorkspaceAuthority {
             tags: ticket.tags,
             body,
             body_truncated,
-            event_count: ticket.events.len(),
+            event_count: subsequent_events.len(),
             events,
             event_page: QueryPage {
                 limit: event_limit,
@@ -1770,6 +1775,9 @@ impl std::fmt::Display for ObjectiveQuerySort {
 }
 
 fn ticket_event_ref(sequence: usize, event: &TicketEvent) -> String {
+    if !event.event_ref.is_empty() {
+        return event.event_ref.clone();
+    }
     event
         .attributes
         .get("event_id")
@@ -1777,8 +1785,20 @@ fn ticket_event_ref(sequence: usize, event: &TicketEvent) -> String {
         .unwrap_or_else(|| format!("sequence:{sequence}"))
 }
 
-fn ticket_event_detail(sequence: usize, event: &TicketEvent) -> TicketEventDetail {
+pub(crate) fn ticket_post_body_digest(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(body.as_bytes()))
+}
+
+pub(crate) fn ticket_event_detail(sequence: usize, event: &TicketEvent) -> TicketEventDetail {
+    let (body, body_truncated) = truncate_body(event.body.as_str(), if event.is_initial { DETAIL_BODY_LIMIT } else { TICKET_EVENT_BODY_LIMIT });
     TicketEventDetail {
+        is_initial: event.is_initial,
+        edited_at: event.edited_at.clone(),
+        edited_by: event.edited_by.clone(),
+        editable: event.kind == ticket::TicketEventKind::Comment,
+        body_digest: ticket_post_body_digest(event.body.as_str()),
+        body_truncated,
         sequence,
         event_ref: ticket_event_ref(sequence, event),
         kind: event.kind.as_str().to_owned(),
@@ -1790,8 +1810,7 @@ fn ticket_event_detail(sequence: usize, event: &TicketEvent) -> TicketEventDetai
         reason: event.reason.clone(),
         state_field: event.state_field.clone(),
         heading: event.heading.clone(),
-        body: (!event.body.as_str().is_empty())
-            .then(|| truncate_body(event.body.as_str(), TICKET_EVENT_BODY_LIMIT).0),
+        body: Some(body),
         attributes: event.attributes.clone(),
         references: event
             .references
@@ -2468,6 +2487,7 @@ fn ticket_query_item(
         if let Some((sequence, event)) = authoritative_events
             .iter()
             .enumerate()
+            .filter(|(_, event)| !event.is_initial)
             .find(|(_, event)| event.body.as_str().to_lowercase().contains(&needle))
         {
             matched_fields.push("event".to_string());

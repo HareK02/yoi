@@ -1135,10 +1135,11 @@ mod tests {
                 [worker_id().to_string()],
             )?;
             c.execute(
-                "INSERT INTO typed_tickets (workspace_id, ticket_id, slug, title, status, kind, priority, body, workflow_state, workflow_state_explicit) \
-                 VALUES ('w', 'ticket', 'ticket', 'Ticket', 'open', 'task', 'normal', '', 'open', 1)",
+                "INSERT INTO typed_tickets (workspace_id, ticket_id, slug, title, status, kind, priority, workflow_state, workflow_state_explicit) \
+                 VALUES ('w', 'ticket', 'ticket', 'Ticket', 'open', 'task', 'normal', 'open', 1)",
                 [],
             )?;
+            c.execute("INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,event_ref,kind,body) VALUES('w','ticket',-1,'ticket:-1','comment','')", [])?;
             Ok(())
         })
         .unwrap();
@@ -1398,7 +1399,7 @@ mod tests {
         })
         .unwrap();
         s.with_conn(|conn| {
-            conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit) VALUES('w','ticket-old','ticket-old','Old Ticket','open','task','normal','','open',1)", [])?;
+            conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,workflow_state,workflow_state_explicit) VALUES('w','ticket-old','ticket-old','Old Ticket','open','task','normal','open',1)", [])?;
             conn.execute("INSERT INTO worker_registry(workspace_id,worker_id,runtime_id,display_name,profile,retention_state,created_at,updated_at) VALUES('w','1','r','old worker','builtin:coder','normal','created','2026-08-24T00:00:00Z')", [])?;
             conn.execute("INSERT INTO worker_create_reservations(workspace_id,allocation_key,worker_id,runtime_id,create_fingerprint,state,created_at,updated_at) VALUES('w','allocation-old',?1,'r','fingerprint','created','created','created')", [worker_id().to_string()])?;
             conn.execute("INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,runtime_id,worker_id,assigned_by,assigned_at) VALUES('w','ticket-old','assignment-old','r','1','test','t')", [])?;

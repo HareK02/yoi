@@ -33,6 +33,72 @@
   ],
   "routes": [
     {
+      "id": "posts",
+      "label": "Discussion with initial post and edited replies",
+      "path": "/w/tickets-posts/tickets/T-900",
+      "goal": "Read and edit any discussion post without changing Ticket metadata",
+      "dataState": "Four realistic posts, distinct authors, original and edited times",
+      "ready": {
+        "kind": "selector",
+        "selector": ".ticket-timeline article:nth-of-type(4)"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Thread and metadata",
+          "fullPage": true
+        },
+        {
+          "id": "edit-initial",
+          "label": "Same post editor on initial post",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": ".ticket-timeline article:first-of-type button"
+            }
+          ],
+          "fullPage": true
+        },
+        {
+          "id": "later-posts",
+          "label": "Later discussion and edited attribution",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": ".ticket-timeline article:first-of-type button[type=button]"
+            },
+            {
+              "action": "click",
+              "selector": ".ticket-timeline article:last-of-type header strong"
+            }
+          ],
+          "fullPage": true
+        },
+        {
+          "id": "composer",
+          "label": "Thread-only comment and close footer",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": ".ticket-thread-composer textarea"
+            }
+          ],
+          "fullPage": true
+        },
+        {
+          "id": "metadata",
+          "label": "Title editing separate from post bodies",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": ".ticket-metadata button"
+            }
+          ],
+          "fullPage": true
+        }
+      ]
+    },
+    {
       "id": "options",
       "label": "Return options without conclusion",
       "path": "/w/tickets/tickets/T-1",
@@ -54,7 +120,7 @@
           "interaction": [
             {
               "action": "click",
-              "selector": ".ticket-case-card textarea"
+              "selector": ".ticket-thread-composer textarea"
             }
           ],
           "fullPage": true
@@ -83,7 +149,7 @@
           "interaction": [
             {
               "action": "click",
-              "selector": ".ticket-case-card textarea"
+              "selector": ".ticket-thread-composer textarea"
             }
           ],
           "fullPage": true
@@ -112,7 +178,7 @@
           "interaction": [
             {
               "action": "click",
-              "selector": ".ticket-case-card textarea"
+              "selector": ".ticket-thread-composer textarea"
             }
           ],
           "fullPage": true

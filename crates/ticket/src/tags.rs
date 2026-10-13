@@ -201,6 +201,10 @@ impl SqliteTicketBackend {
             conn,
             ticket_id,
             &TicketEvent {
+                event_ref: String::new(),
+                is_initial: false,
+                edited_at: None,
+                edited_by: None,
                 kind: TicketEventKind::TagsChanged,
                 author: Some(default_author()),
                 at: Some(now_utc()),

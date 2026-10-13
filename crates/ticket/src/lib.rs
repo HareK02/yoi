@@ -623,7 +623,7 @@ pub fn sqlite_ticket_content_digest(
 ) -> Result<Option<String>> {
     let item: Option<(String, String)> = connection
         .query_row(
-            "SELECT title,body FROM typed_tickets WHERE workspace_id=?1 AND ticket_id=?2",
+            "SELECT title,(SELECT body FROM typed_ticket_events e WHERE e.workspace_id=typed_tickets.workspace_id AND e.ticket_id=typed_tickets.ticket_id AND e.event_index=-1) FROM typed_tickets WHERE workspace_id=?1 AND ticket_id=?2",
             params![workspace_id, ticket_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -1018,13 +1018,6 @@ pub struct TicketBodyReplacement {
 struct TicketBodyReplacementOutcome {
     body: MarkdownText,
     replacement_count: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TicketBodyEditAudit {
-    None,
-    WholeBody,
-    Partial { replacement_count: usize },
 }
 
 impl TicketItemEdit {
@@ -1595,6 +1588,8 @@ pub struct TicketMeta {
     pub priority: String,
     pub labels: Vec<String>,
     pub created_at: Option<String>,
+    #[serde(default)]
+    pub created_by: Option<String>,
     pub updated_at: Option<String>,
     pub assignee: Option<String>,
     pub readiness: Option<String>,
@@ -1675,6 +1670,15 @@ pub struct TicketDocument {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketEvent {
+    /// Persisted identity, independent of display position and legacy event_id attributes.
+    #[serde(default)]
+    pub event_ref: String,
+    #[serde(default)]
+    pub is_initial: bool,
+    #[serde(default)]
+    pub edited_at: Option<String>,
+    #[serde(default)]
+    pub edited_by: Option<String>,
     pub kind: TicketEventKind,
     pub author: Option<String>,
     pub at: Option<String>,
@@ -1759,7 +1763,25 @@ impl TicketDoctorReport {
     }
 }
 
+/// A compare-and-swap edit of a real comment post. The host supplies authenticated author.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TicketPostEdit {
+    pub event_ref: String,
+    pub expected_body: MarkdownText,
+    pub body: MarkdownText,
+    pub author: String,
+}
+
 pub trait TicketBackend {
+    fn edit_post_with_snapshots(
+        &self,
+        id: TicketIdOrSlug,
+        edit: TicketPostEdit,
+    ) -> Result<(Ticket, Ticket)>;
+    fn edit_post(&self, id: TicketIdOrSlug, edit: TicketPostEdit) -> Result<Ticket> {
+        self.edit_post_with_snapshots(id, edit)
+            .map(|(_, current)| current)
+    }
     fn list_workspace_tags(&self, request: TagListRequest) -> Result<Vec<WorkspaceTag>>;
     fn mutate_workspace_tag(&self, request: WorkspaceTagMutation) -> Result<WorkspaceTag>;
     fn set_ticket_tags(
@@ -1862,6 +1884,10 @@ pub enum TicketBackendOperation {
         id: TicketIdOrSlug,
         edit: TicketItemEdit,
     },
+    EditPost {
+        id: TicketIdOrSlug,
+        edit: TicketPostEdit,
+    },
     DependencyCheck {
         id: TicketIdOrSlug,
     },
@@ -1927,6 +1953,7 @@ pub enum TicketBackendOperationResult {
     Unit,
     Tickets(Vec<TicketSummary>),
     Ticket(Ticket),
+    TicketSnapshots { previous: Ticket, current: Ticket },
     TicketRef(TicketRef),
     DependencyCheck(TicketDependencyCheck),
     QueueOutcome(TicketQueueOutcome),
@@ -1971,6 +1998,10 @@ where
         }
         TicketBackendOperation::EditItem { id, edit } => {
             TicketBackendOperationResult::Ticket(backend.edit_item(id, edit)?)
+        }
+        TicketBackendOperation::EditPost { id, edit } => {
+            let (previous, current) = backend.edit_post_with_snapshots(id, edit)?;
+            TicketBackendOperationResult::TicketSnapshots { previous, current }
         }
         TicketBackendOperation::DependencyCheck { id } => {
             TicketBackendOperationResult::DependencyCheck(backend.dependency_check(id)?)
@@ -2444,14 +2475,6 @@ impl SqliteTicketBackend {
         op(&conn)
     }
 
-    fn created_event_body(&self) -> &'static str {
-        if is_japanese_record_language(self.record_language()) {
-            "Ticket が作成されました。"
-        } else {
-            "Ticket created."
-        }
-    }
-
     fn default_item_body(&self) -> &'static str {
         if is_japanese_record_language(self.record_language()) {
             "## 背景\n\n## 要件\n\n## 受け入れ条件\n"
@@ -2564,15 +2587,20 @@ impl SqliteTicketBackend {
     }
 
     fn insert_event(&self, conn: &Connection, ticket_id: &str, event: &TicketEvent) -> Result<()> {
-        let next_index: i64 = conn.query_row(
+        let next_index: i64 = if event.is_initial {
+            -1
+        } else {
+            conn.query_row(
             "SELECT COALESCE(MAX(event_index), -1) + 1 FROM typed_ticket_events WHERE workspace_id = ?1 AND ticket_id = ?2",
             params![self.workspace_id, ticket_id],
             |row| row.get(0),
-        ).map_err(sqlite_err)?;
+        ).map_err(sqlite_err)?
+        };
+        let event_ref = format!("{ticket_id}:{next_index}");
         conn.execute(r#"INSERT INTO typed_ticket_events
-            (workspace_id, ticket_id, event_index, kind, author, at, status, from_state, to_state, reason, state_field, heading, body)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
-            params![self.workspace_id, ticket_id, next_index, event.kind.as_str(), event.author, event.at, event.status, event.from, event.to, event.reason, event.state_field, event.heading, event.body.as_str()]
+            (workspace_id, ticket_id, event_index, kind, author, at, status, from_state, to_state, reason, state_field, heading, body, event_ref, archived)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
+            params![self.workspace_id, ticket_id, next_index, event.kind.as_str(), event.author, event.at, event.status, event.from, event.to, event.reason, event.state_field, event.heading, event.body.as_str(), event_ref, matches!(event.kind.as_str(), "create" | "item_edit")]
         ).map_err(sqlite_err)?;
         for (ordinal, reference) in event.references.iter().enumerate() {
             conn.execute("INSERT INTO typed_ticket_event_references (workspace_id, ticket_id, event_index, ordinal, kind, target) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -2611,9 +2639,9 @@ impl SqliteTicketBackend {
 
     fn insert_ticket(&self, conn: &Connection, ticket: &Ticket) -> Result<()> {
         conn.execute(r#"INSERT INTO typed_tickets
-            (workspace_id, ticket_id, slug, title, status, kind, priority, body, created_at, updated_at, assignee, readiness, workflow_state, workflow_state_explicit, queued_by, queued_at, resolution)
+            (workspace_id, ticket_id, slug, title, status, kind, priority, created_by, created_at, updated_at, assignee, readiness, workflow_state, workflow_state_explicit, queued_by, queued_at, resolution)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"#,
-            params![self.workspace_id, ticket.meta.id, ticket.meta.slug, ticket.meta.title, ticket.meta.status.as_str(), ticket.meta.kind, ticket.meta.priority, ticket.document.body.as_str(), ticket.meta.created_at, ticket.meta.updated_at, ticket.meta.assignee, ticket.meta.readiness, ticket.meta.workflow_state.as_str(), if ticket.meta.workflow_state_explicit { 1 } else { 0 }, ticket.meta.queued_by, ticket.meta.queued_at, ticket.resolution.as_ref().map(|body| body.as_str())]
+            params![self.workspace_id, ticket.meta.id, ticket.meta.slug, ticket.meta.title, ticket.meta.status.as_str(), ticket.meta.kind, ticket.meta.priority, ticket.meta.created_by, ticket.meta.created_at, ticket.meta.updated_at, ticket.meta.assignee, ticket.meta.readiness, ticket.meta.workflow_state.as_str(), if ticket.meta.workflow_state_explicit { 1 } else { 0 }, ticket.meta.queued_by, ticket.meta.queued_at, ticket.resolution.as_ref().map(|body| body.as_str())]
         ).map_err(sqlite_err)?;
         self.replace_ticket_targets(conn, &ticket.meta.id, &ticket.meta.targets)?;
         self.insert_ordered_values(
@@ -2735,6 +2763,7 @@ impl SqliteTicketBackend {
             priority: row.get(5)?,
             labels: Vec::new(),
             created_at: row.get(6)?,
+            created_by: row.get(16)?,
             updated_at: row.get(7)?,
             assignee: row.get(8)?,
             readiness: row.get(9)?,
@@ -2751,7 +2780,7 @@ impl SqliteTicketBackend {
     fn load_ticket(&self, conn: &Connection, ticket_id: &str) -> Result<Ticket> {
         #[cfg(test)]
         self.full_ticket_load_count.fetch_add(1, Ordering::SeqCst);
-        let (mut meta, body, resolution): (TicketMeta, String, Option<String>) = conn.query_row(r#"SELECT ticket_id, slug, title, status, kind, priority, created_at, updated_at, assignee, readiness, body, resolution, workflow_state, workflow_state_explicit, queued_by, queued_at FROM typed_tickets WHERE workspace_id = ?1 AND ticket_id = ?2"#,
+        let (mut meta, body, resolution): (TicketMeta, String, Option<String>) = conn.query_row(r#"SELECT ticket_id, slug, title, status, kind, priority, created_at, updated_at, assignee, readiness, (SELECT body FROM typed_ticket_events e WHERE e.workspace_id = typed_tickets.workspace_id AND e.ticket_id = typed_tickets.ticket_id AND e.event_index = -1), resolution, workflow_state, workflow_state_explicit, queued_by, queued_at, created_by FROM typed_tickets WHERE workspace_id = ?1 AND ticket_id = ?2"#,
             params![self.workspace_id, ticket_id], |row| Ok((Self::ticket_meta_from_row(row)?, row.get(10)?, row.get(11)?))).optional().map_err(sqlite_err)?.ok_or_else(|| TicketError::NotFound(ticket_id.to_string()))?;
         meta.resource_key = Self::resource_key_for(conn, &self.workspace_id, ticket_id)?;
         meta.targets = self.load_ticket_targets(conn, ticket_id)?;
@@ -2861,7 +2890,7 @@ impl SqliteTicketBackend {
     }
 
     fn load_events(&self, conn: &Connection, ticket_id: &str) -> Result<Vec<TicketEvent>> {
-        let mut stmt = conn.prepare(r#"SELECT event_index, kind, author, at, status, from_state, to_state, reason, state_field, heading, body FROM typed_ticket_events WHERE workspace_id = ?1 AND ticket_id = ?2 ORDER BY event_index ASC"#).map_err(sqlite_err)?;
+        let mut stmt = conn.prepare(r#"SELECT event_index, kind, author, at, status, from_state, to_state, reason, state_field, heading, body, event_ref, edited_at, edited_by FROM typed_ticket_events WHERE workspace_id = ?1 AND ticket_id = ?2 AND archived = 0 ORDER BY event_index ASC"#).map_err(sqlite_err)?;
         let rows = stmt
             .query_map(params![self.workspace_id, ticket_id], |row| {
                 Ok((
@@ -2876,17 +2905,38 @@ impl SqliteTicketBackend {
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, Option<String>>(9)?,
                     row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
                 ))
             })
             .map_err(sqlite_err)?;
         let mut events = Vec::new();
         for row in rows {
-            let (index, kind, author, at, status, from, to, reason, state_field, heading, body) =
-                row.map_err(sqlite_err)?;
+            let (
+                index,
+                kind,
+                author,
+                at,
+                status,
+                from,
+                to,
+                reason,
+                state_field,
+                heading,
+                body,
+                event_ref,
+                edited_at,
+                edited_by,
+            ) = row.map_err(sqlite_err)?;
             let mut attributes = self.load_event_attributes(conn, ticket_id, index)?;
-            attributes.insert("event_id".to_string(), format!("{ticket_id}:{index}"));
+            attributes.insert("event_id".to_string(), event_ref.clone());
             attributes.insert("event_sequence".to_string(), index.to_string());
             events.push(TicketEvent {
+                event_ref,
+                is_initial: index == -1,
+                edited_at,
+                edited_by,
                 kind: TicketEventKind::from(kind.as_str()),
                 author,
                 at,
@@ -2961,7 +3011,7 @@ impl SqliteTicketBackend {
         conn: &Connection,
         filter: TicketListQuery,
     ) -> Result<Vec<TicketSummary>> {
-        let mut stmt = conn.prepare(r#"SELECT ticket_id, slug, title, status, kind, priority, created_at, updated_at, assignee, readiness, body, resolution, workflow_state, workflow_state_explicit, queued_by, queued_at FROM typed_tickets WHERE workspace_id = ?1 ORDER BY ticket_id ASC"#).map_err(sqlite_err)?;
+        let mut stmt = conn.prepare(r#"SELECT ticket_id, slug, title, status, kind, priority, created_at, updated_at, assignee, readiness, NULL, resolution, workflow_state, workflow_state_explicit, queued_by, queued_at, created_by FROM typed_tickets WHERE workspace_id = ?1 ORDER BY ticket_id ASC"#).map_err(sqlite_err)?;
         let rows = stmt
             .query_map(params![self.workspace_id], Self::ticket_meta_from_row)
             .map_err(sqlite_err)?;
@@ -3048,6 +3098,36 @@ fn finish_sqlite_transaction<R>(conn: &Connection, result: Result<R>) -> Result<
 }
 
 impl TicketBackend for SqliteTicketBackend {
+    fn edit_post_with_snapshots(
+        &self,
+        id: TicketIdOrSlug,
+        edit: TicketPostEdit,
+    ) -> Result<(Ticket, Ticket)> {
+        self.with_write(|conn| {
+            validate_required_event_value("event_ref", &edit.event_ref)?;
+            validate_required_event_value("author", &edit.author)?;
+            let ticket_id = self.resolve_ticket_id(conn, id)?;
+            let previous = self.load_ticket(conn, &ticket_id)?;
+            let post = previous.events.iter().find(|event| event.event_ref == edit.event_ref)
+                .ok_or_else(|| TicketError::NotFound(edit.event_ref.clone()))?;
+            if post.kind != TicketEventKind::Comment {
+                return Err(TicketError::Conflict("only comment posts can be edited".into()));
+            }
+            if post.body != edit.expected_body {
+                return Err(TicketError::Conflict("stale Ticket post body".into()));
+            }
+            let now = now_utc();
+            let changed = conn.execute(
+                "UPDATE typed_ticket_events SET body = ?4, edited_at = ?5, edited_by = ?6 WHERE workspace_id = ?1 AND ticket_id = ?2 AND event_ref = ?3 AND body = ?7 AND kind = 'comment' AND archived = 0",
+                params![self.workspace_id, ticket_id, edit.event_ref, edit.body.as_str(), now, edit.author, edit.expected_body.as_str()],
+            ).map_err(sqlite_err)?;
+            if changed != 1 { return Err(TicketError::Conflict("stale Ticket post body".into())); }
+            self.touch_ticket(conn, &ticket_id, &now)?;
+            let current = self.load_ticket(conn, &ticket_id)?;
+            Ok((previous, current))
+        })
+    }
+
     fn list_workspace_tags(&self, request: TagListRequest) -> Result<Vec<WorkspaceTag>> {
         self.list_tags(request)
     }
@@ -3109,6 +3189,10 @@ impl TicketBackend for SqliteTicketBackend {
             } else {
                 ExtensibleTicketStatus::Open
             };
+            let created_by = input
+                .author
+                .clone()
+                .filter(|author| !author.trim().is_empty());
             let meta = TicketMeta {
                 id: id.clone(),
                 resource_key: None,
@@ -3119,6 +3203,7 @@ impl TicketBackend for SqliteTicketBackend {
                 priority: input.priority,
                 labels: input.labels,
                 created_at: Some(now.clone()),
+                created_by: created_by.clone(),
                 updated_at: Some(now.clone()),
                 assignee: input.assignee,
                 readiness: input.readiness,
@@ -3137,6 +3222,7 @@ impl TicketBackend for SqliteTicketBackend {
             };
             let author = input
                 .author
+                .clone()
                 .unwrap_or_else(|| "SqliteTicketBackend".to_string());
             let ticket = Ticket {
                 closure_operation_key: None,
@@ -3146,20 +3232,24 @@ impl TicketBackend for SqliteTicketBackend {
                 tags: Vec::new(),
                 meta,
                 document: TicketDocument {
-                    body,
+                    body: body.clone(),
                     raw_frontmatter: BTreeMap::new(),
                 },
                 events: vec![TicketEvent {
-                    kind: TicketEventKind::Create,
-                    author: Some(author.clone()),
+                    event_ref: String::new(),
+                    is_initial: true,
+                    edited_at: None,
+                    edited_by: None,
+                    kind: TicketEventKind::Comment,
+                    author: created_by,
                     at: Some(now.clone()),
                     status: None,
                     from: None,
                     to: None,
                     reason: None,
                     state_field: None,
-                    heading: Some(TicketEventKind::Create.heading()),
-                    body: MarkdownText::new(self.created_event_body()),
+                    heading: None,
+                    body,
                     references: Vec::new(),
                     attributes: BTreeMap::new(),
                 }],
@@ -3226,31 +3316,27 @@ impl TicketBackend for SqliteTicketBackend {
             let ticket_id = self.resolve_ticket_id(conn, id)?;
             let previous = self.load_ticket(conn, &ticket_id)?;
             let now = now_utc();
-            let mut body_edit_audit = TicketBodyEditAudit::None;
             if let Some(title) = edit.title.as_ref() {
                 conn.execute("UPDATE typed_tickets SET title = ?3, updated_at = ?4 WHERE workspace_id = ?1 AND ticket_id = ?2", params![self.workspace_id, ticket_id, title, now]).map_err(sqlite_err)?;
             }
             let mut updated_body = None;
             if let Some(body) = edit.body.as_ref() {
                 updated_body = Some(body.clone());
-                body_edit_audit = TicketBodyEditAudit::WholeBody;
             }
             if let Some(replacement) = edit.body_replacement.as_ref() {
                 let current_body: String = conn
                     .query_row(
-                        "SELECT body FROM typed_tickets WHERE workspace_id = ?1 AND ticket_id = ?2",
+                        "SELECT body FROM typed_ticket_events WHERE workspace_id = ?1 AND ticket_id = ?2 AND event_index = -1",
                         params![self.workspace_id, ticket_id],
                         |row| row.get(0),
                     )
                     .map_err(sqlite_err)?;
                 let outcome = replacement.apply(current_body.as_str())?;
                 updated_body = Some(outcome.body);
-                body_edit_audit = TicketBodyEditAudit::Partial {
-                    replacement_count: outcome.replacement_count,
-                };
             }
             if let Some(body) = updated_body.as_ref() {
-                conn.execute("UPDATE typed_tickets SET body = ?3, updated_at = ?4 WHERE workspace_id = ?1 AND ticket_id = ?2", params![self.workspace_id, ticket_id, body.as_str(), now]).map_err(sqlite_err)?;
+                conn.execute("UPDATE typed_ticket_events SET body = ?3, edited_at = ?4, edited_by = ?5 WHERE workspace_id = ?1 AND ticket_id = ?2 AND event_index = -1", params![self.workspace_id, ticket_id, body.as_str(), now, edit.author]).map_err(sqlite_err)?;
+                self.touch_ticket(conn, &ticket_id, &now)?;
             }
             if let Some(targets) = edit.targets.as_ref() {
                 let targets = match targets {
@@ -3261,43 +3347,6 @@ impl TicketBackend for SqliteTicketBackend {
                 self.touch_ticket(conn, &ticket_id, &now)?;
             }
 
-            let mut changes = Vec::new();
-            if edit.title.is_some() {
-                changes.push("title");
-            }
-            if !matches!(body_edit_audit, TicketBodyEditAudit::None) {
-                changes.push("body");
-            }
-            if edit.targets.is_some() {
-                changes.push("targets");
-            }
-            let mut attributes = BTreeMap::new();
-            attributes.insert("changes".to_string(), changes.join(","));
-            let body = match body_edit_audit {
-                TicketBodyEditAudit::None => {
-                    MarkdownText::new(format!("Ticket item updated: {}.", changes.join(", ")))
-                }
-                TicketBodyEditAudit::WholeBody => {
-                    attributes.insert("body_edit".to_string(), "whole".to_string());
-                    MarkdownText::new(format!(
-                        "Ticket item updated: {}. Body was replaced as a whole.",
-                        changes.join(", ")
-                    ))
-                }
-                TicketBodyEditAudit::Partial { replacement_count } => {
-                    attributes.insert("body_edit".to_string(), "partial".to_string());
-                    attributes.insert(
-                        "replacement_count".to_string(),
-                        replacement_count.to_string(),
-                    );
-                    MarkdownText::new(format!(
-                        "Ticket item updated: {}. Body replacement applied to {replacement_count} occurrence(s).",
-                        changes.join(", ")
-                    ))
-                }
-            };
-            let event = TicketEvent { kind: TicketEventKind::Other("item_edit".to_string()), author: Some(edit.author.unwrap_or_else(default_author)), at: Some(now), status: None, from: None, to: None, reason: None, state_field: None, heading: Some("Item edit".to_string()), body, references: Vec::new(), attributes };
-            self.insert_event(conn, &ticket_id, &event)?;
             let current = self.load_ticket(conn, &ticket_id)?;
             Ok((previous, current))
         })
@@ -3335,6 +3384,10 @@ impl TicketBackend for SqliteTicketBackend {
                 conn,
                 &ticket_id,
                 &TicketEvent {
+                    event_ref: String::new(),
+                    is_initial: false,
+                    edited_at: None,
+                    edited_by: None,
                     kind: event.kind.clone(),
                     author: event.author.or_else(|| Some(default_author())),
                     at: Some(at.clone()),
@@ -3368,6 +3421,10 @@ impl TicketBackend for SqliteTicketBackend {
                 conn,
                 &ticket_id,
                 &TicketEvent {
+                    event_ref: String::new(),
+                    is_initial: false,
+                    edited_at: None,
+                    edited_by: None,
                     kind: TicketEventKind::IntakeSummary,
                     author: Some(summary.author.unwrap_or_else(default_author)),
                     at: Some(at.clone()),
@@ -3444,7 +3501,7 @@ impl TicketBackend for SqliteTicketBackend {
             self.insert_case_history(conn, &ticket_id, &entry, &fingerprint)?;
             conn.execute("UPDATE typed_tickets SET workflow_state = ?3, workflow_state_explicit = 1, status = ?3, updated_at = ?4, resolution = CASE WHEN ?3 = 'closed' THEN ?5 ELSE NULL END WHERE workspace_id = ?1 AND ticket_id = ?2", params![self.workspace_id, ticket_id, state.as_str(), at, request.explanation]).map_err(sqlite_err)?;
             let kind = if matches!(request.action, TicketCaseAction::Close { .. }) { TicketEventKind::Close } else { TicketEventKind::StateChanged };
-            self.insert_event(conn, &ticket_id, &TicketEvent {
+            self.insert_event(conn, &ticket_id, &TicketEvent { event_ref: String::new(), is_initial: false, edited_at: None, edited_by: None,
                 heading: Some(kind.heading()), kind, author: Some(entry.author), at: Some(at), status: Some(state.to_string()), from: Some(previous.meta.workflow_state.to_string()), to: Some(state.to_string()), reason: Some(request.explanation.clone()), state_field: Some("case".into()), body: MarkdownText::new(&request.explanation), references: request.references.clone(),
                 attributes: BTreeMap::from([("operation_key".into(), request.operation_key.clone()), ("fingerprint_version".into(), "case-update-v1".into()), ("request_fingerprint".into(), fingerprint.clone()), ("case_action".into(), serde_json::to_string(&request.action).map_err(sqlite_err)?), ("expected_content_digest".into(), request.expected_content_digest.clone())]),
             })?;
@@ -3503,7 +3560,7 @@ impl TicketBackend for SqliteTicketBackend {
                 self.insert_event(
                     conn,
                     &ticket_id,
-                    &TicketEvent {
+                    &TicketEvent { event_ref: String::new(), is_initial: false, edited_at: None, edited_by: None,
                         kind: TicketEventKind::IntakeSummary,
                         author: summary.author,
                         at: None,
@@ -3522,7 +3579,7 @@ impl TicketBackend for SqliteTicketBackend {
             self.insert_event(
                 conn,
                 &ticket_id,
-                &TicketEvent {
+                &TicketEvent { event_ref: String::new(), is_initial: false, edited_at: None, edited_by: None,
                     kind: TicketEventKind::StateChanged,
                     author: Some(request.author.unwrap_or_else(default_author)),
                     at: Some(at.clone()),
@@ -3588,7 +3645,7 @@ impl TicketBackend for SqliteTicketBackend {
                 "UPDATE typed_tickets SET queued_by = ?3, queued_at = ?4, updated_at = ?4 WHERE workspace_id = ?1 AND ticket_id = ?2",
                 params![self.workspace_id, requested_ticket, queued_by, at],
             ).map_err(sqlite_err)?;
-            self.insert_event(conn, &requested_ticket, &TicketEvent {
+            self.insert_event(conn, &requested_ticket, &TicketEvent { event_ref: String::new(), is_initial: false, edited_at: None, edited_by: None,
                 kind: TicketEventKind::StateChanged,
                 author: Some(queued_by.to_owned()),
                 at: Some(at),
@@ -4397,15 +4454,11 @@ mod tests {
                 ticket_target("docs", Some("main"), TicketTargetAccess::ReadOnly),
             ]
         );
-        let edit_event = edited
-            .events
-            .iter()
-            .rev()
-            .find(|event| event.kind == TicketEventKind::Other("item_edit".to_string()))
-            .expect("item_edit event");
-        assert_eq!(
-            edit_event.attributes.get("changes"),
-            Some(&"targets".to_string())
+        assert!(
+            !edited
+                .events
+                .iter()
+                .any(|event| event.kind.as_str() == "item_edit")
         );
 
         let cleared = backend
@@ -4443,21 +4496,11 @@ mod tests {
             edited.document.body.as_str().trim_start_matches('\n'),
             "ALPHA\nbeta\nALPHA\n"
         );
-        let edit_event = edited
-            .events
-            .iter()
-            .rev()
-            .find(|event| event.kind == TicketEventKind::Other("item_edit".to_string()))
-            .expect("item_edit event");
-        assert_eq!(
-            edit_event.attributes.get("body_edit"),
-            Some(&"partial".to_string())
-        );
-        assert_eq!(
-            edit_event.attributes.get("replacement_count"),
-            Some(&"2".to_string())
-        );
-        assert!(edit_event.body.as_str().contains("2 occurrence"));
+        assert_eq!(edited.events.len(), 1);
+        assert_eq!(edited.events[0].kind, TicketEventKind::Comment);
+        assert_eq!(edited.events[0].body, edited.document.body);
+        assert_eq!(edited.events[0].edited_by.as_deref(), Some("tester"));
+        assert!(edited.events[0].edited_at.is_some());
 
         let duplicate_err = backend
             .edit_item(
@@ -5472,12 +5515,7 @@ mod tests {
         let ticket = backend.show(TicketIdOrSlug::Id(created.id)).unwrap();
 
         assert!(ticket.document.body.as_str().contains("## 背景"));
-        assert!(
-            ticket.events[0]
-                .body
-                .as_str()
-                .contains("Ticket が作成されました。")
-        );
+        assert!(ticket.events[0].body.as_str().contains("## 背景"));
     }
 
     #[test]

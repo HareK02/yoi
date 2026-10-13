@@ -37,9 +37,10 @@ const MAX_BODY_MAX_BYTES: usize = 64 * 1024;
 const DEFAULT_DIAGNOSTIC_LIMIT: usize = 100;
 const MAX_DIAGNOSTIC_LIMIT: usize = 500;
 
-pub const TICKET_BASE_TOOL_NAMES: [&str; 13] = [
+pub const TICKET_BASE_TOOL_NAMES: [&str; 14] = [
     "TicketCreate",
     "TicketEditItem",
+    "TicketEditPost",
     "QueryTicket",
     "ShowTicket",
     "TicketComment",
@@ -71,9 +72,10 @@ pub const TICKET_ORCHESTRATION_TOOL_NAMES: [&str; 5] = [
 pub const TICKET_ORCHESTRATION_READ_ONLY_TOOL_NAMES: [&str; 2] =
     ["TicketRelationQuery", "TicketOrchestrationPlanQuery"];
 
-pub const TICKET_TOOL_NAMES: [&str; 19] = [
+pub const TICKET_TOOL_NAMES: [&str; 20] = [
     "TicketCreate",
     "TicketEditItem",
+    "TicketEditPost",
     "QueryTicket",
     "ShowTicket",
     "TicketComment",
@@ -102,9 +104,10 @@ pub const TICKET_READ_ONLY_TOOL_NAMES: [&str; 6] = [
     "TicketOrchestrationPlanQuery",
 ];
 
-pub const TICKET_MUTATING_TOOL_NAMES: [&str; 13] = [
+pub const TICKET_MUTATING_TOOL_NAMES: [&str; 14] = [
     "TicketCreate",
     "TicketEditItem",
+    "TicketEditPost",
     "TicketComment",
     "TicketPlan",
     "TicketDecision",
@@ -121,13 +124,16 @@ pub const TICKET_MUTATING_TOOL_NAMES: [&str; 13] = [
 const CREATE_DESCRIPTION: &str = "Create a Ticket through the configured typed Ticket backend. \
 `title` is required, `body` is Markdown, and the backend assigns the id.";
 const EDIT_ITEM_DESCRIPTION: &str = "Edit a Ticket item through the configured typed Ticket backend. \
-This updates the current item title/body and appends an audited item_edit event. Intended for \
+This updates the current item title and/or initial comment body without adding a discussion entry. Intended for \
 User/Companion authoring surfaces, not Orchestrator implementation control.";
+const EDIT_POST_DESCRIPTION: &str = "Edit an initial or discussion comment by stable event_ref and exact expected_body. \
+Preserves original author and time and records edit metadata without adding a discussion entry. \
+System events and case judgments cannot be edited. The Workspace backend supplies the authenticated editor.";
 const LIST_DESCRIPTION: &str = "Query Tickets from the configured typed Ticket backend as a bounded \
 overview. Workspace-backed Workers replace this definition with the richer authoritative \
 text/event/evidence/relation/Objective/time/attention query.";
 const SHOW_DESCRIPTION: &str = "Show one Ticket by id or exact query through the configured typed \
-Ticket backend. Output includes bounded Markdown body, recent events, resolution, and artifact \
+Ticket backend. Output includes the initial comment and recent events with stable event_ref, author/time and edit metadata, bounded Markdown body, resolution, and artifact \
 metadata; Workspace-backed Workers replace this definition with the richer authoritative evidence projection.";
 const COMMENT_DESCRIPTION: &str = "Append a typed Ticket comment event. `body` is Markdown.";
 const PLAN_DESCRIPTION: &str = "Append a typed Ticket plan event. `body` is Markdown.";
@@ -166,6 +172,7 @@ fn base_tool_description(name: &str) -> &'static str {
     match name {
         "TicketCreate" => CREATE_DESCRIPTION,
         "TicketEditItem" => EDIT_ITEM_DESCRIPTION,
+        "TicketEditPost" => EDIT_POST_DESCRIPTION,
         "QueryTicket" => LIST_DESCRIPTION,
         "ShowTicket" => SHOW_DESCRIPTION,
         "TicketComment" => COMMENT_DESCRIPTION,
@@ -246,6 +253,14 @@ impl From<crate::SqliteTicketBackend> for TicketToolBackend {
 }
 
 impl TicketBackend for TicketToolBackend {
+    fn edit_post_with_snapshots(
+        &self,
+        id: TicketIdOrSlug,
+        edit: crate::TicketPostEdit,
+    ) -> TicketResult<(Ticket, Ticket)> {
+        self.backend.edit_post_with_snapshots(id, edit)
+    }
+
     fn list_workspace_tags(
         &self,
         request: crate::TagListRequest,
@@ -435,6 +450,19 @@ struct TicketEditItemParams {
     /// Optional ordered targets replacement or clear operation.
     #[serde(default)]
     targets: Option<crate::TicketTargetsEdit>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TicketEditPostParams {
+    /// Ticket reference. Prefer T-*; canonical internal ids remain accepted.
+    ticket: String,
+    /// Persisted post identity returned by ShowTicket, not a display ordinal.
+    event_ref: String,
+    /// Exact observed Markdown body. A stale or truncated body cannot authorize an edit.
+    expected_body: String,
+    /// Replacement Markdown body.
+    body: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
@@ -799,6 +827,11 @@ struct TicketEditItemTool {
 }
 
 #[derive(Clone)]
+struct TicketEditPostTool {
+    backend: TicketToolBackend,
+}
+
+#[derive(Clone)]
 struct QueryTicketTool {
     backend: TicketToolBackend,
 }
@@ -977,6 +1010,38 @@ impl Tool for TicketEditItemTool {
                 DEFAULT_EVENT_LIMIT,
                 DEFAULT_ARTIFACT_LIMIT,
                 16 * 1024,
+            ),
+        ))
+    }
+}
+
+#[async_trait]
+impl Tool for TicketEditPostTool {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: agen::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let params: TicketEditPostParams = parse_input("TicketEditPost", input_json)?;
+        let ticket = self
+            .backend
+            .edit_post(
+                TicketIdOrSlug::from(params.ticket),
+                crate::TicketPostEdit {
+                    event_ref: params.event_ref,
+                    expected_body: MarkdownText::new(params.expected_body),
+                    body: MarkdownText::new(params.body),
+                    author: default_author(),
+                },
+            )
+            .map_err(|error| backend_error("TicketEditPost", error))?;
+        Ok(json_output(
+            format!("Edited Ticket post in {}", ticket.meta.id),
+            ticket_json(
+                &ticket,
+                DEFAULT_EVENT_LIMIT,
+                DEFAULT_ARTIFACT_LIMIT,
+                DEFAULT_BODY_MAX_BYTES,
             ),
         ))
     }
@@ -1629,6 +1694,28 @@ fn ticket_relations_json(ticket: &Ticket) -> Value {
     })
 }
 
+fn ticket_event_json(event: &crate::TicketEvent, body_max_bytes: usize) -> Value {
+    json!({
+        "event_ref": event.event_ref,
+        "is_initial": event.is_initial,
+        "kind": event.kind.as_str(),
+        "author": event.author,
+        "at": event.at,
+        "edited_at": event.edited_at,
+        "edited_by": event.edited_by,
+        "state": event.status,
+        "from": event.from,
+        "to": event.to,
+        "reason": event.reason,
+        "state_field": event.state_field,
+        "attributes": event.attributes,
+        "references": event.references,
+        "heading": event.heading,
+        "body": truncate_text(event.body.as_str(), body_max_bytes),
+        "body_truncated": event.body.as_str().len() > body_max_bytes,
+    })
+}
+
 fn ticket_json(
     ticket: &Ticket,
     event_limit: usize,
@@ -1640,21 +1727,7 @@ fn ticket_json(
         .events
         .iter()
         .skip(event_count.saturating_sub(event_limit))
-        .map(|event| {
-            json!({
-                "kind": event.kind.as_str(),
-                "author": event.author,
-                "at": event.at,
-                "state": event.status,
-                "from": event.from,
-                "to": event.to,
-                "reason": event.reason,
-                "state_field": event.state_field,
-                "attributes": event.attributes,
-                "heading": event.heading,
-                "body": truncate_text(event.body.as_str(), body_max_bytes),
-            })
-        })
+        .map(|event| ticket_event_json(event, body_max_bytes))
         .collect();
     let artifact_count = ticket.artifacts.len();
     let artifacts: Vec<_> = ticket
@@ -1669,6 +1742,7 @@ fn ticket_json(
             "title": ticket.meta.title,
             "state": ticket.meta.workflow_state.as_str(),
             "created_at": ticket.meta.created_at,
+            "created_by": ticket.meta.created_by,
             "updated_at": ticket.meta.updated_at,
             "assignee": ticket.meta.assignee,
             "readiness": ticket.meta.readiness,
@@ -1682,6 +1756,7 @@ fn ticket_json(
         "current_closure": ticket.current_closure.as_ref().map(|j| json!({"operation_key": j.operation_key, "reason": j.reason, "explanation": truncate_text(&j.explanation, body_max_bytes), "author": j.author, "references": j.references, "at": j.at})),
         "case_history": { "count": ticket.case_history.len(), "items": ticket.case_history.iter().rev().take(event_limit).map(|j| json!({"operation_key": j.operation_key, "previous_closure_operation_key": j.previous_closure_operation_key, "action": j.action, "explanation": truncate_text(&j.explanation, body_max_bytes), "author": j.author, "references": j.references, "at": j.at})).collect::<Vec<_>>() },
         "legacy_workflow_snapshot": ticket.legacy_workflow_snapshot,
+        "initial_post": ticket.events.iter().find(|event| event.is_initial).map(|event| ticket_event_json(event, body_max_bytes)),
         "body": truncate_text(ticket.document.body.as_str(), body_max_bytes),
         "events": {
             "count": event_count,
@@ -1784,6 +1859,7 @@ fn input_schema(name: &str) -> Value {
     match name {
         "TicketCreate" => serde_json::to_value(schemars::schema_for!(TicketCreateParams)),
         "TicketEditItem" => serde_json::to_value(schemars::schema_for!(TicketEditItemParams)),
+        "TicketEditPost" => serde_json::to_value(schemars::schema_for!(TicketEditPostParams)),
         "QueryTicket" => serde_json::to_value(schemars::schema_for!(QueryTicketParams)),
         "ShowTicket" => serde_json::to_value(schemars::schema_for!(ShowTicketParams)),
         "TicketComment" | "TicketPlan" | "TicketDecision" | "TicketImplementationReport" => {
@@ -1829,6 +1905,7 @@ macro_rules! impl_from_backend {
 
 impl_from_backend!(TicketCreateTool);
 impl_from_backend!(TicketEditItemTool);
+impl_from_backend!(TicketEditPostTool);
 impl_from_backend!(QueryTicketTool);
 impl_from_backend!(ShowTicketTool);
 impl_from_backend!(TicketCommentTool);
@@ -1853,6 +1930,7 @@ pub fn ticket_tools(backend: impl Into<TicketToolBackend>) -> Vec<ToolDefinition
     vec![
         tool_definition::<TicketCreateTool>("TicketCreate", backend.clone()),
         tool_definition::<TicketEditItemTool>("TicketEditItem", backend.clone()),
+        tool_definition::<TicketEditPostTool>("TicketEditPost", backend.clone()),
         tool_definition::<QueryTicketTool>("QueryTicket", backend.clone()),
         tool_definition::<ShowTicketTool>("ShowTicket", backend.clone()),
         tool_definition::<TicketCommentTool>("TicketComment", backend.clone()),
@@ -1948,6 +2026,131 @@ mod tests {
             .expect("tool exists")
     }
 
+    #[tokio::test]
+    async fn edit_post_tool_and_show_preserve_common_identity_and_metadata() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let mut input = NewTicket::new("Post tools");
+        input.author = Some("creator".into());
+        input.body = MarkdownText::new("Initial body");
+        let reference = backend.create(input).unwrap();
+        let comment = tool_by_name(backend.clone(), "TicketComment");
+        comment
+            .execute(
+                &json!({"ticket": reference.id, "body": "Discussion body"}).to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let before = backend.show(reference.id.clone().into()).unwrap();
+        let edit = tool_by_name(backend.clone(), "TicketEditPost");
+        let show = tool_by_name(backend.clone(), "ShowTicket");
+        let schema = input_schema("TicketEditPost");
+        assert_eq!(schema["additionalProperties"], false);
+        for key in ["ticket", "event_ref", "expected_body", "body"] {
+            assert!(schema["required"].as_array().unwrap().contains(&json!(key)));
+        }
+        assert!(
+            !schema["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("author")
+        );
+        for post in &before.events {
+            let args = json!({"ticket": reference.id, "event_ref": post.event_ref, "expected_body": post.body.as_str(), "body": format!("Edited {}", post.body.as_str())});
+            let output = edit
+                .execute(&args.to_string(), Default::default())
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_str(&output.content.unwrap()).unwrap();
+            assert_eq!(value["events"]["count"], 2);
+            let projected = value["events"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["event_ref"] == post.event_ref)
+                .unwrap();
+            assert_eq!(projected["author"], json!(post.author));
+            assert_eq!(projected["at"], json!(post.at));
+            assert_eq!(projected["is_initial"], post.is_initial);
+            assert_eq!(projected["edited_by"], default_author());
+            assert!(projected["edited_at"].is_string());
+            assert_eq!(projected["body_truncated"], false);
+            assert!(
+                edit.execute(&args.to_string(), Default::default())
+                    .await
+                    .is_err()
+            );
+            let mut spoofed = args.clone();
+            spoofed["author"] = json!("spoofed-author");
+            assert!(
+                edit.execute(&spoofed.to_string(), Default::default())
+                    .await
+                    .is_err()
+            );
+        }
+        let output = show
+            .execute(
+                &json!({"id": reference.id, "event_limit": 1}).to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&output.content.unwrap()).unwrap();
+        assert_eq!(value["events"]["returned"], 1);
+        assert_eq!(value["events"]["items"][0]["is_initial"], false);
+        assert_eq!(value["initial_post"]["is_initial"], true);
+        assert_eq!(
+            value["initial_post"]["event_ref"],
+            before.events[0].event_ref
+        );
+        assert_eq!(value["initial_post"]["body"], value["body"]);
+        assert_eq!(value["meta"]["created_by"], "creator");
+        assert_eq!(value["initial_post"]["author"], "creator");
+        let initial_keys = value["initial_post"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>();
+        let comment_keys = value["events"]["items"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>();
+        assert_eq!(initial_keys, comment_keys);
+        let clipped = ticket_json(&backend.show(reference.id.clone().into()).unwrap(), 1, 0, 3);
+        assert_eq!(clipped["initial_post"]["body_truncated"], true);
+        assert_eq!(
+            clipped["initial_post"]["event_ref"],
+            before.events[0].event_ref
+        );
+        assert_eq!(clipped["initial_post"]["author"], "creator");
+        let decision = tool_by_name(backend.clone(), "TicketDecision");
+        decision
+            .execute(
+                &json!({"ticket": reference.id, "body": "Immutable judgment"}).to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let current = backend.show(reference.id.clone().into()).unwrap();
+        let system = current.events.last().unwrap();
+        assert!(edit.execute(&json!({"ticket": reference.id, "event_ref": system.event_ref, "expected_body": system.body.as_str(), "body": "Changed judgment"}).to_string(), Default::default()).await.is_err());
+        assert_eq!(backend.show(reference.id.into()).unwrap(), current);
+        let (_, unknown) = backend
+            .create_with_snapshot(NewTicket::new("Unknown creator"))
+            .unwrap();
+        let unknown_json = ticket_json(&unknown, 1, 0, 100);
+        assert!(
+            unknown_json["meta"]
+                .as_object()
+                .unwrap()
+                .contains_key("created_by")
+        );
+        assert!(unknown_json["meta"]["created_by"].is_null());
+        assert!(unknown_json["initial_post"]["author"].is_null());
+    }
+
     #[test]
     fn post_mutation_reference_failures_are_outcome_unknown() {
         let temp = TempDir::new().unwrap();
@@ -1978,6 +2181,7 @@ mod tests {
             [
                 "TicketCreate",
                 "TicketEditItem",
+                "TicketEditPost",
                 "TicketComment",
                 "TicketPlan",
                 "TicketDecision",
@@ -2321,20 +2525,10 @@ mod tests {
         let record = backend
             .show(TicketIdOrSlug::Id(created.id.clone()))
             .unwrap();
-        let event = record
-            .events
-            .iter()
-            .rev()
-            .find(|event| event.kind == TicketEventKind::Other("item_edit".to_string()))
-            .expect("item_edit event");
-        assert_eq!(
-            event.attributes.get("body_edit"),
-            Some(&"partial".to_string())
-        );
-        assert_eq!(
-            event.attributes.get("replacement_count"),
-            Some(&"2".to_string())
-        );
+        assert_eq!(record.events.len(), 1);
+        assert_eq!(record.events[0].kind, TicketEventKind::Comment);
+        assert_eq!(record.events[0].body, record.document.body);
+        assert!(record.events[0].edited_at.is_some());
 
         let error = edit
             .execute(
@@ -2655,6 +2849,7 @@ mod tests {
         for name in [
             "TicketCreate",
             "TicketEditItem",
+            "TicketEditPost",
             "TicketComment",
             "TicketPlan",
             "TicketDecision",

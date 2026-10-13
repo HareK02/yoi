@@ -1,3 +1,15 @@
+import type { TicketEventDetail } from "../../generated/ticket-api.ts";
+
+export function fixturePost(body: string, overrides: Partial<TicketEventDetail> = {}): TicketEventDetail {
+  return {
+    sequence: 0, event_ref: "post-initial", kind: "comment", is_initial: true,
+    author: "Mika", at: "2026-09-28T01:00:00Z", body,
+    edited_at: null, edited_by: null, body_digest: "b".repeat(64),
+    body_truncated: false, editable: true, attributes: {}, references: [],
+    ...overrides,
+  };
+}
+
 // Deterministic read-only fixtures shared by Home component and browser tests.
 export const fixturePage = (returned: number, more = false) => ({
   returned,
@@ -42,6 +54,8 @@ export function fixtureDetail(key = "T-101") {
     closure_history: [],
     content_digest: "a".repeat(64),
     created_at: updated(1),
+    created_by: "Mika",
+    initial_post: fixturePost("Implementation in progress."),
     readiness: null,
     body: "Implementation in progress.",
     body_truncated: false,

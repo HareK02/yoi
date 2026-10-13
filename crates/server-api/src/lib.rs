@@ -342,6 +342,8 @@ impl_openapi_schema!(
     TextResponse,
     TicketDependencyCheckResponse,
     TicketDetail,
+    TicketEventDetail,
+    TicketPostEditRequest,
     TicketCaseUpdateRequest,
     TicketAssignmentTrackingUpdateRequest,
     TicketAssignmentTrackingRecord,
@@ -3331,10 +3333,29 @@ pub trait ServerApi {
     #[patch("/api/w/{workspace_id}/tickets/{id}", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_edit(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
         #[body] request: BrowserEditTicketRequest,
     ) -> Result<TicketDetail, RepositoryApiError>;
+    #[get("/api/w/{workspace_id}/tickets/{id}/posts/{event_ref}", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_post_get(
+        &self,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[path] event_ref: String,
+    ) -> Result<TicketEventDetail, RepositoryApiError>;
+
+    #[patch("/api/w/{workspace_id}/tickets/{id}/posts/{event_ref}", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_post_edit(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[path] event_ref: String,
+        #[body] request: TicketPostEditRequest,
+    ) -> Result<TicketDetail, RepositoryApiError>;
+
     #[post("/api/w/{workspace_id}/tickets/{id}/show", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_show(
         &self,
@@ -3390,6 +3411,7 @@ pub trait ServerApi {
     #[post("/api/w/{workspace_id}/tickets/{id}/events", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_event_append(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
         #[body] request: BrowserAppendTicketEventRequest,
@@ -7391,6 +7413,12 @@ pub struct TicketListResponse {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct TicketEventDetail {
+    pub is_initial: bool,
+    pub edited_at: Option<String>,
+    pub edited_by: Option<String>,
+    pub body_digest: String,
+    pub body_truncated: bool,
+    pub editable: bool,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub sequence: usize,
@@ -7800,6 +7828,8 @@ pub struct TicketShowRequest {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct TicketDetail {
+    pub created_by: Option<String>,
+    pub initial_post: TicketEventDetail,
     pub id: String,
     #[cfg_attr(feature = "typescript", ts(type = "Array<WorkspaceTag>"))]
     pub tags: Vec<ticket::WorkspaceTag>,
@@ -8180,6 +8210,14 @@ impl From<ticket::TicketState> for BrowserTicketState {
             ticket::TicketState::Closed => Self::Closed,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketPostEditRequest {
+    pub body: String,
+    pub expected_body_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
