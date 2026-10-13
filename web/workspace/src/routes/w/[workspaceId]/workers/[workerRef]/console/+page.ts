@@ -5,9 +5,10 @@ import {
   canonicalResourceReference,
   resourceKey,
 } from "#lib/workspace/resource-links.ts";
+import { deferPage } from "#lib/workspace/navigation/deferred.ts";
 import type { PageLoad } from "./$types";
 
-export const load = (async ({ fetch, params }) => {
+export const load = deferPage(async ({ fetch, params }: Parameters<PageLoad>[0]) => {
   const reference = resourceKey(params.workerRef);
   const result = await loadJson(
     fetch,
@@ -41,4 +42,4 @@ export const load = (async ({ fetch, params }) => {
     worker: result.data,
     workerError: result.error,
   };
-}) satisfies PageLoad;
+});

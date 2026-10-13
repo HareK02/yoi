@@ -1,8 +1,9 @@
+import { deferPage } from "#lib/workspace/navigation/deferred.ts";
 import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 import { parseWorkspaceRuntimeDetail } from "#lib/workspace/api/runtime-management.ts";
 import type { PageLoad } from "./$types";
 
-export const load: PageLoad = async ({ fetch, params }) => {
+export const load = deferPage(async ({ fetch, params }: Parameters<PageLoad>[0]) => {
   const detail = await loadJson(
     fetch,
     workspaceApiPath(
@@ -28,4 +29,4 @@ export const load: PageLoad = async ({ fetch, params }) => {
     runtimeDetail: detail.data,
     runtimeDetailError: detail.error,
   };
-};
+});

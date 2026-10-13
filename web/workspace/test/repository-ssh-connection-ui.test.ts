@@ -10,7 +10,7 @@ import {
 const root = new URL("../", import.meta.url);
 const pageSource = await Deno.readTextFile(
   new URL(
-    "./src/routes/w/[workspaceId]/repositories/[repositoryKey]/+page.svelte",
+    "./src/routes/w/[workspaceId]/repositories/[repositoryKey]/PageContent.svelte",
     root,
   ),
 );

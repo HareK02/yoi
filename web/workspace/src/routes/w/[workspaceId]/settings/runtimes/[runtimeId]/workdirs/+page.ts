@@ -1,10 +1,11 @@
+import { deferPage } from "#lib/workspace/navigation/deferred.ts";
 import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 import { parseWorkspaceRuntimeList } from "#lib/workspace/api/runtime-management.ts";
 import { parseRuntimeCleanupPlan } from "#lib/workspace/api/runtime-workers.ts";
 import { parseWorkingDirectoryListResponse } from "#lib/workspace/api/workdirs.ts";
 import type { PageLoad } from "./$types";
 
-export const load: PageLoad = async ({ fetch, params }) => {
+export const load = deferPage(async ({ fetch, params }: Parameters<PageLoad>[0]) => {
   const runtimeId = params.runtimeId;
   const [runtimes, workdirs, cleanupPlan] = await Promise.all([
     loadJson(
@@ -43,4 +44,4 @@ export const load: PageLoad = async ({ fetch, params }) => {
     cleanupPlan: cleanupPlan.data,
     cleanupPlanError: cleanupPlan.error,
   };
-};
+});

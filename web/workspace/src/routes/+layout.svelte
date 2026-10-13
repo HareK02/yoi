@@ -23,7 +23,10 @@
   import '../app.css';
   import type { LayoutProps } from './$types';
 
+  import { observeDeferred } from '#lib/workspace/navigation/observe-deferred.svelte.ts';
+
   let { children, data }: LayoutProps = $props();
+  const catalog = observeDeferred(() => data.deferredCatalog, () => 'catalog');
   let sidebar = $state<SidebarSnippet | null>(null);
   const sidebarOverrides = createOverrideStack<SidebarSnippet>((activeSidebar) => {
     sidebar = activeSidebar;
@@ -52,7 +55,7 @@
   const sidebarOpen = $derived((!mobileLayout.current && sidebarMode === 'pinned') || sidebarTransientOpen);
 
   $effect(() => {
-    const error = data.workspaceCatalogError;
+    const error = catalog.data?.workspaceCatalogError;
     if (error) {
       pushWorkspaceAlert('error', error, {
         id: 'workspace-catalog-load',
@@ -103,8 +106,8 @@
     <GlobalSidebar
       currentPath={page.url.pathname}
       content={sidebar}
-      workspaces={data.accessibleWorkspaces}
-      workspaceError={data.workspaceCatalogError}
+      workspaces={catalog.data?.accessibleWorkspaces ?? null}
+      workspaceError={catalog.data?.workspaceCatalogError}
     />
   </SidebarFrame>
   <Bevel as="div" class="app-shell__topbar-bevel" top={false} right={false} left={false} fill>

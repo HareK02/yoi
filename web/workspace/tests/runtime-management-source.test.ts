@@ -47,7 +47,7 @@ Deno.test("Runtime Settings routes validate unknown JSON through the shared Runt
 Deno.test("Runtime registration presents the complete multi-Workspace trust sequence", async () => {
   const page = await Deno.readTextFile(
     new URL(
-      "../src/routes/w/[workspaceId]/settings/runtimes/+page.svelte",
+      "../src/routes/w/[workspaceId]/settings/runtimes/PageContent.svelte",
       import.meta.url,
     ),
   );
@@ -89,7 +89,7 @@ Deno.test("Runtime registration presents the complete multi-Workspace trust sequ
 Deno.test("Runtime list links to canonical detail and has no inline delete action", async () => {
   const page = await Deno.readTextFile(
     new URL(
-      "../src/routes/w/[workspaceId]/settings/runtimes/+page.svelte",
+      "../src/routes/w/[workspaceId]/settings/runtimes/PageContent.svelte",
       import.meta.url,
     ),
   );
@@ -122,7 +122,7 @@ Deno.test("Runtime list links to canonical detail and has no inline delete actio
 Deno.test("Runtime detail keeps trust controls owner-only and conflict-safe", async () => {
   const page = await Deno.readTextFile(
     new URL(
-      "../src/routes/w/[workspaceId]/settings/runtimes/[runtimeId]/+page.svelte",
+      "../src/routes/w/[workspaceId]/settings/runtimes/[runtimeId]/PageContent.svelte",
       import.meta.url,
     ),
   );
@@ -224,7 +224,7 @@ Deno.test("Runtime detail uses flat sections instead of nested cards", async () 
   const [page, css] = await Promise.all([
     Deno.readTextFile(
       new URL(
-        "../src/routes/w/[workspaceId]/settings/runtimes/[runtimeId]/+page.svelte",
+        "../src/routes/w/[workspaceId]/settings/runtimes/[runtimeId]/PageContent.svelte",
         import.meta.url,
       ),
     ),
@@ -245,7 +245,7 @@ Deno.test("Runtime detail uses flat sections instead of nested cards", async () 
 });
 
 Deno.test("Runtime labels and recovery controls do not depend on persisted authentication approval", async () => {
-  for (const name of ["+page.svelte", "[runtimeId]/+page.svelte"]) {
+  for (const name of ["PageContent.svelte", "[runtimeId]/PageContent.svelte"]) {
     const page = await Deno.readTextFile(
       new URL(
         "../src/routes/w/[workspaceId]/settings/runtimes/" + name,

@@ -365,7 +365,7 @@ Deno.test("Workspace deletion DTOs fail closed and preserve durable operation st
 
 Deno.test("Workspace settings exposes owner-gated typed destructive confirmation", async () => {
   const source = (await Promise.all([
-    "../src/routes/w/[workspaceId]/settings/+page.svelte",
+    "../src/routes/w/[workspaceId]/settings/PageContent.svelte",
     "../src/lib/workspace/settings/WorkspaceIdentitySettings.svelte",
   ].map((path) => Deno.readTextFile(new URL(path, import.meta.url))))).join(
     "\n",
@@ -399,7 +399,7 @@ Deno.test("Repository settings consume the validated shared wire shape", async (
     ),
     Deno.readTextFile(
       new URL(
-        "../src/routes/w/[workspaceId]/settings/repositories/+page.svelte",
+        "../src/routes/w/[workspaceId]/settings/repositories/PageContent.svelte",
         import.meta.url,
       ),
     ),

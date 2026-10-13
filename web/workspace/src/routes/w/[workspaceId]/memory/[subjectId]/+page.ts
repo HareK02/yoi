@@ -9,6 +9,7 @@ import {
   parseSubjektivResidentSurfaceResponse,
   parseSubjektivSubjectResponse,
 } from "#lib/workspace/memory/api.ts";
+import { deferPage } from "#lib/workspace/navigation/deferred.ts";
 import type { PageLoad } from "./$types";
 
 const MAX_CURSOR_BYTES = 16_384;
@@ -20,7 +21,7 @@ function boundedCursor(value: string | null): string | null {
     : null;
 }
 
-export const load: PageLoad = async ({ fetch, params, url }) => {
+export const load = deferPage(async ({ fetch, params, url }: Parameters<PageLoad>[0]) => {
   const subjectId = params.subjectId;
   const subjectPath = `/subjektiv/subjects/${encodeURIComponent(subjectId)}`;
   const cursor = boundedCursor(url.searchParams.get("cursor"));
@@ -60,4 +61,4 @@ export const load: PageLoad = async ({ fetch, params, url }) => {
     surface,
     memories,
   };
-};
+});

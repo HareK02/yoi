@@ -24,7 +24,13 @@
   import '#lib/workspace/styles/workers.css';
   import type { LayoutProps } from './$types';
 
-  let { data, children }: LayoutProps = $props();
+  import { observeDeferred } from '#lib/workspace/navigation/observe-deferred.svelte.ts';
+  import { invalidateAll } from '$app/navigation';
+
+  let { data, children, params }: LayoutProps = $props();
+  const loaded = observeDeferred(() => data.deferredWorkspace, () => params.workspaceId);
+  const workspace = $derived(loaded.data?.workspace ?? null);
+  const workspaceError = $derived(loaded.failure?.message ?? null);
   const parentSidebarController = getSidebarController();
   let sidebarContent = $state<SidebarSnippet | null>(null);
   const sidebarContentOverrides = createOverrideStack<SidebarSnippet>((activeContent) => {
@@ -35,7 +41,7 @@
     registerSidebar: sidebarContentOverrides.register,
   });
 
-  const workspaceId = $derived(data.workspace?.workspace_id ?? page.params.workspaceId ?? '');
+  const workspaceId = $derived(params.workspaceId);
   const ownsCurrentRoute = $derived(
     workspaceId !== '' && ownsRoutePath(workspaceRoute(workspaceId), page.url.pathname),
   );
@@ -48,7 +54,7 @@
   }
 
   $effect(() => {
-    const nextWorkspaceId = data.workspace?.workspace_id ?? null;
+    const nextWorkspaceId = workspaceId || null;
     if (nextWorkspaceId === activeWorkspaceId) return;
     const previousWorkspaceId = activeWorkspaceId;
     activeWorkspaceId = nextWorkspaceId;
@@ -62,16 +68,16 @@
 
 {#snippet workspaceHeader()}
   <WorkspaceBreadcrumbs
-    workspaceId={page.params.workspaceId ?? data.workspace?.workspace_id ?? ''}
-    workspace={data.workspace ?? null}
-    workspaceError={data.workspaceError ?? null}
+    workspaceId={workspaceId}
+    {workspace}
+    {workspaceError}
   />
 {/snippet}
 
 {#snippet workspaceSidebar()}
   <WorkspaceSidebar
-    workspace={data.workspace ?? null}
-    workspaceError={data.workspaceError ?? null}
+    {workspace}
+    {workspaceError}
     currentPath={page.url.pathname}
     content={sidebarContent}
   />
@@ -84,4 +90,22 @@
   active={ownsCurrentRoute}
 />
 
-{@render children()}
+<svelte:head>
+  {#if workspaceError}<title>Workspace · Unavailable</title>
+  {:else if !workspace}<title>Workspace · Loading</title>{/if}
+</svelte:head>
+
+{#if workspaceError}
+  <section class="workspace-page">
+    <h1>Workspace unavailable</h1>
+    <p role="alert">{workspaceError}</p>
+    <button type="button" class="workspace-secondary-button" onclick={() => invalidateAll()}>Retry</button>
+  </section>
+{:else if workspace}
+  {@render children()}
+{:else}
+  <section class="workspace-page" aria-busy="true">
+    <h1>Workspace</h1>
+    <p role="status">Loading workspace…</p>
+  </section>
+{/if}

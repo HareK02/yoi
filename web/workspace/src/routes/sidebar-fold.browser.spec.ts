@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createRawSnippet, tick } from "svelte";
 import { logout } from "#lib/workspace/auth/api.ts";
+import { settle } from '#lib/workspace/navigation/deferred.ts';
 import Layout from "./+layout.svelte";
 
 vi.mock("$app/state", () => ({ page: { url: new URL("https://example.test/") } }));
@@ -12,7 +13,7 @@ const legacyKey = "yoi.sidebar.folded.v1";
 const props = {
   params: {},
   children: createRawSnippet(() => ({ render: () => "<p>Page content</p>" })),
-  data: { accessibleWorkspaces: [], workspaceCatalogError: null },
+  data: { deferredCatalog: settle({ accessibleWorkspaces: [], workspaceCatalogError: null }) },
 };
 const frame = () => screen.getByRole("complementary", { name: "Sidebar" });
 const folded = () => frame().classList.contains("folded");
@@ -35,8 +36,7 @@ test("Workspace catalog failure uses the shared alert without rendering diagnost
     props: {
       ...props,
       data: {
-        accessibleWorkspaces: [],
-        workspaceCatalogError: "Workspace catalog request failed",
+        deferredCatalog: settle({ accessibleWorkspaces: [], workspaceCatalogError: "Workspace catalog request failed" }),
       },
     },
   });

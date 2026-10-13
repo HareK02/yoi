@@ -5,6 +5,7 @@ import {
   parseSubjektivMemoryReadResponse,
   parseSubjektivSubjectResponse,
 } from "#lib/workspace/memory/api.ts";
+import { deferPage } from "#lib/workspace/navigation/deferred.ts";
 import type { PageLoad } from "./$types";
 
 const SAFE_INTEGER_TEXT = /^(0|[1-9][0-9]{0,15})$/;
@@ -32,7 +33,7 @@ function safeIntegerQuery(
   return String(parsed);
 }
 
-export const load: PageLoad = async ({ fetch, params, url }) => {
+export const load = deferPage(async ({ fetch, params, url }: Parameters<PageLoad>[0]) => {
   const subjectId = params.subjectId;
   const memoryId = params.memoryId;
   const subjectPath = `/subjektiv/subjects/${encodeURIComponent(subjectId)}`;
@@ -93,4 +94,4 @@ export const load: PageLoad = async ({ fetch, params, url }) => {
     memory,
     changes,
   };
-};
+});

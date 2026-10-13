@@ -3,8 +3,9 @@ import { loadWorkspaceRepositoryDetail } from "#lib/workspace/api/repositories.t
 import { parseWorkspaceRuntimeList } from "#lib/workspace/api/runtime-management.ts";
 import { parseRepositoryLogResponse } from "#lib/workspace/api/workspace-model.ts";
 import type { PageLoad } from "./$types";
+import { deferPage } from "#lib/workspace/navigation/deferred.ts";
 
-export const load: PageLoad = async ({ fetch, params }) => {
+export const load = deferPage(async ({ fetch, params }: Parameters<PageLoad>[0]) => {
   const workspaceId = params.workspaceId;
   const repositoryKey = params.repositoryKey;
   const [repositoryResult, logResult, runtimesResult] = await Promise.all([
@@ -58,4 +59,4 @@ export const load: PageLoad = async ({ fetch, params }) => {
     runtimes,
     runtimesError,
   };
-};
+});

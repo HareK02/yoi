@@ -22,7 +22,7 @@ import * as attachmentsApi from "#lib/workspace/console/composer-attachments.ts"
 import { undo } from "@codemirror/commands";
 import * as alerts from "#lib/workspace/alerts/store.ts";
 import * as consoleModel from "#lib/workspace/console/model.ts";
-import ConsolePage from "./+page.svelte";
+import ConsolePage from "./PageContent.svelte";
 
 // happy-dom does not implement Web Animations. Motion itself is covered in Chromium.
 vi.mock("svelte/motion", () => ({ prefersReducedMotion: { current: true } }));

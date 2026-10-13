@@ -5,19 +5,11 @@ import {
 } from "../../src/lib/workspace/api/repository-access-loader.ts";
 import { RepositoryAccessSchemaError } from "../../src/lib/workspace/api/repository-access.ts";
 import { load as loadRepositoryAccessPage } from "../../src/routes/w/[workspaceId]/settings/repository-access/+page.ts";
+import type { ResolvedPageData } from "../../src/lib/workspace/navigation/deferred.ts";
 
 type HttpFailure = { status?: number; body?: { message?: string } };
 
-type LoadedPage = {
-  accessProjection: unknown;
-  accessProjectionError: string | null;
-  credentials: Array<{ credential_id: string }>;
-  credentialsError: string | null;
-  publicKeys: Array<{ credential_id: string }>;
-  defaultPublicKeyError: string | null;
-  hostTrusts: Array<{ host_trust_id: string }>;
-  hostTrustsError: string | null;
-};
+type LoadedPage = ResolvedPageData<ReturnType<typeof loadRepositoryAccessPage>>;
 
 const projectionFixture = {
   workspace_id: "workspace-1",
@@ -74,13 +66,30 @@ async function loadPageWithFailure(failedSuffix: string): Promise<LoadedPage> {
     }
     throw new Error(`unexpected loader request: ${path}`);
   };
-  return await (loadRepositoryAccessPage as unknown as (event: {
-    fetch: typeof fetch;
-    params: { workspaceId: string };
-  }) => Promise<LoadedPage>)({
-    fetch: fetcher as typeof fetch,
-    params: { workspaceId: "workspace-1" },
-  });
+  const envelope = loadRepositoryAccessPage(
+    {
+      fetch: fetcher as typeof fetch,
+      params: { workspaceId: "workspace-1" },
+      url: new URL(
+        "https://workspace.test/w/workspace-1/settings/repository-access",
+      ),
+    } as Parameters<typeof loadRepositoryAccessPage>[0],
+  );
+  if (
+    envelope instanceof Promise ||
+    Object.keys(envelope).join() !== "deferredPage"
+  ) {
+    throw new Error(
+      "Repository Access load must immediately return only the deferred page envelope",
+    );
+  }
+  const result = await envelope.deferredPage;
+  if (!result.ok) {
+    throw new Error(
+      `unexpected deferred page failure: ${result.failure.message}`,
+    );
+  }
+  return result.data;
 }
 
 async function captureHttpFailure(

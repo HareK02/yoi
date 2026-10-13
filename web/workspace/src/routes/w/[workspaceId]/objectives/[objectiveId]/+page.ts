@@ -9,8 +9,9 @@ import {
   resourceKey,
 } from "#lib/workspace/resource-links.ts";
 import type { PageLoad } from "./$types";
+import { deferPage } from "#lib/workspace/navigation/deferred.ts";
 
-export const load: PageLoad = async ({ fetch, params }) => {
+export const load = deferPage(async ({ fetch, params }: Parameters<PageLoad>[0]) => {
   const apiPath = (path: string) => workspaceApiPath(params.workspaceId, path);
   const objectiveId = resourceKey(params.objectiveId);
   const objective = await loadJson(
@@ -42,4 +43,4 @@ export const load: PageLoad = async ({ fetch, params }) => {
     objective: objective.data,
     objectiveError: objective.error,
   };
-};
+});

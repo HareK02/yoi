@@ -1,7 +1,8 @@
 import { loadWorkspaceRepositoryList } from "#lib/workspace/api/repositories.ts";
 import type { PageLoad } from "./$types";
+import { deferPage } from "#lib/workspace/navigation/deferred.ts";
 
-export const load: PageLoad = async ({ fetch, params }) => {
+export const load = deferPage(async ({ fetch, params }: Parameters<PageLoad>[0]) => {
   const repositories = await loadWorkspaceRepositoryList(
     fetch,
     params.workspaceId,
@@ -11,4 +12,4 @@ export const load: PageLoad = async ({ fetch, params }) => {
     repositories: repositories.data,
     repositoriesError: repositories.error,
   };
-};
+});

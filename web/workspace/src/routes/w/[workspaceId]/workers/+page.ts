@@ -5,8 +5,9 @@ import type {
   RuntimeCleanupPlanResponse,
 } from "#lib/workspace/sidebar/types.ts";
 import type { PageLoad } from "./$types";
+import { deferPage } from "#lib/workspace/navigation/deferred.ts";
 
-export const load: PageLoad = async ({ fetch, params }) => {
+export const load = deferPage(async ({ fetch, params }: Parameters<PageLoad>[0]) => {
   const workers = await loadJson(
     fetch,
     workspaceApiPath(params.workspaceId, "/workers"),
@@ -45,4 +46,4 @@ export const load: PageLoad = async ({ fetch, params }) => {
     cleanupPlans,
     cleanupPlanErrors,
   };
-};
+});

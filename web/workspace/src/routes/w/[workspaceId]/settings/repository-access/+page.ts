@@ -1,3 +1,4 @@
+import { deferPage } from "#lib/workspace/navigation/deferred.ts";
 import { workspaceApiPath } from "#lib/workspace/api/http.ts";
 import {
   parseRepositoryAccessProjection,
@@ -13,7 +14,7 @@ import type { Load } from "@sveltejs/kit";
 
 const WORKSPACE_DEFAULT_CREDENTIAL_ID = "workspace-default";
 
-export const load = (async ({ fetch, params }) => {
+export const load = deferPage(async ({ fetch, params }: Parameters<Load<{workspaceId: string}>>[0]) => {
   const workspaceId = params.workspaceId;
   const accessProjectionResult = await loadRepositoryAccessPermissionGate(
     fetch,
@@ -68,4 +69,4 @@ export const load = (async ({ fetch, params }) => {
     accessProjection: accessProjectionResult.data,
     accessProjectionError: accessProjectionResult.error,
   };
-}) satisfies Load<{ workspaceId: string }>;
+});

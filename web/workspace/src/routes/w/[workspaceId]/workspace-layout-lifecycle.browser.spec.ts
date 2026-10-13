@@ -3,6 +3,7 @@
 import { cleanup, render } from "@testing-library/svelte";
 import { afterEach, expect, test, vi } from "vitest";
 import { createRawSnippet } from "svelte";
+import { settle } from '#lib/workspace/navigation/deferred.ts';
 import Layout from "./+layout.svelte";
 
 const resources = vi.hoisted(() => {
@@ -48,12 +49,12 @@ vi.mock("#lib/workspace/header/context.ts", () => ({
 
 const children = createRawSnippet(() => ({ render: () => "<p>content</p>" }));
 function data(workspaceId: string, displayName = workspaceId) {
-  return {
+  return { deferredWorkspace: settle({
     workspace: { workspace_id: workspaceId, display_name: displayName },
     workspaceError: null,
     repositories: [],
     repositoriesError: null,
-  };
+  }) };
 }
 
 afterEach(() => {
@@ -65,7 +66,7 @@ afterEach(() => {
 
 test("same-Workspace layout data refresh keeps resources, while route switch and exit dispose in order", async () => {
   const view = render(Layout, {
-    props: { data: data("workspace-a"), children } as never,
+    props: { data: data("workspace-a"), params: {workspaceId:"workspace-a"}, children } as never,
   });
   expect(resources.events).toEqual([]);
 
@@ -75,7 +76,7 @@ test("same-Workspace layout data refresh keeps resources, while route switch and
   } as never);
   expect(resources.events).toEqual([]);
 
-  await view.rerender({ data: data("workspace-b"), children } as never);
+  await view.rerender({ data: data("workspace-b"), params: {workspaceId:"workspace-b"}, children } as never);
   expect(resources.events).toEqual([
     "workers:workspace-a",
     "multiplexer:workspace-a",

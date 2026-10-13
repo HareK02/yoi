@@ -15,7 +15,7 @@ const ticketLoader = await Deno.readTextFile(
 );
 const ticketPage = await Deno.readTextFile(
   new URL(
-    "../../../routes/w/[workspaceId]/tickets/[ticketId]/+page.svelte",
+    "../../../routes/w/[workspaceId]/tickets/[ticketId]/PageContent.svelte",
     import.meta.url,
   ),
 );
@@ -33,7 +33,7 @@ const detailLoader = await Deno.readTextFile(
 );
 const detailPage = await Deno.readTextFile(
   new URL(
-    "../../../routes/w/[workspaceId]/merge-requests/[mergeRequestId]/+page.svelte",
+    "../../../routes/w/[workspaceId]/merge-requests/[mergeRequestId]/PageContent.svelte",
     import.meta.url,
   ),
 );

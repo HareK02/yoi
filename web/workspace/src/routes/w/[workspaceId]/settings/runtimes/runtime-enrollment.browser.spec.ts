@@ -8,11 +8,12 @@ import {
 } from "@testing-library/svelte";
 import { afterEach, expect, test, vi } from "vitest";
 import type { ComponentProps } from "svelte";
-import RuntimeSettings from "./+page.svelte";
-import RuntimeDetail from "./[runtimeId]/+page.svelte";
+import RuntimeSettings from "./PageContent.svelte";
+import RuntimeDetail from "./[runtimeId]/PageContent.svelte";
 
-const api = vi.hoisted(() => ({ create: vi.fn(), fingerprint: vi.fn() }));
-vi.mock("$app/navigation", () => ({ invalidateAll: vi.fn(async () => {}) }));
+const api = vi.hoisted(() => ({ create: vi.fn(), fingerprint: vi.fn(), refresh: vi.fn() }));
+vi.mock("$app/navigation", () => ({ goto: vi.fn(async () => {}) }));
+vi.mock("#lib/workspace/navigation/refresh.ts", () => ({ refreshPageData: api.refresh }));
 vi.mock("#lib/workspace/api/runtime-management.ts", async (importOriginal) => ({
   ...await importOriginal<
     typeof import("#lib/workspace/api/runtime-management.ts")
@@ -20,6 +21,13 @@ vi.mock("#lib/workspace/api/runtime-management.ts", async (importOriginal) => ({
   createRemoteRuntime: api.create,
   previewRuntimePublicKeyFingerprint: api.fingerprint,
 }));
+
+function deferredRefresh() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  api.refresh.mockReturnValue(promise);
+  return resolve;
+}
 
 afterEach(() => {
   cleanup();
@@ -29,6 +37,7 @@ afterEach(() => {
 test("Runtime registration uses public bundle without requiring copied Workspace enrollment identity", async () => {
   api.fingerprint.mockResolvedValue("sha256:runtime-public-key");
   api.create.mockResolvedValue({});
+  const finishRefresh = deferredRefresh();
   const data = {
     workspaceId: "workspace-a",
     workspace: { permissions: { manage_runtimes: true } },
@@ -37,7 +46,7 @@ test("Runtime registration uses public bundle without requiring copied Workspace
     signingIdentityError: "Workspace public identity could not be loaded",
   } as unknown as ComponentProps<typeof RuntimeSettings>["data"];
   render(RuntimeSettings, {
-    props: { data, params: { workspaceId: "workspace-a" } },
+    props: { data },
   });
   await fireEvent.click(screen.getByRole("button", { name: "Add Runtime" }));
   await fireEvent.input(
@@ -74,11 +83,17 @@ test("Runtime registration uses public bundle without requiring copied Workspace
     endpoint: "https://runtime.example",
     expected_binding_id: null,
   });
+  await waitFor(() => expect(api.refresh).toHaveBeenCalledOnce());
+  await fireEvent.click(screen.getByRole("button", { name: "Add Runtime" }));
+  expect(screen.getByRole("button", { name: "Preview fingerprint" })).toHaveProperty("disabled", true);
+  finishRefresh();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Preview fingerprint" })).toHaveProperty("disabled", false));
 });
 
 test("Runtime reactivation uses the observed binding without copied Workspace identity", async () => {
   api.fingerprint.mockResolvedValue("sha256:replacement-key");
   api.create.mockResolvedValue({});
+  const finishRefresh = deferredRefresh();
   const data = {
     workspaceId: "workspace-a",
     runtimeId: "runtime-a",
@@ -111,7 +126,6 @@ test("Runtime reactivation uses the observed binding without copied Workspace id
   render(RuntimeDetail, {
     props: {
       data,
-      params: { workspaceId: "workspace-a", runtimeId: "runtime-a" },
     },
   });
   expect(screen.queryByLabelText("Workspace trust ID")).toBeNull();
@@ -136,4 +150,10 @@ test("Runtime reactivation uses the observed binding without copied Workspace id
     endpoint: "https://runtime.example",
     expected_binding_id: "observed-binding",
   });
+  await waitFor(() => expect(api.refresh).toHaveBeenCalledOnce());
+  expect(screen.getByRole("button", { name: "Saving…" })).toHaveProperty("disabled", true);
+  expect(screen.getByRole("button", { name: "Edit Runtime" })).toHaveProperty("disabled", true);
+  finishRefresh();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Reactivate with this key" })).toHaveProperty("disabled", false));
+  expect(screen.getByRole("button", { name: "Edit Runtime" })).toHaveProperty("disabled", false);
 });

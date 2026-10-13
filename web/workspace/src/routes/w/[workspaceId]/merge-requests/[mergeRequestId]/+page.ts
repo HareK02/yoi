@@ -6,7 +6,9 @@ import {
   TICKET_BROWSER_API_LOAD_POLICY,
 } from "#lib/workspace/api/ticket-browser.ts";
 
-export const load: PageLoad = async ({ params, fetch }) => {
+import { deferPage } from "#lib/workspace/navigation/deferred.ts";
+
+export const load = deferPage(async ({ params, fetch }: Parameters<PageLoad>[0]) => {
   const result = await loadJson(
     fetch,
     `${
@@ -22,4 +24,4 @@ export const load: PageLoad = async ({ params, fetch }) => {
     mergeRequest: result.data,
     error: result.error,
   };
-};
+});

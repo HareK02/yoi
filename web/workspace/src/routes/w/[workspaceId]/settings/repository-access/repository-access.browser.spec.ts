@@ -9,8 +9,10 @@ import {
   within,
 } from "@testing-library/svelte";
 import { afterEach, expect, test, vi } from "vitest";
-import RepositoryAccessPage from "./+page.svelte";
-import type { PageProps } from "./$types";
+import RepositoryAccessPage from "./PageContent.svelte";
+import type { ComponentProps } from "svelte";
+
+type PageProps = ComponentProps<typeof RepositoryAccessPage>;
 
 const defaultCredential = {
   credential_id: "workspace-default",
@@ -92,7 +94,6 @@ function deferred<T>() {
 function pageProps(data = pageData()): PageProps {
   return {
     data,
-    params: { workspaceId: data.workspaceId },
   } as unknown as PageProps;
 }
 
@@ -104,6 +105,106 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+});
+
+test.each(["Generate credential", "Import credential"])(
+  "%s and new host drafts survive same-Workspace refresh and reset on Workspace switch",
+  async (action) => {
+    const { rerender } = renderPage();
+    await fireEvent.click(screen.getByRole("button", { name: action }));
+    await fireEvent.input(screen.getByRole("textbox", { name: "Credential id" }), {
+      target: { value: "draft-credential" },
+    });
+    await fireEvent.input(screen.getByRole("textbox", { name: "Name" }), {
+      target: { value: "Draft name" },
+    });
+    if (action === "Import credential") {
+      await fireEvent.input(screen.getByRole("textbox", { name: /^OpenSSH private key/ }), {
+        target: { value: "draft-private-key" },
+      });
+      await fireEvent.input(screen.getByLabelText(/^Passphrase \(optional\)/), {
+        target: { value: "draft-passphrase" },
+      });
+    }
+    await fireEvent.click(screen.getByRole("button", { name: "Add pinned key" }));
+    await fireEvent.input(screen.getByRole("textbox", { name: "Host trust id" }), {
+      target: { value: "draft-host" },
+    });
+    const refreshed = pageData();
+    refreshed.credentials[1].name = "Refreshed deploy name";
+    refreshed.accessProjection.projection_digest = "sha256:refreshed";
+    await rerender(pageProps(refreshed));
+    expect(screen.getByText("Refreshed deploy name")).not.toBeNull();
+    expect(screen.getByText("sha256:refreshed")).not.toBeNull();
+    expect(screen.getByRole("textbox", { name: "Credential id" })).toHaveProperty("value", "draft-credential");
+    expect(screen.getByRole("textbox", { name: "Name" })).toHaveProperty("value", "Draft name");
+    expect(screen.getByRole("textbox", { name: "Host trust id" })).toHaveProperty("value", "draft-host");
+    if (action === "Import credential") {
+      expect(screen.getByRole("textbox", { name: /^OpenSSH private key/ })).toHaveProperty("value", "draft-private-key");
+      expect(screen.getByLabelText(/^Passphrase \(optional\)/)).toHaveProperty("value", "draft-passphrase");
+    }
+    await rerender(pageProps(pageData("workspace-2")));
+    expect(screen.queryByRole("textbox", { name: "Credential id" })).toBeNull();
+    expect(screen.queryByRole("textbox", { name: "Host trust id" })).toBeNull();
+    await fireEvent.click(screen.getByRole("button", { name: action }));
+    expect(screen.getByRole("textbox", { name: "Credential id" })).toHaveProperty("value", "");
+    expect(screen.getByRole("textbox", { name: "Name" })).toHaveProperty("value", "");
+    if (action === "Import credential") {
+      expect(screen.getByRole("textbox", { name: /^OpenSSH private key/ })).toHaveProperty("value", "");
+      expect(screen.getByLabelText(/^Passphrase \(optional\)/)).toHaveProperty("value", "");
+    }
+  },
+);
+
+test("same-Workspace refresh preserves rotation drafts and their observed CAS fingerprints", async () => {
+  const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+    new Response(null, { status: 409 })
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  const { rerender } = renderPage();
+  const credentialRow = screen.getByText("Deploy key").closest("tr")!;
+  await fireEvent.click(within(credentialRow).getByRole("button", { name: "Rotate" }));
+  await fireEvent.input(screen.getByRole("textbox", { name: /^New OpenSSH private key/ }), {
+    target: { value: "-----BEGIN OPENSSH PRIVATE KEY-----" },
+  });
+  await fireEvent.input(screen.getByLabelText(/^Passphrase \(optional\)/), {
+    target: { value: "rotation-passphrase" },
+  });
+  await fireEvent.click(screen.getByRole("button", { name: "Rotate key" }));
+  await fireEvent.input(screen.getByRole("textbox", { name: /^OpenSSH public host key/ }), {
+    target: { value: "ssh-ed25519 AAAA-draft" },
+  });
+  const refreshed = pageData();
+  refreshed.credentials[1].public_key_fingerprint = "SHA256:deploy-refreshed";
+  refreshed.hostTrusts[0].fingerprint = "SHA256:host-refreshed";
+  refreshed.hostTrusts[0].hostname = "changed.example.test";
+  refreshed.hostTrusts[0].port = 2222;
+  await rerender(pageProps(refreshed));
+  expect(within(credentialRow).getByText("SHA256:deploy-refreshed")).not.toBeNull();
+  expect(screen.getByText("changed.example.test:2222")).not.toBeNull();
+  expect(screen.getByRole("textbox", { name: /^New OpenSSH private key/ })).toHaveProperty("value", "-----BEGIN OPENSSH PRIVATE KEY-----");
+  expect(screen.getByLabelText(/^Passphrase \(optional\)/)).toHaveProperty("value", "rotation-passphrase");
+  expect(screen.getByRole("textbox", { name: /^OpenSSH public host key/ })).toHaveProperty("value", "ssh-ed25519 AAAA-draft");
+  expect(screen.getByText("Current fingerprint").parentElement?.textContent).toContain("SHA256:host-current");
+  await fireEvent.click(screen.getByRole("button", { name: "Rotate credential" }));
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+  expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
+    expected_public_key_fingerprint: "SHA256:deploy",
+    passphrase: "rotation-passphrase",
+  });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Rotate credential" })).toHaveProperty("disabled", false));
+  await fireEvent.click(screen.getByRole("button", { name: "Save new key" }));
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+  expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toMatchObject({
+    expected_fingerprint: "SHA256:host-current",
+    hostname: "github.com",
+    port: 22,
+    host_key: "ssh-ed25519 AAAA-draft",
+  });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Save new key" })).toHaveProperty("disabled", false));
+  await rerender(pageProps(pageData("workspace-2")));
+  expect(screen.queryByRole("button", { name: "Rotate credential" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Save new key" })).toBeNull();
 });
 
 test("opens disclosures with focus, focuses invalid fields, and restores trigger focus on cancel", async () => {
@@ -147,7 +248,7 @@ test("fences a deferred editor while an unrelated host draft remains active afte
     throw new Error(`unexpected request: ${url}`);
   });
   vi.stubGlobal("fetch", fetchMock);
-  renderPage();
+  const { rerender } = renderPage();
 
   const trigger = screen.getByRole("button", { name: "Generate credential" });
   trigger.focus();
@@ -190,6 +291,12 @@ test("fences a deferred editor while an unrelated host draft remains active afte
   const hostDraft = screen.getByRole("textbox", { name: "Host trust id" });
   await fireEvent.input(hostDraft, { target: { value: "draft-host" } });
   hostDraft.focus();
+
+  await rerender(pageProps(pageData()));
+  expect(screen.getByRole("button", { name: "Generating…" })).toHaveProperty("disabled", true);
+  expect(screen.getByRole("textbox", { name: "Credential id" })).toHaveProperty("value", "generated");
+  expect(hostDraft).toHaveProperty("value", "draft-host");
+  expect(fetchMock).toHaveBeenCalledTimes(1);
 
   createResponse.resolve(Response.json({
     ...deployCredential,

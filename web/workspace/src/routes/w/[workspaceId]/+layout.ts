@@ -2,10 +2,15 @@ import { error } from "@sveltejs/kit";
 import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 import { loadWorkspaceRepositoryList } from "#lib/workspace/api/repositories.ts";
 import { parseWorkspaceResponse } from "#lib/workspace/api/workspace-model.ts";
+import { settle } from "#lib/workspace/navigation/deferred.ts";
 import type { LayoutLoad } from "./$types";
 
-export const load: LayoutLoad = async ({ fetch, params }) => {
+export const load = ({ fetch, params }: Parameters<LayoutLoad>[0]) => {
   const workspaceId = params.workspaceId;
+  return { deferredWorkspace: settle(loadWorkspace(fetch, workspaceId)) };
+};
+
+async function loadWorkspace(fetch: Parameters<LayoutLoad>[0]["fetch"], workspaceId: string) {
   const [workspaceResult, repositoryResult] = await Promise.all([
     loadJson(
       fetch,

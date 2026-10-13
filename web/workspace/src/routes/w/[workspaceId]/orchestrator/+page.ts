@@ -11,8 +11,9 @@ import {
 } from "#lib/workspace/tickets/ticket-panel.ts";
 import type { TicketAssignmentTrackingStatus } from "#lib/generated/ticket-api.ts";
 import type { PageLoad } from "./$types";
+import { deferPage } from "#lib/workspace/navigation/deferred.ts";
 
-export const load: PageLoad = async ({ fetch, params, url }) => {
+export const load = deferPage(async ({ fetch, params, url }: Parameters<PageLoad>[0]) => {
   const workspaceId = params.workspaceId;
   const filters = {
     ...readTicketFilters(url.searchParams),
@@ -52,4 +53,4 @@ export const load: PageLoad = async ({ fetch, params, url }) => {
     ),
   ]);
   return { workspaceId, filters, handling, tickets, orchestrator };
-};
+});

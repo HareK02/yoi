@@ -167,7 +167,7 @@ Deno.test("handling summary uses only the current self-report and never Worker o
 Deno.test("Ticket authoring creates the target collection without singular authority", async () => {
   const source = await Deno.readTextFile(
     new URL(
-      "../../../routes/w/[workspaceId]/tickets/+page.svelte",
+      "../../../routes/w/[workspaceId]/tickets/PageContent.svelte",
       import.meta.url,
     ),
   );

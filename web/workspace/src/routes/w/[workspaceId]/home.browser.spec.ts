@@ -9,7 +9,7 @@ import {
 import { afterEach, expect, test, vi } from "vitest";
 import type { ComponentProps } from "svelte";
 import { invalidate } from "$app/navigation";
-import Home from "./+page.svelte";
+import Home from "./PageContent.svelte";
 import { load } from "./+page";
 import {
   type Dashboard,
@@ -44,7 +44,7 @@ function data(id = "home-owner", fetchFn: typeof fetch = fixtureFetch()): Data {
 }
 function mount(value = data()) {
   return render(Home, {
-    props: { params: { workspaceId: value.workspaceId }, data: value },
+    props: { data: value },
   });
 }
 afterEach(() => {

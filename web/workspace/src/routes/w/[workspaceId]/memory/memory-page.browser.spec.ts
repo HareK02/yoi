@@ -15,9 +15,9 @@ const { gotoMock } = vi.hoisted(() => ({
 
 vi.mock("$app/navigation", () => ({ goto: gotoMock }));
 
-import SubjectIndexPage from "./+page.svelte";
-import SubjectPage from "./[subjectId]/+page.svelte";
-import MemoryDetailPage from "./[subjectId]/[memoryId]/+page.svelte";
+import SubjectIndexPage from "./PageContent.svelte";
+import SubjectPage from "./[subjectId]/PageContent.svelte";
+import MemoryDetailPage from "./[subjectId]/[memoryId]/PageContent.svelte";
 
 afterEach(() => {
   cleanup();
@@ -396,6 +396,59 @@ function subjectPageData(record = subject(), workspaceId = "workspace-1") {
     memories: result({ items: [], has_more: false }),
   };
 }
+
+test("same-identity refresh updates Subject projection without rebasing an active behavior draft", async () => {
+  const fetchMock = vi.fn(async (_path: string, _init?: RequestInit) =>
+    Response.json({ message: "save rejected" }, { status: 409 })
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  const view = render(SubjectPage, { data: subjectPageData() } as never);
+  await fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+  const textarea = screen.getByRole("textbox", { name: "Subject behavior" });
+  await fireEvent.input(textarea, { target: { value: "Unsaved behavior draft" } });
+
+  const refreshed = { ...subject(), role: "Refreshed role", behavior_md: "Changed on server." };
+  await view.rerender({ data: subjectPageData(refreshed) } as never);
+  expect(screen.getByRole("heading", { name: "Refreshed role", level: 1 })).not.toBeNull();
+  expect(screen.getByRole("textbox", { name: "Subject behavior" })).toHaveProperty("value", "Unsaved behavior draft");
+  await fireEvent.click(screen.getByRole("button", { name: "Save behavior" }));
+  await waitFor(() => expect(screen.getByRole("alert")).not.toBeNull());
+  expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+    expected_behavior_md: "Prefer explicit evidence.",
+    behavior_md: "Unsaved behavior draft",
+  });
+
+  await view.rerender({ data: subjectPageData({ ...refreshed, behavior_md: "Changed again." }) } as never);
+  expect(screen.getByRole("alert")).not.toBeNull();
+  expect(textarea).toHaveProperty("value", "Unsaved behavior draft");
+  await fireEvent.click(screen.getByRole("button", { name: "Save behavior" }));
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+  expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)).expected_behavior_md).toBe("Prefer explicit evidence.");
+  await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toHaveProperty("disabled", false));
+  await fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(screen.getByRole("article", { name: "User-managed Subject behavior" }).textContent).toContain("Changed again.");
+  await fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+  expect(screen.getByRole("textbox", { name: "Subject behavior" })).toHaveProperty("value", "Changed again.");
+});
+
+test("same-identity refresh keeps an in-flight behavior save fenced and accepts its result", async () => {
+  let resolveRequest!: (response: Response) => void;
+  const fetchMock = vi.fn(() => new Promise<Response>((resolve) => { resolveRequest = resolve; }));
+  vi.stubGlobal("fetch", fetchMock);
+  const view = render(SubjectPage, { data: subjectPageData() } as never);
+  await fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+  await fireEvent.input(screen.getByRole("textbox", { name: "Subject behavior" }), {
+    target: { value: "Saved draft" },
+  });
+  await fireEvent.click(screen.getByRole("button", { name: "Save behavior" }));
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+  await view.rerender({ data: subjectPageData({ ...subject(), behavior_md: "Refreshed text" }) } as never);
+  expect(screen.getByRole("button", { name: "Saving…" })).toHaveProperty("disabled", true);
+  expect(screen.getByRole("textbox", { name: "Subject behavior" })).toHaveProperty("value", "Saved draft");
+  resolveRequest(Response.json({ ...subject(), behavior_md: "Saved draft" }));
+  await waitFor(() => expect(screen.getByText(/storage confirmed/)).not.toBeNull());
+  expect(screen.getByRole("article", { name: "User-managed Subject behavior" }).textContent).toContain("Saved draft");
+});
 
 test.each([
   ["subject-2", "workspace-1"],

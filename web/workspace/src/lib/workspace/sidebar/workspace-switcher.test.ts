@@ -87,10 +87,9 @@ Deno.test("workspace header prefixes breadcrumbs with the same Workspace menu", 
     "Workspace selector should precede the breadcrumb trail",
   );
   assert(
-    workspaceLayoutSource.includes("workspace={data.workspace ?? null}") &&
-      workspaceLayoutSource.includes(
-        "workspaceError={data.workspaceError ?? null}",
-      ),
+    workspaceLayoutSource.includes("loaded.data?.workspace ?? null") &&
+      workspaceLayoutSource.includes("{workspace}") &&
+      workspaceLayoutSource.includes("{workspaceError}"),
     "Workspace layout should pass the authoritative Workspace name to the header selector",
   );
 });

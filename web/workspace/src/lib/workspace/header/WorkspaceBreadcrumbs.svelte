@@ -12,14 +12,15 @@
 
   let { workspaceId, workspace = null, workspaceError = null }: Props = $props();
 
-  const workerName = $derived.by(() => {
-    const data = page.data as Record<string, unknown>;
-    const worker = data.worker as
-      | { display_name?: string | null; label?: string | null }
-      | null
-      | undefined;
-    return worker?.display_name ?? worker?.label ?? null;
-  });
+  import { observeDeferred } from '#lib/workspace/navigation/observe-deferred.svelte.ts';
+  import { settle, type DeferredResult } from '#lib/workspace/navigation/deferred.ts';
+
+  type WorkerData = { worker?: { display_name?: string | null; label?: string | null } | null };
+  const resource = observeDeferred(
+    () => (page.data as { deferredPage?: Promise<DeferredResult<WorkerData>> }).deferredPage ?? settle({} as WorkerData),
+    () => page.url.pathname,
+  );
+  const workerName = $derived(resource.data?.worker?.display_name ?? resource.data?.worker?.label ?? null);
   const breadcrumbs = $derived(
     buildWorkspaceBreadcrumbs(page.url.pathname, workspaceId, { workerName }),
   );

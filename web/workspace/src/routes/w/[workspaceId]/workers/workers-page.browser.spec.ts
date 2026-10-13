@@ -18,7 +18,7 @@ import {
   clearWorkspaceAlerts,
   workspaceAlerts,
 } from "#lib/workspace/alerts/store.ts";
-import WorkersPage from "./+page.svelte";
+import WorkersPage from "./PageContent.svelte";
 
 const shared = vi.hoisted(() => ({
   stores: new Map(),
@@ -122,7 +122,6 @@ test("catalog updates preserve retention and workdirs, and stale page data never
   const store = catalog();
   vi.stubGlobal("fetch", vi.fn(async () => Response.json(plan())));
   const view = render(WorkersPage, {
-    params: { workspaceId: "page-test" },
     data: data(),
   });
   const attachment: NonNullable<Worker["workdir_attachments"]>[number] = {
@@ -169,7 +168,7 @@ test("catalog change invalidates Delete immediately and an older cleanup respons
   const request = vi.fn().mockReturnValueOnce(older.promise)
     .mockReturnValueOnce(newer.promise);
   vi.stubGlobal("fetch", request);
-  render(WorkersPage, { params: { workspaceId: "page-test" }, data: data() });
+  render(WorkersPage, { data: data() });
   publish(store, [worker({ pinned: false })]);
   await waitFor(() => expect(request).toHaveBeenCalledTimes(1));
   expect(screen.queryByRole("button", { name: "Delete Catalog worker" }))
@@ -192,7 +191,7 @@ test("refresh start invalidates an installed Delete candidate without requesting
   const store = catalog();
   const request = vi.fn(async () => Response.json(plan()));
   vi.stubGlobal("fetch", request);
-  render(WorkersPage, { params: { workspaceId: "page-test" }, data: data() });
+  render(WorkersPage, { data: data() });
   publish(store, [worker({ pinned: false })]);
   expect(await screen.findByRole("button", { name: "Delete Catalog worker" }))
     .toBeTruthy();
@@ -226,7 +225,7 @@ test.each(["during refresh", "after completion"] as const)(
     const request = vi.fn().mockReturnValueOnce(older.promise)
       .mockReturnValueOnce(newer.promise);
     vi.stubGlobal("fetch", request);
-    render(WorkersPage, { params: { workspaceId: "page-test" }, data: data() });
+    render(WorkersPage, { data: data() });
     publish(store, [worker({ pinned: false })]);
     await waitFor(() => expect(request).toHaveBeenCalledTimes(1));
 
@@ -279,7 +278,7 @@ test("restore follow-up cannot request cleanup while the authoritative catalog r
       : Response.json(plan())
   );
   vi.stubGlobal("fetch", request);
-  render(WorkersPage, { params: { workspaceId: "page-test" }, data: data() });
+  render(WorkersPage, { data: data() });
   publish(store, [worker({ pinned: false })]);
   expect(await screen.findByRole("button", { name: "Delete Catalog worker" }))
     .toBeTruthy();
@@ -320,7 +319,6 @@ test.each(["switch", "dispose"] as const)(
       alerts = value;
     });
     const view = render(WorkersPage, {
-      params: { workspaceId: "page-test" },
       data: data(),
     });
     await fireEvent.click(
@@ -359,7 +357,7 @@ test("pin response does not overwrite authoritative catalog retention", async ()
         : Promise.resolve(Response.json(plan()))
     ),
   );
-  render(WorkersPage, { params: { workspaceId: "page-test" }, data: data() });
+  render(WorkersPage, { data: data() });
   publish(store, [worker()]);
   await fireEvent.click(
     await screen.findByRole("button", { name: "Unpin Catalog worker" }),
@@ -392,7 +390,6 @@ test.each(["switch", "dispose"] as const)(
     );
     vi.stubGlobal("fetch", request);
     const view = render(WorkersPage, {
-      params: { workspaceId: "page-test" },
       data: data(),
     });
     publish(store, [worker({ pinned: false })]);
@@ -447,7 +444,6 @@ test.each(["stopped", "idle", "running", "paused", "unavailable"] as const)(
     catalog();
     vi.stubGlobal("fetch", vi.fn(async () => Response.json(plan())));
     render(WorkersPage, {
-      params: { workspaceId: "page-test" },
       data: data(
         "page-test",
         worker({
@@ -480,7 +476,7 @@ test.each(
         : Response.json(plan())
     );
     vi.stubGlobal("fetch", request);
-    render(WorkersPage, { params: { workspaceId: "page-test" }, data: data() });
+    render(WorkersPage, { data: data() });
     await fireEvent.click(
       screen.getByRole("button", { name: "Restore Catalog worker" }),
     );
@@ -524,7 +520,7 @@ test.each(["transport", "reconciliation"] as const)(
       },
     );
     vi.stubGlobal("fetch", request);
-    render(WorkersPage, { params: { workspaceId: "page-test" }, data: data() });
+    render(WorkersPage, { data: data() });
     await fireEvent.click(
       screen.getByRole("button", { name: "Restore Catalog worker" }),
     );
@@ -572,7 +568,6 @@ test.each(["switch", "dispose"] as const)(
       alerts = value;
     });
     const view = render(WorkersPage, {
-      params: { workspaceId: "page-test" },
       data: data(),
     });
     await fireEvent.click(

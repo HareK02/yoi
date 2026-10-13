@@ -2,7 +2,7 @@ import { assert, assertStringIncludes } from "jsr:@std/assert";
 
 const pageSource = await Deno.readTextFile(
   new URL(
-    "../src/routes/w/[workspaceId]/tickets/[ticketId]/+page.svelte",
+    "../src/routes/w/[workspaceId]/tickets/[ticketId]/PageContent.svelte",
     import.meta.url,
   ),
 );

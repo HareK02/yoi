@@ -8,7 +8,7 @@ import {
 } from "@testing-library/svelte";
 import { afterEach, expect, test, vi } from "vitest";
 import type { ComponentProps } from "svelte";
-import NewWorker from "./+page.svelte";
+import NewWorker from "./PageContent.svelte";
 function mount(
   ticketContext:
     | { ticketId: string; ticketTitle: string; initialInput: string }
@@ -25,7 +25,7 @@ function mount(
     ticketContext,
   } as unknown as ComponentProps<typeof NewWorker>["data"];
   return render(NewWorker, {
-    props: { data, params: { workspaceId: "empty" } },
+    props: { data },
   });
 }
 import { emptyLaunchOptions } from "#lib/workspace/sidebar/worker-launch.test-fixtures.ts";

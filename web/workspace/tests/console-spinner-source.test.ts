@@ -56,19 +56,26 @@ Deno.test("sidebar running status reuses the green symbol spinner", async () => 
     sidebarCss.includes("--spinner-color: var(--success)"),
     "sidebar spinner should use the green success token",
   );
+  const activityModel = await Deno.readTextFile(
+    new URL("../src/lib/workspace/sidebar/workers.ts", import.meta.url),
+  );
+  const running = activityModel.indexOf("if (worker.state === 'running')");
+  const subworker = activityModel.indexOf("if (worker.has_running_internal_workers)");
+  const idle = activityModel.indexOf("if (worker.state === 'idle')");
   assert(
-    sidebar.indexOf("worker.state === 'running'") <
-      sidebar.indexOf("worker.has_running_internal_workers"),
+    running >= 0 && running < subworker,
     "parent running state should keep the green Spinner priority",
   );
   assert(
-    sidebar.indexOf("worker.has_running_internal_workers") <
-      sidebar.indexOf("worker.state === 'idle'"),
+    subworker >= 0 && subworker < idle,
     "SubWorker activity should replace the idle dot with the purple Spinner",
   );
   assert(
-    sidebar.includes("worker.has_running_internal_workers"),
-    "idle parents should render SubWorker activity from the Workspace projection",
+    sidebar.includes("sidebarWorkerActivity(worker)") &&
+      sidebar.includes("activity === 'worker-running'") &&
+      sidebar.includes("activity === 'subworker-running'") &&
+      sidebar.includes("activity === 'idle'"),
+    "sidebar should render the authoritative parent and SubWorker activity projection",
   );
   assert(
     sidebar.includes('<Spinner label="SubWorker running" />'),
@@ -87,7 +94,7 @@ Deno.test("sidebar running status reuses the green symbol spinner", async () => 
 Deno.test("running status is Composer-side above mini Tasks", async () => {
   const page = await Deno.readTextFile(
     new URL(
-      "../src/routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
+      "../src/routes/w/[workspaceId]/workers/[workerRef]/console/PageContent.svelte",
       import.meta.url,
     ),
   );
@@ -100,15 +107,17 @@ Deno.test("running status is Composer-side above mini Tasks", async () => {
   const status = page.indexOf("<WorkerRunStatus");
   const miniMode = page.indexOf('mode="mini"');
   const tasks = page.lastIndexOf("<ConsoleTasks", miniMode);
-  const composer = page.indexOf('<form class="console-composer card"');
+  const composer = page.indexOf('<form class="console-composer"');
 
   assert(status >= 0, "WorkerRunStatus should be rendered");
+  assert(composer >= 0, "Composer should be rendered");
   assert(miniMode >= 0 && tasks >= 0, "mini Tasks should be rendered");
   assert(status < tasks, "WorkerRunStatus should be above mini Tasks");
   assert(tasks < composer, "mini Tasks should remain above Composer");
   assert(
-    runStatus.includes("nowMs - (startedAtMs ?? nowMs)"),
-    "running elapsed should be recomputed from timestamps",
+    runStatus.includes("compactionStatus?.progress.started_at_ms ?? startedAtMs") &&
+      runStatus.includes("nowMs - (clockStartedAtMs ?? nowMs)"),
+    "running elapsed should be recomputed from the active compaction or run timestamp",
   );
 });
 

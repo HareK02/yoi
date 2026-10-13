@@ -16,8 +16,9 @@ import type {
   WorkspaceTag,
 } from "#lib/generated/ticket-api.ts";
 import type { PageLoad } from "./$types";
+import { deferPage } from "#lib/workspace/navigation/deferred.ts";
 
-export const load: PageLoad = async ({ fetch, params, url }) => {
+export const load = deferPage(async ({ fetch, params, url }: Parameters<PageLoad>[0]) => {
   const workspaceId = params.workspaceId;
   const search = url.searchParams.get("q") ?? DEFAULT_TICKET_SEARCH;
   const loadTickets = async () => {
@@ -84,4 +85,4 @@ export const load: PageLoad = async ({ fetch, params, url }) => {
     loadWorkspaceRepositoryList(fetch, workspaceId),
   ]);
   return { workspaceId, search, ...result, orchestrator, repositories };
-};
+});

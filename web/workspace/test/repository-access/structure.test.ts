@@ -9,7 +9,7 @@ function assert(condition: boolean, message: string): asserts condition {
 
 const source = await Deno.readTextFile(
   new URL(
-    "../../src/routes/w/[workspaceId]/settings/repository-access/+page.svelte",
+    "../../src/routes/w/[workspaceId]/settings/repository-access/PageContent.svelte",
     import.meta.url,
   ),
 );

@@ -12,8 +12,9 @@ import {
 } from "#lib/workspace/resource-links.ts";
 import type { WorkspaceOrchestratorStatus } from "#lib/workspace/tickets/ticket-panel.ts";
 import type { PageLoad } from "./$types";
+import { deferPage } from "#lib/workspace/navigation/deferred.ts";
 
-export const load = (async ({ fetch, params }) => {
+export const load = deferPage(async ({ fetch, params }: Parameters<PageLoad>[0]) => {
   const reference = resourceKey(params.ticketId);
   const ticketPath = workspaceApiPath(
     params.workspaceId,
@@ -58,4 +59,4 @@ export const load = (async ({ fetch, params }) => {
     repositories,
     orchestrator,
   };
-}) satisfies PageLoad;
+});

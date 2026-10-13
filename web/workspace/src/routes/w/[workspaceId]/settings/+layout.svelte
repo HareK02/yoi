@@ -17,7 +17,7 @@
   import '#lib/workspace/styles/settings.css';
   import type { LayoutProps } from './$types';
 
-  let { data, children }: LayoutProps = $props();
+  let { children }: LayoutProps = $props();
   const parentSidebarController = getSidebarController();
   let sidebarContent = $state<SidebarSnippet | null>(null);
   const sidebarContentOverrides = createOverrideStack<SidebarSnippet>((activeContent) => {
@@ -28,7 +28,7 @@
     registerSidebar: sidebarContentOverrides.register,
   });
 
-  const workspaceId = $derived(data.workspace?.workspace_id ?? page.params.workspaceId ?? '');
+  const workspaceId = $derived(page.params.workspaceId ?? '');
   const ownsCurrentRoute = $derived(
     workspaceId !== '' &&
       ownsRoutePath(workspaceRoute(workspaceId, '/settings'), page.url.pathname),

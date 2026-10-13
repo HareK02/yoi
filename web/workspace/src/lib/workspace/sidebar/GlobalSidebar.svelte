@@ -7,7 +7,7 @@
   type Props = {
     currentPath: string;
     content?: SidebarSnippet | null;
-    workspaces?: WorkspaceCatalogRecord[];
+    workspaces?: WorkspaceCatalogRecord[] | null;
     workspaceError?: string | null;
   };
 

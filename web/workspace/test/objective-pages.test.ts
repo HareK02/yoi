@@ -7,13 +7,13 @@ import {
 
 const objectivesListSource = await Deno.readTextFile(
   new URL(
-    "../src/routes/w/[workspaceId]/objectives/+page.svelte",
+    "../src/routes/w/[workspaceId]/objectives/PageContent.svelte",
     import.meta.url,
   ),
 );
 const objectiveDetailSource = await Deno.readTextFile(
   new URL(
-    "../src/routes/w/[workspaceId]/objectives/[objectiveId]/+page.svelte",
+    "../src/routes/w/[workspaceId]/objectives/[objectiveId]/PageContent.svelte",
     import.meta.url,
   ),
 );

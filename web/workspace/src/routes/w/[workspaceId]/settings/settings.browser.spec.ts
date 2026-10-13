@@ -9,7 +9,7 @@ import {
 import { afterEach, expect, test, vi } from "vitest";
 import type { ComponentProps } from "svelte";
 import { goto, invalidate } from "$app/navigation";
-import Settings from "./+page.svelte";
+import Settings from "./PageContent.svelte";
 import {
   deletionFixture,
   identityFixture,
@@ -42,7 +42,6 @@ function mount(value = data()) {
   return render(Settings, {
     props: {
       data: value,
-      params: { workspaceId: value.workspace!.workspace_id },
     },
   });
 }
@@ -466,7 +465,6 @@ test("Workspace switch resets drafts and ignores old load/mutation completions",
   await fireEvent.click(screen.getByRole("button", { name: "Save name" }));
   await view.rerender({
     data: data("home-long"),
-    params: { workspaceId: "home-long" },
   });
   await screen.findByText(metadataFixture("home-long").display_name);
   release(
@@ -492,7 +490,6 @@ test("slow identity keeps the name usable and old identity responses cannot leak
   expect(screen.getByText("Loading identity…")).toBeTruthy();
   await view.rerender({
     data: data("home-empty"),
-    params: { workspaceId: "home-empty" },
   });
   await screen.findByText("Not provisioned");
   release(Response.json(identityFixture()));
@@ -520,7 +517,6 @@ test("a completed deletion request from an unmounted Workspace cannot navigate a
   await screen.findByText("Deleting…");
   await view.rerender({
     data: data("home-member", false),
-    params: { workspaceId: "home-member" },
   });
   await screen.findByRole("button", { name: "Edit name" });
   release(Response.json(operation()));

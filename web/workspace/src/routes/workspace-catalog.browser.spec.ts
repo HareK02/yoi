@@ -8,7 +8,7 @@ import {
 } from "@testing-library/svelte";
 import { afterEach, expect, test, vi } from "vitest";
 import { goto } from "$app/navigation";
-import Catalog from "./+page.svelte";
+import Catalog from "./PageContent.svelte";
 import {
   createdWorkspace,
   creationResponse,
@@ -24,8 +24,6 @@ function mount() {
   return render(Catalog, {
     props: {
       data: {
-        accessibleWorkspaces: [createdWorkspace],
-        workspaceCatalogError: null,
         workspaces: [{ ...createdWorkspace, repositories: [] }],
         catalogError: null,
       },

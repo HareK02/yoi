@@ -1,7 +1,8 @@
+import { deferPage } from "#lib/workspace/navigation/deferred.ts";
 import type { PageLoad } from "./$types";
 import { loadWorkspaceCatalog } from "#lib/workspace/api/workspace-catalog.ts";
 
-export const load: PageLoad = async ({ fetch }) => {
+export const load = deferPage(async ({ fetch }: Parameters<PageLoad>[0]) => {
   try {
     return {
       workspaces: await loadWorkspaceCatalog(fetch),
@@ -13,4 +14,4 @@ export const load: PageLoad = async ({ fetch }) => {
       catalogError: error instanceof Error ? error.message : String(error),
     };
   }
-};
+});

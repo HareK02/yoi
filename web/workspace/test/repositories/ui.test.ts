@@ -9,7 +9,7 @@ function assert(condition: boolean, message: string): asserts condition {
 
 const pageSource = await Deno.readTextFile(
   new URL(
-    "../../src/routes/w/[workspaceId]/settings/repositories/+page.svelte",
+    "../../src/routes/w/[workspaceId]/settings/repositories/PageContent.svelte",
     import.meta.url,
   ),
 );
@@ -34,7 +34,7 @@ test("Repository settings use the scoped list and typed create collection", () =
       'method: "POST"',
       "repository_key: repositoryKey",
       "default_ref: defaultRef || null",
-      "await invalidateAll()",
+      "await refreshPageData()",
     ]
   ) {
     assert(

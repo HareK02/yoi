@@ -79,7 +79,7 @@
 
   {#if content}
     {@render content()}
-  {:else}
+  {:else if workspace && !ownsRoutePath(workspaceSettingsHref, currentPath)}
     <nav class="sidebar-sections" aria-label="Workspace sections">
       <TicketsNavSection {currentPath} {workspaceId} />
       <ObjectivesNavSection {currentPath} {workspaceId} />

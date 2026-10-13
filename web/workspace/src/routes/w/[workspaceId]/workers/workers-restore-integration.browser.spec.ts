@@ -18,7 +18,7 @@ import {
 } from "#lib/workspace/alerts/store.ts";
 import { disposeWorkspaceWorkersStore } from "#lib/workspace/sidebar/worker-subscription.ts";
 import WorkersNavSection from "#lib/workspace/sidebar/WorkersNavSection.svelte";
-import WorkersPage from "./+page.svelte";
+import WorkersPage from "./PageContent.svelte";
 
 const transport = vi.hoisted(() => ({
   listener: null as null | { onFrame(frame: SubscriptionFrame): void },
@@ -127,7 +127,6 @@ function mount() {
     currentPath: `/w/${workspaceId}/workers`,
   });
   render(WorkersPage, {
-    params: { workspaceId },
     data: {
       workspaceId,
       workers: { items: [row] },
