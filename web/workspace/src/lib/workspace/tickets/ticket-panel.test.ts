@@ -3,18 +3,12 @@ import {
   currentOrchestratorAssignment,
   handlingLabel,
   handlingSummary,
-  nextTicketLaneVisibleCount,
   readTicketFilters,
-  TICKET_LANE_PAGE_SIZE,
-  ticketLanes,
   ticketQueryRequest,
   ticketWorkerLaunchHref,
   ticketWorkerMessage,
 } from "./ticket-panel.ts";
-import type {
-  TicketDetail,
-  TicketListItemSummary as TicketSummary,
-} from "../../generated/ticket-api.ts";
+import type { TicketDetail } from "../../generated/ticket-api.ts";
 
 declare const Deno: {
   test(name: string, fn: () => void | Promise<void>): void;
@@ -28,57 +22,6 @@ function assertEquals<T>(actual: T, expected: T): void {
     );
   }
 }
-
-Deno.test("ticketLanes separates open and closed cases and orders updates deterministically", () => {
-  const tickets = [
-    {
-      id: "old",
-      state: "open",
-      title: "Open old",
-      tags: [{
-        workspace_id: "workspace-a",
-        id: "tag-closed",
-        name: "closed",
-        last_operation_key: "create-closed",
-        deleted: false,
-      }],
-      updated_at: "2026-07-29T12:00:00Z",
-    },
-    {
-      id: "new",
-      state: "open",
-      title: "Open new",
-      tags: [],
-      updated_at: "2026-07-30T12:00:00Z",
-    },
-    {
-      id: "closed",
-      state: "closed",
-      title: "Closed",
-      tags: [{
-        workspace_id: "workspace-a",
-        id: "tag-ready",
-        name: "ready",
-        last_operation_key: "create-ready",
-        deleted: false,
-      }],
-      updated_at: null,
-    },
-  ] as TicketSummary[];
-  const lanes = ticketLanes(tickets);
-  assertEquals(lanes.map((lane) => lane.id), ["open", "closed"]);
-  assertEquals(lanes[0].tickets.map((ticket) => ticket.id), ["new", "old"]);
-  assertEquals(lanes[1].tickets.map((ticket) => ticket.id), ["closed"]);
-});
-
-Deno.test("ticket lane visibility advances in bounded pages of 30", () => {
-  assertEquals(TICKET_LANE_PAGE_SIZE, 30);
-  assertEquals(nextTicketLaneVisibleCount(0, 95), 30);
-  assertEquals(nextTicketLaneVisibleCount(30, 95), 60);
-  assertEquals(nextTicketLaneVisibleCount(60, 95), 90);
-  assertEquals(nextTicketLaneVisibleCount(90, 95), 95);
-  assertEquals(nextTicketLaneVisibleCount(95, 95), 95);
-});
 
 Deno.test("generic Ticket launch carries natural text without role or resource claims", () => {
   const requests = [

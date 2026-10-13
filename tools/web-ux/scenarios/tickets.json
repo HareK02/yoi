@@ -141,11 +141,11 @@
       "id": "list",
       "label": "Member creates a repository-free Ticket",
       "path": "/w/tickets/tickets",
-      "goal": "Server-filter open and closed cases by canonical tags and current principal",
-      "dataState": "Open+done, open+waiting, inprogress with MR, closed with history",
+      "goal": "Search one server-ordered Ticket list with typed qualifiers; create without a repository",
+      "dataState": "Default open cases; closed reason search and optional creation",
       "ready": {
         "kind": "selector",
-        "selector": ".ticket-kanban"
+        "selector": ".ticket-list-row"
       },
       "capturePoints": [
         {
@@ -169,30 +169,27 @@
           "fullPage": true
         },
         {
-          "id": "last-case",
-          "label": "Closed case and final handling result",
-          "interaction": [
-            {
-              "action": "press",
-              "selector": ".ticket-lane[data-state=closed] .ticket-card",
-              "key": "End"
-            }
-          ],
-          "fullPage": true
-        },
-        {
-          "id": "reason-filter",
-          "label": "Current close reason versus historical reason search",
+          "id": "reason-query",
+          "label": "Closed cases with a current completed reason",
           "interaction": [
             {
               "action": "click",
               "selector": ".ticket-panel-controls button:has-text(\"Cancel\")"
             },
             {
+              "action": "fill",
+              "selector": "input[aria-label=\"Search tickets\"]",
+              "value": "state:closed reason:completed"
+            },
+            {
               "action": "click",
-              "selector": ".ticket-reason-filter summary"
+              "selector": "form[aria-label=\"Search tickets\"] button:has-text(\"Search\")"
             }
           ],
+          "ready": {
+            "kind": "selector",
+            "selector": ".ticket-list-row:has(.ticket-list-key:text-is(\"T-4\"))"
+          },
           "fullPage": true
         }
       ]
@@ -265,13 +262,13 @@
     },
     {
       "id": "long",
-      "path": "/w/tickets-long/tickets",
+      "path": "/w/tickets-long/tickets?q=",
       "label": "Long list titles and handling",
       "goal": "Long list titles and handling",
       "dataState": "Long titles and multiline results",
       "ready": {
         "kind": "selector",
-        "selector": ".ticket-kanban"
+        "selector": ".ticket-list-row"
       },
       "capturePoints": [
         {
@@ -285,7 +282,7 @@
           "interaction": [
             {
               "action": "press",
-              "selector": ".ticket-lane[data-state=closed] .ticket-card",
+              "selector": ".ticket-list-rows > li:last-child .ticket-list-row",
               "key": "End"
             }
           ],
@@ -316,10 +313,10 @@
       "path": "/w/tickets-error/tickets",
       "label": "Query failure recovery",
       "goal": "Query failure recovery",
-      "dataState": "503 query, scoped errors and retry",
+      "dataState": "503 query, single list error and retry",
       "ready": {
         "kind": "selector",
-        "selector": ".ticket-lane-page-error"
+        "selector": "[role=alert]"
       },
       "capturePoints": [
         {
@@ -361,6 +358,60 @@
         {
           "id": "initial",
           "label": "Waiting with running Orchestrator Worker",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "mixed",
+      "path": "/w/tickets/tickets?q=",
+      "label": "Explicit empty query includes both case states",
+      "goal": "Scan open and closed cases in one server-ordered list",
+      "dataState": "Open+done, open+waiting, inprogress with MR, closed with history",
+      "ready": {
+        "kind": "selector",
+        "selector": ".ticket-list-row:has(.ticket-list-key:text-is(\"T-4\"))"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Mixed-state flat list",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "list-empty",
+      "path": "/w/tickets-empty/tickets?q=",
+      "label": "No matching Tickets",
+      "goal": "Distinguish an empty list from a failed read",
+      "dataState": "Empty response",
+      "ready": {
+        "kind": "selector",
+        "selector": ".ticket-list :text-is(\"No tickets match this query.\")"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Empty Ticket list",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "invalid-query",
+      "path": "/w/tickets/tickets?q=state%3Aclose",
+      "label": "Invalid recognized state qualifier",
+      "goal": "Correct a query without issuing a broad fallback read",
+      "dataState": "Rejected close alias",
+      "ready": {
+        "kind": "selector",
+        "selector": "[role=alert]"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Query validation error",
           "fullPage": true
         }
       ]

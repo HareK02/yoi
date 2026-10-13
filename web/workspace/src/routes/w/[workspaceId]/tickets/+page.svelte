@@ -1,6 +1,6 @@
 <script lang="ts">
-  // laneは案件状態のopen／closedだけを表し、狭い画面では縦に並べる。
-  // 担当の自己申告handlingと分類タグは別に示し、laneやWorker稼働状態へ読み替えない。
+  // 検索条件とページ順序はBackendのqueryに任せ、取得済みの一部を並べ替えない。
+  // 案件状態と担当の自己申告は、同じ行でも別の情報として表示する。
   import { goto } from "$app/navigation";
   import { untrack } from "svelte";
   import type { ApiResult } from "#lib/workspace/api/http.ts";
@@ -18,26 +18,16 @@
   } from "#lib/workspace/api/ticket-browser.ts";
   import type {
     NewTicket,
-    QueryPage,
     TicketQueryItem as TicketSummary,
-    TicketState,
     TicketTarget,
     TicketTargetAccess,
   } from "#lib/generated/ticket-api.ts";
   import { ticketHref } from "#lib/workspace/resource-links.ts";
   import {
-    ticketQueryRequest, currentOrchestratorAssignment, assignmentPrincipalLabel, handlingLabel, handlingSummary, closureReasonLabel,
+    currentOrchestratorAssignment, assignmentPrincipalLabel, handlingLabel, closureReasonLabel,
     type WorkspaceOrchestratorStatus,
   } from "#lib/workspace/tickets/ticket-panel.ts";
   import type { PageData } from "./$types";
-
-  type LaneState = {
-    states: TicketState[];
-    tickets: TicketSummary[];
-    page: QueryPage | null;
-    loading: boolean;
-    error: string | null;
-  };
 
   type EditableTicketTarget = {
     repository_key: string;
@@ -46,19 +36,21 @@
   };
 
   let { data }: { data: PageData } = $props();
-  function initialLanes(): Record<string, LaneState> {
-    return Object.fromEntries(Object.entries(data.ticketLanes).flatMap(([laneId, result]) => result ? [[laneId, {
-      states: [laneId as TicketState], tickets: result.data?.items ?? [], page: result.data?.page ?? null,
-      loading: false, error: result.error,
-    }]] : []));
-  }
-  let laneState = $state<Record<string, LaneState>>(untrack(initialLanes));
-  let principal = $state(untrack(() => data.filters.principal));
-  let closureChoice = $state(untrack(() => data.filters.closureReason));
-  let filtersBusy = $state(false);
-  $effect(() => { const currentData = data; untrack(() => {
-    laneState = initialLanes(); principal = currentData.filters.principal; closureChoice = currentData.filters.closureReason; orchestrator = currentData.orchestrator;
-  }); });
+  let response = $state(untrack(() => data.tickets));
+  let searchText = $state(untrack(() => data.search));
+  let searchBusy = $state(false);
+  let pageBusy = $state(false);
+  let navigationError = $state<string | null>(null);
+  $effect(() => {
+    const currentData = data;
+    untrack(() => {
+      response = currentData.tickets;
+      searchText = currentData.search;
+      pageBusy = false;
+      navigationError = null;
+      orchestrator = currentData.orchestrator;
+    });
+  });
   let orchestrator = $state<ApiResult<WorkspaceOrchestratorStatus>>(
     untrack(() => data.orchestrator),
   );
@@ -82,15 +74,21 @@
     }
     return true;
   });
-  const lanes = $derived(Object.entries(laneState).map(([id, lane]) => ({ id, label: id === "open" ? "Open" : "Closed", tickets: lane.tickets })));
-
-  async function applyFilters(event: SubmitEvent) {
-    event.preventDefault();
-    const form = event.currentTarget as HTMLFormElement;
-    const search = new URLSearchParams();
-    for (const [key, value] of new FormData(form)) if (typeof value === "string" && value) search.append(key, value);
-    filtersBusy = true;
-    try { await goto(`?${search}`); } finally { filtersBusy = false; }
+  async function searchTickets(event?: SubmitEvent) {
+    event?.preventDefault();
+    if (searchBusy) return;
+    searchBusy = true;
+    navigationError = null;
+    try {
+      const query = new URLSearchParams({ q: searchText.trim() });
+      await goto(`/w/${encodeURIComponent(data.workspaceId)}/tickets?${query}`, {
+        reset: false, refreshAll: true,
+      });
+    } catch (error) {
+      navigationError = error instanceof Error ? error.message : String(error);
+    } finally {
+      searchBusy = false;
+    }
   }
 
   function mergeTickets(
@@ -102,31 +100,28 @@
     return [...byId.values()];
   }
 
-  async function loadMore(laneId: string): Promise<void> {
-    const lane = laneState[laneId];
-    if (!lane || lane.loading || (lane.page && !lane.page.has_more)) {
-      return;
-    }
-    lane.loading = true;
-    lane.error = null;
-    try {
-      const result = await loadJson(
-        fetch,
-        workspaceApiPath(data.workspaceId, "/tickets/query"),
-        { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(ticketQueryRequest(data.filters, lane.states, lane.page?.next_cursor ?? null)) },
-        parseTicketQueryResponse,
-        TICKET_BROWSER_API_LOAD_POLICY,
-      );
-      if (!result.data) {
-        throw new Error(result.error ?? "追加読み込みに失敗しました");
-      }
-      lane.tickets = mergeTickets(lane.tickets, result.data.items);
-      lane.page = result.data.page;
-    } catch (error) {
-      lane.error = error instanceof Error ? error.message : String(error);
-    } finally {
-      lane.loading = false;
-    }
+  async function loadMore(): Promise<void> {
+    if (pageBusy || searchBusy || !data.queryRequest || (response.data && !response.data.page.has_more)) return;
+    const observedData = data;
+    const previous = response.data;
+    pageBusy = true;
+    response = { data: previous, error: null };
+    const result = await loadJson(
+      fetch,
+      workspaceApiPath(observedData.workspaceId, "/tickets/query"),
+      {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...observedData.queryRequest, cursor: previous?.page.next_cursor ?? null }),
+      },
+      parseTicketQueryResponse,
+      TICKET_BROWSER_API_LOAD_POLICY,
+    );
+    // 旧query/Workspaceの遅延応答で、現在の一覧やページ状態を上書きしない。
+    if (data !== observedData) return;
+    response = result.data
+      ? { data: { ...result.data, items: mergeTickets(previous?.items ?? [], result.data.items) }, error: null }
+      : { data: previous, error: result.error };
+    pageBusy = false;
   }
 
   function addCreateTarget(): void {
@@ -288,98 +283,91 @@
     </p>
   {/if}
 
-  <form class="ticket-query-form" onsubmit={applyFilters} aria-label="Ticket filters">
-    <label>Search<input name="q" value={data.filters.query} type="search" /></label>
-    <label>Case<select name="case" value={data.filters.caseState}><option value="all">Open and closed</option><option value="open">Open</option><option value="closed">Closed</option></select></label>
-    <label>Assigned principal<select name="principal" bind:value={principal}><option value="all">Any</option><option value="orchestrator">Orchestrator</option><option value="user">User</option><option value="worker">Worker</option></select></label>
-    {#if principal === "user"}<label>Account ID<input name="account" value={data.filters.accountId} required /></label>{/if}
-    {#if principal === "worker"}<label>Runtime ID<input name="runtime" value={data.filters.runtimeId} required /></label><label>Worker ID<input name="worker" value={data.filters.workerId} required /></label>{/if}
-    <fieldset><legend>Classification tags (all selected)</legend>
-      {#each data.tags.data ?? [] as tag (tag.id)}
-        {#if !tag.deleted}<label class="ticket-tag-filter"><input type="checkbox" name="tag" value={tag.id} checked={data.filters.tagIds.includes(tag.id)} />{tag.name}</label>{/if}
-      {:else}<span class="workspace-empty-copy">No tags</span>{/each}
-      {#if data.tags.error}<p class="workspace-callout is-error" role="alert">Tags: {data.tags.error}</p>{/if}
-    </fieldset>
-    <details class="ticket-reason-filter" open={data.filters.closureReason !== "all"}><summary>Close reason filter</summary>
-      <label>Current close reason<select name="reason" bind:value={closureChoice}><option value="all">Any reason</option><option value="completed">Completed</option><option value="not_planned">Not planned</option><option value="duplicate">Duplicate</option><option value="unknown">Unknown</option><option value="other">Other (exact text)</option></select></label>
-      {#if closureChoice === "other"}<label>Close reason text<input name="reason_text" value={data.filters.closureText} required /></label>{/if}
-      <p class="workspace-empty-copy">Matches current closed cases. Search also includes past close reasons.</p>
-    </details>
-    <button class="workspace-secondary-button" disabled={filtersBusy}>{filtersBusy ? "Searching…" : "Apply filters"}</button>
-    <a href={`/w/${encodeURIComponent(data.workspaceId)}/orchestrator`}>Orchestrator handling</a>
+  <form class="ticket-query-form" onsubmit={searchTickets} aria-label="Search tickets">
+    <input name="q" type="search" aria-label="Search tickets" bind:value={searchText}
+      placeholder="Search tickets · state:open" spellcheck="false" />
+    <button class="workspace-secondary-button" type="submit" disabled={searchBusy}>
+      {searchBusy ? "Searching…" : "Search"}
+    </button>
   </form>
+  <div class="ticket-search-context">
+    <details class="ticket-search-help">
+      <summary>Search syntax</summary>
+      <p>Combine text with <code>state:open</code> or <code>state:closed</code>. Omit state to search both.</p>
+      <p><code>tag:"UI bug"</code> · <code>assignee:orchestrator</code> · <code>reason:completed</code></p>
+      <p>Other principals: <code>assignee:user/account-id</code> or <code>assignee:worker/runtime-id/worker-id</code>.
+        Custom close reason: <code>reason:"Superseded plan"</code>.</p>
+    </details>
+    <a href={'/w/' + encodeURIComponent(data.workspaceId) + '/orchestrator'}>Orchestrator handling</a>
+  </div>
+  {#if navigationError}<p class="workspace-callout is-error" role="alert">{navigationError}</p>{/if}
 
-  <section class="ticket-kanban" aria-label="Ticket cases">
-    {#each lanes as lane (lane.id)}
-      {@const pagination = laneState[lane.id]}
-      <section class="ticket-lane" data-state={lane.id}>
-        <header class="ticket-lane-header">
-          <div>
-            <span class="ticket-state-dot"></span>
-            <h2>{lane.label}</h2>
-          </div>
-          <span class="ticket-lane-count">{lane.tickets.length} loaded</span>
-        </header>
-        <div
-          class="ticket-lane-cards"
-          data-lane-id={lane.id}
-        >
-          {#each lane.tickets as ticket (ticket.id)}
-            {@const assignment = currentOrchestratorAssignment(ticket)}
-            <a
-              class="ticket-card"
-              href={ticketHref(data.workspaceId, ticket)}
-            >
-              <span class="ticket-card-id">{ticket.resource_key}</span>
-              <strong>{ticket.title}</strong>
-              <div class="ticket-card-meta">
-                <span>Case: {ticket.state} · {ticket.priority}</span>
-                <time>{prettyDate(ticket.updated_at)}</time>
+  <section class="ticket-list" aria-label="Tickets" aria-busy={searchBusy || pageBusy}>
+    {#if response.data}
+      <p class="ticket-list-count" aria-live="polite">{response.data.items.length} tickets loaded</p>
+    {/if}
+    <ul class="ticket-list-rows">
+      {#each response.data?.items ?? [] as ticket (ticket.id)}
+        {@const assignment = currentOrchestratorAssignment(ticket)}
+        <li>
+          <a class="ticket-list-row" data-state={ticket.state} href={ticketHref(data.workspaceId, ticket)}>
+            <span class="ticket-list-state">{ticket.state === "open" ? "Open" : "Closed"}</span>
+            <div class="ticket-list-content">
+              <strong class="ticket-list-title">{ticket.title}</strong>
+              <div class="ticket-list-meta">
+                <span class="ticket-list-key">{ticket.resource_key}</span>
+                <time datetime={ticket.updated_at ?? undefined}>{prettyDate(ticket.updated_at)}</time>
+                {#each ticket.tags as tag (tag.id)}<span class="ticket-list-tag">{tag.name}</span>{/each}
+                {#if ticket.current_closure}<span>Close reason: {closureReasonLabel(ticket.current_closure.reason)}</span>{/if}
+                {#if assignment}<span title={assignmentPrincipalLabel(assignment.principal)}>Handling: {handlingLabel(assignment.tracking?.status)} ({assignment.tracking ? "self-reported" : "not reported"})</span>{/if}
               </div>
-              {#if ticket.current_closure}<span class="ticket-closure-summary">Close reason: {closureReasonLabel(ticket.current_closure.reason)}</span>{/if}
-              <span class="ticket-classification">Tags: {ticket.tags.length ? ticket.tags.map((tag) => tag.name).join(", ") : "None"}</span>
-              <div class="ticket-handling-summary">
-                <span>Orchestrator handling: {assignment ? handlingLabel(assignment.tracking?.status) : "Not assigned"}{#if assignment}{" "}<small>({assignment.tracking ? "self-reported" : "not reported"})</small>{/if}</span>
-                {#if assignment}<span>Assigned principal: {assignmentPrincipalLabel(assignment.principal)}</span>{/if}
-                <span>{handlingSummary(assignment)}</span>
-              </div>
-            </a>
-          {:else}
-            {#if !pagination?.error}<div class="ticket-lane-empty">No tickets</div>{/if}
-          {/each}
-          {#if pagination?.loading}
-            <p class="ticket-lane-page-state" aria-live="polite">Loading…</p>
-          {:else if pagination?.error}
-            <div class="ticket-lane-page-state ticket-lane-page-error" role="alert">
-              <span>{pagination.error}</span>
-              <button type="button" onclick={() => loadMore(lane.id)}>Retry</button>
             </div>
-          {:else if pagination?.page?.has_more}
-            <button class="workspace-secondary-button" type="button" onclick={() => loadMore(lane.id)}>Load more {lane.label.toLowerCase()} tickets</button>
-          {:else if pagination?.page && !pagination.page.has_more && lane.tickets.length > 0}
-            <p class="ticket-lane-page-state">End of lane</p>
-          {/if}
-        </div>
-      </section>
-    {/each}
+          </a>
+        </li>
+      {/each}
+    </ul>
+    {#if response.error}
+      <div class="ticket-list-error" role="alert">
+        <span>{response.error}</span>
+        <button class="workspace-secondary-button" type="button" disabled={pageBusy || searchBusy}
+          onclick={() => data.queryRequest ? loadMore() : searchTickets()}>Retry</button>
+      </div>
+    {:else if !response.data?.items.length && !searchBusy}
+      <p class="ticket-list-empty">No tickets match this query.</p>
+    {/if}
+    {#if pageBusy}
+      <p class="ticket-list-page-state" aria-live="polite">Loading…</p>
+    {:else if response.data?.page.has_more && !response.error}
+      <button class="workspace-secondary-button ticket-load-more" type="button" disabled={searchBusy} onclick={loadMore}>Load more tickets</button>
+    {/if}
   </section>
 </div>
 
 <style>
-  .ticket-query-form { display: flex; flex-wrap: wrap; align-items: end; gap: var(--space-3); margin-block: var(--space-4); }
-  .ticket-query-form > label { display: grid; gap: var(--space-1); min-width: 0; flex: 1 1 10rem; }
-  .ticket-query-form input:not([type="checkbox"]), .ticket-query-form select { min-width: 0; width: 100%; padding: var(--space-2); color: var(--text); background: var(--bg-raised); border: 1px solid var(--line); border-radius: var(--radius-soft); font: inherit; }
-  .ticket-query-form fieldset { display: flex; flex-wrap: wrap; gap: var(--space-3); border: 0; padding: 0; flex: 1 1 100%; min-width: 0; }
-  .ticket-tag-filter { display: flex; align-items: center; gap: var(--space-1); overflow-wrap: anywhere; }
-  .ticket-reason-filter { flex: 1 1 100%; }
-  .ticket-reason-filter label { display: grid; gap: var(--space-1); max-width: 28rem; margin-block: var(--space-2); }
-  .ticket-reason-filter summary { cursor: pointer; }
-  .ticket-query-form legend { margin-bottom: var(--space-2); }
-  .ticket-kanban { grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr)); align-items: start; overflow: visible; }
-  .ticket-lane { height: auto; min-height: 0; max-height: none; }
-  .ticket-lane-cards { max-height: none; overflow: visible; }
-  .ticket-card { overflow-wrap: anywhere; }
-  .ticket-handling-summary { display: grid; gap: var(--space-1); border-top: 1px solid var(--line); padding-top: var(--space-2); color: var(--text-muted); }
-  .ticket-classification { color: var(--text-muted); }
-  .ticket-closure-summary { font-weight: 600; }
+  .ticket-query-form { display: flex; align-items: stretch; gap: var(--space-2); margin-top: var(--space-4); }
+  .ticket-query-form input { flex: 1; min-width: 0; padding: var(--space-2) var(--space-3); color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-soft); font: inherit; }
+  .ticket-query-form input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .ticket-search-context { display: flex; align-items: start; justify-content: space-between; flex-wrap: wrap; gap: var(--space-2); margin-block: var(--space-2) var(--space-4); color: var(--text-muted); font-size: var(--font-size-compact); }
+  .ticket-search-context a { color: inherit; }
+  .ticket-search-help { min-width: 0; max-width: 100%; }
+  .ticket-search-help summary { cursor: pointer; width: fit-content; }
+  .ticket-search-help p { margin-block: var(--space-2); overflow-wrap: anywhere; }
+  .ticket-search-help code { font-size: inherit; }
+  .ticket-list { min-width: 0; }
+  .ticket-list-count { margin: 0; padding-block: var(--space-2); color: var(--text-muted); font-size: var(--font-size-compact); }
+  .ticket-list-rows { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
+  .ticket-list-row { display: grid; grid-template-columns: 4.5rem minmax(0, 1fr); align-items: start; gap: var(--space-2); padding-block: var(--space-3); border-bottom: 1px solid var(--line); color: var(--text); text-decoration: none; }
+  .ticket-list-row:hover { background: var(--interactive-hover); }
+  .ticket-list-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .ticket-list-state { padding-top: 2px; font-size: var(--font-size-compact); color: var(--text-muted); }
+  .ticket-list-row[data-state="open"] .ticket-list-state { color: var(--success); }
+  .ticket-list-content { min-width: 0; }
+  .ticket-list-title { display: block; font-size: var(--font-size-body); line-height: var(--line-height-body); color: var(--text-strong); overflow-wrap: anywhere; }
+  .ticket-list-meta { display: flex; flex-wrap: wrap; gap: var(--space-1) var(--space-3); margin-top: var(--space-1); font-size: var(--font-size-compact); color: var(--text-muted); overflow-wrap: anywhere; }
+  .ticket-list-key { font-family: var(--font-mono); }
+  .ticket-list-tag { color: var(--text); }
+  .ticket-list-empty, .ticket-list-page-state { padding-block: var(--space-4); margin: 0; color: var(--text-muted); }
+  .ticket-list-error { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); padding-block: var(--space-4); color: var(--danger); overflow-wrap: anywhere; }
+  .ticket-load-more { margin-block: var(--space-4); }
+  @media (max-width: 480px) { .ticket-list-row { grid-template-columns: 3.5rem minmax(0, 1fr); } }
 </style>

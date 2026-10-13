@@ -319,7 +319,7 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
   );
 });
 
-Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", async () => {
+Deno.test("workspace Tickets surface provides query list and lifecycle controls", async () => {
   const ticketsNav = await Deno.readTextFile(
     new URL("../sidebar/TicketsNavSection.svelte", import.meta.url),
   );
@@ -352,9 +352,6 @@ Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", as
       "./../../../routes/w/[workspaceId]/tickets/[ticketId]/+page.svelte",
       import.meta.url,
     ),
-  );
-  const ticketPanelModel = await Deno.readTextFile(
-    new URL("../tickets/ticket-panel.ts", import.meta.url),
   );
   const generatedTicketApi = await Deno.readTextFile(
     new URL("../../generated/ticket-api.ts", import.meta.url),
@@ -391,21 +388,14 @@ Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", as
       !mergeRequestsNav.includes("review and integration resources"),
     "Tickets, Objectives, and Merge Requests should each be a single primary sidebar link",
   );
+  // クエリ・ページングの振舞いはticket-search.testとTicket browser suiteで検証する。
   assert(
-    ticketsLoad.includes("ticketQueryRequest(filters, [state])") &&
+    ticketsLoad.includes("compileTicketSearch") &&
       ticketsLoad.includes("/tickets/query") &&
-      ticketsLoad.includes('method: "POST"') &&
-      ticketsPage.includes('class="ticket-kanban"') &&
-      ticketsPage.includes("laneState") &&
-      ticketsPage.includes("loadMore(lane.id)"),
-    "Tickets list must apply shared server query filters before paging case lanes",
-  );
-  assert(
-    ticketPanelModel.includes('label: "Open"') &&
-      ticketPanelModel.includes('label: "Closed"') &&
-      ticketPanelModel.includes("TICKET_LANE_PAGE_SIZE = 30") &&
-      ticketPanelModel.includes("nextTicketLaneVisibleCount"),
-    "Ticket Kanban should separate cases into independent 30-item display windows",
+      ticketsPage.includes('class="ticket-list"') &&
+      !ticketsPage.includes("TicketQueryFilters") &&
+      !ticketsPage.includes("ticket-kanban"),
+    "Tickets use one server query and a flat list rather than lanes or separate filters",
   );
   assert(
     generatedTicketApi.includes(

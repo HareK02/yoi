@@ -7,46 +7,74 @@ import {
 } from "#lib/workspace/api/ticket-browser.ts";
 import { parseTags } from "#lib/workspace/api/ticket-operations.ts";
 import {
-  readTicketFilters,
-  ticketQueryRequest,
-} from "#lib/workspace/tickets/ticket-panel.ts";
-import type { TicketState } from "#lib/generated/ticket-api.ts";
+  compileTicketSearch,
+  DEFAULT_TICKET_SEARCH,
+  ticketSearchNeedsTags,
+} from "#lib/workspace/tickets/ticket-search.ts";
+import type {
+  TicketQueryRequest,
+  WorkspaceTag,
+} from "#lib/generated/ticket-api.ts";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params, url }) => {
   const workspaceId = params.workspaceId;
-  const filters = readTicketFilters(url.searchParams);
-  const loadLane = async (state: TicketState) => {
-    if (filters.caseState !== "all" && filters.caseState !== state) return null;
+  const search = url.searchParams.get("q") ?? DEFAULT_TICKET_SEARCH;
+  const loadTickets = async () => {
+    let queryRequest: TicketQueryRequest | null = null;
     try {
-      return await loadJson(
+      const tags: WorkspaceTag[] = [];
+      // タグ名をstable IDへ解決する場合だけ一覧を取得する。状態検索をタグAPIに依存させない。
+      if (ticketSearchNeedsTags(search)) {
+        let after = "";
+        while (true) {
+          const result = await loadJson(
+            fetch,
+            workspaceApiPath(
+              workspaceId,
+              `/ticket-tags?limit=200${
+                after ? `&after=${encodeURIComponent(after)}` : ""
+              }`,
+            ),
+            undefined,
+            parseTags,
+            TICKET_BROWSER_API_LOAD_POLICY,
+          );
+          if (!result.data) {
+            throw new Error(result.error ?? "Tags could not be loaded");
+          }
+          tags.push(...result.data);
+          if (result.data.length < 200) break;
+          const next = result.data.at(-1)!.id;
+          if (next <= after) throw new Error("Tag pagination did not advance");
+          after = next;
+        }
+      }
+      queryRequest = compileTicketSearch(search, tags);
+      const tickets = await loadJson(
         fetch,
         workspaceApiPath(workspaceId, "/tickets/query"),
         {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify(ticketQueryRequest(filters, [state])),
+          body: JSON.stringify(queryRequest),
         },
         parseTicketQueryResponse,
         TICKET_BROWSER_API_LOAD_POLICY,
       );
+      return { queryRequest, tickets };
     } catch (error) {
       return {
-        data: null,
-        error: error instanceof Error ? error.message : String(error),
+        queryRequest,
+        tickets: {
+          data: null,
+          error: error instanceof Error ? error.message : String(error),
+        },
       };
     }
   };
-  const [open, closed, tags, orchestrator, repositories] = await Promise.all([
-    loadLane("open"),
-    loadLane("closed"),
-    loadJson(
-      fetch,
-      workspaceApiPath(workspaceId, "/ticket-tags"),
-      undefined,
-      parseTags,
-      TICKET_BROWSER_API_LOAD_POLICY,
-    ),
+  const [result, orchestrator, repositories] = await Promise.all([
+    loadTickets(),
     loadJson(
       fetch,
       workspaceApiPath(workspaceId, "/orchestrator"),
@@ -55,12 +83,5 @@ export const load: PageLoad = async ({ fetch, params, url }) => {
     ),
     loadWorkspaceRepositoryList(fetch, workspaceId),
   ]);
-  return {
-    workspaceId,
-    filters,
-    ticketLanes: { open, closed },
-    tags,
-    orchestrator,
-    repositories,
-  };
+  return { workspaceId, search, ...result, orchestrator, repositories };
 };

@@ -33,9 +33,9 @@ Workspace Webは、Workspaceの確定した状態を確認し、注意が必要�
 
 詳細では、対象の識別情報、現在の状態、注意が必要な事項を最初に示し、本文や履歴を主領域に置く。関連、target、review、案件判断、担当のhandlingをそれぞれ別の主体が確定する場合は、独立したsectionに分ける。
 
-## Ticket board
+## Ticket一覧
 
-boardのlaneは案件状態の`open`／`closed`を表し、狭い画面では縦に並べる。`open`を着手可能・queue済み、`closed`を要求実現済みと読み替えない。終了理由と説明を案件の判断として示し、再開・訂正でも過去の判断を残す。
+Ticketは平坦なリストで表示し、検索条件は単一のクエリ欄にまとめる。状態別のlaneや独立したfilter群は設けず、案件状態は`state:open`／`state:closed`で指定する。`open`を着手可能・queue済み、`closed`を要求実現済みと読み替えない。終了理由と説明を案件の判断として示し、再開・訂正でも過去の判断を残す。
 
 各Ticketにはkey、title、優先判断を変える情報を表示する。分類タグ、担当principal、自己申告のhandlingを案件状態と分けて示す。検索と絞込みは取得済みの一部分ではなく、Backendのqueryへ適用してからページを取得する。
 
