@@ -31,6 +31,11 @@
 //! A replacement may checkpoint old saved record receipts only for identical selected source bytes.
 //! Tokens incorporate prior saved content conditions as well as current content, preventing A→B→A
 //! edits from resurrecting an old operation premise after intervening saved effects.
+//! Source-ledger pagination uses an opaque, scope/Subject/Journal-bound content cursor: late gap
+//! admission, accepted-fragment extension, reflection, or availability changes reject continuation.
+//! The fingerprint and bounded projection share one transaction; hashing streams bounded rows.
+//! Hosts resuming at the processing cursor can use a bounded source point lookup instead of
+//! traversing already reflected pages. Receipt/entry keysets remain append-stable.
 
 mod store;
 #[cfg(test)]

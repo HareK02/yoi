@@ -1747,7 +1747,7 @@ fn metadata_and_operation_keysets_do_not_skip_appends_or_sort_by_request_id() {
         .list_journal_sources(
             &fixture.host,
             &fixture.journal_id,
-            Some(source_page.next.unwrap().parse().unwrap()),
+            source_page.next.as_deref(),
             2,
         )
         .unwrap();
@@ -2443,4 +2443,181 @@ fn journal_migration_failure_rolls_back_ddl_and_retries_without_changing_existin
         store.read_journal(&host, &id).unwrap().source_session_id,
         "post-migration-session"
     );
+}
+
+#[test]
+fn late_gap_admission_and_partial_updates_reject_stale_source_page_cursors() {
+    let fixture = Fixture::with_sizes(&[8]);
+    let second = source_range("source-session", 1, 8);
+    let third = source_range("source-session", 2, 8);
+    let fourth = source_range("source-session", 3, 8);
+    fixture
+        .store()
+        .accept_journal_sources(&fixture.host, "", &[third, fourth])
+        .unwrap();
+    let first = fixture
+        .store()
+        .list_journal_sources(&fixture.host, &fixture.journal_id, None, 2)
+        .unwrap();
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .map(|s| s.source.order)
+            .collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    let cursor = first.next.unwrap();
+    fixture
+        .store()
+        .accept_journal_sources(&fixture.host, "", &[second])
+        .unwrap();
+    let next =
+        fixture
+            .store()
+            .list_journal_sources(&fixture.host, &fixture.journal_id, Some(&cursor), 2);
+    assert!(
+        matches!(next, Err(JournalError::Conflict(_))),
+        "gap completion must not silently skip newly admitted order 1: {next:?}"
+    );
+    let fresh = fixture
+        .store()
+        .list_journal_sources(&fixture.host, &fixture.journal_id, None, 2)
+        .unwrap();
+    assert_eq!(
+        fresh
+            .items
+            .iter()
+            .map(|s| s.source.order)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    let next = fixture
+        .store()
+        .list_journal_sources(&fixture.host, &fixture.journal_id, fresh.next.as_deref(), 2)
+        .unwrap();
+    assert_eq!(
+        next.items
+            .iter()
+            .map(|s| s.source.order)
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+    // Duplicate notifications do not change the content condition.
+    fixture
+        .store()
+        .accept_journal_sources(&fixture.host, "", &fixture.ranges)
+        .unwrap();
+    assert!(
+        fixture
+            .store()
+            .list_journal_sources(&fixture.host, &fixture.journal_id, fresh.next.as_deref(), 2)
+            .is_ok()
+    );
+    let selected = fixture.ranges[0].clone();
+    let (_, job) = fixture.generation("reflect-during-list", vec![selected.clone()]);
+    fixture.execute(
+        &job,
+        "no-change",
+        JournalAction::ConfirmUnchanged,
+        vec![selected.clone()],
+    );
+    assert!(
+        fixture
+            .store()
+            .list_journal_sources(&fixture.host, &fixture.journal_id, fresh.next.as_deref(), 2)
+            .is_ok()
+    );
+    fixture.execute(
+        &job,
+        "checkpoint",
+        checkpoint(&["no-change"]),
+        vec![selected],
+    );
+    assert!(matches!(
+        fixture.store().list_journal_sources(
+            &fixture.host,
+            &fixture.journal_id,
+            fresh.next.as_deref(),
+            2
+        ),
+        Err(JournalError::Conflict(_))
+    ));
+    assert_eq!(
+        fixture
+            .store()
+            .read_journal_source(&fixture.host, &fixture.journal_id, 0)
+            .unwrap()
+            .reflected_bytes,
+        8
+    );
+
+    let host = session_host(fixture.store(), &fixture.host.subject_id, "partial-session");
+    let range = source_range("partial-session", 0, 16);
+    let later = source_range("partial-session", 1, 8);
+    let id = fixture
+        .store()
+        .accept_journal_sources(&host, "Partial source", &[fragment(&range, 0, 4), later])
+        .unwrap();
+    let page = fixture
+        .store()
+        .list_journal_sources(&host, &id, None, 1)
+        .unwrap();
+    fixture
+        .store()
+        .accept_journal_sources(&host, "", &[fragment(&range, 4, 8)])
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .store()
+            .list_journal_sources(&host, &id, page.next.as_deref(), 1),
+        Err(JournalError::Conflict(_))
+    ));
+    let page = fixture
+        .store()
+        .list_journal_sources(&host, &id, None, 1)
+        .unwrap();
+    fixture
+        .store()
+        .mark_journal_sources_unavailable(&host, &id, &[fragment(&range, 0, 8)])
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .store()
+            .list_journal_sources(&host, &id, page.next.as_deref(), 1),
+        Err(JournalError::Conflict(_))
+    ));
+    let page = fixture
+        .store()
+        .list_journal_sources(&host, &id, None, 1)
+        .unwrap();
+    fixture
+        .store()
+        .mark_journal_sources_available(&host, &id, &[fragment(&range, 0, 4)])
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .store()
+            .list_journal_sources(&host, &id, page.next.as_deref(), 1),
+        Err(JournalError::Conflict(_))
+    ));
+    let page = fixture
+        .store()
+        .list_journal_sources(&host, &id, None, 1)
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .store()
+            .list_journal_sources(&host, &fixture.journal_id, page.next.as_deref(), 1),
+        Err(JournalError::InvalidInput(_))
+    ));
+    let mut cursor: serde_json::Value =
+        serde_json::from_str(page.next.as_deref().unwrap()).unwrap();
+    cursor["unexpected_field"] = true.into();
+    assert!(matches!(
+        fixture
+            .store()
+            .list_journal_sources(&host, &id, Some(&cursor.to_string()), 1),
+        Err(JournalError::InvalidInput(_))
+    ));
 }

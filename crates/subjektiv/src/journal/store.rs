@@ -3,6 +3,37 @@ use crate::{issued_id, now};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourcePageCursor {
+    scope_id: String,
+    subject_id: String,
+    journal_id: String,
+    source_fingerprint: String,
+    after_order: u64,
+}
+
+// Hash rows incrementally rather than materializing an unbounded coverage ledger. The caller
+// holds one storage transaction for both this content condition and the bounded page projection.
+fn source_fingerprint(tx: &Connection, journal_id: &str) -> JournalResult<String> {
+    let mut hash = Sha256::new();
+    let mut stmt=tx.prepare("SELECT source_order, source_json, accepted_json, unavailable_json, reflected_bytes FROM journal_sources WHERE journal_id=?1 ORDER BY source_order")?;
+    let mut rows = stmt.query([journal_id])?;
+    while let Some(row) = rows.next()? {
+        let value = (
+            row.get::<_, u64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, u64>(4)?,
+        );
+        let bytes = serde_json::to_vec(&value)?;
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 fn invalid(message: &str) -> JournalError {
     JournalError::InvalidInput(message.into())
 }
@@ -185,6 +216,7 @@ fn refresh_state(tx: &Connection, j: &mut Journal) -> JournalResult<()> {
 }
 fn check_source(range: &JournalSourceRange, session: &str) -> JournalResult<()> {
     let s = &range.source;
+    label(&s.session_id)?;
     let suffix = s
         .pointer
         .entry_ref
@@ -741,21 +773,47 @@ impl SubjektivStore {
             fit_page(items,more)
         })
     }
+    /// Coverage changes can fill an earlier gap or extend an already listed entry. Continuation
+    /// pins the complete ledger content condition, rejecting changes instead of losing those bytes.
     pub fn list_journal_sources(
         &self,
         host: &JournalHostContext,
         journal_id: &str,
-        after: Option<u64>,
+        cursor: Option<&str>,
         limit: usize,
     ) -> JournalResult<JournalPage<JournalSourceStatus>> {
         let limit = page_limit(limit)?;
-        self.database.try_with_connection(|tx| {
+        self.database.try_transaction(|tx| {
             check_host(self,tx,host,false)?;journal(tx,host,journal_id,false)?;
+            let fingerprint=source_fingerprint(tx,journal_id)?;
+            let after=if let Some(cursor)=cursor {
+                if cursor.len()>2048 {return Err(invalid("source cursor exceeds byte limit"));}
+                let cursor:SourcePageCursor=serde_json::from_str(cursor).map_err(|_|invalid("invalid source cursor"))?;
+                if cursor.scope_id!=host.scope_id || cursor.subject_id!=host.subject_id || cursor.journal_id!=journal_id || cursor.after_order>i64::MAX as u64 {return Err(invalid("source cursor belongs to a different scope/Subject/Journal or invalid order"));}
+                if cursor.source_fingerprint!=fingerprint {return Err(conflict("source coverage changed; restart pagination from current state"));}
+                Some(cursor.after_order)
+            } else {None};
             let mut stmt=tx.prepare("SELECT source_order FROM journal_sources WHERE journal_id=?1 AND (?2 IS NULL OR source_order>?2) ORDER BY source_order LIMIT ?3")?;
             let orders=stmt.query_map(params![journal_id,after,limit+1],|r|r.get::<_,u64>(0))?.collect::<Result<Vec<_>,_>>()?;
             let more=orders.len()>limit;let mut items=Vec::new();
-            for order in orders.into_iter().take(limit) {items.push((order.to_string(),source(tx,journal_id,order)?));}
+            for order in orders.into_iter().take(limit) {
+                let next=serde_json::to_string(&SourcePageCursor {scope_id:host.scope_id.clone(),subject_id:host.subject_id.clone(),journal_id:journal_id.into(),source_fingerprint:fingerprint.clone(),after_order:order})?;
+                items.push((next,source(tx,journal_id,order)?));
+            }
             fit_page(items,more)
+        })
+    }
+    /// Bounded point lookup for Host resume from `process_order`, without scanning reflected pages.
+    pub fn read_journal_source(
+        &self,
+        host: &JournalHostContext,
+        journal_id: &str,
+        order: u64,
+    ) -> JournalResult<JournalSourceStatus> {
+        self.database.try_with_connection(|tx| {
+            check_host(self, tx, host, false)?;
+            journal(tx, host, journal_id, false)?;
+            source(tx, journal_id, order)
         })
     }
     /// Returns metadata only. IDs and entry positions are append-stable keysets, so appends/rewrites cannot shift unread pages.
