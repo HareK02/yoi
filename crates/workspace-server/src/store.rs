@@ -14004,6 +14004,7 @@ fn migrate_ticket_posts_v93_to_v94(conn: &Connection) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     ticket::migrate_sqlite_ticket_schema_in_transaction(&tx)
         .map_err(|error| Error::Store(format!("Ticket posts migration failed: {error}")))?;
+    assignment_delivery::install_post_inputs(&tx)?;
     tx.execute(
         "INSERT INTO __yoi_schema_migrations(version,name) VALUES(94,'Canonical Ticket posts')",
         [],
@@ -14025,6 +14026,7 @@ fn migrate_ticket_posts_v93_to_v94(conn: &Connection) -> Result<()> {
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     create_workspace_schema_structure(conn)?;
     assignment_delivery::install(conn)?;
+    assignment_delivery::install_post_inputs(conn)?;
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
         Error::Store(format!(
             "fresh Workspace Ticket schema verification failed: {error}"
@@ -14256,6 +14258,26 @@ fn verify_workspace_resource_constraints(conn: &Connection) -> Result<()> {
             if !present {
                 return Err(Error::Store(format!(
                     "Assignment delivery constraint {name} is missing"
+                )));
+            }
+        }
+    }
+    if current_schema_version(conn)? >= 94 {
+        for (kind, name) in [
+            ("table", "ticket_assignment_content_inputs"),
+            ("trigger", "ticket_assignment_content_input_no_update"),
+            ("trigger", "ticket_assignment_content_input_no_delete"),
+            ("trigger", "ticket_assignment_title_input"),
+            ("trigger", "ticket_assignment_initial_post_input"),
+        ] {
+            let present: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type=?1 AND name=?2)",
+                params![kind, name],
+                |row| row.get(0),
+            )?;
+            if !present {
+                return Err(Error::Store(format!(
+                    "Assignment content input constraint {name} is missing"
                 )));
             }
         }
@@ -20146,16 +20168,18 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         let (_dir, path) = legacy_case_workspace(90);
         let conn = Connection::open(&path).unwrap();
         configure_sqlite(&conn).unwrap();
+        // Keep the collision table valid for dependent triggers during the shared
+        // Ticket table rebuild. Only Workspace phase two must fail on DROP VIEW.
         conn.execute_batch("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit)
             VALUES('case-workspace','terminal','terminal','Terminal','closed','task','P2','','done',1);
             DROP VIEW ticket_active_worker_assignments;
-            CREATE TABLE ticket_active_worker_assignments(collision TEXT);").unwrap();
+            CREATE TABLE ticket_active_worker_assignments AS SELECT * FROM ticket_current_worker_assignments WHERE 0;").unwrap();
         install_retained_ticket_tags8(&conn);
         let _tags = seed_retained_classification(&conn, "case-workspace", "terminal");
         let tags_before = classification_rows(&conn);
         let auth_before = fixture_auth_rows(&conn);
         let error = migrate_ticket_cases_v90_to_v91(&conn).unwrap_err();
-        assert!(error.to_string().contains("DROP TABLE"));
+        assert!(error.to_string().contains("DROP TABLE"), "{error}");
         assert_eq!(current_schema_version(&conn).unwrap(), 90);
         assert_eq!(fixture_auth_rows(&conn), auth_before);
         assert_eq!(classification_rows(&conn), tags_before);
@@ -21142,10 +21166,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          FROM typed_tickets WHERE ticket_id='ticket'", [],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
                     if state == "closed" {
-                        assert_eq!((persisted.as_str(), events, assignments, operations), (state,0,0,0));
+                        assert_eq!((persisted.as_str(), events, assignments, operations), (state,1,0,0));
                     } else {
-                        assert_eq!((persisted.as_str(), events, assignments, operations), ("open",1,1,1));
-                        let transition: (Option<String>,Option<String>,String) = conn.query_row("SELECT from_state,to_state,kind FROM typed_ticket_events", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+                        assert_eq!((persisted.as_str(), events, assignments, operations), ("open",2,1,1));
+                        let transition: (Option<String>,Option<String>,String) = conn.query_row("SELECT from_state,to_state,kind FROM typed_ticket_events WHERE kind='assignment'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
                         assert_eq!(transition, (None, None, "assignment".into()));
                         assert_eq!(conn.query_row("SELECT value FROM typed_ticket_event_attributes WHERE key='assignment_role'", [], |row| row.get::<_,String>(0))?, "worker");
                     }
@@ -21404,12 +21428,14 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 conn.execute_batch(
                     r#"
 INSERT INTO typed_tickets (
-    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    workspace_id, ticket_id, slug, title, status, kind, priority,
     workflow_state, workflow_state_explicit
 ) VALUES
-    ('workspace-a', 'ticket-1', 'ticket-1', 'Ticket 1', 'open', 'task', 'normal', '', 'open', 1),
-    ('workspace-a', 'ticket-2', 'ticket-2', 'Ticket 2', 'open', 'task', 'normal', '', 'open', 1),
-    ('workspace-a', 'ticket-3', 'ticket-3', 'Ticket 3', 'open', 'task', 'normal', '', 'open', 1);
+    ('workspace-a', 'ticket-1', 'ticket-1', 'Ticket 1', 'open', 'task', 'normal', 'open', 1),
+    ('workspace-a', 'ticket-2', 'ticket-2', 'Ticket 2', 'open', 'task', 'normal', 'open', 1),
+    ('workspace-a', 'ticket-3', 'ticket-3', 'Ticket 3', 'open', 'task', 'normal', 'open', 1);
+INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,event_ref,kind,body)
+SELECT workspace_id,ticket_id,-1,ticket_id || ':-1','comment','' FROM typed_tickets WHERE workspace_id='workspace-a';
 INSERT INTO worker_registry (
     workspace_id, runtime_id, worker_id, display_name, retention_state, created_at, updated_at
 ) VALUES
@@ -22032,9 +22058,11 @@ INSERT INTO workspace_signing_identities (
     '2026-01-01', NULL, '2026-01-01'
 );
 INSERT INTO typed_tickets (
-    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    workspace_id, ticket_id, slug, title, status, kind, priority,
     workflow_state, workflow_state_explicit
-) VALUES ('workspace-a', 'ticket-a', 'ticket-a', 'A', 'open', 'task', 'normal', '', 'open', 1);
+) VALUES ('workspace-a', 'ticket-a', 'ticket-a', 'A', 'open', 'task', 'normal', 'open', 1);
+INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,event_ref,kind,body)
+VALUES ('workspace-a','ticket-a',-1,'ticket-a:-1','comment','');
 INSERT INTO worker_registry (
     workspace_id, runtime_id, worker_id, display_name, retention_state, created_at, updated_at
 ) VALUES (
@@ -22062,9 +22090,11 @@ INSERT INTO workspace_signing_identities (
     '2026-01-01', NULL, '2026-01-01'
 );
 INSERT INTO typed_tickets (
-    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    workspace_id, ticket_id, slug, title, status, kind, priority,
     workflow_state, workflow_state_explicit
-) VALUES ('workspace-b', 'ticket-a', 'ticket-a-b', 'B', 'open', 'task', 'normal', '', 'open', 1);
+) VALUES ('workspace-b', 'ticket-a', 'ticket-a-b', 'B', 'open', 'task', 'normal', 'open', 1);
+INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,event_ref,kind,body)
+VALUES ('workspace-b','ticket-a',-1,'ticket-a:-1','comment','');
 INSERT INTO worker_registry (
     workspace_id, runtime_id, worker_id, display_name, retention_state, created_at, updated_at
 ) VALUES (

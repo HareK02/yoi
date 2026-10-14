@@ -6,7 +6,7 @@ fn delivery_store_external_event(
     state_field: Option<&str>,
 ) {
     store.with_conn(|conn| {
-        conn.execute("INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,kind,author,at,state_field,body) VALUES('w','tracking',?1,?2,'user','2026-10-12T00:00:00Z',?3,'Answer arrived')",params![index,kind,state_field])?;
+        conn.execute("INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,event_ref,kind,author,at,state_field,body) VALUES('w','tracking',?1,'tracking:' || ?1,?2,'user','2026-10-12T00:00:00Z',?3,'Answer arrived')",params![index,kind,state_field])?;
         Ok(())
     }).unwrap();
 }
@@ -651,7 +651,7 @@ fn assignment_delivery_schema92_upgrade_uses_reconciled_migration_evidence_not_l
     );
     store
         .with_conn(|conn| {
-            assert_eq!(current_schema_version(conn)?, 93);
+            assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
             assert_eq!(
                 stored_fixture_rows(conn, "ticket_worker_assignments"),
                 assignments
@@ -1032,4 +1032,121 @@ async fn assignment_diagnostic_start_cursor_pages_existing_claims_without_input_
     );
     let wire = serde_json::to_string(&first).unwrap();
     assert!(!wire.contains("tracking-binding") && !wire.contains("External resource"));
+}
+
+#[tokio::test]
+async fn assignment_content_edits_are_atomic_durable_inputs_without_appending_posts() {
+    use ticket::TicketBackend;
+    let (directory, store) = tracking_store_fixture().await;
+    tracking_store_assign(&store, "a", "assign-a");
+    let source = tracking_store_source();
+    let initial = delivery_store_reserve_initial(&store, &source);
+    store.ack_ticket_assignment_delivery("w", &initial.delivery_id, &source).unwrap();
+    let path = directory.path().join("workspace.db");
+    let backend = ticket::SqliteTicketBackend::open_verified(&path, "w").unwrap();
+    let original = backend.show("tracking".into()).unwrap();
+    backend.edit_item("tracking".into(), ticket::TicketItemEdit {
+        title: Some("Changed title".into()), ..Default::default()
+    }).unwrap();
+    backend.edit_item("tracking".into(), ticket::TicketItemEdit {
+        title: Some("Changed title".into()), ..Default::default()
+    }).unwrap();
+    let mut latest = backend.show("tracking".into()).unwrap();
+    for body in ["Changed requirements", "Final requirements"] {
+        backend.edit_post("tracking".into(), ticket::TicketPostEdit {
+            event_ref: latest.events[0].event_ref.clone(),
+            expected_body: latest.document.body.clone(),
+            body: ticket::MarkdownText::new(body), author: "fixture-editor".into(),
+        }).unwrap();
+        latest = backend.show("tracking".into()).unwrap();
+    }
+    assert_eq!(latest.events.len(), original.events.len());
+    assert_eq!(latest.events[0].event_ref, original.events[0].event_ref);
+    backend.add_event("tracking".into(), ticket::NewTicketEvent::new(
+        ticket::TicketEventKind::Comment, "Discussion",
+    )).unwrap();
+    let comment = backend.show("tracking".into()).unwrap().events.last().unwrap().clone();
+    backend.edit_post("tracking".into(), ticket::TicketPostEdit {
+        event_ref: comment.event_ref, expected_body: comment.body,
+        body: ticket::MarkdownText::new("Edited discussion"), author: "fixture-editor".into(),
+    }).unwrap();
+    // Input insertion participates in the content write, including rollback.
+    store.with_conn_mut(|conn| {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("UPDATE typed_tickets SET title='Rolled back' WHERE ticket_id='tracking'", [])?;
+        tx.rollback()?;
+        assert!(conn.execute("UPDATE ticket_assignment_content_inputs SET assignment_id='other'", []).is_err());
+        assert!(conn.execute("DELETE FROM ticket_assignment_content_inputs", []).is_err());
+        Ok(())
+    }).unwrap();
+    let pending = store.list_pending_ticket_assignment_deliveries("w", 100).unwrap();
+    assert_eq!(pending.len(), 3, "no-op and discussion edits are not new request inputs");
+    assert!(pending.iter().all(|input| input.input_event_id.starts_with("ticket-edit:")));
+    let mut cursor = None;
+    let mut diagnostics = Vec::new();
+    loop {
+        let page = store.page_ticket_assignment_diagnostics("w", "tracking", "a", cursor.as_deref(), None, 1).unwrap();
+        diagnostics.extend(page.inputs.into_iter().map(|input| input.input_event_id));
+        cursor = page.next_input_event_id;
+        if cursor.is_none() { break; }
+    }
+    assert_eq!(diagnostics, std::iter::once(initial.input_event_id.clone())
+        .chain(pending.iter().map(|input| input.input_event_id.clone())).collect::<Vec<_>>());
+    drop(store);
+    let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+    assert_eq!(reopened.list_pending_ticket_assignment_deliveries("w", 100).unwrap(), pending);
+    for input in pending {
+        let reserved = reopened.reserve_ticket_assignment_delivery("w", "a", &input.input_event_id, &source).unwrap();
+        assert_eq!(reserved, input);
+        reopened.ack_ticket_assignment_delivery("w", &reserved.delivery_id, &source).unwrap();
+    }
+    assert!(reopened.list_pending_ticket_assignment_deliveries("w", 100).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn assignment_content_edits_never_revive_done_closed_or_reissued_delegations() {
+    for change in ["done", "close-reopen", "reissue"] {
+        let (directory, store) = tracking_store_fixture().await;
+        tracking_store_assign(&store, "a", "assign-a");
+        let source = tracking_store_source();
+        let initial = delivery_store_reserve_initial(&store, &source);
+        store.ack_ticket_assignment_delivery("w", &initial.delivery_id, &source).unwrap();
+        store.with_conn(|conn| {
+            conn.execute("UPDATE typed_tickets SET title='Input before authority change' WHERE ticket_id='tracking'", [])?;
+            Ok(())
+        }).unwrap();
+        let old = store.list_pending_ticket_assignment_deliveries("w", 100).unwrap().remove(0);
+        match change {
+            "done" => { store.update_ticket_assignment_tracking("w", "tracking", &tracking_store_input("a", "event-assign-a", "done-a"), &source).unwrap(); }
+            "close-reopen" => { store.with_conn(|conn| { conn.execute_batch("UPDATE typed_tickets SET workflow_state='closed' WHERE ticket_id='tracking'; UPDATE typed_tickets SET workflow_state='open' WHERE ticket_id='tracking';")?; Ok(()) }).unwrap(); }
+            _ => { tracking_store_assign(&store, "b", "assign-b"); }
+        }
+        use ticket::TicketBackend;
+        let backend = ticket::SqliteTicketBackend::open_verified(directory.path().join("workspace.db"), "w").unwrap();
+        backend.edit_item("tracking".into(), ticket::TicketItemEdit {
+            body: Some(ticket::MarkdownText::new("New requirements")), author: Some("fixture-editor".into()), ..Default::default()
+        }).unwrap();
+        let pending = store.list_pending_ticket_assignment_deliveries("w", 100).unwrap();
+        if change == "reissue" {
+            assert_eq!(pending.len(), 2, "new delegation and its content edit only");
+            assert!(pending.iter().all(|input| input.assignment_id == "b"));
+        } else { assert!(pending.is_empty(), "{change}"); }
+        assert!(store.reserve_ticket_assignment_delivery("w", "a", &old.input_event_id, &source).is_err());
+        let page = store.page_ticket_assignment_diagnostics("w", "tracking", "a", None, None, 100).unwrap();
+        assert!(!page.actionable);
+        assert_eq!(page.inputs.len(), 2, "retain old input evidence without creating new authority");
+    }
+}
+
+#[tokio::test]
+async fn assignment_content_input_missing_guards_refuse_startup() {
+    for trigger in ["ticket_assignment_title_input", "ticket_assignment_initial_post_input", "ticket_assignment_content_input_no_update", "ticket_assignment_content_input_no_delete"] {
+        let (directory, store) = tracking_store_fixture().await;
+        store.with_conn(|conn| { conn.execute_batch(&format!("DROP TRIGGER {trigger}"))?; Ok(()) }).unwrap();
+        drop(store);
+        let error = match SqliteWorkspaceStore::open_for_test(directory.path().join("workspace.db")) {
+            Ok(_) => panic!("missing {trigger} was accepted"), Err(error) => error,
+        };
+        assert!(error.to_string().contains(trigger), "{error}");
+    }
 }

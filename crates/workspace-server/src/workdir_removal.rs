@@ -1298,10 +1298,14 @@ mod tests {
                     )?;
                     conn.execute(
                         "INSERT INTO typed_tickets (
-                            workspace_id, ticket_id, slug, title, status, kind, priority, body,
+                            workspace_id, ticket_id, slug, title, status, kind, priority,
                             workflow_state, workflow_state_explicit
                          ) VALUES ('workspace-a', 'ticket-a', 'ticket-a', 'Ticket A', 'open',
-                                   'task', 'normal', '', 'open', 1)",
+                                   'task', 'normal', 'open', 1)",
+                        [],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,event_ref,kind,body) VALUES('workspace-a','ticket-a',-1,'ticket-a:-1','comment','')",
                         [],
                     )?;
                     conn.execute(

@@ -599,14 +599,8 @@ fn independent_case_schema9_adds_only_tags_without_reapplying_judgments_or_recei
     reopened.events[0]
         .attributes
         .retain(|key, _| matches!(key.as_str(), "event_id" | "event_sequence"));
-    // The frozen v9 copy has no persisted event_id attributes. Its published
-    // fallback was a zero-based ordinal, not the source v12 persisted identity.
-    for (ordinal, event) in reopened.events.iter_mut().skip(1).enumerate() {
-        event.event_ref = format!("sequence:{ordinal}");
-        event
-            .attributes
-            .insert("event_id".into(), event.event_ref.clone());
-    }
+    // The frozen SQLite loader published ticket_id:event_index identities.
+    // These remain identical after migration, without replacing them with display ordinals.
     let path = temp.path().join("retained9.db");
     let connection = Connection::open(&path).unwrap();
     schema7(&connection);

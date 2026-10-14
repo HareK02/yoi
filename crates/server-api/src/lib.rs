@@ -312,6 +312,8 @@ impl_openapi_schema!(
     CreateTicketRelationRequest,
     DefaultIntakeReadyBodyRequest,
     EditTicketRecordItemRequest,
+    EditTicketPostRequest,
+    TicketPostSnapshots,
     MergeEvent,
     MergeRequestDetailResponse,
     MergeRequestListQuery,
@@ -3085,6 +3087,14 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: EditTicketRecordItemRequest,
     ) -> Result<TicketRecord, RepositoryApiError>;
+    #[patch("/api/w/{workspace_id}/tickets/{id}/posts", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_record_post_edit(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: EditTicketPostRequest,
+    ) -> Result<TicketPostSnapshots, RepositoryApiError>;
     #[get("/api/w/{workspace_id}/tickets/{id}/dependency-check", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_dependency_check(
         &self,
@@ -8072,6 +8082,8 @@ transparent_ticket_dto!(
 );
 transparent_ticket_dto!(CreateTicketRecordRequest, ticket::NewTicket);
 transparent_ticket_dto!(EditTicketRecordItemRequest, ticket::TicketItemEdit);
+transparent_ticket_dto!(EditTicketPostRequest, ticket::TicketPostEdit);
+transparent_ticket_dto!(TicketPostSnapshots, (ticket::Ticket, ticket::Ticket));
 transparent_ticket_dto!(TicketThreadEventRequest, ticket::NewTicketEvent);
 transparent_ticket_dto!(TicketIntakeSummaryRequest, ticket::TicketIntakeSummary);
 transparent_ticket_dto!(CreateTicketRelationRequest, ticket::NewTicketRelation);

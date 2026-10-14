@@ -6948,6 +6948,15 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::ticket_orchestration_plan_record(service.clone()))
         .merge(server_api::server_api_axum::ticket_get(service.clone()))
         .merge(server_api::server_api_axum::ticket_edit(service.clone()))
+        .merge(server_api::server_api_axum::ticket_post_get(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_post_edit(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_record_post_edit(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::ticket_show(service.clone()))
         .merge(server_api::server_api_axum::ticket_assignment_list(
             service.clone(),
@@ -10286,12 +10295,19 @@ impl server_api::ServerApi for ServerApiContractService {
         request: server_api::CreateTicketRecordRequest,
     ) -> std::result::Result<server_api::TicketRecordRef, server_api::RepositoryApiError> {
         let result = execute_ticket_rest_operation_with_context(
-            self.workspace_api()?, &workspace_id, contract_request_headers(&context)?, Some(&context),
+            self.workspace_api()?,
+            &workspace_id,
+            contract_request_headers(&context)?,
+            Some(&context),
             TicketBackendOperation::Create { input: request.0 },
-        ).await.map_err(ApiError::into_repository_api_error)?;
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
         let Json(response) = ticket_rest_result(result, |result| match result {
-            TicketBackendOperationResult::TicketRef(ticket) => Some(ticket), _ => None,
-        }).map_err(ApiError::into_repository_api_error)?;
+            TicketBackendOperationResult::TicketRef(ticket) => Some(ticket),
+            _ => None,
+        })
+        .map_err(ApiError::into_repository_api_error)?;
         Ok(server_api::TicketRecordRef(response))
     }
 
@@ -10432,13 +10448,52 @@ impl server_api::ServerApi for ServerApiContractService {
         request: server_api::EditTicketRecordItemRequest,
     ) -> std::result::Result<server_api::TicketRecord, server_api::RepositoryApiError> {
         let result = execute_ticket_rest_operation_with_context(
-            self.workspace_api()?, &workspace_id, contract_request_headers(&context)?, Some(&context),
-            TicketBackendOperation::EditItem { id: TicketIdOrSlug::Query(id), edit: request.0 },
-        ).await.map_err(ApiError::into_repository_api_error)?;
+            self.workspace_api()?,
+            &workspace_id,
+            contract_request_headers(&context)?,
+            Some(&context),
+            TicketBackendOperation::EditItem {
+                id: TicketIdOrSlug::Query(id),
+                edit: request.0,
+            },
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
         let Json(response) = ticket_rest_result(result, |result| match result {
-            TicketBackendOperationResult::Ticket(ticket) => Some(ticket), _ => None,
-        }).map_err(ApiError::into_repository_api_error)?;
+            TicketBackendOperationResult::Ticket(ticket) => Some(ticket),
+            _ => None,
+        })
+        .map_err(ApiError::into_repository_api_error)?;
         Ok(server_api::TicketRecord(response))
+    }
+
+    async fn ticket_record_post_edit(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::EditTicketPostRequest,
+    ) -> std::result::Result<server_api::TicketPostSnapshots, server_api::RepositoryApiError> {
+        let result = execute_ticket_rest_operation_with_context(
+            self.workspace_api()?,
+            &workspace_id,
+            contract_request_headers(&context)?,
+            Some(&context),
+            TicketBackendOperation::EditPost {
+                id: TicketIdOrSlug::Query(id),
+                edit: request.0,
+            },
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        let Json(response) = ticket_rest_result(result, |result| match result {
+            TicketBackendOperationResult::TicketSnapshots { previous, current } => {
+                Some((previous, current))
+            }
+            _ => None,
+        })
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketPostSnapshots(response))
     }
 
     async fn ticket_dependency_check(
@@ -10468,9 +10523,17 @@ impl server_api::ServerApi for ServerApiContractService {
         request: server_api::TicketThreadEventRequest,
     ) -> std::result::Result<(), server_api::RepositoryApiError> {
         let result = execute_ticket_rest_operation_with_context(
-            self.workspace_api()?, &workspace_id, contract_request_headers(&context)?, Some(&context),
-            TicketBackendOperation::AddEvent { id: TicketIdOrSlug::Query(id), event: request.0 },
-        ).await.map_err(ApiError::into_repository_api_error)?;
+            self.workspace_api()?,
+            &workspace_id,
+            contract_request_headers(&context)?,
+            Some(&context),
+            TicketBackendOperation::AddEvent {
+                id: TicketIdOrSlug::Query(id),
+                event: request.0,
+            },
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
         ticket_rest_unit(result).map_err(ApiError::into_repository_api_error)?;
         Ok(())
     }
@@ -10948,18 +11011,34 @@ impl server_api::ServerApi for ServerApiContractService {
     }
 
     async fn ticket_post_get(
-        &self, workspace_id: String, id: String, event_ref: String,
+        &self,
+        workspace_id: String,
+        id: String,
+        event_ref: String,
     ) -> std::result::Result<server_api::TicketEventDetail, server_api::RepositoryApiError> {
         scoped_get_ticket_post(self.workspace_api()?.clone(), workspace_id, id, event_ref)
-            .await.map_err(ApiError::into_repository_api_error)
+            .await
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn ticket_post_edit(
-        &self, context: server_api::ServerRequestContext, workspace_id: String, id: String,
-        event_ref: String, request: server_api::TicketPostEditRequest,
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        event_ref: String,
+        request: server_api::TicketPostEditRequest,
     ) -> std::result::Result<TicketDetail, server_api::RepositoryApiError> {
-        let Json(detail) = scoped_edit_ticket_post(self.workspace_api()?.clone(), context,
-            workspace_id, id, event_ref, request).await.map_err(ApiError::into_repository_api_error)?;
+        let Json(detail) = scoped_edit_ticket_post(
+            self.workspace_api()?.clone(),
+            context,
+            workspace_id,
+            id,
+            event_ref,
+            request,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
         Ok(detail)
     }
 
@@ -15435,24 +15514,52 @@ async fn scoped_edit_ticket_item(
 ) -> ApiResult<Json<TicketDetail>> {
     let targets = request.target.map(|target| match target {
         server_api::BrowserTicketTargetEdit::Set { targets } => TicketTargetsEdit::Set {
-            targets: targets.into_iter().map(|target| ticket::TicketTarget {
-                repository_key: target.repository_key, ref_selector: target.ref_selector, access: target.access,
-            }).collect(),
+            targets: targets
+                .into_iter()
+                .map(|target| ticket::TicketTarget {
+                    repository_key: target.repository_key,
+                    ref_selector: target.ref_selector,
+                    access: target.access,
+                })
+                .collect(),
         },
         server_api::BrowserTicketTargetEdit::Clear => TicketTargetsEdit::Clear,
     });
     let body_replacement = match (request.old_string, request.new_string) {
-        (Some(old_string), Some(new_string)) => Some(TicketBodyReplacement { old_string, new_string, replace_all: request.replace_all }),
+        (Some(old_string), Some(new_string)) => Some(TicketBodyReplacement {
+            old_string,
+            new_string,
+            replace_all: request.replace_all,
+        }),
         (None, None) => None,
-        _ => return Err(settings_bad_request("invalid_ticket_edit_replacement", "old_string and new_string must be provided together")),
+        _ => {
+            return Err(settings_bad_request(
+                "invalid_ticket_edit_replacement",
+                "old_string and new_string must be provided together",
+            ));
+        }
     };
-    execute_ticket_rest_operation_with_context(&api, &path.workspace_id,
-        contract_request_headers(context).map_err(|error| Error::Config(error.message))?, Some(context),
-        TicketBackendOperation::EditItem { id: TicketIdOrSlug::Query(path.id.clone()), edit: TicketItemEdit {
-            title: request.title, body: request.body.map(MarkdownText::new), body_replacement,
-            targets, author: request.author,
-        } }).await?;
-    api.host_executors.host()?.run(move || browser_ticket_detail(&api, &path.id)).await
+    execute_ticket_rest_operation_with_context(
+        &api,
+        &path.workspace_id,
+        contract_request_headers(context).map_err(|error| Error::Config(error.message))?,
+        Some(context),
+        TicketBackendOperation::EditItem {
+            id: TicketIdOrSlug::Query(path.id.clone()),
+            edit: TicketItemEdit {
+                title: request.title,
+                body: request.body.map(MarkdownText::new),
+                body_replacement,
+                targets,
+                author: request.author,
+            },
+        },
+    )
+    .await?;
+    api.host_executors
+        .host()?
+        .run(move || browser_ticket_detail(&api, &path.id))
+        .await
 }
 
 async fn scoped_append_ticket_event(
@@ -15465,14 +15572,27 @@ async fn scoped_append_ticket_event(
         server_api::BrowserTicketThreadRole::Comment => TicketEventKind::Comment,
         server_api::BrowserTicketThreadRole::Plan => TicketEventKind::Plan,
         server_api::BrowserTicketThreadRole::Decision => TicketEventKind::Decision,
-        server_api::BrowserTicketThreadRole::ImplementationReport => TicketEventKind::ImplementationReport,
+        server_api::BrowserTicketThreadRole::ImplementationReport => {
+            TicketEventKind::ImplementationReport
+        }
     };
     let mut event = NewTicketEvent::new(role, request.body);
     event.author = request.author;
-    execute_ticket_rest_operation_with_context(&api, &path.workspace_id,
-        contract_request_headers(context).map_err(|error| Error::Config(error.message))?, Some(context),
-        TicketBackendOperation::AddEvent { id: TicketIdOrSlug::Query(path.id.clone()), event }).await?;
-    api.host_executors.host()?.run(move || browser_ticket_detail(&api, &path.id)).await
+    execute_ticket_rest_operation_with_context(
+        &api,
+        &path.workspace_id,
+        contract_request_headers(context).map_err(|error| Error::Config(error.message))?,
+        Some(context),
+        TicketBackendOperation::AddEvent {
+            id: TicketIdOrSlug::Query(path.id.clone()),
+            event,
+        },
+    )
+    .await?;
+    api.host_executors
+        .host()?
+        .run(move || browser_ticket_detail(&api, &path.id))
+        .await
 }
 
 const TICKET_EDITABLE_POST_BODY_LIMIT: usize = 1024 * 1024;
@@ -15484,67 +15604,106 @@ fn authenticated_ticket_post_author(
     if let Some(source) = source {
         return Ok(format!("worker:{}/{}", source.runtime_id, source.worker_id));
     }
-    let actor = context.actor.as_ref().ok_or_else(|| Error::WorkspacePermissionDenied(
-        "Ticket posts require an authenticated actor".into()))?;
+    let actor = context.actor.as_ref().ok_or_else(|| {
+        Error::WorkspacePermissionDenied("Ticket posts require an authenticated actor".into())
+    })?;
     let identity = serde_json::to_string(&(&actor.account_id, &actor.user_id))
         .map_err(|error| Error::Config(format!("failed to encode post actor: {error}")))?;
     Ok(format!("workspace-user:{identity}"))
 }
 
 async fn scoped_get_ticket_post(
-    api: WorkspaceApi, workspace_id: String, id: String, event_ref: String,
+    api: WorkspaceApi,
+    workspace_id: String,
+    id: String,
+    event_ref: String,
 ) -> ApiResult<server_api::TicketEventDetail> {
-    api.host_executors.host()?.run(move || {
-        validate_workspace_scope(&api, &workspace_id)?;
-        let id = resolve_workspace_ticket_reference(&api, &workspace_id, &id)?;
-        let ticket = browser_ticket_backend(&api)?.show(TicketIdOrSlug::Id(id)).map_err(Error::from)?;
-        let (sequence, post) = ticket.events.iter().enumerate().find(|(_, post)| post.event_ref == event_ref)
-            .ok_or_else(|| Error::Ticket(ticket::TicketError::NotFound(event_ref)))?;
-        if post.body.as_str().len() > TICKET_EDITABLE_POST_BODY_LIMIT {
-            return Err(settings_bad_request("ticket_post_too_large", "Ticket post exceeds the full-post read limit"));
-        }
-        let mut detail = crate::authority::ticket_event_detail(sequence, post);
-        detail.body = Some(post.body.as_str().to_string());
-        detail.body_truncated = false;
-        Ok(detail)
-    }).await
+    api.host_executors
+        .host()?
+        .run(move || {
+            validate_workspace_scope(&api, &workspace_id)?;
+            let id = resolve_workspace_ticket_reference(&api, &workspace_id, &id)?;
+            let ticket = browser_ticket_backend(&api)?
+                .show(TicketIdOrSlug::Id(id))
+                .map_err(Error::from)?;
+            let (sequence, post) = ticket
+                .events
+                .iter()
+                .enumerate()
+                .find(|(_, post)| post.event_ref == event_ref)
+                .ok_or_else(|| Error::Ticket(ticket::TicketError::NotFound(event_ref)))?;
+            if post.body.as_str().len() > TICKET_EDITABLE_POST_BODY_LIMIT {
+                return Err(settings_bad_request(
+                    "ticket_post_too_large",
+                    "Ticket post exceeds the full-post read limit",
+                ));
+            }
+            let mut detail = crate::authority::ticket_event_detail(sequence, post);
+            detail.body = Some(post.body.as_str().to_string());
+            detail.body_truncated = false;
+            Ok(detail)
+        })
+        .await
 }
 
 async fn scoped_edit_ticket_post(
-    api: WorkspaceApi, context: server_api::ServerRequestContext,
-    workspace_id: String, id: String, event_ref: String, request: server_api::TicketPostEditRequest,
+    api: WorkspaceApi,
+    context: server_api::ServerRequestContext,
+    workspace_id: String,
+    id: String,
+    event_ref: String,
+    request: server_api::TicketPostEditRequest,
 ) -> ApiResult<Json<TicketDetail>> {
-    let headers = contract_request_headers(&context).map_err(|error| Error::Config(error.message))?;
-    let source = authenticated_ticket_worker_source(&headers, &context)?;
-    let author = authenticated_ticket_post_author(&context, source.as_ref())?;
+    let headers =
+        contract_request_headers(&context).map_err(|error| Error::Config(error.message))?;
     if request.body.len() > TICKET_EDITABLE_POST_BODY_LIMIT {
-        return Err(settings_bad_request("ticket_post_too_large", "Ticket post exceeds the edit limit"));
+        return Err(settings_bad_request(
+            "ticket_post_too_large",
+            "Ticket post exceeds the edit limit",
+        ));
     }
-    api.host_executors.host()?.run(move || {
-        validate_workspace_scope(&api, &workspace_id)?;
-        let id = resolve_workspace_ticket_reference(&api, &workspace_id, &id)?;
-        let backend = browser_ticket_backend(&api)?;
-        let observed = backend.show(TicketIdOrSlug::Id(id.clone())).map_err(Error::from)?;
-        let post = observed.events.iter().find(|post| post.event_ref == event_ref)
-            .ok_or_else(|| Error::Ticket(ticket::TicketError::NotFound(event_ref.clone())))?;
-        if crate::authority::ticket_post_body_digest(post.body.as_str()) != request.expected_body_digest {
-            return Err(Error::Ticket(ticket::TicketError::Conflict("stale Ticket post body digest".into())).into());
-        }
-        let is_initial = post.is_initial;
-        // The digest is a transport observation; storage compares its exact body in the write transaction.
-        let (previous, current) = backend.edit_post_with_snapshots(TicketIdOrSlug::Id(id.clone()), ticket::TicketPostEdit {
-            event_ref, expected_body: post.body.clone(), body: MarkdownText::new(request.body), author,
-        }).map_err(Error::from)?;
-        notify_ticket_recipients(&api, &workspace_id, &id, previous.meta.workflow_state.as_str(),
-            current.meta.workflow_state.as_str(), source.clone());
-        if is_initial && let Some(source) = source {
-            schedule_ticket_item_check(&api, &current, TicketItemCheckEdit::Edit {
-                title_changed: false, body_changed: true, previous_title: None,
-                previous_body: Some(previous.document.body.as_str().to_string()), body_replacement: None,
-            }, source);
-        }
-        browser_ticket_detail(&api, &id)
-    }).await
+    api.host_executors
+        .host()?
+        .run(move || {
+            validate_workspace_scope(&api, &workspace_id)?;
+            let id = resolve_workspace_ticket_reference(&api, &workspace_id, &id)?;
+            let backend = browser_ticket_backend(&api)?;
+            let observed = backend
+                .show(TicketIdOrSlug::Id(id.clone()))
+                .map_err(Error::from)?;
+            let post = observed
+                .events
+                .iter()
+                .find(|post| post.event_ref == event_ref)
+                .ok_or_else(|| Error::Ticket(ticket::TicketError::NotFound(event_ref.clone())))?;
+            if crate::authority::ticket_post_body_digest(post.body.as_str())
+                != request.expected_body_digest
+            {
+                return Err(Error::Ticket(ticket::TicketError::Conflict(
+                    "stale Ticket post body digest".into(),
+                ))
+                .into());
+            }
+            // The digest is a transport observation; storage compares its exact body in the write transaction.
+            let expected_body = post.body.clone();
+            execute_ticket_rest_operation_on_host(
+                &api,
+                &workspace_id,
+                headers,
+                Some(&context),
+                TicketBackendOperation::EditPost {
+                    id: TicketIdOrSlug::Id(id.clone()),
+                    edit: ticket::TicketPostEdit {
+                        event_ref,
+                        expected_body,
+                        body: MarkdownText::new(request.body),
+                        author: String::new(),
+                    },
+                },
+            )?;
+            browser_ticket_detail(&api, &id)
+        })
+        .await
 }
 
 async fn scoped_mark_ticket_ready_from_browser(
@@ -15860,13 +16019,19 @@ fn execute_ticket_rest_operation_on_host(
     } else {
         verified_source.or(hinted_source)
     };
-    if matches!(operation, TicketBackendOperation::Create { .. } | TicketBackendOperation::EditItem { .. } | TicketBackendOperation::AddEvent { .. })
-        && let Some(context) = context
+    if matches!(
+        operation,
+        TicketBackendOperation::Create { .. }
+            | TicketBackendOperation::EditItem { .. }
+            | TicketBackendOperation::EditPost { .. }
+            | TicketBackendOperation::AddEvent { .. }
+    ) && let Some(context) = context
     {
         let author = authenticated_ticket_post_author(context, source.as_ref())?;
         match &mut operation {
             TicketBackendOperation::Create { input } => input.author = Some(author),
             TicketBackendOperation::EditItem { edit, .. } => edit.author = Some(author),
+            TicketBackendOperation::EditPost { edit, .. } => edit.author = author,
             TicketBackendOperation::AddEvent { event, .. } => event.author = Some(author),
             _ => unreachable!(),
         }
@@ -15987,6 +16152,35 @@ fn execute_ticket_rest_operation_on_host(
             }
             (TicketBackendOperationResult::Ticket(ticket), None)
         }
+        TicketBackendOperation::EditPost { id, edit } => {
+            let event_ref = edit.event_ref.clone();
+            let (previous, current) = backend
+                .edit_post_with_snapshots(id, edit)
+                .map_err(Error::from)?;
+            // Check only an initial post, using the transaction's actual preimage.
+            ticket_item_check = source.clone().and_then(|source| {
+                previous
+                    .events
+                    .iter()
+                    .find(|post| post.event_ref == event_ref && post.is_initial)
+                    .map(|_| {
+                        (
+                            source,
+                            TicketItemCheckEdit::Edit {
+                                title_changed: false,
+                                body_changed: true,
+                                previous_title: None,
+                                previous_body: Some(previous.document.body.as_str().to_string()),
+                                body_replacement: None,
+                            },
+                        )
+                    })
+            });
+            (
+                TicketBackendOperationResult::TicketSnapshots { previous, current },
+                None,
+            )
+        }
         operation => (
             execute_ticket_backend_operation(&backend, operation).map_err(Error::from)?,
             None,
@@ -16005,6 +16199,16 @@ fn execute_ticket_rest_operation_on_host(
                     source.clone(),
                 );
             }
+        } else if let TicketBackendOperationResult::TicketSnapshots { previous, current } = &result
+        {
+            notify_ticket_recipients(
+                api,
+                workspace_id,
+                &current.meta.id,
+                previous.meta.workflow_state.as_str(),
+                current.meta.workflow_state.as_str(),
+                source.clone(),
+            );
         } else if let Some(target) = target
             && let Ok(ticket) = backend.show(target)
         {
@@ -16021,6 +16225,7 @@ fn execute_ticket_rest_operation_on_host(
     if let Some((source_worker, edit)) = ticket_item_check {
         let checked_ticket = created_ticket.or_else(|| match &result {
             TicketBackendOperationResult::Ticket(ticket) => Some(ticket.clone()),
+            TicketBackendOperationResult::TicketSnapshots { current, .. } => Some(current.clone()),
             _ => None,
         });
         if let Some(ticket) = checked_ticket {
@@ -18310,6 +18515,7 @@ type WorkerMutationSource = RuntimeWorkerRef;
 fn ticket_mutation_target(operation: &TicketBackendOperation) -> Option<&TicketIdOrSlug> {
     match operation {
         TicketBackendOperation::EditItem { id, .. }
+        | TicketBackendOperation::EditPost { id, .. }
         | TicketBackendOperation::AddEvent { id, .. }
         | TicketBackendOperation::AddStateChanged { id, .. }
         | TicketBackendOperation::AddIntakeSummary { id, .. }
@@ -18349,6 +18555,7 @@ fn bind_worker_ticket_operation_source(
     match operation {
         TicketBackendOperation::Create { input } => input.author = Some(author),
         TicketBackendOperation::EditItem { edit, .. } => edit.author = Some(author),
+        TicketBackendOperation::EditPost { edit, .. } => edit.author = author,
         TicketBackendOperation::AddEvent { event, .. } => event.author = Some(author),
         TicketBackendOperation::AddStateChanged { change, .. } => change.author = Some(author),
         TicketBackendOperation::AddIntakeSummary { summary, .. } => summary.author = Some(author),
@@ -18373,6 +18580,7 @@ fn ticket_mutation_operation_kind(operation: &TicketBackendOperation) -> &'stati
     match operation {
         TicketBackendOperation::Create { .. } => "create",
         TicketBackendOperation::EditItem { .. } => "edit_item",
+        TicketBackendOperation::EditPost { .. } => "edit_post",
         TicketBackendOperation::AddEvent { .. } => "add_event",
         TicketBackendOperation::AddStateChanged { .. } => "add_state_changed",
         TicketBackendOperation::UpdateCase { .. } => "case_update",
@@ -47445,7 +47653,13 @@ mod tests {
             .unwrap();
         let Json(_) = scoped_edit_ticket_item(
             State(api.clone()),
-            &server_request_context(Some(test_browser_request_actor()), None, None, None, &HeaderMap::new()),
+            &server_request_context(
+                Some(test_browser_request_actor()),
+                None,
+                None,
+                None,
+                &HeaderMap::new(),
+            ),
             AxumPath(ScopedRecordPath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 id: ticket_ref.id.clone(),
@@ -52595,6 +52809,14 @@ mod tests {
             axum::http::HeaderValue::from_str(&source_worker.worker.worker_id).unwrap(),
         );
         let response = build_inner_router(api.clone())
+            .layer(Extension(
+                crate::worker_source::VerifiedRuntimeRequestSource {
+                    authentication_binding_id: "fixture-binding".into(),
+                    token_id_hash: None,
+                    runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),
+                    worker_id: Some(source_worker.worker.worker_id.clone()),
+                },
+            ))
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -53471,6 +53693,263 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ticket_post_native_route_binds_actor_and_returns_atomic_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut input = ticket::NewTicket::new("Native post edit");
+        input.body = MarkdownText::new("Original initial post");
+        input.author = Some("original-author".into());
+        let (reference, original) = backend.create_with_snapshot(input).unwrap();
+        let app = build_inner_router(api.clone()).layer(Extension(test_browser_request_actor()));
+        let uri = format!(
+            "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/posts",
+            reference.resource_key.as_ref().unwrap()
+        );
+        let edit = json!({
+            "event_ref": original.events[0].event_ref,
+            "expected_body": original.document.body,
+            "body": "Changed initial post",
+            "author": "forged-editor"
+        });
+        let response = request_json(
+            app.clone(),
+            "PATCH",
+            &uri,
+            Some(edit.clone()),
+            StatusCode::OK,
+        )
+        .await;
+        let (previous, current): (ticket::Ticket, ticket::Ticket) =
+            serde_json::from_value(response).unwrap();
+        assert_eq!(previous, original);
+        assert_eq!(current, backend.show(reference.id.clone().into()).unwrap());
+        assert_eq!(current.document.body.as_str(), "Changed initial post");
+        assert_ne!(
+            ticket::ticket_content_digest(&previous),
+            ticket::ticket_content_digest(&current)
+        );
+        assert_eq!(current.events.len(), original.events.len());
+        assert_eq!(current.events[0].author, original.events[0].author);
+        assert_eq!(current.events[0].at, original.events[0].at);
+        let context = server_request_context(
+            Some(test_browser_request_actor()),
+            None,
+            None,
+            None,
+            &HeaderMap::new(),
+        );
+        let author = authenticated_ticket_post_author(&context, None).unwrap();
+        assert_eq!(
+            current.events[0].edited_by.as_deref(),
+            Some(author.as_str())
+        );
+        assert!(current.events[0].edited_at.is_some());
+        assert!(ticket_check_jobs_for_snapshot(&api, &current).is_empty());
+        request_json(app, "PATCH", &uri, Some(edit), StatusCode::CONFLICT).await;
+        assert_eq!(backend.show(reference.id.into()).unwrap(), current);
+    }
+
+    #[tokio::test]
+    async fn ticket_post_native_worker_route_checks_only_initial_with_atomic_preimage() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let source = spawn_ticket_check_source(&api, "post-editor");
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut input = ticket::NewTicket::new("Worker post edit");
+        input.body = MarkdownText::new("Initial requirements");
+        input.author = Some("creator".into());
+        let reference = backend.create(input).unwrap();
+        let mut comment = NewTicketEvent::new(TicketEventKind::Comment, "Discussion");
+        comment.author = Some("commenter".into());
+        backend
+            .add_event(reference.id.clone().into(), comment)
+            .unwrap();
+        let original = backend.show(reference.id.clone().into()).unwrap();
+        // Below proof middleware, inject the verified Worker subject; no identity hints required.
+        let app = build_inner_router(api.clone()).layer(Extension(
+            crate::worker_source::VerifiedRuntimeRequestSource {
+                authentication_binding_id: "fixture-binding".into(),
+                token_id_hash: None,
+                runtime_id: source.runtime_id.clone(),
+                worker_id: Some(source.worker_id.clone()),
+            },
+        ));
+        let uri = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{}/posts", reference.id);
+        let editor = format!("worker:{}/{}", source.runtime_id, source.worker_id);
+        let mut latest = original.clone();
+        for (index, body) in [
+            (1, "Changed discussion"),
+            (0, "Changed requirements"),
+            (0, "Final requirements"),
+        ] {
+            let edit = json!({ "event_ref": latest.events[index].event_ref,
+                    "expected_body": latest.events[index].body, "body": body, "author": "forged-editor" });
+            let response = request_json(
+                app.clone(),
+                "PATCH",
+                &uri,
+                Some(edit.clone()),
+                StatusCode::OK,
+            )
+            .await;
+            let (previous, current): (ticket::Ticket, ticket::Ticket) =
+                serde_json::from_value(response).unwrap();
+            assert_eq!(previous, latest);
+            assert_eq!(
+                current.events[index].edited_by.as_deref(),
+                Some(editor.as_str())
+            );
+            assert_eq!(current.events[index].author, original.events[index].author);
+            assert_eq!(current.events[index].at, original.events[index].at);
+            assert_eq!(current.events.len(), original.events.len());
+            if index == 0 {
+                let jobs = ticket_check_jobs_for_snapshot(&api, &current);
+                assert_eq!(jobs.len(), 1);
+                let checked = ticket_item_checker::parse_input(&jobs[0].request.input).unwrap();
+                assert_eq!(checked.body, current.document.body.as_str());
+                assert_eq!(
+                    checked.content_digest,
+                    ticket_item_checker::content_digest(&current)
+                );
+                assert!(matches!(checked.edit, TicketItemCheckEdit::Edit {
+                        title_changed: false, body_changed: true, previous_body: Some(ref body), ..
+                    } if body == previous.document.body.as_str()));
+            } else {
+                assert_eq!(
+                    ticket::ticket_content_digest(&previous),
+                    ticket::ticket_content_digest(&current)
+                );
+                assert!(ticket_check_jobs_for_snapshot(&api, &current).is_empty());
+            }
+            request_json(app.clone(), "PATCH", &uri, Some(edit), StatusCode::CONFLICT).await;
+            assert_eq!(backend.show(reference.id.clone().into()).unwrap(), current);
+            latest = current;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            api.host_executors.host().unwrap().drain().await.unwrap();
+            api.host_executors.cleanup().unwrap().drain().await.unwrap();
+            api.worker_projection.shutdown_async().await;
+            api.store.db_executor().drain().await.unwrap();
+        })
+        .await
+        .expect("post fixture must drain accepted work");
+    }
+
+    #[tokio::test]
+    async fn ticket_post_browser_routes_read_full_body_and_cas_initial_and_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut input = ticket::NewTicket::new("Browser posts");
+        input.body = MarkdownText::new("Initial post");
+        input.author = Some("creator".into());
+        let reference = backend.create(input).unwrap();
+        let full_body = "長い comment\n".repeat(4000);
+        let mut comment = NewTicketEvent::new(TicketEventKind::Comment, full_body.clone());
+        comment.author = Some("commenter".into());
+        backend
+            .add_event(reference.id.clone().into(), comment)
+            .unwrap();
+        backend
+            .add_event(
+                reference.id.clone().into(),
+                NewTicketEvent::new(TicketEventKind::Decision, "Immutable decision"),
+            )
+            .unwrap();
+        let original = backend.show(reference.id.clone().into()).unwrap();
+        let app = build_inner_router(api.clone()).layer(Extension(test_browser_request_actor()));
+        let base = format!(
+            "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/posts",
+            reference.resource_key.as_ref().unwrap()
+        );
+        let mut latest = original.clone();
+        for (index, replacement) in [(1, "Changed discussion"), (0, "Changed initial")] {
+            let uri = format!("{base}/{}", latest.events[index].event_ref);
+            let read = request_json(app.clone(), "GET", &uri, None, StatusCode::OK).await;
+            let post: server_api::TicketEventDetail = serde_json::from_value(read).unwrap();
+            assert_eq!(
+                post.body.as_deref(),
+                Some(latest.events[index].body.as_str())
+            );
+            assert!(!post.body_truncated);
+            assert!(post.editable);
+            assert_eq!(
+                post.body_digest,
+                crate::authority::ticket_post_body_digest(latest.events[index].body.as_str())
+            );
+            let edit = json!({ "expected_body_digest": post.body_digest, "body": replacement });
+            let response = request_json(
+                app.clone(),
+                "PATCH",
+                &uri,
+                Some(edit.clone()),
+                StatusCode::OK,
+            )
+            .await;
+            let detail: TicketDetail = serde_json::from_value(response).unwrap();
+            let current = backend.show(reference.id.clone().into()).unwrap();
+            assert_eq!(detail.id, reference.id);
+            assert_eq!(current.events.len(), original.events.len());
+            assert_eq!(current.events[index].author, original.events[index].author);
+            assert_eq!(current.events[index].at, original.events[index].at);
+            assert!(
+                current.events[index]
+                    .edited_by
+                    .as_ref()
+                    .unwrap()
+                    .starts_with("workspace-user:")
+            );
+            assert!(current.events[index].edited_at.is_some());
+            assert_eq!(current.events[index].body.as_str(), replacement);
+            if index == 0 {
+                assert_eq!(current.document.body.as_str(), replacement);
+                assert_ne!(
+                    ticket::ticket_content_digest(&latest),
+                    ticket::ticket_content_digest(&current)
+                );
+            } else {
+                assert_eq!(current.document.body, original.document.body);
+                assert_eq!(
+                    ticket::ticket_content_digest(&latest),
+                    ticket::ticket_content_digest(&current)
+                );
+            }
+            request_json(app.clone(), "PATCH", &uri, Some(edit), StatusCode::CONFLICT).await;
+            assert_eq!(backend.show(reference.id.clone().into()).unwrap(), current);
+            latest = current;
+        }
+        let system_uri = format!("{base}/{}", original.events[2].event_ref);
+        let system = request_json(app.clone(), "GET", &system_uri, None, StatusCode::OK).await;
+        assert_eq!(system["editable"], false);
+        request_json(
+            app.clone(),
+            "PATCH",
+            &system_uri,
+            Some(json!({"expected_body_digest": system["body_digest"], "body": "forged"})),
+            StatusCode::CONFLICT,
+        )
+        .await;
+        request_json(
+            app.clone(),
+            "GET",
+            &format!("{base}/missing"),
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        let other = backend
+            .create(ticket::NewTicket::new("Other ticket"))
+            .unwrap();
+        let foreign = format!(
+            "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/posts/{}",
+            other.id, original.events[0].event_ref
+        );
+        request_json(app, "GET", &foreign, None, StatusCode::NOT_FOUND).await;
+        assert_eq!(backend.show(reference.id.into()).unwrap(), latest);
+    }
+
+    #[tokio::test]
     async fn ticket_browser_endpoints_mutate_typed_backend_and_return_thread() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
@@ -53539,7 +54018,13 @@ mod tests {
 
         let Json(edited) = scoped_edit_ticket_item(
             State(api.clone()),
-            &server_request_context(Some(test_browser_request_actor()), None, None, None, &HeaderMap::new()),
+            &server_request_context(
+                Some(test_browser_request_actor()),
+                None,
+                None,
+                None,
+                &HeaderMap::new(),
+            ),
             AxumPath(path()),
             Json(server_api::BrowserEditTicketRequest {
                 title: Some("Browser Ticket API edited".to_string()),
@@ -53577,7 +54062,13 @@ mod tests {
 
         let Json(commented) = scoped_append_ticket_event(
             State(api.clone()),
-            &server_request_context(Some(test_browser_request_actor()), None, None, None, &HeaderMap::new()),
+            &server_request_context(
+                Some(test_browser_request_actor()),
+                None,
+                None,
+                None,
+                &HeaderMap::new(),
+            ),
             AxumPath(path()),
             Json(server_api::BrowserAppendTicketEventRequest {
                 role: server_api::BrowserTicketThreadRole::Comment,
@@ -55228,9 +55719,14 @@ mod tests {
         crate::store::configure_sqlite(&conn).unwrap();
         conn.execute(
             "INSERT INTO typed_tickets (
-                 workspace_id, ticket_id, slug, title, status, kind, priority, body,
+                 workspace_id, ticket_id, slug, title, status, kind, priority,
                  workflow_state, workflow_state_explicit
-             ) VALUES (?1, ?2, ?2, ?2, 'open', 'task', 'normal', '', 'open', 1)",
+             ) VALUES (?1, ?2, ?2, ?2, 'open', 'task', 'normal', 'open', 1)",
+            rusqlite::params![api.config.workspace_id, ticket_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,event_ref,kind,body) VALUES(?1,?2,-1,?2 || ':-1','comment','')",
             rusqlite::params![api.config.workspace_id, ticket_id],
         )
         .unwrap();
@@ -60402,7 +60898,7 @@ mod tests {
     {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
-        let app = build_inner_router(api);
+        let app = build_inner_router(api).layer(Extension(test_browser_request_actor()));
 
         let response = app
             .clone()
@@ -63348,11 +63844,13 @@ mod tests {
             .execute_batch(
                 r#"
 INSERT INTO typed_tickets (
-    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    workspace_id, ticket_id, slug, title, status, kind, priority,
     workflow_state, workflow_state_explicit
 ) VALUES
-    ('0192f0e8-4d84-7d6e-a000-000000000001', '00000000001J2', 'ticket-j2', 'Ticket J2', 'open', 'task', 'normal', '', 'open', 1),
-    ('0192f0e8-4d84-7d6e-a000-000000000001', '00000000001J3', 'ticket-j3', 'Ticket J3', 'open', 'task', 'normal', '', 'open', 1);
+    ('0192f0e8-4d84-7d6e-a000-000000000001', '00000000001J2', 'ticket-j2', 'Ticket J2', 'open', 'task', 'normal', 'open', 1),
+    ('0192f0e8-4d84-7d6e-a000-000000000001', '00000000001J3', 'ticket-j3', 'Ticket J3', 'open', 'task', 'normal', 'open', 1);
+INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,event_ref,kind,body)
+SELECT workspace_id,ticket_id,-1,ticket_id || ':-1','comment','' FROM typed_tickets WHERE workspace_id='0192f0e8-4d84-7d6e-a000-000000000001';
 INSERT INTO workspace_resource_keys (
     workspace_id, resource_kind, resource_id, sequence, resource_key, allocated_at
 ) VALUES

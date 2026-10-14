@@ -54,23 +54,6 @@ function reads(path: string, row: TicketAssignmentTrackingProjection) {
   if (path.includes("/assignment-tracking/assignments")) {
     return Response.json({ items: [row], next_assignment_id: null });
   }
-  if (path.includes("/assignment-diagnostics")) {
-    return Response.json({
-      assignment_id: row.assignment_id,
-      current: true,
-      actionable: true,
-      input_origin_known: true,
-      inputs: [{
-        input_event_id: "input",
-        delivery_id: "delivery",
-        notification: "request_persisted",
-        acceptance_outcome_unknown: true,
-      }],
-      starts: [],
-      next_input_event_id: null,
-      next_start_operation_id: null,
-    });
-  }
   throw new Error(`Unexpected read ${path}`);
 }
 test("an answer response loss keeps exact assignment/event/key/body for retry even when observed responsibility changes", async () => {
@@ -126,9 +109,11 @@ test("an answer response loss keeps exact assignment/event/key/body for retry ev
 test("a done reissue persists before a failed refresh and does not pretend delivery or execution succeeded", async () => {
   const row = assignment("delegation-1", "done");
   const sent: unknown[] = [];
+  const paths: string[] = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      paths.push(String(input));
       if (init?.method === "PUT") {
         sent.push(JSON.parse(String(init.body)));
         return Response.json({
@@ -164,13 +149,14 @@ test("a done reissue persists before a failed refresh and does not pretend deliv
   expect(sent).toHaveLength(1);
   expect(sent[0]).toMatchObject({ expected_assignment_id: "delegation-1" });
   expect(view.queryByText("Retry exact operation")).toBeNull();
-  expect(view.container.textContent).toContain("Outcome unknown");
-  expect(view.container.textContent).toContain(
-    "Outcome unknown — may already be accepted",
+  await waitFor(() =>
+    expect(view.getByRole("alert").textContent).toContain(
+      "Operation saved; latest projection unavailable",
+    )
   );
-  expect(view.container.textContent).toContain(
-    "No work start records observed",
-  );
+  expect(view.container.querySelector(".ticket-delivery")).toBeNull();
+  expect(view.queryByText("Delivery and execution")).toBeNull();
+  expect(paths.some((path) => path.includes("assignment-diagnostics"))).toBe(false);
   expect(view.container.textContent).toContain("Self-reported handling: done");
 });
 test("classification conflict keeps stable IDs and the original observed set across an exact retry", async () => {

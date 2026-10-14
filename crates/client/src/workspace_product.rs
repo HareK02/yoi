@@ -601,6 +601,22 @@ impl BackendWorkspaceProductClient {
 }
 
 impl TicketBackend for BackendWorkspaceProductClient {
+    fn edit_post_with_snapshots(
+        &self,
+        id: TicketIdOrSlug,
+        edit: ticket::TicketPostEdit,
+    ) -> ticket::Result<(Ticket, Ticket)> {
+        let workspace_id = self.workspace_id.clone();
+        let id = ticket_reference(&id);
+        self.generated(move |client| async move {
+            client
+                .ticket_record_post_edit(workspace_id, id, server_api::EditTicketPostRequest(edit))
+                .await
+                .map(|response| response.0)
+        })
+        .map_err(ticket_client_error)
+    }
+
     fn list_workspace_tags(
         &self,
         request: ticket::TagListRequest,
@@ -992,6 +1008,47 @@ mod tests {
             }
         });
         (format!("http://{address}"), receiver, handle)
+    }
+
+    #[test]
+    fn post_edit_uses_native_patch_and_returns_server_snapshots_without_reread() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend =
+            ticket::SqliteTicketBackend::open(temp.path().join("fixture.db"), "workspace-a")
+                .unwrap();
+        let mut input = NewTicket::new("Post snapshots");
+        input.body = MarkdownText::new("Original requirements");
+        let reference = backend.create(input).unwrap();
+        let original = backend.show(reference.id.clone().into()).unwrap();
+        let edit = ticket::TicketPostEdit {
+            event_ref: original.events[0].event_ref.clone(),
+            expected_body: original.document.body.clone(),
+            body: MarkdownText::new("Changed requirements"),
+            author: "authenticated-editor".into(),
+        };
+        let expected = backend
+            .edit_post_with_snapshots(reference.id.into(), edit.clone())
+            .unwrap();
+        let body = serde_json::to_string(&expected).unwrap();
+        let (url, requests, server) = one_response_server("200 OK", &body);
+        let client =
+            BackendWorkspaceProductClient::new_with_access_token(url, "workspace-a", "token")
+                .unwrap();
+        let actual = TicketBackend::edit_post_with_snapshots(
+            &client,
+            TicketIdOrSlug::Query("T-123".into()),
+            edit.clone(),
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+        let request = requests.recv().unwrap();
+        assert!(request.starts_with("PATCH /api/w/workspace-a/tickets/T-123/posts HTTP/1.1\r\n"));
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            serde_json::from_str::<ticket::TicketPostEdit>(body).unwrap(),
+            edit
+        );
+        server.join().unwrap();
     }
 
     #[test]

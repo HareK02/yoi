@@ -12941,6 +12941,30 @@
         },
         "type": "object"
       },
+      "TicketPostEdit": {
+        "description": "A compare-and-swap edit of a real comment post. The host supplies authenticated author.",
+        "properties": {
+          "author": {
+            "type": "string"
+          },
+          "body": {
+            "$ref": "#/components/schemas/MarkdownText"
+          },
+          "event_ref": {
+            "type": "string"
+          },
+          "expected_body": {
+            "$ref": "#/components/schemas/MarkdownText"
+          }
+        },
+        "required": [
+          "event_ref",
+          "expected_body",
+          "body",
+          "author"
+        ],
+        "type": "object"
+      },
       "TicketPostEditRequest": {
         "additionalProperties": false,
         "properties": {
@@ -14041,6 +14065,19 @@
           "fingerprint"
         ],
         "type": "object"
+      },
+      "Tuple_of_Ticket_and_Ticket": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "$ref": "#/components/schemas/Ticket"
+          },
+          {
+            "$ref": "#/components/schemas/Ticket"
+          }
+        ],
+        "type": "array"
       },
       "UpdateRemoteRuntimeRequest": {
         "additionalProperties": false,
@@ -17198,7 +17235,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:1d6615147b8d7143484b9a2aaf163da6916fcabb7560c675c5b7bf4d94aa2214"
+    "x-yoi-source-digest": "sha256:334f540d268db97ec52ce67092f4d672a5757f11df3589ac54153cd595e95904"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -35912,6 +35949,123 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/OrchestrationPlanRecord"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/tickets/{id}/posts": {
+      "patch": {
+        "operationId": "ticket_record_post_edit",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TicketPostEdit"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Tuple_of_Ticket_and_Ticket"
                 }
               }
             },

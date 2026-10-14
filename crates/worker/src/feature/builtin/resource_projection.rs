@@ -37,6 +37,14 @@ struct ModelTicketQueryItem {
     merge_request: Option<ModelMergeRequest>,
 }
 
+#[derive(Debug, serde::Deserialize, Serialize)]
+struct ModelTicketTarget {
+    repository_key: String,
+    // Keep an unspecified selector explicit in the model-facing read contract.
+    ref_selector: Option<String>,
+    access: ticket::TicketTargetAccess,
+}
+
 #[derive(Debug, Serialize)]
 pub(super) struct ModelTicketDetail {
     ticket: String,
@@ -45,6 +53,7 @@ pub(super) struct ModelTicketDetail {
     body: String,
     body_truncated: bool,
     initial_post: ModelTicketEvent,
+    targets: Vec<ModelTicketTarget>,
     created_by: Option<String>,
     state: ticket::TicketState,
     closure_operation_key: Option<String>,
@@ -351,6 +360,7 @@ pub(super) fn project_ticket_detail(value: Value) -> Result<ModelTicketDetail, S
             root.get("initial_post")
                 .ok_or("Ticket detail response is missing initial_post")?,
         )?,
+        targets: typed_field(root, "targets")?,
         created_by: optional_string(root, "created_by")?,
         state: typed_field(root, "state")?,
         closure_operation_key: typed_field(root, "closure_operation_key")?,
@@ -855,7 +865,7 @@ mod tests {
     fn mrless_evidence_is_inapplicable_not_missing_or_vacuously_approved() {
         for state in ["open", "closed"] {
             let projected = project_ticket_detail(json!({
-                "resource_key": "T-718", "assignment_tracking": [], "tags": [], "content_digest": "rev-1", "title": "No Git required", "body": "Decision", "body_truncated": false, "initial_post": post_fixture(true, "Decision"),
+                "resource_key": "T-718", "assignment_tracking": [], "tags": [], "content_digest": "rev-1", "title": "No Git required", "body": "Decision", "body_truncated": false, "targets": [], "initial_post": post_fixture(true, "Decision"),
                 "closure_operation_key": null, "current_closure": null, "closure_history": [], "legacy_handoff": null,
                 "state": state, "events": [post_fixture(false, "No Git needed")],
                 "linked_objectives": [], "assignments": [], "implementation_reports": [],
@@ -898,7 +908,7 @@ mod tests {
         });
         let response = json!({
             "assignment_tracking": [], "tags": [{"workspace_id":"ws", "id":"tag-1", "name":"closed", "last_operation_key":"tag-create", "deleted":false}],
-            "resource_key": "T-739", "content_digest": "content-digest", "title": "Case", "body": "Requirements", "body_truncated": false, "initial_post": post_fixture(true, "Requirements"),
+            "resource_key": "T-739", "content_digest": "content-digest", "title": "Case", "body": "Requirements", "body_truncated": false, "targets": [], "initial_post": post_fixture(true, "Requirements"),
             "state": "open", "closure_operation_key": "close-1", "current_closure": null,
             "closure_history": history, "legacy_handoff": legacy,
             "events": [], "linked_objectives": [], "assignments": [], "implementation_reports": [],
@@ -1049,7 +1059,7 @@ mod tests {
             "content_digest": "ticket-content-digest",
                 "closure_operation_key": null, "current_closure": null, "closure_history": [], "legacy_handoff": null,
             "title": "Queued Submit",
-            "body": "Body", "body_truncated": false, "initial_post": post_fixture(true, "Body"),
+            "body": "Body", "body_truncated": false, "targets": [], "initial_post": post_fixture(true, "Body"),
             "state": "open",
             "readiness": null,
             "priority": "P2",
@@ -1153,7 +1163,7 @@ mod tests {
                 "content_digest": "current-ticket-content-digest",
                 "closure_operation_key": null, "current_closure": null, "closure_history": [], "legacy_handoff": null,
                 "title": "Source evidence",
-                "body": "Body", "body_truncated": false, "initial_post": post_fixture(true, "Body"),
+                "body": "Body", "body_truncated": false, "targets": [], "initial_post": post_fixture(true, "Body"),
                 "state": "open",
                 "events": [],
                 "linked_objectives": [],
@@ -1337,7 +1347,7 @@ mod tests {
         let closure = json!({"operation_key":"close-1", "reason":"not_planned", "explanation":"Not proceeding", "references":[{"kind":"ticket", "target":"T-12"}], "author":"workspace-user:alice", "at":"2026-01-01T00:00:00Z"});
         let history = json!([{"operation_key":"close-1", "previous_closure_operation_key":null, "action":{"action":"close", "reason":"not_planned"}, "explanation":"Not proceeding", "references":[{"kind":"ticket", "target":"T-12"}], "author":"workspace-user:alice", "at":"2026-01-01T00:00:00Z"}]);
         let detail = json!({
-            "resource_key":"T-739", "title":"Case", "body":"Requirements", "body_truncated":false, "initial_post":post_fixture(true, "Requirements"), "created_by":"workspace-user:creator", "content_digest":"content-1",
+            "resource_key":"T-739", "title":"Case", "body":"Requirements", "body_truncated":false, "targets":[], "initial_post":post_fixture(true, "Requirements"), "created_by":"workspace-user:creator", "content_digest":"content-1",
             "state":"closed", "assignment_tracking": [tracking], "tags":[tag], "closure_operation_key":"close-1", "current_closure":closure,
             "legacy_handoff":null, "closure_history":history, "events":[], "linked_objectives":[], "assignments":[], "implementation_reports":[], "merge_requests":[]
         });

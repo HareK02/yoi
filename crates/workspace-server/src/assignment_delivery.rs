@@ -126,6 +126,12 @@ WHERE json_extract(h.source_context_json,'$.kind')='migration'
     Ok(())
 }
 
+/// Additive schema94 composition; keep the applied schema93 install unchanged.
+pub(super) fn install_post_inputs(conn: &Connection) -> Result<()> {
+    conn.execute_batch(include_str!("assignment_content_inputs.sql"))?;
+    Ok(())
+}
+
 const INPUTS_SQL: &str = r#"
 WITH eligible AS (
  SELECT a.*,o.input_event_id,o.after_ticket_event_index
@@ -152,6 +158,10 @@ WITH eligible AS (
  AND e.kind NOT LIKE 'assignment_delivery%'
  AND COALESCE(e.state_field,'') NOT IN ('case','routing','assignment_tracking')
  AND NOT EXISTS(SELECT 1 FROM typed_ticket_event_attributes attr WHERE attr.workspace_id=e.workspace_id AND attr.ticket_id=e.ticket_id AND attr.event_index=e.event_index AND attr.key='orchestrator_assignment_id' AND attr.value<>a.assignment_id)
+ UNION ALL
+ SELECT a.ticket_id,a.assignment_id,'ticket-edit:' || printf('%020d',e.input_sequence),a.tracking_json,e.after_ticket_event_index+1
+ FROM eligible a JOIN ticket_assignment_content_inputs e
+ ON e.workspace_id=a.workspace_id AND e.ticket_id=a.ticket_id AND e.assignment_id=a.assignment_id
 )
 SELECT i.ticket_id,i.assignment_id,i.input_event_id,
  json_extract(i.tracking_json,'$.waiting_reason'),json_extract(i.tracking_json,'$.next_action'),d.payload_json
@@ -180,7 +190,9 @@ fn inputs_in_tx(
     assignment_id: Option<&str>,
     input_event_id: Option<&str>,
 ) -> Result<Vec<TicketAssignmentDelivery>> {
-    let sql = format!("{INPUTS_SQL} ORDER BY i.ticket_id,i.assignment_id,i.input_order LIMIT ?2");
+    let sql = format!(
+        "{INPUTS_SQL} ORDER BY i.ticket_id,i.assignment_id,i.input_order,i.input_event_id LIMIT ?2"
+    );
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map(
         params![workspace_id, limit as i64, assignment_id, input_event_id],
@@ -404,12 +416,15 @@ pub(super) fn save_operation_fence(
 // Same input selection as delivery, plus immutable delivered history. Never
 // SELECT payload/source/content into the public diagnostic projection.
 const DIAGNOSTIC_INPUTS_SQL: &str = r#"
-WITH inputs AS (
+WITH raw_inputs AS (
  SELECT o.input_event_id,-1 AS input_order FROM ticket_assignment_delivery_origins o
  WHERE o.workspace_id=?1 AND o.assignment_id=?3
  UNION
- SELECT d.input_event_id,CASE WHEN d.input_event_id LIKE 'ticket-event:%' THEN CAST(substr(d.input_event_id,14) AS INTEGER) ELSE -1 END
- FROM ticket_assignment_deliveries d WHERE d.workspace_id=?1 AND d.assignment_id=?3
+ SELECT d.input_event_id,COALESCE(e.after_ticket_event_index+1,CASE WHEN d.input_event_id LIKE 'ticket-event:%' THEN CAST(substr(d.input_event_id,14) AS INTEGER) ELSE -1 END)
+ FROM ticket_assignment_deliveries d
+ LEFT JOIN ticket_assignment_content_inputs e ON e.workspace_id=d.workspace_id AND e.assignment_id=d.assignment_id
+ AND d.input_event_id='ticket-edit:' || printf('%020d',e.input_sequence)
+ WHERE d.workspace_id=?1 AND d.assignment_id=?3
  UNION
  SELECT 'ticket-event:' || e.event_index,e.event_index
  FROM ticket_assignment_delivery_origins o JOIN typed_ticket_events e ON e.workspace_id=o.workspace_id AND e.ticket_id=o.ticket_id
@@ -425,6 +440,11 @@ WITH inputs AS (
  JOIN ticket_worker_assignments original ON original.workspace_id=o.workspace_id AND original.assignment_id=o.assignment_id
  WHERE later.workspace_id=o.workspace_id AND later.ticket_id=o.ticket_id AND la.rowid>original.rowid),9223372036854775807)
  AND NOT EXISTS(SELECT 1 FROM typed_ticket_event_attributes attr WHERE attr.workspace_id=e.workspace_id AND attr.ticket_id=e.ticket_id AND attr.event_index=e.event_index AND attr.key='orchestrator_assignment_id' AND attr.value<>?3)
+ UNION
+ SELECT 'ticket-edit:' || printf('%020d',input_sequence),after_ticket_event_index+1
+ FROM ticket_assignment_content_inputs WHERE workspace_id=?1 AND ticket_id=?2 AND assignment_id=?3
+), inputs AS (
+ SELECT input_event_id,ROW_NUMBER() OVER (ORDER BY input_order,input_event_id) AS input_order FROM raw_inputs
 )
 "#;
 

@@ -762,12 +762,19 @@ impl SqliteWorkspaceAuthority {
         let id = ticket.meta.id.as_str();
         let dependency_check =
             dependency_backend.dependency_check(TicketIdOrSlug::Id(id.to_string()))?;
-        let initial = ticket.events.iter().find(|event| event.is_initial)
+        let initial = ticket
+            .events
+            .iter()
+            .find(|event| event.is_initial)
             .ok_or_else(|| Error::Store("Ticket initial post is missing".into()))?;
         let initial_post = ticket_event_detail(0, initial);
         let body = initial_post.body.clone().unwrap_or_default();
         let body_truncated = initial_post.body_truncated;
-        let subsequent_events = ticket.events.iter().filter(|event| !event.is_initial).collect::<Vec<_>>();
+        let subsequent_events = ticket
+            .events
+            .iter()
+            .filter(|event| !event.is_initial)
+            .collect::<Vec<_>>();
         let event_limit = request
             .event_limit
             .unwrap_or(TICKET_EVENT_LIMIT)
@@ -1787,11 +1794,21 @@ fn ticket_event_ref(sequence: usize, event: &TicketEvent) -> String {
 
 pub(crate) fn ticket_post_body_digest(body: &str) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(body.as_bytes()))
+    Sha256::digest(body.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub(crate) fn ticket_event_detail(sequence: usize, event: &TicketEvent) -> TicketEventDetail {
-    let (body, body_truncated) = truncate_body(event.body.as_str(), if event.is_initial { DETAIL_BODY_LIMIT } else { TICKET_EVENT_BODY_LIMIT });
+    let (body, body_truncated) = truncate_body(
+        event.body.as_str(),
+        if event.is_initial {
+            DETAIL_BODY_LIMIT
+        } else {
+            TICKET_EVENT_BODY_LIMIT
+        },
+    );
     TicketEventDetail {
         is_initial: event.is_initial,
         edited_at: event.edited_at.clone(),
@@ -1946,6 +1963,11 @@ pub(crate) fn merge_request_summary(
 }
 
 fn substantive_item_edit(event: &TicketEvent) -> bool {
+    // Initial-comment edits replace requirements without appending an item_edit event.
+    // Discussion-comment edits do not change the Ticket's requirement scope.
+    if event.is_initial && event.edited_at.is_some() {
+        return true;
+    }
     if event.kind.as_str() != "item_edit" {
         return false;
     }
@@ -3041,6 +3063,10 @@ mod tests {
             attributes.insert("changes".to_string(), changes.to_string());
         }
         TicketEvent {
+            event_ref: format!("event:{kind}:{at}"),
+            is_initial: false,
+            edited_at: None,
+            edited_by: None,
             kind: ticket::TicketEventKind::Other(kind.to_string()),
             author: Some("coder".to_string()),
             at: Some(at.to_string()),
@@ -3054,6 +3080,40 @@ mod tests {
             attributes,
             references: Vec::new(),
         }
+    }
+
+    #[test]
+    fn edited_initial_post_marks_rescope_but_discussion_edits_do_not() {
+        let evidence = TicketEvidenceSummary {
+            missing: vec!["review_after_rescope".into()],
+            ..Default::default()
+        };
+        let mut post = ticket_event("comment", "2026-10-13T00:00:00Z", None);
+        post.kind = ticket::TicketEventKind::Comment;
+        post.is_initial = true;
+        assert!(!ticket_attention_matches(
+            "open",
+            &evidence,
+            false,
+            &[post.clone()],
+            "stale_after_rescope"
+        ));
+        post.edited_at = Some("2026-10-13T01:00:00Z".into());
+        assert!(ticket_attention_matches(
+            "open",
+            &evidence,
+            false,
+            &[post.clone()],
+            "stale_after_rescope"
+        ));
+        post.is_initial = false;
+        assert!(!ticket_attention_matches(
+            "open",
+            &evidence,
+            false,
+            &[post],
+            "stale_after_rescope"
+        ));
     }
 
     fn unavailable_source(
@@ -3615,30 +3675,29 @@ mod tests {
             .execute_batch(
                 r#"
 INSERT INTO typed_tickets (
-    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    workspace_id, ticket_id, slug, title, status, kind, priority,
     created_at, updated_at, workflow_state, workflow_state_explicit
 ) VALUES
     ('workspace-test', '00000000001J2', '00000000001J2', 'Read bridge', 'open', 'ticket', 'P2',
-     'Ticket body. Deep Ticket marker. This body is intentionally long enough for bounded projection tests.',
      '2026-01-01T00:00:00Z', '2026-01-03T00:00:00Z', 'open', 1),
     ('workspace-test', '00000000001J5', '00000000001J5', 'Second ticket', 'open', 'ticket', 'P2',
-     'Ticket body', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', 'open', 1),
+     '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', 'open', 1),
     ('workspace-test', '00000000001J6', '00000000001J6', 'Third ticket', 'open', 'ticket', 'P2',
-     'Ticket body', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'open', 1);
+     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'open', 1);
 
 INSERT INTO typed_ticket_events (
-    workspace_id, ticket_id, event_index, kind, author, at, heading, body
+    workspace_id, ticket_id, event_index, event_ref, kind, author, at, body
 ) VALUES
-    ('workspace-test', '00000000001J2', 0, 'create', 'test', '2026-01-01T00:00:00Z', 'Created', 'created'),
-    ('workspace-test', '00000000001J5', 0, 'create', 'test', '2026-01-01T00:00:00Z', 'Created', 'created'),
-    ('workspace-test', '00000000001J6', 0, 'create', 'test', '2026-01-01T00:00:00Z', 'Created', 'created');
+    ('workspace-test', '00000000001J2', -1, '00000000001J2:-1', 'comment', 'test', '2026-01-01T00:00:00Z', 'Ticket body'),
+    ('workspace-test', '00000000001J5', -1, '00000000001J5:-1', 'comment', 'test', '2026-01-01T00:00:00Z', 'Ticket body'),
+    ('workspace-test', '00000000001J6', -1, '00000000001J6:-1', 'comment', 'test', '2026-01-01T00:00:00Z', 'Ticket body');
 "#,
             )
             .unwrap();
         rusqlite::Connection::open(&db_path)
             .unwrap()
             .execute(
-                "UPDATE typed_tickets SET body = ?3 WHERE workspace_id = ?1 AND ticket_id = ?2",
+                "UPDATE typed_ticket_events SET body = ?3 WHERE workspace_id = ?1 AND ticket_id = ?2 AND event_index = -1",
                 rusqlite::params![
                     "workspace-test",
                     "00000000001J2",
@@ -4044,11 +4103,15 @@ VALUES ('workspace-test', 'ticket', 4);
             .execute_batch(
                 r#"
 INSERT INTO typed_tickets (
-    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    workspace_id, ticket_id, slug, title, status, kind, priority,
     workflow_state, workflow_state_explicit
 ) VALUES
-    ('workspace-test', '00000000001J2', 'ticket-j2', 'Ticket J2', 'open', 'task', 'normal', '', 'open', 1),
-    ('workspace-test', '00000000001J3', 'ticket-j3', 'Ticket J3', 'open', 'task', 'normal', '', 'open', 1);
+    ('workspace-test', '00000000001J2', 'ticket-j2', 'Ticket J2', 'open', 'task', 'normal', 'open', 1),
+    ('workspace-test', '00000000001J3', 'ticket-j3', 'Ticket J3', 'open', 'task', 'normal', 'open', 1);
+INSERT INTO typed_ticket_events (workspace_id, ticket_id, event_index, event_ref, kind, body)
+VALUES
+    ('workspace-test', '00000000001J2', -1, '00000000001J2:-1', 'comment', ''),
+    ('workspace-test', '00000000001J3', -1, '00000000001J3:-1', 'comment', '');
 INSERT INTO workspace_resource_keys (
     workspace_id, resource_kind, resource_id, sequence, resource_key, allocated_at
 ) VALUES

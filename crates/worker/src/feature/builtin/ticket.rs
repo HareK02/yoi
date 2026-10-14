@@ -101,7 +101,7 @@ impl WorkspaceTicketReadKind {
                 "Query authoritative Workspace Tickets with bounded typed filters, stable snippets, evidence summaries, and cursor metadata."
             }
             Self::Show => {
-                "Show one authoritative Workspace Ticket with its content digest, paged thread, links, historical implementation reports, and current Merge Request readiness evidence."
+                "Show one authoritative Workspace Ticket with its ordered implementation targets (repository_key, ref_selector, access), content digest, paged thread, links, historical implementation reports, and current Merge Request readiness evidence. Read targets here before choosing a work repository; a null selector remains unspecified, not an inferred default."
             }
         }
     }
@@ -2529,8 +2529,8 @@ mod tests {
             );
             if status == 200 {
                 let (previous, current) = result.unwrap();
-                assert_eq!(previous.meta.id, record.meta.id);
-                assert_eq!(current.meta.id, record.meta.id);
+                assert_eq!(previous.meta.id, "T-718");
+                assert_eq!(current.meta.id, "T-718");
             } else {
                 assert!(result.unwrap_err().to_string().contains("409"));
             }
@@ -2542,6 +2542,121 @@ mod tests {
                 serde_json::from_str::<Value>(requests[0].body.as_deref().unwrap()).unwrap(),
                 input,
             );
+        }
+    }
+
+    fn target_detail_fixture(targets: Value) -> Value {
+        json!({
+            "resource_key": "T-739", "title": "Work location", "body": "Requirements",
+            "body_truncated": false, "content_digest": "observed-content", "targets": targets,
+            "initial_post": {
+                "sequence": 0, "event_ref": "initial", "is_initial": true,
+                "kind": "comment", "body": "Requirements", "body_truncated": false,
+                "body_digest": "a".repeat(64), "editable": true,
+                "author": null, "at": null, "edited_at": null, "edited_by": null
+            },
+            "state": "open", "closure_operation_key": null, "current_closure": null,
+            "legacy_handoff": null, "closure_history": [], "assignment_tracking": [],
+            "tags": [], "events": [], "linked_objectives": [], "assignments": [],
+            "implementation_reports": [], "merge_requests": []
+        })
+    }
+
+    #[tokio::test]
+    async fn orchestrator_show_and_native_read_preserve_ordered_targets() {
+        for targets in [
+            json!([]),
+            json!([
+                {"repository_key": "main", "ref_selector": "develop", "access": "read_write"},
+                {"repository_key": "docs", "ref_selector": null, "access": "read_only"},
+                {"repository_key": "archive", "ref_selector": "refs/tags/v1", "access": "read_only"}
+            ]),
+        ] {
+            let client = Arc::new(DecisionClient {
+                requests: Mutex::new(Vec::new()),
+                response: crate::worker::WorkspaceResponse {
+                    status: 200,
+                    body: target_detail_fixture(targets.clone()).to_string(),
+                },
+            });
+            let definitions =
+                enabled_ticket_definitions(client.clone(), TicketFeatureAccess::workflow());
+            let definition = definitions
+                .into_iter()
+                .find(|definition| definition().0.name == "ShowTicket")
+                .unwrap();
+            let (meta, tool) = definition();
+            assert!(meta.description.contains("targets"));
+            let output = tool
+                .execute(
+                    r#"{"id":"T-739","event_limit":1}"#,
+                    ToolExecutionContext::direct(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                ticket_tool_output_json(output)
+                    .unwrap_or_else(|_| panic!("Ticket read returned invalid JSON"))["targets"],
+                targets
+            );
+
+            let native =
+                native_ticket_tools(client.clone(), TicketFeatureAccess::workflow()).unwrap();
+            let read = native
+                .into_iter()
+                .find(|tool| tool.projection.operation == "read")
+                .unwrap();
+            let output = read
+                .tool
+                .execute(
+                    r#"{"id":"T-739","event_cursor":"10"}"#,
+                    ToolExecutionContext::direct(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                ticket_tool_output_json(output)
+                    .unwrap_or_else(|_| panic!("Ticket read returned invalid JSON"))["targets"],
+                targets
+            );
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.path == "/api/w/workspace/tickets/T-739/show")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn show_rejects_missing_or_malformed_targets_instead_of_reporting_unassigned() {
+        for malformed in [
+            None,
+            Some(Value::Null),
+            Some(json!({})),
+            Some(json!([{"repository_key":"main","access":"write"}])),
+        ] {
+            let mut detail = target_detail_fixture(json!([]));
+            if let Some(value) = malformed {
+                detail["targets"] = value;
+            } else {
+                detail.as_object_mut().unwrap().remove("targets");
+            }
+            let client = Arc::new(DecisionClient {
+                requests: Mutex::new(Vec::new()),
+                response: crate::worker::WorkspaceResponse {
+                    status: 200,
+                    body: detail.to_string(),
+                },
+            });
+            let (_, tool) =
+                workspace_ticket_read_definition(client, WorkspaceTicketReadKind::Show)();
+            let error = tool
+                .execute(r#"{"id":"T-739"}"#, ToolExecutionContext::direct())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("targets"), "{error}");
         }
     }
 

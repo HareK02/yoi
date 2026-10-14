@@ -48,6 +48,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "ticket_assignment_delivery_acknowledgements",
     "ticket_assignment_delivery_requests",
     "ticket_assignment_deliveries",
+    "ticket_assignment_content_inputs",
     "ticket_assignment_delivery_origins",
     "ticket_assignment_operation_fences",
     "ticket_assignment_operations",
@@ -488,6 +489,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 ("ticket_assignment_delivery_requests", "ticket_assignment_delivery_request_no_delete"),
                 ("ticket_assignment_delivery_acknowledgements", "ticket_assignment_delivery_ack_no_delete"),
                 ("ticket_assignment_delivery_origins", "ticket_assignment_delivery_origin_no_delete"),
+                ("ticket_assignment_content_inputs", "ticket_assignment_content_input_no_delete"),
                 ("ticket_assignment_operation_fences", "ticket_assignment_operation_fence_no_delete"),
                 ("typed_ticket_assignment_tracking_history", "typed_ticket_assignment_tracking_history_no_delete"),
                 ("typed_ticket_assignment_tracking_operations", "typed_ticket_assignment_tracking_operations_no_delete"),
@@ -1016,6 +1018,15 @@ mod tests {
                         false,
                     )
                     .unwrap();
+                let initial = backend
+                    .edit_item(
+                        initial.meta.id.clone().into(),
+                        ticket::TicketItemEdit {
+                            title: Some("Changed case evidence".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
                 // Seed domain handling evidence under a transaction. This fixture
                 // exercises owner purge, not singleton authentication or delivery.
                 store
@@ -1091,7 +1102,7 @@ mod tests {
             }
             let assert_immutable = |workspace: &str| {
                 store.with_conn(|conn| {
-                    for table in ["typed_ticket_case_history", "typed_ticket_legacy_workflow_snapshot", "ticket_worker_assignment_events", "typed_ticket_assignment_tracking_history", "typed_ticket_assignment_tracking_operations", "ticket_assignment_operations"] {
+                    for table in ["typed_ticket_case_history", "typed_ticket_legacy_workflow_snapshot", "ticket_worker_assignment_events", "typed_ticket_assignment_tracking_history", "typed_ticket_assignment_tracking_operations", "ticket_assignment_operations", "ticket_assignment_content_inputs"] {
                         assert!(conn.execute(&format!("DELETE FROM {table} WHERE workspace_id=?1"), [workspace]).is_err());
                         assert!(conn.execute(&format!("UPDATE {table} SET ticket_id=ticket_id WHERE workspace_id=?1"), [workspace]).is_err());
                     }
@@ -1176,6 +1187,7 @@ mod tests {
                             };
                             assert_eq!(count, expected, "rollback must restore {table}");
                         }
+                        assert_eq!(conn.query_row("SELECT COUNT(*) FROM ticket_assignment_content_inputs WHERE workspace_id='workspace-a'", [], |row| row.get::<_,i64>(0))?, 1, "rollback restores content inputs");
                         conn.execute_batch("DROP TRIGGER reject_workspace_purge;")?;
                         Ok(())
                     })
@@ -1202,6 +1214,8 @@ mod tests {
             assert_immutable("workspace-b");
             store
                 .with_conn(|conn| {
+                    assert_eq!(conn.query_row("SELECT COUNT(*) FROM ticket_assignment_content_inputs WHERE workspace_id='workspace-a'", [], |row| row.get::<_,i64>(0))?, 0);
+                    assert_eq!(conn.query_row("SELECT COUNT(*) FROM ticket_assignment_content_inputs WHERE workspace_id='workspace-b'", [], |row| row.get::<_,i64>(0))?, 1);
                     for (table, before) in tables.iter().zip(&other_before) {
                         let count: i64 = conn.query_row(
                             &format!(
