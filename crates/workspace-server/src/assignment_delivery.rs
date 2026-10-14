@@ -1,13 +1,14 @@
 //! Durable operational delivery and startup fencing, independent of Ticket handling.
 //!
-//! All delivery triggers use the same pending-input scan: current actionable delegation,
-//! committed input origin and open case, never Queue/open state alone. Waiting is not a
-//! resend reason; comments, self-reports and case/routing history are not new requests.
-//! Migration preserves evidence but creates origins only for reconciled assignment-specific
-//! legacy Queue fences. Unknown/history/done/released assignments are not fresh work.
+//! Notification eligibility comes from the shared routing policy and its persisted decisions.
+//! This adapter retains the original assignment delivery identity, immutable request and ACK.
+//! Retained migration SQL establishes origins only for reconciled assignment-specific legacy
+//! Queue fences; migration does not reinterpret historical comments as new requests.
 //!
-//! Reserve, prepare and acknowledge recheck delegation, singleton and live binding under
-//! IMMEDIATE ownership. Persist the entire rendered request before Runtime I/O, then reuse
+//! Reserve and prepare recheck delegation, singleton and live binding under
+//! IMMEDIATE ownership. ACK instead verifies the target authorized before I/O;
+//! a later responsibility change must not erase Runtime acceptance evidence.
+//! Persist the entire rendered request before Runtime I/O, then reuse
 //! its request ID and content on response loss. Send outside the transaction; acknowledgement
 //! proves Runtime acceptance, not model consideration, execution, handling or fulfillment.
 //! Async callers offload whole helpers, never split authorization/receipt/CAS/audit across awaits.
@@ -132,46 +133,6 @@ pub(super) fn install_post_inputs(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-const INPUTS_SQL: &str = r#"
-WITH eligible AS (
- SELECT a.*,o.input_event_id,o.after_ticket_event_index
- FROM ticket_current_worker_assignments c
- JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.assignment_id=c.assignment_id
- JOIN ticket_assignment_delivery_origins o ON o.workspace_id=a.workspace_id AND o.assignment_id=a.assignment_id
- JOIN typed_tickets t ON t.workspace_id=a.workspace_id AND t.ticket_id=a.ticket_id
- WHERE a.workspace_id=?1 AND a.role='orchestrator' AND a.principal_kind='workspace_agent'
- AND a.principal_id='workspace-orchestrator' AND t.workflow_state='open'
- AND json_extract(a.tracking_json,'$.status') IN ('waiting','inprogress')
- AND NOT EXISTS(SELECT 1 FROM ticket_assignment_work_releases r
- WHERE r.workspace_id=a.workspace_id AND r.assignment_id=a.assignment_id)
-), inputs AS (
- SELECT ticket_id,assignment_id,input_event_id,tracking_json,-1 AS input_order FROM eligible
- UNION ALL
- SELECT a.ticket_id,a.assignment_id,'ticket-event:' || e.event_index,a.tracking_json,e.event_index
- FROM eligible a JOIN typed_ticket_events e ON e.workspace_id=a.workspace_id AND e.ticket_id=a.ticket_id
- WHERE e.event_index>a.after_ticket_event_index
- -- Continuing request intent is explicit: fenced assignment answers or item content edits.
- -- Ordinary comments and all case/routing/handling history are not new requests.
- AND e.kind IN ('assignment_answer','item_edit')
- AND (e.kind<>'assignment_answer' OR EXISTS(SELECT 1 FROM typed_ticket_event_attributes attr WHERE attr.workspace_id=e.workspace_id AND attr.ticket_id=e.ticket_id AND attr.event_index=e.event_index AND attr.key='orchestrator_assignment_id' AND attr.value=a.assignment_id))
- AND e.kind NOT LIKE 'assignment_tracking%'
- AND e.kind NOT LIKE 'assignment_delivery%'
- AND COALESCE(e.state_field,'') NOT IN ('case','routing','assignment_tracking')
- AND NOT EXISTS(SELECT 1 FROM typed_ticket_event_attributes attr WHERE attr.workspace_id=e.workspace_id AND attr.ticket_id=e.ticket_id AND attr.event_index=e.event_index AND attr.key='orchestrator_assignment_id' AND attr.value<>a.assignment_id)
- UNION ALL
- SELECT a.ticket_id,a.assignment_id,'ticket-edit:' || printf('%020d',e.input_sequence),a.tracking_json,e.after_ticket_event_index+1
- FROM eligible a JOIN ticket_assignment_content_inputs e
- ON e.workspace_id=a.workspace_id AND e.ticket_id=a.ticket_id AND e.assignment_id=a.assignment_id
-)
-SELECT i.ticket_id,i.assignment_id,i.input_event_id,
- json_extract(i.tracking_json,'$.waiting_reason'),json_extract(i.tracking_json,'$.next_action'),d.payload_json
-FROM inputs i
-LEFT JOIN ticket_assignment_deliveries d ON d.workspace_id=?1 AND d.assignment_id=i.assignment_id AND d.input_event_id=i.input_event_id
-WHERE NOT EXISTS(SELECT 1 FROM ticket_assignment_delivery_acknowledgements ack
- WHERE ack.workspace_id=?1 AND ack.delivery_id=d.delivery_id)
-AND (?3 IS NULL OR i.assignment_id=?3) AND (?4 IS NULL OR i.input_event_id=?4)
-"#;
-
 fn decode_payload(payload: &str) -> Result<TicketAssignmentDelivery> {
     serde_json::from_str(payload).map_err(|e| Error::Store(e.to_string()))
 }
@@ -181,57 +142,51 @@ pub(super) fn list_in_tx(
     workspace_id: &str,
     limit: usize,
 ) -> Result<Vec<TicketAssignmentDelivery>> {
-    inputs_in_tx(conn, workspace_id, limit, None, None)
+    if !(1..=100).contains(&limit) {
+        return Err(Error::InvalidInput("Delivery limit must be 1..100".into()));
+    }
+    notification_routing::pending_sources(conn, workspace_id, "orchestrator", limit)?
+        .into_iter()
+        .map(|(ticket, assignment, input, id)| {
+            delivery(conn, workspace_id, ticket, assignment, input, id)
+        })
+        .collect()
+}
+fn delivery(
+    conn: &Connection,
+    workspace: &str,
+    ticket_id: String,
+    assignment_id: String,
+    input_event_id: String,
+    delivery_id: String,
+) -> Result<TicketAssignmentDelivery> {
+    let saved: Option<String> = conn.query_row("SELECT payload_json FROM ticket_assignment_deliveries WHERE workspace_id=?1 AND assignment_id=?2 AND input_event_id=?3",params![workspace,assignment_id,input_event_id],|r|r.get(0)).optional()?;
+    if let Some(saved) = saved {
+        return decode_payload(&saved);
+    }
+    let (waiting_reason,next_action)=conn.query_row("SELECT json_extract(tracking_json,'$.waiting_reason'),json_extract(tracking_json,'$.next_action') FROM ticket_worker_assignments WHERE workspace_id=?1 AND assignment_id=?2",params![workspace,assignment_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    Ok(TicketAssignmentDelivery {
+        ticket_id,
+        assignment_id,
+        input_event_id,
+        request_id: delivery_id.clone(),
+        delivery_id,
+        waiting_reason,
+        next_action,
+    })
 }
 fn inputs_in_tx(
     conn: &Connection,
-    workspace_id: &str,
-    limit: usize,
-    assignment_id: Option<&str>,
-    input_event_id: Option<&str>,
+    workspace: &str,
+    _limit: usize,
+    assignment: Option<&str>,
+    input: Option<&str>,
 ) -> Result<Vec<TicketAssignmentDelivery>> {
-    let sql = format!(
-        "{INPUTS_SQL} ORDER BY i.ticket_id,i.assignment_id,i.input_order,i.input_event_id LIMIT ?2"
-    );
-    let mut statement = conn.prepare(&sql)?;
-    let rows = statement.query_map(
-        params![workspace_id, limit as i64, assignment_id, input_event_id],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        },
-    )?;
-    rows.map(|row| {
-        let (ticket_id, assignment_id, input_event_id, waiting_reason, next_action, payload) = row?;
-        if let Some(payload) = payload {
-            return decode_payload(&payload);
-        }
-        // Hash the identities, not mutable handling. Scope is Workspace-qualified.
-        let identities = serde_json::to_string(&(workspace_id, &assignment_id, &input_event_id))
-            .map_err(|e| Error::Store(e.to_string()))?;
-        let digest = Sha256::digest(identities.as_bytes());
-        let hex = digest
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let delivery_id = format!("assignment-delivery:{hex}");
-        Ok(TicketAssignmentDelivery {
-            ticket_id,
-            assignment_id,
-            input_event_id,
-            request_id: delivery_id.clone(),
-            delivery_id,
-            waiting_reason,
-            next_action,
-        })
-    })
-    .collect()
+    notification_routing::route_pending(conn, workspace)?;
+    let row: Option<(String,String,String,String)>=conn.query_row("SELECT s.ticket_id,s.assignment_id,s.input_event_id,d.delivery_id FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.workspace_id=?1 AND s.assignment_id=?2 AND s.input_event_id=?3 AND s.role='orchestrator' AND d.disposition='deliver' AND NOT EXISTS(SELECT 1 FROM ticket_assignment_delivery_acknowledgements a WHERE a.workspace_id=?1 AND a.delivery_id=d.delivery_id)",params![workspace,assignment,input],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+    row.into_iter()
+        .map(|(ticket, a, i, id)| delivery(conn, workspace, ticket, a, i, id))
+        .collect()
 }
 
 fn source_guard(
@@ -255,19 +210,42 @@ pub(super) fn require_current(
     ticket_id: &str,
     assignment_id: &str,
 ) -> Result<()> {
-    let current:bool=conn.query_row(r#"SELECT EXISTS(SELECT 1 FROM ticket_current_worker_assignments c
- JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.assignment_id=c.assignment_id
- JOIN typed_tickets t ON t.workspace_id=a.workspace_id AND t.ticket_id=a.ticket_id
- WHERE c.workspace_id=?1 AND c.ticket_id=?2 AND c.assignment_id=?3 AND c.role='orchestrator'
- AND a.principal_kind='workspace_agent' AND a.principal_id='workspace-orchestrator'
- AND t.workflow_state='open' AND json_extract(a.tracking_json,'$.status') IN ('waiting','inprogress')
- AND EXISTS(SELECT 1 FROM ticket_assignment_delivery_origins o WHERE o.workspace_id=a.workspace_id AND o.assignment_id=a.assignment_id)
- AND NOT EXISTS(SELECT 1 FROM ticket_assignment_work_releases r WHERE r.workspace_id=a.workspace_id AND r.assignment_id=a.assignment_id))"#,params![workspace_id,ticket_id,assignment_id],|r|r.get(0))?;
-    if !current {
+    notification_routing::require_current(
+        conn,
+        workspace_id,
+        ticket_id,
+        assignment_id,
+        "orchestrator",
+    )?;
+    let known: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM ticket_assignment_delivery_origins WHERE workspace_id=?1 AND assignment_id=?2)", params![workspace_id, assignment_id], |r|r.get(0))?;
+    if !known {
         return Err(Error::TicketAssignmentConflict(
-            "Assignment is no longer a current actionable delegation".into(),
+            "Assignment has no committed input origin".into(),
         ));
     }
+    Ok(())
+}
+
+// Call only after source_guard and require_current in the reservation/preparation
+// transaction. A replacement target gets its own evidence for the same delivery,
+// not a new request or authority to revive a completed/released assignment.
+fn save_authorized_target(
+    conn: &Connection,
+    workspace: &str,
+    delivery: &str,
+    source: &TicketAssignmentTrackingSourceContext,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO notification_assignment_targets VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            workspace,
+            delivery,
+            source.runtime_id,
+            source.worker_id,
+            source.agent_key,
+            source.authentication_binding_id
+        ],
+    )?;
     Ok(())
 }
 
@@ -284,13 +262,14 @@ pub(super) fn reserve(
         let ticket_id:String=tx.query_row("SELECT ticket_id FROM ticket_worker_assignments WHERE workspace_id=?1 AND assignment_id=?2",params![workspace_id,assignment_id],|r|r.get(0))?;
         require_current(&tx,workspace_id,&ticket_id,assignment_id)?;
         let saved:Option<String>=tx.query_row("SELECT payload_json FROM ticket_assignment_deliveries WHERE workspace_id=?1 AND assignment_id=?2 AND input_event_id=?3",params![workspace_id,assignment_id,input_event_id],|r|r.get(0)).optional()?;
-        if let Some(saved)=saved {let result=decode_payload(&saved)?;tx.commit()?;return Ok(result);}
+        if let Some(saved)=saved {let result=decode_payload(&saved)?;save_authorized_target(&tx,workspace_id,&result.delivery_id,source)?;tx.commit()?;return Ok(result);}
         // A caller cannot fabricate an input. Restrict the same common query by
         // exact assignment/input identity rather than trusting a scan snapshot.
         let candidates=inputs_in_tx(&tx,workspace_id,1,Some(assignment_id),Some(input_event_id))?;
         let delivery=candidates.into_iter().find(|d|d.assignment_id==assignment_id && d.input_event_id==input_event_id)
             .ok_or_else(||Error::TicketAssignmentConflict("Assignment input is not pending".into()))?;
         tx.execute("INSERT INTO ticket_assignment_deliveries VALUES(?1,?2,?3,?4,?5,?6)",params![workspace_id,assignment_id,input_event_id,delivery.delivery_id,serde_json::to_string(&delivery).map_err(|e|Error::Store(e.to_string()))?,serde_json::to_string(source).map_err(|e|Error::Store(e.to_string()))?])?;
+        save_authorized_target(&tx,workspace_id,&delivery.delivery_id,source)?;
         tx.commit()?;
         Ok(delivery)
     })
@@ -317,6 +296,7 @@ pub(super) fn prepare_content(
         let payload:String=tx.query_row("SELECT payload_json FROM ticket_assignment_deliveries WHERE workspace_id=?1 AND delivery_id=?2",params![workspace_id,delivery_id],|r|r.get(0))?;
         let delivery=decode_payload(&payload)?;
         require_current(&tx,workspace_id,&delivery.ticket_id,&delivery.assignment_id)?;
+        save_authorized_target(&tx,workspace_id,delivery_id,source)?;
         let saved:Option<String>=tx.query_row("SELECT content FROM ticket_assignment_delivery_requests WHERE workspace_id=?1 AND delivery_id=?2",params![workspace_id,delivery_id],|r|r.get(0)).optional()?;
         let result=if let Some(saved)=saved {saved} else {
             tx.execute("INSERT INTO ticket_assignment_delivery_requests VALUES(?1,?2,?3)",params![workspace_id,delivery_id,content])?;
@@ -335,10 +315,12 @@ pub(super) fn ack(
 ) -> Result<()> {
     store.with_conn_mut(|conn| {
         let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        source_guard(&tx,workspace_id,source)?;
-        let payload:String=tx.query_row("SELECT payload_json FROM ticket_assignment_deliveries WHERE workspace_id=?1 AND delivery_id=?2",params![workspace_id,delivery_id],|r|r.get(0))?;
-        let delivery=decode_payload(&payload)?;
-        require_current(&tx,workspace_id,&delivery.ticket_id,&delivery.assignment_id)?;
+        // This is an acceptance receipt, not another send authorization. Match all
+        // authenticated target identity fields against evidence saved while current.
+        // Actor is audit attribution; it is not target authority. Existing ACK bytes
+        // still have to match on replay and are never replaced.
+        let authorized:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM notification_assignment_targets WHERE workspace_id=?1 AND delivery_id=?2 AND runtime_id=?3 AND worker_id=?4 AND agent_key=?5 AND authentication_binding_id=?6)",params![workspace_id,delivery_id,source.runtime_id,source.worker_id,source.agent_key,source.authentication_binding_id],|r|r.get(0))?;
+        if !authorized {return Err(Error::WorkspacePermissionDenied("Acknowledgement target was not authorized for this delivery".into()));}
         let source_json=serde_json::to_string(source).map_err(|e|Error::Store(e.to_string()))?;
         let saved:Option<String>=tx.query_row("SELECT source_json FROM ticket_assignment_delivery_acknowledgements WHERE workspace_id=?1 AND delivery_id=?2",params![workspace_id,delivery_id],|r|r.get(0)).optional()?;
         if let Some(saved)=saved {
@@ -413,41 +395,6 @@ pub(super) fn save_operation_fence(
     Ok(())
 }
 
-// Same input selection as delivery, plus immutable delivered history. Never
-// SELECT payload/source/content into the public diagnostic projection.
-const DIAGNOSTIC_INPUTS_SQL: &str = r#"
-WITH raw_inputs AS (
- SELECT o.input_event_id,-1 AS input_order FROM ticket_assignment_delivery_origins o
- WHERE o.workspace_id=?1 AND o.assignment_id=?3
- UNION
- SELECT d.input_event_id,COALESCE(e.after_ticket_event_index+1,CASE WHEN d.input_event_id LIKE 'ticket-event:%' THEN CAST(substr(d.input_event_id,14) AS INTEGER) ELSE -1 END)
- FROM ticket_assignment_deliveries d
- LEFT JOIN ticket_assignment_content_inputs e ON e.workspace_id=d.workspace_id AND e.assignment_id=d.assignment_id
- AND d.input_event_id='ticket-edit:' || printf('%020d',e.input_sequence)
- WHERE d.workspace_id=?1 AND d.assignment_id=?3
- UNION
- SELECT 'ticket-event:' || e.event_index,e.event_index
- FROM ticket_assignment_delivery_origins o JOIN typed_ticket_events e ON e.workspace_id=o.workspace_id AND e.ticket_id=o.ticket_id
- WHERE o.workspace_id=?1 AND o.ticket_id=?2 AND o.assignment_id=?3 AND e.event_index>o.after_ticket_event_index
- AND e.kind IN ('assignment_answer','item_edit')
- AND (e.kind<>'assignment_answer' OR EXISTS(SELECT 1 FROM typed_ticket_event_attributes attr WHERE attr.workspace_id=e.workspace_id AND attr.ticket_id=e.ticket_id AND attr.event_index=e.event_index AND attr.key='orchestrator_assignment_id' AND attr.value=?3))
- AND e.kind NOT LIKE 'assignment_tracking%' AND e.kind NOT LIKE 'assignment_delivery%'
- AND COALESCE(e.state_field,'') NOT IN ('case','routing','assignment_tracking')
- -- Retain historical input identity after done/release. A later delegation's
- -- origin bounds ordinary events; an explicit answer's attribute is authoritative.
- AND e.event_index<=COALESCE((SELECT MIN(later.after_ticket_event_index) FROM ticket_assignment_delivery_origins later
- JOIN ticket_worker_assignments la ON la.workspace_id=later.workspace_id AND la.assignment_id=later.assignment_id
- JOIN ticket_worker_assignments original ON original.workspace_id=o.workspace_id AND original.assignment_id=o.assignment_id
- WHERE later.workspace_id=o.workspace_id AND later.ticket_id=o.ticket_id AND la.rowid>original.rowid),9223372036854775807)
- AND NOT EXISTS(SELECT 1 FROM typed_ticket_event_attributes attr WHERE attr.workspace_id=e.workspace_id AND attr.ticket_id=e.ticket_id AND attr.event_index=e.event_index AND attr.key='orchestrator_assignment_id' AND attr.value<>?3)
- UNION
- SELECT 'ticket-edit:' || printf('%020d',input_sequence),after_ticket_event_index+1
- FROM ticket_assignment_content_inputs WHERE workspace_id=?1 AND ticket_id=?2 AND assignment_id=?3
-), inputs AS (
- SELECT input_event_id,ROW_NUMBER() OVER (ORDER BY input_order,input_event_id) AS input_order FROM raw_inputs
-)
-"#;
-
 pub(super) fn diagnostics_page(
     store: &SqliteWorkspaceStore,
     workspace_id: &str,
@@ -473,20 +420,9 @@ pub(super) fn diagnostics_page(
             Err(Error::TicketAssignmentConflict(_)) => false,
             Err(error) => return Err(error),
         };
-        let after = match after_input_event_id {
-            None => -2,
-            Some(id) => tx.query_row(&format!("{DIAGNOSTIC_INPUTS_SQL} SELECT input_order FROM inputs WHERE input_event_id=?5"),params![workspace_id,ticket_id,assignment_id,actionable,id],|r| r.get::<_,i64>(0)).optional()?.ok_or_else(|| Error::InvalidInput("Input cursor does not belong to this assignment".into()))?,
-        };
-        let sql = format!("{DIAGNOSTIC_INPUTS_SQL} SELECT i.input_event_id,d.delivery_id,EXISTS(SELECT 1 FROM ticket_assignment_delivery_requests req WHERE req.workspace_id=?1 AND req.delivery_id=d.delivery_id),EXISTS(SELECT 1 FROM ticket_assignment_delivery_acknowledgements ack WHERE ack.workspace_id=?1 AND ack.delivery_id=d.delivery_id) FROM inputs i LEFT JOIN ticket_assignment_deliveries d ON d.workspace_id=?1 AND d.assignment_id=?3 AND d.input_event_id=i.input_event_id WHERE i.input_order>?5 ORDER BY i.input_order LIMIT ?6");
-        let mut stmt = tx.prepare(&sql)?;
-        let mut inputs = stmt.query_map(params![workspace_id,ticket_id,assignment_id,actionable,after,(limit+1) as i64],|r| {
-            let delivery_id: Option<String> = r.get(1)?;
-            let prepared: bool = r.get(2)?;
-            let ack: bool = r.get(3)?;
-            use server_api::TicketAssignmentInputDeliveryState::*;
-            let notification = if ack { RuntimeAccepted } else if prepared { RequestPersisted } else if delivery_id.is_some() { Reserved } else { NotReserved };
-            Ok(server_api::TicketAssignmentInputDiagnostic { input_event_id:r.get(0)?, delivery_id,notification,acceptance_outcome_unknown:prepared && !ack })
-        })?.collect::<std::result::Result<Vec<_>,_>>()?;
+        let mut inputs = notification_routing::diagnostic_inputs(
+            &tx, workspace_id, ticket_id, assignment_id, after_input_event_id, limit,
+        )?;
         let more = inputs.len()>limit;
         inputs.truncate(limit);
         let next_input_event_id = if more { inputs.last().map(|i| i.input_event_id.clone()) } else { None };

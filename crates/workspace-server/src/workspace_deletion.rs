@@ -45,6 +45,12 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "repository_ssh_host_trust_keys",
     "repository_ssh_host_trusts",
     "server_secret_objects",
+    "notification_assignment_targets",
+    "notification_acknowledgements",
+    "notification_requests",
+    "notification_failures",
+    "notification_decisions",
+    "notification_sources",
     "ticket_assignment_delivery_acknowledgements",
     "ticket_assignment_delivery_requests",
     "ticket_assignment_deliveries",
@@ -66,6 +72,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "typed_ticket_artifacts",
     "typed_ticket_event_attributes",
     "typed_ticket_event_references",
+    "typed_ticket_content_changes",
     "typed_ticket_events",
     "typed_ticket_labels",
     "typed_ticket_orchestration_plans",
@@ -482,6 +489,12 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
             // commit; update guards remain installed throughout.
             let mut ticket_delete_guards = Vec::new();
             for (table, trigger) in [
+                ("notification_assignment_targets", "notification_assignment_targets_no_delete"),
+                ("notification_sources", "notification_sources_no_delete"),
+                ("notification_decisions", "notification_decisions_no_delete"),
+                ("notification_requests", "notification_requests_no_delete"),
+                ("notification_acknowledgements", "notification_acknowledgements_no_delete"),
+                ("notification_failures", "notification_failures_no_delete"),
                 ("ticket_worker_assignments", "typed_ticket_assignment_identity_no_delete"),
                 ("ticket_worker_assignment_events", "typed_ticket_assignment_events_no_delete"),
                 ("ticket_assignment_operations", "typed_ticket_assignment_receipt_no_delete"),

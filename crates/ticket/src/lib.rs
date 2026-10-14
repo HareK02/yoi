@@ -29,6 +29,7 @@ mod assignment_answer;
 pub use assignment_answer::*;
 mod assignment_tracking;
 pub mod config;
+mod content_changes;
 mod sqlite_schema;
 mod tags;
 pub use assignment_tracking::*;
@@ -3116,6 +3117,9 @@ impl TicketBackend for SqliteTicketBackend {
             if post.body != edit.expected_body {
                 return Err(TicketError::Conflict("stale Ticket post body".into()));
             }
+            if post.body == edit.body {
+                return Ok((previous.clone(), previous));
+            }
             let now = now_utc();
             let changed = conn.execute(
                 "UPDATE typed_ticket_events SET body = ?4, edited_at = ?5, edited_by = ?6 WHERE workspace_id = ?1 AND ticket_id = ?2 AND event_ref = ?3 AND body = ?7 AND kind = 'comment' AND archived = 0",
@@ -3123,6 +3127,16 @@ impl TicketBackend for SqliteTicketBackend {
             ).map_err(sqlite_err)?;
             if changed != 1 { return Err(TicketError::Conflict("stale Ticket post body".into())); }
             self.touch_ticket(conn, &ticket_id, &now)?;
+            let fact = if post.is_initial {
+                content_changes::ContentChange::ContentEdit {
+                    title_changed: false,
+                    body_event_ref: Some(&post.event_ref),
+                    targets_changed: false,
+                }
+            } else {
+                content_changes::ContentChange::CommentEdit { event_ref: &post.event_ref }
+            };
+            fact.insert(conn, &self.workspace_id, &ticket_id, Some(&edit.author), &now)?;
             let current = self.load_ticket(conn, &ticket_id)?;
             Ok((previous, current))
         })
@@ -3315,37 +3329,41 @@ impl TicketBackend for SqliteTicketBackend {
             }
             let ticket_id = self.resolve_ticket_id(conn, id)?;
             let previous = self.load_ticket(conn, &ticket_id)?;
-            let now = now_utc();
-            if let Some(title) = edit.title.as_ref() {
-                conn.execute("UPDATE typed_tickets SET title = ?3, updated_at = ?4 WHERE workspace_id = ?1 AND ticket_id = ?2", params![self.workspace_id, ticket_id, title, now]).map_err(sqlite_err)?;
-            }
-            let mut updated_body = None;
-            if let Some(body) = edit.body.as_ref() {
-                updated_body = Some(body.clone());
-            }
+            let mut updated_body = edit.body.clone();
             if let Some(replacement) = edit.body_replacement.as_ref() {
-                let current_body: String = conn
-                    .query_row(
-                        "SELECT body FROM typed_ticket_events WHERE workspace_id = ?1 AND ticket_id = ?2 AND event_index = -1",
-                        params![self.workspace_id, ticket_id],
-                        |row| row.get(0),
-                    )
-                    .map_err(sqlite_err)?;
-                let outcome = replacement.apply(current_body.as_str())?;
-                updated_body = Some(outcome.body);
+                updated_body = Some(replacement.apply(previous.document.body.as_str())?.body);
             }
-            if let Some(body) = updated_body.as_ref() {
-                conn.execute("UPDATE typed_ticket_events SET body = ?3, edited_at = ?4, edited_by = ?5 WHERE workspace_id = ?1 AND ticket_id = ?2 AND event_index = -1", params![self.workspace_id, ticket_id, body.as_str(), now, edit.author]).map_err(sqlite_err)?;
-                self.touch_ticket(conn, &ticket_id, &now)?;
+            let targets = edit.targets.as_ref().map(|targets| match targets {
+                TicketTargetsEdit::Set { targets } => targets.as_slice(),
+                TicketTargetsEdit::Clear => &[],
+            });
+            let title_changed = edit.title.as_ref().is_some_and(|title| *title != previous.meta.title);
+            let body_changed = updated_body.as_ref().is_some_and(|body| *body != previous.document.body);
+            let targets_changed = targets.is_some_and(|targets| targets != previous.meta.targets);
+            if !title_changed && !body_changed && !targets_changed {
+                return Ok((previous.clone(), previous));
             }
-            if let Some(targets) = edit.targets.as_ref() {
-                let targets = match targets {
-                    TicketTargetsEdit::Set { targets } => targets.as_slice(),
-                    TicketTargetsEdit::Clear => &[],
-                };
-                self.replace_ticket_targets(conn, &ticket_id, targets)?;
-                self.touch_ticket(conn, &ticket_id, &now)?;
+            let now = now_utc();
+            if title_changed {
+                conn.execute("UPDATE typed_tickets SET title = ?3 WHERE workspace_id = ?1 AND ticket_id = ?2", params![self.workspace_id, ticket_id, edit.title]).map_err(sqlite_err)?;
             }
+            let body_event_ref = if body_changed {
+                let initial = previous.events.iter().find(|event| event.is_initial)
+                    .ok_or_else(|| TicketError::Conflict("Ticket initial post is missing".into()))?;
+                conn.execute("UPDATE typed_ticket_events SET body = ?3, edited_at = ?4, edited_by = ?5 WHERE workspace_id = ?1 AND ticket_id = ?2 AND event_index = -1", params![self.workspace_id, ticket_id, updated_body.as_ref().expect("changed body").as_str(), now, edit.author]).map_err(sqlite_err)?;
+                Some(initial.event_ref.as_str())
+            } else {
+                None
+            };
+            if targets_changed {
+                self.replace_ticket_targets(conn, &ticket_id, targets.expect("changed targets"))?;
+            }
+            self.touch_ticket(conn, &ticket_id, &now)?;
+            content_changes::ContentChange::ContentEdit {
+                title_changed,
+                body_event_ref,
+                targets_changed,
+            }.insert(conn, &self.workspace_id, &ticket_id, edit.author.as_deref(), &now)?;
 
             let current = self.load_ticket(conn, &ticket_id)?;
             Ok((previous, current))

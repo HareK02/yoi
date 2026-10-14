@@ -408,7 +408,7 @@ fn migration_preserves_original_records_and_only_reconciles_current_fenced_deleg
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
-            12
+            13
         );
         let value = sqlite_ticket_assignment_tracking(&conn, "w", "t", "a")
             .unwrap()

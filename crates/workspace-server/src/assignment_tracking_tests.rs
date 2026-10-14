@@ -442,7 +442,7 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
             .iter()
             .map(|m| m.version)
             .collect::<Vec<_>>(),
-        vec![92, 93, 94]
+        (92..=LATEST_SCHEMA_VERSION).collect::<Vec<_>>()
     );
     let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     store
@@ -465,7 +465,11 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
                         93,
                         "Durable assignment deliveries and source-bound startup fences".into()
                     ),
-                    (94, "Canonical Ticket posts".into())
+                    (94, "Canonical Ticket posts".into()),
+                    (
+                        95,
+                        "Common notification routing and durable Worker delivery".into()
+                    )
                 ]
             );
             for (table, rows) in retained.iter().zip(original.iter()) {
@@ -604,7 +608,7 @@ fn tracking_store_schema91_closed_unknown_assignment_uses_assign_audit_for_first
         );
         store.with_conn(|conn| {
             assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
-            assert_eq!(conn.query_row("SELECT MAX(version) FROM ticket_schema_migrations", [], |row| row.get::<_,i64>(0))?, 12);
+            assert_eq!(conn.query_row("SELECT MAX(version) FROM ticket_schema_migrations", [], |row| row.get::<_,i64>(0))?, 13);
             assert_eq!(conn.query_row("SELECT workflow_state FROM typed_tickets WHERE ticket_id='historical-done'", [], |row| row.get::<_,String>(0))?, "closed");
             let stored: (Option<String>, Option<String>) = conn.query_row("SELECT tracking_json,last_tracking_event_id FROM ticket_worker_assignments WHERE assignment_id='a-historical-done'", [], |row| Ok((row.get(0)?,row.get(1)?)))?;
             assert_eq!(stored, (None, None), "read baseline must not manufacture tracking storage");
@@ -1566,12 +1570,21 @@ async fn assignment_answer_replay_returns_saved_event_without_new_assignment_or_
     let pending = store
         .list_pending_ticket_assignment_deliveries("w", 100)
         .unwrap();
-    assert_eq!(pending.len(), 2);
+    assert_eq!(
+        pending.len(),
+        1,
+        "self-answer preserves the receipt without waking the same Orchestrator"
+    );
     assert!(
         pending
             .iter()
-            .any(|p| p.input_event_id == saved.input_event_id)
+            .all(|p| p.input_event_id != saved.input_event_id)
     );
+    store.with_conn(|conn| {
+        let reason: String = conn.query_row("SELECT d.reason FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.workspace_id='w' AND s.assignment_id='answer-a' AND s.input_event_id=?1 AND s.role='orchestrator'", [&saved.input_event_id], |row| row.get(0))?;
+        assert_eq!(reason, "self_notification");
+        Ok(())
+    }).unwrap();
     store
         .with_conn(|conn| {
             assert_eq!(

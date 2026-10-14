@@ -302,11 +302,9 @@ async fn assignment_delivery_clear_reassign_fences_scanned_and_reserved_inputs()
             .reserve_ticket_assignment_delivery("w", "a", &old.input_event_id, &source)
             .is_err()
     );
-    assert!(
-        store
-            .ack_ticket_assignment_delivery("w", &old.delivery_id, &source)
-            .is_err()
-    );
+    // Acceptance of the previously authorized request is evidence, not permission
+    // to resend or transfer work to the new assignment.
+    store.ack_ticket_assignment_delivery("w", &old.delivery_id, &source).unwrap();
     let pending = store
         .list_pending_ticket_assignment_deliveries("w", 100)
         .unwrap();
@@ -327,7 +325,7 @@ async fn assignment_delivery_clear_reassign_fences_scanned_and_reserved_inputs()
 }
 
 #[tokio::test]
-async fn assignment_delivery_old_worker_or_authenticated_binding_cannot_reserve_or_ack() {
+async fn assignment_delivery_old_target_cannot_resend_but_can_record_authorized_acceptance() {
     for change in ["replacement", "revoke", "binding-change"] {
         let (_directory, store) = tracking_store_fixture().await;
         tracking_store_assign(&store, "a", "assign-a");
@@ -347,13 +345,9 @@ async fn assignment_delivery_old_worker_or_authenticated_binding_cannot_reserve_
             ),
             "{change}"
         );
-        assert!(
-            matches!(
-                store.ack_ticket_assignment_delivery("w", &old.delivery_id, &source),
-                Err(Error::WorkspacePermissionDenied(_))
-            ),
-            "{change}"
-        );
+        let mut unreserved = source.clone();
+        unreserved.worker_id = "never-authorized-target".into();
+        assert!(store.ack_ticket_assignment_delivery("w", &old.delivery_id, &unreserved).is_err());
         if change == "replacement" {
             let mut replacement = source.clone();
             replacement.worker_id = "replacement".into();
@@ -373,6 +367,8 @@ async fn assignment_delivery_old_worker_or_authenticated_binding_cannot_reserve_
                     .len(),
                 1
             );
+        } else {
+            store.ack_ticket_assignment_delivery("w", &old.delivery_id, &source).unwrap();
         }
     }
 }
@@ -1111,9 +1107,11 @@ async fn assignment_content_edits_never_revive_done_closed_or_reissued_delegatio
         let source = tracking_store_source();
         let initial = delivery_store_reserve_initial(&store, &source);
         store.ack_ticket_assignment_delivery("w", &initial.delivery_id, &source).unwrap();
-        store.with_conn(|conn| {
-            conn.execute("UPDATE typed_tickets SET title='Input before authority change' WHERE ticket_id='tracking'", [])?;
-            Ok(())
+        use ticket::TicketBackend;
+        let backend = ticket::SqliteTicketBackend::open_verified(directory.path().join("workspace.db"), "w").unwrap();
+        backend.edit_item("tracking".into(), ticket::TicketItemEdit {
+            title: Some("Input before authority change".into()),
+            author: Some("fixture-editor".into()), ..Default::default()
         }).unwrap();
         let old = store.list_pending_ticket_assignment_deliveries("w", 100).unwrap().remove(0);
         match change {
@@ -1121,8 +1119,6 @@ async fn assignment_content_edits_never_revive_done_closed_or_reissued_delegatio
             "close-reopen" => { store.with_conn(|conn| { conn.execute_batch("UPDATE typed_tickets SET workflow_state='closed' WHERE ticket_id='tracking'; UPDATE typed_tickets SET workflow_state='open' WHERE ticket_id='tracking';")?; Ok(()) }).unwrap(); }
             _ => { tracking_store_assign(&store, "b", "assign-b"); }
         }
-        use ticket::TicketBackend;
-        let backend = ticket::SqliteTicketBackend::open_verified(directory.path().join("workspace.db"), "w").unwrap();
         backend.edit_item("tracking".into(), ticket::TicketItemEdit {
             body: Some(ticket::MarkdownText::new("New requirements")), author: Some("fixture-editor".into()), ..Default::default()
         }).unwrap();

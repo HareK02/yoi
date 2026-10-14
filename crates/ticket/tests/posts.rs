@@ -1,3 +1,9 @@
+//! Real SQLite component tests through TicketBackend, including durable edit facts.
+//! Host capture is represented only by test triggers; Workspace routing is not tested here.
+
+#[path = "posts/content_changes.rs"]
+mod content_changes;
+
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
 use ticket::{
@@ -264,7 +270,7 @@ fn schema12_migrates_body_authors_archived_history_and_stable_references_then_re
             |r| r.get::<_, i64>(0)
         )
         .unwrap(),
-        12
+        13
     );
     backend
         .add_event("known".into(), comment("Next", "author"))

@@ -61,7 +61,7 @@ fn ticket_posts_schema93_preserves_initial_body_creator_comments_and_archived_au
             .iter()
             .map(|step| step.version)
             .collect::<Vec<_>>(),
-        [94]
+        (94..=LATEST_SCHEMA_VERSION).collect::<Vec<_>>()
     );
     let conn = Connection::open(&path).unwrap();
     assert!(
@@ -76,14 +76,15 @@ fn ticket_posts_schema93_preserves_initial_body_creator_comments_and_archived_au
     assert_eq!(SqliteWorkspaceStore::migrate_database(&path).unwrap(), plan);
     let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     store.with_conn(|conn| {
-        assert_eq!(current_schema_version(conn)?, 94);
+        assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
         assert!(!column_exists(conn,"typed_tickets","body")?);
         assert_eq!(stored_fixture_rows(conn,"typed_ticket_events"),old_events);
         assert_eq!(stored_fixture_rows(conn,"typed_ticket_event_attributes"),old_attributes);
         assert_eq!(stored_fixture_rows(conn,"typed_ticket_event_references"),old_references);
         let markers = stored_fixture_rows(conn,"ticket_schema_migrations");
         assert_eq!(&markers[..old_markers.len()],old_markers.as_slice());
-        assert_eq!(markers.len(),old_markers.len()+1);
+        assert_eq!(markers.len(),old_markers.len()+2);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM typed_ticket_content_changes",[],|r|r.get::<_,i64>(0))?,0,"migration does not invent content change facts");
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM ticket_assignment_content_inputs",[],|r|r.get::<_,i64>(0))?,0,"migration does not turn historical edits into new inputs");
         let initial: (String,Option<String>,Option<String>,String,String) = conn.query_row("SELECT e.body,t.created_by,e.author,e.kind,e.event_ref FROM typed_tickets t JOIN typed_ticket_events e USING(workspace_id,ticket_id) WHERE t.ticket_id='authored' AND e.event_index=-1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
         assert_eq!(initial,("Current requirements after edits".into(),Some("creator".into()),Some("creator".into()),"comment".into(),"authored:-1".into()));
@@ -341,7 +342,7 @@ fn ticket_posts_oldest_supported_host50_preserves_content_through_full_chain() {
     let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     store
         .with_conn(|conn| {
-            assert_eq!(current_schema_version(conn)?, 94);
+            assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
             ticket::verify_sqlite_ticket_schema(conn).unwrap();
             assert_eq!(
                 conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r

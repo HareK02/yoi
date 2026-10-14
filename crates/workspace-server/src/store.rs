@@ -62,6 +62,12 @@ use crate::{Error, Result};
 
 #[path = "assignment_delivery.rs"]
 mod assignment_delivery;
+#[path = "notification_routing.rs"]
+mod notification_routing;
+pub use notification_routing::{
+    NotificationDeliveryKey, NotificationEventKind, NotificationFailureCode, NotificationPurpose,
+    NotificationReason, TicketWorkerNotification, TicketWorkerNotificationTarget,
+};
 #[path = "assignment_tracking.rs"]
 mod assignment_tracking;
 pub use assignment_delivery::TicketAssignmentDelivery;
@@ -73,7 +79,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 94;
+const LATEST_SCHEMA_VERSION: i64 = 95;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -350,6 +356,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 94,
         name: "Canonical Ticket posts",
         apply: migrate_ticket_posts_v93_to_v94,
+    },
+    Migration {
+        version: 95,
+        name: "Common notification routing and durable Worker delivery",
+        apply: migrate_notification_routing_v94_to_v95,
     },
 ];
 
@@ -1885,6 +1896,30 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         workspace_id: &str,
         delivery_id: &str,
         source: &TicketAssignmentTrackingSourceContext,
+    ) -> Result<()>;
+    fn list_pending_ticket_worker_notifications(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TicketWorkerNotification>>;
+    fn prepare_ticket_worker_notification_content(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        content: &str,
+        target: &TicketWorkerNotificationTarget,
+    ) -> Result<String>;
+    fn ack_ticket_worker_notification(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        target: &TicketWorkerNotificationTarget,
+    ) -> Result<()>;
+    fn record_notification_delivery_failure(
+        &self,
+        workspace_id: &str,
+        key: &NotificationDeliveryKey,
+        code: NotificationFailureCode,
     ) -> Result<()>;
     fn reserve_ticket_assignment_operation_for_orchestrator(
         &self,
@@ -8006,6 +8041,38 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             None,
         )
     }
+    fn list_pending_ticket_worker_notifications(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TicketWorkerNotification>> {
+        notification_routing::list_workers(self, workspace_id, limit)
+    }
+    fn prepare_ticket_worker_notification_content(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        content: &str,
+        target: &TicketWorkerNotificationTarget,
+    ) -> Result<String> {
+        notification_routing::prepare_worker(self, workspace_id, delivery_id, content, target)
+    }
+    fn ack_ticket_worker_notification(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        target: &TicketWorkerNotificationTarget,
+    ) -> Result<()> {
+        notification_routing::ack_worker(self, workspace_id, delivery_id, target)
+    }
+    fn record_notification_delivery_failure(
+        &self,
+        workspace_id: &str,
+        key: &NotificationDeliveryKey,
+        code: NotificationFailureCode,
+    ) -> Result<()> {
+        notification_routing::failure(self, workspace_id, key, code)
+    }
     fn reserve_ticket_assignment_operation_for_orchestrator(
         &self,
         workspace_id: &str,
@@ -8051,7 +8118,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 "Assignment delivery scan limit must be 1..=1000".into(),
             ));
         }
-        self.with_conn(|conn| assignment_delivery::list_in_tx(conn, workspace_id, limit))
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let result = assignment_delivery::list_in_tx(&tx, workspace_id, limit)?;
+            tx.commit()?;
+            Ok(result)
+        })
     }
     fn reserve_ticket_assignment_delivery(
         &self,
@@ -14023,10 +14095,39 @@ fn migrate_ticket_posts_v93_to_v94(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_notification_routing_v94_to_v95(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 94 {
+        return Err(Error::Store(
+            "Notification routing migration requires schema 94".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    ticket::migrate_sqlite_ticket_schema_in_transaction(&tx)
+        .map_err(|e| Error::Store(format!("Ticket content facts migration failed: {e}")))?;
+    notification_routing::install(&tx)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(95,?1)",
+        ["Common notification routing and durable Worker delivery"],
+    )?;
+    verify_workspace_resource_constraints(&tx)?;
+    let violations: i64 =
+        tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })?;
+    if violations != 0 {
+        return Err(Error::Store(
+            "Notification routing migration left foreign-key violations".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     create_workspace_schema_structure(conn)?;
     assignment_delivery::install(conn)?;
     assignment_delivery::install_post_inputs(conn)?;
+    notification_routing::install(conn)?;
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
         Error::Store(format!(
             "fresh Workspace Ticket schema verification failed: {error}"
@@ -14281,6 +14382,9 @@ fn verify_workspace_resource_constraints(conn: &Connection) -> Result<()> {
                 )));
             }
         }
+    }
+    if current_schema_version(conn)? >= 95 {
+        notification_routing::verify(conn)?;
     }
     Ok(())
 }
@@ -15036,6 +15140,7 @@ fn table_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>> {
 mod tests {
     include!("assignment_tracking_tests.rs");
     include!("assignment_delivery_tests.rs");
+    include!("notification_routing_tests.rs");
     include!("store_workspace_config_tests.rs");
 
     fn drive_grant_fixture(store: &SqliteWorkspaceStore) -> server_api::DriveGrantResponse {
@@ -17248,6 +17353,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:92, name:"Ticket-owned assignment tracking".into()},
                 WorkspaceSchemaMigrationStep {version:93, name:"Durable assignment deliveries and source-bound startup fences".into()},
                 WorkspaceSchemaMigrationStep {version:94, name:"Canonical Ticket posts".into()},
+                WorkspaceSchemaMigrationStep {version:95, name:"Common notification routing and durable Worker delivery".into()},
             ]
         );
 
@@ -17352,6 +17458,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (92, "Ticket-owned assignment tracking".to_string()),
 (93, "Durable assignment deliveries and source-bound startup fences".to_string()),
 (94, "Canonical Ticket posts".to_string()),
+(95, "Common notification routing and durable Worker delivery".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -19954,11 +20061,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .iter()
                 .map(|step| step.version)
                 .collect::<Vec<_>>(),
-            if version == 89 {
-                vec![90, 91, 92, 93, 94]
-            } else {
-                vec![91, 92, 93, 94]
-            }
+            ((version + 1)..=LATEST_SCHEMA_VERSION).collect::<Vec<_>>()
         );
         drop(conn);
         let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
@@ -19974,7 +20077,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (91, "Ticket open/closed cases and retained routing evidence".into()),
                          (92, "Ticket-owned assignment tracking".into()),
                          (93, "Durable assignment deliveries and source-bound startup fences".into()),
-                         (94, "Canonical Ticket posts".into())]);
+                         (94, "Canonical Ticket posts".into()),
+                         (95, "Common notification routing and durable Worker delivery".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }

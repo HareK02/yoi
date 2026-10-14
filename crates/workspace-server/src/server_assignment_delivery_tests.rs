@@ -1,5 +1,7 @@
 // Included as a child module of server::tests. These tests exercise committed
-// Assign + HTTP + embedded Runtime boundaries, not the old Queue predicate.
+// Ticket activity + SQLite routing + HTTP + embedded Runtime boundaries. Only
+// the model and explicit response-loss boundary are replaced in the real fixture.
+// Run with cargo test -p yoi-workspace-server --lib assignment_delivery.
 use super::*;
 use session_store::{LogEntry, Store, WorkerSessionStore};
 use worker_runtime::execution as delivery_execution;
@@ -198,7 +200,7 @@ fn delivery_commit_answer_without_scan(api: &WorkspaceApi, ticket: &str, text: &
         .unwrap();
 }
 
-fn delivery_external_comment(api: &WorkspaceApi, ticket: &str, text: &str) {
+fn delivery_comment_without_scan(api: &WorkspaceApi, ticket: &str, text: &str) {
     browser_ticket_backend(api)
         .unwrap()
         .add_event(
@@ -206,6 +208,10 @@ fn delivery_external_comment(api: &WorkspaceApi, ticket: &str, text: &str) {
             ticket::NewTicketEvent::new(ticket::TicketEventKind::Comment, text),
         )
         .unwrap();
+}
+
+fn delivery_external_comment(api: &WorkspaceApi, ticket: &str, text: &str) {
+    delivery_comment_without_scan(api, ticket, text);
     notify_ticket_recipients(api, TEST_WORKSPACE_ID, ticket, "open", "open", None);
 }
 
@@ -1134,4 +1140,628 @@ async fn assignment_worker_replacement_receives_pending_input_without_recreating
     delivery_scan(&api, &replacement);
     assert_eq!(execution.attempts.lock().unwrap().len(), 2);
     delivery_stop(&api, &replacement);
+}
+
+fn delivery_assign_worker(
+    api: &WorkspaceApi,
+    ticket: &str,
+    worker: &RuntimeWorkerRef,
+    assignment: &str,
+    previous: Option<&str>,
+) -> TicketWorkerAssignmentRecord {
+    let record = TicketWorkerAssignmentRecord {
+        workspace_id: TEST_WORKSPACE_ID.into(),
+        ticket_id: ticket.into(),
+        assignment_id: assignment.into(),
+        worker: worker.clone(),
+        assigned_by: "fixture-account".into(),
+        assigned_at: TEST_CREATED_AT.into(),
+    };
+    api.store
+        .set_current_ticket_worker_assignment(
+            &record,
+            previous,
+            &format!("{assignment}-event"),
+            &format!("{assignment}-operation"),
+            previous.is_some(),
+        )
+        .unwrap();
+    record
+}
+
+fn delivery_worker_pending(api: &WorkspaceApi) -> Vec<crate::store::TicketWorkerNotification> {
+    api.store
+        .list_pending_ticket_worker_notifications(TEST_WORKSPACE_ID, 20)
+        .unwrap()
+}
+
+async fn delivery_settle_real_worker_assignment(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+) -> usize {
+    let initial = delivery_worker_pending(api).len();
+    recover_ticket_notifications(api);
+    if initial > 0 {
+        delivery_wait_idle(api, worker, initial).await;
+    }
+    assert!(delivery_worker_pending(api).is_empty());
+    initial
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_notification_missing_callback_is_recovered_to_real_worker_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution, _) = delivery_real_fixture(dir.path(), false).await;
+    let worker = spawn_ticket_check_source(&api, "notification-recipient");
+    let ticket = delivery_ticket(&api, "Recover committed Worker activity");
+    let assignment = delivery_assign_worker(&api, &ticket.id, &worker, "worker-owner", None);
+    let initial = delivery_settle_real_worker_assignment(&api, &worker).await;
+    let before = execution.attempts.lock().unwrap().len();
+
+    // Commit the actual domain event but deliberately omit the mutation callback.
+    delivery_comment_without_scan(&api, &ticket.id, "A human supplied useful context");
+    assert_eq!(execution.attempts.lock().unwrap().len(), before);
+    let pending = delivery_worker_pending(&api);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].worker, worker);
+    recover_ticket_notifications(&api);
+    delivery_wait_idle(&api, &worker, initial + 1).await;
+    let attempts = execution.attempts.lock().unwrap().clone();
+    assert_eq!(attempts.len(), before + 1);
+    assert_eq!(attempts[before].0, pending[0].request_id);
+    assert!(
+        attempts[before]
+            .1
+            .contains(ticket.resource_key.as_deref().unwrap())
+    );
+    assert!(attempts[before].1.contains(&pending[0].input_event_id));
+    assert_eq!(delivery_receipts(&api, &worker).len(), initial + 1);
+    assert!(delivery_worker_pending(&api).is_empty());
+    for _ in 0..3 {
+        recover_ticket_notifications(&api);
+    }
+    assert_eq!(*execution.attempts.lock().unwrap(), attempts);
+    assert_eq!(
+        api.store
+            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket.id)
+            .unwrap(),
+        Some(assignment),
+        "attention acceptance must not replace assignment authority"
+    );
+    assert_eq!(
+        api.authority.ticket(&ticket.id).unwrap().state.as_str(),
+        "open"
+    );
+    delivery_stop(&api, &worker);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_notification_response_loss_retries_same_request_without_duplicate_acceptance() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution, _) = delivery_real_fixture(dir.path(), false).await;
+    let worker = spawn_ticket_check_source(&api, "lost-response-recipient");
+    let ticket = delivery_ticket(&api, "Worker response loss");
+    delivery_assign_worker(&api, &ticket.id, &worker, "worker-owner", None);
+    let initial = delivery_settle_real_worker_assignment(&api, &worker).await;
+    let before = execution.attempts.lock().unwrap().len();
+    execution
+        .lose_responses
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    delivery_comment_without_scan(&api, &ticket.id, "Preserve this notification identity");
+    let pending = delivery_worker_pending(&api);
+    assert_eq!(pending.len(), 1);
+    recover_ticket_notifications(&api);
+    delivery_wait_idle(&api, &worker, initial + 1).await;
+    let accepted = execution.attempts.lock().unwrap()[before].clone();
+    assert_eq!(accepted.0, pending[0].request_id);
+    let failure: String = api.config_store.with_conn(|conn| {
+        Ok(conn.query_row("SELECT code FROM notification_failures WHERE workspace_id=?1 AND delivery_id=?2 ORDER BY sequence DESC LIMIT 1", rusqlite::params![TEST_WORKSPACE_ID, pending[0].delivery_id], |row| row.get(0))?)
+    }).unwrap();
+    assert_eq!(
+        failure, "acceptance_unknown",
+        "response loss is not a confirmed rejection"
+    );
+    assert_eq!(delivery_receipts(&api, &worker).len(), initial + 1);
+    assert_eq!(
+        delivery_worker_pending(&api),
+        pending,
+        "unknown ACK was treated as success"
+    );
+
+    // Reopen the durable Store while keeping the same real Runtime/session. A
+    // later domain edit must not change the frozen text of the uncertain request.
+    browser_ticket_backend(&api)
+        .unwrap()
+        .edit_item(
+            ticket.id.clone().into(),
+            ticket::TicketItemEdit {
+                title: Some("Title changed after Worker acceptance".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut recovered = api.clone();
+    recovered.store =
+        Arc::new(SqliteWorkspaceStore::open_for_test(&api.config.database_path).unwrap());
+    execution
+        .lose_responses
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    recover_ticket_notifications(&recovered);
+    let attempts = execution.attempts.lock().unwrap().clone();
+    let retries = attempts
+        .iter()
+        .filter(|attempt| attempt.0 == accepted.0)
+        .collect::<Vec<_>>();
+    assert!(
+        retries.len() >= 2,
+        "uncertain Runtime acceptance was not retried"
+    );
+    assert!(
+        retries.iter().all(|attempt| **attempt == accepted),
+        "retry changed frozen ID/body"
+    );
+    let distinct = attempts
+        .iter()
+        .map(|attempt| &attempt.0)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    delivery_wait_idle(&recovered, &worker, distinct).await;
+    assert_eq!(delivery_receipts(&recovered, &worker).len(), distinct);
+    assert_eq!(
+        delivery_commits(&recovered, &worker)
+            .iter()
+            .filter(|body| **body == accepted.1)
+            .count(),
+        1
+    );
+    assert!(delivery_worker_pending(&recovered).is_empty());
+    recover_ticket_notifications(&recovered);
+    assert_eq!(*execution.attempts.lock().unwrap(), attempts);
+    delivery_stop(&recovered, &worker);
+}
+
+#[tokio::test]
+async fn worker_notification_stopped_recipient_does_not_block_other_recipient() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution, orchestrator, _) = delivery_recording_fixture(dir.path()).await;
+    let worker = spawn_ticket_check_source(&api, "stopped-notification-recipient");
+    let ticket = delivery_ticket(&api, "One input with independent recipients");
+    delivery_assign(&api, &ticket.id, "assign-orchestrator").await;
+    delivery_assign_worker(&api, &ticket.id, &worker, "worker-owner", None);
+    recover_ticket_notifications(&api);
+    assert!(delivery_worker_pending(&api).is_empty());
+    execution.take_inputs();
+    execution.take_input_request_ids();
+    delivery_stop(&api, &worker);
+    delivery_commit_answer_without_scan(
+        &api,
+        &ticket.id,
+        "Continue with this answer",
+        "answer-both",
+    );
+    let pending = delivery_worker_pending(&api);
+    assert_eq!(pending.len(), 1);
+    recover_ticket_notifications(&api);
+    let inputs = execution.take_inputs();
+    assert_eq!(
+        inputs.len(),
+        1,
+        "stopped Worker must not block Orchestrator delivery"
+    );
+    assert_eq!(inputs[0].0.worker_id.to_string(), orchestrator.worker_id);
+    assert!(
+        inputs[0]
+            .1
+            .contains(ticket.resource_key.as_deref().unwrap())
+    );
+    assert!(attention_pending(&api).is_empty());
+    assert_eq!(
+        delivery_worker_pending(&api),
+        pending,
+        "other recipient ACK consumed the failed delivery"
+    );
+    recover_ticket_notifications(&api);
+    assert!(
+        execution.take_inputs().is_empty(),
+        "successful recipient was sent again"
+    );
+    delivery_stop(&api, &orchestrator);
+}
+
+#[tokio::test]
+async fn worker_notification_reassignment_never_forwards_old_pending_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution, orchestrator, _) = delivery_recording_fixture(dir.path()).await;
+    let old_worker = spawn_ticket_check_source(&api, "old-notification-recipient");
+    let replacement = spawn_ticket_check_source(&api, "new-notification-recipient");
+    let ticket = delivery_ticket(&api, "Do not forward old authority");
+    delivery_assign_worker(&api, &ticket.id, &old_worker, "old-owner", None);
+    recover_ticket_notifications(&api);
+    execution.take_inputs();
+    execution.take_input_request_ids();
+    delivery_comment_without_scan(&api, &ticket.id, "Activity belonging to the old owner");
+    let pending = delivery_worker_pending(&api);
+    assert_eq!(pending.len(), 1);
+    execution.reject_inputs("response outcome unknown");
+    recover_ticket_notifications(&api);
+    let failed = execution.take_inputs();
+    assert!(!failed.is_empty());
+    assert!(
+        failed
+            .iter()
+            .all(|input| input.0.worker_id.to_string() == old_worker.worker_id)
+    );
+    assert!(
+        execution
+            .take_input_request_ids()
+            .iter()
+            .all(|id| id.as_deref() == Some(pending[0].request_id.as_str()))
+    );
+
+    let current = delivery_assign_worker(
+        &api,
+        &ticket.id,
+        &replacement,
+        "new-owner",
+        Some("old-owner"),
+    );
+    *execution.input_failure.lock().unwrap() = None;
+    delivery_comment_without_scan(&api, &ticket.id, "Activity belonging to the new owner");
+    recover_ticket_notifications(&api);
+    let inputs = execution.take_inputs();
+    assert!(!inputs.is_empty(), "new owner's current activity was lost");
+    assert!(
+        inputs
+            .iter()
+            .all(|input| input.0.worker_id.to_string() == replacement.worker_id)
+    );
+    assert!(
+        inputs
+            .iter()
+            .all(|input| !input.1.contains(&pending[0].input_event_id)),
+        "old activity was forwarded to the replacement"
+    );
+    assert!(
+        execution
+            .take_input_request_ids()
+            .iter()
+            .all(|id| id.as_deref() != Some(pending[0].request_id.as_str()))
+    );
+    assert!(delivery_worker_pending(&api).is_empty());
+    assert_eq!(
+        api.store
+            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket.id)
+            .unwrap(),
+        Some(current)
+    );
+    recover_ticket_notifications(&api);
+    assert!(execution.take_inputs().is_empty());
+    delivery_stop(&api, &old_worker);
+    delivery_stop(&api, &replacement);
+    delivery_stop(&api, &orchestrator);
+}
+
+async fn delivery_drain_host_with_paused_time(api: &WorkspaceApi) {
+    let executor = api.host_executors.host().unwrap();
+    let drain = executor.drain();
+    tokio::pin!(drain);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let std::task::Poll::Ready(result) = futures::poll!(drain.as_mut()) {
+            result.unwrap();
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "notification host round did not finish"
+        );
+        // Keep a runnable future while the real host executor finishes: Tokio
+        // must not auto-advance the paused retry clock to infer completion.
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn worker_notification_periodic_recovery_runs_without_runtime_subscription() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut api, execution, orchestrator, _) = delivery_recording_fixture(dir.path()).await;
+    let worker = spawn_ticket_check_source(&api, "periodic-notification-recipient");
+    let ticket = delivery_ticket(&api, "Recover without subscription or callback");
+    delivery_assign_worker(&api, &ticket.id, &worker, "worker-owner", None);
+    recover_ticket_notifications(&api);
+    execution.take_inputs();
+    execution.take_input_request_ids();
+    api.runtime_subscription_broker = RuntimeSubscriptionBroker::new(TEST_WORKSPACE_ID);
+    assert!(
+        api.runtime_subscription_broker
+            .subscribe(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                protocol::subscription::EventSubscriptionSelector::RuntimeWorkers,
+            )
+            .is_err()
+    );
+
+    // Poll the production hook itself, not a timer or recovery stand-in. Keeping
+    // its future local also guarantees cancellation on assertion failure.
+    delivery_comment_without_scan(&api, &ticket.id, "Missed startup callback");
+    let hook = run_orchestrator_turn_end_hook(api.clone());
+    tokio::pin!(hook);
+    assert!(futures::poll!(hook.as_mut()).is_pending());
+    delivery_drain_host_with_paused_time(&api).await;
+    assert_eq!(
+        execution.take_inputs().len(),
+        1,
+        "startup round did not recover"
+    );
+    assert!(delivery_worker_pending(&api).is_empty());
+    assert!(futures::poll!(hook.as_mut()).is_pending());
+
+    delivery_comment_without_scan(&api, &ticket.id, "Missed callback after startup");
+    tokio::time::advance(std::time::Duration::from_secs(29)).await;
+    assert!(futures::poll!(hook.as_mut()).is_pending());
+    delivery_drain_host_with_paused_time(&api).await;
+    assert!(
+        execution.take_inputs().is_empty(),
+        "recovery retried before the bounded interval"
+    );
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    assert!(futures::poll!(hook.as_mut()).is_pending());
+    delivery_drain_host_with_paused_time(&api).await;
+    let inputs = execution.take_inputs();
+    assert_eq!(
+        inputs.len(),
+        1,
+        "periodic recovery required a subscription or mutation callback"
+    );
+    assert_eq!(inputs[0].0.worker_id.to_string(), worker.worker_id);
+    assert!(delivery_worker_pending(&api).is_empty());
+    assert!(api.runtime_subscription_broker.runtime_ids().is_empty());
+    delivery_stop(&api, &worker);
+    delivery_stop(&api, &orchestrator);
+}
+
+async fn delivery_signed_item_edit(
+    api: &WorkspaceApi,
+    identity: &RuntimeIdentityMaterial,
+    worker: &RuntimeWorkerRef,
+    ticket: &str,
+    edit: Value,
+) -> ticket::Ticket {
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/item");
+    let response = build_router(api.clone())
+        .oneshot(runtime_source_request(
+            identity,
+            Some(&worker.worker_id),
+            "PATCH",
+            &path,
+            serde_json::to_vec(&edit).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let edited: ticket::Ticket = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        edited,
+        browser_ticket_backend(api)
+            .unwrap()
+            .show(ticket.to_owned().into())
+            .unwrap()
+    );
+    edited
+}
+
+#[tokio::test]
+async fn notification_item_edit_worker_title_only_self_edit_does_not_notify_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution, orchestrator, identity) = delivery_recording_fixture(dir.path()).await;
+    let worker = spawn_ticket_check_source(&api, "self-title-editor");
+    seed_worker_source_member(&api, &worker.runtime_id, &worker.worker_id);
+    let ticket = delivery_ticket(&api, "Worker will clarify its own title");
+    delivery_assign_worker(&api, &ticket.id, &worker, "self-title-owner", None);
+    recover_ticket_notifications(&api);
+    execution.take_inputs();
+    execution.take_input_request_ids();
+    let before = browser_ticket_backend(&api)
+        .unwrap()
+        .show(ticket.id.clone().into())
+        .unwrap();
+
+    let edited = delivery_signed_item_edit(
+        &api,
+        &identity,
+        &worker,
+        &ticket.id,
+        json!({"title":"Clarified by the assigned Worker"}),
+    )
+    .await;
+    assert_eq!(edited.meta.title, "Clarified by the assigned Worker");
+    assert_eq!(edited.document.body, before.document.body);
+    assert_eq!(edited.meta.targets, before.meta.targets);
+    for _ in 0..3 {
+        recover_ticket_notifications(&api);
+    }
+    let inputs = execution.take_inputs();
+    delivery_stop(&api, &worker);
+    delivery_stop(&api, &orchestrator);
+    assert!(
+        inputs
+            .iter()
+            .all(|(recipient, _)| recipient.worker_id.to_string() != worker.worker_id),
+        "authenticated title-only self-edit became fresh Worker input"
+    );
+    assert!(delivery_worker_pending(&api).is_empty());
+}
+
+#[tokio::test]
+async fn notification_item_edit_orchestrator_initial_body_self_edit_does_not_reenter_delegation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution, orchestrator, identity) = delivery_recording_fixture(dir.path()).await;
+    let ticket = delivery_ticket(&api, "Orchestrator clarifies the initial post");
+    let assigned = delivery_assign(&api, &ticket.id, "assign-self-body").await;
+    let assignment = assigned["assignment"]["assignment_id"].as_str().unwrap();
+    let initial = delivery_tracking(&api, &ticket.id, assignment);
+    execution.take_inputs();
+    execution.take_input_request_ids();
+    let before = browser_ticket_backend(&api)
+        .unwrap()
+        .show(ticket.id.clone().into())
+        .unwrap();
+
+    let edited = delivery_signed_item_edit(
+        &api,
+        &identity,
+        &orchestrator,
+        &ticket.id,
+        json!({"body":"Clarified requirements written by the current Orchestrator"}),
+    )
+    .await;
+    assert_eq!(
+        edited.document.body.as_str(),
+        "Clarified requirements written by the current Orchestrator"
+    );
+    assert_eq!(edited.meta.title, before.meta.title);
+    assert_eq!(
+        edited.events[0].edited_by.as_deref(),
+        Some(
+            format!(
+                "worker:{}/{}",
+                orchestrator.runtime_id, orchestrator.worker_id
+            )
+            .as_str()
+        )
+    );
+    for _ in 0..3 {
+        recover_ticket_notifications(&api);
+    }
+    let inputs = execution.take_inputs();
+    assert_eq!(delivery_tracking(&api, &ticket.id, assignment), initial);
+    delivery_stop(&api, &orchestrator);
+    assert!(
+        inputs
+            .iter()
+            .all(|(recipient, _)| recipient.worker_id.to_string() != orchestrator.worker_id),
+        "workspace_agent principal did not recognize its authenticated Orchestrator self-edit"
+    );
+    assert!(attention_pending(&api).is_empty());
+}
+
+#[tokio::test]
+async fn notification_item_edit_external_targets_only_change_notifies_existing_recipients_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution, orchestrator, _) = delivery_recording_fixture(dir.path()).await;
+    let worker = spawn_ticket_check_source(&api, "target-change-recipient");
+    let ticket = delivery_ticket(&api, "External target change must not disappear");
+    delivery_assign(&api, &ticket.id, "assign-targets").await;
+    delivery_assign_worker(&api, &ticket.id, &worker, "targets-owner", None);
+    recover_ticket_notifications(&api);
+    execution.take_inputs();
+    execution.take_input_request_ids();
+    let before = browser_ticket_backend(&api)
+        .unwrap()
+        .show(ticket.id.clone().into())
+        .unwrap();
+    let targets = vec![test_ticket_target(
+        "test-repository",
+        "develop",
+        TicketTargetAccess::ReadWrite,
+    )];
+    let result = delivery_http(
+        &api,
+        "PATCH",
+        &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{}/item", ticket.id),
+        Some(json!({"targets":{"action":"set","targets":targets}})),
+        StatusCode::OK,
+    )
+    .await;
+    let edited: ticket::Ticket = serde_json::from_value(result).unwrap();
+    assert_eq!(
+        edited,
+        browser_ticket_backend(&api)
+            .unwrap()
+            .show(ticket.id.clone().into())
+            .unwrap()
+    );
+    assert_eq!(edited.meta.targets, targets);
+    assert_eq!(edited.meta.title, before.meta.title);
+    assert_eq!(edited.document.body, before.document.body);
+    recover_ticket_notifications(&api);
+    let inputs = execution.take_inputs();
+    let ids = execution.take_input_request_ids();
+    recover_ticket_notifications(&api);
+    let repeats = execution.take_inputs();
+    delivery_stop(&api, &worker);
+    delivery_stop(&api, &orchestrator);
+    for recipient in [&orchestrator, &worker] {
+        assert_eq!(
+            inputs
+                .iter()
+                .filter(|(target, _)| target.worker_id.to_string() == recipient.worker_id)
+                .count(),
+            1,
+            "targets-only external edit did not reach {} exactly once: {inputs:?}",
+            recipient.worker_id
+        );
+    }
+    assert_eq!(ids.len(), 2);
+    assert!(ids.iter().all(Option::is_some));
+    assert_ne!(ids[0], ids[1]);
+    assert!(repeats.is_empty(), "targets edit was delivered repeatedly");
+    assert!(delivery_worker_pending(&api).is_empty());
+    assert!(attention_pending(&api).is_empty());
+}
+
+#[tokio::test]
+async fn catalog_shutdown_stops_notification_hook_and_fences_later_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution, orchestrator, _) = delivery_recording_fixture(dir.path()).await;
+    let ticket = delivery_ticket(&api, "Pending at server shutdown");
+    delivery_assign(&api, &ticket.id, "shutdown-assignment").await;
+    execution.take_inputs();
+    delivery_commit_answer_without_scan(
+        &api,
+        &ticket.id,
+        "Retain for the next server",
+        "shutdown-answer",
+    );
+    let catalog = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
+    catalog
+        .apis
+        .lock()
+        .await
+        .insert(TEST_WORKSPACE_ID.into(), api.clone());
+    let hook = tokio::spawn(run_orchestrator_turn_end_hook(api.clone()));
+    catalog
+        .hook_handles
+        .lock()
+        .await
+        .insert(TEST_WORKSPACE_ID.into(), hook.abort_handle());
+    catalog.shutdown_feature_storage().await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), hook)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled()
+    );
+    assert!(catalog.hook_handles.lock().await.is_empty());
+    execution.take_inputs();
+    recover_ticket_notifications(&api);
+    dispatch_orchestrator_assignment_attention(&api, &orchestrator);
+    assert!(
+        execution.take_inputs().is_empty(),
+        "stopped server dispatched a saved notification"
+    );
+    assert_eq!(
+        attention_pending(&api).len(),
+        1,
+        "shutdown discarded durable work"
+    );
+    delivery_stop(&api, &orchestrator);
 }

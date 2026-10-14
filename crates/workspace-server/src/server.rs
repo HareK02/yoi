@@ -1568,6 +1568,13 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
     }
 }
 
+#[path = "notification_delivery.rs"]
+mod notification_delivery;
+use crate::store::NotificationFailureCode;
+use notification_delivery::{
+    assignment_delivery_key, record_notification_failure, recover_ticket_notifications,
+};
+
 // Per-recipient reservation. No lock is held across Runtime calls: subscription
 // callbacks may reenter the attention path while send_input runs.
 #[derive(Default)]
@@ -1641,6 +1648,7 @@ pub struct WorkspaceApi {
     orchestrator_spawn_lock: Arc<std::sync::Mutex<()>>,
     orchestrator_attention:
         Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<Mutex<OrchestratorAttentionState>>>>>,
+    notification_delivery_lifecycle: Arc<notification_delivery::NotificationDeliveryLifecycle>,
     backend_job_drain_requests: Arc<AtomicU64>,
     observation_proxy: BackendObservationProxy,
     runtime_subscription_broker: RuntimeSubscriptionBroker,
@@ -2682,6 +2690,9 @@ impl WorkspaceServerApi {
     }
 
     async fn shutdown_feature_storage(&self) -> Result<()> {
+        for (_, hook) in self.hook_handles.lock().await.drain() {
+            hook.abort();
+        }
         let apis = self.apis.lock().await.values().cloned().collect::<Vec<_>>();
         for api in apis {
             shutdown_workspace_feature_storage(&api).await?;
@@ -3878,6 +3889,7 @@ impl WorkspaceApi {
             runtime_binding_expectations: Arc::new(RwLock::new(HashMap::new())),
             companion,
             orchestrator_spawn_lock: Arc::new(std::sync::Mutex::new(())),
+            notification_delivery_lifecycle: Arc::new(Default::default()),
             orchestrator_attention: Arc::new(Mutex::new(HashMap::new())),
             backend_job_drain_requests: Arc::new(AtomicU64::new(0)),
             observation_proxy,
@@ -11190,9 +11202,7 @@ impl server_api::ServerApi for ServerApiContractService {
                     .map_err(ApiError::into_repository_api_error)?;
                 // The entire event/audit/receipt transaction has committed. Response loss
                 // retries the saved receipt; delivery scan deduplicates accepted inputs.
-                if let Some(orchestrator) = find_workspace_orchestrator(&api) {
-                    dispatch_orchestrator_assignment_attention(&api, &orchestrator.worker);
-                }
+                recover_ticket_notifications(&api);
                 Ok(server_api::TicketAssignmentAnswerResponse(receipt))
             })
             .await
@@ -12640,6 +12650,9 @@ pub async fn serve(
 // Feature shutdown fences new operations and waits for synchronous connection
 // holders. Accepted close retains ownership after its async waiter disappears.
 async fn shutdown_workspace_feature_storage(api: &WorkspaceApi) -> Result<()> {
+    // Aborting the async hook cannot cancel an already admitted Host closure.
+    // Fence all delivery entry points and wait for their actual I/O owners first.
+    api.notification_delivery_lifecycle.stop_and_drain().await;
     api.worker_projection.shutdown_async().await;
     let storage = api.feature_storage.clone();
     api.store
@@ -16186,8 +16199,9 @@ fn execute_ticket_rest_operation_on_host(
             None,
         ),
     };
-    // Classification has no routing or execution side effects.
-    if is_mutation && !matches!(operation_kind, "mutate_workspace_tag" | "set_ticket_tags") {
+    // All committed facts enter the same routing policy, including reasons for
+    // non-notification. Waking the dispatcher is not itself a request to a Worker.
+    if is_mutation {
         if let TicketBackendOperationResult::QueueOutcome(outcome) = &result {
             for ticket_id in &outcome.queued_tickets {
                 notify_ticket_recipients(
@@ -18349,6 +18363,7 @@ async fn apply_ticket_case_update(
     let ticket = backend
         .update_case(&ticket_id, request)
         .map_err(Error::from)?;
+    recover_ticket_notifications(&api);
     Ok(Json(ticket))
 
     }).await
@@ -18721,6 +18736,7 @@ fn canonical_ticket_resource_key(resource_key: &str) -> Option<&str> {
         .then_some(resource_key)
 }
 
+#[cfg(test)]
 fn ticket_notification_content(
     resource_key: &str,
     previous_state: &str,
@@ -18777,6 +18793,9 @@ fn ticket_notification_delivery_error_category(
     result: &std::result::Result<WorkerInputResult, RuntimeRegistryError>,
 ) -> Option<&'static str> {
     match result {
+        Ok(result) if result.disposition == WorkerInputDisposition::Unknown => {
+            Some("acceptance_unknown")
+        }
         Ok(result) => match result.state {
             InternalWorkerOperationState::Accepted => None,
             InternalWorkerOperationState::Rejected => Some("runtime_rejected"),
@@ -18809,61 +18828,15 @@ fn emit_ticket_notification_delivery_warning(warning: TicketNotificationDelivery
 
 fn notify_ticket_recipients(
     api: &WorkspaceApi,
-    workspace_id: &str,
-    ticket_id: &str,
-    previous_state: &str,
-    current_state: &str,
-    source: Option<RuntimeWorkerRef>,
+    _workspace_id: &str,
+    _ticket_id: &str,
+    _previous_state: &str,
+    _current_state: &str,
+    _source: Option<RuntimeWorkerRef>,
 ) {
-    let Ok(Some(resource_key)) =
-        api.store
-            .resource_key(workspace_id, WorkspaceResourceKind::Ticket, ticket_id)
-    else {
-        return;
-    };
-    let Some(resource_key) = canonical_ticket_resource_key(&resource_key) else {
-        return;
-    };
-
-    let mut recipients = Vec::new();
-    if let Some(assignment) = api
-        .store
-        .get_active_ticket_worker_assignment(workspace_id, ticket_id)
-        .ok()
-        .flatten()
-    {
-        recipients.push(assignment.worker.clone());
-    }
-    if let Some(orchestrator) = find_workspace_orchestrator(api) {
-        dispatch_orchestrator_assignment_attention(api, &orchestrator.worker);
-    }
-    recipients.sort();
-    recipients.dedup();
-
-    let content = ticket_notification_content(resource_key, previous_state, current_state);
-    for recipient in recipients {
-        if source.as_ref().is_some_and(|source| source == &recipient) {
-            continue;
-        }
-        let result = api.runtime.send_input(
-            &recipient,
-            WorkerInputRequest {
-                kind: WorkerInputKind::Notify,
-                content: content.clone(),
-                submission_request_id: None,
-                segments: None,
-            },
-        );
-        if let Some(error_category) = ticket_notification_delivery_error_category(&result) {
-            emit_ticket_notification_delivery_warning(TicketNotificationDeliveryWarning::new(
-                workspace_id,
-                ticket_id,
-                current_state,
-                &recipient,
-                error_category,
-            ));
-        }
-    }
+    // Source identity and recipients were captured by the domain transaction.
+    // Call-site state strings and current Worker observations are not routing authority.
+    recover_ticket_notifications(api);
 }
 
 fn authenticate_worker_mutation_source(
@@ -20362,36 +20335,61 @@ async fn execute_workdir_session_operation(
 }
 
 async fn run_orchestrator_turn_end_hook(api: WorkspaceApi) {
-    let Ok(mut subscription) = api.runtime_subscription_broker.subscribe(
-        EMBEDDED_WORKER_RUNTIME_ID,
-        protocol::subscription::EventSubscriptionSelector::RuntimeWorkers,
-    ) else {
-        return;
-    };
+    // Fixed, bounded recovery independent of unrelated Ticket updates. A missed
+    // tick is skipped rather than accumulated; rounds do not overlap on this owner.
+    let mut recovery = tokio::time::interval(std::time::Duration::from_secs(30));
+    recovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut subscription: Option<crate::runtime_subscription::BrokerSubscription> = None;
     let mut worker_states = HashMap::new();
-    while let Some(update) = subscription.recv().await {
-        let stage_api = api.clone();
-        let result = api.host_executors.host().map(|executor| async move {
-            executor
-                .run(move || -> Result<_> {
-                    let keep_running =
-                        observe_orchestrator_turn_end(&stage_api, &mut worker_states, update);
-                    Ok((keep_running, worker_states))
-                })
-                .await
-        });
-        match result {
-            Ok(operation) => match operation.await {
-                Ok((true, states)) => worker_states = states,
-                Ok((false, _)) => return,
-                Err(error) => {
-                    tracing::warn!(%error, "Orchestrator hook stopped; durable inputs remain recoverable");
-                    return;
+    loop {
+        let update = tokio::select! {
+            _ = recovery.tick() => {
+                if subscription.is_none() {
+                    subscription = api.runtime_subscription_broker.subscribe(
+                        EMBEDDED_WORKER_RUNTIME_ID,
+                        protocol::subscription::EventSubscriptionSelector::RuntimeWorkers,
+                    ).ok();
                 }
-            },
+                None
+            }
+            update = async {
+                match subscription.as_mut() {
+                    Some(subscription) => subscription.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if update.is_none() { subscription = None; }
+                update
+            }
+        };
+        let stage_api = api.clone();
+        let states = std::mem::take(&mut worker_states);
+        let result = match api.host_executors.host() {
+            Ok(executor) => {
+                executor
+                    .run(move || -> Result<_> {
+                        let mut states = states;
+                        let keep_subscription = if let Some(update) = update {
+                            observe_orchestrator_turn_end(&stage_api, &mut states, update)
+                        } else {
+                            recover_ticket_notifications(&stage_api);
+                            true
+                        };
+                        Ok((keep_subscription, states))
+                    })
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok((keep_subscription, states)) => {
+                worker_states = states;
+                if !keep_subscription {
+                    subscription = None;
+                }
+            }
             Err(error) => {
-                tracing::warn!(%error, "Orchestrator hook executor unavailable");
-                return;
+                tracing::warn!(%error, "notification recovery round failed; retry on the next bounded tick");
             }
         }
     }
@@ -20479,9 +20477,7 @@ fn enqueue_orchestrator_assignment_attention(
     let (done, completion) = tokio::sync::oneshot::channel();
     match api.host_executors.host().and_then(|executor| {
         executor.dispatch(move || {
-            if let Some(orchestrator) = find_workspace_orchestrator(&api) {
-                dispatch_orchestrator_assignment_attention(&api, &orchestrator.worker);
-            }
+            recover_ticket_notifications(&api);
             let _ = done.send(());
         })
     }) {
@@ -20512,6 +20508,9 @@ fn with_orchestrator_attention_reservation(
         Option<OrchestratorAttentionDelivery>,
     ),
 ) {
+    let Some(_permit) = api.notification_delivery_lifecycle.begin() else {
+        return;
+    };
     let state = orchestrator_attention_state(api, worker);
     loop {
         let pending = {
@@ -20566,76 +20565,113 @@ fn check_orchestrator_assignment_attention(
     state: &Arc<Mutex<OrchestratorAttentionState>>,
     pending: Option<OrchestratorAttentionDelivery>,
 ) {
-    let Ok(target) = orchestrator_delivery_target(api, worker) else {
-        return;
-    };
-    if let Some(delivery) = pending {
-        // Validate current identity before retrying an immutable request. Clear,
-        // reissue, close and Worker replacement cannot revive an old delivery.
-        if api
-            .store
-            .reserve_ticket_assignment_delivery(
-                &api.config.workspace_id,
-                &delivery.input.assignment_id,
-                &delivery.input.input_event_id,
-                &target,
-            )
-            .is_ok()
-        {
-            send_orchestrator_attention(api, worker, state, delivery);
-            if state
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .pending
-                .is_some()
-            {
-                return; // Unknown/failed acceptance needs an explicit later trigger.
-            }
-        } else {
-            state.lock().unwrap_or_else(|p| p.into_inner()).pending = None;
-        }
-        // Discarding or acknowledging an old retry must not consume this new-
-        // input trigger. Continue the common scan in the same reservation.
-    }
-    let Ok(inputs) = api
+    let inputs = match api
         .store
         .list_pending_ticket_assignment_deliveries(&api.config.workspace_id, 20)
-    else {
-        return;
+    {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            tracing::warn!(%error, "assignment notification scan failed");
+            return;
+        }
     };
-    let Ok(Some(config_state)) = api
-        .config_store
-        .load_workspace_config(&api.config.workspace_id)
-    else {
-        return;
+    let target = match orchestrator_delivery_target(api, worker) {
+        Ok(target) => target,
+        Err(_) => {
+            for input in inputs {
+                record_notification_failure(
+                    api,
+                    &assignment_delivery_key(&input),
+                    notification_delivery::orchestrator_target_failure(api, worker),
+                );
+            }
+            return;
+        }
     };
-    let Ok(projection) = api
-        .prompt_projection_cache
-        .resolve(&api.config.workspace_id, &config_state)
-    else {
-        return;
-    };
-    let Ok(catalog) = worker::PromptCatalog::from_projection(projection.catalog().clone()) else {
-        return;
-    };
+    let retried_id = pending
+        .as_ref()
+        .map(|delivery| delivery.input.delivery_id.clone());
+    if let Some(delivery) = pending {
+        // The saved bytes are useful on retry, but process memory is never backlog authority.
+        send_orchestrator_attention(api, worker, state, delivery);
+    }
     for input in inputs {
-        // Reserve from the same pending-input contract, rechecking current
-        // assignment and target binding under the write lock before any I/O.
-        let Ok(input) = api.store.reserve_ticket_assignment_delivery(
+        if api.notification_delivery_lifecycle.stopped() {
+            break;
+        }
+        if retried_id.as_deref() == Some(&input.delivery_id) {
+            continue;
+        }
+        let key = assignment_delivery_key(&input);
+        let input = match api.store.reserve_ticket_assignment_delivery(
             &api.config.workspace_id,
             &input.assignment_id,
             &input.input_event_id,
             &target,
-        ) else {
-            continue;
+        ) {
+            Ok(input) => input,
+            Err(error) => {
+                record_notification_failure(
+                    api,
+                    &key,
+                    match error {
+                        Error::TicketAssignmentConflict(_) => {
+                            NotificationFailureCode::AssignmentChanged
+                        }
+                        _ => NotificationFailureCode::PreparationFailed,
+                    },
+                );
+                continue;
+            }
         };
-        let Ok(ticket) = api.authority.ticket(&input.ticket_id) else {
-            continue;
+        let config_state = match api
+            .config_store
+            .load_workspace_config(&api.config.workspace_id)
+        {
+            Ok(Some(config)) => config,
+            _ => {
+                record_notification_failure(
+                    api,
+                    &key,
+                    NotificationFailureCode::ConfigurationUnavailable,
+                );
+                continue;
+            }
         };
-        let Ok(projected) =
-            worker::OrchestratorQueueAttentionTicket::new(ticket.resource_key, ticket.title)
-        else {
-            continue;
+        let catalog = api
+            .prompt_projection_cache
+            .resolve(&api.config.workspace_id, &config_state)
+            .and_then(|projection| {
+                worker::PromptCatalog::from_projection(projection.catalog().clone())
+                    .map_err(|error| Error::Config(error.to_string()))
+            });
+        let catalog = match catalog {
+            Ok(catalog) => catalog,
+            Err(_) => {
+                record_notification_failure(
+                    api,
+                    &key,
+                    NotificationFailureCode::ConfigurationUnavailable,
+                );
+                continue;
+            }
+        };
+        let ticket = match api.authority.ticket(&input.ticket_id) {
+            Ok(ticket) => ticket,
+            Err(_) => {
+                record_notification_failure(api, &key, NotificationFailureCode::SourceLookupFailed);
+                continue;
+            }
+        };
+        let projected = match worker::OrchestratorQueueAttentionTicket::new(
+            ticket.resource_key,
+            ticket.title,
+        ) {
+            Ok(ticket) => ticket,
+            Err(_) => {
+                record_notification_failure(api, &key, NotificationFailureCode::SourceLookupFailed);
+                continue;
+            }
         };
         let context =
             worker::OrchestratorQueueAttentionContext::new(vec![projected.with_assignment_input(
@@ -20644,22 +20680,27 @@ fn check_orchestrator_assignment_attention(
                 input.waiting_reason.as_deref(),
                 input.next_action.as_deref(),
             )]);
-        let Ok(content) = catalog.orchestrator_queue_attention(
+        let content = match catalog.orchestrator_queue_attention(
             worker::OrchestratorQueueAttentionPrompt::Server,
             &context,
-        ) else {
-            continue;
+        ) {
+            Ok(content) => content,
+            Err(_) => {
+                record_notification_failure(api, &key, NotificationFailureCode::RenderingFailed);
+                continue;
+            }
         };
-        // The complete rendered request, including title/catalog projection, is
-        // pinned before dispatch; restart retries never render a new payload
-        // under an already accepted Runtime request id.
-        let Ok(content) = api.store.prepare_ticket_assignment_delivery_content(
+        let content = match api.store.prepare_ticket_assignment_delivery_content(
             &api.config.workspace_id,
             &input.delivery_id,
             &content,
             &target,
-        ) else {
-            continue;
+        ) {
+            Ok(content) => content,
+            Err(_) => {
+                record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
+                continue;
+            }
         };
         let delivery = OrchestratorAttentionDelivery {
             fingerprint: input.delivery_id.clone(),
@@ -20669,14 +20710,8 @@ fn check_orchestrator_assignment_attention(
         };
         state.lock().unwrap_or_else(|p| p.into_inner()).pending = Some(delivery.clone());
         send_orchestrator_attention(api, worker, state, delivery);
-        if state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .pending
-            .is_some()
-        {
-            break;
-        }
+        // Continue other recipients/inputs even after a failure. Unacknowledged
+        // requests remain in SQLite, including those not kept in this small cache.
     }
 }
 
@@ -20687,20 +20722,38 @@ fn send_orchestrator_attention(
     delivery: OrchestratorAttentionDelivery,
 ) {
     tracing::debug!(delivery_id = %delivery.fingerprint, assignment_id = %delivery.input.assignment_id, "dispatch committed assignment input");
+    let key = assignment_delivery_key(&delivery.input);
     for _ in 0..2 {
-        let Ok(target) = orchestrator_delivery_target(api, worker) else {
+        if api.notification_delivery_lifecycle.stopped() {
             return;
+        }
+        let target = match orchestrator_delivery_target(api, worker) {
+            Ok(target) => target,
+            Err(_) => {
+                record_notification_failure(
+                    api,
+                    &key,
+                    notification_delivery::orchestrator_target_failure(api, worker),
+                );
+                return;
+            }
         };
-        if api
-            .store
-            .reserve_ticket_assignment_delivery(
-                &api.config.workspace_id,
-                &delivery.input.assignment_id,
-                &delivery.input.input_event_id,
-                &target,
-            )
-            .is_err()
-        {
+        if let Err(error) = api.store.reserve_ticket_assignment_delivery(
+            &api.config.workspace_id,
+            &delivery.input.assignment_id,
+            &delivery.input.input_event_id,
+            &target,
+        ) {
+            record_notification_failure(
+                api,
+                &key,
+                match error {
+                    Error::TicketAssignmentConflict(_) => {
+                        NotificationFailureCode::AssignmentChanged
+                    }
+                    _ => NotificationFailureCode::PreparationFailed,
+                },
+            );
             state.lock().unwrap_or_else(|p| p.into_inner()).pending = None;
             return;
         }
@@ -20713,10 +20766,7 @@ fn send_orchestrator_attention(
                 segments: None,
             },
         );
-        if result
-            .as_ref()
-            .is_ok_and(|result| result.state == InternalWorkerOperationState::Accepted)
-        {
+        if notification_delivery::notification_failure(&result).is_none() {
             if api
                 .store
                 .ack_ticket_assignment_delivery(
@@ -20729,9 +20779,18 @@ fn send_orchestrator_attention(
                 let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
                 state.accepted = Some(delivery);
                 state.pending = None;
+            } else {
+                record_notification_failure(
+                    api,
+                    &key,
+                    NotificationFailureCode::AcknowledgementFailed,
+                );
             }
             return;
         }
+        let failure = notification_delivery::notification_failure(&result)
+            .expect("non-accepted delivery has a classified failure");
+        record_notification_failure(api, &key, failure);
         if let Some(error_category) = ticket_notification_delivery_error_category(&result) {
             tracing::warn!(
                 event = "ticket_assignment_delivery_pending",
@@ -51427,14 +51486,35 @@ mod tests {
                 .unwrap();
         }
 
+        let initial_notifications = execution.take_inputs();
         assert_eq!(
-            execution.take_inputs().len(),
+            initial_notifications
+                .iter()
+                .filter(|(recipient, _)| recipient.worker_id.to_string() == orchestrator.worker_id)
+                .count(),
             1,
             "ordinary history must not create unfenced continuing input"
         );
+        assert_eq!(
+            initial_notifications
+                .iter()
+                .filter(|(recipient, _)| recipient.worker_id.to_string() == source.worker_id)
+                .count(),
+            1,
+            "the Worker receives assignment attention, not its own later comments"
+        );
         seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
         author_notification_test_answer(&api, &ticket.id, "notification-explicit-answer").await;
-        let inputs = execution.take_inputs();
+        let notifications = execution.take_inputs();
+        assert_eq!(
+            notifications.len(),
+            2,
+            "fenced answer and separate Worker attention"
+        );
+        let inputs = notifications
+            .into_iter()
+            .filter(|(recipient, _)| recipient.worker_id.to_string() == orchestrator.worker_id)
+            .collect::<Vec<_>>();
         assert_eq!(inputs.len(), 1, "one fenced continuing answer");
         let unique = inputs
             .iter()
@@ -53429,25 +53509,24 @@ mod tests {
             api.authority.ticket(&ticket_ref.id).unwrap().state.as_str(),
             TicketState::Open.as_str()
         );
-        let warnings = TICKET_NOTIFICATION_DELIVERY_WARNING_CAPTURE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .filter(|warning| warning.ticket_id == ticket_ref.id)
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(warnings.len(), 1);
-        let warning = &warnings[0];
-        assert_eq!(warning.level, "warning");
-        assert_eq!(warning.event, "ticket_notification_delivery_failed");
-        assert_eq!(warning.workspace_id, TEST_WORKSPACE_ID);
-        assert_eq!(warning.current_state, TicketState::Open.as_str());
-        assert_eq!(warning.recipient_runtime_id, missing_recipient.runtime_id);
-        assert_eq!(warning.recipient_worker_id, missing_recipient.worker_id);
-        assert_eq!(warning.error_category, "unknown_worker");
-        let serialized = serde_json::to_string(warning).unwrap();
-        assert!(!serialized.contains("queued update"));
-        assert!(!serialized.contains("Ticket notification:"));
+        let failures = api.config_store.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT f.code FROM notification_failures f JOIN notification_decisions d ON d.workspace_id=f.workspace_id AND d.delivery_id=f.delivery_id JOIN notification_sources s ON s.sequence=d.source_sequence WHERE s.workspace_id=?1 AND s.ticket_id=?2 AND s.role='worker'")?;
+            Ok(stmt.query_map(rusqlite::params![TEST_WORKSPACE_ID, ticket_ref.id], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
+        }).unwrap();
+        assert!(
+            !failures.is_empty(),
+            "missing recipient must remain diagnosable after restart"
+        );
+        assert!(failures.iter().all(|code| code == "target_unavailable"));
+        let pending = api
+            .store
+            .list_pending_ticket_worker_notifications(TEST_WORKSPACE_ID, 100)
+            .unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|input| input.ticket_id == ticket_ref.id && input.worker == missing_recipient)
+        );
 
         seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
         author_notification_test_answer(&api, &ticket_ref.id, "notification-saved-answer").await;
@@ -53510,16 +53589,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             warnings.len(),
-            3,
-            "one missing Worker and two bounded Orchestrator delivery attempts"
+            2,
+            "two bounded Orchestrator transport attempts; missing Worker is recorded without I/O"
         );
         assert!(warnings.iter().any(|warning| {
-            warning.recipient_worker_id == missing_recipient.worker_id
-                && warning.error_category == "unknown_worker"
-        }));
-        assert!(warnings.iter().any(|warning| {
             warning.recipient_worker_id == orchestrator.worker_id
-                && warning.error_category == "runtime_rejected"
+                && warning.error_category == "acceptance_unknown"
         }));
         let serialized = serde_json::to_string(&warnings).unwrap();
         assert!(!serialized.contains("all delivery failure update"));

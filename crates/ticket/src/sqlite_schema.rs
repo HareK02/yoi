@@ -20,7 +20,7 @@ use crate::{Result, TicketError, sqlite_err};
 
 const MIGRATION_TABLE: &str = "ticket_schema_migrations";
 const MAX_SCHEMA_DIAGNOSTICS: usize = 32;
-const LATEST_SQLITE_TICKET_SCHEMA_VERSION: i64 = 12;
+const LATEST_SQLITE_TICKET_SCHEMA_VERSION: i64 = 13;
 const BASELINE_MIGRATION_NAME: &str = "ticket schema baseline";
 
 #[derive(Clone, Copy)]
@@ -320,11 +320,10 @@ pub fn migrate_sqlite_ticket_schema(connection: &Connection) -> Result<()> {
     }
 }
 
-/// Composes retained 6/7, tags-only 8 or cases-only 9 through component 10, then
-/// appends the 10→11 assignment and 11→12 post migrations without replacing applied markers.
-/// The host owns the surrounding transaction (for example Workspace 91→92).
+/// Appends assignment, post, and content-change fact migrations without replacing applied markers.
+/// The host owns the surrounding transaction.
 /// A savepoint rolls back this component on failure, without committing host work.
-/// Current component 12 is verified only; immutable judgments are never reapplied.
+/// Current component 13 is verified only; historical edits are never backfilled.
 pub fn migrate_sqlite_ticket_schema_in_transaction(connection: &Connection) -> Result<()> {
     if connection.is_autocommit() {
         return Err(TicketError::Sqlite(
@@ -348,7 +347,7 @@ pub fn migrate_sqlite_ticket_schema_in_transaction(connection: &Connection) -> R
             create_latest_ticket_schema(connection)?;
             connection
                 .execute(
-                    "INSERT INTO ticket_schema_migrations VALUES (12, ?1, ?2)",
+                    "INSERT INTO ticket_schema_migrations VALUES (13, ?1, ?2)",
                     params![BASELINE_MIGRATION_NAME, chrono::Utc::now().to_rfc3339()],
                 )
                 .map_err(sqlite_err)?;
@@ -374,7 +373,8 @@ pub fn migrate_sqlite_ticket_schema_in_transaction(connection: &Connection) -> R
                 TicketSchemaShape::Cases9 => add_tag_schema(connection)?,
                 TicketSchemaShape::Composed10
                 | TicketSchemaShape::Tracking11
-                | TicketSchemaShape::Posts12 => {}
+                | TicketSchemaShape::Posts12
+                | TicketSchemaShape::ContentChanges13 => {}
             }
             if version < 10 {
                 connection
@@ -391,6 +391,10 @@ pub fn migrate_sqlite_ticket_schema_in_transaction(connection: &Connection) -> R
             if version < 12 {
                 migrate_posts(connection)?;
                 connection.execute("INSERT INTO ticket_schema_migrations VALUES (12, 'Canonical Ticket posts', ?1)", params![chrono::Utc::now().to_rfc3339()]).map_err(sqlite_err)?;
+            }
+            if version < 13 {
+                migrate_content_changes(connection)?;
+                connection.execute("INSERT INTO ticket_schema_migrations VALUES (13, 'Ticket content change facts', ?1)", params![chrono::Utc::now().to_rfc3339()]).map_err(sqlite_err)?;
             }
         }
         verify_sqlite_ticket_schema(connection)
@@ -416,6 +420,7 @@ enum TicketSchemaShape {
     Composed10,
     Tracking11,
     Posts12,
+    ContentChanges13,
 }
 impl TicketSchemaShape {
     fn from_version(version: i64) -> Self {
@@ -426,6 +431,7 @@ impl TicketSchemaShape {
             10 => Self::Composed10,
             11 => Self::Tracking11,
             12 => Self::Posts12,
+            13 => Self::ContentChanges13,
             _ => unreachable!(),
         }
     }
@@ -437,25 +443,34 @@ impl TicketSchemaShape {
             Self::Composed10 => 10,
             Self::Tracking11 => 11,
             Self::Posts12 => 12,
+            Self::ContentChanges13 => 13,
         }
     }
     fn tags(self) -> bool {
         matches!(
             self,
-            Self::Tags8 | Self::Composed10 | Self::Tracking11 | Self::Posts12
+            Self::Tags8
+                | Self::Composed10
+                | Self::Tracking11
+                | Self::Posts12
+                | Self::ContentChanges13
         )
     }
     fn cases(self) -> bool {
         matches!(
             self,
-            Self::Cases9 | Self::Composed10 | Self::Tracking11 | Self::Posts12
+            Self::Cases9
+                | Self::Composed10
+                | Self::Tracking11
+                | Self::Posts12
+                | Self::ContentChanges13
         )
     }
 }
 
 /// Verifies the current Ticket-owned SQLite schema without executing DDL.
 pub fn verify_sqlite_ticket_schema(connection: &Connection) -> Result<()> {
-    verify_ticket_schema_shape(connection, TicketSchemaShape::Posts12)
+    verify_ticket_schema_shape(connection, TicketSchemaShape::ContentChanges13)
 }
 
 /// Retained Workspace schema-66 migration produces the pre-classification v7
@@ -569,7 +584,10 @@ fn verify_ticket_schema_shape(connection: &Connection, shape: TicketSchemaShape)
             continue;
         }
         let mut columns = columns.to_vec();
-        if matches!(shape, TicketSchemaShape::Posts12) {
+        if matches!(
+            shape,
+            TicketSchemaShape::Posts12 | TicketSchemaShape::ContentChanges13
+        ) {
             if table == "typed_tickets" {
                 columns.retain(|c| c.name != "body");
                 columns.push(column("created_by", "TEXT", false, 0));
@@ -810,7 +828,9 @@ fn verify_ticket_schema_shape(connection: &Connection, shape: TicketSchemaShape)
 
     if matches!(
         shape,
-        TicketSchemaShape::Tracking11 | TicketSchemaShape::Posts12
+        TicketSchemaShape::Tracking11
+            | TicketSchemaShape::Posts12
+            | TicketSchemaShape::ContentChanges13
     ) {
         if let Err(error) =
             crate::assignment_tracking::verify_assignment_tracking_schema(connection)
@@ -818,7 +838,10 @@ fn verify_ticket_schema_shape(connection: &Connection, shape: TicketSchemaShape)
             push_diagnostic(&mut diagnostics, error.to_string());
         }
     }
-    if matches!(shape, TicketSchemaShape::Posts12) {
+    if matches!(
+        shape,
+        TicketSchemaShape::Posts12 | TicketSchemaShape::ContentChanges13
+    ) {
         collect_index_diagnostics(
             connection,
             "typed_ticket_events",
@@ -827,6 +850,9 @@ fn verify_ticket_schema_shape(connection: &Connection, shape: TicketSchemaShape)
             &["workspace_id", "ticket_id", "event_ref"],
             &mut diagnostics,
         );
+    }
+    if matches!(shape, TicketSchemaShape::ContentChanges13) {
+        collect_content_change_diagnostics(connection, &mut diagnostics)?;
     }
     if diagnostics.is_empty() {
         Ok(())
@@ -849,7 +875,90 @@ fn create_latest_ticket_schema(connection: &Connection) -> Result<()> {
         .execute_batch(include_str!("latest_schema.sql"))
         .map_err(sqlite_err)?;
     crate::assignment_tracking::migrate_assignment_tracking(connection)?;
-    migrate_posts(connection)
+    migrate_posts(connection)?;
+    migrate_content_changes(connection)
+}
+
+fn migrate_content_changes(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(include_str!("content_changes.sql"))
+        .map_err(sqlite_err)
+}
+
+fn collect_content_change_diagnostics(
+    connection: &Connection,
+    diagnostics: &mut Vec<String>,
+) -> Result<()> {
+    const TABLE: &str = "typed_ticket_content_changes";
+    collect_table_diagnostics(
+        connection,
+        TABLE,
+        &[
+            column("change_id", "TEXT", true, 1),
+            column("workspace_id", "TEXT", true, 0),
+            column("ticket_id", "TEXT", true, 0),
+            column("kind", "TEXT", true, 0),
+            column("actor", "TEXT", false, 0),
+            column("at", "TEXT", true, 0),
+            column("title_changed", "INTEGER", true, 0),
+            column("body_changed", "INTEGER", true, 0),
+            column("targets_changed", "INTEGER", true, 0),
+            column("source_event_ref", "TEXT", false, 0),
+        ],
+        CHILD_FOREIGN_KEYS,
+        diagnostics,
+    );
+    // These new objects are wholly Ticket-owned. Compare their complete definitions,
+    // including CHECK predicates and the composite FK, not just column affinities.
+    // Additional host triggers are independent and remain permitted.
+    let ddl = include_str!("content_changes.sql");
+    let table_sql = format!(
+        "CREATE TABLE {}",
+        ddl.split_once("CREATE TABLE ")
+            .expect("table DDL")
+            .1
+            .split_once(";\n")
+            .expect("table terminator")
+            .0
+    );
+    let trigger_sql = format!(
+        "CREATE TRIGGER {}",
+        ddl.split_once("CREATE TRIGGER ")
+            .expect("trigger DDL")
+            .1
+            .trim()
+    );
+    for (kind, name, expected) in [
+        ("table", TABLE, table_sql),
+        (
+            "trigger",
+            "typed_ticket_content_changes_no_update",
+            trigger_sql,
+        ),
+    ] {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                params![kind, name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_err)?;
+        let normalize = |sql: &str| {
+            sql.trim()
+                .trim_end_matches(';')
+                .split_whitespace()
+                .collect::<String>()
+        };
+        if actual.as_deref().map(normalize) != Some(normalize(&expected)) {
+            push_diagnostic(
+                diagnostics,
+                format!("invalid Ticket content change {kind} {name}"),
+            );
+        }
+    }
+    collect_foreign_key_check_diagnostics(connection, TABLE, diagnostics);
+    Ok(())
 }
 
 fn migrate_posts(connection: &Connection) -> Result<()> {
@@ -1105,22 +1214,25 @@ fn load_applied_migrations(connection: &Connection) -> Result<BTreeMap<i64, Stri
 fn recognized_schema_version(applied: &BTreeMap<i64, String>) -> Result<i64> {
     if applied.len() == 1 {
         if let Some((&version, name)) = applied.first_key_value() {
-            if (6..=12).contains(&version) && name == BASELINE_MIGRATION_NAME {
+            if (6..=13).contains(&version) && name == BASELINE_MIGRATION_NAME {
                 return Ok(version);
             }
         }
     }
-    for baseline in [10, 11] {
+    for baseline in [10, 11, 12] {
         let mut expected = BTreeMap::from([(baseline, BASELINE_MIGRATION_NAME.to_owned())]);
-        if baseline == 10 {
-            expected.insert(11, "Ticket-owned assignment tracking".to_owned());
-            if applied == &expected {
-                return Ok(11);
+        for (version, name) in [
+            (11, "Ticket-owned assignment tracking"),
+            (12, "Canonical Ticket posts"),
+            (13, "Ticket content change facts"),
+        ] {
+            if version <= baseline {
+                continue;
             }
-        }
-        expected.insert(12, "Canonical Ticket posts".to_owned());
-        if applied == &expected {
-            return Ok(12);
+            expected.insert(version, name.to_owned());
+            if applied == &expected {
+                return Ok(version);
+            }
         }
     }
     Err(TicketError::Sqlite(format!(
@@ -1623,7 +1735,8 @@ mod tests {
             BTreeMap::from([
                 (10, BASELINE_MIGRATION_NAME.to_owned()),
                 (11, "Ticket-owned assignment tracking".to_owned()),
-                (12, "Canonical Ticket posts".to_owned())
+                (12, "Canonical Ticket posts".to_owned()),
+                (13, "Ticket content change facts".to_owned())
             ])
         );
     }
@@ -1766,7 +1879,7 @@ mod tests {
 
         let error = migrate_sqlite_ticket_schema(&connection).unwrap_err();
         assert!(error.to_string().contains(
-            "migration history must contain a canonical baseline and ordered migrations through 12"
+            "migration history must contain a canonical baseline and ordered migrations through 13"
         ));
         assert_eq!(load_applied_migrations(&connection).unwrap().len(), 2);
     }
@@ -1788,7 +1901,7 @@ mod tests {
 
         let error = migrate_sqlite_ticket_schema(&connection).unwrap_err();
         assert!(error.to_string().contains(
-            "migration history must contain a canonical baseline and ordered migrations through 12"
+            "migration history must contain a canonical baseline and ordered migrations through 13"
         ));
         assert!(!table_exists(&connection, "typed_tickets").unwrap());
     }
