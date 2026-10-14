@@ -953,6 +953,31 @@ mod tests {
             store.session_attribution("session-1").unwrap().unwrap(),
             stored_attribution
         );
+        let host = crate::journal::JournalHostContext::validated_session(
+            &store,
+            stored_attribution.clone(),
+        )
+        .unwrap();
+        let range = crate::journal::JournalSourceRange {
+            source: crate::journal::JournalSource {
+                session_id: stored_attribution.session_id.clone(),
+                pointer: crate::journal::JournalSourcePointer {
+                    segment_id: Uuid::now_v7(),
+                    entry_ref: "Eafter-v1-migration".into(),
+                },
+                order: 0,
+                content_sha256: "ab".repeat(32),
+                total_bytes: 8,
+            },
+            bytes: crate::journal::JournalByteRange { start: 0, end: 8 },
+        };
+        let journal_id = store
+            .accept_journal_sources(&host, "After oldest supported migration", &[range])
+            .unwrap();
+        assert_eq!(
+            store.read_journal(&host, &journal_id).unwrap().subject_id,
+            subject_id
+        );
     }
 
     #[test]
