@@ -91,13 +91,13 @@
 />
 
 <svelte:head>
-  {#if workspaceError}<title>Workspace · Unavailable</title>
+  {#if workspaceError}<title>Workspace · Load error</title>
   {:else if !workspace}<title>Workspace · Loading</title>{/if}
 </svelte:head>
 
 {#if workspaceError}
   <section class="workspace-page">
-    <h1>Workspace unavailable</h1>
+    <h1>Workspace details could not be loaded</h1>
     <p role="alert">{workspaceError}</p>
     <button type="button" class="workspace-secondary-button" onclick={() => invalidateAll()}>Retry</button>
   </section>

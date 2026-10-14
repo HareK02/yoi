@@ -54,10 +54,14 @@ import type {
   WorkspaceTag,
 } from "#lib/generated/ticket-api.ts";
 
+export class TicketBrowserContractError extends Error {}
+
 export const TICKET_BROWSER_API_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 export const TICKET_BROWSER_API_LOAD_POLICY = {
   diagnosticLabel: "Ticket Browser API",
   maxResponseBytes: TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
+  describeValidationError: (error: unknown) =>
+    error instanceof TicketBrowserContractError ? error.message : undefined,
 } as const;
 
 const MAX_STRING_LENGTH = 262_144;
@@ -66,7 +70,7 @@ const MAX_MAP_ENTRIES = 4_096;
 
 function object(value: unknown, label: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error(`${label} must be an object`);
+    throw new TicketBrowserContractError(`${label} must be an object`);
   }
   return value as Record<string, unknown>;
 }
@@ -78,20 +82,20 @@ function exact(
 ): void {
   const unexpected = Object.keys(value).find((key) => !allowed.includes(key));
   if (unexpected !== undefined) {
-    throw new Error(`${label} contains unknown field ${unexpected}`);
+    throw new TicketBrowserContractError(`${label} contains unknown field`);
   }
 }
 
 function string(value: unknown, label: string): string {
-  if (typeof value !== "string") throw new Error(`${label} must be a string`);
+  if (typeof value !== "string") throw new TicketBrowserContractError(`${label} must be a string`);
   if (value.length > MAX_STRING_LENGTH) {
-    throw new Error(`${label} exceeds its length limit`);
+    throw new TicketBrowserContractError(`${label} exceeds its length limit`);
   }
   return value;
 }
 
 function boolean(value: unknown, label: string): boolean {
-  if (typeof value !== "boolean") throw new Error(`${label} must be a boolean`);
+  if (typeof value !== "boolean") throw new TicketBrowserContractError(`${label} must be a boolean`);
   return value;
 }
 
@@ -105,7 +109,7 @@ function integer(
     typeof value !== "number" || !Number.isSafeInteger(value) ||
     value < minimum || value > maximum
   ) {
-    throw new Error(
+    throw new TicketBrowserContractError(
       `${label} must be an integer from ${minimum} through ${maximum}`,
     );
   }
@@ -128,9 +132,9 @@ function array<T>(
   label: string,
   parse: (item: unknown, label: string) => T,
 ): T[] {
-  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  if (!Array.isArray(value)) throw new TicketBrowserContractError(`${label} must be an array`);
   if (value.length > MAX_COLLECTION_LENGTH) {
-    throw new Error(`${label} exceeds its item limit`);
+    throw new TicketBrowserContractError(`${label} exceeds its item limit`);
   }
   return value.map((item, index) => parse(item, `${label}[${index}]`));
 }
@@ -143,12 +147,12 @@ function stringMap(value: unknown, label: string): Record<string, string> {
   const source = object(value, label);
   const entries = Object.entries(source);
   if (entries.length > MAX_MAP_ENTRIES) {
-    throw new Error(`${label} exceeds its entry limit`);
+    throw new TicketBrowserContractError(`${label} exceeds its entry limit`);
   }
   return Object.fromEntries(
     entries.map(([key, item]) => [
       string(key, `${label} key`),
-      string(item, `${label}.${key}`),
+      string(item, `${label} value`),
     ]),
   );
 }
@@ -199,7 +203,7 @@ function parseInvalidProjectRecord(
 
 function parseTicketState(value: unknown, label: string): BrowserTicketState {
   if (value !== "open" && value !== "closed") {
-    throw new Error(`${label} is invalid`);
+    throw new TicketBrowserContractError(`${label} is invalid`);
   }
   return value;
 }
@@ -226,7 +230,7 @@ function parseCaseAction(value: unknown, label: string): TicketCaseAction {
     return { action: "reopen" };
   }
   if (item.action !== "close" && item.action !== "correct_closure") {
-    throw new Error(`${label}.action is invalid`);
+    throw new TicketBrowserContractError(`${label}.action is invalid`);
   }
   exact(item, ["action", "reason"], label);
   return {
@@ -351,7 +355,7 @@ export function parseWorkspaceTag(
   ], label);
   const id = string(item.id, `${label}.id`);
   if (id.trim().length === 0 || new TextEncoder().encode(id).length > 128) {
-    throw new Error(`${label}.id must be nonempty and at most 128 UTF-8 bytes`);
+    throw new TicketBrowserContractError(`${label}.id must be nonempty and at most 128 UTF-8 bytes`);
   }
   return {
     workspace_id: string(item.workspace_id, `${label}.workspace_id`),
@@ -588,7 +592,7 @@ function parseTicketAssignmentPrincipal(
     exact(item, ["agent_key", "kind"], label);
     return { kind, agent_key: string(item.agent_key, `${label}.agent_key`) };
   }
-  throw new Error(`${label}.kind is invalid`);
+  throw new TicketBrowserContractError(`${label}.kind is invalid`);
 }
 
 function parseTicketAssignmentSummary(
@@ -653,7 +657,7 @@ function parseTicketRoleAssignmentRecord(
   ], label);
   const role = string(item.role, `${label}.role`);
   if (!["orchestrator", "worker", "owner", "contributor"].includes(role)) {
-    throw new Error(`${label}.role is invalid`);
+    throw new TicketBrowserContractError(`${label}.role is invalid`);
   }
   return {
     assigned_at: string(item.assigned_at, `${label}.assigned_at`),
@@ -681,7 +685,7 @@ export function parseAssignmentTracking(
   );
   const status = string(item.status, `${label}.status`);
   if (status !== "waiting" && status !== "inprogress" && status !== "done") {
-    throw new Error(`${label}.status is invalid`);
+    throw new TicketBrowserContractError(`${label}.status is invalid`);
   }
   return {
     status,
@@ -715,7 +719,7 @@ function parseAssignmentRelease(
   ], label);
   const action = string(item.action, `${label}.action`);
   if (action !== "unassigned" && action !== "replaced") {
-    throw new Error(`${label}.action is invalid`);
+    throw new TicketBrowserContractError(`${label}.action is invalid`);
   }
   return {
     action,
@@ -839,7 +843,7 @@ function parseSourceRefObservation(
     exact(item, ["status", "code"], label);
     return { status, code: string(item.code, `${label}.code`) };
   }
-  throw new Error(`${label}.status is invalid`);
+  throw new TicketBrowserContractError(`${label}.status is invalid`);
 }
 
 function parseTicketMergeRequestSummary(
@@ -1085,7 +1089,7 @@ function parseTicketTarget(value: unknown, label: string): TicketTarget {
   exact(item, ["access", "ref_selector", "repository_key"], label);
   const access = string(item.access, `${label}.access`);
   if (access !== "read_only" && access !== "read_write") {
-    throw new Error(`${label}.access is invalid`);
+    throw new TicketBrowserContractError(`${label}.access is invalid`);
   }
   return {
     access,
@@ -1234,7 +1238,7 @@ export function parseTicketRecordRef(value: unknown): TicketRef {
   exact(item, ["id", "resource_key", "slug", "status"], label);
   const status = string(item.status, `${label}.status`);
   if (status !== "Open" && status !== "Closed") {
-    throw new Error(`${label}.status is invalid`);
+    throw new TicketBrowserContractError(`${label}.status is invalid`);
   }
   return {
     id: string(item.id, `${label}.id`),
@@ -1502,7 +1506,7 @@ function parseReviewFinding(value: unknown, label: string): ReviewFinding {
   exact(item, ["body", "code", "line", "path", "severity"], label);
   const severity = string(item.severity, `${label}.severity`);
   if (!["blocker", "major", "minor", "note"].includes(severity)) {
-    throw new Error(`${label}.severity is invalid`);
+    throw new TicketBrowserContractError(`${label}.severity is invalid`);
   }
   return {
     body: string(item.body, `${label}.body`),
@@ -1576,7 +1580,7 @@ function parseMergeRequestThreadEvent(
     ], label);
     const decision = string(item.decision, `${label}.decision`);
     if (!["approve", "request_changes"].includes(decision)) {
-      throw new Error(`${label}.decision is invalid`);
+      throw new TicketBrowserContractError(`${label}.decision is invalid`);
     }
     return {
       ...eventBase,
@@ -1658,10 +1662,10 @@ function parseMergeRequestThreadEvent(
     const strategy = string(item.strategy, `${label}.strategy`);
     const resolution = string(item.resolution, `${label}.resolution`);
     if (!["fast_forward", "merge"].includes(strategy)) {
-      throw new Error(`${label}.strategy is invalid`);
+      throw new TicketBrowserContractError(`${label}.strategy is invalid`);
     }
     if (!["none", "clean", "conflicts_resolved"].includes(resolution)) {
-      throw new Error(`${label}.resolution is invalid`);
+      throw new TicketBrowserContractError(`${label}.resolution is invalid`);
     }
     return {
       ...eventBase,
@@ -1688,7 +1692,7 @@ function parseMergeRequestThreadEvent(
       ),
     };
   }
-  throw new Error(`${label}.kind is invalid`);
+  throw new TicketBrowserContractError(`${label}.kind is invalid`);
 }
 
 function parseMergeRequestRef(
@@ -1743,7 +1747,7 @@ export function parseMergeRequestDetailResponse(
   ], label);
   const state = string(item.state, `${label}.state`);
   if (!["open", "merged", "closed"].includes(state)) {
-    throw new Error(`${label}.state is invalid`);
+    throw new TicketBrowserContractError(`${label}.state is invalid`);
   }
   return {
     created_at: string(item.created_at, `${label}.created_at`),

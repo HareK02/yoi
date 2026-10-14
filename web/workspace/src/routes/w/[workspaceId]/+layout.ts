@@ -25,9 +25,13 @@ async function loadWorkspace(fetch: Parameters<LayoutLoad>[0]["fetch"], workspac
   const workspace = workspaceResult.data;
   const workspaceError = workspaceResult.error;
   if (!workspace) {
-    error(404, {
-      message: workspaceError ?? `Workspace ${workspaceId} is unavailable`,
-    });
+    const message = workspaceError ?? "Workspace details could not be loaded";
+    const status = workspaceResult.status;
+    if (status !== undefined && status >= 400 && status <= 599) {
+      error(status, message);
+    }
+    // Transport/decoding failures do not prove that the Workspace was removed.
+    throw new Error(message);
   }
 
   const repositories = repositoryResult.data;

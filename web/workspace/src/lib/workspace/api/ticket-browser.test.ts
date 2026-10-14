@@ -2,8 +2,10 @@ declare const Deno: {
   test(name: string, fn: () => Promise<void> | void): void;
 };
 
+import { loadJson } from "./http.ts";
 import { fixturePost } from "../home/dashboard.test-fixtures.ts";
 import {
+  TICKET_BROWSER_API_LOAD_POLICY,
   parseTicketEvent,
   parseMergeRequestDetailResponse,
   parseMergeRequestListResponse,
@@ -64,10 +66,35 @@ Deno.test("Ticket post parser rejects absent safety fields and unknown wire fiel
   }
   assertThrows(() => parseTicketEvent({ ...fixturePost("Post"), editable: "yes" }), "editable");
   assertThrows(() => parseTicketEvent({ ...fixturePost("Post"), edited_by: 7 }), "edited_by");
-  assertThrows(() => parseTicketEvent({ ...fixturePost("Post"), surprise: true }), "unknown field surprise");
+  assertThrows(() => parseTicketEvent({ ...fixturePost("Post"), surprise: true }), "unknown field");
   const detail: Record<string, unknown> = { ...ticketDetailFixture() };
   delete detail.initial_post;
   assertThrows(() => parseTicketDetail(detail), "initial_post");
+});
+
+Deno.test("Ticket load diagnostics retain the failed field without leaking response contents", async () => {
+  const secret = "PRIVATE_RESPONSE_TEXT";
+  const wire: Record<string, unknown> = { ...ticketDetailFixture(), body: secret };
+  delete wire.initial_post;
+  const load = (payload: unknown) => loadJson(
+    (async () => Response.json(payload)) as typeof fetch,
+    "/api/w/workspace-a/tickets/T-1",
+    undefined,
+    parseTicketDetail,
+    TICKET_BROWSER_API_LOAD_POLICY,
+  );
+  const missing = await load(wire);
+  assertEquals(missing.data, null);
+  assertEquals(missing.error, "Ticket Browser API: Ticket detail.initial_post must be an object");
+  assertEquals(missing.status, undefined);
+  const unknown = await load({ ...ticketDetailFixture(), [secret]: true });
+  assertEquals(unknown.error, "Ticket Browser API: Ticket detail contains unknown field");
+  const nested = ticketDetailFixture();
+  const malformed = await load({ ...nested, initial_post: { ...nested.initial_post, attributes: { [secret]: 5 } } });
+  assertEquals(malformed.error, "Ticket Browser API: Ticket detail.initial_post.attributes value must be a string");
+  for (const result of [missing, unknown, malformed]) {
+    assertEquals(result.error?.includes(secret), false);
+  }
 });
 
 Deno.test("Ticket Browser parser accepts the generated Ticket list shape", () => {
@@ -105,7 +132,7 @@ Deno.test("Ticket Browser parser rejects unknown fields and out-of-range limits"
   };
   assertThrows(
     () => parseTicketListResponse({ ...fixture, stale: true }),
-    "unknown field stale",
+    "unknown field",
   );
   assertThrows(
     () => parseTicketListResponse({ ...fixture, limit: 1001 }),
@@ -296,7 +323,7 @@ Deno.test("Ticket Browser parser accepts target collections and rejects singular
         repository_key: "main",
         ref_selector: "develop",
       }),
-    "unknown field repository_key",
+    "unknown field",
   );
 });
 
@@ -393,11 +420,11 @@ Deno.test("Merge Request summaries reject missing and malformed tagged source ob
         { status: "unavailable", code: "x".repeat(262_145) },
         "code exceeds its length limit",
       ],
-      [{ status: "observed", code: "stale" }, "unknown field code"],
-      [{ status: "not_required", code: "stale" }, "unknown field code"],
+      [{ status: "observed", code: "stale" }, "unknown field"],
+      [{ status: "not_required", code: "stale" }, "unknown field"],
       [
         { status: "unavailable", code: "missing", extra: true },
-        "unknown field extra",
+        "unknown field",
       ],
     ] as const
   ) {
@@ -529,7 +556,7 @@ Deno.test("Ticket Browser parser validates the canonical Merge Request thread", 
         ...parsed,
         thread: [{ ...parsed.thread[0], unexpected: true }],
       }),
-    "unknown field unexpected",
+    "unknown field",
   );
 });
 
@@ -692,7 +719,7 @@ Deno.test("Ticket tag projections reject missing collections and malformed ident
           "last_operation_key must be a string",
         ],
         [{ ...tag, deleted: "false" }, "deleted must be a boolean"],
-        [{ ...tag, state: "closed" }, "unknown field state"],
+        [{ ...tag, state: "closed" }, "unknown field"],
       ] as const
     ) {
       assertThrows(() => parse([value]), message);

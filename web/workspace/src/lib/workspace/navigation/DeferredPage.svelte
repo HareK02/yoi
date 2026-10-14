@@ -13,6 +13,31 @@
   let resolved = $state.raw<{ path: string; value: ResolvedPageData<T> } | null>(null);
   let failure = $state.raw<{ path: string; value: DeferredFailure } | null>(null);
   let loading = $state(true);
+  let renderFailure = $state.raw<{ path: string; error: unknown } | null>(null);
+  let recoveryVersion = $state(0);
+  let retrying = $state(false);
+  let retryFailure = $state<string | null>(null);
+  const errorMessage = (error: unknown) => {
+    // SvelteKit may transform render exceptions into a serialized App.Error.
+    if (error !== null && typeof error === 'object' && 'message' in error && typeof error.message === 'string') {
+      return error.message;
+    }
+    return String(error);
+  };
+
+  async function retry() {
+    if (retrying || loading) return;
+    const requestedPath = path;
+    retrying = true;
+    retryFailure = null;
+    try {
+      await invalidateAll();
+    } catch (error) {
+      if (path === requestedPath) retryFailure = errorMessage(error);
+    } finally {
+      retrying = false;
+    }
+  }
   const path = $derived(identity ?? page.url.pathname);
   const current = $derived(resolved?.path === path ? resolved.value : null);
   const currentFailure = $derived(failure?.path === path ? failure.value : null);
@@ -23,9 +48,14 @@
     let active = true;
     loading = true;
     failure = null;
+    retryFailure = null;
     void resolvePageData(requestedData).then(async (result) => {
       if (!active) return;
       if (result.ok) {
+        // Never reset a failed boundary against stale data, including while Retry
+        // invalidation is pending. Remount only after this load has fresh data.
+        if (renderFailure?.path === requestedPath) recoveryVersion += 1;
+        renderFailure = null;
         resolved = { path: requestedPath, value: result.data };
         loading = false;
       } else if (result.failure.redirect) {
@@ -51,7 +81,7 @@
 </script>
 
 <svelte:head>
-  {#if currentFailure}<title>{title} · Unavailable</title>
+  {#if currentFailure || renderFailure?.path === path}<title>{title} · Error</title>
   {:else if !current}<title>{title} · Loading</title>{/if}
 </svelte:head>
 
@@ -59,11 +89,26 @@
   <section class="workspace-page deferred-page" aria-label={title}>
     <h1>{title}</h1>
     <p role="alert">{currentFailure.message}</p>
-    <button type="button" class="workspace-secondary-button" onclick={() => invalidateAll()}>Retry</button>
+    {#if retryFailure}<p role="alert">{retryFailure}</p>{/if}
+    <button type="button" class="workspace-secondary-button" disabled={retrying || loading} onclick={retry}>Retry</button>
   </section>
 {:else if current}
   {#if loading}<p class="deferred-refresh" role="status">Updating…</p>{/if}
-  {#key path}{@render children(current)}{/key}
+  {#key path}
+    {#key recoveryVersion}
+      <svelte:boundary onerror={(error) => { renderFailure = { path, error }; }}>
+        {@render children(current)}
+        {#snippet failed(error)}
+          <section class="workspace-page deferred-page" aria-label={title}>
+            <h1>{title}</h1>
+            <p role="alert">{errorMessage(error)}</p>
+            {#if retryFailure}<p role="alert">{retryFailure}</p>{/if}
+            <button type="button" class="workspace-secondary-button" disabled={retrying || loading} onclick={retry}>Retry</button>
+          </section>
+        {/snippet}
+      </svelte:boundary>
+    {/key}
+  {/key}
 {:else}
   <section class="workspace-page deferred-page" aria-label={title} aria-busy="true">
     <h1>{title}</h1>

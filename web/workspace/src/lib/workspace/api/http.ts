@@ -12,6 +12,8 @@ import {
 export type ApiResult<T> = {
   data: T | null;
   error: string | null;
+  /** HTTP failure status, when a response was received; absent for local/transport failures. */
+  status?: number;
 };
 
 export type { SkillCatalogResponse, SkillDetailResponse };
@@ -19,6 +21,8 @@ export type { SkillCatalogResponse, SkillDetailResponse };
 export type JsonLoadPolicy = {
   diagnosticLabel: string;
   maxResponseBytes: number;
+  /** Only explicitly trusted validator errors may expose bounded field diagnostics. */
+  describeValidationError?: (error: unknown) => string | undefined;
 };
 
 const SKILL_API_LOAD_POLICY: JsonLoadPolicy = {
@@ -96,6 +100,7 @@ export async function loadJson<T>(
   parse: (value: unknown) => T = (value) => value as T,
   policy?: JsonLoadPolicy,
 ): Promise<ApiResult<T>> {
+  let stage: "request" | "decode" | "validate" = "request";
   try {
     const response = await fetchFn(path, init);
     if (!response.ok) {
@@ -103,6 +108,7 @@ export async function loadJson<T>(
         await response.body?.cancel();
         return {
           data: null,
+          status: response.status,
           error:
             `${policy.diagnosticLabel} request failed with HTTP ${response.status}`,
         };
@@ -110,19 +116,31 @@ export async function loadJson<T>(
       const text = await response.text();
       return {
         data: null,
+        status: response.status,
         error: text || `${path} request failed (${response.status})`,
       };
     }
+    stage = "decode";
     const payload: unknown = policy
       ? await readBoundedJson(response, policy.maxResponseBytes)
       : await response.json();
+    stage = "validate";
     return { data: parse(payload), error: null };
   } catch (error) {
     if (policy) {
+      const validationDiagnostic = stage === "validate"
+        ? policy.describeValidationError?.(error)
+        : undefined;
       const diagnostic = error instanceof SkillApiContractError
         ? error.message
+        : validationDiagnostic !== undefined
+        ? `${policy.diagnosticLabel}: ${validationDiagnostic}`
         : error instanceof ResponseByteLimitError
         ? `${policy.diagnosticLabel} response exceeds its byte limit`
+        : stage === "request"
+        ? `${policy.diagnosticLabel} request could not be completed`
+        : stage === "decode"
+        ? `${policy.diagnosticLabel} response could not be decoded as JSON`
         : `${policy.diagnosticLabel} response is invalid`;
       return { data: null, error: diagnostic.slice(0, 256) };
     }

@@ -72,6 +72,49 @@ async function queryRequests(base: string) {
   return requests.filter((row: { path: string }) => row.path === "/tickets/query");
 }
 
+Deno.test("Ticket parser failures stay local, retain Workspace navigation, and recover on retry", async () => {
+  await withFixture(async (browser, base) => {
+    const page = await browser.newPage();
+    const wire = await detail(base, "T-1");
+    delete wire.initial_post;
+    let invalid = true;
+    await page.route("**/api/w/tickets/tickets/T-1", async (route) => {
+      if (invalid) await route.fulfill({ status: 200, json: wire });
+      else await route.continue();
+    });
+    await page.goto(`${base}/w/tickets/tickets/T-1`);
+    await page.getByRole("alert").filter({ hasText: "Ticket detail.initial_post must be an object" }).waitFor();
+    assertEquals(await page.getByText("The selected Workspace cannot be opened", { exact: true }).count(), 0);
+    assertEquals(await page.getByText("Workspace unavailable", { exact: true }).count(), 0);
+    assert(await page.getByRole("navigation", { name: "Current workspace location" }).isVisible());
+    invalid = false;
+    await page.getByRole("button", { name: "Retry", exact: true }).click();
+    await page.locator(".ticket-detail-header").waitFor();
+    assertEquals(await page.getByRole("alert").filter({ hasText: "initial_post must be an object" }).count(), 0);
+    await page.close();
+  });
+});
+
+Deno.test("Workspace HTTP failure retains its real status and recovers without recreating the Workspace", async () => {
+  await withFixture(async (browser, base) => {
+    const page = await browser.newPage();
+    let unavailable = true;
+    await page.route("**/api/w/tickets/workspace", async (route) => {
+      if (unavailable) await route.fulfill({ status: 503, body: "private server failure" });
+      else await route.continue();
+    });
+    await page.goto(`${base}/w/tickets/tickets/T-1`);
+    await page.getByRole("heading", { name: "Workspace details could not be loaded" }).waitFor();
+    assert(await page.locator(".workspace-page [role=alert]").filter({ hasText: "HTTP 503" }).isVisible());
+    assertEquals(await page.getByText("The selected Workspace cannot be opened", { exact: true }).count(), 0);
+    assertEquals(await page.getByText("private server failure", { exact: true }).count(), 0);
+    unavailable = false;
+    await page.getByRole("button", { name: "Retry", exact: true }).click();
+    await page.locator(".ticket-detail-header").waitFor();
+    await page.close();
+  });
+});
+
 Deno.test("single Ticket query searches beyond loaded rows and preserves qualifiers on pagination", async () => {
   await withFixture(async (browser, base) => {
     const page = await browser.newPage();
