@@ -3567,6 +3567,24 @@ Deno.test("overview hides thinking and aggregates uninterrupted tool activity", 
   assertEquals(overview[4].body, "edited +2/-1");
 });
 
+Deno.test("overview folds image attachments into the surrounding tool run while Normal preserves them", () => {
+  const tools: ConsoleLine[] = ["Read", "ViewImage", "ViewImage", "Bash"].map((name, index) => ({
+    ...consoleLine(`tool-${index}`, "tool"),
+    toolCall: { id: `call-${index}`, name, argsStream: "", state: "done" },
+    ...(name === "ViewImage" ? {
+      attachments: [{ attachment_id: `image-${index}`, media_type: "image/png", byte_len: 100 }],
+    } : {}),
+  }));
+  const lines = [consoleLine("user", "user"), ...tools, consoleLine("answer", "assistant")];
+  const overview = projectConsoleLines(lines, "overview");
+  assertEquals(overview.map((line) => line.kind), ["user", "activity", "assistant"]);
+  assertEquals(overview[1].body, "1 file read・ran 1 command・2 ViewImage");
+  assertEquals(overview[1].attachments, undefined);
+  assertEquals(overview[1].toolCall, undefined);
+  assertEquals(projectConsoleLines(lines, "normal"), lines);
+  assertEquals(lines[2].attachments?.[0].attachment_id, "image-1");
+});
+
 Deno.test("overview keeps tool failure counts without marking the activity as an error", () => {
   const overview = projectOverviewLines([
     consoleLine("thinking-active", "thinking"),
@@ -3865,9 +3883,11 @@ Deno.test("committed tool identities reconcile one live call block", () => {
     byte_len: 5_735_340,
   }]);
   assertEquals(
-    projectConsoleLines(lines, "overview")[0].attachments,
+    projectConsoleLines(lines, "normal")[0].attachments,
     lines[0].attachments,
   );
+  assertEquals(projectConsoleLines(lines, "overview")[0].kind, "activity");
+  assertEquals(projectConsoleLines(lines, "overview")[0].attachments, undefined);
 });
 
 Deno.test("image rejection correction updates the existing tool result without duplicate rows", () => {

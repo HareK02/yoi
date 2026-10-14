@@ -609,12 +609,7 @@ export function projectOverviewLines(lines: ConsoleLine[]): ConsoleLine[] {
     if (line.systemItemKind === "task_reminder") continue;
     if (isOverviewThinkingLine(line)) continue;
     if (line.kind === "tool" && line.toolCall) {
-      if (line.attachments?.length) {
-        flushTools();
-        overview.push(line);
-      } else {
-        toolGroup.push(line);
-      }
+      toolGroup.push(line);
       continue;
     }
     flushTools();

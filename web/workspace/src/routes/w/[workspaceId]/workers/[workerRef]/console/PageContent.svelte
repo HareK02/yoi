@@ -1989,7 +1989,7 @@
                 {#if (consoleDisplayState.kind === "ready" || consoleDisplayState.kind === "stale") && lines.length > 0}
                     <ol class="console-log">
                         {#each lines as item (item.id)}
-                            <ConsoleLineItem {item} {attachmentUrl} rewindSelected={rewindEntryId !== null && item.entryId === rewindEntryId} />
+                            <ConsoleLineItem {item} viewMode={consoleViewMode} {attachmentUrl} rewindSelected={rewindEntryId !== null && item.entryId === rewindEntryId} />
                         {/each}
                     </ol>
                 {/if}

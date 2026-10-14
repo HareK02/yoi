@@ -11,6 +11,7 @@
   };
 
   let { attachment, url }: Props = $props();
+  const supportsIntersectionObserver = typeof IntersectionObserver !== "undefined";
   let root: HTMLElement | null = $state(null);
   let objectUrl = $state<string | null>(null);
   let previewDialog: HTMLDialogElement | null = $state(null);
@@ -81,19 +82,19 @@
   });
 
   $effect(() => {
-    if (!root || !url || status !== "idle") return;
-    if (typeof IntersectionObserver === "undefined") {
-      void load();
-      return;
-    }
+    if (!root || !url || status !== "idle" || !supportsIntersectionObserver) return;
+    let active = true;
     const observer = new IntersectionObserver((entries) => {
-      if (entries.some((entry) => entry.isIntersecting)) {
+      if (active && entries.some((entry) => entry.isIntersecting)) {
         observer.disconnect();
         void load();
       }
-    }, { rootMargin: "160px" });
+    }, { root: root.closest(".console-scroll"), rootMargin: "160px" });
     observer.observe(root);
-    return () => observer.disconnect();
+    return () => {
+      active = false;
+      observer.disconnect();
+    };
   });
 </script>
 
@@ -134,6 +135,9 @@
     </dialog>
   {:else}
     <span>{statusText()}</span>
+    {#if url && status === "idle" && !supportsIntersectionObserver}
+      <button class="retry" type="button" onclick={() => void load()}>Load image</button>
+    {/if}
     {#if url && ["missing", "expired", "unauthorized", "network", "failed"].includes(status)}
       <button class="retry" type="button" onclick={() => void load()}>Retry</button>
     {/if}

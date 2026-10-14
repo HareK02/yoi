@@ -3,15 +3,16 @@
   import ConsoleAttachmentImage from '#lib/workspace/console/ConsoleAttachmentImage.svelte';
   import RichMarkdown from '#lib/workspace/console/RichMarkdown.svelte';
   import type { SessionToolAttachment } from '#lib/generated/protocol.ts';
-  import type { ConsoleLine } from '#lib/workspace/console/model.ts';
+  import type { ConsoleLine, ConsoleViewMode } from '#lib/workspace/console/model.ts';
 
   type Props = {
     item: ConsoleLine;
+    viewMode?: ConsoleViewMode;
     rewindSelected?: boolean;
     attachmentUrl?: (attachment: SessionToolAttachment) => string | null;
   };
 
-  let { item, rewindSelected = false, attachmentUrl = () => null }: Props = $props();
+  let { item, viewMode = 'overview', rewindSelected = false, attachmentUrl = () => null }: Props = $props();
   let detailOpen = $state(false);
   let nowMs = $state(Date.now());
 
@@ -146,7 +147,7 @@
   {:else}
     <p class="console-plain-text">{item.body || '—'}</p>
   {/if}
-  {#if item.attachments?.length}
+  {#if viewMode === 'normal' && item.attachments?.length}
     <div class="console-attachments">
       {#each item.attachments as attachment (attachment.attachment_id)}
         <ConsoleAttachmentImage {attachment} url={attachmentUrl(attachment)} />

@@ -3,6 +3,8 @@
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/svelte";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import ConsoleAttachmentImage from "./ConsoleAttachmentImage.svelte";
+import ConsoleLineItem from "./ConsoleLineItem.svelte";
+import type { ConsoleLine } from "./model.ts";
 import {
   ConsoleAttachmentFetchError,
   loadConsoleAttachment,
@@ -20,9 +22,27 @@ const attachment = {
 };
 const blob = new Blob([new Uint8Array([1, 2, 3])], { type: "image/png" });
 
+function installObserver(automaticallyIntersect = true) {
+  const observers: { notify: (near: boolean) => void; options?: IntersectionObserverInit; disconnect: ReturnType<typeof vi.fn> }[] = [];
+  vi.stubGlobal("IntersectionObserver", class {
+    notify: (near: boolean) => void;
+    disconnect = vi.fn();
+    constructor(callback: IntersectionObserverCallback, options?: IntersectionObserverInit) {
+      this.notify = (near: boolean) => callback(
+        [{ isIntersecting: near } as IntersectionObserverEntry],
+        this as unknown as IntersectionObserver,
+      );
+      observers.push({ notify: this.notify, options, disconnect: this.disconnect });
+    }
+    observe() {
+      if (automaticallyIntersect) queueMicrotask(() => this.notify(true));
+    }
+  });
+  return observers;
+}
+
 beforeEach(() => {
-  // Exercise the loader's no-observer fallback deterministically.
-  vi.stubGlobal("IntersectionObserver", undefined);
+  installObserver();
   vi.mocked(loadConsoleAttachment).mockReset().mockResolvedValue(blob);
   let nextUrl = 0;
   vi.spyOn(URL, "createObjectURL").mockImplementation(() => `blob:image-${++nextUrl}`);
@@ -33,6 +53,65 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+test("Overview neither mounts nor loads images, and switching back releases the Normal preview", async () => {
+  const observers = installObserver(false);
+  const item: ConsoleLine = {
+    id: "view-image", kind: "tool", title: "ViewImage", body: "Attached image", source: "event",
+    attachments: [attachment],
+  };
+  const attachmentUrl = vi.fn(() => "/image/a");
+  const view = render(ConsoleLineItem, { item, viewMode: "overview", attachmentUrl });
+  expect(view.container.querySelector(".console-attachments")).toBeNull();
+  expect(attachmentUrl).not.toHaveBeenCalled();
+  expect(loadConsoleAttachment).not.toHaveBeenCalled();
+  expect(observers).toHaveLength(0);
+
+  await view.rerender({ item, viewMode: "normal", attachmentUrl });
+  expect(observers).toHaveLength(1);
+  expect(loadConsoleAttachment).not.toHaveBeenCalled();
+  observers[0].notify(true);
+  await fireEvent.click(await view.findByRole("button", { name: "Enlarge tool output image" }));
+  const dialog = view.getByRole("dialog") as HTMLDialogElement;
+  await view.rerender({ item, viewMode: "overview", attachmentUrl });
+  expect(dialog.open).toBe(false);
+  expect(view.container.querySelector(".console-attachments")).toBeNull();
+  expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:image-1");
+  expect(loadConsoleAttachment).toHaveBeenCalledOnce();
+});
+
+test("Normal images wait for the Console scroll viewport and ignore a disposed observer", async () => {
+  const observers = installObserver(false);
+  const scroll = document.createElement("div");
+  scroll.className = "console-scroll";
+  document.body.append(scroll);
+  try {
+    const view = render(ConsoleAttachmentImage, { target: scroll, props: { attachment, url: "/image/a" } });
+    expect(observers[0].options).toEqual({ root: scroll, rootMargin: "160px" });
+    observers[0].notify(false);
+    await Promise.resolve();
+    expect(loadConsoleAttachment).not.toHaveBeenCalled();
+    await view.rerender({ attachment, url: "/image/b" });
+    expect(observers[0].disconnect).toHaveBeenCalled();
+    observers[0].notify(true);
+    expect(loadConsoleAttachment).not.toHaveBeenCalled();
+    observers[1].notify(true);
+    await view.findByAltText("Tool output attachment");
+    expect(loadConsoleAttachment).toHaveBeenCalledExactlyOnceWith("/image/b");
+  } finally {
+    cleanup();
+    scroll.remove();
+  }
+});
+
+test("without an observer images require an explicit load instead of eagerly downloading", async () => {
+  vi.stubGlobal("IntersectionObserver", undefined);
+  const view = render(ConsoleAttachmentImage, { attachment, url: "/image/a" });
+  expect(loadConsoleAttachment).not.toHaveBeenCalled();
+  await fireEvent.click(view.getByRole("button", { name: "Load image" }));
+  await view.findByAltText("Tool output attachment");
+  expect(loadConsoleAttachment).toHaveBeenCalledOnce();
 });
 
 test("clicking a loaded image opens a modal using the same blob, without another fetch", async () => {
