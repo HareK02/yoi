@@ -919,3 +919,91 @@ async fn saturated_host_before_command_start_returns_availability_without_a_prov
     host.drain().await.unwrap();
     fixture.api.store.db_executor().drain().await.unwrap();
 }
+
+#[tokio::test]
+async fn canonical_ticket_case_errors_are_logged_without_request_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut api = test_api(dir.path()).await;
+    let identity = RuntimeIdentityMaterial::generate("runtime-case-log").unwrap();
+    configure_runtime_request_auth(&mut api, &identity, "runtime-case-log");
+    seed_worker_source_member(&api, "runtime-case-log", "companion");
+    let backend = browser_ticket_backend(&api).unwrap();
+    let reference = backend
+        .create(ticket::NewTicket::new("Case logging"))
+        .unwrap();
+    let before = backend.show(reference.id.clone().into()).unwrap();
+    let input = case_test_request(
+        &before,
+        "case-log",
+        ticket::TicketCaseAction::Close {
+            reason: ticket::TicketClosureReason::Completed,
+        },
+    );
+    let mut body = serde_json::to_value(input).unwrap();
+    body.as_object_mut().unwrap().remove("author");
+    body["explanation"] = json!("body-secret");
+    let path = format!(
+        "/workspaces/{TEST_WORKSPACE_ID}/tickets/{}/case",
+        reference.id
+    );
+    let app = build_router(api.clone());
+    let request = |worker, body: &Value| {
+        runtime_source_request(
+            &identity,
+            worker,
+            "POST",
+            &format!("{path}?token=query-secret"),
+            serde_json::to_vec(body).unwrap(),
+        )
+    };
+    // Runtime identity alone still cannot impersonate a Worker or human.
+    let (status, error, events) = request_with_logs(app.clone(), request(None, &body)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{error}");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["path"], path);
+    assert_eq!(events[0]["status"], 403);
+    assert_eq!(events[0]["message"], error["message"]);
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("verified Runtime Worker identity")
+    );
+    assert_eq!(backend.show(reference.id.clone().into()).unwrap(), before);
+
+    // Profile-authorized unassigned Workers reach the same CAS validation.
+    let mut stale = body.clone();
+    stale["expected_content_digest"] = json!("stale");
+    let (status, error, events) =
+        request_with_logs(app.clone(), request(Some("companion"), &stale)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["path"], path);
+    assert_eq!(events[0]["status"], 409);
+    assert_eq!(events[0]["message"], error["message"]);
+    assert_eq!(backend.show(reference.id.clone().into()).unwrap(), before);
+
+    let (status, result, events) = request_with_logs(app, request(Some("companion"), &body)).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert!(events.is_empty(), "{events:?}");
+}
+
+#[tokio::test]
+async fn non_api_workspace_paths_are_not_logged_as_ticket_api_errors() {
+    let app = Router::new()
+        .route(
+            "/workspaces/not-a-ticket-page",
+            get(|| async { ApiError::from(Error::InvalidInput("not an API".into())) }),
+        )
+        .layer(middleware::from_fn(log_failed_api_response));
+    let (status, _, events) = request_with_logs(
+        app,
+        Request::builder()
+            .uri("/workspaces/not-a-ticket-page")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(events.is_empty());
+}

@@ -293,9 +293,9 @@ impl Tool for WorkspaceTicketReadTool {
             ))
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
         if !response.is_success() {
-            return Err(ToolError::ExecutionFailed(format!(
-                "Workspace Ticket API request failed with HTTP status {}",
-                response.status
+            return Err(ToolError::ExecutionFailed(ticket_api_error_message(
+                response.status,
+                &response.body,
             )));
         }
         let response_value: Value = serde_json::from_str(&response.body).map_err(|error| {
@@ -646,9 +646,9 @@ impl TicketFeatureAccess {
     }
 
     fn allows_tool(self, name: &str) -> bool {
-        // Publishing a decision tool is not an authority grant. The injected
-        // Workspace transport lets the Backend validate the current assignment
-        // or author/orchestrator permission on every decision, in both modes.
+        // Profile tool policy controls case-decision access in both modes.
+        // The Backend verifies actor/Workspace identity and CAS/replay, not
+        // orchestration assignment as an additional case-decision permission.
         READ_ONLY_TOOL_NAMES.contains(&name)
             || (name == "TicketCaseUpdate" && (self.authoring || self.thread || self.workflow))
             || (self.authoring && AUTHORING_TOOL_NAMES.contains(&name))
@@ -921,9 +921,9 @@ impl WorkspaceHttpTicketBackend {
             TicketError::Conflict(format!("ticket REST request failed: {error}"))
         })?;
         if !response.is_success() {
-            return Err(TicketError::Conflict(format!(
-                "ticket REST API request failed with HTTP status {}",
-                response.status
+            return Err(TicketError::Conflict(ticket_api_error_message(
+                response.status,
+                &response.body,
             )));
         }
         serde_json::from_str(&response.body)
@@ -997,9 +997,9 @@ impl WorkspaceHttpTicketBackend {
             TicketError::Conflict(format!("ticket REST request failed: {error}"))
         })?;
         if !response.is_success() {
-            return Err(TicketError::Conflict(format!(
-                "ticket REST API request failed with HTTP status {}",
-                response.status
+            return Err(TicketError::Conflict(ticket_api_error_message(
+                response.status,
+                &response.body,
             )));
         }
         Ok(TicketBackendOperationResult::Unit)
@@ -2100,6 +2100,56 @@ fn authorize_native_ticket(
     }
 }
 
+// Only render the public API error envelope, never an arbitrary proxy body or
+// unknown fields. Backend owns redaction of its public message; bound it here
+// and keep diagnostics to stable codes rather than raw provider details.
+fn ticket_api_error_message(status: u16, body: &str) -> String {
+    let mut message = format!("ticket REST API request failed with HTTP status {status}");
+    if body.len() > 64 * 1024 {
+        return message;
+    }
+    let Ok(error) = serde_json::from_str::<server_api::RepositoryApiError>(body) else {
+        return message;
+    };
+    let detail = if error.message.trim().is_empty() {
+        &error.error
+    } else {
+        &error.message
+    };
+    let mut chars = detail.trim().chars();
+    let bounded: String = chars
+        .by_ref()
+        .take(1024)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if !bounded.is_empty() {
+        message.push_str(": ");
+        message.push_str(&bounded);
+        if chars.next().is_some() {
+            message.push('…');
+        }
+    }
+    let codes: Vec<_> = error
+        .diagnostics
+        .iter()
+        .take(4)
+        .map(|diagnostic| diagnostic.code.as_str())
+        .filter(|code| {
+            !code.is_empty()
+                && code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+        })
+        .collect();
+    if !codes.is_empty() {
+        message.push_str(" [");
+        message.push_str(&codes.join(", "));
+        message.push(']');
+    }
+    message
+}
+
 fn map_ticket_tool_error(error: ToolError) -> WipOperationError {
     match error {
         ToolError::InvalidArgument(message) => {
@@ -2112,17 +2162,19 @@ fn map_ticket_tool_error(error: ToolError) -> WipOperationError {
             format!("{code}: {message}"),
         ),
         ToolError::ExecutionFailed(message) => {
-            if message.contains("HTTP status 401") || message.contains("HTTP status 403") {
-                protocol_failure(ProtocolErrorCode::PermissionDenied, message)
-            } else if message.contains("HTTP status 404") {
-                protocol_failure(ProtocolErrorCode::NotFound, message)
-            } else if message.contains("HTTP status 400")
-                || message.contains("HTTP status 409")
-                || message.contains("HTTP status 422")
-            {
-                protocol_failure(ProtocolErrorCode::InvalidArguments, message)
-            } else {
-                WipOperationError::OutcomeUnknown(message)
+            // Parse the transport status before the public detail. A message
+            // mentioning a different HTTP status must not change classification.
+            let status = message
+                .split_once("HTTP status ")
+                .and_then(|(_, tail)| tail.split(|c: char| c == ':' || c.is_whitespace()).next())
+                .and_then(|status| status.parse::<u16>().ok());
+            match status {
+                Some(401 | 403) => protocol_failure(ProtocolErrorCode::PermissionDenied, message),
+                Some(404) => protocol_failure(ProtocolErrorCode::NotFound, message),
+                Some(400 | 409 | 422) => {
+                    protocol_failure(ProtocolErrorCode::InvalidArguments, message)
+                }
+                _ => WipOperationError::OutcomeUnknown(message),
             }
         }
         ToolError::Internal(message) => WipOperationError::OutcomeUnknown(message),
@@ -2460,6 +2512,135 @@ mod tests {
             "action": {"action": "close", "reason": "not_planned"},
             "explanation": "No repository changes are needed"
         })
+    }
+
+    #[tokio::test]
+    async fn ticket_api_errors_keep_public_details_in_tools_and_wip() {
+        for (status, code) in [
+            (403, ProtocolErrorCode::PermissionDenied),
+            (404, ProtocolErrorCode::NotFound),
+            (409, ProtocolErrorCode::InvalidArguments),
+        ] {
+            let client = Arc::new(DecisionClient {
+                requests: Mutex::new(Vec::new()),
+                response: crate::worker::WorkspaceResponse {
+                    status,
+                    body: json!({
+                        "error": "Rejected",
+                        "message": "Verified actor is required; unrelated HTTP status 401",
+                        "diagnostics": [{"code":"ticket_actor_required", "severity":"error", "message":"provider-private-detail"}]
+                    }).to_string(),
+                },
+            });
+            let (_, tool) = workspace_ticket_decision_definition(
+                client.clone(),
+                WorkspaceTicketDecisionKind::CaseUpdate,
+            )();
+            let error = tool
+                .execute(
+                    &decision_input().to_string(),
+                    ToolExecutionContext::direct(),
+                )
+                .await
+                .unwrap_err();
+            let text = error.to_string();
+            assert!(text.contains(&format!("HTTP status {status}")), "{text}");
+            assert!(text.contains("Verified actor is required"), "{text}");
+            assert!(text.contains("ticket_actor_required"), "{text}");
+            assert!(!text.contains("provider-private-detail"));
+            assert!(
+                matches!(map_ticket_tool_error(error), WipOperationError::Protocol(ProtocolError {code: actual, ..}) if actual == code)
+            );
+
+            // Unit-returning mutations and read tools share the same formatter.
+            let error = WorkspaceHttpTicketBackend::request_unit(
+                client.clone(),
+                WorkspaceRequestMethod::Post,
+                "/test".into(),
+                None,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("Verified actor is required"));
+            let (_, read) =
+                workspace_ticket_read_definition(client.clone(), WorkspaceTicketReadKind::Show)();
+            let error = read
+                .execute(r#"{"id":"T-739"}"#, ToolExecutionContext::direct())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("ticket_actor_required"));
+
+            let tools =
+                native_ticket_tools(client.clone(), TicketFeatureAccess::workspace_authoring())
+                    .unwrap();
+            let error = execute_native_ticket_tool(
+                tools
+                    .iter()
+                    .find(|tool| tool.name == "TicketCaseUpdate")
+                    .unwrap(),
+                &None,
+                decision_input(),
+                WipCallContext {
+                    execution: ToolExecutionContext::direct(),
+                    security_context: String::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, WipOperationError::Protocol(ProtocolError {code: actual, ref message}) if actual == code && message.contains("Verified actor is required"))
+            );
+        }
+    }
+
+    #[test]
+    fn ticket_api_errors_bound_public_fields_and_ignore_unstructured_bodies() {
+        let prefix = "ticket REST API request failed with HTTP status 502";
+        for body in [
+            "<html>proxy-private-detail</html>".into(),
+            "not JSON".into(),
+            json!({"message":"not the public envelope", "token":"private"}).to_string(),
+            json!({"error":"Rejected", "message":"detail", "token":"private"}).to_string(),
+            "x".repeat(64 * 1024 + 1),
+        ] {
+            assert_eq!(ticket_api_error_message(502, &body), prefix);
+        }
+        let body =
+            json!({"error":"Rejected", "message":format!("line\n\u{1b}{}", "あ".repeat(2000)),
+            "diagnostics":[{"code":"/private/path", "severity":"error", "message":"secret"}] })
+            .to_string();
+        let message = ticket_api_error_message(502, &body);
+        assert!(message.ends_with('…'));
+        assert!(message.len() < 4096);
+        assert!(!message.chars().any(char::is_control));
+        assert!(!message.contains("secret") && !message.contains("/private/path"));
+        let message = ticket_api_error_message(
+            502,
+            &json!({"error":"Bad Gateway", "message":"upstream reported HTTP status 403"})
+                .to_string(),
+        );
+        assert!(matches!(
+            map_ticket_tool_error(ToolError::ExecutionFailed(message)),
+            WipOperationError::OutcomeUnknown(_)
+        ));
+    }
+
+    #[test]
+    fn case_tool_availability_is_profile_controlled_in_both_interfaces() {
+        for (access, allowed) in [
+            (TicketFeatureAccess::read_only(), false),
+            (TicketFeatureAccess::review(), false),
+            (TicketFeatureAccess::workspace_authoring(), true),
+            (TicketFeatureAccess::work_report(), true),
+            (TicketFeatureAccess::workflow(), true),
+        ] {
+            assert_eq!(access.tool_names().contains(&"TicketCaseUpdate"), allowed);
+            let tools =
+                native_ticket_tools(decision_client(200, TicketState::Open), access).unwrap();
+            assert_eq!(
+                tools.iter().any(|tool| tool.name == "TicketCaseUpdate"),
+                allowed
+            );
+        }
     }
 
     #[test]
@@ -3282,6 +3463,15 @@ mod tests {
                 WipOperationError::Protocol(ProtocolError { code: actual, .. }) if actual == code
             ));
         }
+        // Assignment tools use a separate adapter but share this WIP classifier.
+        assert!(matches!(
+            map_ticket_tool_error(ToolError::ExecutionFailed("Assignment request failed with HTTP status 403: denied; HTTP status 409 is unrelated".into())),
+            WipOperationError::Protocol(ProtocolError { code: ProtocolErrorCode::PermissionDenied, .. })
+        ));
+        assert!(matches!(
+            map_ticket_tool_error(ToolError::ExecutionFailed("Assignment tracking request failed with HTTP status 409: stale; HTTP status 403 is unrelated".into())),
+            WipOperationError::Protocol(ProtocolError { code: ProtocolErrorCode::InvalidArguments, .. })
+        ));
         assert!(matches!(
             map_ticket_tool_error(ToolError::ExecutionFailed("transport disconnected".into())),
             WipOperationError::OutcomeUnknown(_)

@@ -12486,7 +12486,9 @@ async fn log_failed_api_response(request: Request, next: Next) -> Response {
     let response = next.run(request).await;
     let status = response.status();
 
-    if uri.path().starts_with("/api/") && (status.is_client_error() || status.is_server_error()) {
+    let is_api = uri.path().starts_with("/api/")
+        || canonical_ticket_operation_workspace_id(uri.path()).is_some();
+    if is_api && (status.is_client_error() || status.is_server_error()) {
         // Generated routes bypass ApiError::into_response; inspect their typed error, not the body.
         let generated_error = response
             .extensions()
@@ -16038,23 +16040,6 @@ fn execute_ticket_rest_operation_on_host(
     }
     validate_ticket_repository_operation(api, &operation)?;
     let before = target.as_ref().and_then(|id| backend.show(id.clone()).ok());
-    if let Some(source) = source.as_ref()
-        && (generic_ticket_state_change(&operation).is_some()
-            || matches!(
-                operation,
-                TicketBackendOperation::QueueReady { .. }
-                    | TicketBackendOperation::MarkReady { .. }
-            ))
-    {
-        let context = worker_ticket_source_context(api, workspace_id, source, before.as_ref());
-        let is_orchestrator =
-            find_workspace_orchestrator(api).is_some_and(|worker| worker.worker == *source);
-        if context.actor_role != "ticket_worker" && !is_orchestrator {
-            return Err(Error::WorkspacePermissionDenied(
-                "Ticket state decisions require the assigned Worker or registered Workspace Orchestrator".into(),
-            ).into());
-        }
-    }
     let mut ticket_item_check = source
         .as_ref()
         .cloned()
@@ -18291,67 +18276,66 @@ async fn apply_ticket_case_update(
     Json(mut request): Json<ticket::TicketCaseUpdate>,
 ) -> ApiResult<Json<ticket::Ticket>> {
     let actor = actor.cloned();
-    api.host_executors.host()?.run(move || {
-        let actor = actor.as_ref();
+    api.host_executors
+        .host()?
+        .run(move || {
+            let actor = actor.as_ref();
 
-    validate_workspace_scope(&api, &workspace_id)?;
-    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
-    let mut backend = browser_ticket_backend(&api)?;
-    let before = backend
-        .show(TicketIdOrSlug::Id(ticket_id.clone()))
-        .map_err(Error::from)?;
-    if let Some(source) = source {
-        let author = format!("worker:{}/{}", source.runtime_id, source.worker_id);
-        let replay_event = before.events.iter().find(|event| {
-            event.author.as_deref() == Some(author.as_str())
-                && event.attributes.get("operation_key") == Some(&request.operation_key)
-                && event.attributes.get("source_runtime_id") == Some(&source.runtime_id)
-                && event.attributes.get("source_worker_id") == Some(&source.worker_id)
-        });
-        let replay = replay_event.is_some();
-        let context = worker_ticket_source_context(&api, &workspace_id, &source, Some(&before));
-        let is_orchestrator =
-            find_workspace_orchestrator(&api).is_some_and(|worker| worker.worker == source);
-        if !replay && context.actor_role != "ticket_worker" && !is_orchestrator {
-            return Err(Error::WorkspacePermissionDenied(
-                "Ticket state decisions require the assigned Worker or registered Workspace Orchestrator".into(),
-            ).into());
-        }
-        request.author = Some(author);
-        let attributes = if let Some(event) = replay_event {
-            // Replay authenticates the same actor, but retains the receipt's
-            // original work identity. Completion/reopen never revives that grant.
-            event
-                .attributes
-                .iter()
-                .filter(|(key, _)| key.starts_with("source_"))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect()
-        } else {
-            context.attributes("case_update")
-        };
-        backend = backend.with_event_attributes(attributes);
-    } else if let Some(actor) = actor {
-        // Include both verified IDs in the author (and thus the receipt fingerprint).
-        // JSON tuple encoding avoids ambiguous identity concatenation; proof tokens,
-        // auth method and signature timestamps are not replay identity.
-        let identity = serde_json::to_string(&(&actor.account_id, &actor.user_id))
-            .map_err(|error| Error::Config(format!("failed to encode case actor: {error}")))?;
-        request.author = Some(format!("workspace-user:{identity}"));
-        backend = backend.with_event_attributes(BTreeMap::from([
-            ("source_account_id".into(), actor.account_id.clone()),
-            ("source_user_id".into(), actor.user_id.clone()),
-        ]));
-    } else {
-        // Only the test-only header adapter can reach this legacy attribution.
-        request.author = Some("workspace-user".into());
-    }
-    let ticket = backend
-        .update_case(&ticket_id, request)
-        .map_err(Error::from)?;
-    Ok(Json(ticket))
-
-    }).await
+            validate_workspace_scope(&api, &workspace_id)?;
+            let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
+            let mut backend = browser_ticket_backend(&api)?;
+            let before = backend
+                .show(TicketIdOrSlug::Id(ticket_id.clone()))
+                .map_err(Error::from)?;
+            if let Some(source) = source {
+                let author = format!("worker:{}/{}", source.runtime_id, source.worker_id);
+                let replay_event = before.events.iter().find(|event| {
+                    event.author.as_deref() == Some(author.as_str())
+                        && event.attributes.get("operation_key") == Some(&request.operation_key)
+                        && event.attributes.get("source_runtime_id") == Some(&source.runtime_id)
+                        && event.attributes.get("source_worker_id") == Some(&source.worker_id)
+                });
+                // Profile tool policy authorizes this operation at the Runtime boundary.
+                // Assignment is audit context, not an additional case-decision permission.
+                let context =
+                    worker_ticket_source_context(&api, &workspace_id, &source, Some(&before));
+                request.author = Some(author);
+                let attributes = if let Some(event) = replay_event {
+                    // Replay authenticates the same actor, but retains the receipt's
+                    // original work identity. Completion/reopen never revives that grant.
+                    event
+                        .attributes
+                        .iter()
+                        .filter(|(key, _)| key.starts_with("source_"))
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect()
+                } else {
+                    context.attributes("case_update")
+                };
+                backend = backend.with_event_attributes(attributes);
+            } else if let Some(actor) = actor {
+                // Include both verified IDs in the author (and thus the receipt fingerprint).
+                // JSON tuple encoding avoids ambiguous identity concatenation; proof tokens,
+                // auth method and signature timestamps are not replay identity.
+                let identity = serde_json::to_string(&(&actor.account_id, &actor.user_id))
+                    .map_err(|error| {
+                        Error::Config(format!("failed to encode case actor: {error}"))
+                    })?;
+                request.author = Some(format!("workspace-user:{identity}"));
+                backend = backend.with_event_attributes(BTreeMap::from([
+                    ("source_account_id".into(), actor.account_id.clone()),
+                    ("source_user_id".into(), actor.user_id.clone()),
+                ]));
+            } else {
+                // Only the test-only header adapter can reach this legacy attribution.
+                request.author = Some("workspace-user".into());
+            }
+            let ticket = backend
+                .update_case(&ticket_id, request)
+                .map_err(Error::from)?;
+            Ok(Json(ticket))
+        })
+        .await
 }
 
 fn reject_non_browser_reopen_auth(headers: &HeaderMap) -> Result<()> {
@@ -51528,7 +51512,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_decisions_reject_other_workers_and_browser_route_source_bypasses() {
+    async fn ticket_decisions_allow_verified_workers_without_target_assignment() {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
         let backend = browser_ticket_backend(&api).unwrap();
@@ -51545,23 +51529,26 @@ mod tests {
             },
             expected_closure_operation_key: None,
             author: None,
-            operation_key: "forged".into(),
+            operation_key: "authorized-case-decision".into(),
             expected_content_digest: ticket::ticket_content_digest(&before),
             expected_state: TicketState::Open,
-            explanation: "Not my task".into(),
+            explanation: "Authorized case decision independent of assignment".into(),
             references: Vec::new(),
         };
-        let response = scoped_ticket_case_update(
+        let Json(closed) = scoped_ticket_case_update(
             State(api.clone()),
             ticket_check_headers(&other),
             AxumPath((TEST_WORKSPACE_ID.into(), ticket.id.clone())),
             Json(request),
         )
         .await
-        .unwrap_err()
-        .into_response();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_eq!(backend.show(ticket.id.into()).unwrap(), before);
+        .unwrap();
+        assert_eq!(closed.meta.workflow_state, TicketState::Closed);
+        assert_eq!(
+            closed.events.last().unwrap().attributes["source_actor_role"],
+            "worker"
+        );
+        assert_eq!(backend.show(ticket.id.into()).unwrap(), closed);
     }
 
     #[tokio::test]
