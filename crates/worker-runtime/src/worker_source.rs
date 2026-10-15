@@ -640,6 +640,11 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
                                     .await,
                             )
                         }
+                        WorkspaceServerOperation::NotificationDiagnostics { query } => {
+                            generated_workspace_response(
+                                client.notification_diagnostics(workspace_id, query).await,
+                            )
+                        }
                         WorkspaceServerOperation::TicketAssignmentDiagnostics {
                             ticket_id,
                             query,
@@ -955,6 +960,19 @@ mod tests {
             serde_json::json!({"workspace_id":"workspace-a", "ticket_id":"T-1", "assignment":null});
         let answer: server_api::TicketAssignmentAnswerRequest = serde_json::from_value(serde_json::json!({ "assignment_id": "delegation", "expected_last_event_id": "observed", "operation_key": "answer-op", "body": "User answer\ncontinued" })).unwrap();
         let cases = vec![
+            (
+                WorkspaceServerOperation::NotificationDiagnostics {
+                    query: server_api::NotificationDiagnosticsQuery {
+                        ticket: Some("T-1".into()),
+                        source_event_id: Some("ticket-event:1".into()),
+                        limit: Some(1),
+                        ..Default::default()
+                    },
+                },
+                "GET",
+                "/api/w/workspace-a/notification-diagnostics?ticket=T-1&source_event_id=ticket-event%3A1&limit=1",
+                serde_json::json!({"items":[],"next_cursor":null,"source_checks":[]}),
+            ),
             (
                 WorkspaceServerOperation::TicketAssignmentSet {
                     ticket_id: "T-1".into(),

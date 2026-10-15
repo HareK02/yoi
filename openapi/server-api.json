@@ -5632,6 +5632,258 @@
         ],
         "type": "object"
       },
+      "NotificationDiagnostic": {
+        "additionalProperties": false,
+        "properties": {
+          "assignment_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "delivery_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "disposition": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "event_kind": {
+            "type": "string"
+          },
+          "job_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_failure_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_failure_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "merge_request_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_processing_confirmed": {
+            "description": "No model-processing evidence is currently collected by this read contract.",
+            "type": "boolean"
+          },
+          "purpose": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "recipient_current": {
+            "description": "Current assignment identity only; null for fixed-worker or absent recipients.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "recipient_role": {
+            "type": "string"
+          },
+          "retry_candidate": {
+            "description": "Saved delivery candidate, NOT permission to send. Live recipient and binding checks remain required.",
+            "type": "boolean"
+          },
+          "source_event_id": {
+            "type": "string"
+          },
+          "source_id": {
+            "type": "string"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/NotificationDiagnosticStage"
+          },
+          "target_runtime_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_worker_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ticket": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "source_id",
+          "source_event_id",
+          "event_kind",
+          "recipient_role",
+          "stage",
+          "retry_candidate",
+          "model_processing_confirmed"
+        ],
+        "type": "object"
+      },
+      "NotificationDiagnosticStage": {
+        "enum": [
+          "historical",
+          "awaiting_routing",
+          "suppressed",
+          "deferred",
+          "pending",
+          "reserved",
+          "request_persisted",
+          "runtime_rejected",
+          "acceptance_unknown",
+          "delivery_failed",
+          "runtime_accepted"
+        ],
+        "type": "string"
+      },
+      "NotificationDiagnosticsPage": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/NotificationDiagnostic"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_checks": {
+            "items": {
+              "$ref": "#/components/schemas/NotificationSourceCheck"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items",
+          "source_checks"
+        ],
+        "type": "object"
+      },
+      "NotificationDiagnosticsQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "assignment_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "delivery_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "job_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "merge_request_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_event_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_id": {
+            "description": "Exact source identity for a single-record lookup.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ticket": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "NotificationSourceCheck": {
+        "additionalProperties": false,
+        "properties": {
+          "captured": {
+            "description": "Whether the origin has any captured source (independent of pagination/recipient filters).\nA present origin with false here is unconnected, not intentionally suppressed.",
+            "type": "boolean"
+          },
+          "origin_present": {
+            "description": "Whether an exact durable origin is present; null means that reference form was not verified.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "reference": {
+            "type": "string"
+          },
+          "resource_kind": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "resource_kind",
+          "reference",
+          "captured"
+        ],
+        "type": "object"
+      },
       "Nullable_string": {
         "type": [
           "string",
@@ -17235,7 +17487,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:334f540d268db97ec52ce67092f4d672a5757f11df3589ac54153cd595e95904"
+    "x-yoi-source-digest": "sha256:ba0b73fac609dc65712a95c3b96f1044b16f82a5775f591813c02e8f392b5a04"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -24473,6 +24725,103 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/MergeRequestDetailResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/notification-diagnostics": {
+      "get": {
+        "operationId": "notification_diagnostics",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/NotificationDiagnosticsQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationDiagnosticsPage"
                 }
               }
             },

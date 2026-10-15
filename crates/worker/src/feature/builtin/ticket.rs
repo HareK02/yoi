@@ -40,6 +40,7 @@
 
 mod assignment_public;
 mod assignment_tracking;
+mod notification_diagnostics;
 mod tags;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -486,6 +487,7 @@ fn workspace_ticket_decision_definition(
 fn workspace_ticket_tool_description(name: &str) -> String {
     match name {
         "TicketCaseUpdate" => TICKET_CASE_UPDATE_DESCRIPTION.into(),
+        "NotificationDiagnostics" => notification_diagnostics::DESCRIPTION.into(),
         name if assignment_public::TOOL_NAMES.contains(&name) => {
             assignment_public::description(name).into()
         }
@@ -642,6 +644,7 @@ impl TicketFeatureAccess {
                             || (*name == "TicketAssignmentAnswer" && self.thread)
                     }),
             )
+            .chain(std::iter::once(notification_diagnostics::NAME))
             .collect()
     }
 
@@ -665,6 +668,7 @@ const READ_ONLY_TOOL_NAMES: &[&str] = &[
     "TicketAssignmentTrackingHistory",
     "TicketAssignmentsQuery",
     "TicketAssignmentDiagnostics",
+    "NotificationDiagnostics",
 ];
 
 const AUTHORING_TOOL_NAMES: &[&str] = &[
@@ -701,6 +705,7 @@ const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketAssignmentsQuery",
     "TicketAssignmentDiagnostics",
     "TicketAssignmentAnswer",
+    "NotificationDiagnostics",
 ];
 
 #[cfg(test)]
@@ -727,6 +732,7 @@ const WORKFLOW_TOOL_NAMES: &[&str] = &[
     "TicketAssignmentsQuery",
     "TicketAssignmentDiagnostics",
     "TicketAssignmentAnswer",
+    "NotificationDiagnostics",
 ];
 
 const WORKFLOW_ADDITIONAL_TOOL_NAMES: &[&str] = &[
@@ -1631,6 +1637,12 @@ fn native_ticket_operation(tool_name: &str) -> Option<NativeTicketOperation> {
             identity_field: Some("ticket"),
             mutating: false,
         },
+        "NotificationDiagnostics" => NativeTicketOperation {
+            operation: "notification_diagnostics",
+            surface: NativeTicketSurface::Collection,
+            identity_field: None,
+            mutating: false,
+        },
         "TicketAssignmentDiagnostics" => NativeTicketOperation {
             operation: "assignment_diagnostics",
             surface: NativeTicketSurface::Item,
@@ -1769,6 +1781,9 @@ pub(crate) fn enabled_ticket_definitions(
         if allowed.contains(&kind.name()) {
             definitions.push(assignment_public::definition(client.clone(), kind));
         }
+    }
+    if allowed.contains(&notification_diagnostics::NAME) {
+        definitions.push(notification_diagnostics::definition(client.clone()));
     }
     definitions
 }

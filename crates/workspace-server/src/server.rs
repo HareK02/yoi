@@ -6862,6 +6862,9 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::ticket_summary_search(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::notification_diagnostics(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::ticket_doctor(service.clone()))
         .merge(server_api::server_api_axum::ticket_relation_query(
             service.clone(),
@@ -10794,6 +10797,26 @@ impl server_api::ServerApi for ServerApiContractService {
         .await
         .map_err(ApiError::into_repository_api_error)?;
         Ok(response)
+    }
+
+    async fn notification_diagnostics(
+        &self,
+        _context: server_api::ServerRequestContext,
+        workspace_id: String,
+        query: server_api::NotificationDiagnosticsQuery,
+    ) -> std::result::Result<server_api::NotificationDiagnosticsPage, server_api::RepositoryApiError>
+    {
+        let api = self.workspace_api()?.clone();
+        let executor = api.store.db_executor();
+        executor
+            .run(move || {
+                validate_workspace_scope(&api, &workspace_id)?;
+                api.store
+                    .notification_diagnostics(&workspace_id, &query)
+                    .map_err(ApiError::from)
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn ticket_case_update(

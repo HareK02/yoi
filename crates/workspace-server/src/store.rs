@@ -62,6 +62,8 @@ use crate::{Error, Result};
 
 #[path = "assignment_delivery.rs"]
 mod assignment_delivery;
+#[path = "notification_diagnostics.rs"]
+mod notification_diagnostics;
 #[path = "notification_routing.rs"]
 mod notification_routing;
 pub use notification_routing::{
@@ -1897,6 +1899,11 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         delivery_id: &str,
         source: &TicketAssignmentTrackingSourceContext,
     ) -> Result<()>;
+    fn notification_diagnostics(
+        &self,
+        workspace_id: &str,
+        query: &server_api::NotificationDiagnosticsQuery,
+    ) -> Result<server_api::NotificationDiagnosticsPage>;
     fn list_pending_ticket_worker_notifications(
         &self,
         workspace_id: &str,
@@ -8040,6 +8047,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             created_at,
             None,
         )
+    }
+    fn notification_diagnostics(
+        &self,
+        workspace_id: &str,
+        query: &server_api::NotificationDiagnosticsQuery,
+    ) -> Result<server_api::NotificationDiagnosticsPage> {
+        notification_diagnostics::page(self, workspace_id, query)
     }
     fn list_pending_ticket_worker_notifications(
         &self,
@@ -15141,6 +15155,7 @@ mod tests {
     include!("assignment_tracking_tests.rs");
     include!("assignment_delivery_tests.rs");
     include!("notification_routing_tests.rs");
+    include!("notification_diagnostics_tests.rs");
     include!("store_workspace_config_tests.rs");
 
     fn drive_grant_fixture(store: &SqliteWorkspaceStore) -> server_api::DriveGrantResponse {

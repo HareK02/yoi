@@ -746,6 +746,9 @@ pub enum WorkspaceServerOperation {
         ticket_id: String,
         query: server_api::TicketAssignmentsQuery,
     },
+    NotificationDiagnostics {
+        query: server_api::NotificationDiagnosticsQuery,
+    },
     TicketAssignmentDiagnostics {
         ticket_id: String,
         query: server_api::TicketAssignmentDiagnosticsQuery,
@@ -903,6 +906,13 @@ fn workspace_server_operation_request(
                     "/workspaces/{workspace_id}/tickets/{}/assignment-tracking/assignments",
                     encode_workspace_path_segment(&ticket_id)
                 ),
+                &query,
+            )
+        }
+        WorkspaceServerOperation::NotificationDiagnostics { query } => {
+            workspace_server_query_request(
+                WorkspaceRequestMethod::Get,
+                format!("{base}/notification-diagnostics"),
                 &query,
             )
         }

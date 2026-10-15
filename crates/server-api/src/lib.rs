@@ -7,6 +7,8 @@ pub use api_macros::axum as server_support;
 pub use api_macros::reqwest as client_support;
 pub use api_macros::{ApiContract, BinaryBody, HttpMethod, TransportMetadata, WebSocketOperation};
 mod drive;
+mod notification;
+pub use notification::*;
 pub mod repository_openapi_typescript;
 pub use drive::*;
 mod workspace_config;
@@ -366,6 +368,8 @@ impl_openapi_schema!(
     TicketAssignmentsPage,
     TicketAssignmentAnswerRequest,
     TicketAssignmentAnswerResponse,
+    NotificationDiagnosticsQuery,
+    NotificationDiagnosticsPage,
     TicketAssignmentDiagnosticsQuery,
     TicketAssignmentDiagnosticsPage,
     TicketQueryRequest,
@@ -3240,6 +3244,14 @@ pub trait ServerApi {
         #[path] ticket_id: String,
         #[query] query: TicketAssignmentsQuery,
     ) -> Result<TicketAssignmentsPage, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/notification-diagnostics", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn notification_diagnostics(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] query: NotificationDiagnosticsQuery,
+    ) -> Result<NotificationDiagnosticsPage, RepositoryApiError>;
 
     #[get("/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-diagnostics", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_assignment_diagnostics(

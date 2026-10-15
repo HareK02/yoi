@@ -537,6 +537,13 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketAssignmentsPage")],
         },
         OperationContract {
+            path: "/api/w/{workspace_id}/notification-diagnostics",
+            method: "get",
+            operation_id: "notification_diagnostics",
+            request: None,
+            successes: &[("200", "NotificationDiagnosticsPage")],
+        },
+        OperationContract {
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-diagnostics",
             method: "get",
             operation_id: "ticket_assignment_diagnostics",

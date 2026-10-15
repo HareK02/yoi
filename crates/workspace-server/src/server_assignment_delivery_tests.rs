@@ -6,6 +6,26 @@ use super::*;
 use session_store::{LogEntry, Store, WorkerSessionStore};
 use worker_runtime::execution as delivery_execution;
 
+#[tokio::test]
+async fn notification_diagnostics_http_auth_scope_and_readonly_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = test_api(dir.path()).await;
+    seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+    let ticket = delivery_ticket(&api, "Notification diagnostics auth fixture");
+    delivery_assign(&api, ticket.id.as_str(), "diagnostics-assignment").await;
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/notification-diagnostics?ticket={}&limit=1",ticket.id.as_str());
+    let page = delivery_http(&api,"GET",&path,None,StatusCode::OK).await;
+    assert_eq!(page["items"].as_array().unwrap().len(),1);
+    assert_eq!(page["items"][0]["model_processing_confirmed"],false);
+    assert!(page["items"][0].get("content").is_none());
+    let again=delivery_http(&api,"GET",&path,None,StatusCode::OK).await;
+    assert_eq!(again,page);
+    let response=build_router(api.clone()).oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(),StatusCode::UNAUTHORIZED);
+    delivery_http(&api,"GET","/api/w/other-workspace/notification-diagnostics",None,StatusCode::NOT_FOUND).await;
+    delivery_http(&api,"GET",&format!("/api/w/{TEST_WORKSPACE_ID}/notification-diagnostics?limit=101"),None,StatusCode::BAD_REQUEST).await;
+}
+
 fn delivery_assignment_path(ticket: &str) -> String {
     format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator")
 }
@@ -979,6 +999,10 @@ async fn assignment_real_worker_response_loss_restore_and_concurrent_scans_commi
         "uncertain delivery changed request id or payload: {attempts:?}"
     );
     assert_eq!(delivery_receipts(&api, &worker).len(), 1);
+    let unknown = api.store.notification_diagnostics(TEST_WORKSPACE_ID, &server_api::NotificationDiagnosticsQuery {
+        assignment_id: Some(assignment.into()), ..Default::default()
+    }).unwrap().items.into_iter().find(|item| item.stage == server_api::NotificationDiagnosticStage::AcceptanceUnknown).expect("saved unknown acceptance must remain visible while Runtime already has its receipt");
+    assert!(!unknown.model_processing_confirmed);
     // Change mutable rendering context while the acknowledgement is unknown.
     // A new self-report is not a new input and cannot change the frozen retry.
     seed_worker_source_member(&api, &worker.runtime_id, &worker.worker_id);
@@ -1038,6 +1062,11 @@ async fn assignment_real_worker_response_loss_restore_and_concurrent_scans_commi
     }
     delivery_wait_idle(&reopened, &worker, 2).await;
     assert_eq!(delivery_receipts(&reopened, &worker).len(), 2);
+    let evidence = delivery_http(&reopened,"GET",&format!("/api/w/{TEST_WORKSPACE_ID}/notification-diagnostics?source_id={}",unknown.source_id),None,StatusCode::OK).await;
+    assert_eq!(evidence["items"][0]["stage"],"runtime_accepted");
+    assert_eq!(evidence["items"][0]["delivery_id"],json!(unknown.delivery_id));
+    assert_eq!(evidence["items"][0]["model_processing_confirmed"],false);
+    assert_eq!(evidence["items"][0]["retry_candidate"],false);
     assert_eq!(
         delivery_commits(&reopened, &worker)
             .iter()
