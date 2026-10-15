@@ -163,6 +163,11 @@ async fn job_notification_checker_read_failure_reopen_recovers_same_source_to_re
     let failed_once = failures();
     assert_eq!(failed_once.len(), 1);
     assert_eq!(failed_once[0].2, "source_lookup_failed");
+    let diagnostic=api.store.notification_diagnostics(TEST_WORKSPACE_ID,&server_api::NotificationDiagnosticsQuery{job_id:Some(request.job_id.clone()),..Default::default()}).unwrap().items.remove(0);
+    assert_eq!(diagnostic.stage,server_api::NotificationDiagnosticStage::DeliveryFailed);
+    assert!(diagnostic.disposition.is_none() && diagnostic.retry_candidate);
+    assert!(!diagnostic.acceptance_outcome_unknown);
+    assert_eq!(diagnostic.last_failure_code.as_deref(),Some("source_lookup_failed"));
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM notification_decisions WHERE source_sequence=?1", [original_source.0], |r| r.get::<_,i64>(0)).unwrap(), 0);
     assert!(api.store.job_notification_request(TEST_WORKSPACE_ID, &source.delivery_id).unwrap().is_none());
     assert!(delivery_receipts(&api, &target).is_empty());
@@ -189,6 +194,10 @@ async fn job_notification_checker_read_failure_reopen_recovers_same_source_to_re
     assert!(execution.attempts.lock().unwrap().iter().any(|attempt| attempt.0 == source.delivery_id && attempt.1 == pinned.0));
     assert_eq!(source_snapshot(), original_source);
     assert_eq!(failures(), failed_once, "recovery must retain the original failure observation");
+    let diagnostic=reopened.store.notification_diagnostics(TEST_WORKSPACE_ID,&server_api::NotificationDiagnosticsQuery{job_id:Some(request.job_id.clone()),..Default::default()}).unwrap().items.remove(0);
+    assert_eq!(diagnostic.stage,server_api::NotificationDiagnosticStage::RuntimeAccepted);
+    assert_eq!(diagnostic.last_failure_code.as_deref(),Some("source_lookup_failed"));
+    assert!(!diagnostic.retry_candidate && !diagnostic.acceptance_outcome_unknown && !diagnostic.model_processing_confirmed);
     let job = reopened.store.get_backend_job(TEST_WORKSPACE_ID, &request.job_id).unwrap().unwrap();
     assert_eq!(job.state, BackendJobState::Completed);
     assert_eq!(job.current_attempt, accepted.job.current_attempt);

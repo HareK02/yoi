@@ -33,7 +33,12 @@ fn source_checks(
         });
     }
     if let Some(id) = &query.source_event_id {
-        let captured: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM notification_sources s LEFT JOIN workspace_resource_keys k ON k.workspace_id=s.workspace_id AND k.resource_kind='ticket' AND k.resource_id=s.ticket_id WHERE s.workspace_id=?1 AND s.input_event_id=?2 AND (?3 IS NULL OR s.ticket_id=?3 OR k.resource_key=?3))",params![workspace,id,query.ticket],|r|r.get(0))?;
+        // Ticket event ordinals are Ticket-local; MR/result source identities are global within Workspace.
+        let scoped_ticket = id
+            .starts_with("ticket-event:")
+            .then_some(query.ticket.as_deref())
+            .flatten();
+        let captured: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM notification_sources s LEFT JOIN workspace_resource_keys k ON k.workspace_id=s.workspace_id AND k.resource_kind='ticket' AND k.resource_id=s.ticket_id WHERE s.workspace_id=?1 AND s.input_event_id=?2 AND (?3 IS NULL OR s.ticket_id=?3 OR k.resource_key=?3))",params![workspace,id,scoped_ticket],|r|r.get(0))?;
         let origin = if captured {
             Some(true)
         } else if let (Some(ticket), Some(index)) = (
@@ -46,6 +51,13 @@ fn source_checks(
             id.strip_prefix("mr-event:").and_then(|v| v.split_once(':'))
         {
             Some(conn.query_row("SELECT EXISTS(SELECT 1 FROM merge_request_thread_events WHERE workspace_id=?1 AND merge_request_id=?2 AND event_id=?3)",params![workspace,mr,event],|r|r.get(0))?)
+        } else if let Some(result) = id.strip_prefix("implementation-result:") {
+            Some(conn.query_row("SELECT EXISTS(SELECT 1 FROM ticket_implementation_results WHERE workspace_id=?1 AND result_id=?2)",params![workspace,result],|r|r.get(0))?)
+        } else if let Some((mr, sequence)) = id
+            .strip_prefix("mr-source:")
+            .and_then(|v| v.split_once(':'))
+        {
+            Some(conn.query_row("SELECT EXISTS(SELECT 1 FROM merge_request_source_observations WHERE workspace_id=?1 AND merge_request_id=?2 AND sequence=?3)",params![workspace,mr,sequence],|r|r.get(0))?)
         } else {
             None
         };
@@ -160,12 +172,14 @@ pub(super) fn page_with_connection(
         (a.delivery_id IS NOT NULL OR aa.delivery_id IS NOT NULL OR COALESCE(l.runtime_accepted,0)=1),
         COALESCE(json_extract(a.target_json,'$.worker.runtime_id'),json_extract(aa.source_json,'$.runtime_id'),json_extract(r.target_json,'$.worker.runtime_id'),json_extract(r.target_json,'$.runtime_id'),json_extract(ar.reserved_source_json,'$.runtime_id'),json_extract(l.record_json,'$.target.runtime_id')),
         COALESCE(json_extract(a.target_json,'$.worker.worker_id'),json_extract(aa.source_json,'$.worker_id'),json_extract(r.target_json,'$.worker.worker_id'),json_extract(r.target_json,'$.worker_id'),json_extract(ar.reserved_source_json,'$.worker_id'),json_extract(l.record_json,'$.target.worker_id')),
-        f.code,f.recorded_at,
+        COALESCE(f.code,pf.code),COALESCE(f.recorded_at,pf.recorded_at),
         CASE WHEN s.role IN ('orchestrator','worker') AND s.assignment_id!='' THEN EXISTS(SELECT 1 FROM ticket_current_worker_assignments c WHERE c.workspace_id=s.workspace_id AND c.ticket_id=s.ticket_id AND c.role=s.role AND c.assignment_id=s.assignment_id) END,
         EXISTS(SELECT 1 FROM notification_failures uf WHERE uf.workspace_id=s.workspace_id AND uf.delivery_id=d.delivery_id AND uf.code IN ('acceptance_unknown','acknowledgement_failed')),
         (SELECT COUNT(*) FROM (SELECT DISTINCT at.runtime_id,at.worker_id FROM notification_assignment_targets at WHERE at.workspace_id=s.workspace_id AND at.delivery_id=d.delivery_id)),
-        l.delivery_id IS NOT NULL
+        l.delivery_id IS NOT NULL,
+        pf.sequence IS NOT NULL
         {joins}
+        LEFT JOIN notification_source_preparation_failures pf ON pf.sequence=(SELECT MAX(p.sequence) FROM notification_source_preparation_failures p WHERE p.source_sequence=s.sequence)
         LEFT JOIN notification_job_legacy_receipts l ON l.workspace_id=s.workspace_id AND l.delivery_id=d.delivery_id
         LEFT JOIN notification_requests r ON r.workspace_id=s.workspace_id AND r.delivery_id=d.delivery_id
         LEFT JOIN notification_acknowledgements a ON a.workspace_id=s.workspace_id AND a.delivery_id=d.delivery_id
@@ -186,6 +200,7 @@ pub(super) fn page_with_connection(
         let recipient_current: Option<bool> = row.get(19)?;
         let unresolved_send: bool = row.get(20)?;
         let multiple_targets = row.get::<_, i64>(21)? > 1;
+        let source_failure: bool = row.get(23)?;
         let acceptance_outcome_unknown = !accepted && (prepared || unresolved_send);
         use server_api::NotificationTargetResolution as Target;
         let target_resolution = if accepted {
@@ -214,7 +229,11 @@ pub(super) fn page_with_connection(
         } else if recipient_current == Some(false) {
             Stage::Historical
         } else if disposition.is_none() {
-            Stage::AwaitingRouting
+            if source_failure {
+                Stage::DeliveryFailed
+            } else {
+                Stage::AwaitingRouting
+            }
         } else if disposition.as_deref() == Some("suppress") {
             Stage::Suppressed
         } else if disposition.as_deref() == Some("defer") {
@@ -235,7 +254,8 @@ pub(super) fn page_with_connection(
         let retry_candidate = !accepted
             && recipient_current != Some(false)
             && failure.as_deref() != Some("assignment_changed")
-            && disposition.as_deref() == Some("deliver");
+            && (disposition.as_deref() == Some("deliver")
+                || (disposition.is_none() && source_failure));
         items.push(NotificationDiagnostic {
             source_id: format!("notification-source:{}", row.get::<_, i64>(0)?),
             source_event_id: bounded(row.get(1)?).unwrap_or_default(),

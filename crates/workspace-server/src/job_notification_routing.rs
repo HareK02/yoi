@@ -192,7 +192,7 @@ pub(in crate::store) fn route(
             let ack:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM notification_acknowledgements WHERE workspace_id=?1 AND delivery_id=?2) OR EXISTS(SELECT 1 FROM notification_job_legacy_receipts WHERE workspace_id=?1 AND delivery_id=?2 AND runtime_accepted=1)",params![workspace,source.delivery_id],|r|r.get(0))?;
             tx.commit()?; return Ok(disposition=="deliver" && !ack);
         }
-        if let JobNotificationFacts::Failed(NotificationFailureCode::SourceLookupFailed)=facts {
+        if job.request.notification_target.is_some() && matches!(facts, JobNotificationFacts::Failed(NotificationFailureCode::SourceLookupFailed)) {
             // A transient checker read is not suppression or an immutable defer.
             // With no decision, the existing pending scan retries the same source.
             // Check existing decisions first: never replace pinned request evidence.

@@ -491,6 +491,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
             // commit; update guards remain installed throughout.
             let mut ticket_delete_guards = Vec::new();
             for (table, trigger) in [
+                ("notification_source_preparation_failures", "notification_source_preparation_failures_no_delete"),
                 ("notification_job_targets", "notification_job_targets_no_delete"),
                 ("notification_job_legacy_receipts", "notification_job_legacy_no_delete"),
                 ("notification_assignment_targets", "notification_assignment_targets_no_delete"),
@@ -520,6 +521,11 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 )?;
                 tx.execute_batch(&format!("DROP TRIGGER \"{trigger}\";"))?;
                 ticket_delete_guards.push(definition);
+            }
+            // Source-owned children have no Workspace column; purge them through
+            // the authenticated parent's scope before removing the source graph.
+            for table in ["notification_source_preparation_failures", "notification_source_offers"] {
+                tx.execute(&format!("DELETE FROM {table} WHERE source_sequence IN (SELECT sequence FROM notification_sources WHERE workspace_id=?1)"),[&workspace_id])?;
             }
             for table in WORKSPACE_DELETION_PURGE_TABLES {
                 tx.execute(
@@ -1113,6 +1119,8 @@ mod tests {
                                 serde_json::to_string(&snapshot).unwrap()
                             ],
                         )?;
+                        conn.execute("INSERT INTO notification_source_preparation_failures(source_sequence,code) SELECT sequence,'source_lookup_failed' FROM notification_sources WHERE workspace_id=?1 LIMIT 1",[workspace])?;
+                        conn.execute("INSERT INTO notification_source_offers(source_sequence,last_offered) SELECT sequence,1 FROM notification_sources WHERE workspace_id=?1 LIMIT 1",[workspace])?;
                         Ok(())
                     })
                     .unwrap();
@@ -1123,6 +1131,8 @@ mod tests {
                         assert!(conn.execute(&format!("DELETE FROM {table} WHERE workspace_id=?1"), [workspace]).is_err());
                         assert!(conn.execute(&format!("UPDATE {table} SET ticket_id=ticket_id WHERE workspace_id=?1"), [workspace]).is_err());
                     }
+                    assert!(conn.execute("DELETE FROM notification_source_preparation_failures WHERE source_sequence IN (SELECT sequence FROM notification_sources WHERE workspace_id=?1)",[workspace]).is_err());
+                    assert_eq!(conn.query_row("SELECT COUNT(*) FROM notification_source_preparation_failures p JOIN notification_sources s ON s.sequence=p.source_sequence WHERE s.workspace_id=?1",[workspace],|r|r.get::<_,i64>(0))?,1);
                     assert!(conn.execute("DELETE FROM typed_tickets WHERE workspace_id=?1", [workspace]).is_err(),
                         "ordinary Ticket deletion must not cascade away case evidence");
                     Ok(())

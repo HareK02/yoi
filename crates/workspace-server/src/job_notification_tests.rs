@@ -87,6 +87,14 @@ async fn job_notification_routing_common_policy_distinguishes_suppression_failur
             None,
         ),
         (
+            "no-target-lookup-failure",
+            false,
+            JobNotificationFacts::Failed(NotificationFailureCode::SourceLookupFailed),
+            "suppress",
+            "no_recipient",
+            Some("source_lookup_failed"),
+        ),
+        (
             "clean",
             true,
             JobNotificationFacts::NoFindings,
@@ -200,6 +208,11 @@ async fn job_notification_preparation_failures_remain_pending_and_append_only() 
         let (_, source) = job_notice_fixture(&store, if target { "retry" } else { "retry-no-target" }, target);
         for _ in 0..2 {
             assert!(!store.route_job_notification("w", &source, &JobNotificationFacts::Failed(NotificationFailureCode::SourceLookupFailed)).unwrap());
+        }
+        if !target {
+            assert_eq!(job_notice_evidence(&store,&source),("suppress".into(),"no_recipient".into(),false,Some("source_lookup_failed".into())));
+            assert!(!store.list_pending_job_notifications("w",100).unwrap().iter().any(|s|s.delivery_id==source.delivery_id));
+            continue;
         }
         store.with_conn(|conn| {
             let sequence: i64 = conn.query_row("SELECT sequence FROM notification_sources WHERE input_event_id=?1", [&source.delivery_id], |r| r.get(0))?;
