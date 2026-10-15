@@ -210,6 +210,122 @@ async fn job_notification_preparation_failures_remain_pending_and_append_only() 
 }
 
 #[tokio::test]
+async fn job_notification_fair_offers_survive_reopen_and_bound_preparation_and_ack_retries() {
+    let (directory, mut store) = tracking_store_fixture().await;
+    let mut failing = Vec::new();
+    for i in 0..25 {
+        let (_, source) = job_notice_fixture(&store, &format!("failing-{i}"), true);
+        assert!(!store.route_job_notification(
+            "w", &source,
+            &JobNotificationFacts::Failed(NotificationFailureCode::SourceLookupFailed),
+        ).unwrap());
+        failing.push(source);
+    }
+    let (_, healthy) = job_notice_fixture(&store, "later-healthy", true);
+    let (_, retry) = job_notice_fixture(&store, "later-pinned-retry", true);
+    let target = TicketWorkerNotificationTarget {
+        worker: RuntimeWorkerRef::new("r", "replacement"),
+        authentication_binding_id: "tracking-binding".into(),
+    };
+    assert!(store.route_job_notification(
+        "w", &retry, &JobNotificationFacts::Result("original pinned bytes".into()),
+    ).unwrap());
+    assert_eq!(store.authorize_job_notification("w", &retry.delivery_id, &target).unwrap(), None);
+    let retry_key = NotificationDeliveryKey::WorkerNotification {
+        delivery_id: retry.delivery_id.clone(),
+    };
+    store.record_notification_delivery_failure(
+        "w", &retry_key, NotificationFailureCode::AcceptanceUnknown,
+    ).unwrap();
+    let pinned = store.job_notification_request("w", &retry.delivery_id).unwrap();
+    // Start with an already-offered pinned retry, not only a never-offered result.
+    // All sources share the same offer clock; 25 failure observations are not ticks.
+    assert_eq!(store.list_pending_job_notifications("w", 100).unwrap().len(), 27);
+    let snapshot = |store: &SqliteWorkspaceStore, table: &str| {
+        store.with_conn(|conn| Ok(stored_fixture_rows(conn, table))).unwrap()
+    };
+    let original_sources = snapshot(&store, "notification_sources");
+    let original_decisions = snapshot(&store, "notification_decisions");
+    let original_preparation_failures = snapshot(&store, "notification_source_preparation_failures");
+    let original_delivery_failures = snapshot(&store, "notification_failures");
+    let original_jobs = snapshot(&store, "backend_jobs");
+    let mut failure_offers = vec![0; failing.len()];
+    let mut healthy_round = None;
+    let mut retry_rounds = Vec::new();
+
+    for round in 1..=4 {
+        // Reopen before every production-sized round, including the first retry.
+        let saved_offers = snapshot(&store, "notification_source_offers");
+        drop(store);
+        store = SqliteWorkspaceStore::open_for_test(directory.path().join("workspace.db")).unwrap();
+        assert_eq!(snapshot(&store, "notification_source_offers"), saved_offers);
+        let pending = store.list_pending_job_notifications("w", 20).unwrap();
+        assert_eq!(pending.len(), 20);
+        if round == 1 {
+            assert!(pending.iter().all(|s| s.job_id.starts_with("failing-")));
+        }
+        for source in pending {
+            if let Some(index) = failing.iter().position(|s| s.delivery_id == source.delivery_id) {
+                failure_offers[index] += 1;
+                assert!(!store.route_job_notification(
+                    "w", &source,
+                    &JobNotificationFacts::Failed(NotificationFailureCode::SourceLookupFailed),
+                ).unwrap());
+            } else if source.delivery_id == healthy.delivery_id {
+                assert!(healthy_round.replace(round).is_none());
+                assert!(store.route_job_notification(
+                    "w", &source, &JobNotificationFacts::Result("healthy body".into()),
+                ).unwrap());
+                assert_eq!(store.authorize_job_notification("w", &source.delivery_id, &target).unwrap(), None);
+                store.ack_job_notification("w", &source.delivery_id, &target.worker).unwrap();
+            } else {
+                assert_eq!(source.delivery_id, retry.delivery_id);
+                retry_rounds.push(round);
+                // Neither scheduling nor a new rendering may replace the request.
+                assert!(store.route_job_notification(
+                    "w", &source, &JobNotificationFacts::Result("must not replace pinned bytes".into()),
+                ).unwrap());
+                assert_eq!(store.job_notification_request("w", &source.delivery_id).unwrap(), pinned);
+                if retry_rounds.len() == 1 {
+                    store.record_notification_delivery_failure(
+                        "w", &retry_key, NotificationFailureCode::AcceptanceUnknown,
+                    ).unwrap();
+                } else {
+                    store.ack_job_notification("w", &source.delivery_id, &target.worker).unwrap();
+                }
+            }
+        }
+        if round == 2 {
+            assert!(failure_offers.iter().all(|count| *count >= 1));
+            assert_eq!(healthy_round, Some(2));
+            assert_eq!(retry_rounds, vec![2]);
+        }
+    }
+    // With 26 sources still pending after the healthy ACK, even the last source
+    // in an offer-time tie returns within ceil(26 / 20) = 2 further rounds.
+    assert_eq!(retry_rounds, vec![2, 4], "a pinned retry must not starve behind undecided sources");
+    assert!(job_notice_evidence(&store, &healthy).2);
+    assert!(job_notice_evidence(&store, &retry).2);
+    assert_eq!(snapshot(&store, "notification_sources"), original_sources);
+    assert_eq!(snapshot(&store, "backend_jobs"), original_jobs);
+    let decisions = snapshot(&store, "notification_decisions");
+    assert!(original_decisions.iter().all(|row| decisions.contains(row)));
+    let preparation_failures = snapshot(&store, "notification_source_preparation_failures");
+    assert!(preparation_failures.starts_with(&original_preparation_failures));
+    assert_eq!(preparation_failures.len(), 25 + failure_offers.iter().sum::<usize>());
+    assert!(snapshot(&store, "notification_failures").starts_with(&original_delivery_failures));
+    assert_eq!(store.job_notification_request("w", &retry.delivery_id).unwrap(), pinned);
+    assert!(store.list_pending_job_notifications("w", 20).unwrap().iter().all(|s| s.job_id.starts_with("failing-")));
+    store.with_conn(|conn| {
+        assert!(conn.execute("INSERT INTO notification_source_offers VALUES(-1,1)", []).is_err());
+        assert!(conn.execute("UPDATE notification_source_offers SET last_offered=0", []).is_err());
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.role='backend_job'", [], |r| r.get::<_, i64>(0))?, 2);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get::<_, i64>(0))?, 0);
+        Ok(())
+    }).unwrap();
+}
+
+#[tokio::test]
 async fn job_notification_result_commit_reopen_parallel_recovery_and_fixed_target_receipt() {
     let (directory, store) = tracking_store_fixture().await;
     let (accepted, source) = job_notice_fixture(&store, "commit-gap", true);
