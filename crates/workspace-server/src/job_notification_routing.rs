@@ -20,6 +20,7 @@ pub enum JobNotificationFacts {
     Result(String),
     NoFindings,
     StaleContent,
+    /// SourceLookupFailed leaves routing undecided; other failures are terminal.
     Failed(NotificationFailureCode),
 }
 
@@ -74,6 +75,16 @@ pub(in crate::store) fn install(conn: &Connection) -> Result<()> {
             FOREIGN KEY(workspace_id,delivery_id) REFERENCES notification_decisions(workspace_id,delivery_id));
         CREATE TRIGGER notification_job_legacy_no_update BEFORE UPDATE ON notification_job_legacy_receipts BEGIN SELECT RAISE(ABORT,'Legacy notification evidence is immutable'); END;
         CREATE TRIGGER notification_job_legacy_no_delete BEFORE DELETE ON notification_job_legacy_receipts BEGIN SELECT RAISE(ABORT,'Legacy notification evidence is immutable'); END;")?;
+    // Preparation may fail before a routing decision exists. Keep observations
+    // against the common source, never invent a terminal decision to hold them.
+    conn.execute_batch("CREATE TABLE notification_source_preparation_failures (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_sequence INTEGER NOT NULL REFERENCES notification_sources(sequence),
+        code TEXT NOT NULL,
+        recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+        CREATE INDEX notification_source_preparation_failures_source ON notification_source_preparation_failures(source_sequence,sequence);
+        CREATE TRIGGER notification_source_preparation_failures_no_update BEFORE UPDATE ON notification_source_preparation_failures BEGIN SELECT RAISE(ABORT,'Source preparation evidence is immutable'); END;
+        CREATE TRIGGER notification_source_preparation_failures_no_delete BEFORE DELETE ON notification_source_preparation_failures BEGIN SELECT RAISE(ABORT,'Source preparation evidence is immutable'); END;")?;
     // Includes no-target results and the crash gap before the former reservation.
     let identities = conn.prepare("SELECT a.workspace_id,a.job_id,a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.state='completed' AND j.state='completed' AND a.attempt=j.current_attempt")?
         .query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?
@@ -171,6 +182,13 @@ pub(in crate::store) fn route(
         if let Some(disposition)=existing {
             let ack:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM notification_acknowledgements WHERE workspace_id=?1 AND delivery_id=?2) OR EXISTS(SELECT 1 FROM notification_job_legacy_receipts WHERE workspace_id=?1 AND delivery_id=?2 AND runtime_accepted=1)",params![workspace,source.delivery_id],|r|r.get(0))?;
             tx.commit()?; return Ok(disposition=="deliver" && !ack);
+        }
+        if let JobNotificationFacts::Failed(NotificationFailureCode::SourceLookupFailed)=facts {
+            // A transient checker read is not suppression or an immutable defer.
+            // With no decision, the existing pending scan retries the same source.
+            // Check existing decisions first: never replace pinned request evidence.
+            tx.execute("INSERT INTO notification_source_preparation_failures(source_sequence,code) SELECT sequence,?3 FROM notification_sources WHERE workspace_id=?1 AND input_event_id=?2 AND role='backend_job'",params![workspace,source.delivery_id,code(NotificationFailureCode::SourceLookupFailed)?])?;
+            tx.commit()?; return Ok(false);
         }
         let (disposition,reason)=policy(job.request.notification_target.is_some(),facts);
         save_decision(&tx, workspace, &source.delivery_id, disposition, reason)?;
@@ -393,6 +411,10 @@ pub(in crate::store) fn authorize(
 
 pub(in crate::store) fn verify(conn: &Connection) -> Result<()> {
     for name in [
+        "notification_source_preparation_failures",
+        "notification_source_preparation_failures_source",
+        "notification_source_preparation_failures_no_update",
+        "notification_source_preparation_failures_no_delete",
         "notification_job_identity",
         "notification_job_source_guard",
         "notification_job_targets",
