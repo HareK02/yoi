@@ -4,19 +4,19 @@ use serde_json::{Map, Value};
 use ts_rs::{Config, TS};
 
 use crate::{
-    Alert, AlertLevel, AlertSource, CommandEvent, CommandSnapshot, CommandStatus, CommandStream,
-    CommandStreamSlice, CompactionLifecycle, CompactionLifecycleState, CompactionPhase,
-    CompactionTrigger, CompletionContext, CompletionEntry, CompletionKind, ContextTokenSource,
-    ContextUsage, ErrorCode, Event, FeatureInvocation, FeatureInvocationDescriptor,
-    FeatureInvocationIdentity, FeatureInvocationResult, FeatureInvocationStatus,
-    FeatureInvocationSyntax, Greeting, InFlightBlock, InFlightCompaction, InFlightSnapshot,
-    InFlightToolCallState, InternalWorkerKind, InternalWorkerRef, InternalWorkerSnapshot,
-    InvocationArgumentDescriptor, InvocationArgumentType, InvocationArgumentValue,
-    InvocationClientAdapter, InvocationCompletion, InvocationValue, InvokeKind, MemoryWorkerEvent,
-    Method, PasteArtifactAvailability, PasteArtifactMediaType, PasteArtifactRef,
-    PendingSubmissionSummary, PendingSubmissionsSnapshot, Permission, ReasoningConfig,
-    RewindSummary, RunFailureKind, RunResult, RunResumeSource, RunYieldReason, ScopeRule, Segment,
-    SessionContentPart, SessionConversationTurn, SessionEntryProvenance,
+    Alert, AlertLevel, AlertPosition, AlertSource, CommandEvent, CommandSnapshot, CommandStatus,
+    CommandStream, CommandStreamSlice, CompactionLifecycle, CompactionLifecycleState,
+    CompactionPhase, CompactionTrigger, CompletionContext, CompletionEntry, CompletionKind,
+    ContextTokenSource, ContextUsage, ErrorCode, Event, FeatureInvocation,
+    FeatureInvocationDescriptor, FeatureInvocationIdentity, FeatureInvocationResult,
+    FeatureInvocationStatus, FeatureInvocationSyntax, Greeting, InFlightBlock, InFlightCompaction,
+    InFlightSnapshot, InFlightToolCallState, InternalWorkerKind, InternalWorkerRef,
+    InternalWorkerSnapshot, InvocationArgumentDescriptor, InvocationArgumentType,
+    InvocationArgumentValue, InvocationClientAdapter, InvocationCompletion, InvocationValue,
+    InvokeKind, MemoryWorkerEvent, Method, PasteArtifactAvailability, PasteArtifactMediaType,
+    PasteArtifactRef, PendingSubmissionSummary, PendingSubmissionsSnapshot, Permission,
+    ReasoningConfig, RewindSummary, RunFailureKind, RunResult, RunResumeSource, RunYieldReason,
+    ScopeRule, Segment, SessionContentPart, SessionConversationTurn, SessionEntryProvenance,
     SessionHistoryLineageBoundary, SessionHistoryPage, SessionMessageRole, SessionSnapshot,
     SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment, SubmissionDisposition,
     SymlinkPolicy, ToolResultDisposition, TurnResult, UploadedFileAvailability, UploadedFileRef,
@@ -65,6 +65,7 @@ pub fn generated_protocol_types() -> String {
     );
 
     push_decl::<AlertLevel>(&cfg, &mut output);
+    push_decl::<AlertPosition>(&cfg, &mut output);
     push_decl::<AlertSource>(&cfg, &mut output);
     push_decl::<CompletionKind>(&cfg, &mut output);
     push_decl::<CompletionContext>(&cfg, &mut output);

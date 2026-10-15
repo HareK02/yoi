@@ -1532,6 +1532,8 @@ mod tests {
             let mut writer = JsonLineWriter::new(writer_half);
             writer
                 .write(&Event::Alert(Alert {
+                    id: None,
+                    position: None,
                     level: AlertLevel::Warn,
                     source: AlertSource::Worker,
                     message: "connect-time alert".into(),
@@ -1763,6 +1765,8 @@ mod tests {
             let mut writer = JsonLineWriter::new(stream);
             writer
                 .write(&Event::Alert(Alert {
+                    id: None,
+                    position: None,
                     level: AlertLevel::Warn,
                     source: AlertSource::Worker,
                     message: "replayed alert".into(),

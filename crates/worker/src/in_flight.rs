@@ -1,11 +1,11 @@
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, Weak},
 };
 
 use protocol::{
-    CommandEvent, CommandSnapshot, CommandStatus, CommandStream, CommandStreamSlice, Event,
-    InFlightBlock, InFlightSnapshot, InFlightToolCallState,
+    AlertPosition, CommandEvent, CommandSnapshot, CommandStatus, CommandStream, CommandStreamSlice,
+    Event, InFlightBlock, InFlightSnapshot, InFlightToolCallState,
 };
 use session_store::{LoggedContentPart, LoggedItem};
 use tokio::sync::broadcast;
@@ -38,6 +38,7 @@ enum TrackedBlock {
         block_id: InFlightBlockId,
         text: String,
         finished: bool,
+        alert_positions: Vec<Weak<Mutex<AlertPosition>>>,
     },
     Thinking {
         block_id: InFlightBlockId,
@@ -78,6 +79,7 @@ impl InFlightEvents {
             block_id,
             text: String::new(),
             finished: false,
+            alert_positions: Vec::new(),
         });
         block_id
     }
@@ -213,10 +215,11 @@ impl InFlightEvents {
     pub(crate) fn clear_for_committed_item_then<R>(
         &self,
         item: &LoggedItem,
+        entry_id: Option<&str>,
         f: impl FnOnce() -> R,
     ) -> R {
         let mut inner = self.lock();
-        inner.clear_for_committed_item(item);
+        inner.clear_for_committed_item(item, entry_id);
         f()
     }
 
@@ -378,7 +381,7 @@ impl InFlightInner {
         }
     }
 
-    fn clear_for_committed_item(&mut self, item: &LoggedItem) {
+    fn clear_for_committed_item(&mut self, item: &LoggedItem, entry_id: Option<&str>) {
         match item {
             LoggedItem::Message { role, content }
                 if matches!(role, session_store::LoggedRole::Assistant) =>
@@ -391,7 +394,7 @@ impl InFlightInner {
                     })
                     .collect::<String>();
                 if !text.is_empty() {
-                    self.remove_first_text_matching(&text);
+                    self.remove_first_text_matching(&text, entry_id);
                 }
             }
             LoggedItem::Reasoning {
@@ -420,13 +423,55 @@ impl InFlightInner {
         }
     }
 
+    pub(crate) fn capture_alert_position(&mut self) -> Option<Arc<Mutex<AlertPosition>>> {
+        // Prune evicted alerts even when their streamed block has not committed yet.
+        for block in &mut self.blocks {
+            if let TrackedBlock::Text {
+                alert_positions, ..
+            } = block
+            {
+                alert_positions.retain(|position| position.strong_count() > 0);
+            }
+        }
+        for block in self.blocks.iter_mut().rev() {
+            match block {
+                TrackedBlock::Text {
+                    block_id,
+                    text,
+                    alert_positions,
+                    ..
+                } if !text.is_empty() => {
+                    let position = Arc::new(Mutex::new(AlertPosition::AfterInFlight {
+                        block_id: block_id.0,
+                    }));
+                    alert_positions.push(Arc::downgrade(&position));
+                    return Some(position);
+                }
+                TrackedBlock::ToolCall { id, .. } => {
+                    return Some(Arc::new(Mutex::new(AlertPosition::AfterToolCall {
+                        call_id: id.clone(),
+                    })));
+                }
+                // Hidden reasoning and empty text are not conversation rows.
+                _ => {}
+            }
+        }
+        None
+    }
+
     fn snapshot(&self) -> InFlightSnapshot {
+        let (block_ids, blocks) = self
+            .blocks
+            .iter()
+            .filter_map(|block| {
+                block
+                    .to_snapshot_block()
+                    .map(|snapshot| (block.block_id().0, snapshot))
+            })
+            .unzip();
         InFlightSnapshot {
-            blocks: self
-                .blocks
-                .iter()
-                .filter_map(TrackedBlock::to_snapshot_block)
-                .collect(),
+            block_ids,
+            blocks,
             commands: self.commands.clone(),
             compaction: self.compaction.clone(),
         }
@@ -444,11 +489,25 @@ impl InFlightInner {
         }
     }
 
-    fn remove_first_text_matching(&mut self, committed: &str) -> bool {
+    fn remove_first_text_matching(&mut self, committed: &str, entry_id: Option<&str>) -> bool {
         if let Some(index) = self.blocks.iter().position(|block| match block {
             TrackedBlock::Text { text, .. } => text == committed,
             _ => false,
         }) {
+            if let (
+                TrackedBlock::Text {
+                    alert_positions, ..
+                },
+                Some(entry_id),
+            ) = (&self.blocks[index], entry_id)
+            {
+                for position in alert_positions.iter().filter_map(Weak::upgrade) {
+                    *position.lock().expect("alert position mutex poisoned") =
+                        AlertPosition::AfterEntry {
+                            entry_id: entry_id.to_owned(),
+                        };
+                }
+            }
             self.blocks.remove(index);
             true
         } else {
@@ -560,6 +619,72 @@ mod tests {
     }
 
     #[test]
+    fn alert_watchers_are_pruned_and_removed_with_their_text_block() {
+        let (tx, _) = broadcast::channel(16);
+        let in_flight = InFlightEvents::new(tx);
+        let text = in_flight.start_text_block();
+        in_flight.text_delta(text, "same".into());
+        let first = in_flight.snapshot_guard().capture_alert_position().unwrap();
+        drop(first);
+        let second = in_flight.snapshot_guard().capture_alert_position().unwrap();
+        {
+            let guard = in_flight.snapshot_guard();
+            let TrackedBlock::Text {
+                alert_positions, ..
+            } = &guard.blocks[0]
+            else {
+                panic!("expected text")
+            };
+            assert_eq!(alert_positions.len(), 1);
+        }
+        let later = in_flight.start_text_block();
+        in_flight.text_delta(later, "same".into());
+        let third = in_flight.snapshot_guard().capture_alert_position().unwrap();
+        let item = LoggedItem::Message {
+            role: session_store::LoggedRole::Assistant,
+            content: vec![LoggedContentPart::Text {
+                text: "same".into(),
+            }],
+        };
+        in_flight.clear_for_committed_item_then(&item, Some("first-entry"), || ());
+        assert_eq!(
+            *second.lock().unwrap(),
+            AlertPosition::AfterEntry {
+                entry_id: "first-entry".into()
+            }
+        );
+        assert_eq!(
+            *third.lock().unwrap(),
+            AlertPosition::AfterInFlight { block_id: later.0 }
+        );
+        in_flight.clear();
+        assert!(in_flight.snapshot_guard().blocks.is_empty());
+        assert_eq!(
+            *third.lock().unwrap(),
+            AlertPosition::AfterInFlight { block_id: later.0 }
+        );
+    }
+
+    #[test]
+    fn snapshot_ids_are_parallel_to_emitted_blocks_not_filtered_placeholders() {
+        let (tx, _) = broadcast::channel(16);
+        let in_flight = InFlightEvents::new(tx);
+        in_flight.start_text_block();
+        let hidden = in_flight.thinking_start();
+        in_flight.thinking_done(hidden, String::new());
+        let visible = in_flight.start_text_block();
+        in_flight.text_delta(visible, "shown".into());
+        let tool = in_flight.tool_call_start("call-1".into(), "Read".into());
+        let snapshot = snapshot_from_guard(&in_flight.snapshot_guard());
+        assert_eq!(snapshot.blocks.len(), 2);
+        assert_eq!(snapshot.block_ids, vec![visible.0, tool.0]);
+        assert_eq!(
+            snapshot.block_ids,
+            snapshot_from_guard(&in_flight.snapshot_guard()).block_ids
+        );
+    }
+
+    #[test]
     fn snapshot_boundary_does_not_duplicate_or_gap_delta_sent_after_subscribe() {
         let (working_event_tx, _) = broadcast::channel(16);
         let in_flight = InFlightEvents::new(working_event_tx.clone());
@@ -621,7 +746,7 @@ mod tests {
             // This mirrors Worker::append_entry ordering: clear in-flight first,
             // then publish the finalized AssistantItem. Identity-aware clients
             // reconcile this durable commit with the preceding streamed block.
-            in_flight_for_commit.clear_for_committed_item_then(&assistant_item, || {
+            in_flight_for_commit.clear_for_committed_item_then(&assistant_item, None, || {
                 sink_for_commit.publish(assistant_entry);
             });
             committed_tx.send(()).unwrap();
@@ -670,7 +795,7 @@ mod tests {
             entry: crate::session_history::test_logged_history_entry(assistant_item.clone()),
         };
 
-        in_flight.clear_for_committed_item_then(&assistant_item, || {
+        in_flight.clear_for_committed_item_then(&assistant_item, None, || {
             sink.publish(assistant_entry);
         });
 
@@ -698,6 +823,7 @@ mod tests {
                     text: "done".into(),
                 }],
             },
+            None,
             || (),
         );
 
@@ -723,6 +849,7 @@ mod tests {
                 encrypted_content: Some("opaque".into()),
                 signature: None,
             },
+            None,
             || (),
         );
 
@@ -746,6 +873,7 @@ mod tests {
                 encrypted_content: Some("opaque".into()),
                 signature: None,
             },
+            None,
             || (),
         );
 

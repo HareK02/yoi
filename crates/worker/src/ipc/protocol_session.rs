@@ -30,12 +30,12 @@ fn subscribe_before_snapshot<Subscription, Snapshot>(
 
 pub fn subscribe_worker_protocol_session(handle: &WorkerHandle) -> WorkerProtocolSessionStreams {
     let ((snapshot_event, log_entries), (alert_snapshot, events)) = subscribe_before_snapshot(
-        || handle.alerter.subscribe_with_snapshot(),
+        || handle.alerter.subscribe_with_deferred_snapshot(),
         || handle.snapshot_event_with_entry_subscription(),
     );
     WorkerProtocolSessionStreams {
         snapshot_event,
-        alert_snapshot,
+        alert_snapshot: alert_snapshot(),
         log_entries,
         events,
     }

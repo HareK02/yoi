@@ -1497,11 +1497,28 @@ pub enum Event {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct Alert {
+    /// Stable only within the emitting live Worker; not durable alert history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<AlertPosition>,
     pub level: AlertLevel,
     pub source: AlertSource,
     pub message: String,
     /// Milliseconds since the Unix epoch.
     pub timestamp_ms: i64,
+}
+
+/// Display anchor captured at emission, resolved when pending text is committed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AlertPosition {
+    Start,
+    AfterEntry { entry_id: String },
+    AfterToolCall { call_id: String },
+    AfterInFlight { block_id: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1704,6 +1721,9 @@ pub struct InFlightCompaction {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct InFlightSnapshot {
+    /// Live-Worker identities parallel to the blocks actually included below.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub block_ids: Vec<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<InFlightBlock>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2721,6 +2741,7 @@ mod tests {
             },
             state: WorkerStatus::Running.into(),
             in_flight: InFlightSnapshot {
+                block_ids: Vec::new(),
                 blocks: vec![
                     InFlightBlock::Text {
                         text: "hel".into(),
@@ -3049,8 +3070,41 @@ mod tests {
     }
 
     #[test]
+    fn alert_ordering_metadata_is_optional_and_uses_tagged_wire_anchors() {
+        let legacy = serde_json::json!({ "level": "warn", "source": "worker", "message": "old", "timestamp_ms": 42 });
+        let alert: Alert = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(alert.id.is_none());
+        assert!(alert.position.is_none());
+        assert_eq!(serde_json::to_value(alert).unwrap(), legacy);
+        for position in [
+            serde_json::json!({ "kind": "start" }),
+            serde_json::json!({ "kind": "after_entry", "entry_id": "entry-1" }),
+            serde_json::json!({ "kind": "after_tool_call", "call_id": "call-1" }),
+            serde_json::json!({ "kind": "after_in_flight", "block_id": 7 }),
+        ] {
+            let mut wire = legacy.clone();
+            wire["id"] = serde_json::json!("alert-1");
+            wire["position"] = position;
+            let alert: Alert = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(alert).unwrap(), wire);
+        }
+        let old_snapshot: InFlightSnapshot = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(old_snapshot.block_ids.is_empty());
+        assert_eq!(
+            serde_json::to_value(old_snapshot).unwrap(),
+            serde_json::json!({})
+        );
+        let wire =
+            serde_json::json!({"blocks": [{"kind": "text", "text": "pending"}], "block_ids": [7]});
+        let snapshot: InFlightSnapshot = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(snapshot).unwrap(), wire);
+    }
+
+    #[test]
     fn event_alert_format() {
         let event = Event::Alert(Alert {
+            id: None,
+            position: None,
             level: AlertLevel::Warn,
             source: AlertSource::Compactor,
             message: "compaction failed".into(),

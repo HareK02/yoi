@@ -2901,12 +2901,33 @@ where
             let mut events = streams.events;
             let mut entry_events = streams.log_entries;
             let bridge_worker_state = worker_state.clone();
+            let bridge_handle = handle.clone();
             let bridge_task = match self.spawn_on_adapter_runtime(async move {
                 loop {
                     tokio::select! {
                         event = events.recv() => {
                             match event {
-                                Ok(mut event) => {
+                                Ok(event) => {
+                                    let mut event = match bridge_handle.alerter.freshen_event(event) {
+                                        Ok(event) => event,
+                                        Err(_) => {
+                                            // This shared bridge also carries Worker state: do
+                                            // not terminate it when a bounded Alert was evicted.
+                                            // Replace both receivers with the paired snapshot.
+                                            let replacement = subscribe_worker_protocol_session(&bridge_handle);
+                                            events = replacement.events;
+                                            entry_events = replacement.log_entries;
+                                            let mut snapshot = replacement.snapshot_event;
+                                            if apply_protocol_worker_state(&bridge_worker_state, &mut snapshot).is_err() {
+                                                break;
+                                            }
+                                            let _ = bridge_context.publish_protocol_event(snapshot);
+                                            for alert in replacement.alert_snapshot {
+                                                let _ = bridge_context.publish_protocol_event(Event::Alert(alert));
+                                            }
+                                            continue;
+                                        }
+                                    };
                                     match apply_protocol_worker_state(&bridge_worker_state, &mut event) {
                                         Ok(true) => {
                                             let _ = bridge_context.publish_protocol_event(event);
@@ -4525,6 +4546,10 @@ where
                         },
                     };
                     if let Some(event) = event {
+                        let Ok(event) = relay_handle.alerter.freshen_event(event) else {
+                            // An evicted Alert needs a fresh paired snapshot.
+                            break;
+                        };
                         tokio::select! {
                             biased;
                             _ = relay_handle.protocol_closed() => break,
@@ -5174,6 +5199,71 @@ mod tests {
             ),
             "A must receive no restored B protocol events"
         );
+        assert!(backend.stop_worker(&request.worker_ref).is_accepted());
+    }
+
+    #[cfg(feature = "ws-server")]
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn protocol_transport_reconnects_instead_of_forwarding_an_evicted_alert() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_store = root.path().join("runtime");
+        let backend = Arc::new(
+            WorkerRuntimeExecutionBackend::new(
+                ProfileRuntimeWorkerFactory::new(root.path())
+                    .with_runtime_store_dir(&runtime_store)
+                    .with_runtime_id("runtime-subjektiv-test"),
+            )
+            .unwrap(),
+        );
+        let request = backend
+            .run_on_adapter_runtime(async move {
+                Ok(saved_subjektiv_restore_fixture(&runtime_store, true).await)
+            })
+            .unwrap();
+        assert!(matches!(
+            backend.restore_worker(request.clone()),
+            WorkerExecutionSpawnResult::Connected { .. }
+        ));
+        let execution = backend.workers.lock().unwrap()[&request.worker_ref].clone();
+        let mut transport = Arc::clone(&backend)
+            .attach_worker_protocol(&request.worker_ref)
+            .unwrap();
+        // A queued frame whose ID has left the bounded buffer must not be
+        // forwarded with its now-unresolvable pending-text position.
+        execution
+            .handle
+            .send_event(Event::Alert(protocol::Alert {
+                id: Some("evicted-alert".into()),
+                position: Some(protocol::AlertPosition::AfterInFlight { block_id: 99 }),
+                level: protocol::AlertLevel::Warn,
+                source: protocol::AlertSource::Worker,
+                message: "stale alert".into(),
+                timestamp_ms: 1,
+            }))
+            .unwrap();
+        backend.run_on_adapter_runtime(async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(event) = transport.events.recv().await {
+                    assert!(!matches!(event, Event::Alert(alert) if alert.id.as_deref() == Some("evicted-alert")));
+                }
+            }).await.map_err(|_| "stale Alert did not close its transport".to_string())?;
+            Ok(())
+        }).unwrap();
+        execution.handle.alerter.alert(
+            protocol::AlertLevel::Warn,
+            protocol::AlertSource::Worker,
+            "retained alert".into(),
+        );
+        let mut replacement = Arc::clone(&backend)
+            .attach_worker_protocol(&request.worker_ref)
+            .unwrap();
+        backend.run_on_adapter_runtime(async move {
+            let event = tokio::time::timeout(Duration::from_secs(5), replacement.events.recv())
+                .await.map_err(|_| "replacement Alert replay timed out".to_string())?;
+            assert!(matches!(event, Some(Event::Alert(alert)) if alert.message == "retained alert" && alert.id.is_some()));
+            Ok(())
+        }).unwrap();
         assert!(backend.stop_worker(&request.worker_ref).is_accepted());
     }
 

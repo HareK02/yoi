@@ -1268,6 +1268,55 @@ test("preserves rendered content while reconnecting", async () => {
   ).not.toBeNull();
 });
 
+test("Alert keeps its transcript position on reconnect and a fresh Console mount", async () => {
+  vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) =>
+    Promise.resolve(Response.json(String(input).includes("/session/history")
+      ? emptyHistoryPage()
+      : { availability: "live_protocol" }))
+  ));
+  const first = sessionWithUserMessage("before the alert");
+  const second = sessionWithUserMessage("after the alert").entries[0];
+  const full = { ...first, entries: [...first.entries, second] };
+  const alert: ProtocolEvent = {
+    event: "alert",
+    data: {
+      id: "alert-reopen-test",
+      position: { kind: "after_entry", entry_id: first.entries[0].entry_id },
+      level: "warn", source: "compactor", message: "retained alert body", timestamp_ms: 2,
+    },
+  };
+  const expectOrder = () => {
+    const article = screen.getByRole("article", { name: "main transcript" });
+    const rows = Array.from(article.querySelectorAll(".console-line"));
+    expect(rows).toHaveLength(3);
+    expect(rows[0].textContent).toContain("before the alert");
+    expect(rows[1].textContent).toContain("retained alert body");
+    expect(rows[1].classList.contains("alert-line")).toBe(true);
+    expect(rows[2].textContent).toContain("after the alert");
+  };
+  const initial = render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  latestListener().onFrame(subscribedFrame(first));
+  protocolEvent(alert);
+  protocolEvent({ event: "user_message", data: {
+    entry_id: second.entry_id, segments: [{ kind: "text", content: "after the alert" }],
+  } });
+  await waitFor(expectOrder);
+
+  latestListener().onStatus?.("closed");
+  latestListener().onStatus?.("connecting");
+  const replay = subscribedFrame(full);
+  replay.message.payload.snapshot.data.events.push(alert, alert);
+  latestListener().onFrame(replay);
+  await waitFor(expectOrder);
+
+  initial.unmount();
+  render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledTimes(2));
+  latestListener().onFrame(replay);
+  await waitFor(expectOrder);
+});
+
 test("reconnect snapshot refreshes lineage and removes stale sibling history", async () => {
   let historyRequests = 0;
   vi.stubGlobal(

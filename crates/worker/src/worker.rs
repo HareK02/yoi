@@ -1918,11 +1918,13 @@ where
         self.state.increment_entries();
         if let Some(in_flight) = &self.in_flight {
             let committed_item = match &entry {
-                LogEntry::AnnotatedAssistantItem { entry, .. } => Some(entry.item.clone()),
+                LogEntry::AnnotatedAssistantItem { entry, .. } => {
+                    Some((entry.item.clone(), entry.metadata.entry_id.0.clone()))
+                }
                 _ => None,
             };
-            if let Some(item_for_clear) = committed_item {
-                in_flight.clear_for_committed_item_then(&item_for_clear, || {
+            if let Some((item_for_clear, entry_id)) = committed_item {
+                in_flight.clear_for_committed_item_then(&item_for_clear, Some(&entry_id), || {
                     self.sink.publish(entry);
                 });
                 return Ok(());
@@ -4253,6 +4255,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Worker-internal operations (compaction failures, AGENTS.md
     /// ingestion warnings) can surface messages to connected clients.
     pub fn attach_alerter(&mut self, alerter: Alerter) {
+        alerter.attach_position_source(self.sink.clone(), self.in_flight.clone());
         self.alerter = Some(alerter);
     }
 
@@ -13311,6 +13314,77 @@ mod build_summary_prompt_tests {
         fn all(enabled: bool) -> Self {
             Self { summary: enabled }
         }
+    }
+
+    // Real Worker wiring, filesystem Store, log writer and reconnect buffers;
+    // only the model client is inert because this test never invokes the engine.
+    #[tokio::test]
+    async fn alert_pending_text_anchor_resolves_at_durable_commit_before_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store,
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone()),
+            Scope::writable(&cwd).unwrap(),
+        )
+        .await
+        .unwrap();
+        let (tx, _) = broadcast::channel(16);
+        let in_flight = InFlightEvents::new(tx.clone());
+        worker.in_flight = Some(in_flight.clone());
+        let alerter = Alerter::new(tx);
+        worker.attach_alerter(alerter.clone());
+        alerter.alert(AlertLevel::Warn, AlertSource::Worker, "before head".into());
+        assert_eq!(
+            alerter.subscribe_with_snapshot().0[0].position,
+            Some(protocol::AlertPosition::Start)
+        );
+        worker.materialize_durable_session_head().await.unwrap();
+        let text = in_flight.start_text_block();
+        in_flight.text_delta(text, "streamed".into());
+        alerter.alert(AlertLevel::Warn, AlertSource::Worker, "during text".into());
+        let (before, _) = alerter.subscribe_with_snapshot();
+        let snapshot = crate::in_flight::snapshot_from_guard(&in_flight.snapshot_guard());
+        assert_eq!(
+            before[1].position,
+            Some(protocol::AlertPosition::AfterInFlight {
+                block_id: snapshot.block_ids[0]
+            })
+        );
+        let (deferred, _) = alerter.subscribe_with_deferred_snapshot();
+        let entry = crate::session_history::test_logged_history_entry(
+            agen::Item::assistant_message("streamed"),
+        );
+        let entry_id = entry.metadata.entry_id.0.clone();
+        worker
+            .log_writer_handle()
+            .append_entry(LogEntry::AnnotatedAssistantItem { ts: 42, entry })
+            .unwrap();
+        let (entries, _) = worker.sink.subscribe_with_snapshot();
+        assert!(entries.iter().any(|entry| matches!(entry, LogEntry::AnnotatedAssistantItem { entry, .. } if entry.metadata.entry_id.0 == entry_id)));
+        assert!(
+            crate::in_flight::snapshot_from_guard(&in_flight.snapshot_guard())
+                .blocks
+                .is_empty()
+        );
+        let replay = deferred();
+        assert_eq!(replay[1].id, before[1].id);
+        assert_eq!(
+            replay[1].position,
+            Some(protocol::AlertPosition::AfterEntry {
+                entry_id: entry_id.clone()
+            })
+        );
+        alerter.alert(AlertLevel::Warn, AlertSource::Worker, "after commit".into());
+        assert_eq!(
+            alerter.subscribe_with_snapshot().0[2].position,
+            Some(protocol::AlertPosition::AfterEntry { entry_id })
+        );
     }
 
     #[tokio::test]

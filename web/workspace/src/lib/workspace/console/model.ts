@@ -24,6 +24,12 @@ import type {
   WorkerStatus,
 } from "#lib/generated/protocol.ts";
 import { invocationInput } from "./composer-invocation.ts";
+import {
+  attachAlertInFlightAnchor,
+  deduplicateAlertLines,
+  orderAlertLines,
+  resolveCommittedAlertAnchors,
+} from "./alert-order.ts";
 import { stringify as stringifyYaml } from "yaml";
 import {
   applyRunActivityEvent,
@@ -103,6 +109,12 @@ export type ConsoleLine = {
   eventId?: string | null;
   /** Stable durable identity when this line originates from a committed entry. */
   entryId?: string;
+  /** Calls/results can share a row while retaining distinct durable anchors. */
+  sourceEntryIds?: string[];
+  /** Durable creation time or first live observation; never reconnect time for Alerts. */
+  timestampMs?: number;
+  /** Live-Worker block identity, retained through committed-row replacement. */
+  inFlightBlockId?: number;
   source: "event";
   streaming?: boolean;
   error?: boolean;
@@ -114,6 +126,8 @@ export type ConsoleLine = {
   toolCallLines?: ConsoleLine[];
   /** Typed `SystemItem.kind` used by presentation-only projections. */
   systemItemKind?: string;
+  /** Original protocol Alert, retained for chronology and Alert-specific presentation. */
+  alert?: Alert;
 };
 
 export type InternalWorkerProjection = {
@@ -340,18 +354,46 @@ export function mergeCommittedHistoryLines(
   history: ConsoleLine[],
   current: ConsoleLine[],
 ): ConsoleLine[] {
-  const durableStats = new Map(
-    history.filter((line) => line.kind === "run_stats" && line.entryId)
-      .map((line) => [line.entryId!, line]),
+  const historySource = history.flatMap((line) => line.toolCallLines ?? [line]);
+  const currentSource = current.flatMap((line) => line.toolCallLines ?? [line]);
+  const alerts = [...historySource, ...currentSource].filter((line) =>
+    line.alert
   );
-  return aggregateReadToolLines(mergeHistorySourceLines(
-    history.flatMap((line) => line.toolCallLines ?? [line]),
-    current.flatMap((line) => line.toolCallLines ?? [line]).map((line) =>
-      line.kind === "run_stats" && line.entryId
-        ? durableStats.get(line.entryId) ?? line
-        : line
-    ),
-  ));
+  const durableRows = new Map(
+    historySource.filter((line) => !line.alert)
+      .map((line) => [historyLineKey(line), line]),
+  );
+  const merged = mergeHistorySourceLines(
+    historySource.filter((line) => !line.alert),
+    currentSource.filter((line) => !line.alert).map((line) => {
+      const key = historyLineKey(line);
+      const durable = key ? durableRows.get(key) : undefined;
+      if (!durable) return line;
+      if (line.kind === "run_stats") return durable;
+      // Keep the current row authoritative; borrow durable metadata only when
+      // needed to place Alerts against a live or partially restored tool row.
+      if (alerts.length === 0) return line;
+      return {
+        ...line,
+        entryId: line.entryId ?? durable.entryId,
+        sourceEntryIds: [
+          ...new Set([
+            ...(durable.sourceEntryIds ?? []),
+            ...(durable.entryId ? [durable.entryId] : []),
+            ...(line.sourceEntryIds ?? []),
+            ...(line.entryId ? [line.entryId] : []),
+          ]),
+        ],
+        timestampMs: line.entryId
+          ? line.timestampMs ?? durable.timestampMs
+          : durable.timestampMs ?? line.timestampMs,
+      };
+    }),
+  );
+  return aggregateReadToolLines(orderAlertLines([
+    ...merged,
+    ...alerts,
+  ]));
 }
 
 function historyLineKey(line: ConsoleLine): string | undefined {
@@ -440,12 +482,12 @@ export function projectSessionHistoryEntries(
   ).lines;
 }
 
-function projectVisibleConsole(
+export function projectVisibleConsole(
   projection: ConsoleProjection,
 ): ConsoleProjection {
   return {
     ...projection,
-    lines: aggregateReadToolLines(projection.lines),
+    lines: aggregateReadToolLines(orderAlertLines(projection.lines)),
     internalWorkers: projection.internalWorkers.map((worker) => ({
       ...worker,
       console: projectVisibleConsole(worker.console),
@@ -650,6 +692,8 @@ function appendSnapshotInFlightLines(
   blocks: InFlightBlock[],
   eventId: string,
   cwd: string | null,
+  blockIds: number[] = [],
+  observedAtMs?: number,
 ): void {
   blocks.forEach((block, index) => {
     const blockEventId = `${eventId}:${index}`;
@@ -702,6 +746,16 @@ function appendSnapshotInFlightLines(
           cwd,
         });
         break;
+    }
+    const rowIndex = projection.lines.findLastIndex((line) =>
+      line.eventId === blockEventId
+    );
+    if (rowIndex >= 0) {
+      projection.lines[rowIndex] = {
+        ...projection.lines[rowIndex],
+        inFlightBlockId: blockIds[index],
+        timestampMs: projection.lines[rowIndex].timestampMs ?? observedAtMs,
+      };
     }
   });
 }
@@ -862,6 +916,65 @@ function appendCommandStream(
   };
 }
 
+function retainSnapshotAlerts(
+  previous: ConsoleProjection,
+  restored: ConsoleProjection,
+): ConsoleProjection {
+  const entryIndexes = new Map<string, number>();
+  const blockIndexes = new Map<number, number>();
+  previous.lines.forEach((line, index) => {
+    const { entryId, inFlightBlockId } = line;
+    if (entryId !== undefined && !entryIndexes.has(entryId)) {
+      entryIndexes.set(entryId, index);
+    }
+    if (inFlightBlockId !== undefined && !blockIndexes.has(inFlightBlockId)) {
+      blockIndexes.set(inFlightBlockId, index);
+    }
+  });
+  const lines = restored.lines.map((line) => {
+    // Preserve the first matching source row, including when both keys match.
+    const entryIndex = line.entryId === undefined
+      ? undefined
+      : entryIndexes.get(line.entryId);
+    const blockIndex = line.inFlightBlockId === undefined
+      ? undefined
+      : blockIndexes.get(line.inFlightBlockId);
+    const known = previous.lines[
+      Math.min(
+        entryIndex ?? previous.lines.length,
+        blockIndex ?? previous.lines.length,
+      )
+    ];
+    return known
+      ? {
+        ...line,
+        inFlightBlockId: line.inFlightBlockId ?? known.inFlightBlockId,
+        timestampMs: line.entryId
+          ? line.timestampMs
+          : known.timestampMs ?? line.timestampMs,
+      }
+      : line;
+  });
+  const alerts = previous.lines.filter((line) =>
+    line.alert && !(line.error && hasDurableRunFailure(restored, line.body))
+  );
+  return {
+    ...restored,
+    lines: deduplicateAlertLines([...lines, ...alerts]),
+    internalWorkers: restored.internalWorkers.map((worker) => {
+      const known = previous.internalWorkers.find((old) =>
+        old.worker.session_id === worker.worker.session_id
+      );
+      return known
+        ? {
+          ...worker,
+          console: retainSnapshotAlerts(known.console, worker.console),
+        }
+        : worker;
+    }),
+  };
+}
+
 function projectInternalWorkerSnapshot(
   snapshot: InternalWorkerSnapshot,
   eventId: string,
@@ -882,6 +995,7 @@ function projectInternalWorkerSnapshot(
     snapshot.in_flight?.blocks ?? [],
     `${eventId}:internal:${snapshot.worker.session_id}:in-flight`,
     cwd,
+    snapshot.in_flight?.block_ids,
   );
   appendSnapshotCommands(
     console,
@@ -1057,7 +1171,10 @@ export function applyProtocolEvent(
 
   switch (event.event) {
     case "user_message":
-      if (event.data.entry_id && next.lines.some((line) => line.entryId === event.data.entry_id)) break;
+      if (
+        event.data.entry_id &&
+        next.lines.some((line) => line.entryId === event.data.entry_id)
+      ) break;
       next.lines.push({
         ...line(
           envelope.eventId,
@@ -1072,17 +1189,19 @@ export function applyProtocolEvent(
       // A snapshot may already include this commit. Check before reconciling so
       // replay cannot consume a later, unrelated live assistant block.
       if (isRepeatedSessionEntry(next, event.data.entry)) break;
-      const replacementIndex = reconcileCommittedSessionEntry(
+      const replacement = reconcileCommittedSessionEntry(
         next,
         event.data.entry,
       );
       applySessionEntry(next, envelope.eventId, event.data.entry);
-      if (replacementIndex !== undefined) {
+      if (replacement !== undefined) {
+        const replacementIndex = replacement.index;
         const committedIndex = next.lines.findIndex((line) =>
           line.entryId === event.data.entry.entry_id
         );
         if (committedIndex >= 0) {
           const [committed] = next.lines.splice(committedIndex, 1);
+          committed.inFlightBlockId = replacement.inFlightBlockId;
           next.lines.splice(replacementIndex, 0, committed);
           const stats = next.lines[replacementIndex + 1];
           if (stats?.kind === "run_stats" && !stats.entryId) {
@@ -1212,6 +1331,8 @@ export function applyProtocolEvent(
         event.data.in_flight?.blocks ?? [],
         `${envelope.eventId}:snapshot-in-flight`,
         next.cwd,
+        event.data.in_flight?.block_ids,
+        envelope.observedAtMs,
       );
       appendSnapshotCommands(
         next,
@@ -1221,6 +1342,9 @@ export function applyProtocolEvent(
       next.internalWorkers = (event.data.internal_workers ?? []).map((worker) =>
         projectInternalWorkerSnapshot(worker, envelope.eventId, next.cwd)
       );
+      const retained = retainSnapshotAlerts(projection, next);
+      next.lines = retained.lines;
+      next.internalWorkers = retained.internalWorkers;
       next.removedInternalWorkers = {};
       const withCompaction = applyInFlightCompaction(
         next,
@@ -1278,7 +1402,9 @@ export function applyProtocolEvent(
       applyCommandEvent(next, envelope.eventId, event.data.event);
       break;
     case "segment_rotated": {
-      const retainedErrors = next.lines.filter((line) => line.kind === "error");
+      const retainedErrors = next.lines.filter((line) =>
+        line.kind === "error" || line.alert
+      );
       const retainedCompaction = next.lines.filter((line) =>
         line.id === RUNTIME_COMPACTION_LINE_ID
       );
@@ -1348,6 +1474,11 @@ export function applyProtocolEvent(
       break;
   }
 
+  next.lines = next.lines.map((line) =>
+    line.timestampMs === undefined && line.eventId === envelope.eventId
+      ? { ...line, timestampMs: envelope.observedAtMs }
+      : line
+  );
   return next;
 }
 
@@ -1509,8 +1640,9 @@ function appendAlertLine(
 ): void {
   const isError = alert.level === "error";
   if (isError && hasDurableRunFailure(projection, alert.message)) return;
-  projection.lines.push(
-    line(
+  projection.lines = attachAlertInFlightAnchor(projection.lines, alert);
+  projection.lines = deduplicateAlertLines([...projection.lines, {
+    ...line(
       eventId,
       isError ? "error" : "status",
       `Alert · ${alert.source}`,
@@ -1519,7 +1651,9 @@ function appendAlertLine(
       false,
       isError,
     ),
-  );
+    alert,
+    timestampMs: alert.timestamp_ms,
+  }]);
 }
 
 function findLastLineIndex(
@@ -2335,7 +2469,7 @@ function snapshotProjectionFromSession(
 function reconcileCommittedSessionEntry(
   projection: ConsoleProjection,
   entry: SessionSnapshotEntry,
-): number | undefined {
+): { index: number; inFlightBlockId?: number } | undefined {
   if (entry.kind !== "message" || entry.role !== "assistant") return;
   const turnStart = findLastLineIndex(
     projection.lines,
@@ -2348,8 +2482,13 @@ function reconcileCommittedSessionEntry(
       !line.entryId &&
       line.streaming !== true
     ) {
+      projection.lines = resolveCommittedAlertAnchors(
+        projection.lines,
+        line.inFlightBlockId,
+        entry.entry_id,
+      );
       projection.lines.splice(index, 1);
-      return index;
+      return { index, inFlightBlockId: line.inFlightBlockId };
     }
   }
 }
@@ -2375,7 +2514,8 @@ function applySessionEntry(
   if (!isRecord(value) || isRepeatedSessionEntry(projection, value)) return;
   const eventId = stringField(value, "entry_id") ?? fallbackEventId;
   const lineCountBefore = projection.lines.length;
-  switch (stringField(value, "kind")) {
+  const entryKind = stringField(value, "kind");
+  switch (entryKind) {
     case "user_input":
       projection.lines.push(
         line(
@@ -2422,7 +2562,10 @@ function applySessionEntry(
       const requests = safeTokenCount(value["requests"]);
       const upload = safeTokenCount(value["upload_tokens"]);
       const output = safeTokenCount(value["output_tokens"]);
-      if (elapsed !== null && requests !== null && upload !== null && output !== null) {
+      if (
+        elapsed !== null && requests !== null && upload !== null &&
+        output !== null
+      ) {
         projection.lines.push(runStatsLine(eventId, {
           startedAtMs: 0,
           requests,
@@ -2451,18 +2594,41 @@ function applySessionEntry(
       break;
   }
   const entryId = stringField(value, "entry_id");
-  if (entryId) {
+  const timestampMs = typeof value["timestamp"] === "number"
+    ? value["timestamp"]
+    : undefined;
+  const stampLine = (index: number) => {
+    const line = projection.lines[index];
+    if (!line || line.eventId !== eventId) return;
+    const sourceEntryIds = new Set(line.sourceEntryIds ?? []);
+    if (line.entryId) sourceEntryIds.add(line.entryId);
+    if (entryId) sourceEntryIds.add(entryId);
+    projection.lines[index] = {
+      ...line,
+      entryId: entryId ?? line.entryId,
+      sourceEntryIds: [...sourceEntryIds],
+      timestampMs: entryKind === "tool_result"
+        ? line.timestampMs ?? timestampMs
+        : timestampMs ?? line.timestampMs,
+    };
+  };
+  if (entryKind === "run_error") {
+    // Failure reconciliation can remove transient rows before appending.
+    stampLine(projection.lines.length - 1);
+  } else if (
+    (entryKind === "tool_call" || entryKind === "tool_result") &&
+    projection.lines.length === lineCountBefore
+  ) {
+    stampLine(
+      projection.lines.findLastIndex((line) => line.eventId === eventId),
+    );
+  } else {
     for (
-      let index = Math.max(
-        0,
-        Math.min(lineCountBefore, projection.lines.length - 1),
-      );
+      let index = lineCountBefore;
       index < projection.lines.length;
       index += 1
     ) {
-      if (projection.lines[index].eventId === eventId) {
-        projection.lines[index].entryId = entryId;
-      }
+      stampLine(index);
     }
   }
 }

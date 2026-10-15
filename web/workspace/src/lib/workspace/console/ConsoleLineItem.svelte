@@ -85,6 +85,7 @@
 <li
   class={`console-line ${lineClass(item)} ${toolClass(item)}`}
   class:error-line={item.error}
+  class:alert-line={!!item.alert}
   class:rewind-selected={rewindSelected}
   aria-current={rewindSelected ? "true" : undefined}
   data-console-line-id={item.id}
@@ -183,6 +184,23 @@
 
   .console-line.error-line {
     color: var(--danger);
+  }
+
+  .console-line.alert-line {
+    --alert-heading: #a74709;
+    --alert-body: #595959;
+    color: var(--alert-body);
+  }
+
+  .console-line.alert-line .message-heading {
+    color: var(--alert-heading);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .console-line.alert-line {
+      --alert-heading: #f6a75c;
+      --alert-body: #b8b8b8;
+    }
   }
 
   .console-line.user {

@@ -46269,6 +46269,7 @@ mod tests {
                 },
                 state: self.state.lock().unwrap().clone(),
                 in_flight: protocol::InFlightSnapshot {
+                    block_ids: Vec::new(),
                     blocks: Vec::new(),
                     commands: Vec::new(),
                     compaction: None,

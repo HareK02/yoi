@@ -154,6 +154,11 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: WorkerHandle)
             event = streams.events.recv() => {
                 match event {
                     Ok(event) => {
+                        let Ok(event) = handle.alerter.freshen_event(event) else {
+                            // The queued Alert was evicted; reconnect must rebuild
+                            // the bounded prefix rather than forward a stale anchor.
+                            break;
+                        };
                         if writer.write_event(&event).await.is_err() {
                             break;
                         }

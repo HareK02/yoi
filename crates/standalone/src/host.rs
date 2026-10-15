@@ -619,6 +619,11 @@ async fn run_protocol_session(
             event = events.recv() => {
                 match event {
                     Ok(event) => {
+                        let Ok(event) = handle.alerter.freshen_event(event) else {
+                            // The retained anchor was evicted; reconnect must obtain
+                            // a paired session/Alert snapshot rather than a stale row.
+                            return;
+                        };
                         if !send_protocol_event(&peer, event).await {
                             return;
                         }

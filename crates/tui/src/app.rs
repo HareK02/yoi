@@ -4319,6 +4319,8 @@ mod completion_flow_tests {
         let mut app = App::new("test".into());
         let message = "mid-run compaction failed: summary unavailable";
         app.handle_worker_event(Event::Alert(protocol::Alert {
+            id: None,
+            position: None,
             level: AlertLevel::Error,
             source: AlertSource::Compactor,
             message: message.into(),
@@ -4402,6 +4404,7 @@ mod completion_flow_tests {
             },
             state: test_worker_state(WorkerStatus::Running),
             in_flight: InFlightSnapshot {
+                block_ids: Vec::new(),
                 blocks: vec![
                     InFlightBlock::Thinking {
                         text: "why".into(),

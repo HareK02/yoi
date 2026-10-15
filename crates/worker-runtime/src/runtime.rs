@@ -11818,6 +11818,7 @@ mod tests {
                 },
                 state: protocol::WorkerStatus::Running.into(),
                 in_flight: protocol::InFlightSnapshot {
+                    block_ids: Vec::new(),
                     blocks: Vec::new(),
                     commands: Vec::new(),
                     compaction: None,

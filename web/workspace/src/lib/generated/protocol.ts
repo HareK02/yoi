@@ -4,6 +4,8 @@
 
 export type AlertLevel = "warn" | "error";
 
+export type AlertPosition = { "kind": "start" } | { "kind": "after_entry", entry_id: string, } | { "kind": "after_tool_call", call_id: string, } | { "kind": "after_in_flight", block_id: number, };
+
 export type AlertSource = "worker" | "engine" | "compactor" | "agents_md";
 
 export type CompletionKind = "file" | "feature" | "feature_argument";
@@ -161,7 +163,11 @@ export type InFlightBlock = { "kind": "text", text: string, finished?: boolean, 
 
 export type InFlightCompaction = { phase: CompactionPhase, started_at_ms: number, trigger: CompactionTrigger, };
 
-export type InFlightSnapshot = { blocks?: Array<InFlightBlock>, commands?: Array<CommandSnapshot>,
+export type InFlightSnapshot = {
+/**
+ * Live-Worker identities parallel to the blocks actually included below.
+ */
+block_ids?: Array<number>, blocks?: Array<InFlightBlock>, commands?: Array<CommandSnapshot>,
 /**
  * The currently running compaction, if any.
  *
@@ -284,7 +290,11 @@ export type InternalWorkerSnapshot = { worker: InternalWorkerRef, session: Sessi
  */
 greeting?: Greeting | null, status: WorkerStatus, error?: string | null, in_flight?: InFlightSnapshot, internal_workers?: Array<InternalWorkerSnapshot>, };
 
-export type Alert = { level: AlertLevel, source: AlertSource, message: string,
+export type Alert = {
+/**
+ * Stable only within the emitting live Worker; not durable alert history.
+ */
+id?: string | null, position?: AlertPosition | null, level: AlertLevel, source: AlertSource, message: string,
 /**
  * Milliseconds since the Unix epoch.
  */

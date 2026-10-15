@@ -24,6 +24,7 @@
 
 use std::sync::{Arc, Mutex as StdMutex};
 
+use protocol::{AlertPosition, SessionSnapshotEntryData};
 use session_store::LogEntry;
 use tokio::sync::broadcast;
 
@@ -46,12 +47,52 @@ pub struct SegmentLogSink {
 struct SinkInner {
     /// Full session log mirror in commit order. Reset on session swap
     /// (compaction / fork) via [`SegmentLogSink::reset_with_initial`].
-    mirror: StdMutex<Vec<LogEntry>>,
+    mirror: StdMutex<Mirror>,
     /// Broadcast channel for live entry updates. The same `Sender`
     /// survives session swaps so existing subscribers keep their
     /// receiver — they observe the swap as a freshly broadcast
     /// `LogEntry::AnnotatedSegmentStart` and reset their view accordingly.
     session_entry_tx: broadcast::Sender<LogEntry>,
+}
+
+struct Mirror {
+    entries: Vec<LogEntry>,
+    alert_position: AlertPosition,
+}
+
+impl Mirror {
+    fn new(entries: Vec<LogEntry>) -> Self {
+        let alert_position = latest_alert_position(&entries).unwrap_or(AlertPosition::Start);
+        Self {
+            entries,
+            alert_position,
+        }
+    }
+}
+
+// Use the public projection so private reasoning/response boundaries cannot become
+// anchors. Results/accounting update existing rows, and non-error Run lifecycle
+// transitions have no conversation row of their own.
+fn latest_alert_position(entries: &[LogEntry]) -> Option<AlertPosition> {
+    session_store::public_snapshot::project_current_session_snapshot(entries)
+        .entries
+        .into_iter()
+        .rev()
+        .find_map(|entry| match entry.data {
+            SessionSnapshotEntryData::ToolCall { call_id, .. } => {
+                Some(AlertPosition::AfterToolCall { call_id })
+            }
+            SessionSnapshotEntryData::ToolResult { .. }
+            | SessionSnapshotEntryData::Invoke { .. }
+            | SessionSnapshotEntryData::Usage { .. }
+            | SessionSnapshotEntryData::RunStats { .. }
+            | SessionSnapshotEntryData::RunYielded { .. }
+            | SessionSnapshotEntryData::RunResumed { .. }
+            | SessionSnapshotEntryData::RunCancelled => None,
+            _ => Some(AlertPosition::AfterEntry {
+                entry_id: entry.entry_id,
+            }),
+        })
 }
 
 impl SegmentLogSink {
@@ -62,7 +103,7 @@ impl SegmentLogSink {
         let (session_entry_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             inner: Arc::new(SinkInner {
-                mirror: StdMutex::new(Vec::new()),
+                mirror: StdMutex::new(Mirror::new(Vec::new())),
                 session_entry_tx,
             }),
         }
@@ -75,7 +116,7 @@ impl SegmentLogSink {
         let (session_entry_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             inner: Arc::new(SinkInner {
-                mirror: StdMutex::new(entries),
+                mirror: StdMutex::new(Mirror::new(entries)),
                 session_entry_tx,
             }),
         }
@@ -103,7 +144,10 @@ impl SegmentLogSink {
             .mirror
             .lock()
             .expect("session log mirror mutex poisoned");
-        mirror.push(entry.clone());
+        if let Some(position) = latest_alert_position(std::slice::from_ref(&entry)) {
+            mirror.alert_position = position;
+        }
+        mirror.entries.push(entry.clone());
         if Self::is_live_relevant(&entry) {
             // SendError means there are zero subscribers; harmless. The
             // mirror lock is held across `send` so subscribers cannot
@@ -147,8 +191,7 @@ impl SegmentLogSink {
             .mirror
             .lock()
             .expect("session log mirror mutex poisoned");
-        mirror.clear();
-        mirror.push(initial.clone());
+        *mirror = Mirror::new(vec![initial.clone()]);
         let _ = self.inner.session_entry_tx.send(initial);
     }
 
@@ -164,7 +207,7 @@ impl SegmentLogSink {
             .mirror
             .lock()
             .expect("session log mirror mutex poisoned");
-        *mirror = entries;
+        *mirror = Mirror::new(entries);
         if let Some(initial) = first {
             let _ = self.inner.session_entry_tx.send(initial);
         }
@@ -181,7 +224,7 @@ impl SegmentLogSink {
             .mirror
             .lock()
             .expect("session log mirror mutex poisoned");
-        *mirror = entries;
+        *mirror = Mirror::new(entries);
     }
 
     /// Truncate the mirror without broadcasting.
@@ -191,7 +234,9 @@ impl SegmentLogSink {
             .mirror
             .lock()
             .expect("session log mirror mutex poisoned");
-        mirror.truncate(entries_len);
+        mirror.entries.truncate(entries_len);
+        mirror.alert_position =
+            latest_alert_position(&mirror.entries).unwrap_or(AlertPosition::Start);
     }
 
     /// Atomically read the current mirror and subscribe to subsequent
@@ -203,9 +248,18 @@ impl SegmentLogSink {
             .mirror
             .lock()
             .expect("session log mirror mutex poisoned");
-        let snapshot = mirror.clone();
+        let snapshot = mirror.entries.clone();
         let rx = self.inner.session_entry_tx.subscribe();
         (snapshot, rx)
+    }
+
+    pub(crate) fn alert_position(&self) -> AlertPosition {
+        self.inner
+            .mirror
+            .lock()
+            .expect("session log mirror mutex poisoned")
+            .alert_position
+            .clone()
     }
 
     /// Current entry count. Useful for tests / diagnostics.
@@ -214,6 +268,7 @@ impl SegmentLogSink {
             .mirror
             .lock()
             .expect("session log mirror mutex poisoned")
+            .entries
             .len()
     }
 
@@ -265,6 +320,70 @@ mod tests {
                 content: text.to_owned(),
             }],
         }
+    }
+
+    #[test]
+    fn alert_anchor_tracks_visible_rows_not_reasoning_results_or_accounting() {
+        let sink = SegmentLogSink::new();
+        assert_eq!(sink.alert_position(), AlertPosition::Start);
+        sink.publish(session_start());
+        assert_eq!(sink.alert_position(), AlertPosition::Start);
+        let user = user_input("hello");
+        sink.publish(user.clone());
+        let expected = latest_alert_position(&[user.clone()]).unwrap();
+        assert_eq!(sink.alert_position(), expected);
+        sink.publish(turn_end(1));
+        sink.publish(LogEntry::Invoke {
+            ts: 2,
+            trigger: protocol::InvokeKind::UserSend,
+        });
+        sink.publish(LogEntry::AnnotatedAssistantItem {
+            ts: 3,
+            entry: crate::session_history::test_logged_history_entry(
+                session_store::LoggedItem::Reasoning {
+                    text: "private".into(),
+                    summary: vec![],
+                    encrypted_content: None,
+                    signature: None,
+                },
+            ),
+        });
+        assert_eq!(sink.alert_position(), expected);
+        let tool = LogEntry::AnnotatedAssistantItem {
+            ts: 4,
+            entry: crate::session_history::test_logged_history_entry(agen::Item::tool_call(
+                "call-1", "Read", "{}",
+            )),
+        };
+        sink.publish(tool.clone());
+        assert_eq!(
+            sink.alert_position(),
+            AlertPosition::AfterToolCall {
+                call_id: "call-1".into()
+            }
+        );
+        sink.publish(user_input("newer row"));
+        let newer = sink.alert_position();
+        sink.publish(LogEntry::AnnotatedToolResult {
+            ts: 5,
+            entry: crate::session_history::test_logged_history_entry(agen::Item::tool_result(
+                "call-1", "done",
+            )),
+        });
+        assert_eq!(sink.alert_position(), newer);
+        sink.replace_silent(vec![session_start(), user.clone(), tool]);
+        assert_eq!(
+            sink.alert_position(),
+            AlertPosition::AfterToolCall {
+                call_id: "call-1".into()
+            }
+        );
+        sink.truncate_silent(2);
+        assert_eq!(sink.alert_position(), expected);
+        sink.reset_with_initial(session_start());
+        assert_eq!(sink.alert_position(), AlertPosition::Start);
+        sink.reset_with_initial_entries(vec![session_start(), user]);
+        assert_eq!(sink.alert_position(), expected);
     }
 
     #[test]

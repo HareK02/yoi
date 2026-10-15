@@ -131,6 +131,8 @@ mod tests {
             listener,
             vec![
                 Event::Alert(Alert {
+                    id: None,
+                    position: None,
                     level: AlertLevel::Warn,
                     source: AlertSource::Worker,
                     message: "replayed alert".into(),

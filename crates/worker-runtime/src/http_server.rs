@@ -4821,6 +4821,7 @@ mod ws_tests {
             },
             state: protocol::WorkerStateSnapshot::initial(),
             in_flight: protocol::InFlightSnapshot {
+                block_ids: Vec::new(),
                 blocks: Vec::new(),
                 commands: Vec::new(),
                 compaction: None,
