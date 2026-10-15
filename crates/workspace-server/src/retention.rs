@@ -110,6 +110,50 @@ impl ErasedJournalSession {
     }
 }
 
+/// Physical Runtime erasure acknowledgement, not merely a domain tombstone.
+/// Only the scoped erase request and a matching Session response construct it.
+/// The Runtime acknowledgement includes associated archived diagnostic originals;
+/// historical retention receipts retain their original values.
+#[derive(Clone, Debug)]
+pub struct RuntimeJournalErasureAck {
+    domain: ErasedJournalSession,
+    source: runtime_api::SessionPublicSource,
+}
+
+impl ErasedJournalSession {
+    pub(crate) fn erase_runtime_source(
+        self,
+        runtime: &crate::hosts::RuntimeRegistry,
+        source: runtime_api::SessionPublicSource,
+    ) -> crate::Result<RuntimeJournalErasureAck> {
+        let response = runtime
+            .session_material_erase(
+                &self.worker.runtime_id,
+                runtime_api::SessionMaterialEraseRequest {
+                    workspace_id: self.workspace_id.clone(),
+                    source: source.clone(),
+                    expected_session_id: self.session_id.clone(),
+                },
+            )
+            .map_err(|e| e.into_error())?;
+        if response.session_id != self.session_id {
+            return Err(StoreError::RepositoryConflict(
+                "Session erase receipt differs from the requested identity".into(),
+            ));
+        }
+        Ok(RuntimeJournalErasureAck {
+            domain: self,
+            source,
+        })
+    }
+}
+
+impl RuntimeJournalErasureAck {
+    pub(crate) fn domain_proof(&self) -> &ErasedJournalSession {
+        &self.domain
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerRemovalBlocker {
@@ -490,12 +534,125 @@ impl SqliteWorkspaceStore {
         Ok(())
     }
 
+    /// An unknown acceptance is not failure. Supersede only after physical erasure
+    /// fenced Archive effects and Runtime attested the same remaining aggregate.
+    pub(crate) fn supersede_erased_worker_removal(
+        &self,
+        prepared: &PreparedWorkerRemoval,
+        ack: &RuntimeJournalErasureAck,
+        inventory: &WorkerRetentionInventory,
+    ) -> Result<(), WorkerRetentionError> {
+        let proof = ack.domain_proof();
+        if proof.workspace_id != prepared.plan.workspace_id
+            || proof.worker != prepared.plan.worker
+            || prepared.plan.session_disposition != SessionDisposition::Archive
+            || inventory.workspace_id != proof.workspace_id
+            || inventory.runtime_id != proof.worker.runtime_id
+            || inventory.worker_id.to_string() != proof.worker.worker_id
+            || inventory
+                .session_id
+                .as_ref()
+                .is_some_and(|id| id != &proof.session_id)
+        {
+            return Err(WorkerRetentionError::Invalid(
+                "Erasure reconciliation source mismatch".into(),
+            ));
+        }
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let plan = load_plan_op(&tx, &prepared.plan.operation_id)?
+                .ok_or_else(|| StoreError::InvalidInput("operation missing".into()))?;
+            if plan != prepared.plan
+                || !matches!(
+                    plan.state,
+                    WorkerRemovalPlanState::Planned
+                        | WorkerRemovalPlanState::Executing
+                        | WorkerRemovalPlanState::Failed
+                )
+            {
+                return Err(StoreError::InvalidInput("active operation mismatch".into()));
+            }
+            insert_erasure_reconciliation_audit(&tx, &plan, ack, None)?;
+            mark_stale(&tx, &plan, "journal_session_erased_archive_fenced")?;
+            tx.commit()?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn audit_erased_worker_removal_receipt(
+        &self,
+        prepared: &PreparedWorkerRemoval,
+        ack: &RuntimeJournalErasureAck,
+        result: &WorkerRetentionExecutionResult,
+    ) -> Result<(), WorkerRetentionError> {
+        let proof = ack.domain_proof();
+        if proof.workspace_id != prepared.plan.workspace_id
+            || proof.worker != prepared.plan.worker
+            || result.operation_id != prepared.plan.operation_id
+            || result.input_fingerprint != prepared.plan.input_fingerprint
+            || result.worker_id.to_string() != proof.worker.worker_id
+            || !result.source_removed
+            || result.session_disposition != prepared.plan.session_disposition
+            || result.diagnostics_disposition != prepared.plan.diagnostics_disposition
+            || result.archive.as_ref().is_none_or(|a| {
+                a.source_session_id != proof.session_id
+                    || Some(&a.archive_id) != prepared.plan.archive_id.as_ref()
+                    || a.workspace_id != proof.workspace_id
+                    || a.source_runtime_id != proof.worker.runtime_id
+                    || a.source_worker_id.to_string() != proof.worker.worker_id
+                    || a.operation_id != result.operation_id
+                    || a.input_fingerprint != result.input_fingerprint
+            })
+        {
+            return Err(WorkerRetentionError::Invalid(
+                "Erasure receipt mismatch".into(),
+            ));
+        }
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            insert_erasure_reconciliation_audit(&tx, &prepared.plan, ack, Some(result))?;
+            tx.commit()?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     pub fn commit_worker_removal(
         &self,
         workspace_id: &str,
         operation_id: &str,
         fp: &str,
         result: &WorkerRetentionExecutionResult,
+    ) -> Result<WorkerRemovalCommit, WorkerRetentionError> {
+        self.commit_worker_removal_inner(workspace_id, operation_id, fp, result, None)
+    }
+
+    /// Receipt-confirmed removal after erasure must not republish the erased Archive.
+    /// The original operation, fingerprint and Runtime result remain unchanged.
+    pub(crate) fn commit_erased_worker_removal(
+        &self,
+        workspace_id: &str,
+        prepared: &PreparedWorkerRemoval,
+        result: &WorkerRetentionExecutionResult,
+        ack: &RuntimeJournalErasureAck,
+    ) -> Result<WorkerRemovalCommit, WorkerRetentionError> {
+        self.commit_worker_removal_inner(
+            workspace_id,
+            &prepared.plan.operation_id,
+            &prepared.plan.input_fingerprint,
+            result,
+            Some(ack),
+        )
+    }
+
+    fn commit_worker_removal_inner(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        fp: &str,
+        result: &WorkerRetentionExecutionResult,
+        erasure: Option<&RuntimeJournalErasureAck>,
     ) -> Result<WorkerRemovalCommit, WorkerRetentionError> {
         self.with_conn_mut(|conn|{
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -519,6 +676,13 @@ impl SqliteWorkspaceStore {
                 return Err(StoreError::InvalidInput("Runtime retention result does not match removal plan".into()));
             }
             if !result.source_removed{return Err(StoreError::InvalidInput("Runtime source was not removed".into()));}
+            if let Some(ack) = erasure {
+                let proof = ack.domain_proof();
+                if proof.workspace_id != workspace_id || proof.worker != plan.worker
+                    || result.archive.as_ref().is_none_or(|a| a.source_session_id != proof.session_id) {
+                    return Err(StoreError::InvalidInput("Erased removal receipt requires matching source and physical Runtime erasure acknowledgement".into()));
+                }
+            }
             let worker=load_worker(&tx,workspace_id,&plan.worker)?.ok_or_else(||StoreError::InvalidInput("Worker missing before commit".into()))?;
             if worker.updated_at!=plan.worker_updated_at{return Err(StoreError::InvalidInput(format!("stale:{}:Worker updated_at changed",plan.plan_id)));}
             if worker.retention_state=="pinned" { return Err(StoreError::InvalidInput(format!("stale:{}:hold added",plan.plan_id))); }
@@ -527,6 +691,7 @@ impl SqliteWorkspaceStore {
             let now=Utc::now().to_rfc3339();
             if let Some(a)=&result.archive{
                 if plan.archive_id.as_deref()!=Some(&a.archive_id)||a.workspace_id!=workspace_id||a.source_runtime_id!=plan.worker.runtime_id||a.source_worker_id.to_string()!=plan.worker.worker_id||a.policy_id!=plan.policy_id||a.operation_id!=operation_id||a.input_fingerprint!=fp{return Err(StoreError::InvalidInput("archive manifest mismatch".into()));}
+                if erasure.is_none() {
                 let expires_at=match plan.archive_retention { ArchiveRetention::Forever=>None, ArchiveRetention::ForSeconds{seconds}=>{let seconds=i64::try_from(seconds).map_err(|_|StoreError::InvalidInput("archive retention deadline overflow".into()))?;Some((Utc::now()+chrono::Duration::seconds(seconds)).to_rfc3339())} };
                 tx.execute("INSERT OR IGNORE INTO worker_session_archives(archive_id,workspace_id,runtime_id,worker_id,session_id,checksum_sha256,content_bytes,policy_id,policy_digest,operation_id,committed_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![a.archive_id,workspace_id,plan.worker.runtime_id,plan.worker.worker_id,a.source_session_id,a.content_checksum_sha256,a.content_bytes,plan.policy_id,plan.policy_digest,operation_id,now,expires_at])?;
                 let observe_grants = {
@@ -574,20 +739,21 @@ impl SqliteWorkspaceStore {
                         )?;
                     }
                 }
+                }
             }else if plan.session_disposition==SessionDisposition::Archive{return Err(StoreError::InvalidInput("archive manifest missing".into()));}
             match plan.diagnostics_disposition {
                 DiagnosticsDisposition::Purge if result.diagnostics_retained => return Err(StoreError::InvalidInput("Runtime retained diagnostics for purge disposition".into())),
                 DiagnosticsDisposition::Retain if !result.diagnostics_retained => return Err(StoreError::InvalidInput("Runtime did not retain diagnostics".into())),
-                DiagnosticsDisposition::Retain => {
+                DiagnosticsDisposition::Retain if erasure.is_none() => {
                     let seconds=plan.diagnostics_retention_seconds.ok_or_else(||StoreError::InvalidInput("diagnostics retention deadline missing".into()))?;
                     let seconds=i64::try_from(seconds).map_err(|_|StoreError::InvalidInput("diagnostics retention deadline overflow".into()))?;
                     let expires_at=(Utc::now()+chrono::Duration::seconds(seconds)).to_rfc3339();
                     tx.execute("INSERT OR IGNORE INTO worker_diagnostics_archives(operation_id,workspace_id,runtime_id,worker_id,policy_id,policy_digest,committed_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![operation_id,workspace_id,plan.worker.runtime_id,plan.worker.worker_id,plan.policy_id,plan.policy_digest,now,expires_at])?;
                 }
-                DiagnosticsDisposition::Purge => {}
+                DiagnosticsDisposition::Purge | DiagnosticsDisposition::Retain => {}
             }
             if plan.metadata_disposition==MetadataDisposition::Tombstone{
-                tx.execute("INSERT OR IGNORE INTO worker_tombstones(workspace_id,runtime_id,worker_id,display_name,profile,worker_created_at,removed_at,archive_id,policy_id,policy_digest,operation_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,worker.display_name,worker.profile,worker.created_at,now,plan.archive_id,plan.policy_id,plan.policy_digest,operation_id])?;
+                tx.execute("INSERT OR IGNORE INTO worker_tombstones(workspace_id,runtime_id,worker_id,display_name,profile,worker_created_at,removed_at,archive_id,policy_id,policy_digest,operation_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,worker.display_name,worker.profile,worker.created_at,now,if erasure.is_some() { None } else { plan.archive_id.clone() },plan.policy_id,plan.policy_digest,operation_id])?;
             }
             tx.execute("UPDATE worker_workdir_links SET unlinked_at=?4 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND unlinked_at IS NULL",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,now])?;
             let deleted=tx.execute("DELETE FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND updated_at=?4",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,plan.worker_updated_at])?;
@@ -595,6 +761,9 @@ impl SqliteWorkspaceStore {
             if deleted!=1{return Err(StoreError::InvalidInput(format!("stale:{}:removal fence changed",plan.plan_id)));}
             let catalog=commit_worker_catalog_removal(&tx,workspace_id,&plan.worker)?;
             tx.execute("UPDATE worker_removal_operations SET state='succeeded',failure_category=NULL,updated_at=?1 WHERE operation_id=?2",params![now,operation_id])?;
+            if let Some(ack) = erasure {
+                insert_erasure_reconciliation_audit(&tx, &plan, ack, Some(result))?;
+            }
             tx.execute("INSERT OR IGNORE INTO worker_retention_audit_events(event_id,operation_id,workspace_id,event_kind,detail,created_at) VALUES(?1,?2,?3,'worker_removed',?4,?5)",params![stable("wre",operation_id),operation_id,workspace_id,format!("runtime_id={} worker_id={} session={} metadata={} diagnostics={}",plan.worker.runtime_id,plan.worker.worker_id,sess(plan.session_disposition),meta(plan.metadata_disposition),diag(plan.diagnostics_disposition)),now])?;
             tx.commit()?;plan.state=WorkerRemovalPlanState::Succeeded;plan.updated_at=now;Ok(WorkerRemovalCommit { plan, catalog })
         }).map_err(map_error)
@@ -969,6 +1138,32 @@ fn load_plan_q(c: &Connection, key: &str, id: &str) -> crate::Result<Option<Work
     .optional()
     .map_err(StoreError::from)
 }
+fn insert_erasure_reconciliation_audit(
+    tx: &rusqlite::Transaction<'_>,
+    plan: &WorkerRemovalPlan,
+    ack: &RuntimeJournalErasureAck,
+    result: Option<&WorkerRetentionExecutionResult>,
+) -> crate::Result<()> {
+    let proof = ack.domain_proof();
+    let kind = if result.is_some() {
+        "erased_removal_receipt"
+    } else {
+        "erased_archive_superseded"
+    };
+    let detail = serde_json::json!({
+        "input_fingerprint": plan.input_fingerprint,
+        "session_id": proof.session_id,
+        "archive_id": plan.archive_id,
+        "source_removed": result.map(|r| r.source_removed),
+        "old_diagnostics_retained": result.map(|r| r.diagnostics_retained),
+        "runtime_erasure_ack": { "session_id": proof.session_id, "source": ack.source },
+        "old_acceptance": if result.is_some() { "receipt_confirmed" } else { "unknown_archive_fenced" },
+    });
+    tx.execute("INSERT OR IGNORE INTO worker_retention_audit_events(event_id,operation_id,workspace_id,event_kind,detail,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![stable("wre", &format!("{}:{kind}", plan.operation_id)), plan.operation_id, plan.workspace_id, kind, detail.to_string(), Utc::now().to_rfc3339()])?;
+    Ok(())
+}
+
 fn mark_stale(
     tx: &rusqlite::Transaction<'_>,
     plan: &WorkerRemovalPlan,

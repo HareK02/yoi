@@ -2141,3 +2141,503 @@ async fn serialized_removal_input_cannot_supply_journal_erasure_authority() {
     assert!(!f.store.journal_session_erased(&f.host).unwrap());
     assert!(session_root(f.dir.path(), &f.target).exists());
 }
+
+impl SubjectRemovalFixture {
+    async fn reopen(self) -> Self {
+        let Self {
+            dir,
+            api,
+            dispatcher,
+            controller,
+            target,
+            attr,
+            host,
+            store,
+        } = self;
+        let config = api.config.clone();
+        drop(api);
+        drop(dispatcher);
+        drop(store);
+        let control = Arc::new(test_control_store(&config));
+        let dispatcher = Arc::new(
+            crate::worker_source::EmbeddedServerWorkerMutationDispatcher::new(
+                config.clone(),
+                control.clone(),
+            ),
+        );
+        let api = WorkspaceApi::new_with_execution_backend_and_broker(
+            config,
+            control,
+            Arc::new(DeterministicExecutionBackend::default()),
+            BackendResourceBroker::default(),
+            HostExecutors::default(),
+            Some(dispatcher.clone()),
+        )
+        .await
+        .unwrap();
+        let store = open_subjektiv_store(&api).unwrap();
+        Self {
+            dir,
+            api,
+            dispatcher,
+            controller,
+            target,
+            attr,
+            host,
+            store,
+        }
+    }
+
+    fn assert_erased_removal(&self) {
+        assert!(
+            self.api
+                .store
+                .get_worker_registry(TEST_WORKSPACE_ID, &self.target)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            self.api
+                .config_store
+                .worker_session_archive(TEST_WORKSPACE_ID, &self.target, &self.attr.session_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            self.api
+                .store
+                .list_backend_journal_jobs(TEST_WORKSPACE_ID, &self.attr.session_id, None, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!session_root(self.dir.path(), &self.target).exists());
+        assert!(matches!(
+            source_retention(self.dir.path()).ensure_live(self.attr.session_id.parse().unwrap()),
+            Err(session_store::StoreError::SessionErased(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn erased_archive_plan_resend_and_reopen_replan_without_republishing_sources() {
+    for stage in ["planned", "executing", "failed"] {
+        for restart in [false, true] {
+            let mut f = SubjectRemovalFixture::new().await;
+            f.disable();
+            let policy = f
+                .api
+                .config_store
+                .worker_retention_policy(TEST_WORKSPACE_ID)
+                .unwrap();
+            let conn = rusqlite::Connection::open(&f.api.config.database_path).unwrap();
+            let archive_parent = f
+                .dir
+                .path()
+                .join(".test-embedded-runtime-store/archives/workers");
+            if stage == "planned" {
+                conn.execute_batch("CREATE TRIGGER interrupt_removal BEFORE UPDATE OF state ON worker_removal_operations WHEN NEW.state='executing' BEGIN SELECT RAISE(ABORT,'injected execution interruption'); END;").unwrap();
+            } else {
+                // Fail Archive publication before any receipt. Suppress recording
+                // failure too to model the executing-at-Host-stop durable boundary.
+                std::fs::create_dir_all(archive_parent.parent().unwrap()).unwrap();
+                std::fs::write(&archive_parent, "publication blocked").unwrap();
+                if stage == "executing" {
+                    conn.execute_batch("CREATE TRIGGER interrupt_removal BEFORE UPDATE OF state ON worker_removal_operations WHEN NEW.state='failed' BEGIN SELECT RAISE(ABORT,'injected failure-save interruption'); END;").unwrap();
+                }
+            }
+            assert_ne!(f.remove().status, StatusCode::OK.as_u16());
+            conn.execute_batch("DROP TRIGGER IF EXISTS interrupt_removal")
+                .unwrap();
+            if stage != "planned" {
+                std::fs::remove_file(&archive_parent).unwrap();
+            }
+            let old = f
+                .api
+                .config_store
+                .recover_worker_removal_execution(TEST_WORKSPACE_ID, &f.target)
+                .unwrap()
+                .unwrap();
+            assert_eq!(serde_json::to_value(old.plan.state).unwrap(), stage);
+            assert_eq!(
+                old.plan.session_disposition,
+                worker_runtime::retention::SessionDisposition::Archive
+            );
+            f.api
+                .erase_subjektiv_journal_session(
+                    &f.attr.session_id,
+                    "erase-interrupted-archive-plan",
+                )
+                .unwrap();
+            if restart {
+                f = f.reopen().await;
+            }
+            let response = f.remove();
+            assert_eq!(
+                response.status,
+                StatusCode::OK.as_u16(),
+                "{stage}/{restart}: {}",
+                response.body
+            );
+            let saved = f
+                .api
+                .config_store
+                .recover_worker_removal_execution(TEST_WORKSPACE_ID, &f.target)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                saved.plan.session_disposition,
+                worker_runtime::retention::SessionDisposition::Purge
+            );
+            assert_eq!(saved.plan.reason, old.plan.reason);
+            assert_ne!(saved.plan.operation_id, old.plan.operation_id);
+            let (state, fingerprint, detail): (String, String, String) = conn.query_row(
+                "SELECT o.state,o.input_fingerprint,a.detail FROM worker_removal_operations o JOIN worker_retention_audit_events a USING(operation_id) WHERE o.operation_id=?1 AND a.event_kind='erased_archive_superseded'",
+                [&old.plan.operation_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            assert_eq!(state, "stale");
+            assert_eq!(fingerprint, old.plan.input_fingerprint);
+            let detail: Value = serde_json::from_str(&detail).unwrap();
+            assert_eq!(detail["old_acceptance"], "unknown_archive_fenced");
+            assert!(detail["source_removed"].is_null());
+            f.assert_erased_removal();
+            assert_eq!(
+                f.api
+                    .config_store
+                    .worker_retention_policy(TEST_WORKSPACE_ID)
+                    .unwrap(),
+                policy
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn erased_completed_archive_receipt_is_audited_without_republishing_on_resend_or_reopen() {
+    for restart in [false, true] {
+        let mut f = SubjectRemovalFixture::new().await;
+        f.disable();
+        let conn = rusqlite::Connection::open(&f.api.config.database_path).unwrap();
+        // Runtime has committed source_removed, but Backend commit/response is lost.
+        conn.execute_batch("CREATE TRIGGER interrupt_removal BEFORE DELETE ON worker_registry BEGIN SELECT RAISE(ABORT,'injected metadata commit interruption'); END;").unwrap();
+        assert_ne!(f.remove().status, StatusCode::OK.as_u16());
+        conn.execute_batch("DROP TRIGGER interrupt_removal")
+            .unwrap();
+        let old = f
+            .api
+            .config_store
+            .recover_worker_removal_execution(TEST_WORKSPACE_ID, &f.target)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            old.plan.state,
+            crate::retention::WorkerRemovalPlanState::Failed
+        );
+        let receipt = f
+            .api
+            .runtime
+            .execute_worker_retention(&f.target, old.runtime_request.clone())
+            .unwrap();
+        assert!(receipt.source_removed);
+        let archive_id = old.plan.archive_id.as_ref().unwrap();
+        let archive_source = f
+            .dir
+            .path()
+            .join(".test-embedded-runtime-store/archives/workers")
+            .join(archive_id)
+            .join("session");
+        assert!(archive_source.exists());
+        // The domain tombstone commits even though retained-source resolution fails.
+        // Recovery must locate only this plan's exact reserved archive, not publish it.
+        assert!(
+            f.api
+                .erase_subjektiv_journal_session(&f.attr.session_id, "erase-transferred-original")
+                .is_err()
+        );
+        assert!(f.store.journal_session_erased(&f.host).unwrap());
+        if restart {
+            f = f.reopen().await;
+        }
+        let response = f.remove();
+        assert_eq!(
+            response.status,
+            StatusCode::OK.as_u16(),
+            "{restart}: {}",
+            response.body
+        );
+        let saved = f
+            .api
+            .config_store
+            .recover_worker_removal_execution(TEST_WORKSPACE_ID, &f.target)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.plan.operation_id, old.plan.operation_id);
+        assert_eq!(saved.plan.input_fingerprint, old.plan.input_fingerprint);
+        assert_eq!(saved.plan.session_disposition, old.plan.session_disposition);
+        let detail: String = conn.query_row("SELECT detail FROM worker_retention_audit_events WHERE operation_id=?1 AND event_kind='erased_removal_receipt'", [&old.plan.operation_id], |r| r.get(0)).unwrap();
+        let detail: Value = serde_json::from_str(&detail).unwrap();
+        assert_eq!(detail["source_removed"], true);
+        assert_eq!(detail["old_acceptance"], "receipt_confirmed");
+        assert!(!archive_source.exists());
+        f.assert_erased_removal();
+    }
+}
+
+#[tokio::test]
+async fn erased_archive_without_receipt_or_inventory_remains_unknown_without_replanning() {
+    let f = SubjectRemovalFixture::new().await;
+    f.disable();
+    let conn = rusqlite::Connection::open(&f.api.config.database_path).unwrap();
+    conn.execute_batch("CREATE TRIGGER interrupt_removal BEFORE UPDATE OF state ON worker_removal_operations WHEN NEW.state='executing' BEGIN SELECT RAISE(ABORT,'injected interruption'); END;").unwrap();
+    assert_ne!(f.remove().status, StatusCode::OK.as_u16());
+    conn.execute_batch("DROP TRIGGER interrupt_removal")
+        .unwrap();
+    let old = f
+        .api
+        .config_store
+        .recover_worker_removal_execution(TEST_WORKSPACE_ID, &f.target)
+        .unwrap()
+        .unwrap();
+    f.api
+        .erase_subjektiv_journal_session(&f.attr.session_id, "erase-with-unknown-outcome")
+        .unwrap();
+    // Corrupt/missing aggregate after an unacknowledged operation is NOT evidence
+    // that source_removed completed. Runtime has no matching receipt here.
+    std::fs::remove_file(
+        session_root(f.dir.path(), &f.target)
+            .parent()
+            .unwrap()
+            .join("worker.json"),
+    )
+    .unwrap();
+    let response = f.remove();
+    assert_eq!(
+        response.status,
+        StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+        "{}",
+        response.body
+    );
+    let body: Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(body["code"], "erased_removal_outcome_unknown");
+    let saved = f
+        .api
+        .config_store
+        .recover_worker_removal_execution(TEST_WORKSPACE_ID, &f.target)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.plan.operation_id, old.plan.operation_id);
+    assert_eq!(
+        saved.plan.state,
+        crate::retention::WorkerRemovalPlanState::Executing
+    );
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM worker_removal_operations WHERE worker_id=?1",
+            [&f.target.worker_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn erased_archive_retained_diagnostics_receipt_finalizes_only_after_physical_ack_on_resend_or_reopen()
+ {
+    for restart in [false, true] {
+        for interrupt_erase in [false, true] {
+            let mut f = SubjectRemovalFixture::new().await;
+            f.disable();
+            let policy = f
+                .api
+                .config_store
+                .worker_retention_policy(TEST_WORKSPACE_ID)
+                .unwrap()
+                .unwrap();
+            let policy = f
+                .api
+                .config_store
+                .update_worker_retention_policy(
+                    TEST_WORKSPACE_ID,
+                    &policy.policy_digest,
+                    &crate::retention::WorkerRetentionPolicyUpdate {
+                        policy_id: "fixture-retained-diagnostics".into(),
+                        session_disposition: policy.session_disposition,
+                        metadata_disposition: policy.metadata_disposition,
+                        archive_retention: policy.archive_retention,
+                        diagnostics_disposition:
+                            worker_runtime::retention::DiagnosticsDisposition::Retain,
+                        diagnostics_retention_seconds: Some(3600),
+                    },
+                )
+                .unwrap();
+            let worker_root = session_root(f.dir.path(), &f.target)
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            std::fs::create_dir_all(worker_root.join("runs/fixture-run")).unwrap();
+            std::fs::write(
+                worker_root.join("runs/fixture-run/worker.out.log"),
+                "diagnostic original",
+            )
+            .unwrap();
+            let conn = rusqlite::Connection::open(&f.api.config.database_path).unwrap();
+            // Real Runtime receipt exists; Backend commit/response is interrupted.
+            conn.execute_batch("CREATE TRIGGER interrupt_removal BEFORE DELETE ON worker_registry BEGIN SELECT RAISE(ABORT,'injected metadata commit interruption'); END;").unwrap();
+            assert_ne!(f.remove().status, StatusCode::OK.as_u16());
+            conn.execute_batch("DROP TRIGGER interrupt_removal")
+                .unwrap();
+            let old = f
+                .api
+                .config_store
+                .recover_worker_removal_execution(TEST_WORKSPACE_ID, &f.target)
+                .unwrap()
+                .unwrap();
+            let runtime_root = f.dir.path().join(".test-embedded-runtime-store");
+            let receipt_path = runtime_root
+                .join("retention/operations")
+                .join(format!("{}.json", old.plan.operation_id));
+            let receipt_bytes = std::fs::read(&receipt_path).unwrap();
+            let receipt = f
+                .api
+                .runtime
+                .execute_worker_retention(&f.target, old.runtime_request.clone())
+                .unwrap();
+            assert!(receipt.source_removed);
+            assert!(receipt.diagnostics_retained);
+            let diagnostics_root = runtime_root
+                .join("archives/diagnostics")
+                .join(&old.plan.operation_id);
+            let diagnostics_manifest = diagnostics_root.join("manifest.json");
+            let diagnostics_bytes = std::fs::read(&diagnostics_manifest).unwrap();
+            let archive_source = runtime_root
+                .join("archives/workers")
+                .join(old.plan.archive_id.as_ref().unwrap())
+                .join("session");
+            assert!(diagnostics_root.exists());
+            assert!(archive_source.exists());
+            // Domain erasure succeeds, but no physical acknowledgement can be
+            // claimed from the old retained locator after aggregate removal.
+            assert!(
+                f.api
+                    .erase_subjektiv_journal_session(
+                        &f.attr.session_id,
+                        "erase-retained-diagnostics"
+                    )
+                    .is_err()
+            );
+            if interrupt_erase {
+                // Runtime must reject mismatched diagnostics identity rather than
+                // acknowledge removal of an unrelated operation. No fake Host ack.
+                let mut damaged: Value = serde_json::from_slice(&diagnostics_bytes).unwrap();
+                damaged["input_fingerprint"] = json!("unrelated-operation");
+                std::fs::write(&diagnostics_manifest, serde_json::to_vec(&damaged).unwrap())
+                    .unwrap();
+                let response = f.remove();
+                assert_eq!(
+                    response.status,
+                    StatusCode::CONFLICT.as_u16(),
+                    "{}",
+                    response.body
+                );
+                let body: Value = serde_json::from_str(&response.body).unwrap();
+                assert_eq!(body["code"], "erased_removal_reconciliation_unconfirmed");
+                assert!(
+                    f.api
+                        .store
+                        .get_worker_registry(TEST_WORKSPACE_ID, &f.target)
+                        .unwrap()
+                        .is_some()
+                );
+                let count: i64 = conn.query_row("SELECT COUNT(*) FROM worker_retention_audit_events WHERE operation_id=?1 AND event_kind='erased_removal_receipt'", [&old.plan.operation_id], |r| r.get(0)).unwrap();
+                assert_eq!(
+                    count, 0,
+                    "failed acknowledgement cannot authorize finalization/audit"
+                );
+                assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_bytes);
+                let waiting = f
+                    .api
+                    .config_store
+                    .recover_worker_removal_execution(TEST_WORKSPACE_ID, &f.target)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(waiting.plan.operation_id, old.plan.operation_id);
+                assert_eq!(waiting.plan.input_fingerprint, old.plan.input_fingerprint);
+                assert_eq!(
+                    waiting.plan.state,
+                    crate::retention::WorkerRemovalPlanState::Executing
+                );
+                let plans: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM worker_removal_operations WHERE worker_id=?1",
+                        [&f.target.worker_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    plans, 1,
+                    "missing physical ack cannot authorize a replacement plan"
+                );
+                std::fs::write(&diagnostics_manifest, &diagnostics_bytes).unwrap();
+            }
+            if restart {
+                f = f.reopen().await;
+            }
+            let response = f.remove();
+            assert_eq!(
+                response.status,
+                StatusCode::OK.as_u16(),
+                "restart={restart}, interrupted={interrupt_erase}: {}",
+                response.body
+            );
+            assert!(!diagnostics_root.exists());
+            assert!(!archive_source.exists());
+            assert_eq!(
+                std::fs::read(&receipt_path).unwrap(),
+                receipt_bytes,
+                "historical Runtime receipt must not be rewritten"
+            );
+            let saved = f
+                .api
+                .config_store
+                .recover_worker_removal_execution(TEST_WORKSPACE_ID, &f.target)
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.plan.operation_id, old.plan.operation_id);
+            assert_eq!(saved.plan.input_fingerprint, old.plan.input_fingerprint);
+            assert_eq!(
+                saved.plan.diagnostics_disposition,
+                old.plan.diagnostics_disposition
+            );
+            let detail: String = conn.query_row("SELECT detail FROM worker_retention_audit_events WHERE operation_id=?1 AND event_kind='erased_removal_receipt'", [&old.plan.operation_id], |r| r.get(0)).unwrap();
+            let detail: Value = serde_json::from_str(&detail).unwrap();
+            assert_eq!(detail["source_removed"], true);
+            assert_eq!(detail["old_diagnostics_retained"], true);
+            assert_eq!(
+                detail["runtime_erasure_ack"]["session_id"],
+                f.attr.session_id
+            );
+            let diagnostics_catalog: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM worker_diagnostics_archives WHERE operation_id=?1",
+                    [&old.plan.operation_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(diagnostics_catalog, 0);
+            let tombstone_archive: Option<String> = conn
+                .query_row(
+                    "SELECT archive_id FROM worker_tombstones WHERE operation_id=?1",
+                    [&old.plan.operation_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(tombstone_archive.is_none());
+            f.assert_erased_removal();
+            assert_eq!(
+                f.api
+                    .config_store
+                    .worker_retention_policy(TEST_WORKSPACE_ID)
+                    .unwrap(),
+                Some(policy)
+            );
+        }
+    }
+}

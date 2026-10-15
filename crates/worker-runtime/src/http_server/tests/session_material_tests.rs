@@ -659,8 +659,38 @@ fn catalog_rejects_oversize_record_with_explicit_resource_limit() {
 fn archive_scope_and_legacy_active_pointer_are_checked_and_erase_retry_never_restores_originals() {
     let f = Fixture::new();
     f.stop();
-    let request = f.retention_request(SessionDisposition::Archive);
-    f.runtime.execute_worker_retention(&request).unwrap();
+    let mut request = f.retention_request(SessionDisposition::Archive);
+    request.diagnostics_disposition = DiagnosticsDisposition::Retain;
+    let log = f
+        .root()
+        .parent()
+        .unwrap()
+        .join("runs/run-original/worker.out.log");
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::fs::write(&log, "archived diagnostic original").unwrap();
+    let original_receipt = f.runtime.execute_worker_retention(&request).unwrap();
+    assert!(original_receipt.diagnostics_retained);
+    let diagnostics = f
+        .temp
+        .path()
+        .join("archives/diagnostics")
+        .join(&request.operation_id);
+    assert!(
+        diagnostics
+            .join("runs/run-original/worker.out.log")
+            .is_file()
+    );
+    let staged_diagnostics =
+        diagnostics.with_file_name(format!(".{}.tmp-42-1", request.operation_id));
+    std::fs::create_dir_all(&staged_diagnostics).unwrap();
+    std::fs::write(
+        staged_diagnostics.join("partial-original.log"),
+        "incomplete copy",
+    )
+    .unwrap();
+    let unrelated = diagnostics.with_file_name("another-operation");
+    std::fs::create_dir_all(&unrelated).unwrap();
+    std::fs::write(unrelated.join("untouched.log"), "unrelated diagnostic").unwrap();
     let source = Source::Archived {
         archive_id: "canonical-archive".into(),
     };
@@ -756,10 +786,74 @@ fn archive_scope_and_legacy_active_pointer_are_checked_and_erase_retry_never_res
             .pin_session_public_source_scoped(&f.scope, &source, &f.session.to_string(), pin)
             .is_err()
     );
-    // An old removal receipt is evidence only and must not republish erased bytes.
-    f.runtime.execute_worker_retention(&request).unwrap();
+    // An old receipt is historical evidence, not permission to republish erased bytes.
+    assert_eq!(
+        f.runtime.execute_worker_retention(&request).unwrap(),
+        original_receipt
+    );
+    assert!(!diagnostics.exists());
+    assert!(!staged_diagnostics.exists());
+    assert!(unrelated.join("untouched.log").is_file());
     assert!(!root.exists());
     assert!(retention.pins(f.session).unwrap().is_empty());
+}
+
+#[test]
+fn erasure_rejects_mismatched_archived_diagnostics_then_resumes_under_the_same_fence() {
+    let f = Fixture::new();
+    f.stop();
+    let mut request = f.retention_request(SessionDisposition::Archive);
+    request.diagnostics_disposition = DiagnosticsDisposition::Retain;
+    let receipt = f.runtime.execute_worker_retention(&request).unwrap();
+    let source = Source::Archived {
+        archive_id: request.archive_id.clone().unwrap(),
+    };
+    let manifest = f
+        .temp
+        .path()
+        .join("archives/diagnostics")
+        .join(&request.operation_id)
+        .join("manifest.json");
+    let original: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    for field in ["workspace_id", "input_fingerprint", "source_worker_id"] {
+        let mut changed = original.clone();
+        changed[field] = serde_json::json!(uuid::Uuid::now_v7().to_string());
+        std::fs::write(&manifest, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(
+            f.runtime
+                .delete_session_public_source_scoped(
+                    &f.scope,
+                    &source,
+                    &f.session.to_string(),
+                    SessionDeletionIntent::ErasePermanently
+                )
+                .is_err()
+        );
+        assert!(manifest.exists());
+        assert!(matches!(
+            runtime_session_retention(f.temp.path()).ensure_live(f.session),
+            Err(session_store::StoreError::SessionErased(_))
+        ));
+    }
+    std::fs::write(&manifest, serde_json::to_vec(&original).unwrap()).unwrap();
+    f.runtime
+        .delete_session_public_source_scoped(
+            &f.scope,
+            &source,
+            &f.session.to_string(),
+            SessionDeletionIntent::ErasePermanently,
+        )
+        .unwrap();
+    assert!(!manifest.parent().unwrap().exists());
+    assert_eq!(
+        f.runtime.execute_worker_retention(&request).unwrap(),
+        receipt
+    );
+    assert!(
+        receipt.diagnostics_retained,
+        "historical receipt must not be rewritten after erasure"
+    );
 }
 
 #[test]

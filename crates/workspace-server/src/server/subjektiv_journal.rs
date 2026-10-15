@@ -878,6 +878,51 @@ pub(super) fn prepare_worker_removal(
     Ok(None)
 }
 
+/// A successful erase response proves the Runtime's permanent fence. The reserved
+/// archive covers transfer-before-Backend-commit crashes too. Never admit or generate.
+pub(super) fn erased_archive_removal_proof(
+    service: &WorkerRemovalService,
+    runtime: &RuntimeRegistry,
+    target: &RuntimeWorkerRef,
+    prepared: &crate::retention::PreparedWorkerRemoval,
+) -> Result<Option<crate::retention::RuntimeJournalErasureAck>> {
+    let Some(attr) = removal_attribution(service, target)? else {
+        return Ok(None);
+    };
+    let store = crate::subjektiv::SubjektivStore::open(
+        &service.journal_storage,
+        &service.journal_registration,
+    )
+    .map_err(|e| Error::Store(e.to_string()))?;
+    let Some(proof) =
+        crate::retention::ErasedJournalSession::validated(&service.workspace_id, &store, &attr)?
+    else {
+        return Ok(None);
+    };
+    let api = service.journal_dispatch_api.upgrade().ok_or_else(|| {
+        Error::Store("Workspace API unavailable for erased removal recovery".into())
+    })?;
+    reconcile_session_jobs(&api, &attr, true)?;
+    let source = runtime_api::SessionPublicSource::Retained {
+        worker_id: prepared.runtime_request.worker_id,
+    };
+    let ack = match proof.clone().erase_runtime_source(runtime, source) {
+        Ok(ack) => ack,
+        Err(original) => {
+            let Some(archive_id) = prepared.runtime_request.archive_id.clone() else {
+                return Err(original);
+            };
+            proof
+                .erase_runtime_source(
+                    runtime,
+                    runtime_api::SessionPublicSource::Archived { archive_id },
+                )
+                .map_err(|_| original)?
+        }
+    };
+    Ok(Some(ack))
+}
+
 pub(super) fn validate_removal_retention(
     service: &WorkerRemovalService,
     target: &RuntimeWorkerRef,

@@ -7,6 +7,8 @@ use crate::store::{StaleLeasePolicy, StandaloneWorkerAllocation, StandaloneWorke
 use session_store::{Store, WorkerMetadataStore};
 use std::sync::atomic::AtomicBool;
 
+mod compaction;
+
 struct Fixture {
     _temp: tempfile::TempDir,
     _allocation: Option<StandaloneWorkerAllocation>,
@@ -494,6 +496,7 @@ struct JournalScript {
     gate_first: bool,
     pause_after_record: bool,
     record_saved: Arc<tokio::sync::Notify>,
+    source_reads: Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
 }
 impl JournalScript {
     fn response(
@@ -565,6 +568,16 @@ impl JournalScript {
                     let id = format!("source-{index}-{offset}");
                     if let Some(page) = result(&id) {
                         let page = &page["value"];
+                        let key = format!("{}:{id}", state["generation_id"].as_str().unwrap());
+                        let text = page["text"].as_str().unwrap().to_owned();
+                        if let Some(previous) =
+                            self.source_reads.lock().unwrap().insert(key, text.clone())
+                        {
+                            assert_eq!(
+                                previous, text,
+                                "frozen source read changed within a generation"
+                            );
+                        }
                         if let Some(next) = page["next_byte"].as_u64() {
                             assert!(next > offset);
                             offset = next;

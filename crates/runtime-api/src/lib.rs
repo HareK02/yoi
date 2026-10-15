@@ -812,6 +812,9 @@ pub struct SessionMaterialEraseRequest {
     pub expected_session_id: String,
 }
 
+/// Acknowledges the permanent fence and physical erasure of Session originals,
+/// including archived diagnostics bound to the same removal operations. Historical
+/// retention receipts remain immutable; their old retained flags are not current availability.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionMaterialEraseResponse {
     pub session_id: String,

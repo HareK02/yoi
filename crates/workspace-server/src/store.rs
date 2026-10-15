@@ -1451,6 +1451,40 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
             "Worker retention authority is unavailable".to_string(),
         ))
     }
+    fn supersede_erased_worker_removal(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        proof: &crate::retention::RuntimeJournalErasureAck,
+        inventory: &worker_runtime::retention::WorkerRetentionInventory,
+    ) -> std::result::Result<(), crate::retention::WorkerRetentionError> {
+        let _ = (prepared, proof, inventory);
+        Err(crate::retention::WorkerRetentionError::Invalid(
+            "Erased removal reconciliation authority is unavailable".into(),
+        ))
+    }
+    fn audit_erased_worker_removal_receipt(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        proof: &crate::retention::RuntimeJournalErasureAck,
+        result: &worker_runtime::retention::WorkerRetentionExecutionResult,
+    ) -> std::result::Result<(), crate::retention::WorkerRetentionError> {
+        let _ = (prepared, proof, result);
+        Err(crate::retention::WorkerRetentionError::Invalid(
+            "Erased removal reconciliation authority is unavailable".into(),
+        ))
+    }
+    fn commit_erased_worker_removal(
+        &self,
+        workspace_id: &str,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        result: &worker_runtime::retention::WorkerRetentionExecutionResult,
+        proof: &crate::retention::RuntimeJournalErasureAck,
+    ) -> std::result::Result<WorkerRemovalCommit, crate::retention::WorkerRetentionError> {
+        let _ = (workspace_id, prepared, result, proof);
+        Err(crate::retention::WorkerRetentionError::Invalid(
+            "Erased removal reconciliation authority is unavailable".into(),
+        ))
+    }
     fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>>;
     fn upsert_repository(&self, record: &RepositoryRecord) -> Result<()>;
     fn insert_repository(&self, record: &RepositoryRecord) -> Result<RepositoryInsertOutcome>;
@@ -5438,6 +5472,37 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         )
     }
 
+    fn supersede_erased_worker_removal(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        proof: &crate::retention::RuntimeJournalErasureAck,
+        inventory: &worker_runtime::retention::WorkerRetentionInventory,
+    ) -> std::result::Result<(), crate::retention::WorkerRetentionError> {
+        SqliteWorkspaceStore::supersede_erased_worker_removal(self, prepared, proof, inventory)
+    }
+    fn audit_erased_worker_removal_receipt(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        proof: &crate::retention::RuntimeJournalErasureAck,
+        result: &worker_runtime::retention::WorkerRetentionExecutionResult,
+    ) -> std::result::Result<(), crate::retention::WorkerRetentionError> {
+        SqliteWorkspaceStore::audit_erased_worker_removal_receipt(self, prepared, proof, result)
+    }
+    fn commit_erased_worker_removal(
+        &self,
+        workspace_id: &str,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        result: &worker_runtime::retention::WorkerRetentionExecutionResult,
+        proof: &crate::retention::RuntimeJournalErasureAck,
+    ) -> std::result::Result<WorkerRemovalCommit, crate::retention::WorkerRetentionError> {
+        SqliteWorkspaceStore::commit_erased_worker_removal(
+            self,
+            workspace_id,
+            prepared,
+            result,
+            proof,
+        )
+    }
     fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(

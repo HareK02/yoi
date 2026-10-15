@@ -1889,8 +1889,98 @@ impl WorkerRemovalService {
         &self,
         runtime: &RuntimeRegistry,
         target: &RuntimeWorkerRef,
-        prepared: crate::retention::PreparedWorkerRemoval,
+        mut prepared: crate::retention::PreparedWorkerRemoval,
+        parent_workspace_deletion_operation_id: Option<&str>,
     ) -> std::result::Result<worker::WorkspaceResponse, String> {
+        if prepared.plan.session_disposition
+            == worker_runtime::retention::SessionDisposition::Archive
+        {
+            let erasure_ack = match subjektiv_journal::erased_archive_removal_proof(
+                self, runtime, target, &prepared,
+            ) {
+                Ok(ack) => ack,
+                Err(error) => {
+                    return Ok(worker_remove_error_response(
+                        StatusCode::CONFLICT,
+                        "erased_removal_reconciliation_unconfirmed",
+                        &error.to_string(),
+                    ));
+                }
+            };
+            if let Some(ack) = erasure_ack {
+                // Replay EXACT old input under the acknowledged permanent fence.
+                // Runtime can return an existing receipt, but cannot re-Archive.
+                match runtime.execute_worker_retention(target, prepared.runtime_request.clone()) {
+                    Ok(result) => {
+                        if let Err(error) = self
+                            .store
+                            .audit_erased_worker_removal_receipt(&prepared, &ack, &result)
+                        {
+                            return Ok(worker_retention_error_response(error));
+                        }
+                        return match self.worker_projection.publish_ordered(|| {
+                            self.store
+                                .commit_erased_worker_removal(
+                                    &self.workspace_id,
+                                    &prepared,
+                                    &result,
+                                    &ack,
+                                )
+                                .map(|commit| ((), commit.catalog))
+                        }) {
+                            Ok(()) => Ok(worker_remove_success_response(target)),
+                            Err(error) => Ok(worker_retention_error_response(error)),
+                        };
+                    }
+                    Err(_) => {
+                        // Errors are unknown acceptance, not failure. A missing
+                        // aggregate without a receipt remains unresolved.
+                        let inventory = match runtime.worker_retention_inventory(target) {
+                            Ok(inventory) => inventory,
+                            Err(_) => {
+                                return Ok(worker_remove_error_response(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "erased_removal_outcome_unknown",
+                                    "Old Runtime outcome cannot be reconciled; removal remains recoverable",
+                                ));
+                            }
+                        };
+                        if let Err(error) = self
+                            .store
+                            .supersede_erased_worker_removal(&prepared, &ack, &inventory)
+                        {
+                            return Ok(worker_retention_error_response(error));
+                        }
+                        let request = crate::retention::WorkerRemovalPlanRequest {
+                            workspace_id: self.workspace_id.clone(),
+                            worker: target.clone(),
+                            reason: prepared.plan.reason.clone(),
+                            journal_erasure: Some(ack.domain_proof().clone()),
+                        };
+                        let plan = match self.store.plan_worker_removal(&request, &inventory) {
+                            Ok(plan) => plan,
+                            Err(error) => return Ok(worker_retention_error_response(error)),
+                        };
+                        prepared = match self.store.prepare_worker_removal_execution(
+                            &self.workspace_id,
+                            &plan.plan_id,
+                            &plan.input_fingerprint,
+                        ) {
+                            Ok(prepared) => prepared,
+                            Err(error) => return Ok(worker_retention_error_response(error)),
+                        };
+                        if let Some(parent) = parent_workspace_deletion_operation_id {
+                            self.store
+                                .append_workspace_deletion_child_operation(
+                                    parent,
+                                    &prepared.plan.operation_id,
+                                )
+                                .map_err(|error| error.to_string())?;
+                        }
+                    }
+                }
+            }
+        }
         if let Err(error) = subjektiv_journal::validate_removal_retention(self, target, &prepared) {
             return Ok(worker_remove_error_response(
                 StatusCode::CONFLICT,
@@ -2168,7 +2258,12 @@ impl WorkerRemovalService {
                 ));
             }
             return self
-                .resume_worker_retention(runtime, &target, prepared)
+                .resume_worker_retention(
+                    runtime,
+                    &target,
+                    prepared,
+                    parent_workspace_deletion_operation_id,
+                )
                 .await;
         }
 

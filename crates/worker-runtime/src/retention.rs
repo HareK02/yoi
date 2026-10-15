@@ -297,14 +297,15 @@ pub(crate) fn remove_archived_session_copies(
         }
         let session_root = entry.path().join("session");
         let owner = match fs::read(entry.path().join("manifest.json")) {
-            Ok(bytes) => Some(
-                serde_json::from_slice::<WorkerSessionArchiveManifest>(&bytes)?.source_session_id,
-            ),
+            Ok(bytes) => Some(serde_json::from_slice::<WorkerSessionArchiveManifest>(
+                &bytes,
+            )?),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
         if let Some(owner) = owner {
-            if owner == session.to_string() {
+            if owner.source_session_id == session.to_string() {
+                erase_archived_diagnostics(runtime_root, &owner)?;
                 match fs::remove_dir_all(&session_root) {
                     Ok(()) => (),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
@@ -323,6 +324,89 @@ pub(crate) fn remove_archived_session_copies(
             fs::remove_dir_all(&session_root)?;
         }
     }
+    Ok(())
+}
+
+/// Erasure includes diagnostic originals of the same archived removal operation.
+/// The immutable removal receipt is historical evidence and is never rewritten.
+/// Staging names are bound to that exact operation; unrelated archives are untouched.
+fn erase_archived_diagnostics(
+    runtime_root: &Path,
+    archive: &WorkerSessionArchiveManifest,
+) -> Result<(), session_store::StoreError> {
+    let invalid = || {
+        session_store::StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Archived diagnostics erasure identity mismatch",
+        ))
+    };
+    if archive.schema_version != ARCHIVE_SCHEMA_VERSION {
+        return Err(invalid());
+    }
+    validate_id("operation_id", &archive.operation_id).map_err(|_| invalid())?;
+    let receipt_path = runtime_root
+        .join("retention/operations")
+        .join(format!("{}.json", archive.operation_id));
+    if let Some(receipt) = read_operation_receipt(&receipt_path).map_err(|_| invalid())? {
+        if receipt.request.workspace_id != archive.workspace_id
+            || receipt.request.source_runtime_id != archive.source_runtime_id
+            || receipt.request.worker_id != archive.source_worker_id
+            || receipt.request.operation_id != archive.operation_id
+            || receipt.request.input_fingerprint != archive.input_fingerprint
+            || receipt.request.archive_id.as_ref() != Some(&archive.archive_id)
+            || receipt.result.archive.as_ref() != Some(archive)
+        {
+            return Err(invalid());
+        }
+    }
+    let parent = runtime_root.join("archives/diagnostics");
+    let entries = match fs::read_dir(&parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let staging_prefix = format!(".{}.tmp-", archive.operation_id);
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let staged = name.strip_prefix(&staging_prefix).is_some_and(|suffix| {
+            suffix.split_once('-').is_some_and(|(pid, sequence)| {
+                !pid.is_empty()
+                    && !sequence.is_empty()
+                    && pid.bytes().all(|b| b.is_ascii_digit())
+                    && sequence.bytes().all(|b| b.is_ascii_digit())
+            })
+        });
+        if name != archive.operation_id && !staged {
+            continue;
+        }
+        if !entry.file_type()?.is_dir() {
+            return Err(invalid());
+        }
+        let manifest = match fs::read(entry.path().join("manifest.json")) {
+            Ok(bytes) => Some(serde_json::from_slice::<DiagnosticsArchiveManifest>(
+                &bytes,
+            )?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && staged => None,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(manifest) = manifest {
+            if manifest.schema_version != ARCHIVE_SCHEMA_VERSION
+                || manifest.workspace_id != archive.workspace_id
+                || manifest.source_runtime_id != archive.source_runtime_id
+                || manifest.source_worker_id != archive.source_worker_id
+                || manifest.operation_id != archive.operation_id
+                || manifest.input_fingerprint != archive.input_fingerprint
+            {
+                return Err(invalid());
+            }
+        }
+        fs::remove_dir_all(entry.path())?;
+    }
+    sync_directory(&parent, "erase archived Worker diagnostics").map_err(|_| invalid())?;
     Ok(())
 }
 
