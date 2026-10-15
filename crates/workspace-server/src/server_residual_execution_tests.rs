@@ -715,7 +715,7 @@ async fn worker_control_source_lookup_waits_off_tokio_and_retains_finite_host_ow
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn ticket_tracking_and_case_authority_runtime_lookup_leave_db_and_tokio_free() {
+async fn ticket_tracking_authority_and_case_audit_lookup_leave_db_and_tokio_free() {
     for operation in ["tracking", "case"] {
         let fixture = fixture().await;
         let ticket = browser_ticket_backend(&fixture.api)
@@ -841,11 +841,25 @@ async fn ticket_tracking_and_case_authority_runtime_lookup_leave_db_and_tokio_fr
         observed(fixture.host_executor.drain()).await.unwrap();
         observed(fixture.executor.drain()).await.unwrap();
         assert_eq!(leases.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            backend.show(TicketIdOrSlug::Id(ticket.id)).unwrap(),
-            before,
-            "failed live authority must not make a decision"
-        );
+        let after = backend.show(TicketIdOrSlug::Id(ticket.id)).unwrap();
+        if operation == "tracking" {
+            assert_eq!(
+                after, before,
+                "tracking still requires live assignment authority"
+            );
+        } else {
+            // Profile-authorized case changes do not depend on a live
+            // Orchestrator lookup. Its failure only affects audit role context.
+            assert_eq!(after.meta.workflow_state, ticket::TicketState::Closed);
+            assert_eq!(
+                after.events.last().unwrap().attributes["source_actor_role"],
+                "worker"
+            );
+            assert_eq!(
+                after.current_closure.unwrap().operation_key,
+                "case-operation"
+            );
+        }
     }
 }
 

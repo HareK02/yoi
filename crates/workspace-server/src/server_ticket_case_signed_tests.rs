@@ -34,59 +34,62 @@ fn signed_case_request(
 }
 
 #[tokio::test]
-async fn signed_unassigned_worker_without_hints_cannot_close_reopen_or_correct_cases() {
+async fn signed_unassigned_worker_can_close_correct_and_reopen_without_orchestration() {
     let dir = tempfile::tempdir().unwrap();
     let (mut api, execution) = test_api_with_recording_backend(dir.path()).await;
     let identity = RuntimeIdentityMaterial::generate("runtime-case").unwrap();
     configure_runtime_request_auth(&mut api, &identity, "runtime-case");
-    seed_worker_source_member(&api, "runtime-case", "other");
+    seed_worker_source_member(&api, "runtime-case", "companion");
     let backend = browser_ticket_backend(&api).unwrap();
     let reference = backend
-        .create(ticket::NewTicket::new("Case authority"))
+        .create(ticket::NewTicket::new(
+            "Case permission is independent of assignment",
+        ))
         .unwrap();
-    seed_case_assignment(
-        &api,
-        &reference.id,
-        &RuntimeWorkerRef::new("runtime-case", "owner"),
-        "unauthorized-owner",
-    );
+    let authority = case_authority_snapshot(&api);
     let app = build_router(api.clone());
-    for action in [
+    for (index, action) in [
         ticket::TicketCaseAction::Close {
             reason: ticket::TicketClosureReason::Completed,
         },
-        ticket::TicketCaseAction::Reopen,
         ticket::TicketCaseAction::CorrectClosure {
             reason: ticket::TicketClosureReason::NotPlanned,
         },
-    ] {
-        if !matches!(action, ticket::TicketCaseAction::Close { .. }) {
-            let before = backend.show(reference.id.clone().into()).unwrap();
-            if before.meta.workflow_state == TicketState::Open {
-                backend
-                    .update_case(
-                        &reference.id,
-                        case_test_request(
-                            &before,
-                            "fixture-close",
-                            ticket::TicketCaseAction::Close {
-                                reason: ticket::TicketClosureReason::Completed,
-                            },
-                        ),
-                    )
-                    .unwrap();
-            }
-        }
+        ticket::TicketCaseAction::Reopen,
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let before = backend.show(reference.id.clone().into()).unwrap();
-        let input = case_test_request(&before, "unauthorized", action);
-        let authority = case_authority_snapshot(&api);
-        case_response(
+        let input = case_test_request(&before, &format!("case-{index}"), action);
+        let first = case_response(
             app.clone(),
-            signed_case_request(&identity, Some("other"), &reference.id, &input),
-            StatusCode::FORBIDDEN,
+            signed_case_request(&identity, Some("companion"), &reference.id, &input),
+            StatusCode::OK,
         )
         .await;
-        assert_eq!(backend.show(reference.id.clone().into()).unwrap(), before);
+        assert_eq!(
+            first["workflow_state"],
+            if index == 2 { "open" } else { "closed" }
+        );
+        let after = backend.show(reference.id.clone().into()).unwrap();
+        let event = after.events.last().unwrap();
+        assert_eq!(
+            event.author.as_deref(),
+            Some("worker:runtime-case/companion")
+        );
+        assert_eq!(event.attributes["source_actor_role"], "worker");
+        assert!(!event.attributes.contains_key("source_assignment_id"));
+        assert_eq!(
+            case_response(
+                app.clone(),
+                signed_case_request(&identity, Some("companion"), &reference.id, &input),
+                StatusCode::OK,
+            )
+            .await,
+            first
+        );
+        assert_eq!(backend.show(reference.id.clone().into()).unwrap(), after);
         assert_eq!(case_authority_snapshot(&api), authority);
     }
     assert!(execution.protocol_methods().is_empty());
@@ -254,17 +257,7 @@ async fn signed_assigned_worker_case_replay_keeps_original_actor_after_release_w
         StatusCode::CONFLICT,
     )
     .await;
-    let reopen = case_test_request(
-        &closed,
-        "released-worker-reopen",
-        ticket::TicketCaseAction::Reopen,
-    );
-    case_response(
-        app.clone(),
-        signed_case_request(&identity, Some("owner"), &reference.id, &reopen),
-        StatusCode::FORBIDDEN,
-    )
-    .await;
+    // Releasing execution grants does not revoke Profile case-decision access.
     let correction = case_test_request(
         &closed,
         "released-worker-correction",
@@ -273,13 +266,38 @@ async fn signed_assigned_worker_case_replay_keeps_original_actor_after_release_w
         },
     );
     case_response(
-        app,
+        app.clone(),
         signed_case_request(&identity, Some("owner"), &reference.id, &correction),
-        StatusCode::FORBIDDEN,
+        StatusCode::OK,
     )
     .await;
-    assert_eq!(backend.show(reference.id.into()).unwrap(), closed);
+    let stale_reopen = case_test_request(&closed, "stale-reopen", ticket::TicketCaseAction::Reopen);
+    case_response(
+        app.clone(),
+        signed_case_request(&identity, Some("owner"), &reference.id, &stale_reopen),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    let corrected = backend.show(reference.id.clone().into()).unwrap();
+    let reopen = case_test_request(
+        &corrected,
+        "released-worker-reopen",
+        ticket::TicketCaseAction::Reopen,
+    );
+    case_response(
+        app,
+        signed_case_request(&identity, Some("owner"), &reference.id, &reopen),
+        StatusCode::OK,
+    )
+    .await;
+    let reopened = backend.show(reference.id.into()).unwrap();
+    assert_eq!(reopened.meta.workflow_state, TicketState::Open);
+    assert_eq!(
+        reopened.events.last().unwrap().attributes["source_actor_role"],
+        "worker"
+    );
     assert_eq!(case_authority_snapshot(&api), released);
+
     assert!(execution.protocol_methods().is_empty());
 }
 
@@ -492,15 +510,13 @@ async fn typed_and_generic_case_dispatch_keep_the_same_verified_worker_and_recei
         reference.id
     );
     let generic = generic_case_router(api.clone());
-    for worker in [Some("other"), None] {
-        case_response(
-            generic.clone(),
-            signed_case_request(&identity, worker, &reference.id, &input),
-            StatusCode::FORBIDDEN,
-        )
-        .await;
-        assert_eq!(backend.show(reference.id.clone().into()).unwrap(), before);
-    }
+    case_response(
+        generic.clone(),
+        signed_case_request(&identity, None, &reference.id, &input),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    assert_eq!(backend.show(reference.id.clone().into()).unwrap(), before);
     let closed = case_response(
         generic.clone(),
         runtime_source_request(
