@@ -661,6 +661,30 @@ pub struct UserRecord {
     pub updated_at: String,
 }
 
+/// Enrollment authority persisted with the WebAuthn verifier, never supplied by a client.
+/// New-account identities are only allocations until verified completion commits them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "purpose", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PasskeyRegistrationTarget {
+    NewAccount {
+        user: UserRecord,
+    },
+    Addition {
+        user: UserRecord,
+        authentication: PasskeyAuthenticationBinding,
+    },
+}
+
+/// Hash of the exact transport credential that authorized an addition. A second
+/// session for the same user cannot complete its ceremony; revocation is checked
+/// again in the credential insertion transaction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "method", content = "token_hash", rename_all = "snake_case")]
+pub enum PasskeyAuthenticationBinding {
+    BrowserSession(String),
+    ApiToken(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PasskeyCredentialRecord {
     pub credential_id: String,
@@ -1552,6 +1576,13 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     fn get_user(&self, user_id: &str) -> Result<Option<UserRecord>>;
     fn get_user_by_handle(&self, handle: &str) -> Result<Option<UserRecord>>;
     fn any_user(&self) -> Result<Option<UserRecord>>;
+    /// Atomically creates a new account/user/credential, or inserts a credential
+    /// for a still-authenticated existing target. Never overwrites a credential.
+    fn register_verified_passkey(
+        &self,
+        target: &PasskeyRegistrationTarget,
+        credential: &PasskeyCredentialRecord,
+    ) -> Result<()>;
     fn upsert_passkey_credential(&self, record: &PasskeyCredentialRecord) -> Result<()>;
     fn get_passkey_credential(
         &self,
@@ -6346,6 +6377,66 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn register_verified_passkey(
+        &self,
+        target: &PasskeyRegistrationTarget,
+        credential: &PasskeyCredentialRecord,
+    ) -> Result<()> {
+        self.with_immediate_transaction(|tx| {
+            let user = match target {
+                PasskeyRegistrationTarget::NewAccount { user } => {
+                    let occupied: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM accounts WHERE kind = 'user' AND handle = ?1) OR EXISTS(SELECT 1 FROM users WHERE handle = ?1)",
+                        params![user.handle], |row| row.get(0),
+                    )?;
+                    if occupied {
+                        return Err(crate::auth::auth_error("auth_handle_exists", "handle is already registered"));
+                    }
+                    tx.execute(
+                        "INSERT INTO accounts (account_id, kind, handle, display_name, created_at, updated_at) VALUES (?1, 'user', ?2, ?3, ?4, ?5)",
+                        params![user.account_id, user.handle, user.display_name, user.created_at, user.updated_at],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO users (user_id, account_id, handle, display_name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![user.user_id, user.account_id, user.handle, user.display_name, user.created_at, user.updated_at],
+                    )?;
+                    user
+                }
+                PasskeyRegistrationTarget::Addition { user, authentication } => {
+                    let current = tx.query_row(
+                        user_select_sql("WHERE user_id = ?1 AND account_id = ?2").as_str(),
+                        params![user.user_id, user.account_id], read_user_record,
+                    ).optional()?;
+                    if current.is_none() {
+                        return Err(crate::auth::auth_error("passkey_target_mismatch", "addition target no longer exists"));
+                    }
+                    let expires_at: Option<Option<String>> = match authentication {
+                        PasskeyAuthenticationBinding::BrowserSession(hash) => tx.query_row(
+                            "SELECT expires_at FROM browser_sessions WHERE token_hash = ?1 AND user_id = ?2 AND revoked_at IS NULL",
+                            params![hash, user.user_id], |row| row.get(0),
+                        ).optional()?,
+                        PasskeyAuthenticationBinding::ApiToken(hash) => tx.query_row(
+                            "SELECT expires_at FROM api_tokens WHERE token_hash = ?1 AND user_id = ?2 AND revoked_at IS NULL",
+                            params![hash, user.user_id], |row| row.get(0),
+                        ).optional()?,
+                    };
+                    if !expires_at.is_some_and(|expiry| expiry.as_deref().is_none_or(|value| !crate::auth::is_expired(value))) {
+                        return Err(crate::auth::auth_error("auth_required", "addition credential has expired or been revoked"));
+                    }
+                    user
+                }
+            };
+            if user.user_id != credential.user_id {
+                return Err(crate::auth::auth_error("passkey_target_mismatch", "credential does not match enrollment target"));
+            }
+            tx.execute(
+                "INSERT INTO passkey_credentials (credential_id, user_id, public_key_cose, transports_json, sign_count, created_at, last_used_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![credential.credential_id, credential.user_id, credential.public_key_cose, credential.transports_json, credential.sign_count, credential.created_at, credential.last_used_at],
+            )?;
+            Ok(())
+        })
+    }
+
     fn upsert_passkey_credential(&self, record: &PasskeyCredentialRecord) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
@@ -6435,7 +6526,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         ceremony: &str,
         consumed_at: &str,
     ) -> Result<Option<AuthChallengeRecord>> {
-        self.with_conn(|conn| {
+        self.with_immediate_transaction(|conn| {
             let record = conn
                 .query_row(
                     auth_challenge_select_sql(

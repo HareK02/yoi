@@ -15,6 +15,8 @@ export type AuthBootstrapUserRequest = { handle: string, display_name?: string |
 
 export type AuthUserResponse = { user: AuthenticatedUser, };
 
+export type PasskeyAdditionOptionsRequest = { browser_origin?: string | null, };
+
 export type PasskeyRegistrationOptionsRequest = { handle: string, display_name?: string | null, browser_origin?: string | null, };
 
 export type PasskeyRegistrationOptionsResponse = { challenge_id: string, public_key: unknown, };
