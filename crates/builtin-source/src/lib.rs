@@ -82,6 +82,16 @@ pub const BUILTIN_PROFILE_RESOURCES: &[BuiltinProfileResource] = &[
         }],
     },
     BuiltinProfileResource {
+        selector: Some("builtin:subjektiv-journal-recording"),
+        path: "profiles/subjektiv-journal-recording.dcdl",
+        source: include_str!("../../../resources/profiles/subjektiv-journal-recording.dcdl"),
+        description: "Journal recording policy with Host-bound sequential Job tools.",
+        imports: &[BuiltinProfileImport {
+            specifier: "./job.dcdl",
+            resolved_path: "profiles/job.dcdl",
+        }],
+    },
+    BuiltinProfileResource {
         selector: Some("builtin:ticket-worker"),
         path: "profiles/ticket-worker.dcdl",
         source: include_str!("../../../resources/profiles/ticket-worker.dcdl"),

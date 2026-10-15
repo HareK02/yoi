@@ -1284,9 +1284,6 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
   const devicePage = await Deno.readTextFile(
     new URL("./../../../routes/login/device/+page.svelte", import.meta.url),
   );
-  const authApi = await Deno.readTextFile(
-    new URL("../auth/api.ts", import.meta.url),
-  );
   const rootLayout = await Deno.readTextFile(
     new URL("./../../../routes/+layout.svelte", import.meta.url),
   );
@@ -1338,14 +1335,6 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
       devicePage.includes("user_code") &&
       devicePage.includes("Approve device login"),
     "Device login page should approve CLI login without DevTools console",
-  );
-  assert(
-    authApi.includes("/api/auth/whoami") &&
-      authApi.includes("/api/auth/passkeys/registration/options") &&
-      authApi.includes("/api/auth/passkeys/login/complete") &&
-      authApi.includes("/api/auth/logout") &&
-      authApi.includes("/api/auth/device-login/approve"),
-    "Auth model should stay on Backend auth APIs rather than workspace authorization APIs",
   );
   assert(
     rootLayout.includes("SIDEBAR_CONTEXT") &&

@@ -1,5 +1,6 @@
 import type {
   DeviceLoginApproveRequest,
+  PasskeyAdditionOptionsRequest,
   PasskeyLoginCompleteRequest,
   PasskeyLoginOptionsRequest,
   PasskeyRegistrationCompleteRequest,
@@ -114,7 +115,23 @@ export async function registerPasskey(
     display_name: displayName ?? null,
     browser_origin: window.location.origin,
   };
-  const options = await requestJson("/api/auth/passkeys/registration/options", {
+  return await createPasskey("registration", optionsRequest);
+}
+
+export async function addPasskey(): Promise<AuthUser> {
+  const optionsRequest: PasskeyAdditionOptionsRequest = {
+    browser_origin: window.location.origin,
+  };
+  return await createPasskey("addition", optionsRequest);
+}
+
+async function createPasskey(
+  purpose: "registration" | "addition",
+  optionsRequest:
+    | PasskeyRegistrationOptionsRequest
+    | PasskeyAdditionOptionsRequest,
+): Promise<AuthUser> {
+  const options = await requestJson(`/api/auth/passkeys/${purpose}/options`, {
     method: "POST",
     body: JSON.stringify(optionsRequest),
   });
@@ -137,7 +154,7 @@ export async function registerPasskey(
     credential: registrationCredentialToJson(credential),
   };
   const result = parseAuthUserResponse(
-    await requestJson("/api/auth/passkeys/registration/complete", {
+    await requestJson(`/api/auth/passkeys/${purpose}/complete`, {
       method: "POST",
       body: JSON.stringify(completeRequest),
     }),
@@ -145,9 +162,13 @@ export async function registerPasskey(
   return result.user;
 }
 
-export async function loginWithPasskey(handle?: string): Promise<AuthUser> {
+export async function loginWithPasskey(handle: string): Promise<AuthUser> {
+  const loginHandle = handle.trim();
+  if (!loginHandle) {
+    throw new Error("User handle is required for passkey login.");
+  }
   const optionsRequest: PasskeyLoginOptionsRequest = {
-    handle: handle ?? null,
+    handle: loginHandle,
     browser_origin: window.location.origin,
   };
   const options = await requestJson("/api/auth/passkeys/login/options", {

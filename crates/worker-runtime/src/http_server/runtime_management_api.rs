@@ -35,6 +35,86 @@ fn required_auth() -> Result<Extension<RuntimeAuthContext>, runtime_api::Runtime
     })
 }
 
+fn material_scope(
+    state: &RuntimeHttpState,
+    workspace_id: &str,
+) -> Result<RuntimeWorkspaceScope, runtime_api::RuntimeApiError> {
+    let scope = auth_workspace_scope(state, auth_extension().as_ref())
+        .map_err(api_error)?
+        .ok_or_else(|| {
+            runtime_api::RuntimeApiError::new(
+                403,
+                "runtime_session_material_scope_required",
+                "Canonical Session material requires a Workspace-scoped capability",
+            )
+        })?;
+    if scope.workspace_id != workspace_id {
+        return Err(runtime_api::RuntimeApiError::new(
+            403,
+            "runtime_session_material_scope_mismatch",
+            "Canonical Session Workspace does not match the authenticated capability",
+        ));
+    }
+    Ok(scope)
+}
+
+fn material_pin(
+    state: &RuntimeHttpState,
+    request: runtime_api::SessionMaterialPinRequest,
+    release: bool,
+) -> Result<runtime_api::SessionMaterialPinResponse, runtime_api::RuntimeApiError> {
+    let scope = material_scope(state, &request.workspace_id)?;
+    #[cfg(feature = "fs-store")]
+    {
+        let pin = request
+            .pin_id
+            .parse::<uuid::Uuid>()
+            .map(session_store::retention::SessionRetentionPin)
+            .map_err(|_| {
+                runtime_api::RuntimeApiError::new(
+                    400,
+                    "invalid_session_retention_pin",
+                    "Invalid Session retention pin identity",
+                )
+            })?;
+        if release {
+            state.runtime.release_session_public_source_pin_scoped(
+                &scope,
+                &request.source,
+                &request.expected_session_id,
+                pin,
+            )
+        } else {
+            state.runtime.pin_session_public_source_scoped(
+                &scope,
+                &request.source,
+                &request.expected_session_id,
+                pin,
+            )
+        }
+        .map_err(|_| {
+            runtime_api::RuntimeApiError::new(
+                409,
+                "session_retention_rejected",
+                "Session retention operation could not be verified",
+            )
+        })?;
+        Ok(runtime_api::SessionMaterialPinResponse {
+            session_id: request.expected_session_id,
+            pin_id: request.pin_id,
+        })
+    }
+    #[cfg(not(feature = "fs-store"))]
+    {
+        let _ = (scope, release);
+        Err(runtime_api::RuntimeApiError::new(
+            503,
+            "session_retention_unavailable",
+            "Session retention requires filesystem storage",
+        ))
+    }
+}
+
 #[derive(Clone)]
 struct RuntimeManagementApi {
     state: RuntimeHttpState,
@@ -287,6 +367,103 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
             .worker_session_history_scoped(&scope, &worker_ref, request.cursor, request.limit)
             .map_err(RuntimeHttpRestError::runtime)
             .map_err(api_error)
+    }
+
+    async fn session_material_erase(
+        &self,
+        request: runtime_api::SessionMaterialEraseRequest,
+    ) -> Result<runtime_api::SessionMaterialEraseResponse, runtime_api::RuntimeApiError> {
+        let scope = material_scope(&self.state, &request.workspace_id)?;
+        #[cfg(feature = "fs-store")]
+        {
+            self.state
+                .runtime
+                .delete_session_public_source_scoped(
+                    &scope,
+                    &request.source,
+                    &request.expected_session_id,
+                    session_store::retention::SessionDeletionIntent::ErasePermanently,
+                )
+                .map_err(|_| {
+                    runtime_api::RuntimeApiError::new(
+                        409,
+                        "session_erasure_incomplete",
+                        "Session erasure could not complete; retain erasure intent and retry",
+                    )
+                })?;
+            Ok(runtime_api::SessionMaterialEraseResponse {
+                session_id: request.expected_session_id,
+            })
+        }
+        #[cfg(not(feature = "fs-store"))]
+        {
+            let _ = scope;
+            Err(runtime_api::RuntimeApiError::new(
+                503,
+                "session_retention_unavailable",
+                "Session erasure requires filesystem storage",
+            ))
+        }
+    }
+
+    async fn session_material_pin(
+        &self,
+        request: runtime_api::SessionMaterialPinRequest,
+    ) -> Result<runtime_api::SessionMaterialPinResponse, runtime_api::RuntimeApiError> {
+        material_pin(&self.state, request, false)
+    }
+
+    async fn session_material_release(
+        &self,
+        request: runtime_api::SessionMaterialPinRequest,
+    ) -> Result<runtime_api::SessionMaterialPinResponse, runtime_api::RuntimeApiError> {
+        material_pin(&self.state, request, true)
+    }
+
+    async fn session_material_catalog(
+        &self,
+        request: runtime_api::SessionMaterialCatalogRequest,
+    ) -> Result<runtime_api::SessionMaterialCatalogAvailability, runtime_api::RuntimeApiError> {
+        let scope = material_scope(&self.state, &request.workspace_id)?;
+        #[cfg(feature = "fs-store")]
+        {
+            Ok(self
+                .state
+                .runtime
+                .session_material_catalog_scoped(&scope, &request))
+        }
+        #[cfg(not(feature = "fs-store"))]
+        {
+            let _ = scope;
+            Ok(
+                runtime_api::SessionMaterialCatalogAvailability::Unavailable {
+                    reason: runtime_api::SessionPublicUnavailableReason::StorageUnavailable,
+                    message: "Canonical Session storage unavailable".into(),
+                },
+            )
+        }
+    }
+
+    async fn session_material_read(
+        &self,
+        request: runtime_api::SessionMaterialReadRequest,
+    ) -> Result<runtime_api::SessionMaterialReadAvailability, runtime_api::RuntimeApiError> {
+        let scope = material_scope(&self.state, &request.workspace_id)?;
+        #[cfg(feature = "fs-store")]
+        {
+            Ok(self
+                .state
+                .runtime
+                .session_material_read_scoped(&scope, &request))
+        }
+        #[cfg(not(feature = "fs-store"))]
+        {
+            let _ = scope;
+            Ok(runtime_api::SessionMaterialReadAvailability::Unavailable {
+                reason: runtime_api::SessionPublicUnavailableReason::StorageUnavailable,
+                message: "Canonical Session storage unavailable".into(),
+            })
+        }
     }
 
     async fn session_public_search(

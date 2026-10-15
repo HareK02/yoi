@@ -1,0 +1,1227 @@
+//! Durable Journal admission and generation on the existing local Jobs service.
+//!
+//! Admission never waits for the model. One consumer drains saved oldest prefixes, including
+//! input arriving during a generation. Job state, receipts, and the source ledger are the only
+//! recovery authority; shutdown does not delete either original Sessions or pending requests.
+
+use super::*;
+use crate::jobs::{JobAttemptState, JobSnapshot, JobState};
+use subjektiv::api::JobAttemptBinding;
+use subjektiv::journal::recording::JournalMaterial;
+use subjektiv::journal::transport::*;
+use subjektiv::journal::*;
+use worker::subjektiv::{JournalJobFinalizer, JournalJobHost, JournalJobToolsFeature};
+
+#[cfg(test)]
+mod tests;
+
+pub(super) const PURPOSE: &str = "subjektiv_journal";
+const INPUT_BUDGET: usize = 48 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalJournalGrant {
+    binding: StandaloneSubjectBinding,
+    session_id: String,
+    journal_id: String,
+    ranges: Vec<JournalSourceRange>,
+    origins: Vec<SourceOrigin>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceOrigin {
+    pointer: JournalSourcePointer,
+    origin: session_store::public_material::PublicMaterialOrigin,
+}
+impl LocalJournalGrant {
+    fn input(&self) -> serde_json::Value {
+        serde_json::json!({"selected_ranges": self.ranges, "origins": self.origins})
+    }
+}
+
+impl StandaloneSubjects {
+    /// Explicit operator erasure, separate from ordinary Worker removal. Requires the
+    /// Subject's exclusive Host lease. The domain tombstone fences delayed admission and
+    /// tools before physical source erasure; exact retries keep the same request ID.
+    /// No model is started, including when no Journal has yet been generated.
+    pub fn erase_session_completely(
+        self,
+        subject_id: &str,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<(), SubjectError> {
+        let attribution = self
+            .store
+            .session_attribution(session_id)?
+            .filter(|attr| attr.subject_id == subject_id && attr.runtime_id == self.scope_id)
+            .ok_or_else(|| {
+                SubjectError::InvalidScope(
+                    "Session does not belong to the selected Subject/storage scope".into(),
+                )
+            })?;
+        let worker = attribution
+            .worker_id
+            .parse()
+            .map_err(|_| SubjectError::InvalidScope("invalid attributed Worker identity".into()))?;
+        let mut connection = self.connect(subject_id, worker)?;
+        let result = (|| -> Result<(), SubjektivHostError> {
+            let host = &connection.host;
+            let context = authority(host, session_id)?;
+            let path = crate::subjektiv_sessions::authorized_sessions_path(
+                &host.catalog.state_root,
+                &host.binding.scope_id,
+                subject_id,
+                &host.catalog.store,
+                session_id,
+            )?;
+            // Persist this even if source erasure subsequently fails. A retry resumes physical
+            // deletion with the same permanent fence; it must never generate from leftovers.
+            host.catalog
+                .store
+                .erase_journal_session(&context, request_id)
+                .map_err(journal_error)?;
+            let jobs = crate::jobs::StandaloneJobs::open(
+                &connection.jobs_path,
+                host.catalog.state_root.clone(),
+            )
+            .map_err(service_error)?;
+            for snapshot in jobs
+                .pending()
+                .map_err(service_error)?
+                .into_iter()
+                .chain(jobs.unknown_granted().map_err(service_error)?)
+            {
+                if serde_json::from_value::<LocalJournalGrant>(
+                    snapshot.domain_grant.unwrap_or_default(),
+                )
+                .is_ok_and(|grant| grant.binding == host.binding && grant.session_id == session_id)
+                {
+                    jobs.cancel(&snapshot.request.job_id)
+                        .map_err(service_error)?;
+                }
+            }
+            for snapshot in jobs.unacknowledged_results().map_err(service_error)? {
+                if serde_json::from_value::<LocalJournalGrant>(
+                    snapshot.domain_grant.unwrap_or_default(),
+                )
+                .is_ok_and(|grant| grant.binding == host.binding && grant.session_id == session_id)
+                {
+                    jobs.acknowledge(&snapshot.request.job_id)
+                        .map_err(service_error)?;
+                }
+            }
+            session_store::FsStore::new_with_retention(
+                path,
+                crate::store::session_retention(&host.catalog.state_root),
+            )
+            .map_err(source_error)?
+            .delete_session_with_intent(
+                session_id
+                    .parse()
+                    .map_err(|_| SubjektivHostError::InvalidArgument("invalid Session".into()))?,
+                session_store::retention::SessionDeletionIntent::ErasePermanently,
+            )
+            .map_err(source_error)?;
+            Ok(())
+        })();
+        connection.close()?;
+        result.map_err(|error| SubjectError::InvalidScope(error.to_string()))
+    }
+}
+
+pub(crate) fn retained_workers_root(state_root: &Path) -> PathBuf {
+    state_root.join("subjektiv").join("retained-workers")
+}
+
+/// Called while the generic Worker deletion mutation lease excludes restore/final commits.
+/// Returning a destination means logical removal must move, not copy/delete, original material.
+/// There is no model call, and failure leaves the original Worker and its sources in place.
+pub(crate) fn prepare_worker_deletion(
+    state_root: &Path,
+    record: &crate::store::StandaloneWorkerRecord,
+) -> Result<Option<PathBuf>, crate::store::StandaloneStoreError> {
+    let Some(binding) = &record.subject else {
+        return Ok(None);
+    };
+    let prepare = || -> Result<Option<PathBuf>, SubjektivHostError> {
+        let catalog = StandaloneSubjects::open_existing(state_root)
+            .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+        if catalog.scope_id != binding.scope_id {
+            return Err(SubjektivHostError::InvalidArgument(
+                "deletion Subject scope mismatch".into(),
+            ));
+        }
+        let mut connection = catalog
+            .connect(&binding.subject_id, record.worker_id)
+            .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+        let result = (|| {
+            let host = &connection.host;
+            let jobs = crate::jobs::StandaloneJobs::open(
+                &connection.jobs_path,
+                record.cwd.canonical_path.clone(),
+            )
+            .map_err(service_error)?;
+            host.bind_jobs(jobs)
+                .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+            let workers = crate::store::StandaloneWorkerStore::open_existing(state_root)
+                .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+            let sessions = workers.sessions_dir(record.worker_id);
+            let mut pending = false;
+            // Check every original Session, including a save that preceded its notification.
+            // An unknown old Session attribution/lineage blocks removal instead of being erased.
+            if !sessions.is_dir() {
+                return Err(SubjektivHostError::Unavailable(
+                    "original Session storage is missing".into(),
+                ));
+            }
+            let source_store = session_store::FsStore::new_with_retention(
+                &sessions,
+                crate::store::session_retention(state_root),
+            )
+            .map_err(source_error)?;
+            for session in
+                session_store::Store::list_sessions(&source_store).map_err(source_error)?
+            {
+                let context = SubjektivHostContext {
+                    worker_id: record.worker_id.to_string(),
+                    session_id: session.to_string(),
+                };
+                host.attribution(&context, session == record.active_session_id)?;
+                host.reconcile_journal_session(&context.session_id)?;
+                pending |= !host.session_fully_reflected(&context.session_id)?;
+                if source_store
+                    .retention()
+                    .pins(session)
+                    .map_err(source_error)?
+                    .iter()
+                    .any(|pin| pin.0 != session)
+                {
+                    return Err(SubjektivHostError::Unavailable(
+                        "another consumer retains this Session; relocation is not authorized"
+                            .into(),
+                    ));
+                }
+            }
+            if !pending {
+                for session in
+                    session_store::Store::list_sessions(&source_store).map_err(source_error)?
+                {
+                    host.prune_source_session(&source_store, session)?;
+                }
+                return Ok(None);
+            }
+            // Reservation is durable before sources leave the public Worker namespace. The
+            // same Subject's next Host consumes it with the retained attribution after reopen.
+            let _ = host.next_journal_job()?;
+            let archive = retained_workers_root(state_root);
+            private_dir(&archive, true)
+                .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+            let destination = archive.join(record.worker_id.to_string());
+            if destination.exists() {
+                return Err(SubjektivHostError::Unavailable(
+                    "retained Worker already exists; reconcile deletion outcome".into(),
+                ));
+            }
+            Ok(Some(destination))
+        })();
+        connection
+            .close()
+            .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+        result
+    };
+    prepare()
+        .map_err(|error| crate::store::StandaloneStoreError::JournalRetention(error.to_string()))
+}
+
+fn journal_error(error: JournalError) -> SubjektivHostError {
+    match error {
+        JournalError::Conflict(message) => SubjektivHostError::Conflict {
+            code: "journal_conflict".into(),
+            message,
+        },
+        JournalError::PermissionDenied(message)
+        | JournalError::InvalidInput(message)
+        | JournalError::NotFound(message) => SubjektivHostError::InvalidArgument(message),
+        other => SubjektivHostError::Unavailable(other.to_string()),
+    }
+}
+fn source_error(error: session_store::StoreError) -> SubjektivHostError {
+    SubjektivHostError::Unavailable(error.to_string())
+}
+fn service_error(error: crate::jobs::JobServiceError) -> SubjektivHostError {
+    SubjektivHostError::Unavailable(error.to_string())
+}
+fn authority(
+    host: &LocalSubjectHost,
+    session_id: &str,
+) -> Result<JournalHostContext, SubjektivHostError> {
+    let attribution = host
+        .catalog
+        .store
+        .session_attribution(session_id)
+        .map_err(domain_error)?
+        .filter(|attr| {
+            attr.subject_id == host.binding.subject_id && attr.runtime_id == host.binding.scope_id
+        })
+        .ok_or_else(|| {
+            SubjektivHostError::InvalidArgument("foreign or unattributed Journal Session".into())
+        })?;
+    JournalHostContext::validated_session(&host.catalog.store, attribution).map_err(journal_error)
+}
+
+impl LocalSubjectHost {
+    fn journal_session_erased(&self, session: &str) -> Result<bool, SubjektivHostError> {
+        let context = authority(self, session)?;
+        self.catalog
+            .store
+            .journal_session_erased(&context)
+            .map_err(journal_error)
+    }
+
+    fn prune_source_session(
+        &self,
+        source_store: &session_store::FsStore,
+        session: session_store::SessionId,
+    ) -> Result<(), SubjektivHostError> {
+        if self.journal_session_erased(&session.to_string())? {
+            // Resume the already authorized explicit erasure, including physical deletion
+            // that previously failed. Ordinary deletion must not reinterpret its intent.
+            source_store
+                .delete_session_with_intent(
+                    session,
+                    session_store::retention::SessionDeletionIntent::ErasePermanently,
+                )
+                .map(|_| ())
+                .map_err(source_error)
+        } else {
+            source_store
+                .release_session_pin(
+                    session,
+                    session_store::retention::SessionRetentionPin(session),
+                )
+                .map_err(source_error)?;
+            source_store
+                .delete_session(session)
+                .map(|_| ())
+                .map_err(source_error)
+        }
+    }
+
+    pub(super) fn reserve_journal_session(
+        &self,
+        context: &SubjektivHostContext,
+    ) -> Result<(), SubjektivHostError> {
+        self.body(context)?;
+        if self.journal_session_erased(&context.session_id)? {
+            return Ok(());
+        }
+        let session: session_store::SessionId = context
+            .session_id
+            .parse()
+            .map_err(|_| SubjektivHostError::InvalidArgument("invalid Session".into()))?;
+        let root = self
+            .catalog
+            .state_root
+            .join(self.worker_id.to_string())
+            .join("sessions");
+        reject_symlink_components(&root)
+            .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+        let source_store = session_store::FsStore::new_with_retention(
+            &root,
+            crate::store::session_retention(&self.catalog.state_root),
+        )
+        .map_err(source_error)?;
+        {
+            let _guard = source_store
+                .retention()
+                .lock_live(session)
+                .map_err(source_error)?;
+            let path = root.join(session.to_string());
+            match fs::create_dir(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let metadata = fs::symlink_metadata(&path)
+                        .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+                    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                        return Err(SubjektivHostError::InvalidArgument(
+                            "Session retention source is not an owned directory".into(),
+                        ));
+                    }
+                }
+                Err(error) => return Err(SubjektivHostError::Unavailable(error.to_string())),
+            }
+        }
+        // Establish retention at attribution, before the first Run can publish bytes. This
+        // closes the save-before-notification gap even for ordinary FsStore Session deletion.
+        source_store
+            .pin_session(
+                session,
+                session_store::retention::SessionRetentionPin(session),
+            )
+            .map_err(source_error)
+    }
+
+    pub(super) fn admit_journal(
+        &self,
+        context: &SubjektivHostContext,
+    ) -> Result<bool, SubjektivHostError> {
+        let attribution = self.attribution(context, false)?;
+        self.reconcile_journal_session(&attribution.session_id)
+    }
+
+    fn reconcile_journal_session(&self, session: &str) -> Result<bool, SubjektivHostError> {
+        self.ensure_live()?;
+        let context = authority(self, session)?;
+        if self
+            .catalog
+            .store
+            .journal_session_erased(&context)
+            .map_err(journal_error)?
+        {
+            return Ok(false);
+        }
+        self.pin_journal_session(session)?;
+        let sources = self.journal_sources(session)?;
+        let existing = self
+            .catalog
+            .store
+            .journal_for_session(&context)
+            .map_err(journal_error)?;
+        let mut added = false;
+        for source in &sources {
+            let status = existing.as_deref().map(|id| {
+                self.catalog
+                    .store
+                    .read_journal_source(&context, id, source.source.order)
+            });
+            match status {
+                Some(Ok(status)) => {
+                    added |= !status.accepted.iter().any(|range| {
+                        range.start <= source.bytes.start && source.bytes.end <= range.end
+                    });
+                }
+                None | Some(Err(JournalError::NotFound(_))) => added = true,
+                Some(Err(error)) => return Err(journal_error(error)),
+            }
+        }
+        for batch in sources.chunks(MAX_JOURNAL_RANGES) {
+            self.catalog
+                .store
+                .accept_journal_sources(&context, "Session activity", batch)
+                .map_err(journal_error)?;
+        }
+        Ok(added)
+    }
+
+    pub(super) fn recover_journals(&self) {
+        let result = (|| {
+            self.ensure_live()?;
+            for attribution in self
+                .catalog
+                .store
+                .subject_session_attributions(&self.binding.subject_id)
+                .map_err(domain_error)?
+            {
+                // Old Workers' retained sources are reconciled as well; possession of the
+                // Subject lease alone does not bypass the original Worker binding checks.
+                if attribution.runtime_id == self.binding.scope_id
+                    && let Err(error) = self.reconcile_journal_session(&attribution.session_id)
+                {
+                    eprintln!(
+                        "standalone Journal Session {} reconciliation blocked: {error}",
+                        attribution.session_id
+                    );
+                }
+            }
+            Ok::<_, SubjektivHostError>(())
+        })();
+        if let Err(error) = result {
+            eprintln!("standalone Journal reconciliation blocked: {error}");
+        }
+        self.wake_journals();
+    }
+
+    pub(super) fn wake_journals(&self) {
+        let mut running = self
+            .journal_dispatch
+            .lock()
+            .expect("Journal dispatcher poisoned");
+        if *running || !self.live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(host) = self.self_weak.upgrade() else {
+            return;
+        };
+        // Offline admission (for example a deletion preflight) persists intent without
+        // assuming a Tokio executor or creating another Journal-specific runner.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        *running = true;
+        runtime.spawn(async move {
+            loop {
+                let next = {
+                    let mut running = host
+                        .journal_dispatch
+                        .lock()
+                        .expect("Journal dispatcher poisoned");
+                    match host.next_journal_job() {
+                        Ok(Some(job)) => Some(job),
+                        Ok(None) => {
+                            *running = false;
+                            None
+                        }
+                        Err(error) => {
+                            eprintln!("standalone Journal generation remains pending: {error}");
+                            *running = false;
+                            None
+                        }
+                    }
+                };
+                let Some((jobs, id)) = next else {
+                    return;
+                };
+                if let Err(error) = jobs.start(&id).await {
+                    eprintln!("standalone Journal Job {id} remains pending: {error}");
+                    *host
+                        .journal_dispatch
+                        .lock()
+                        .expect("Journal dispatcher poisoned") = false;
+                    return;
+                }
+                match jobs.wait(&id).await {
+                    Ok(snapshot) if snapshot.state == JobState::Completed => {
+                        if let Err(error) = host.complete_journal_job(&jobs, &snapshot) {
+                            eprintln!("standalone Journal completion remains unconfirmed: {error}");
+                            *host
+                                .journal_dispatch
+                                .lock()
+                                .expect("Journal dispatcher poisoned") = false;
+                            return;
+                        }
+                        // Continue even without a further user turn. A later admission has
+                        // remained in the ledger, never in this running Job's frozen input.
+                    }
+                    Ok(_) | Err(_) => {
+                        // Failure is not permission to consume sources or blindly rerun the model.
+                        // Reopen/reconnect performs domain reconciliation before replacement.
+                        *host
+                            .journal_dispatch
+                            .lock()
+                            .expect("Journal dispatcher poisoned") = false;
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    fn next_journal_job(
+        &self,
+    ) -> Result<Option<(crate::jobs::StandaloneJobs, String)>, SubjektivHostError> {
+        let jobs = self.jobs()?;
+        for saved in jobs.unacknowledged_results().map_err(service_error)? {
+            if self.journal_grant(&saved).is_ok() {
+                self.complete_journal_job(&jobs, &saved)?;
+            }
+        }
+        for pending in jobs.pending().map_err(service_error)? {
+            if self.journal_grant(&pending).is_ok() {
+                return Ok(Some((jobs, pending.request.job_id)));
+            }
+        }
+        for unknown in jobs.unknown_granted().map_err(service_error)? {
+            let Ok(grant) = self.journal_grant(&unknown) else {
+                continue;
+            };
+            let context = authority(self, &grant.session_id)?;
+            if let Some(active) = self
+                .catalog
+                .store
+                .active_journal_generation(&context, &grant.journal_id)
+                .map_err(journal_error)?
+            {
+                if active.job.job_id != unknown.request.job_id
+                    || active.job.attempt_id != unknown.attempt.attempt_id
+                {
+                    continue;
+                }
+                self.catalog
+                    .store
+                    .close_journal_generation(&context, &active.id, &active.job)
+                    .map_err(journal_error)?;
+            }
+            // This grant has no ambient side effects: every successful mutation and exact
+            // receipt is in the shared store. Its closed generation fences delayed tools.
+            // Observe actual saved current/open/cursor before freeing generic serialization;
+            // the replacement reads these receipts, never resubmits an aggregate old result.
+            let _ = self
+                .catalog
+                .store
+                .journal_resume_state(&context, &grant.journal_id)
+                .map_err(journal_error)?;
+            jobs.reconcile_granted_attempt(
+                &unknown.request.job_id,
+                &unknown.attempt.attempt_id,
+                &format!("journal-fenced:{}", unknown.attempt.attempt_id),
+            )
+            .map_err(service_error)?;
+        }
+        let reader =
+            JournalHostContext::validated_reader(&self.catalog.store, &self.binding.subject_id)
+                .map_err(journal_error)?;
+        let mut after = None;
+        loop {
+            let page = self
+                .catalog
+                .store
+                .list_journals(&reader, after.as_deref(), MAX_JOURNAL_PAGE)
+                .map_err(journal_error)?;
+            for journal in page.items {
+                let context = authority(self, &journal.source_session_id)?;
+                if let Some(active) = self
+                    .catalog
+                    .store
+                    .active_journal_generation(&context, &journal.id)
+                    .map_err(journal_error)?
+                {
+                    let existing = jobs.get(&active.job.job_id).map_err(service_error)?;
+                    if existing.attempt.attempt_id != active.job.attempt_id {
+                        return Err(SubjektivHostError::Unavailable(
+                            "Journal Job attempt changed without reconciliation".into(),
+                        ));
+                    }
+                    match existing.attempt.state {
+                        JobAttemptState::Reserved | JobAttemptState::Dispatched => continue,
+                        JobAttemptState::Completed => {
+                            self.complete_journal_job(&jobs, &existing)?
+                        }
+                        JobAttemptState::Unknown
+                        | JobAttemptState::Failed
+                        | JobAttemptState::Cancelled => {
+                            // The generic Host has durably fenced this attempt. Close its domain
+                            // generation before replacement; saved record receipts remain visible.
+                            self.catalog
+                                .store
+                                .close_journal_generation(&context, &active.id, &active.job)
+                                .map_err(journal_error)?;
+                        }
+                    }
+                }
+                let materials = self.select_journal_materials(&context, &journal.id)?;
+                if materials.is_empty() {
+                    continue;
+                }
+                let ranges = materials
+                    .into_iter()
+                    .map(|material| material.range)
+                    .collect::<Vec<_>>();
+                let origins = self.journal_origins(&ranges)?;
+                let grant = LocalJournalGrant {
+                    binding: self.binding.clone(),
+                    session_id: journal.source_session_id,
+                    journal_id: journal.id.clone(),
+                    ranges,
+                    origins,
+                };
+                let request = job::JobRequest {
+                    job_id: format!("subjektiv-journal:{}", uuid::Uuid::now_v7()),
+                    purpose: PURPOSE.into(), input_ref: format!("subjektiv://{}/journal/{}", self.binding.subject_id, journal.id),
+                    input: grant.input(),
+                    instruction: "ReadJournalState first. Input descriptors are the frozen canonical public ranges authorized for this Job, not already read material. Read every selected source byte with bounded ReadJournalText before recording; then read initial/current position and open text in bounded pages. Reconcile saved operation receipts before new creates. Save sequential Create/Rewrite/Fix and UpdateJournalPosition operations, then CheckpointJournal backed by saved record/no-change receipts for all selected input. Do not fix an ongoing event just because this Job/turn ended. SubmitJobResult with result: {} only after the entire selected prefix is reflected. Never infer tool success or user intent not evidenced by public input.".into(),
+                    profile: "builtin:subjektiv-journal-recording".into(),
+                    serialization_key: Some(format!("subjektiv-journal:{}", journal.id)),
+                    limits: job::JobLimits { timeout_seconds: 600, ..Default::default() },
+                };
+                let saved = jobs
+                    .request_granted(
+                        request,
+                        serde_json::to_value(grant)
+                            .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?,
+                    )
+                    .map_err(service_error)?;
+                return Ok(Some((jobs, saved.request.job_id)));
+            }
+            after = page.next;
+            if after.is_none() {
+                return Ok(None);
+            }
+        }
+    }
+
+    fn pin_journal_session(&self, session: &str) -> Result<(), SubjektivHostError> {
+        let path = crate::subjektiv_sessions::authorized_sessions_path(
+            &self.catalog.state_root,
+            &self.binding.scope_id,
+            &self.binding.subject_id,
+            &self.catalog.store,
+            session,
+        )?;
+        let session = session
+            .parse()
+            .map_err(|_| SubjektivHostError::InvalidArgument("invalid Session".into()))?;
+        // A Session owns exactly one Journal; its immutable random ID is the stable pin
+        // identity. Pins and erase fences outlive relocation in the Host-wide control root.
+        session_store::FsStore::new_with_retention(
+            path,
+            crate::store::session_retention(&self.catalog.state_root),
+        )
+        .map_err(source_error)?
+        .pin_session(
+            session,
+            session_store::retention::SessionRetentionPin(session),
+        )
+        .map_err(source_error)
+    }
+
+    fn session_fully_reflected(&self, session: &str) -> Result<bool, SubjektivHostError> {
+        if self.journal_session_erased(session)? {
+            return Ok(true);
+        }
+        let sources = self.journal_sources(session)?;
+        if sources.is_empty() {
+            return Ok(true);
+        }
+        let context = authority(self, session)?;
+        let mut after = None;
+        loop {
+            let page = self
+                .catalog
+                .store
+                .list_journals(&context, after.as_deref(), MAX_JOURNAL_PAGE)
+                .map_err(journal_error)?;
+            if let Some(journal) = page
+                .items
+                .into_iter()
+                .find(|journal| journal.source_session_id == session)
+            {
+                for range in sources {
+                    let status = self
+                        .catalog
+                        .store
+                        .read_journal_source(&context, &journal.id, range.source.order)
+                        .map_err(journal_error)?;
+                    if status.source != range.source
+                        || status.reflected_bytes < range.source.total_bytes
+                    {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
+            after = page.next;
+            if after.is_none() {
+                return Ok(false);
+            }
+        }
+    }
+
+    fn prune_retained_workers(&self) -> Result<(), SubjektivHostError> {
+        let root = retained_workers_root(&self.catalog.state_root);
+        if !root.exists() {
+            return Ok(());
+        }
+        let workers = crate::store::StandaloneWorkerStore::open_existing(&root)
+            .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+        for entry in fs::read_dir(&root)
+            .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?
+        {
+            let entry =
+                entry.map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+            let Ok(worker) = entry
+                .file_name()
+                .to_string_lossy()
+                .parse::<protocol::WorkerId>()
+            else {
+                continue;
+            };
+            let record = workers
+                .load(worker)
+                .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+            if record.subject.as_ref() != Some(&self.binding) {
+                continue;
+            }
+            let mut all_reflected = true;
+            let sessions_path = workers.sessions_dir(worker);
+            if !sessions_path.is_dir() {
+                return Err(SubjektivHostError::Unavailable(
+                    "retained Session storage is missing".into(),
+                ));
+            }
+            let source_store = session_store::FsStore::new_with_retention(
+                sessions_path,
+                crate::store::session_retention(&self.catalog.state_root),
+            )
+            .map_err(source_error)?;
+            for session in
+                session_store::Store::list_sessions(&source_store).map_err(source_error)?
+            {
+                let attribution = self
+                    .catalog
+                    .store
+                    .session_attribution(&session.to_string())
+                    .map_err(domain_error)?
+                    .ok_or_else(|| {
+                        SubjektivHostError::Unavailable("retained Session is unattributed".into())
+                    })?;
+                if attribution.worker_id != worker.to_string()
+                    || attribution.subject_id != self.binding.subject_id
+                    || attribution.runtime_id != self.binding.scope_id
+                    || !self.session_fully_reflected(&session.to_string())?
+                {
+                    all_reflected = false;
+                    break;
+                }
+            }
+            if all_reflected {
+                for session in
+                    session_store::Store::list_sessions(&source_store).map_err(source_error)?
+                {
+                    self.prune_source_session(&source_store, session)?;
+                }
+                // These are the relocated originals of an already removed, stopped Worker.
+                // No normal restore path addresses this namespace; keep no duplicate history.
+                fs::remove_dir_all(entry.path())
+                    .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+                File::open(&root)
+                    .and_then(|file| file.sync_all())
+                    .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn material_reader(
+        &self,
+        session: &str,
+    ) -> Result<session_store::public_material::SessionPublicMaterialReader, SubjektivHostError>
+    {
+        let sessions = crate::subjektiv_sessions::authorized_sessions_path(
+            &self.catalog.state_root,
+            &self.binding.scope_id,
+            &self.binding.subject_id,
+            &self.catalog.store,
+            session,
+        )?;
+        let attribution = self
+            .catalog
+            .store
+            .session_attribution(session)
+            .map_err(domain_error)?
+            .ok_or_else(|| {
+                SubjektivHostError::InvalidArgument("Session attribution unavailable".into())
+            })?;
+        let worker_root = sessions.parent().and_then(Path::parent).ok_or_else(|| {
+            SubjektivHostError::InvalidArgument("invalid retained Worker path".into())
+        })?;
+        let workers = crate::store::StandaloneWorkerStore::open_existing(worker_root)
+            .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+        let worker = attribution
+            .worker_id
+            .parse()
+            .map_err(|_| SubjektivHostError::InvalidArgument("invalid attributed Worker".into()))?;
+        let record = workers
+            .load(worker)
+            .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+        let metadata_root = sessions
+            .parent()
+            .ok_or_else(|| SubjektivHostError::InvalidArgument("invalid Session storage".into()))?
+            .join("worker")
+            .join(&record.storage_key);
+        // This is the persisted active selector, not the newest filename/mtime or a model claim.
+        let metadata =
+            session_store::WorkerAggregateStore::open_read_only(metadata_root, &record.storage_key)
+                .and_then(|store| store.read_read_only())
+                .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?
+                .ok_or_else(|| {
+                    SubjektivHostError::Unavailable(
+                        "Worker active Session metadata is missing".into(),
+                    )
+                })?;
+        let active = metadata
+            .active
+            .filter(|active| active.session_id.to_string() == session)
+            .or_else(|| {
+                (record.status == crate::store::StandaloneWorkerStatus::Stopped
+                    && record.active_session_id.to_string() == session)
+                    .then_some(session_store::WorkerActiveSegmentRef {
+                        session_id: record.active_session_id,
+                        segment_id: record.active_segment_id,
+                    })
+            })
+            .and_then(|active| active.segment_id)
+            .ok_or_else(|| {
+                SubjektivHostError::Unavailable(
+                    "no attested active lineage for the retained Session".into(),
+                )
+            })?;
+        session_store::public_material::SessionPublicMaterialReader::open_fs_with_retention(
+            &sessions,
+            session
+                .parse()
+                .map_err(|_| SubjektivHostError::InvalidArgument("invalid Session".into()))?,
+            active,
+            session_store::public_material::PublicMaterialLimits {
+                max_segments: 256,
+                max_entries: 100_000,
+                max_record_bytes: 64 * 1024 * 1024,
+            },
+            crate::store::session_retention(&self.catalog.state_root),
+        )
+        .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))
+    }
+
+    fn journal_sources(
+        &self,
+        session: &str,
+    ) -> Result<Vec<JournalSourceRange>, SubjektivHostError> {
+        let reader = self.material_reader(session)?;
+        Ok(reader
+            .descriptors()
+            .map(|descriptor| JournalSourceRange {
+                source: source_descriptor(session, descriptor),
+                bytes: JournalByteRange {
+                    start: 0,
+                    end: descriptor.total_bytes,
+                },
+            })
+            .collect())
+    }
+
+    fn source_reader(
+        &self,
+        source: &JournalSource,
+    ) -> Result<session_store::public_material::SessionPublicMaterialReader, SubjektivHostError>
+    {
+        let sessions = crate::subjektiv_sessions::authorized_sessions_path(
+            &self.catalog.state_root,
+            &self.binding.scope_id,
+            &self.binding.subject_id,
+            &self.catalog.store,
+            &source.session_id,
+        )?;
+        // Frozen, already admitted original pointers do not follow the Worker's later active
+        // Session/Segment. This reads that original lineage and still checks descriptor identity,
+        // canonical order and digest below; the shared service enforces the frozen byte range.
+        session_store::public_material::SessionPublicMaterialReader::open_fs_with_retention(
+            &sessions,
+            source
+                .session_id
+                .parse()
+                .map_err(|_| SubjektivHostError::InvalidArgument("invalid Session".into()))?,
+            source.pointer.segment_id,
+            session_store::public_material::PublicMaterialLimits {
+                max_segments: 256,
+                max_entries: 100_000,
+                max_record_bytes: 64 * 1024 * 1024,
+            },
+            crate::store::session_retention(&self.catalog.state_root),
+        )
+        .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))
+    }
+
+    fn journal_origins(
+        &self,
+        ranges: &[JournalSourceRange],
+    ) -> Result<Vec<SourceOrigin>, SubjektivHostError> {
+        if ranges.is_empty() {
+            return Err(SubjektivHostError::InvalidArgument(
+                "empty material selection".into(),
+            ));
+        }
+        ranges
+            .iter()
+            .map(|range| {
+                let reader = self.source_reader(&range.source)?;
+                reader
+                    .descriptors()
+                    .find(|descriptor| {
+                        source_descriptor(&range.source.session_id, descriptor) == range.source
+                    })
+                    .map(|descriptor| SourceOrigin {
+                        pointer: range.source.pointer.clone(),
+                        origin: descriptor.origin.clone(),
+                    })
+                    .ok_or_else(|| {
+                        SubjektivHostError::InvalidArgument(
+                            "source provenance/identity changed".into(),
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    fn journal_source_window(
+        &self,
+        source: &JournalSource,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<String, SubjektivHostError> {
+        let reader = self.source_reader(source)?;
+        let descriptor = reader.descriptors().find(|descriptor| source_descriptor(&source.session_id, descriptor) == *source)
+            .ok_or_else(|| SubjektivHostError::InvalidArgument("canonical source identity/order/digest changed or is outside the authorized Session".into()))?;
+        reader
+            .read_content(descriptor, offset, max_bytes)
+            .map(|window| window.content)
+            .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))
+    }
+
+    fn journal_source_material(
+        &self,
+        source: &JournalSource,
+        start: u64,
+        limit: usize,
+    ) -> JournalResult<JournalMaterial> {
+        let text = self
+            .journal_source_window(source, start, limit.max(4))
+            .map_err(|error| JournalError::Conflict(error.to_string()))?;
+        Ok(JournalMaterial {
+            range: JournalSourceRange {
+                source: source.clone(),
+                bytes: JournalByteRange {
+                    start,
+                    end: start + text.len() as u64,
+                },
+            },
+            text,
+        })
+    }
+
+    fn select_journal_materials(
+        &self,
+        context: &JournalHostContext,
+        id: &str,
+    ) -> Result<Vec<JournalMaterial>, SubjektivHostError> {
+        subjektiv::journal::recording::select_materials_bounded(
+            &self.catalog.store,
+            context,
+            id,
+            INPUT_BUDGET,
+            |source, start, limit| self.journal_source_material(source, start, limit),
+        )
+        .map_err(journal_error)
+    }
+
+    fn journal_grant(
+        &self,
+        snapshot: &JobSnapshot,
+    ) -> Result<LocalJournalGrant, SubjektivHostError> {
+        let grant: LocalJournalGrant =
+            serde_json::from_value(snapshot.domain_grant.clone().ok_or_else(|| {
+                SubjektivHostError::InvalidArgument("missing Journal delegation".into())
+            })?)
+            .map_err(|error| SubjektivHostError::InvalidArgument(error.to_string()))?;
+        if grant.binding != self.binding
+            || snapshot.request.purpose != PURPOSE
+            || snapshot.request.serialization_key.as_deref()
+                != Some(&format!("subjektiv-journal:{}", grant.journal_id))
+            || snapshot.request.input != grant.input()
+        {
+            return Err(SubjektivHostError::InvalidArgument(
+                "Job input/grant does not match this Journal capability".into(),
+            ));
+        }
+        let context = authority(self, &grant.session_id)?;
+        let journal = self
+            .catalog
+            .store
+            .read_journal(&context, &grant.journal_id)
+            .map_err(journal_error)?;
+        if journal.source_session_id != grant.session_id || grant.ranges.is_empty() {
+            return Err(SubjektivHostError::InvalidArgument(
+                "Journal input belongs to another Session or is empty".into(),
+            ));
+        }
+        Ok(grant)
+    }
+
+    fn complete_journal_job(
+        &self,
+        jobs: &crate::jobs::StandaloneJobs,
+        snapshot: &JobSnapshot,
+    ) -> Result<(), SubjektivHostError> {
+        let grant = self.journal_grant(snapshot)?;
+        let context = authority(self, &grant.session_id)?;
+        let completion: JournalJobCompletion =
+            serde_json::from_value(snapshot.result.clone().ok_or_else(|| {
+                SubjektivHostError::Unavailable("Journal Job has no accepted result".into())
+            })?)
+            .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+        let generation = self
+            .catalog
+            .store
+            .read_journal_generation(&context, &completion.generation_id)
+            .map_err(journal_error)?;
+        if generation.journal_id != grant.journal_id
+            || generation.job.job_id != snapshot.request.job_id
+            || generation.job.attempt_id != snapshot.attempt.attempt_id
+        {
+            return Err(SubjektivHostError::InvalidArgument(
+                "Journal completion binding mismatch".into(),
+            ));
+        }
+        self.catalog
+            .store
+            .close_journal_generation(&context, &generation.id, &generation.job)
+            .map_err(journal_error)?;
+        jobs.acknowledge(&snapshot.request.job_id)
+            .map_err(service_error)?;
+        if let Err(error) = self.prune_retained_workers() {
+            // Pruning is independent of a successful checkpoint/result. Keep the originals
+            // and continue draining other saved prefixes; a retention error is not model failure.
+            eprintln!("standalone reflected Journal source cleanup deferred: {error}");
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn grant(
+    host: Arc<LocalSubjectHost>,
+    snapshot: &JobSnapshot,
+    fence: Arc<dyn crate::jobs::JobAttemptFence>,
+) -> Result<worker::job::JobFeatureGrant, String> {
+    let grant = host
+        .journal_grant(snapshot)
+        .map_err(|error| error.to_string())?;
+    let context = authority(&host, &grant.session_id).map_err(|error| error.to_string())?;
+    // Re-fetch selected identities before opening mutation authority. Only descriptors are
+    // retained in Job storage; the model must fetch actual source bytes with bounded tools.
+    for range in &grant.ranges {
+        let length = usize::try_from(
+            range
+                .bytes
+                .end
+                .checked_sub(range.bytes.start)
+                .ok_or("invalid source range")?,
+        )
+        .map_err(|_| "source range overflow")?;
+        if length > INPUT_BUDGET {
+            return Err("source range exceeds frozen input budget".into());
+        }
+        let text = host
+            .journal_source_window(&range.source, range.bytes.start, length.max(4))
+            .map_err(|error| error.to_string())?;
+        if text.len() != length {
+            return Err("frozen Journal source byte range changed".into());
+        }
+    }
+    if host
+        .journal_origins(&grant.ranges)
+        .map_err(|error| error.to_string())?
+        != grant.origins
+    {
+        return Err(
+            "frozen Journal provenance does not match the authorized original Session".into(),
+        );
+    }
+    let generation = host
+        .catalog
+        .store
+        .prepare_journal_generation(
+            &context,
+            &grant.journal_id,
+            JobAttemptBinding {
+                job_id: snapshot.request.job_id.clone(),
+                attempt_id: snapshot.attempt.attempt_id.clone(),
+            },
+            grant.ranges.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+    let job_context = JournalJobContext::validated(
+        &host.catalog.store,
+        &context,
+        &generation.id,
+        generation.job.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    let adapter = Arc::new(LocalJournalHost {
+        host,
+        grant,
+        context,
+        job_context,
+        generation,
+        fence,
+    });
+    Ok(worker::job::JobFeatureGrant {
+        features: worker::feature::FeatureRegistryBuilder::new()
+            .with_module(JournalJobToolsFeature::new(adapter.clone())),
+        satisfied_requirements: vec![],
+        finalizer: Some(Arc::new(JournalJobFinalizer::new(adapter))),
+    })
+}
+
+struct LocalJournalHost {
+    host: Arc<LocalSubjectHost>,
+    grant: LocalJournalGrant,
+    context: JournalHostContext,
+    job_context: JournalJobContext,
+    generation: JournalGeneration,
+    fence: Arc<dyn crate::jobs::JobAttemptFence>,
+}
+impl LocalJournalHost {
+    fn live(&self) -> Result<JournalJobContext, SubjektivHostError> {
+        self.host.ensure_live()?;
+        self.fence
+            .ensure_live()
+            .map_err(SubjektivHostError::Unavailable)?;
+        if self
+            .host
+            .catalog
+            .store
+            .journal_for_session(&self.context)
+            .map_err(journal_error)?
+            .as_deref()
+            != Some(&self.grant.journal_id)
+        {
+            return Err(SubjektivHostError::InvalidArgument(
+                "Journal Session binding was erased or changed".into(),
+            ));
+        }
+        // The shared service validates active domain authority inside each operation. Reuse
+        // this bound context for finish replay, which may legitimately be already closed.
+        Ok(self.job_context.clone())
+    }
+}
+impl JournalJobHost for LocalJournalHost {
+    fn execute(
+        &self,
+        request: JournalJobRequest,
+    ) -> Result<JournalJobResponse, SubjektivHostError> {
+        let context = self.live()?;
+        subjektiv::journal::service::execute_bounded(
+            &self.host.catalog.store,
+            &context,
+            request,
+            |source, start, limit| {
+                if source.session_id != self.generation.initial_journal.source_session_id {
+                    return Err(JournalError::PermissionDenied(
+                        "foreign original Session".into(),
+                    ));
+                }
+                self.host.journal_source_material(source, start, limit)
+            },
+        )
+        .map_err(journal_error)
+    }
+    fn finish(&self) -> Result<JournalJobCompletion, SubjektivHostError> {
+        let context = self.live()?;
+        subjektiv::journal::service::finish(&self.host.catalog.store, &context)
+            .map_err(journal_error)
+    }
+}
+
+fn source_descriptor(
+    session: &str,
+    descriptor: &session_store::public_material::PublicMaterialDescriptor,
+) -> JournalSource {
+    JournalSource {
+        session_id: session.into(),
+        pointer: JournalSourcePointer {
+            segment_id: descriptor.identity.segment_id,
+            entry_ref: descriptor.identity.entry_ref.clone(),
+        },
+        order: descriptor.canonical_order,
+        content_sha256: descriptor.sha256.clone(),
+        total_bytes: descriptor.total_bytes,
+    }
+}

@@ -102,6 +102,163 @@ fn request(profile: &str) -> ::job::JobRequest {
         limits: Default::default(),
     }
 }
+#[derive(Default)]
+struct JournalHostFixture(Mutex<Vec<subjektiv::journal::JournalOperation>>);
+impl crate::subjektiv::JournalJobHost for JournalHostFixture {
+    fn execute(
+        &self,
+        request: subjektiv::journal::transport::JournalJobRequest,
+    ) -> Result<
+        subjektiv::journal::transport::JournalJobResponse,
+        crate::subjektiv::SubjektivHostError,
+    > {
+        use subjektiv::journal::{JournalReceipt, transport::*};
+        let JournalJobRequest::Execute { operation } = request else {
+            panic!("script only writes")
+        };
+        let mut saved = self.0.lock().unwrap();
+        assert_eq!(operation.expected_state, format!("state-{}", saved.len()));
+        let request_id = operation.request_id.clone();
+        saved.push(operation);
+        Ok(JournalJobResponse::Saved(JournalReceipt {
+            request_id,
+            generation_id: "generation".into(),
+            entry_id: None,
+            state_token: format!("state-{}", saved.len()),
+            process_order: 0,
+            process_byte: 0,
+        }))
+    }
+    fn finish(
+        &self,
+    ) -> Result<
+        subjektiv::journal::transport::JournalJobCompletion,
+        crate::subjektiv::SubjektivHostError,
+    > {
+        let saved = self.0.lock().unwrap();
+        assert!(
+            matches!(saved.last().map(|op| &op.action), Some(subjektiv::journal::JournalAction::Checkpoint { record_operation_ids }) if record_operation_ids == &["record".to_string()])
+        );
+        Ok(subjektiv::journal::transport::JournalJobCompletion {
+            generation_id: "generation".into(),
+            state_token: format!("state-{}", saved.len()),
+            process_order: 0,
+            process_byte: 0,
+        })
+    }
+}
+
+// Real built-in registry/Profile/Prompt resolution, Job runner, Feature tools and result finalizer.
+// Only external model transport and the domain Host are replaced; store rules belong to Subjektiv.
+#[tokio::test]
+async fn builtin_journal_profile_installs_only_bound_tools_and_finalizes_saved_sequential_progress()
+{
+    use crate::subjektiv::{JournalJobFinalizer, JournalJobToolsFeature};
+    let root = tempfile::tempdir().unwrap();
+    let registry = ProfileDiscovery::with_sources(None, None)
+        .discover()
+        .unwrap();
+    let host = Arc::new(JournalHostFixture::default());
+    let client = ScriptedClient::new(vec![
+        call(
+            "ConfirmJournalUnchanged",
+            json!({"request_id":"record","expected_state":"state-0","action":{"action":"confirm_unchanged"},"covered_ranges":[]}),
+        ),
+        call(
+            "UpdateJournalPosition",
+            json!({"request_id":"position","expected_state":"state-1","action":{"action":"update_position","current_position":"Still in progress; no confirmed outcome."},"covered_ranges":[]}),
+        ),
+        call(
+            "CheckpointJournal",
+            json!({"request_id":"checkpoint","expected_state":"state-2","action":{"action":"checkpoint","record_operation_ids":["record"]},"covered_ranges":[]}),
+        ),
+        call(
+            SUBMIT_JOB_RESULT_TOOL,
+            json!({"result":{"fabricated_aggregate":true}}),
+        ),
+        call(SUBMIT_JOB_RESULT_TOOL, json!({"result":{}})),
+        prose(),
+    ]);
+    // This runner/Feature fixture has no selected sources; descriptor delivery gates
+    // for nonempty ranges are owned and tested by the Subjektiv service.
+    let mut journal_request = request("builtin:subjektiv-journal-recording");
+    journal_request.input = json!({"selected_ranges":[],"origins":[]});
+    journal_request.instruction = "Read immutable selected_ranges through ReadJournalText Source before recording; descriptors are not source bodies.".into();
+    let job = prepare_job_from_registry_with_grant(
+        &journal_request,
+        root.path(),
+        Some(Box::new(client.clone())),
+        &registry,
+        JobFeatureGrant {
+            features: FeatureRegistryBuilder::new()
+                .with_module(JournalJobToolsFeature::new(host.clone())),
+            satisfied_requirements: vec![],
+            finalizer: Some(Arc::new(JournalJobFinalizer::new(host.clone()))),
+        },
+    )
+    .unwrap();
+    assert!(!job.manifest.feature.subjektiv.profile.enabled);
+    assert!(job.manifest.compaction.is_none());
+    assert!(job.manifest.scope.allow.is_empty());
+    assert!(job.manifest.delegation_scope.allow.is_empty());
+    assert_eq!(
+        job.manifest.engine.instruction,
+        "internal.subjektiv_journal_system"
+    );
+    let sink = Arc::new(RecordingSink::default());
+    job.run("attempt".into(), sink.clone(), |_| {})
+        .await
+        .unwrap();
+    assert_eq!(host.0.lock().unwrap().len(), 3);
+    let accepted = sink.0.lock().unwrap();
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].result["state_token"], "state-3");
+    let sent = client.requests.lock().unwrap();
+    assert!(!sent.is_empty());
+    for request in sent.iter() {
+        let names = request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        for name in [
+            "CreateJournalEntry",
+            "RewriteJournalEntry",
+            "FixJournalEntry",
+            "ReadJournalText",
+            SUBMIT_JOB_RESULT_TOOL,
+        ] {
+            assert!(names.contains(&name), "missing {name}");
+        }
+        for forbidden in [
+            "TaskCreate",
+            "SubjektivMemoryRemember",
+            "SubjektivSessionRead",
+            "Bash",
+            "Write",
+            "JournalRecordResult",
+        ] {
+            assert!(!names.contains(&forbidden), "unexpected {forbidden}");
+        }
+        let prompt = request.system_prompt.as_deref().unwrap();
+        for contract in [
+            "OutcomeUnknown",
+            "selected_ranges",
+            "origins",
+            "ReadJournalState",
+            "ReadJournalText",
+            "Source",
+            "content_token",
+            "Conflict",
+        ] {
+            assert!(
+                prompt.contains(contract),
+                "missing Journal input contract {contract}"
+            );
+        }
+    }
+}
+
 fn artifact(instruction: &str, tokens: u32, turns: u32) -> Value {
     json!({"model":{"scheme":"anthropic", "model_id":"scripted-model", "auth":{"kind":"none"}},
         "engine":{"instruction":instruction, "language":"English", "max_tokens":tokens, "max_turns":turns}})

@@ -25,7 +25,7 @@ use thiserror::Error;
 #[path = "job_store/legacy_migrations.rs"]
 mod legacy_migrations;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -189,6 +189,7 @@ impl JobStore {
             0 => {
                 tx.execute_batch(SCHEMA)?;
                 tx.execute_batch(GRANT_SCHEMA)?;
+                tx.execute_batch(RECONCILIATION_SCHEMA)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             1 | 2 => {
@@ -196,6 +197,11 @@ impl JobStore {
                     tx.execute_batch(GRANT_SCHEMA)?;
                 }
                 legacy_migrations::migrate_legacy_jobs(&tx)?;
+                tx.execute_batch(RECONCILIATION_SCHEMA)?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
+            3 => {
+                tx.execute_batch(RECONCILIATION_SCHEMA)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             SCHEMA_VERSION => {}
@@ -278,6 +284,49 @@ impl JobStore {
         Ok(snapshot)
     }
 
+    /// Domain Host attests that this fenced attempt's only effects are reconciled in its
+    /// authoritative durable consumer. This releases serialization, not the original Unknown
+    /// history, and cannot authorize retry or change its result. The service checks cleanup.
+    pub(crate) fn reconcile_granted_attempt(
+        &mut self,
+        job_id: &str,
+        attempt_id: &str,
+        domain_receipt: &str,
+    ) -> Result<(), JobStoreError> {
+        if domain_receipt.is_empty()
+            || domain_receipt.len() > 256
+            || domain_receipt.chars().any(char::is_control)
+        {
+            return Err(JobStoreError::InvalidTransition(
+                "invalid domain reconciliation receipt",
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let snapshot = require_snapshot(&tx, job_id)?;
+        check_attempt(&snapshot, attempt_id)?;
+        if snapshot.domain_grant.is_none()
+            || snapshot.attempt.state != JobAttemptState::Unknown
+            || !matches!(snapshot.state, JobState::Unknown | JobState::Cancelled)
+        {
+            return Err(JobStoreError::InvalidTransition(
+                "domain reconciliation requires a fenced unknown granted attempt",
+            ));
+        }
+        let old: Option<String> = tx.query_row("SELECT domain_receipt FROM job_domain_reconciliations WHERE job_id=?1 AND attempt_id=?2",
+            params![job_id,attempt_id], |row| row.get(0)).optional()?;
+        if old.as_deref().is_some_and(|old| old != domain_receipt) {
+            return Err(JobStoreError::InvalidTransition(
+                "domain reconciliation receipt changed",
+            ));
+        }
+        tx.execute("INSERT OR IGNORE INTO job_domain_reconciliations(job_id,attempt_id,domain_receipt) VALUES(?1,?2,?3)",
+            params![job_id,attempt_id,domain_receipt])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Only definitive failure can create a new immutable attempt. Unknown
     /// outcomes require caller reconciliation, never an automatic replay.
     pub(crate) fn retry(&mut self, job_id: &str) -> Result<JobSnapshot, JobStoreError> {
@@ -311,6 +360,16 @@ impl JobStore {
 
     pub(crate) fn unacknowledged(&self) -> Result<Vec<JobSnapshot>, JobStoreError> {
         let mut statement = self.conn.prepare("SELECT job_id FROM job_intents WHERE state = 'completed' AND acknowledged = 0 ORDER BY rowid")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.into_iter()
+            .map(|id| require_snapshot(&self.conn, &id))
+            .collect()
+    }
+
+    pub(crate) fn unknown_granted(&self) -> Result<Vec<JobSnapshot>, JobStoreError> {
+        let mut statement = self.conn.prepare("SELECT i.job_id FROM job_intents i JOIN job_attempts a ON a.job_id=i.job_id AND a.number=i.current_attempt JOIN job_domain_grants g ON g.job_id=i.job_id WHERE a.state='unknown' AND NOT EXISTS (SELECT 1 FROM job_domain_reconciliations r WHERE r.job_id=a.job_id AND r.attempt_id=a.attempt_id) ORDER BY i.rowid")?;
         let ids = statement
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -527,8 +586,10 @@ fn check_serialization(
     if let Some(key) = key {
         let conflicting: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM job_intents i WHERE serialization_key = ?1
-             AND job_id <> ?2 AND (state IN ('pending', 'unknown') OR EXISTS
-                 (SELECT 1 FROM job_attempts a WHERE a.job_id = i.job_id AND a.state = 'unknown')))",
+             AND job_id <> ?2 AND (state = 'pending' OR EXISTS
+                 (SELECT 1 FROM job_attempts a WHERE a.job_id = i.job_id AND a.state = 'unknown'
+                  AND NOT EXISTS (SELECT 1 FROM job_domain_reconciliations r
+                    WHERE r.job_id=a.job_id AND r.attempt_id=a.attempt_id))))",
             params![key, job_id],
             |row| row.get(0),
         )?;
@@ -658,6 +719,22 @@ fn read_snapshot(conn: &Connection, job_id: &str) -> Result<Option<JobSnapshot>,
     .transpose()
 }
 
+const RECONCILIATION_SCHEMA: &str = "
+DROP INDEX job_serialization_singleflight;
+CREATE UNIQUE INDEX job_serialization_singleflight ON job_intents(serialization_key)
+    WHERE serialization_key IS NOT NULL AND state = 'pending';
+CREATE TABLE job_domain_reconciliations (
+    job_id TEXT NOT NULL REFERENCES job_intents(job_id),
+    attempt_id TEXT NOT NULL,
+    domain_receipt TEXT NOT NULL,
+    PRIMARY KEY (job_id, attempt_id)
+);
+CREATE TRIGGER job_reconciliation_immutable BEFORE UPDATE ON job_domain_reconciliations
+BEGIN SELECT RAISE(ABORT, 'immutable domain reconciliation'); END;
+CREATE TRIGGER job_reconciliation_retained BEFORE DELETE ON job_domain_reconciliations
+BEGIN SELECT RAISE(ABORT, 'retained domain reconciliation'); END;
+";
+
 const GRANT_SCHEMA: &str = "
 CREATE TABLE job_domain_grants (
     job_id TEXT PRIMARY KEY NOT NULL REFERENCES job_intents(job_id),
@@ -730,6 +807,98 @@ mod tests {
             serialization_key: None,
             limits: JobLimits::default(),
         }
+    }
+
+    #[test]
+    fn granted_unknown_reconciliation_releases_serialization_but_preserves_history() {
+        let (dir, mut store) = fixture();
+        let mut first = request("first");
+        first.serialization_key = Some("journal".into());
+        let reserved = store
+            .reserve_granted(first, Some(json!({"domain":"journal"})))
+            .unwrap();
+        store
+            .dispatch("first", &reserved.attempt.attempt_id, 8)
+            .unwrap();
+        let unknown = store
+            .finish(
+                "first",
+                &reserved.attempt.attempt_id,
+                JobAttemptState::Unknown,
+                Some("response lost"),
+            )
+            .unwrap();
+        let mut second = request("second");
+        second.serialization_key = Some("journal".into());
+        assert!(matches!(
+            store.reserve(second.clone()),
+            Err(JobStoreError::SerializationConflict(_))
+        ));
+        assert!(
+            store
+                .reconcile_granted_attempt("first", "foreign-attempt", "domain-fenced")
+                .is_err()
+        );
+        store
+            .reconcile_granted_attempt("first", &unknown.attempt.attempt_id, "domain-fenced")
+            .unwrap();
+        store
+            .reconcile_granted_attempt("first", &unknown.attempt.attempt_id, "domain-fenced")
+            .unwrap();
+        assert!(
+            store
+                .reconcile_granted_attempt("first", &unknown.attempt.attempt_id, "different-proof")
+                .is_err()
+        );
+        assert_eq!(store.get("first").unwrap(), unknown);
+        store.reserve(second).unwrap();
+        assert!(store.retry("first").is_err());
+        drop(store);
+        let mut reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
+        assert_eq!(reopened.get("first").unwrap(), unknown);
+        assert!(reopened.unknown_granted().unwrap().is_empty());
+        assert!(
+            reopened
+                .conn
+                .execute("DELETE FROM job_domain_reconciliations", [])
+                .is_err()
+        );
+        assert!(reopened.retry("first").is_err());
+    }
+
+    #[test]
+    fn schema_three_migration_preserves_unknown_grant_and_its_serialization_fence() {
+        let (dir, mut store) = fixture();
+        let mut first = request("first");
+        first.serialization_key = Some("journal".into());
+        let reserved = store
+            .reserve_granted(first, Some(json!({"domain":"journal"})))
+            .unwrap();
+        store
+            .dispatch("first", &reserved.attempt.attempt_id, 8)
+            .unwrap();
+        let unknown = store
+            .finish(
+                "first",
+                &reserved.attempt.attempt_id,
+                JobAttemptState::Unknown,
+                Some("unconfirmed"),
+            )
+            .unwrap();
+        store.conn.execute_batch("DROP TRIGGER job_reconciliation_immutable; DROP TRIGGER job_reconciliation_retained; DROP TABLE job_domain_reconciliations; DROP INDEX job_serialization_singleflight; CREATE UNIQUE INDEX job_serialization_singleflight ON job_intents(serialization_key) WHERE serialization_key IS NOT NULL AND state IN ('pending','unknown'); PRAGMA user_version=3;").unwrap();
+        drop(store);
+        let mut reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
+        assert_eq!(reopened.get("first").unwrap(), unknown);
+        let mut next = request("next");
+        next.serialization_key = Some("journal".into());
+        assert!(matches!(
+            reopened.reserve(next.clone()),
+            Err(JobStoreError::SerializationConflict(_))
+        ));
+        reopened
+            .reconcile_granted_attempt("first", &unknown.attempt.attempt_id, "domain-fenced")
+            .unwrap();
+        reopened.reserve(next).unwrap();
     }
 
     fn fixture() -> (TempDir, JobStore) {

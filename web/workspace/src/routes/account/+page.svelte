@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import {
+    addPasskey,
     loadWhoami,
     loginWithPasskey,
     logout,
@@ -13,16 +14,19 @@
   let handle = $state('local');
   let displayName = $state('Local User');
   let loading = $state(true);
+  let sessionReady = $state(false);
   let busy = $state(false);
   let status = $state('');
   let error = $state('');
 
   async function refreshWhoami() {
     loading = true;
+    sessionReady = false;
     error = '';
     try {
       const whoami = await loadWhoami();
       actor = whoami.actor;
+      sessionReady = true;
       if (actor?.handle) {
         handle = actor.handle;
         displayName = actor.display_name;
@@ -35,12 +39,18 @@
   }
 
   async function register() {
+    if (busy || !sessionReady) return;
+    const adding = actor !== null;
     busy = true;
-    status = 'Waiting for passkey registration…';
+    status = adding ? 'Waiting for passkey addition…' : 'Waiting for new account registration…';
     error = '';
     try {
-      await registerPasskey(handle.trim(), displayName.trim() || handle.trim());
-      status = 'Passkey registered.';
+      if (adding) {
+        await addPasskey();
+      } else {
+        await registerPasskey(handle.trim(), displayName.trim() || handle.trim());
+      }
+      status = adding ? 'Passkey added to your account.' : 'New account registered.';
       await refreshWhoami();
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
@@ -138,16 +148,16 @@
     <h2>Passkey</h2>
     <form class="settings-form" onsubmit={(event) => { event.preventDefault(); }}>
       <label>
-        User handle
-        <input bind:value={handle} autocomplete="username webauthn" placeholder="local" />
+        {actor ? 'Current user handle' : 'User handle (new registration or login)'}
+        <input bind:value={handle} disabled={busy || loading || !sessionReady || actor !== null} autocomplete="username webauthn" placeholder="local" />
       </label>
       <label>
-        Display name
-        <input bind:value={displayName} autocomplete="name" placeholder="Local User" />
+        Display name (new account only)
+        <input bind:value={displayName} disabled={busy || loading || !sessionReady || actor !== null} autocomplete="name" placeholder="Local User" />
       </label>
       <div class="settings-action-row">
-        <button type="button" disabled={busy || !handle.trim()} onclick={register}>Register passkey</button>
-        <button type="button" disabled={busy || !handle.trim()} onclick={login}>Log in with passkey</button>
+        <button type="button" disabled={busy || loading || !sessionReady || (!actor && !handle.trim())} onclick={register}>{actor ? `Add passkey to ${actor.handle}` : 'Register new account'}</button>
+        <button type="button" disabled={busy || loading || !sessionReady || actor !== null || !handle.trim()} onclick={login}>Log in with passkey</button>
       </div>
     </form>
   </section>

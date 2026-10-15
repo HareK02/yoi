@@ -2420,6 +2420,9 @@ pub enum RuntimeHttpServerError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "fs-store")]
+    mod session_material_tests;
+
     use super::*;
     use crate::auth::RuntimeIdentityMaterial;
     use crate::catalog::{ConfigBundleRef, ProfileSelector, WorkspaceApiRef};

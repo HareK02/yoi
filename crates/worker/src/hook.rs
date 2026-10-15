@@ -405,12 +405,15 @@ pub struct ToolCallSummary {
     pub arguments: Value,
 }
 
-/// Information passed to `PostToolCall` hooks.
+/// Information passed to `PostToolCall` hooks after the terminal result's
+/// annotation/storage callback succeeds. Failure to persist prevents this callback.
 pub struct ToolResultSummary {
     /// Provider-assigned tool call id this result corresponds to.
     pub call_id: String,
     /// Registered tool name.
     pub tool_name: String,
+    /// Original call arguments, read-only and never an authorization grant.
+    pub arguments: Value,
     /// Whether the tool reported an error.
     pub is_error: bool,
     /// Tool output (`summary` always present, `content` may be `None`).

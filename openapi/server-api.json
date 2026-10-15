@@ -6562,6 +6562,19 @@
         ],
         "type": "object"
       },
+      "PasskeyAdditionOptionsRequest": {
+        "additionalProperties": false,
+        "description": "Adds a credential to the current authenticated actor; target identity is never public input.",
+        "properties": {
+          "browser_origin": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "PasskeyLoginCompleteRequest": {
         "additionalProperties": false,
         "properties": {
@@ -6578,6 +6591,7 @@
       },
       "PasskeyLoginOptionsRequest": {
         "additionalProperties": false,
+        "description": "Identified-account login. Missing handles are rejected, not resolved to an implicit user.\n\nThe nullable wire field permits an explicit authentication error for old callers; it does not\nadvertise a discoverable-login ceremony.",
         "properties": {
           "browser_origin": {
             "type": [
@@ -6624,6 +6638,7 @@
       },
       "PasskeyRegistrationOptionsRequest": {
         "additionalProperties": false,
+        "description": "Starts new-account registration only; an existing handle is never interpreted as key addition.",
         "properties": {
           "browser_origin": {
             "type": [
@@ -17733,7 +17748,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:04100376ce54b912df019137dbf7414f9cb2930293ee237a905bc6a5543c294f"
+    "x-yoi-source-digest": "sha256:21dfcde7b03c0b08f9ede1012962ff69a05d4f8373d5a9c5abe6ab43ba5c3720"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -18064,6 +18079,153 @@
             "description": "Error response"
           }
         }
+      }
+    },
+    "/api/auth/passkeys/addition/complete": {
+      "post": {
+        "operationId": "auth_passkey_addition_complete",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyRegistrationCompleteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthUserResponse"
+                }
+              }
+            },
+            "description": "Successful response",
+            "headers": {
+              "set-cookie": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetCookieHeader"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/auth/passkeys/addition/options": {
+      "post": {
+        "operationId": "auth_passkey_addition_options",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyAdditionOptionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasskeyRegistrationOptionsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
       }
     },
     "/api/auth/passkeys/login/complete": {

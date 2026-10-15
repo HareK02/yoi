@@ -259,11 +259,13 @@ const fn default_max_attempts() -> u8 {
 pub struct BackendJobGrants {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subjektiv_consolidation: Option<SubjektivConsolidationGrant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subjektiv_journal: Option<SubjektivJournalGrant>,
 }
 
 impl BackendJobGrants {
     pub fn is_empty(&self) -> bool {
-        self.subjektiv_consolidation.is_none()
+        self.subjektiv_consolidation.is_none() && self.subjektiv_journal.is_none()
     }
 }
 
@@ -274,6 +276,20 @@ pub struct SubjektivConsolidationGrant {
     /// Exact immutable candidate scope. Empty is a surface-only refresh grant:
     /// the subject is still locked, but no candidate access is authorized.
     pub candidate_ids: Vec<String>,
+}
+
+/// A frozen public-source capability, separate from subject Memory administration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivJournalGrant {
+    pub subject_id: String,
+    pub session_id: String,
+    pub journal_id: String,
+    pub selected_ranges: Vec<subjektiv::journal::JournalSourceRange>,
+}
+
+pub fn journal_serialization_key(journal_id: &str) -> String {
+    format!("subjektiv-journal:{journal_id}")
 }
 
 /// Common runner lock identity for a subject, independent of the candidate snapshot.
@@ -360,6 +376,34 @@ impl BackendJobRequest {
                 ));
             }
         }
+        if let Some(grant) = &self.grants.subjektiv_journal {
+            if self.grants.subjektiv_consolidation.is_some() {
+                return Err(Error::InvalidInput(
+                    "Journal and Memory grants are mutually exclusive".into(),
+                ));
+            }
+            for (name, id) in [
+                ("journal subject", &grant.subject_id),
+                ("journal session", &grant.session_id),
+                ("journal id", &grant.journal_id),
+            ] {
+                validate_identifier(name, id, 256)?;
+            }
+            if grant.selected_ranges.is_empty()
+                || grant.selected_ranges.len() > subjektiv::journal::MAX_JOURNAL_RANGES
+                || grant.selected_ranges.iter().any(|r| {
+                    r.source.session_id != grant.session_id
+                        || r.bytes.start >= r.bytes.end
+                        || r.bytes.end > r.source.total_bytes
+                })
+                || self.serialization_key.as_deref()
+                    != Some(journal_serialization_key(&grant.journal_id).as_str())
+            {
+                return Err(Error::InvalidInput(
+                    "invalid Journal range capability or serialization key".into(),
+                ));
+            }
+        }
         request.validate_input().map_err(backend_error)?;
         self.limits.validate()
     }
@@ -391,6 +435,12 @@ impl BackendJobRequest {
             .subjektiv_consolidation
             .as_ref()
             .map(|grant| subjektiv_serialization_key(&grant.subject_id))
+            .or_else(|| {
+                self.grants
+                    .subjektiv_journal
+                    .as_ref()
+                    .map(|g| journal_serialization_key(&g.journal_id))
+            })
             .or_else(|| self.serialization_key.clone())
     }
 

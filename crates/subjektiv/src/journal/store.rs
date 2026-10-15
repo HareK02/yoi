@@ -92,7 +92,35 @@ fn fit_page<T: Serialize>(rows: Vec<(String, T)>, mut more: bool) -> JournalResu
     page.next = if more { last } else { None };
     Ok(page)
 }
-fn check_host(
+pub(super) fn check_session_host(
+    store: &SubjektivStore,
+    tx: &Connection,
+    host: &JournalHostContext,
+) -> JournalResult<()> {
+    if host.scope_id != store.scope_id() {
+        return Err(JournalError::PermissionDenied(
+            "different storage scope".into(),
+        ));
+    }
+    let attr = host
+        .attribution
+        .as_ref()
+        .ok_or_else(|| JournalError::PermissionDenied("Session authority required".into()))?;
+    let raw: Option<String> = tx.query_row("SELECT record_json FROM subject_session_attributions WHERE session_id=?1 AND subject_id=?2", params![attr.session_id, host.subject_id], |row| row.get(0)).optional()?;
+    if raw
+        .map(|s| serde_json::from_str::<SubjectSessionAttribution>(&s))
+        .transpose()?
+        .as_ref()
+        != Some(attr)
+    {
+        return Err(JournalError::PermissionDenied(
+            "Session attribution mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn check_host(
     store: &SubjektivStore,
     tx: &Connection,
     host: &JournalHostContext,
@@ -112,25 +140,11 @@ fn check_host(
         if state != "active" {
             return Err(JournalError::PermissionDenied("Subject is retired".into()));
         }
-        let attr = host
-            .attribution
-            .as_ref()
-            .ok_or_else(|| JournalError::PermissionDenied("Session authority required".into()))?;
-        let raw: Option<String> = tx.query_row("SELECT record_json FROM subject_session_attributions WHERE session_id=?1 AND subject_id=?2", params![attr.session_id, host.subject_id], |r| r.get(0)).optional()?;
-        if raw
-            .map(|s| serde_json::from_str::<SubjectSessionAttribution>(&s))
-            .transpose()?
-            .as_ref()
-            != Some(attr)
-        {
-            return Err(JournalError::PermissionDenied(
-                "Session attribution mismatch".into(),
-            ));
-        }
+        check_session_host(store, tx, host)?;
     }
     Ok(())
 }
-fn journal(
+pub(super) fn journal(
     tx: &Connection,
     host: &JournalHostContext,
     id: &str,
@@ -174,7 +188,7 @@ fn entry(tx: &Connection, journal_id: &str, id: &str) -> JournalResult<JournalEn
         correction_refs,
     })
 }
-fn open(tx: &Connection, journal_id: &str) -> JournalResult<Option<JournalEntry>> {
+pub(super) fn open(tx: &Connection, journal_id: &str) -> JournalResult<Option<JournalEntry>> {
     let id: Option<String> = tx
         .query_row(
             "SELECT id FROM journal_entries WHERE journal_id=?1 AND state='open'",
@@ -222,8 +236,10 @@ fn check_source(range: &JournalSourceRange, session: &str) -> JournalResult<()> 
         .entry_ref
         .strip_prefix('E')
         .ok_or_else(|| invalid("source entry reference must be a public E reference"))?;
+    // Session storage's stable legacy Run references include Session, Segment and record
+    // offset; they are longer than a newly allocated UUID but remain bounded public IDs.
     if suffix.is_empty()
-        || suffix.len() > 64
+        || suffix.len() > 128
         || !suffix
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -247,7 +263,7 @@ fn check_source(range: &JournalSourceRange, session: &str) -> JournalResult<()> 
     }
     Ok(())
 }
-fn merge(mut ranges: Vec<JournalByteRange>) -> JournalResult<Vec<JournalByteRange>> {
+pub(super) fn merge(mut ranges: Vec<JournalByteRange>) -> JournalResult<Vec<JournalByteRange>> {
     ranges.sort_by_key(|r| r.start);
     let mut out: Vec<JournalByteRange> = Vec::new();
     for r in ranges {
@@ -351,7 +367,7 @@ fn generation(
     journal(tx, host, &snapshot.journal_id, true)?;
     Ok((snapshot, active))
 }
-fn job(
+pub(super) fn job(
     store: &SubjektivStore,
     tx: &Connection,
     ctx: &JournalJobContext,
@@ -445,6 +461,7 @@ impl SubjektivStore {
         text(title, 1024)?;
         self.database.try_transaction(|tx| {
             check_host(self,tx,host,true)?;
+            super::lifecycle::reject_erased(tx, host)?;
             let session=&host.attribution.as_ref().expect("checked").session_id;
             if ranges.is_empty() || ranges.len()>MAX_JOURNAL_RANGES {return Err(invalid("admission count must be 1..64"));}
             let existing:Option<String>=tx.query_row("SELECT id FROM journals WHERE source_session_id=?1",[session],|r|r.get(0)).optional()?;
@@ -954,7 +971,7 @@ fn metadata(
         updated_at: j.updated_at,
     })
 }
-fn summary(tx: &Connection, e: JournalEntry) -> JournalResult<JournalEntrySummary> {
+pub(super) fn summary(tx: &Connection, e: JournalEntry) -> JournalResult<JournalEntrySummary> {
     let previous:Option<String>=tx.query_row("SELECT source_end_json FROM journal_entries WHERE journal_id=?1 AND position<?2 AND state='fixed' ORDER BY position DESC LIMIT 1",params![e.journal_id,e.position],|r|r.get(0)).optional()?;
     let source_available = if e.source_end.is_some() {
         let end: u64 = tx.query_row(

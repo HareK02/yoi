@@ -15,6 +15,9 @@
 //! Unknown attempts are not rerun; delivery failures for accepted results do not trigger model
 //! reexecution. Memory application and surface repair use shared-domain CAS/receipts.
 
+mod journal;
+pub(crate) use journal::prepare_worker_deletion;
+
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -220,7 +223,9 @@ impl StandaloneSubjects {
             scope_id: self.scope_id.clone(),
             subject_id: subject_id.to_string(),
         };
-        let host = Arc::new(LocalSubjectHost {
+        let host = Arc::new_cyclic(|weak| LocalSubjectHost {
+            self_weak: weak.clone(),
+            journal_dispatch: Mutex::new(false),
             language: self.memory_language.clone(),
             catalog: self,
             binding: binding.clone(),
@@ -277,6 +282,8 @@ impl Drop for SubjectConnection {
 }
 
 pub(crate) struct LocalSubjectHost {
+    self_weak: std::sync::Weak<Self>,
+    journal_dispatch: Mutex<bool>,
     catalog: StandaloneSubjects,
     binding: StandaloneSubjectBinding,
     worker_id: protocol::WorkerId,
@@ -551,10 +558,11 @@ impl LocalSubjectHost {
                     .and_then(|v| serde_json::from_value::<LocalConsolidationGrant>(v.clone()).ok())
                     .is_some_and(|g| g.binding == self.binding)
                 {
-                    schedule_job(jobs.clone(), job.request.job_id);
+                    schedule_job(jobs.clone(), job.request.job_id, self.self_weak.clone());
                 }
             }
         }
+        self.recover_journals();
     }
     fn validate_evidence(
         &self,
@@ -690,6 +698,22 @@ impl LocalSubjectHost {
     }
 }
 impl SubjektivHost for LocalSubjectHost {
+    fn journal_recording_granted(&self) -> bool {
+        self.live.load(Ordering::Acquire)
+    }
+    fn request_journal_recording(
+        &self,
+        context: &SubjektivHostContext,
+        _reason: subjektiv::journal::transport::JournalRecordingReason,
+    ) -> Result<subjektiv::journal::transport::JournalRecordingResponse, SubjektivHostError> {
+        let admitted = self.admit_journal(context)?;
+        self.wake_journals();
+        Ok(if admitted {
+            subjektiv::journal::transport::JournalRecordingResponse::Accepted
+        } else {
+            subjektiv::journal::transport::JournalRecordingResponse::NoNewSources
+        })
+    }
     fn settings(&self) -> SubjektivHostSettings {
         SubjektivHostSettings {
             language: self.language.clone(),
@@ -788,6 +812,7 @@ impl SubjektivHost for LocalSubjectHost {
         create_if_missing: bool,
     ) -> Result<SubjektivRecordSessionResponse, SubjektivHostError> {
         let attribution = self.attribution(context, create_if_missing)?;
+        self.reserve_journal_session(context)?;
         Ok(SubjektivRecordSessionResponse {
             subject_id: attribution.subject_id,
             session_id: attribution.session_id,
@@ -811,7 +836,7 @@ impl SubjektivHost for LocalSubjectHost {
                     .is_some_and(|g| g.binding == self.binding)
             })
         {
-            schedule_job(jobs, pending.request.job_id);
+            schedule_job(jobs, pending.request.job_id, self.self_weak.clone());
             let (count, bytes) = self
                 .catalog
                 .store
@@ -874,7 +899,7 @@ impl SubjektivHost for LocalSubjectHost {
                     .map_err(|e| SubjektivHostError::Unavailable(e.to_string()))?,
             )
             .map_err(|e| SubjektivHostError::Unavailable(e.to_string()))?;
-        schedule_job(jobs, snapshot.request.job_id);
+        schedule_job(jobs, snapshot.request.job_id, self.self_weak.clone());
         Ok(memory::backend::MemoryConsolidationOutput { status:"started".into(),summary:"Requested a durable generic standalone consolidation Job; processing stops on Host shutdown".into(),candidate_count:count,total_bytes:bytes })
     }
 }
@@ -894,6 +919,9 @@ impl crate::jobs::JobDomainProvider for LocalDomainProvider {
     ) -> Result<worker::job::JobFeatureGrant, String> {
         let host = self.0.upgrade().ok_or("Subject Host unavailable")?;
         host.ensure_live().map_err(|e| e.to_string())?;
+        if snapshot.request.purpose == journal::PURPOSE {
+            return journal::grant(host, snapshot, fence);
+        }
         let grant: LocalConsolidationGrant = serde_json::from_value(
             snapshot
                 .domain_grant
@@ -1097,7 +1125,11 @@ impl worker::job::JobResultFinalizer for LocalConsolidationFinalizer {
     }
 }
 
-fn schedule_job(jobs: crate::jobs::StandaloneJobs, id: String) {
+fn schedule_job(
+    jobs: crate::jobs::StandaloneJobs,
+    id: String,
+    host: std::sync::Weak<LocalSubjectHost>,
+) {
     // Scheduling/consumer acknowledgement has no Internal Worker ownership.
     // The generic service fences and retains every execution until cleanup.
     tokio::spawn(async move {
@@ -1113,6 +1145,9 @@ fn schedule_job(jobs: crate::jobs::StandaloneJobs, id: String) {
             Err(error) => eprintln!(
                 "standalone Subject Job {id} cleanup/acknowledgement is unconfirmed: {error}"
             ),
+        }
+        if let Some(host) = host.upgrade() {
+            host.wake_journals();
         }
     });
 }

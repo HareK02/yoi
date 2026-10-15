@@ -181,6 +181,7 @@ impl_openapi_schema!(
     PasskeyLoginOptionsRequest,
     PasskeyLoginOptionsResponse,
     PasskeyLoginCompleteRequest,
+    PasskeyAdditionOptionsRequest,
     PasskeyRegistrationOptionsRequest,
     PasskeyRegistrationOptionsResponse,
     PasskeyRegistrationCompleteRequest,
@@ -549,6 +550,36 @@ pub trait ServerApi {
         &self,
         #[body] request: PasskeyRegistrationCompleteRequest,
     ) -> Result<server_api_responses::AuthPasskeyRegistrationComplete, RepositoryApiError>;
+
+    #[post(
+        "/api/auth/passkeys/addition/options",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [403, 500, 502],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn auth_passkey_addition_options(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[body] request: PasskeyAdditionOptionsRequest,
+    ) -> Result<PasskeyRegistrationOptionsResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/auth/passkeys/addition/complete",
+        responses = [
+            (status = 200, body = AuthUserResponse, headers = [("set-cookie", SetCookieHeader)])
+        ],
+        error_status = 400,
+        additional_error_statuses = [403, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn auth_passkey_addition_complete(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[body] request: PasskeyRegistrationCompleteRequest,
+    ) -> Result<server_api_responses::AuthPasskeyAdditionComplete, RepositoryApiError>;
 
     #[post(
         "/api/auth/passkeys/login/options",
@@ -3884,6 +3915,7 @@ pub struct AuthUserResponse {
     pub user: AuthenticatedUser,
 }
 
+/// Starts new-account registration only; an existing handle is never interpreted as key addition.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
@@ -3892,6 +3924,16 @@ pub struct PasskeyRegistrationOptionsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
     pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub browser_origin: Option<String>,
+}
+
+/// Adds a credential to the current authenticated actor; target identity is never public input.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyAdditionOptionsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
     pub browser_origin: Option<String>,
@@ -3917,6 +3959,10 @@ pub struct PasskeyRegistrationCompleteRequest {
     pub credential: RegisterPublicKeyCredential,
 }
 
+/// Identified-account login. Missing handles are rejected, not resolved to an implicit user.
+///
+/// The nullable wire field permits an explicit authentication error for old callers; it does not
+/// advertise a discoverable-login ceremony.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
@@ -11355,6 +11401,7 @@ pub fn auth_api_typescript() -> String {
         WhoamiResponse::decl(&config),
         AuthBootstrapUserRequest::decl(&config),
         AuthUserResponse::decl(&config),
+        PasskeyAdditionOptionsRequest::decl(&config),
         PasskeyRegistrationOptionsRequest::decl(&config),
         PasskeyRegistrationOptionsResponse::decl(&config),
         PasskeyRegistrationCompleteRequest::decl(&config),
@@ -12071,6 +12118,16 @@ mod tests {
                 "auth_passkey_registration_options",
                 HttpMethod::Post,
                 "/api/auth/passkeys/registration/options",
+            ),
+            (
+                "auth_passkey_addition_options",
+                HttpMethod::Post,
+                "/api/auth/passkeys/addition/options",
+            ),
+            (
+                "auth_passkey_addition_complete",
+                HttpMethod::Post,
+                "/api/auth/passkeys/addition/complete",
             ),
             (
                 "auth_passkey_login_options",
@@ -14464,6 +14521,20 @@ mod openapi_artifact_tests {
     }
 
     #[test]
+    fn passkey_addition_rejects_caller_selected_target_fields() {
+        for field in ["handle", "user_id", "account_id"] {
+            let payload = serde_json::json!({ (field): "other-user" });
+            assert!(
+                serde_json::from_value::<PasskeyAdditionOptionsRequest>(payload).is_err(),
+                "addition must reject caller-selected {field}"
+            );
+        }
+        assert!(
+            serde_json::from_value::<PasskeyAdditionOptionsRequest>(serde_json::json!({})).is_ok()
+        );
+    }
+
+    #[test]
     fn auth_workspace_catalog_and_typed_header_contract_is_strict() {
         let document = canonical_openapi_document().expect("canonical OpenAPI contract must build");
         let value: serde_json::Value =
@@ -14476,6 +14547,8 @@ mod openapi_artifact_tests {
             ("/api/auth/bootstrap-user", "post"),
             ("/api/auth/passkeys/registration/options", "post"),
             ("/api/auth/passkeys/registration/complete", "post"),
+            ("/api/auth/passkeys/addition/options", "post"),
+            ("/api/auth/passkeys/addition/complete", "post"),
             ("/api/auth/passkeys/login/options", "post"),
             ("/api/auth/passkeys/login/complete", "post"),
             ("/api/auth/logout", "post"),
@@ -14514,6 +14587,7 @@ mod openapi_artifact_tests {
         }
         for path in [
             "/api/auth/passkeys/registration/complete",
+            "/api/auth/passkeys/addition/complete",
             "/api/auth/passkeys/login/complete",
             "/api/auth/logout",
         ] {

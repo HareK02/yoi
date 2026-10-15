@@ -37,9 +37,14 @@
 //! Hosts resuming at the processing cursor can use a bounded source point lookup instead of
 //! traversing already reflected pages. Receipt/entry keysets remain append-stable.
 
+mod lifecycle;
+pub(crate) use lifecycle::migrate as migrate_lifecycle;
+pub mod recording;
+pub mod service;
 mod store;
 #[cfg(test)]
 mod tests;
+pub mod transport;
 
 use crate::{SubjectSessionAttribution, SubjektivStore, api::JobAttemptBinding};
 use feature_storage::FeatureStorageError;
@@ -56,6 +61,25 @@ pub const MAX_JOURNAL_PAGE: usize = 32;
 pub const MAX_JOURNAL_READ_BYTES: usize = 16 * 1024;
 /// Whole pretty-serialized public page budget, including escaped text and metadata.
 pub const MAX_JOURNAL_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Stable owner of Backend source retention, shared by attribution-time protection
+/// and later source admission/release. This identifier confers no read authority.
+/// Local standalone storage uses its scope-exclusive Session UUID as the owner.
+pub fn source_retention_pin(workspace: &str, subject: &str, session: &str) -> Uuid {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(
+        serde_json::to_vec(&(
+            "subjektiv-journal-retention-v1",
+            workspace,
+            subject,
+            session,
+        ))
+        .expect("string tuple serialization"),
+    );
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -134,6 +158,27 @@ impl JournalJobContext {
             binding,
         };
         store.validate_journal_job(&context)?;
+        Ok(context)
+    }
+
+    /// Reconstructs a retained binding for exact completion/receipt recovery. Hosts still check
+    /// the external attempt lease. New record/checkpoint operations independently require an
+    /// active generation inside their transaction, so this never revives cancelled authority.
+    pub fn validated_recovery(
+        store: &SubjektivStore,
+        host: &JournalHostContext,
+        generation_id: &str,
+        binding: JobAttemptBinding,
+    ) -> JournalResult<Self> {
+        let context = Self {
+            host: host.clone(),
+            generation_id: generation_id.into(),
+            binding,
+        };
+        store.database.try_with_connection(|tx| {
+            self::store::job(store, tx, &context, false)?;
+            Ok::<_, JournalError>(())
+        })?;
         Ok(context)
     }
 }

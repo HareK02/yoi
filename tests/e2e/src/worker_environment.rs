@@ -305,7 +305,8 @@ impl WorkerE2eEnvironment {
         self.start_runtime()
     }
 
-    pub fn start_backend(&mut self) -> Result<()> {
+    /// 空のDBでBackendだけを起動し、Account／Workspaceは作成しない。
+    pub fn start_empty_backend(&mut self) -> Result<()> {
         assert_absent_or_empty(&self.server_data_dir, "Server data directory")?;
         assert_absent_or_empty(&self.runtime_data_dir, "Runtime data directory")?;
         let server_binary = self.binaries.binary("yoi-server")?;
@@ -328,7 +329,14 @@ impl WorkerE2eEnvironment {
         self.server = Some(server);
         self.server_url = Some(server_url.clone());
         self.wait_for_server_health(&server_url)?;
+        self.write_metadata("empty-backend-running")?;
+        Ok(())
+    }
 
+    pub fn start_backend(&mut self) -> Result<()> {
+        self.start_empty_backend()?;
+        let server_binary = self.binaries.binary("yoi-server")?;
+        let server_url = self.required_server_url()?.to_string();
         let bootstrap = self.run_command(
             &server_binary,
             &[
@@ -439,7 +447,14 @@ impl WorkerE2eEnvironment {
             false,
         )?;
         let enrollment: Value = serde_json::from_slice(&enrollment.stdout)?;
-        let workspace_trust_id = json_string(&enrollment, "/trust_id")?;
+        if json_string(&enrollment, "/trust_id")?.is_empty()
+            || enrollment.get("workspace_id").and_then(Value::as_str) != Some(workspace_id.as_str())
+            || enrollment.get("state").and_then(Value::as_str) != Some("active")
+        {
+            return Err(HarnessError::Protocol(
+                "Runtime did not retain active trust for the fixture Workspace".to_string(),
+            ));
+        }
 
         let mut command = self.isolated_command(&runtime_binary);
         command.args([
@@ -468,12 +483,20 @@ impl WorkerE2eEnvironment {
                 .post(format!("{server_url}/api/w/{workspace_id}/runtimes"))
                 .json(&serde_json::json!({
                     "public_bundle": runtime_identity,
-                    "workspace_trust_id": workspace_trust_id,
                     "display_name": format!("E2E {}", self.runtime_id),
                     "endpoint": runtime_url
                 })),
             "register Runtime",
         )?;
+        self.assert_connected_and_empty()?;
+        self.write_metadata("running")?;
+        Ok(())
+    }
+
+    pub fn assert_connected_and_empty(&self) -> Result<()> {
+        let server_url = self.required_server_url()?;
+        let workspace_id = self.required_workspace_id()?;
+        // connection testは実署名要求。保存済みの接続flagを認証成功の代わりにしない。
         let connection = self.request_json(
             self.client.post(format!(
                 "{server_url}/api/w/{workspace_id}/runtimes/{}/connection-tests",
@@ -486,14 +509,7 @@ impl WorkerE2eEnvironment {
                 "Runtime connection was not compatible: {connection}"
             )));
         }
-        self.assert_connected_and_empty()?;
-        self.write_metadata("running")?;
-        Ok(())
-    }
-
-    pub fn assert_connected_and_empty(&self) -> Result<()> {
-        let server_url = self.required_server_url()?;
-        let workspace_id = self.required_workspace_id()?;
+        let binding_id = json_string(&connection, "/binding_id")?;
         let runtimes = self.request_json(
             self.client
                 .get(format!("{server_url}/api/w/{workspace_id}/runtimes")),
@@ -506,9 +522,9 @@ impl WorkerE2eEnvironment {
                 items.iter().any(|item| {
                     item.get("runtime_id").and_then(Value::as_str) == Some(self.runtime_id.as_str())
                         && item
-                            .pointer("/management/binding/connection_state")
+                            .pointer("/management/binding/binding_id")
                             .and_then(Value::as_str)
-                            == Some("verified")
+                            == Some(binding_id.as_str())
                 })
             });
         if !connected {

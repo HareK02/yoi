@@ -133,6 +133,9 @@ pub struct WorkerSessionArchiveManifest {
     pub source_runtime_id: String,
     pub source_worker_id: WorkerId,
     pub source_session_id: String,
+    /// Older archives have no attested active lineage and cannot serve canonical scans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_active_segment_id: Option<session_store::SegmentId>,
     pub segment_ids: Vec<String>,
     pub source_created_at: String,
     pub removed_at: String,
@@ -171,6 +174,285 @@ pub(crate) trait WorkerRetentionProvider: Send + Sync {
         &self,
         request: &WorkerRetentionExecutionRequest,
     ) -> Result<WorkerRetentionExecutionResult, RuntimeError>;
+}
+
+pub use crate::session_retention::runtime_session_retention;
+
+/// Prove the legitimate pre-publication state, rather than interpreting a missing
+/// source as empty. A committed active pointer or any source file defeats this proof.
+pub(crate) fn unmaterialized_session(
+    worker_dir: &Path,
+    workspace_id: &str,
+) -> Result<Option<session_store::SessionId>, RuntimeError> {
+    let metadata_path = worker_dir.join("metadata.json");
+    let bytes = match fs::read(&metadata_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(RuntimeError::StoreIo {
+                operation: "inspect pending Session",
+                path: metadata_path,
+                source,
+            });
+        }
+    };
+    let metadata: session_store::WorkerMetadata = serde_json::from_slice(&bytes)
+        .map_err(|_| RuntimeError::InvalidRequest("Pending Session metadata is invalid".into()))?;
+    if metadata.workspace_id.as_deref() != Some(workspace_id) {
+        return Ok(None);
+    }
+    let Some(active) = metadata.active.filter(|active| active.segment_id.is_none()) else {
+        return Ok(None);
+    };
+    let root = worker_dir.join("session");
+    if collect_files(&root, "inspect pending Session")?.is_empty() {
+        Ok(Some(active.session_id))
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) fn aggregate_session_id(
+    worker_dir: &Path,
+) -> Result<Option<session_store::SessionId>, RuntimeError> {
+    let session_path = worker_dir.join("session/session.json");
+    let saved = match fs::read(&session_path) {
+        Ok(bytes) => {
+            let manifest: CanonicalSessionManifest =
+                serde_json::from_slice(&bytes).map_err(|_| {
+                    RuntimeError::InvalidRequest("Retained Session manifest is invalid".into())
+                })?;
+            Some(
+                manifest
+                    .session_id
+                    .parse::<session_store::SessionId>()
+                    .map_err(|_| {
+                        RuntimeError::InvalidRequest("Retained Session identity is invalid".into())
+                    })?,
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(RuntimeError::StoreIo {
+                operation: "read retained Session identity",
+                path: session_path,
+                source,
+            });
+        }
+    };
+    let metadata_path = worker_dir.join("metadata.json");
+    let active = match fs::read(&metadata_path) {
+        Ok(bytes) => {
+            let metadata: session_store::WorkerMetadata =
+                serde_json::from_slice(&bytes).map_err(|_| {
+                    RuntimeError::InvalidRequest("Retained Worker metadata is invalid".into())
+                })?;
+            metadata.active.map(|active| active.session_id)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(RuntimeError::StoreIo {
+                operation: "read retained Session pointer",
+                path: metadata_path,
+                source,
+            });
+        }
+    };
+    if let (Some(saved), Some(active)) = (saved, active) {
+        if saved != active {
+            return Err(RuntimeError::InvalidRequest(
+                "Retained Session manifest and active pointer disagree".into(),
+            ));
+        }
+    }
+    if saved.is_none() && active.is_none() {
+        let session_dir = worker_dir.join("session");
+        if session_dir.is_dir()
+            && !collect_files(&session_dir, "inspect uninitialized Session")?.is_empty()
+        {
+            return Err(RuntimeError::InvalidRequest(
+                "Session material has no retained identity".into(),
+            ));
+        }
+    }
+    Ok(saved.or(active))
+}
+
+/// Called only while the common Session deletion lock is held. Include staged
+/// archives from interrupted transfers: erasure must not leave a second original.
+pub(crate) fn remove_archived_session_copies(
+    runtime_root: &Path,
+    session: session_store::SessionId,
+) -> Result<(), session_store::StoreError> {
+    let archives = runtime_root.join("archives/workers");
+    let entries = match fs::read_dir(archives) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let session_root = entry.path().join("session");
+        let owner = match fs::read(entry.path().join("manifest.json")) {
+            Ok(bytes) => Some(serde_json::from_slice::<WorkerSessionArchiveManifest>(
+                &bytes,
+            )?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(owner) = owner {
+            if owner.source_session_id == session.to_string() {
+                erase_archived_diagnostics(runtime_root, &owner)?;
+                match fs::remove_dir_all(&session_root) {
+                    Ok(()) => (),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            continue;
+        }
+        let bytes = match fs::read(session_root.join("session.json")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let manifest: CanonicalSessionManifest = serde_json::from_slice(&bytes)?;
+        if manifest.session_id == session.to_string() {
+            fs::remove_dir_all(&session_root)?;
+        }
+    }
+    Ok(())
+}
+
+/// Erasure includes diagnostic originals of the same archived removal operation.
+/// The immutable removal receipt is historical evidence and is never rewritten.
+/// Staging names are bound to that exact operation; unrelated archives are untouched.
+fn erase_archived_diagnostics(
+    runtime_root: &Path,
+    archive: &WorkerSessionArchiveManifest,
+) -> Result<(), session_store::StoreError> {
+    let invalid = || {
+        session_store::StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Archived diagnostics erasure identity mismatch",
+        ))
+    };
+    if archive.schema_version != ARCHIVE_SCHEMA_VERSION {
+        return Err(invalid());
+    }
+    validate_id("operation_id", &archive.operation_id).map_err(|_| invalid())?;
+    let receipt_path = runtime_root
+        .join("retention/operations")
+        .join(format!("{}.json", archive.operation_id));
+    if let Some(receipt) = read_operation_receipt(&receipt_path).map_err(|_| invalid())? {
+        if receipt.request.workspace_id != archive.workspace_id
+            || receipt.request.source_runtime_id != archive.source_runtime_id
+            || receipt.request.worker_id != archive.source_worker_id
+            || receipt.request.operation_id != archive.operation_id
+            || receipt.request.input_fingerprint != archive.input_fingerprint
+            || receipt.request.archive_id.as_ref() != Some(&archive.archive_id)
+            || receipt.result.archive.as_ref() != Some(archive)
+        {
+            return Err(invalid());
+        }
+    }
+    let parent = runtime_root.join("archives/diagnostics");
+    let entries = match fs::read_dir(&parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let staging_prefix = format!(".{}.tmp-", archive.operation_id);
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let staged = name.strip_prefix(&staging_prefix).is_some_and(|suffix| {
+            suffix.split_once('-').is_some_and(|(pid, sequence)| {
+                !pid.is_empty()
+                    && !sequence.is_empty()
+                    && pid.bytes().all(|b| b.is_ascii_digit())
+                    && sequence.bytes().all(|b| b.is_ascii_digit())
+            })
+        });
+        if name != archive.operation_id && !staged {
+            continue;
+        }
+        if !entry.file_type()?.is_dir() {
+            return Err(invalid());
+        }
+        let manifest = match fs::read(entry.path().join("manifest.json")) {
+            Ok(bytes) => Some(serde_json::from_slice::<DiagnosticsArchiveManifest>(
+                &bytes,
+            )?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && staged => None,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(manifest) = manifest {
+            if manifest.schema_version != ARCHIVE_SCHEMA_VERSION
+                || manifest.workspace_id != archive.workspace_id
+                || manifest.source_runtime_id != archive.source_runtime_id
+                || manifest.source_worker_id != archive.source_worker_id
+                || manifest.operation_id != archive.operation_id
+                || manifest.input_fingerprint != archive.input_fingerprint
+            {
+                return Err(invalid());
+            }
+        }
+        fs::remove_dir_all(entry.path())?;
+    }
+    sync_directory(&parent, "erase archived Worker diagnostics").map_err(|_| invalid())?;
+    Ok(())
+}
+
+pub(crate) fn retention_error(error: session_store::StoreError) -> RuntimeError {
+    RuntimeError::InvalidRequest(format!("Session retention rejected operation: {error}"))
+}
+
+/// Direct Worker deletion cannot bypass pins. Purge policy is not erase intent.
+pub(crate) fn delete_worker_aggregate(
+    runtime_root: &Path,
+    worker_dir: &Path,
+    intent: session_store::retention::SessionDeletionIntent,
+) -> Result<(), RuntimeError> {
+    let session = aggregate_session_id(worker_dir)?;
+    let retention = runtime_session_retention(runtime_root);
+    // Ordinary policy never creates erase authority. A pre-existing permanent
+    // tombstone is an irrevocable decision whose physical cleanup may be resumed.
+    let intent = match session
+        .map(|session| retention.ensure_live(session))
+        .transpose()
+    {
+        Err(session_store::StoreError::SessionErased(_)) => {
+            session_store::retention::SessionDeletionIntent::ErasePermanently
+        }
+        Err(error) => return Err(retention_error(error)),
+        Ok(_) => intent,
+    };
+    let remove = || -> Result<(), session_store::StoreError> {
+        if intent == session_store::retention::SessionDeletionIntent::ErasePermanently {
+            if let Some(session) = session {
+                remove_archived_session_copies(runtime_root, session)?;
+            }
+        }
+        match fs::remove_dir_all(worker_dir) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    };
+    if let Some(session) = session {
+        runtime_session_retention(runtime_root)
+            .delete(session, intent, remove)
+            .map_err(retention_error)
+    } else {
+        remove().map_err(retention_error)
+    }
 }
 
 /// Filesystem provider for the canonical Runtime Worker aggregate.
@@ -356,6 +638,16 @@ impl FsWorkerRetentionProvider {
         &self,
         archive_id: &str,
     ) -> Result<(WorkerSessionArchiveManifest, PathBuf), RuntimeError> {
+        let (manifest, session_root) = self.session_archive_identity(archive_id)?;
+        let archive_dir = self.archive_dir(archive_id)?;
+        let manifest = validate_existing_archive(&archive_dir, &manifest)?;
+        Ok((manifest, session_root))
+    }
+
+    pub(crate) fn session_archive_identity(
+        &self,
+        archive_id: &str,
+    ) -> Result<(WorkerSessionArchiveManifest, PathBuf), RuntimeError> {
         let archive_dir = self.archive_dir(archive_id)?;
         let manifest: WorkerSessionArchiveManifest = read_json(
             &archive_dir.join("manifest.json"),
@@ -368,7 +660,6 @@ impl FsWorkerRetentionProvider {
                 message: "archive manifest identity mismatch".to_string(),
             });
         }
-        let manifest = validate_existing_archive(&archive_dir, &manifest)?;
         Ok((manifest, archive_dir.join("session")))
     }
 
@@ -401,33 +692,36 @@ impl WorkerRetentionProvider for FsWorkerRetentionProvider {
             return Err(RuntimeError::WorkerNotFound { worker_id });
         }
         let session_dir = worker_dir.join("session");
-        let (session_id, segment_ids, session_bytes) = if session_dir.is_dir() {
-            let manifest: CanonicalSessionManifest = read_json(
-                &session_dir.join("session.json"),
-                "inventory Worker retention",
-            )?;
-            let files = collect_files(&session_dir, "inventory Worker retention")?;
-            let mut segment_ids = BTreeSet::new();
-            let mut bytes = 0_u64;
-            for (relative, path) in files {
-                bytes = bytes.saturating_add(file_len(&path, "inventory Worker retention")?);
-                if let Some(name) = relative.file_name().and_then(|value| value.to_str()) {
-                    let segment = name
-                        .strip_suffix(".trace.jsonl")
-                        .or_else(|| name.strip_suffix(".jsonl"));
-                    if let Some(segment) = segment {
-                        segment_ids.insert(segment.to_string());
+        let (session_id, segment_ids, session_bytes) =
+            if unmaterialized_session(&worker_dir, workspace_id)?.is_some() {
+                (None, Vec::new(), 0)
+            } else if session_dir.is_dir() {
+                let manifest: CanonicalSessionManifest = read_json(
+                    &session_dir.join("session.json"),
+                    "inventory Worker retention",
+                )?;
+                let files = collect_files(&session_dir, "inventory Worker retention")?;
+                let mut segment_ids = BTreeSet::new();
+                let mut bytes = 0_u64;
+                for (relative, path) in files {
+                    bytes = bytes.saturating_add(file_len(&path, "inventory Worker retention")?);
+                    if let Some(name) = relative.file_name().and_then(|value| value.to_str()) {
+                        let segment = name
+                            .strip_suffix(".trace.jsonl")
+                            .or_else(|| name.strip_suffix(".jsonl"));
+                        if let Some(segment) = segment {
+                            segment_ids.insert(segment.to_string());
+                        }
                     }
                 }
-            }
-            (
-                Some(manifest.session_id),
-                segment_ids.into_iter().collect(),
-                bytes,
-            )
-        } else {
-            (None, Vec::new(), 0)
-        };
+                (
+                    Some(manifest.session_id),
+                    segment_ids.into_iter().collect(),
+                    bytes,
+                )
+            } else {
+                (None, Vec::new(), 0)
+            };
         let diagnostics_bytes = diagnostics_files(&worker_dir, "inventory Worker retention")?
             .into_iter()
             .try_fold(0_u64, |total, path| {
@@ -503,12 +797,46 @@ impl WorkerRetentionProvider for FsWorkerRetentionProvider {
                 worker_id: request.worker_id,
             });
         }
+        // Transfer keeps the same Session pin/fence namespace. Hold its lock
+        // across verified archive publication and aggregate removal. A policy
+        // purge instead uses ordinary deletion and must reject outstanding pins.
+        let retention = runtime_session_retention(&self.runtime_root);
+        let transfer_guard = if request.session_disposition == SessionDisposition::Archive {
+            aggregate_session_id(&worker_dir)?
+                .map(|session| retention.lock_live(session))
+                .transpose()
+                .map_err(retention_error)?
+        } else {
+            None
+        };
         let archive = match request.session_disposition {
             SessionDisposition::Archive => {
                 Some(commit_session_archive(self, request, &worker_dir)?)
             }
             SessionDisposition::Purge => None,
         };
+        if let Some(manifest) = &archive {
+            if let Some(active_segment) = manifest.source_active_segment_id {
+                // We already hold the Session transfer lock. Do not reacquire it
+                // through the external-retention constructor during verification.
+                let reader =
+                    session_store::public_material::SessionPublicMaterialReader::open_worker(
+                        &self.archive_dir(&manifest.archive_id)?.join("session"),
+                        active_segment,
+                        Default::default(),
+                    )
+                    .map_err(|error| {
+                        RuntimeError::InvalidRequest(format!(
+                            "Archived canonical source is unreadable: {error}"
+                        ))
+                    })?;
+                if reader.session_id().to_string() != manifest.source_session_id {
+                    return Err(RuntimeError::InvalidRequest(
+                        "Archived canonical source identity mismatch".into(),
+                    ));
+                }
+            }
+        }
         let diagnostics_retained = match request.diagnostics_disposition {
             DiagnosticsDisposition::Purge => false,
             DiagnosticsDisposition::Retain => {
@@ -540,11 +868,23 @@ impl WorkerRetentionProvider for FsWorkerRetentionProvider {
             "commit pending Worker retention receipt",
         )?;
 
-        fs::remove_dir_all(&worker_dir).map_err(|source| RuntimeError::StoreIo {
-            operation: "remove retained Worker aggregate",
-            path: worker_dir.clone(),
-            source,
-        })?;
+        match request.session_disposition {
+            SessionDisposition::Archive => {
+                // commit_session_archive already compared all original bytes.
+                // The transfer lock remains held until removal has completed.
+                fs::remove_dir_all(&worker_dir).map_err(|source| RuntimeError::StoreIo {
+                    operation: "remove retained Worker aggregate",
+                    path: worker_dir.clone(),
+                    source,
+                })?;
+            }
+            SessionDisposition::Purge => delete_worker_aggregate(
+                &self.runtime_root,
+                &worker_dir,
+                session_store::retention::SessionDeletionIntent::Ordinary,
+            )?,
+        }
+        drop(transfer_guard);
         sync_directory(
             worker_dir.parent().unwrap_or(&self.runtime_root),
             "remove retained Worker aggregate",
@@ -703,14 +1043,14 @@ fn commit_session_archive(
         RuntimeError::InvalidRequest("archive disposition requires archive_id".to_string())
     })?;
     let session_dir = worker_dir.join("session");
-    if !session_dir.is_dir() {
-        return Err(RuntimeError::StoreMissing {
-            operation: "archive Worker Session",
-            path: session_dir,
-        });
-    }
-    let session: CanonicalSessionManifest =
-        read_json(&session_dir.join("session.json"), "archive Worker Session")?;
+    let pending = unmaterialized_session(worker_dir, &request.workspace_id)?;
+    let session: CanonicalSessionManifest = if let Some(session) = pending {
+        CanonicalSessionManifest {
+            session_id: session.to_string(),
+        }
+    } else {
+        read_json(&session_dir.join("session.json"), "archive Worker Session")?
+    };
     let source_files = collect_files(&session_dir, "archive Worker Session")?;
     let (checksum, bytes, count) = checksum_files(&source_files, "archive Worker Session")?;
     let mut segment_ids = BTreeSet::new();
@@ -730,6 +1070,25 @@ fn commit_session_archive(
         workspace_id: request.workspace_id.clone(),
         source_runtime_id: request.source_runtime_id.clone(),
         source_worker_id: request.worker_id,
+        source_active_segment_id: if worker_dir.join("metadata.json").is_file() {
+            let metadata: session_store::WorkerMetadata = read_json(
+                &worker_dir.join("metadata.json"),
+                "archive active Session pointer",
+            )?;
+            let active = metadata.active.ok_or_else(|| {
+                RuntimeError::InvalidRequest("Worker has no active Session pointer".into())
+            })?;
+            if active.session_id.to_string() != session.session_id
+                || metadata.workspace_id.as_deref() != Some(&request.workspace_id)
+            {
+                return Err(RuntimeError::InvalidRequest(
+                    "Archive Session pointer scope mismatch".into(),
+                ));
+            }
+            active.segment_id
+        } else {
+            None
+        },
         source_session_id: session.session_id,
         segment_ids: segment_ids.into_iter().collect(),
         source_created_at: request.source_created_at.clone(),
@@ -770,6 +1129,13 @@ fn commit_session_archive(
             path: staging.clone(),
             source,
         })?;
+        // Persist source ownership before copying any original bytes. An
+        // interrupted staging tree remains attributable to explicit erasure.
+        atomic_write_json(
+            &staging.join("manifest.json"),
+            &manifest,
+            "archive Worker Session",
+        )?;
         let target_session = staging.join("session");
         fs::create_dir(&target_session).map_err(|source| RuntimeError::StoreIo {
             operation: "archive Worker Session",
@@ -777,11 +1143,6 @@ fn commit_session_archive(
             source,
         })?;
         copy_files(&source_files, &target_session, "archive Worker Session")?;
-        atomic_write_json(
-            &staging.join("manifest.json"),
-            &manifest,
-            "archive Worker Session",
-        )?;
         sync_tree(&staging, "archive Worker Session")?;
         fs::rename(&staging, &archive_dir).map_err(|source| RuntimeError::StoreIo {
             operation: "archive Worker Session",
@@ -1264,7 +1625,7 @@ mod tests {
         );
         write_json(
             &worker.join("session/session.json"),
-            &serde_json::json!({"schema_version": 1, "session_id": "session-a"}),
+            &serde_json::json!({"schema_version": 1, "session_id": "00000000-0000-4000-8000-000000000001"}),
         );
         fs::create_dir_all(worker.join("session/segments")).unwrap();
         fs::write(worker.join("session/segments/segment-a.jsonl"), b"one\n").unwrap();
@@ -1310,7 +1671,10 @@ mod tests {
         let first = provider.execute(&request).unwrap();
         assert!(first.source_removed);
         let archive = first.archive.as_ref().unwrap();
-        assert_eq!(archive.source_session_id, "session-a");
+        assert_eq!(
+            archive.source_session_id,
+            "00000000-0000-4000-8000-000000000001"
+        );
         assert_eq!(archive.segment_ids, vec!["segment-a"]);
         assert!(!temp.path().join(format!("workers/{worker_id}")).exists());
         assert!(

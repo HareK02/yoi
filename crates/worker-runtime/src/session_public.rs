@@ -364,6 +364,7 @@ fn api_archive_manifest(manifest: &DomainArchiveManifest) -> WorkerSessionArchiv
         source_runtime_id: manifest.source_runtime_id.clone(),
         source_worker_id: manifest.source_worker_id,
         source_session_id: manifest.source_session_id.clone(),
+        source_active_segment_id: manifest.source_active_segment_id.map(|id| id.to_string()),
         segment_ids: manifest.segment_ids.clone(),
         source_created_at: manifest.source_created_at.clone(),
         removed_at: manifest.removed_at.clone(),

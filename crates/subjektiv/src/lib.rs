@@ -608,6 +608,11 @@ static MIGRATIONS: &[FeatureMigration] = &[
         "add durable journal operations and processing ranges",
         journal::migrate,
     ),
+    FeatureMigration::new(
+        9,
+        "fence erased journal Sessions and permit explicit content erasure",
+        journal::migrate_lifecycle,
+    ),
 ];
 
 pub const REGISTRATION: FeatureRegistration =

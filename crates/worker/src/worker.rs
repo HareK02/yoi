@@ -7781,12 +7781,12 @@ where
 
         if self
             .backend_job()
-            .is_some_and(|binding| binding.subjektiv_consolidation)
+            .is_some_and(crate::BackendJobExecutionBinding::has_subjektiv_job_grant)
         {
             if metadata.subjektiv_session_attribution.is_some() {
                 return Err(WorkerError::SubjektivSessionAttribution {
                     state: "job_attribution_forbidden",
-                    message: "consolidation Job execution must not carry subject-body Session attribution".into(),
+                    message: "Subject maintenance Job execution must not carry subject-body Session attribution".into(),
                 });
             }
             return Ok(());
@@ -7815,7 +7815,10 @@ where
                     });
                 }
                 match state {
-                    SubjektivSessionAttributionState::Confirmed { .. } => return Ok(()),
+                    SubjektivSessionAttributionState::Confirmed { subject_id, .. } => {
+                        return self
+                            .retain_journal_source_before_publication(session_id, subject_id);
+                    }
                     SubjektivSessionAttributionState::OutcomeUnknown { .. }
                     | SubjektivSessionAttributionState::Failed { .. } => true,
                     SubjektivSessionAttributionState::LegacyUnknown { .. } => false,
@@ -7970,8 +7973,44 @@ where
         }
         self.persist_subjektiv_session_attribution(SubjektivSessionAttributionState::Confirmed {
             session_id,
-            subject_id: output.subject_id,
-        })
+            subject_id: output.subject_id.clone(),
+        })?;
+        self.retain_journal_source_before_publication(session_id, &output.subject_id)
+    }
+
+    fn retain_journal_source_before_publication(
+        &self,
+        session_id: SessionId,
+        subject_id: &str,
+    ) -> Result<(), WorkerError> {
+        let Some(connection) = self.subjektiv_host_connection().map_err(|error| {
+            WorkerError::SubjektivSessionAttribution {
+                state: "retention_unconfirmed",
+                message: error.to_string(),
+            }
+        })?
+        else {
+            return Ok(());
+        };
+        if !connection.host.journal_recording_granted() {
+            return Ok(());
+        }
+        let pin = session_store::retention::SessionRetentionPin(
+            match self.workspace_client().workspace_id() {
+                Some(workspace) => subjektiv::journal::source_retention_pin(
+                    workspace,
+                    subject_id,
+                    &session_id.to_string(),
+                ),
+                None => session_id,
+            },
+        );
+        // Confirmation can be replayed after response loss. Persist this intent before
+        // exposing the Worker to input, not after the first RunCommitted notification.
+        // It does not claim that an original Session has materialized yet.
+        self.store
+            .retain_session_before_publication(session_id, pin)?;
+        Ok(())
     }
 
     fn persist_subjektiv_session_attribution(
@@ -11111,7 +11150,8 @@ mod build_summary_prompt_tests {
                     job_id: "job-1".into(),
                     attempt_id: "attempt-1".into(),
                     input_digest: None,
-                    subjektiv_consolidation: false
+                    subjektiv_consolidation: false,
+                    subjektiv_journal: false,
                 })
                 .is_err()
         );
@@ -11119,35 +11159,114 @@ mod build_summary_prompt_tests {
     }
 
     #[tokio::test]
-    async fn consolidation_job_binding_is_immutable_and_has_no_subject_body_attribution() {
-        let client = Arc::new(AttributionLifecycleClient::new([]));
-        let (mut worker, store, _temp) = attribution_lifecycle_worker(client.clone()).await;
-        let binding = crate::BackendJobExecutionBinding {
-            job_id: "job-1".into(),
-            attempt_id: "attempt-1".into(),
-            input_digest: Some("input-content-digest".into()),
-            subjektiv_consolidation: true,
-        };
-        worker.bind_backend_job(binding.clone()).unwrap();
-        assert_eq!(worker.backend_job(), Some(&binding));
-        assert!(worker.bind_backend_job(binding).is_err());
-        for lifecycle in [
-            SubjektivSessionAttributionLifecycle::NewSession,
-            SubjektivSessionAttributionLifecycle::RestoredSession,
-        ] {
+    async fn journal_attribution_protects_first_publication_before_any_admission_notification() {
+        for enabled in [false, true] {
+            let client = Arc::new(AttributionLifecycleClient::new([]));
+            let (mut worker, store, _temp) = attribution_lifecycle_worker(client.clone()).await;
+            if enabled {
+                worker.manifest.feature.subjektiv.profile.enabled = true;
+                worker
+                    .manifest
+                    .feature
+                    .subjektiv
+                    .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                        workspace_id: "workspace-test".into(),
+                        language: "English".into(),
+                    })
+                    .unwrap();
+            }
+            let session = worker.session_id();
+            assert!(store.session_store.list_sessions().unwrap().is_empty());
             worker
-                .finalize_subjektiv_session_attribution(true, lifecycle)
+                .finalize_subjektiv_session_attribution(
+                    true,
+                    SubjektivSessionAttributionLifecycle::NewSession,
+                )
                 .unwrap();
-        }
-        assert!(client.requests.lock().unwrap().is_empty());
-        assert!(
+            let pin = session_store::retention::SessionRetentionPin(
+                subjektiv::journal::source_retention_pin(
+                    "workspace-test",
+                    "subject-test",
+                    &session.to_string(),
+                ),
+            );
+            let expected = if enabled { vec![pin] } else { vec![] };
+            assert_eq!(
+                store.session_store.retention().pins(session).unwrap(),
+                expected
+            );
+            // Reopen/replayed confirmation does not depend on a notification or add an owner.
+            worker
+                .finalize_subjektiv_session_attribution(
+                    true,
+                    SubjektivSessionAttributionLifecycle::RestoredSession,
+                )
+                .unwrap();
+            assert_eq!(client.requests.lock().unwrap().len(), 1);
+            assert_eq!(
+                store.session_store.retention().pins(session).unwrap(),
+                expected
+            );
+            worker.materialize_durable_session_head().await.unwrap();
+            let segment = worker.segment_id();
             store
-                .read_by_name(&worker.manifest().worker.name)
-                .unwrap()
-                .unwrap()
-                .subjektiv_session_attribution
-                .is_none()
-        );
+                .append(
+                    session,
+                    segment,
+                    &LogEntry::TurnEnd {
+                        ts: 1,
+                        turn_count: 1,
+                    },
+                )
+                .unwrap();
+            // Simulate stop after the public commit but before RunCommitted/Host admission.
+            if enabled {
+                assert!(
+                    matches!(store.session_store.delete_session(session), Err(StoreError::SessionPinned(id)) if id == session)
+                );
+                assert!(store.session_store.exists(session, segment).unwrap());
+                store
+                    .session_store
+                    .release_session_pin(session, pin)
+                    .unwrap();
+            }
+            assert!(store.session_store.delete_session(session).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn subject_maintenance_job_binding_is_immutable_and_has_no_subject_body_attribution() {
+        for (subjektiv_consolidation, subjektiv_journal) in [(true, false), (false, true)] {
+            let client = Arc::new(AttributionLifecycleClient::new([]));
+            let (mut worker, store, _temp) = attribution_lifecycle_worker(client.clone()).await;
+            let binding = crate::BackendJobExecutionBinding {
+                job_id: "job-1".into(),
+                attempt_id: "attempt-1".into(),
+                input_digest: Some("input-content-digest".into()),
+                subjektiv_consolidation,
+                subjektiv_journal,
+            };
+            worker.bind_backend_job(binding.clone()).unwrap();
+            assert_eq!(worker.backend_job(), Some(&binding));
+            assert!(worker.bind_backend_job(binding).is_err());
+            for lifecycle in [
+                SubjektivSessionAttributionLifecycle::NewSession,
+                SubjektivSessionAttributionLifecycle::RestoredSession,
+            ] {
+                worker
+                    .finalize_subjektiv_session_attribution(true, lifecycle)
+                    .unwrap();
+            }
+            assert!(client.requests.lock().unwrap().is_empty());
+            assert!(
+                store
+                    .read_by_name(&worker.manifest().worker.name)
+                    .unwrap()
+                    .unwrap()
+                    .subjektiv_session_attribution
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]

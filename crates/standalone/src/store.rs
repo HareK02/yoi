@@ -119,6 +119,16 @@ pub enum StaleLeasePolicy {
     Recover,
 }
 
+/// Source control outlives Worker relocation and physical Session pruning. Always derive this
+/// from the Host state root, never from an individual live or retained Worker directory.
+pub(crate) fn session_retention(
+    state_root: &Path,
+) -> session_store::retention::SessionRetentionStore {
+    session_store::retention::SessionRetentionStore::new(
+        state_root.join("retention/session-sources"),
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct StandaloneWorkerStore {
     root: PathBuf,
@@ -359,7 +369,19 @@ impl StandaloneWorkerStore {
     }
 
     pub fn delete(&self, id: WorkerId) -> Result<(), StandaloneStoreError> {
-        let record = self.load(id)?;
+        let record = match self.load(id) {
+            Err(StandaloneStoreError::WorkerNotFound(_)) => {
+                let retained_root = self.root.join("subjektiv").join("retained-workers");
+                let retained =
+                    Self::open_existing(retained_root).and_then(|store| store.load(id))?;
+                if retained.status == StandaloneWorkerStatus::Stopped && retained.subject.is_some()
+                {
+                    return Ok(());
+                }
+                return Err(StandaloneStoreError::InvalidRecord(id));
+            }
+            result => result?,
+        };
         if record.status != StandaloneWorkerStatus::Stopped {
             return Err(StandaloneStoreError::DeleteActive(id));
         }
@@ -374,7 +396,14 @@ impl StandaloneWorkerStore {
                 LeaseLiveness::Unknown => StandaloneStoreError::LeaseLivenessUnknown(id),
             });
         }
-        fs::remove_dir_all(self.worker_dir(id)).map_err(StandaloneStoreError::Io)?;
+        if let Some(retained) = crate::subjektiv::prepare_worker_deletion(&self.root, &record)? {
+            // Atomic relocation preserves the original Session, not a permanent duplicate.
+            // The Subject's durable consumer can read it after logical Worker removal.
+            fs::rename(self.worker_dir(id), &retained).map_err(StandaloneStoreError::Io)?;
+            sync_directory(retained.parent().expect("retained Worker parent"))?;
+        } else {
+            fs::remove_dir_all(self.worker_dir(id)).map_err(StandaloneStoreError::Io)?;
+        }
         sync_directory(&self.root)
     }
 
@@ -793,6 +822,8 @@ pub enum StandaloneStoreError {
     LeaseOwnershipLost,
     #[error("standalone Worker {0} must be stopped before deletion")]
     DeleteActive(WorkerId),
+    #[error("Journal deletion handoff/retention is unconfirmed: {0}")]
+    JournalRetention(String),
     #[error("standalone Worker {0} metadata changed since it was read")]
     MetadataChanged(WorkerId),
     #[error("system clock is before the Unix epoch or out of range")]

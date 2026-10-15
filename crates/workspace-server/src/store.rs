@@ -666,6 +666,30 @@ pub struct UserRecord {
     pub updated_at: String,
 }
 
+/// Enrollment authority persisted with the WebAuthn verifier, never supplied by a client.
+/// New-account identities are only allocations until verified completion commits them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "purpose", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PasskeyRegistrationTarget {
+    NewAccount {
+        user: UserRecord,
+    },
+    Addition {
+        user: UserRecord,
+        authentication: PasskeyAuthenticationBinding,
+    },
+}
+
+/// Hash of the exact transport credential that authorized an addition. A second
+/// session for the same user cannot complete its ceremony; revocation is checked
+/// again in the credential insertion transaction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "method", content = "token_hash", rename_all = "snake_case")]
+pub enum PasskeyAuthenticationBinding {
+    BrowserSession(String),
+    ApiToken(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PasskeyCredentialRecord {
     pub credential_id: String,
@@ -1432,6 +1456,40 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
             "Worker retention authority is unavailable".to_string(),
         ))
     }
+    fn supersede_erased_worker_removal(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        proof: &crate::retention::RuntimeJournalErasureAck,
+        inventory: &worker_runtime::retention::WorkerRetentionInventory,
+    ) -> std::result::Result<(), crate::retention::WorkerRetentionError> {
+        let _ = (prepared, proof, inventory);
+        Err(crate::retention::WorkerRetentionError::Invalid(
+            "Erased removal reconciliation authority is unavailable".into(),
+        ))
+    }
+    fn audit_erased_worker_removal_receipt(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        proof: &crate::retention::RuntimeJournalErasureAck,
+        result: &worker_runtime::retention::WorkerRetentionExecutionResult,
+    ) -> std::result::Result<(), crate::retention::WorkerRetentionError> {
+        let _ = (prepared, proof, result);
+        Err(crate::retention::WorkerRetentionError::Invalid(
+            "Erased removal reconciliation authority is unavailable".into(),
+        ))
+    }
+    fn commit_erased_worker_removal(
+        &self,
+        workspace_id: &str,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        result: &worker_runtime::retention::WorkerRetentionExecutionResult,
+        proof: &crate::retention::RuntimeJournalErasureAck,
+    ) -> std::result::Result<WorkerRemovalCommit, crate::retention::WorkerRetentionError> {
+        let _ = (workspace_id, prepared, result, proof);
+        Err(crate::retention::WorkerRetentionError::Invalid(
+            "Erased removal reconciliation authority is unavailable".into(),
+        ))
+    }
     fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>>;
     fn upsert_repository(&self, record: &RepositoryRecord) -> Result<()>;
     fn insert_repository(&self, record: &RepositoryRecord) -> Result<RepositoryInsertOutcome>;
@@ -1557,6 +1615,13 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     fn get_user(&self, user_id: &str) -> Result<Option<UserRecord>>;
     fn get_user_by_handle(&self, handle: &str) -> Result<Option<UserRecord>>;
     fn any_user(&self) -> Result<Option<UserRecord>>;
+    /// Atomically creates a new account/user/credential, or inserts a credential
+    /// for a still-authenticated existing target. Never overwrites a credential.
+    fn register_verified_passkey(
+        &self,
+        target: &PasskeyRegistrationTarget,
+        credential: &PasskeyCredentialRecord,
+    ) -> Result<()>;
     fn upsert_passkey_credential(&self, record: &PasskeyCredentialRecord) -> Result<()>;
     fn get_passkey_credential(
         &self,
@@ -1684,6 +1749,29 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         submission: &BackendJobResultSubmission,
         now: &str,
     ) -> Result<BackendJobResultAcceptance>;
+    /// Host-only reconciliation of a saved domain completion, never model claims.
+    /// None requires completed canonical cleanup, not Worker liveness inference.
+    fn reconcile_backend_journal_attempt(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        completion: Option<&BackendJobResultSubmission>,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord>;
+    /// Bounded keyset over current Journal Unknown attempts, independent of source liveness.
+    fn list_backend_journal_unknown_attempts(
+        &self,
+        workspace_id: &str,
+        after_job_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<BackendJobAttemptRecord>>;
+    fn list_backend_journal_jobs(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<BackendJobRecord>>;
     fn finish_backend_job_attempt(
         &self,
         workspace_id: &str,
@@ -5389,6 +5477,37 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         )
     }
 
+    fn supersede_erased_worker_removal(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        proof: &crate::retention::RuntimeJournalErasureAck,
+        inventory: &worker_runtime::retention::WorkerRetentionInventory,
+    ) -> std::result::Result<(), crate::retention::WorkerRetentionError> {
+        SqliteWorkspaceStore::supersede_erased_worker_removal(self, prepared, proof, inventory)
+    }
+    fn audit_erased_worker_removal_receipt(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        proof: &crate::retention::RuntimeJournalErasureAck,
+        result: &worker_runtime::retention::WorkerRetentionExecutionResult,
+    ) -> std::result::Result<(), crate::retention::WorkerRetentionError> {
+        SqliteWorkspaceStore::audit_erased_worker_removal_receipt(self, prepared, proof, result)
+    }
+    fn commit_erased_worker_removal(
+        &self,
+        workspace_id: &str,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        result: &worker_runtime::retention::WorkerRetentionExecutionResult,
+        proof: &crate::retention::RuntimeJournalErasureAck,
+    ) -> std::result::Result<WorkerRemovalCommit, crate::retention::WorkerRetentionError> {
+        SqliteWorkspaceStore::commit_erased_worker_removal(
+            self,
+            workspace_id,
+            prepared,
+            result,
+            proof,
+        )
+    }
     fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -6328,6 +6447,66 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn register_verified_passkey(
+        &self,
+        target: &PasskeyRegistrationTarget,
+        credential: &PasskeyCredentialRecord,
+    ) -> Result<()> {
+        self.with_immediate_transaction(|tx| {
+            let user = match target {
+                PasskeyRegistrationTarget::NewAccount { user } => {
+                    let occupied: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM accounts WHERE kind = 'user' AND handle = ?1) OR EXISTS(SELECT 1 FROM users WHERE handle = ?1)",
+                        params![user.handle], |row| row.get(0),
+                    )?;
+                    if occupied {
+                        return Err(crate::auth::auth_error("auth_handle_exists", "handle is already registered"));
+                    }
+                    tx.execute(
+                        "INSERT INTO accounts (account_id, kind, handle, display_name, created_at, updated_at) VALUES (?1, 'user', ?2, ?3, ?4, ?5)",
+                        params![user.account_id, user.handle, user.display_name, user.created_at, user.updated_at],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO users (user_id, account_id, handle, display_name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![user.user_id, user.account_id, user.handle, user.display_name, user.created_at, user.updated_at],
+                    )?;
+                    user
+                }
+                PasskeyRegistrationTarget::Addition { user, authentication } => {
+                    let current = tx.query_row(
+                        user_select_sql("WHERE user_id = ?1 AND account_id = ?2").as_str(),
+                        params![user.user_id, user.account_id], read_user_record,
+                    ).optional()?;
+                    if current.is_none() {
+                        return Err(crate::auth::auth_error("passkey_target_mismatch", "addition target no longer exists"));
+                    }
+                    let expires_at: Option<Option<String>> = match authentication {
+                        PasskeyAuthenticationBinding::BrowserSession(hash) => tx.query_row(
+                            "SELECT expires_at FROM browser_sessions WHERE token_hash = ?1 AND user_id = ?2 AND revoked_at IS NULL",
+                            params![hash, user.user_id], |row| row.get(0),
+                        ).optional()?,
+                        PasskeyAuthenticationBinding::ApiToken(hash) => tx.query_row(
+                            "SELECT expires_at FROM api_tokens WHERE token_hash = ?1 AND user_id = ?2 AND revoked_at IS NULL",
+                            params![hash, user.user_id], |row| row.get(0),
+                        ).optional()?,
+                    };
+                    if !expires_at.is_some_and(|expiry| expiry.as_deref().is_none_or(|value| !crate::auth::is_expired(value))) {
+                        return Err(crate::auth::auth_error("auth_required", "addition credential has expired or been revoked"));
+                    }
+                    user
+                }
+            };
+            if user.user_id != credential.user_id {
+                return Err(crate::auth::auth_error("passkey_target_mismatch", "credential does not match enrollment target"));
+            }
+            tx.execute(
+                "INSERT INTO passkey_credentials (credential_id, user_id, public_key_cose, transports_json, sign_count, created_at, last_used_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![credential.credential_id, credential.user_id, credential.public_key_cose, credential.transports_json, credential.sign_count, credential.created_at, credential.last_used_at],
+            )?;
+            Ok(())
+        })
+    }
+
     fn upsert_passkey_credential(&self, record: &PasskeyCredentialRecord) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
@@ -6417,7 +6596,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         ceremony: &str,
         consumed_at: &str,
     ) -> Result<Option<AuthChallengeRecord>> {
-        self.with_conn(|conn| {
+        self.with_immediate_transaction(|conn| {
             let record = conn
                 .query_row(
                     auth_challenge_select_sql(
@@ -7028,6 +7207,82 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             notification_routing::jobs::capture(&tx,workspace_id,&submission.job_id,&submission.attempt_id)?;
             tx.commit()?;
             Ok(BackendJobResultAcceptance { job, attempt, replayed: false })
+        })
+    }
+
+    fn list_backend_journal_unknown_attempts(
+        &self,
+        workspace_id: &str,
+        after_job_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<BackendJobAttemptRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT a.job_id,a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j ON j.workspace_id=a.workspace_id AND j.job_id=a.job_id WHERE a.workspace_id=?1 AND a.state='unknown' AND j.state='unknown' AND a.attempt=j.current_attempt AND json_type(j.request_json,'$.grants.subjektiv_journal')='object' AND (?2 IS NULL OR a.job_id>?2) ORDER BY a.job_id LIMIT ?3")?;
+            let ids = stmt.query_map(params![workspace_id,after_job_id,limit.clamp(1,100) as i64], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            ids.into_iter().map(|(job,id)| read_backend_job_attempt(conn,workspace_id,&job,&id)?.ok_or_else(|| Error::Store("Journal Unknown attempt disappeared".into()))).collect()
+        })
+    }
+
+    fn list_backend_journal_jobs(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<BackendJobRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT job_id FROM backend_jobs WHERE workspace_id=?1 AND json_extract(request_json,'$.grants.subjektiv_journal.session_id')=?2 AND (?3 IS NULL OR job_id>?3) ORDER BY job_id LIMIT ?4")?;
+            let ids = stmt.query_map(params![workspace_id,session_id,after,limit.clamp(1,100) as i64], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            ids.iter().map(|id| read_backend_job(conn, workspace_id, id)?.ok_or_else(|| Error::Store("Journal Job disappeared".into()))).collect()
+        })
+    }
+
+    fn reconcile_backend_journal_attempt(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        completion: Option<&BackendJobResultSubmission>,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let job = read_backend_job(&tx, workspace_id, &expected.job_id)?.ok_or_else(|| Error::InvalidInput("Journal Job missing".into()))?;
+            let attempt = read_backend_job_attempt(&tx, workspace_id, &expected.job_id, &expected.attempt_id)?.ok_or_else(|| Error::InvalidInput("Journal attempt missing".into()))?;
+            // Full snapshot CAS includes Worker, tracked Run, input and cleanup evidence.
+            if &attempt != expected || job.current_attempt != attempt.attempt
+                || job.request.grants.subjektiv_journal.is_none()
+                || attempt.input_digest != job.request.input_digest()?
+                || !matches!(job.state, BackendJobState::Unknown | BackendJobState::Completed | BackendJobState::Failed) {
+                return Err(Error::InvalidInput("Journal reconciliation binding changed".into()));
+            }
+            if let Some(submission) = completion {
+                if submission.job_id != expected.job_id || submission.attempt_id != expected.attempt_id || submission.input_digest != expected.input_digest {
+                    return Err(Error::InvalidInput("Journal completion binding mismatch".into()));
+                }
+                let (digest, json) = result_digest(&submission.result, job.request.limits.max_result_bytes)?;
+                if attempt.state == BackendJobAttemptState::Completed && attempt.result_digest.as_deref() == Some(digest.as_str()) { tx.commit()?; return Ok(attempt); }
+                if attempt.state != BackendJobAttemptState::Unknown || job.state != BackendJobState::Unknown {
+                    return Err(Error::InvalidInput("Journal completion cannot replace definitive outcome".into()));
+                }
+                tx.execute("UPDATE backend_job_attempts SET state='completed',result_json=?4,result_digest=?5,failure_category=NULL,failure_detail=NULL,updated_at=?6,completed_at=?6 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3 AND state='unknown'",params![workspace_id,expected.job_id,expected.attempt_id,json,digest,now])?;
+                tx.execute("UPDATE backend_jobs SET state='completed',result_json=?3,result_digest=?4,failure_category=NULL,failure_detail=NULL,updated_at=?5,completed_at=?5 WHERE workspace_id=?1 AND job_id=?2 AND state='unknown'",params![workspace_id,expected.job_id,json,digest,now])?;
+                notification_routing::jobs::capture(&tx,workspace_id,&expected.job_id,&expected.attempt_id)?;
+            } else {
+                if attempt.state == BackendJobAttemptState::Failed && attempt.failure_category.as_deref() == Some("journal_attempt_fenced") { tx.commit()?; return Ok(attempt); }
+                if attempt.state != BackendJobAttemptState::Unknown || job.state != BackendJobState::Unknown
+                    || attempt.worker_cleanup_state != Some(BackendJobWorkerCleanupState::Completed)
+                    || attempt.worker_cleanup_completed_at.is_none() {
+                    return Err(Error::InvalidInput("partial Journal Unknown requires completed canonical cleanup fence".into()));
+                }
+                let purged = if let Some(worker) = &attempt.worker {
+                    tx.query_row("SELECT EXISTS(SELECT 1 FROM worker_removal_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state='succeeded' AND session_disposition='purge')",params![workspace_id,worker.runtime_id,worker.worker_id],|r|r.get::<_,bool>(0))?
+                } else { false };
+                if !purged { return Err(Error::InvalidInput("partial Journal Unknown has no committed stop/Purge removal receipt".into())); }
+                tx.execute("UPDATE backend_job_attempts SET state='failed',failure_category='journal_attempt_fenced',failure_detail='Canonical Worker cleanup and domain generation fence confirmed; retained operations remain valid',updated_at=?4 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3 AND state='unknown'",params![workspace_id,expected.job_id,expected.attempt_id,now])?;
+                tx.execute("UPDATE backend_jobs SET state='failed',failure_category='journal_attempt_fenced',failure_detail='Canonical Worker cleanup and domain generation fence confirmed',updated_at=?3 WHERE workspace_id=?1 AND job_id=?2 AND state='unknown'",params![workspace_id,expected.job_id,now])?;
+            }
+            let result = read_backend_job_attempt(&tx,workspace_id,&expected.job_id,&expected.attempt_id)?.ok_or_else(|| Error::Store("Reconciled Journal attempt missing".into()))?;
+            tx.commit()?; Ok(result)
         })
     }
 
@@ -11360,6 +11615,31 @@ fn read_active_backend_job_for_resource(
     id.map(|id| read_backend_job(conn, workspace_id, &id))
         .transpose()
         .map(Option::flatten)
+}
+
+/// Purge authority comes from the immutable request and exact attempt/Worker/input
+/// binding, never from a profile or purpose string.
+pub(crate) fn terminal_journal_job_worker(
+    conn: &Connection,
+    workspace: &str,
+    worker: &RuntimeWorkerRef,
+) -> Result<bool> {
+    let identity: Option<(String, String)> = conn.query_row(
+        "SELECT job_id, attempt_id FROM backend_job_attempts WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",
+        params![workspace, worker.runtime_id, worker.worker_id], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional()?;
+    let Some((job_id, attempt_id)) = identity else {
+        return Ok(false);
+    };
+    let job = read_backend_job(conn, workspace, &job_id)?
+        .ok_or_else(|| Error::Store("Journal cleanup Job missing".into()))?;
+    let attempt = read_backend_job_attempt(conn, workspace, &job_id, &attempt_id)?
+        .ok_or_else(|| Error::Store("Journal cleanup attempt missing".into()))?;
+    job.request.validate()?;
+    Ok(job.request.grants.subjektiv_journal.is_some()
+        && attempt.state.terminal()
+        && attempt.worker.as_ref() == Some(worker)
+        && attempt.input_digest == job.request.input_digest()?)
 }
 
 fn read_backend_job(
@@ -24126,6 +24406,7 @@ INSERT INTO worker_registry (
                     subject_id: subject.into(),
                     candidate_ids: vec![candidate.into()],
                 }),
+                ..Default::default()
             },
             serialization_key: None,
             source_worker: None,

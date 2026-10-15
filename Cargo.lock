@@ -6548,6 +6548,7 @@ dependencies = [
  "session-metrics",
  "session-store",
  "sha2 0.11.0",
+ "subjektiv",
  "tempfile",
  "thiserror 2.0.18",
  "ticket",
@@ -6708,8 +6709,10 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "server-api",
  "sha2 0.11.0",
  "tempfile",
+ "webauthn-authenticator-rs",
 ]
 
 [[package]]

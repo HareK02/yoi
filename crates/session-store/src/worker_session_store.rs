@@ -48,6 +48,7 @@ pub struct WorkerSessionStore {
     root: PathBuf,
     session_id: Arc<Mutex<Option<SessionId>>>,
     append_lock: Arc<Mutex<()>>,
+    retention: Option<crate::retention::SessionRetentionStore>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -164,6 +165,37 @@ impl RetainedSegmentReader {
 }
 
 impl WorkerSessionStore {
+    /// Publishes through the same external control store used by Runtime retention.
+    /// Existing manifest migration is fenced too; future writes keep the guard until their
+    /// physical publication finishes. The control root must outlive this aggregate.
+    pub fn new_with_retention(
+        root: impl Into<PathBuf>,
+        retention: crate::retention::SessionRetentionStore,
+    ) -> Result<Self, StoreError> {
+        let root = root.into();
+        let existing = match fs::read(root.join(SESSION_FILE)) {
+            Ok(bytes) => Some(serde_json::from_slice::<SessionManifest>(&bytes)?.session_id),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let _guard = existing
+            .map(|session| retention.lock_live(session))
+            .transpose()?;
+        let mut store = Self::new(root)?;
+        store.retention = Some(retention);
+        Ok(store)
+    }
+
+    fn lock_publication(
+        &self,
+        session: SessionId,
+    ) -> Result<Option<crate::retention::SessionRetentionGuard>, StoreError> {
+        self.retention
+            .as_ref()
+            .map(|store| store.lock_live(session))
+            .transpose()
+    }
+
     /// Open the Session store rooted at `<worker-aggregate>/session`.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let root = root.into();
@@ -202,6 +234,7 @@ impl WorkerSessionStore {
             root,
             session_id: Arc::new(Mutex::new(session_id)),
             append_lock: Arc::new(Mutex::new(())),
+            retention: None,
         })
     }
 
@@ -224,6 +257,7 @@ impl WorkerSessionStore {
             root,
             session_id: Arc::new(Mutex::new(Some(manifest.session_id))),
             append_lock: Arc::new(Mutex::new(())),
+            retention: None,
         })
     }
 
@@ -682,12 +716,24 @@ impl WorkerSessionStore {
 }
 
 impl Store for WorkerSessionStore {
+    fn retain_session_before_publication(
+        &self,
+        session_id: SessionId,
+        pin: crate::retention::SessionRetentionPin,
+    ) -> Result<(), StoreError> {
+        self.retention
+            .as_ref()
+            .ok_or(StoreError::SessionRetentionUnsupported)?
+            .retain_before_publication(session_id, pin)
+    }
+
     fn append(
         &self,
         session_id: SessionId,
         segment_id: SegmentId,
         entry: &LogEntry,
     ) -> Result<(), StoreError> {
+        let _retention = self.lock_publication(session_id)?;
         self.ensure_session(session_id, true)?;
         self.append_log_entry(&self.log_path(segment_id), entry)
     }
@@ -740,6 +786,7 @@ impl Store for WorkerSessionStore {
         segment_id: SegmentId,
         entries: &[LogEntry],
     ) -> Result<(), StoreError> {
+        let _retention = self.lock_publication(session_id)?;
         self.ensure_session(session_id, true)?;
         let mut content = Vec::new();
         for entry in entries {
@@ -788,6 +835,7 @@ impl Store for WorkerSessionStore {
         content: &str,
         limits: PasteArtifactLimits,
     ) -> Result<PasteArtifactRef, StoreError> {
+        let _retention = self.lock_publication(session_id)?;
         self.ensure_session(session_id, true)?;
         let _guard = self
             .append_lock
@@ -818,6 +866,7 @@ impl Store for WorkerSessionStore {
         content: &[u8],
         limits: UploadedFileLimits,
     ) -> Result<UploadedFileRef, StoreError> {
+        let _retention = self.lock_publication(session_id)?;
         self.ensure_session(session_id, true)?;
         let _guard = self
             .append_lock
@@ -842,6 +891,7 @@ impl Store for WorkerSessionStore {
         context: &UploadedFileUploadContext,
         limits: UploadedFileLimits,
     ) -> Result<UploadedFileRef, StoreError> {
+        let _retention = self.lock_publication(session_id)?;
         self.ensure_session(session_id, true)?;
         let _guard = self
             .append_lock
@@ -881,6 +931,7 @@ impl Store for WorkerSessionStore {
         reference: &UploadedFileRef,
         source_entry_id: &str,
     ) -> Result<UploadedFileRef, StoreError> {
+        let _retention = self.lock_publication(session_id)?;
         self.ensure_session(session_id, false)?;
         let _guard = self
             .append_lock
@@ -909,6 +960,7 @@ impl Store for WorkerSessionStore {
         reference: &UploadedFileRef,
         owner_id: &str,
     ) -> Result<(), StoreError> {
+        let _retention = self.lock_publication(session_id)?;
         self.ensure_session(session_id, false)?;
         let _guard = self
             .append_lock
@@ -923,6 +975,7 @@ impl Store for WorkerSessionStore {
         artifact_id: &str,
         owner_id: &str,
     ) -> Result<(), StoreError> {
+        let _retention = self.lock_publication(session_id)?;
         self.ensure_session(session_id, false)?;
         let _guard = self
             .append_lock
@@ -937,6 +990,7 @@ impl Store for WorkerSessionStore {
         artifact_id: &str,
         source_entry_id: &str,
     ) -> Result<(), StoreError> {
+        let _retention = self.lock_publication(session_id)?;
         self.ensure_session(session_id, false)?;
         let _guard = self
             .append_lock
@@ -954,6 +1008,7 @@ impl Store for WorkerSessionStore {
         session_id: SessionId,
         live_owner_ids: &[String],
     ) -> Result<u64, StoreError> {
+        let _retention = self.lock_publication(session_id)?;
         self.ensure_session(session_id, false)?;
         let _guard = self
             .append_lock
@@ -967,6 +1022,7 @@ impl Store for WorkerSessionStore {
         session_id: SessionId,
         artifact_id: &str,
     ) -> Result<bool, StoreError> {
+        let _retention = self.lock_publication(session_id)?;
         self.ensure_session(session_id, false)?;
         let _guard = self
             .append_lock
@@ -976,6 +1032,7 @@ impl Store for WorkerSessionStore {
     }
 
     fn delete_uncommitted_uploaded_files(&self, session_id: SessionId) -> Result<u64, StoreError> {
+        let _retention = self.lock_publication(session_id)?;
         self.ensure_session(session_id, false)?;
         let _guard = self
             .append_lock
@@ -1010,6 +1067,7 @@ impl Store for WorkerSessionStore {
         segment_id: SegmentId,
         entry: &TraceEntry,
     ) -> Result<(), StoreError> {
+        let _retention = self.lock_publication(session_id)?;
         self.ensure_session(session_id, true)?;
         self.append_line(&self.trace_path(segment_id), &serde_json::to_string(entry)?)
     }
