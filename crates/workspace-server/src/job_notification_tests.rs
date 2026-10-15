@@ -142,6 +142,21 @@ async fn job_notification_routing_common_policy_distinguishes_suppression_failur
             store.route_job_notification("w", &source, &facts).unwrap(),
             disposition == "deliver"
         );
+        let diagnostics=store.notification_diagnostics("w",&server_api::NotificationDiagnosticsQuery{job_id:Some(name.into()),..Default::default()}).unwrap();
+        let item=&diagnostics.items[0];
+        assert_eq!(item.disposition.as_deref(),Some(disposition));
+        assert_eq!(item.reason.as_deref(),Some(reason));
+        assert_eq!(item.job_id.as_deref(),Some(name));
+        assert!(diagnostics.source_checks[0].captured);
+        assert_eq!(diagnostics.source_checks[0].origin_present,Some(true));
+        assert!(!item.model_processing_confirmed && !item.legacy_evidence);
+        if disposition=="deliver" {
+            assert_eq!(item.stage,server_api::NotificationDiagnosticStage::RequestPersisted);
+            assert_eq!(item.target_worker_id.as_deref(),Some("replacement"));
+        } else {
+            assert!(!item.retry_candidate);
+            assert_eq!(item.stage,if disposition=="suppress"{server_api::NotificationDiagnosticStage::Suppressed}else{server_api::NotificationDiagnosticStage::Deferred});
+        }
         assert_eq!(
             job_notice_evidence(&store, &source),
             (
@@ -534,6 +549,19 @@ fn job_notification_migration_retains_legacy_acks_suppressions_unknown_bytes_and
     let store = SqliteWorkspaceStore::open_for_test(path).unwrap();
     let pending = store.list_pending_job_notifications("w", 100).unwrap();
     assert_eq!(pending.len(), 4);
+    for (id,stage) in [(&accepted,server_api::NotificationDiagnosticStage::RuntimeAccepted),(&clean,server_api::NotificationDiagnosticStage::Suppressed),(&stale,server_api::NotificationDiagnosticStage::Suppressed),(&unknown,server_api::NotificationDiagnosticStage::AcceptanceUnknown),(&ambiguous,server_api::NotificationDiagnosticStage::Deferred)] {
+        let page=store.notification_diagnostics("w",&server_api::NotificationDiagnosticsQuery{delivery_id:Some(id.clone()),..Default::default()}).unwrap();
+        let item=&page.items[0];
+        assert_eq!(item.stage,stage);
+        assert!(item.legacy_evidence);
+        assert!(!item.model_processing_confirmed);
+        if id==&accepted {
+            assert!(!item.retry_candidate && !item.acceptance_outcome_unknown);
+            assert!(item.target_worker_id.is_some());
+        }
+        let json=serde_json::to_string(item).unwrap();
+        assert!(!json.contains("record_json") && !json.contains("notification_suppressed"));
+    }
     let checker_body = store
         .job_notification_request("w", &checker)
         .unwrap()

@@ -51,6 +51,10 @@ async fn job_notification_real_worker_ack_loss_reopen_and_parallel_recovery_comm
     let evidence = job_notification_evidence(&api, &id);
     assert!(!evidence.2);
     assert_eq!(evidence.3.as_deref(), Some("acceptance_unknown"));
+    let diagnostics=delivery_http(&api,"GET",&format!("/api/w/{TEST_WORKSPACE_ID}/notification-diagnostics?job_id={}",request.job_id),None,StatusCode::OK).await;
+    assert_eq!(diagnostics["items"][0]["stage"],"acceptance_unknown");
+    assert_eq!(diagnostics["items"][0]["target_worker_id"],target.worker_id);
+    assert_eq!(diagnostics["items"][0]["acceptance_outcome_unknown"],true);
     assert_eq!(delivery_receipts(&api, &target).len(), 1);
     // Reopen only Backend persistence, retaining the real Runtime receipt/session.
     let mut reopened = api.clone();
@@ -77,6 +81,11 @@ async fn job_notification_real_worker_ack_loss_reopen_and_parallel_recovery_comm
     });
     delivery_wait_idle(&reopened, &target, 1).await;
     assert!(job_notification_evidence(&reopened, &id).2);
+    let diagnostics=delivery_http(&reopened,"GET",&format!("/api/w/{TEST_WORKSPACE_ID}/notification-diagnostics?job_id={}",request.job_id),None,StatusCode::OK).await;
+    assert_eq!(diagnostics["items"][0]["stage"],"runtime_accepted");
+    assert_eq!(diagnostics["items"][0]["target_worker_id"],target.worker_id);
+    assert_eq!(diagnostics["items"][0]["acceptance_outcome_unknown"],false);
+    assert_eq!(diagnostics["items"][0]["model_processing_confirmed"],false);
     assert_eq!(delivery_receipts(&reopened, &target).len(), 1);
     assert_eq!(delivery_commits(&reopened, &target), vec![pinned.0.clone()]);
     let attempts = execution.attempts.lock().unwrap();

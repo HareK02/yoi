@@ -157,14 +157,16 @@ pub(super) fn page_with_connection(
         d.disposition,d.reason,d.purpose,d.delivery_id,
         ar.delivery_id IS NOT NULL,
         (r.delivery_id IS NOT NULL OR ap.delivery_id IS NOT NULL),
-        (a.delivery_id IS NOT NULL OR aa.delivery_id IS NOT NULL),
-        COALESCE(json_extract(a.target_json,'$.worker.runtime_id'),json_extract(aa.source_json,'$.runtime_id'),json_extract(r.target_json,'$.worker.runtime_id'),json_extract(ar.reserved_source_json,'$.runtime_id')),
-        COALESCE(json_extract(a.target_json,'$.worker.worker_id'),json_extract(aa.source_json,'$.worker_id'),json_extract(r.target_json,'$.worker.worker_id'),json_extract(ar.reserved_source_json,'$.worker_id')),
+        (a.delivery_id IS NOT NULL OR aa.delivery_id IS NOT NULL OR COALESCE(l.runtime_accepted,0)=1),
+        COALESCE(json_extract(a.target_json,'$.worker.runtime_id'),json_extract(aa.source_json,'$.runtime_id'),json_extract(r.target_json,'$.worker.runtime_id'),json_extract(r.target_json,'$.runtime_id'),json_extract(ar.reserved_source_json,'$.runtime_id'),json_extract(l.record_json,'$.target.runtime_id')),
+        COALESCE(json_extract(a.target_json,'$.worker.worker_id'),json_extract(aa.source_json,'$.worker_id'),json_extract(r.target_json,'$.worker.worker_id'),json_extract(r.target_json,'$.worker_id'),json_extract(ar.reserved_source_json,'$.worker_id'),json_extract(l.record_json,'$.target.worker_id')),
         f.code,f.recorded_at,
         CASE WHEN s.role IN ('orchestrator','worker') AND s.assignment_id!='' THEN EXISTS(SELECT 1 FROM ticket_current_worker_assignments c WHERE c.workspace_id=s.workspace_id AND c.ticket_id=s.ticket_id AND c.role=s.role AND c.assignment_id=s.assignment_id) END,
         EXISTS(SELECT 1 FROM notification_failures uf WHERE uf.workspace_id=s.workspace_id AND uf.delivery_id=d.delivery_id AND uf.code IN ('acceptance_unknown','acknowledgement_failed')),
-        (SELECT COUNT(*) FROM (SELECT DISTINCT at.runtime_id,at.worker_id FROM notification_assignment_targets at WHERE at.workspace_id=s.workspace_id AND at.delivery_id=d.delivery_id))
+        (SELECT COUNT(*) FROM (SELECT DISTINCT at.runtime_id,at.worker_id FROM notification_assignment_targets at WHERE at.workspace_id=s.workspace_id AND at.delivery_id=d.delivery_id)),
+        l.delivery_id IS NOT NULL
         {joins}
+        LEFT JOIN notification_job_legacy_receipts l ON l.workspace_id=s.workspace_id AND l.delivery_id=d.delivery_id
         LEFT JOIN notification_requests r ON r.workspace_id=s.workspace_id AND r.delivery_id=d.delivery_id
         LEFT JOIN notification_acknowledgements a ON a.workspace_id=s.workspace_id AND a.delivery_id=d.delivery_id
         LEFT JOIN ticket_assignment_deliveries ar ON ar.workspace_id=s.workspace_id AND ar.delivery_id=d.delivery_id
@@ -249,6 +251,7 @@ pub(super) fn page_with_connection(
             purpose: bounded(row.get(10)?),
             delivery_id: bounded(row.get(11)?),
             stage,
+            legacy_evidence: row.get(22)?,
             acceptance_outcome_unknown,
             target_resolution,
             target_runtime_id,

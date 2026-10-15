@@ -79,7 +79,7 @@ async fn notification_tool_and_wip_share_bounded_read_contract() {
     let client = Arc::new(Client {
         requests: Mutex::new(vec![]),
         status: 200,
-        body: json!({"items":[{"source_id":"notification-source:5","source_event_id":"mr-event:m:e","event_kind":"mr_review","recipient_role":"orchestrator","stage":"acceptance_unknown","acceptance_outcome_unknown":true,"target_resolution":"multiple_authorized_targets","retry_candidate":true,"model_processing_confirmed":false}],"next_cursor":null,"source_checks":[]}).to_string(),
+        body: json!({"items":[{"source_id":"notification-source:5","source_event_id":"mr-event:m:e","event_kind":"mr_review","recipient_role":"orchestrator","stage":"acceptance_unknown","legacy_evidence":false,"acceptance_outcome_unknown":true,"target_resolution":"multiple_authorized_targets","retry_candidate":true,"model_processing_confirmed":false}],"next_cursor":null,"source_checks":[]}).to_string(),
     });
     let (meta, tool) = definition(client.clone())();
     let schema = jsonschema::validator_for(&meta.input_schema).unwrap();
