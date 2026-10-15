@@ -5635,6 +5635,10 @@
       "NotificationDiagnostic": {
         "additionalProperties": false,
         "properties": {
+          "acceptance_outcome_unknown": {
+            "description": "Conservative: a persisted request without ACK is enough; this does not prove a send occurred.\nCan remain true alongside a later preflight failure, rejection or historical recipient.",
+            "type": "boolean"
+          },
           "assignment_id": {
             "type": [
               "string",
@@ -5719,6 +5723,10 @@
           "stage": {
             "$ref": "#/components/schemas/NotificationDiagnosticStage"
           },
+          "target_resolution": {
+            "$ref": "#/components/schemas/NotificationTargetResolution",
+            "description": "Failure records do not identify a particular authorized replacement target."
+          },
           "target_runtime_id": {
             "type": [
               "string",
@@ -5744,6 +5752,8 @@
           "event_kind",
           "recipient_role",
           "stage",
+          "acceptance_outcome_unknown",
+          "target_resolution",
           "retry_candidate",
           "model_processing_confirmed"
         ],
@@ -5883,6 +5893,16 @@
           "captured"
         ],
         "type": "object"
+      },
+      "NotificationTargetResolution": {
+        "enum": [
+          "unresolved",
+          "reserved",
+          "request_persisted",
+          "runtime_accepted",
+          "multiple_authorized_targets"
+        ],
+        "type": "string"
       },
       "Nullable_string": {
         "type": [
@@ -17487,7 +17507,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:ba0b73fac609dc65712a95c3b96f1044b16f82a5775f591813c02e8f392b5a04"
+    "x-yoi-source-digest": "sha256:d3f51c6f6b7091ca393c9d197309e280a18357889e9e6df69bbdfcaeb13d0cc3"
   },
   "openapi": "3.1.0",
   "paths": {

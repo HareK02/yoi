@@ -1,4 +1,51 @@
 use super::*;
+
+#[tokio::test]
+async fn notification_wip_executes_same_read_and_honors_profile_denial() {
+    for denied in [false, true] {
+        let client = Arc::new(Client {
+            requests: Mutex::new(vec![]),
+            status: 200,
+            body: json!({"items":[],"next_cursor":null,"source_checks":[]}).to_string(),
+        });
+        let tools = native_ticket_tools(client.clone(), TicketFeatureAccess::read_only()).unwrap();
+        let handler = TicketCollectionWipHandler {
+            tools: operation_map(
+                tools
+                    .into_iter()
+                    .filter(|t| t.projection.surface == NativeTicketSurface::Collection)
+                    .collect(),
+            ),
+            permissions: denied.then_some(ToolPermissionConfig {
+                default_action: ToolPermissionAction::Deny,
+                rules: vec![],
+            }),
+            collection_route: "/tickets".into(),
+            observations: Arc::new(Mutex::new(TicketObservationState::default())),
+        };
+        let args = BTreeMap::from([("ticket".into(), WipValue::String("T-755".into()))]);
+        let result = handler
+            .call(
+                "notification_diagnostics",
+                &args,
+                WipCallContext {
+                    execution: ToolExecutionContext::direct(),
+                    security_context: "worker".into(),
+                },
+            )
+            .await;
+        assert_eq!(result.is_err(), denied);
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), usize::from(!denied));
+        if !denied {
+            assert_eq!(requests[0].method, WorkspaceRequestMethod::Get);
+            assert_eq!(
+                requests[0].path,
+                "/api/w/workspace/notification-diagnostics?ticket=T-755"
+            );
+        }
+    }
+}
 use crate::worker::{WorkspaceClientError, WorkspaceRequest, WorkspaceResponse};
 #[derive(Debug)]
 struct Client {
@@ -32,15 +79,23 @@ async fn notification_tool_and_wip_share_bounded_read_contract() {
     let client = Arc::new(Client {
         requests: Mutex::new(vec![]),
         status: 200,
-        body: json!({"items":[],"next_cursor":null,"source_checks":[]}).to_string(),
+        body: json!({"items":[{"source_id":"notification-source:5","source_event_id":"mr-event:m:e","event_kind":"mr_review","recipient_role":"orchestrator","stage":"acceptance_unknown","acceptance_outcome_unknown":true,"target_resolution":"multiple_authorized_targets","retry_candidate":true,"model_processing_confirmed":false}],"next_cursor":null,"source_checks":[]}).to_string(),
     });
     let (meta, tool) = definition(client.clone())();
     let schema = jsonschema::validator_for(&meta.input_schema).unwrap();
     let input = json!({"ticket":"T-755","merge_request_id":"mr/1?","job_id":"job","cursor":"notification-source:4","limit":10});
     assert!(schema.is_valid(&input));
-    tool.execute(&input.to_string(), ToolExecutionContext::direct())
+    let output = tool
+        .execute(&input.to_string(), ToolExecutionContext::direct())
         .await
         .unwrap();
+    let page: Value = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+    assert_eq!(page["items"][0]["acceptance_outcome_unknown"], true);
+    assert_eq!(
+        page["items"][0]["target_resolution"],
+        "multiple_authorized_targets"
+    );
+    assert!(page["items"][0]["target_worker_id"].is_null());
     let requests = client.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].method, WorkspaceRequestMethod::Get);

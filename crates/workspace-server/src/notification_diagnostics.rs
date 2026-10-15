@@ -42,6 +42,10 @@ fn source_checks(
                 .and_then(|v| v.parse::<i64>().ok()),
         ) {
             Some(conn.query_row("SELECT EXISTS(SELECT 1 FROM typed_ticket_events e LEFT JOIN workspace_resource_keys k ON k.workspace_id=e.workspace_id AND k.resource_kind='ticket' AND k.resource_id=e.ticket_id WHERE e.workspace_id=?1 AND (e.ticket_id=?2 OR k.resource_key=?2) AND e.event_index=?3)",params![workspace,ticket,index],|r|r.get(0))?)
+        } else if let Some((mr, event)) =
+            id.strip_prefix("mr-event:").and_then(|v| v.split_once(':'))
+        {
+            Some(conn.query_row("SELECT EXISTS(SELECT 1 FROM merge_request_thread_events WHERE workspace_id=?1 AND merge_request_id=?2 AND event_id=?3)",params![workspace,mr,event],|r|r.get(0))?)
         } else {
             None
         };
@@ -157,7 +161,9 @@ pub(super) fn page_with_connection(
         COALESCE(json_extract(a.target_json,'$.worker.runtime_id'),json_extract(aa.source_json,'$.runtime_id'),json_extract(r.target_json,'$.worker.runtime_id'),json_extract(ar.reserved_source_json,'$.runtime_id')),
         COALESCE(json_extract(a.target_json,'$.worker.worker_id'),json_extract(aa.source_json,'$.worker_id'),json_extract(r.target_json,'$.worker.worker_id'),json_extract(ar.reserved_source_json,'$.worker_id')),
         f.code,f.recorded_at,
-        CASE WHEN s.role IN ('orchestrator','worker') AND s.assignment_id!='' THEN EXISTS(SELECT 1 FROM ticket_current_worker_assignments c WHERE c.workspace_id=s.workspace_id AND c.ticket_id=s.ticket_id AND c.role=s.role AND c.assignment_id=s.assignment_id) END
+        CASE WHEN s.role IN ('orchestrator','worker') AND s.assignment_id!='' THEN EXISTS(SELECT 1 FROM ticket_current_worker_assignments c WHERE c.workspace_id=s.workspace_id AND c.ticket_id=s.ticket_id AND c.role=s.role AND c.assignment_id=s.assignment_id) END,
+        EXISTS(SELECT 1 FROM notification_failures uf WHERE uf.workspace_id=s.workspace_id AND uf.delivery_id=d.delivery_id AND uf.code IN ('acceptance_unknown','acknowledgement_failed')),
+        (SELECT COUNT(*) FROM (SELECT DISTINCT at.runtime_id,at.worker_id FROM notification_assignment_targets at WHERE at.workspace_id=s.workspace_id AND at.delivery_id=d.delivery_id))
         {joins}
         LEFT JOIN notification_requests r ON r.workspace_id=s.workspace_id AND r.delivery_id=d.delivery_id
         LEFT JOIN notification_acknowledgements a ON a.workspace_id=s.workspace_id AND a.delivery_id=d.delivery_id
@@ -176,6 +182,31 @@ pub(super) fn page_with_connection(
         let accepted: bool = row.get(14)?;
         let failure: Option<String> = row.get(17)?;
         let recipient_current: Option<bool> = row.get(19)?;
+        let unresolved_send: bool = row.get(20)?;
+        let multiple_targets = row.get::<_, i64>(21)? > 1;
+        let acceptance_outcome_unknown = !accepted && (prepared || unresolved_send);
+        use server_api::NotificationTargetResolution as Target;
+        let target_resolution = if accepted {
+            Target::RuntimeAccepted
+        } else if multiple_targets {
+            Target::MultipleAuthorizedTargets
+        } else if prepared {
+            Target::RequestPersisted
+        } else if reserved {
+            Target::Reserved
+        } else {
+            Target::Unresolved
+        };
+        let target_runtime_id = if multiple_targets && !accepted {
+            None
+        } else {
+            bounded(row.get(15)?)
+        };
+        let target_worker_id = if multiple_targets && !accepted {
+            None
+        } else {
+            bounded(row.get(16)?)
+        };
         let stage = if accepted {
             Stage::RuntimeAccepted
         } else if recipient_current == Some(false) {
@@ -186,7 +217,7 @@ pub(super) fn page_with_connection(
             Stage::Suppressed
         } else if disposition.as_deref() == Some("defer") {
             Stage::Deferred
-        } else if failure.as_deref() == Some("acceptance_unknown") {
+        } else if unresolved_send {
             Stage::AcceptanceUnknown
         } else if failure.as_deref() == Some("runtime_rejected") {
             Stage::RuntimeRejected
@@ -218,8 +249,10 @@ pub(super) fn page_with_connection(
             purpose: bounded(row.get(10)?),
             delivery_id: bounded(row.get(11)?),
             stage,
-            target_runtime_id: bounded(row.get(15)?),
-            target_worker_id: bounded(row.get(16)?),
+            acceptance_outcome_unknown,
+            target_resolution,
+            target_runtime_id,
+            target_worker_id,
             last_failure_code: bounded(failure),
             last_failure_at: bounded(row.get(18)?),
             retry_candidate,

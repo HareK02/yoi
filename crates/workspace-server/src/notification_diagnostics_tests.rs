@@ -1,5 +1,55 @@
 // Production Store and SQLite. No Runtime/model side effects are required for diagnostics.
 #[tokio::test]
+async fn notification_diagnostics_preserves_unknown_acceptance_and_marks_replacement_ambiguity() {
+    use server_api::{NotificationDiagnosticsQuery as Q,NotificationDiagnosticStage as S,NotificationTargetResolution as T};
+    for initial_failure in [NotificationFailureCode::AcceptanceUnknown,NotificationFailureCode::AcknowledgementFailed] {
+        let (_dir,store)=tracking_store_fixture().await;
+        tracking_store_assign(&store,"a","assign-a");
+        let source=tracking_store_source();
+        let delivery=delivery_store_reserve_initial(&store,&source);
+        store.prepare_ticket_assignment_delivery_content("w",&delivery.delivery_id,"frozen body",&source).unwrap();
+        let key=NotificationDeliveryKey::AssignmentInput{assignment_id:"a".into(),input_event_id:delivery.input_event_id.clone()};
+        store.record_notification_delivery_failure("w",&key,initial_failure).unwrap();
+        store.record_notification_delivery_failure("w",&key,NotificationFailureCode::TargetStopped).unwrap();
+        let query=Q{delivery_id:Some(delivery.delivery_id.clone()),..Default::default()};
+        let read=||store.notification_diagnostics("w",&query).unwrap().items.remove(0);
+        assert_eq!(read().stage,S::AcceptanceUnknown);
+        assert!(read().acceptance_outcome_unknown);
+        assert_eq!(read().last_failure_code.as_deref(),Some("target_stopped"));
+        store.with_conn(|conn|{conn.execute("UPDATE worker_singleton_owners SET worker_id='replacement' WHERE workspace_id='w'",[])?;Ok(())}).unwrap();
+        let replacement=TicketAssignmentTrackingSourceContext{worker_id:"replacement".into(),..source};
+        store.prepare_ticket_assignment_delivery_content("w",&delivery.delivery_id,"ignored new body",&replacement).unwrap();
+        let ambiguous=read();
+        assert_eq!(ambiguous.target_resolution,T::MultipleAuthorizedTargets);
+        assert!(ambiguous.target_runtime_id.is_none() && ambiguous.target_worker_id.is_none());
+        store.ack_ticket_assignment_delivery("w",&delivery.delivery_id,&replacement).unwrap();
+        let accepted=read();
+        assert_eq!(accepted.target_resolution,T::RuntimeAccepted);
+        assert_eq!(accepted.target_worker_id.as_deref(),Some("replacement"));
+        assert!(!accepted.acceptance_outcome_unknown);
+    }
+}
+
+#[tokio::test]
+async fn notification_diagnostics_detects_exact_missing_mr_event_after_earlier_capture() {
+    use server_api::NotificationDiagnosticsQuery as Q;
+    let (_dir,store)=tracking_store_fixture().await;
+    tracking_store_assign(&store,"a","assign-a");
+    store.with_conn(|conn| {
+        conn.execute("INSERT INTO merge_requests(workspace_id,merge_request_id,repository_id,state,selector_to,created_at,updated_at) SELECT workspace_id,'mr-diagnostic',repository_id,'open','develop','1','1' FROM repositories WHERE workspace_id='w' LIMIT 1",[])?;
+        for (event,seq) in [("first",1),("missing",2)] {
+            conn.execute("INSERT INTO merge_request_thread_events(workspace_id,merge_request_id,event_id,sequence,kind,payload_json,created_at) VALUES('w','mr-diagnostic',?1,?2,'review','{}','1')",params![event,seq])?;
+        }
+        conn.execute("INSERT INTO notification_sources(workspace_id,ticket_id,input_event_id,role,assignment_id,kind,facts_json) SELECT workspace_id,ticket_id,'mr-event:mr-diagnostic:first',role,assignment_id,'mr_review',json_set(facts_json,'$.merge_request_id','mr-diagnostic') FROM notification_sources WHERE assignment_id='a' LIMIT 1",[])?;
+        Ok(())
+    }).unwrap();
+    let page=store.notification_diagnostics("w",&Q{merge_request_id:Some("mr-diagnostic".into()),source_event_id:Some("mr-event:mr-diagnostic:missing".into()),..Default::default()}).unwrap();
+    assert!(page.items.is_empty());
+    assert!(page.source_checks[0].captured);
+    assert_eq!(page.source_checks[1].origin_present,Some(true));
+    assert!(!page.source_checks[1].captured);
+}
+#[tokio::test]
 async fn notification_diagnostics_bounds_saved_reasons_without_returning_source_payloads() {
     use server_api::NotificationDiagnosticsQuery as Q;
     let (_dir,store)=tracking_store_fixture().await;

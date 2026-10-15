@@ -33,6 +33,16 @@ pub enum NotificationDiagnosticStage {
     RuntimeAccepted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationTargetResolution {
+    Unresolved,
+    Reserved,
+    RequestPersisted,
+    RuntimeAccepted,
+    MultipleAuthorizedTargets,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NotificationDiagnostic {
@@ -51,6 +61,11 @@ pub struct NotificationDiagnostic {
     pub purpose: Option<String>,
     pub delivery_id: Option<String>,
     pub stage: NotificationDiagnosticStage,
+    /// Conservative: a persisted request without ACK is enough; this does not prove a send occurred.
+    /// Can remain true alongside a later preflight failure, rejection or historical recipient.
+    pub acceptance_outcome_unknown: bool,
+    /// Failure records do not identify a particular authorized replacement target.
+    pub target_resolution: NotificationTargetResolution,
     pub target_runtime_id: Option<String>,
     pub target_worker_id: Option<String>,
     pub last_failure_code: Option<String>,
