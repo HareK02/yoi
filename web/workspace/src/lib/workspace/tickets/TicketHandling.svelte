@@ -150,7 +150,6 @@
   {#if ticket.state === "open" && current?.last_event_id && current.tracking && current.tracking.status !== "done"}
     <form class="ticket-control-form ticket-answer" onsubmit={submitAnswer}>
       <label>Answer / continue this handling<textarea bind:value={answer} rows="3" required disabled={busy || pending !== null}></textarea></label>
-      <p>Continues assignment <code>{current.assignment_id}</code>; not a new delegation. A stale assignment is rejected.</p>
       <button class="workspace-secondary-button" disabled={busy || pending !== null || !answer.trim()}>Send answer to this assignment</button>
     </form>
   {/if}
