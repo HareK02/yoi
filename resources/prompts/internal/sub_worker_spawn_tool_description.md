@@ -2,9 +2,10 @@ Spawn a parent-owned Internal SubWorker session to split context for a delegated
 
 Optional `cwd`: when provided, the spawned SubWorker's tool default working directory only. It must be a Workdir-relative existing directory covered by the child's readable scope, and it does not change workspace/Profile/memory/Ticket roots or grant authority. `name` must be unique among this Worker's direct children.
 
-Profile selection: `profile` may be omitted or set to `default` to use the effective child default profile, set to `inherit` to derive reusable child configuration from this Worker, or set to one of the registry selectors below. Raw/path profile selectors are not accepted by SubWorkerSpawn. `scope` is the child's only filesystem capability and replaces profile scope. `command` is a separate explicit grant, defaults to false, and is accepted only with a writable scope; writable scope alone does not grant command execution.
+Profile selection: omit `profile` or set it to `inherit` to derive reusable child configuration from this Worker. Set it to `default` to use the effective registry default profile, or to one of the registry selectors below. Raw/path profile selectors are not accepted by SubWorkerSpawn. `scope` is the child's only filesystem capability and replaces profile scope. `command` is a separate explicit grant, defaults to false, and is accepted only with a writable scope; writable scope alone does not grant command execution.
 
-Default profile: {{ default_profile }}
+Default when omitted: inherit.
+Registry default (`profile = "default"`): {{ default_profile }}
 Special selector: inherit — derive reusable model/worker/tool policy from the spawner while replacing worker.name and scope.
 Available registry profiles:
 {{ available_profiles }}{% if profile_diagnostic %}

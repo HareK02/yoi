@@ -45,9 +45,9 @@ use protocol::Method;
 struct SubWorkerSpawnInput {
     /// Identifier for the spawned Internal SubWorker. Must be unique among this Worker's direct children.
     name: String,
-    /// Profile selector for child role configuration. Omit or use `default`
-    /// for the effective child default profile, use `inherit` to derive
-    /// reusable config from the spawner, or use a registry selector such as
+    /// Profile selector for child role configuration. Omit or use `inherit`
+    /// to derive reusable config from the spawner, use `default` for the
+    /// effective registry default profile, or use a registry selector such as
     /// `project:coder`, `project:reviewer`, `builtin:companion`, or an
     /// unambiguous profile slug. Raw/path selectors are rejected.
     #[serde(default)]
@@ -204,7 +204,7 @@ enum SpawnProfileSelector {
 
 fn parse_spawn_profile_selector(raw: Option<&str>) -> Result<SpawnProfileSelector, String> {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(SpawnProfileSelector::Default);
+        return Ok(SpawnProfileSelector::Inherit);
     };
     if raw == "default" {
         return Ok(SpawnProfileSelector::Default);
@@ -2298,7 +2298,7 @@ max_tokens = 3333
     }
 
     #[test]
-    fn omitted_profile_resolves_effective_registry_default() {
+    fn explicit_default_profile_resolves_effective_registry_default() {
         let tmp = TempDir::new().unwrap();
         let project = tmp.path().join("project");
         let delegated = tmp.path().join("delegated");
@@ -2322,7 +2322,7 @@ max_tokens = 3333
             "child-default",
             None,
             &scope,
-            SpawnProfileSelector::Default,
+            parse_spawn_profile_selector(Some("default")).unwrap(),
         );
 
         assert_eq!(config.worker.name.as_deref(), Some("child-default"));
@@ -2371,6 +2371,44 @@ max_tokens = 3333
         assert_eq!(config.engine.max_tokens, Some(3333));
         assert_eq!(config.scope.allow, scope);
         assert!(config.scope.deny.is_empty());
+    }
+
+    #[test]
+    fn omitted_profile_inherits_parent_ticket_features_instead_of_registry_default() {
+        let tmp = TempDir::new().unwrap();
+        let mut parent = parent_manifest(tmp.path(), None);
+        let scope = vec![abs_rule(tmp.path(), Permission::Read)];
+        let available = AvailableProfiles {
+            registry: Some(
+                ProfileDiscovery::with_sources(None, None)
+                    .discover()
+                    .unwrap(),
+            ),
+            diagnostic: None,
+        };
+        let input: SubWorkerSpawnInput = serde_json::from_value(serde_json::json!({
+            "name": "child", "task": "inspect", "scope": []
+        }))
+        .unwrap();
+        for enabled in [false, true] {
+            parent.feature.ticket.enabled = enabled;
+            parent.feature.ticket.thread = enabled;
+            let config = child_config_from_profile(
+                &parent,
+                &available,
+                tmp.path(),
+                "child",
+                None,
+                &scope,
+                parse_spawn_profile_selector(input.profile.as_deref()).unwrap(),
+            );
+            assert_eq!(config.model.model_id.as_deref(), Some("parent-model"));
+            assert_eq!(config.engine.language.as_deref(), Some("Parentish"));
+            let ticket = config.feature.ticket.unwrap();
+            assert_eq!(ticket.enabled, Some(enabled));
+            assert_eq!(ticket.thread, Some(enabled));
+            assert_eq!(config.scope.allow, scope);
+        }
     }
 
     #[test]
@@ -2581,13 +2619,15 @@ max_tokens = 3333
 
     #[test]
     fn spawn_profile_selector_accepts_default_inherit_and_registry() {
+        for raw in [None, Some(""), Some("  "), Some("inherit")] {
+            assert_eq!(
+                parse_spawn_profile_selector(raw).unwrap(),
+                SpawnProfileSelector::Inherit
+            );
+        }
         assert_eq!(
-            parse_spawn_profile_selector(None).unwrap(),
+            parse_spawn_profile_selector(Some("default")).unwrap(),
             SpawnProfileSelector::Default
-        );
-        assert_eq!(
-            parse_spawn_profile_selector(Some("inherit")).unwrap(),
-            SpawnProfileSelector::Inherit
         );
         assert_eq!(
             parse_spawn_profile_selector(Some("project:reviewer")).unwrap(),
