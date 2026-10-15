@@ -308,3 +308,89 @@ async fn implementation_result_notification_failure_rolls_back_and_concurrent_re
         })
         .unwrap();
 }
+
+#[tokio::test]
+async fn mr_event_actors_preserve_self_suppression_in_capture_and_backfill() {
+    for historical in [false, true] {
+        let (_dir, store) = tracking_store_fixture().await;
+        tracking_store_assign(&store, "delegation", "assign");
+        routing_worker_assign(&store, "implementation");
+        let events = [
+            ("review_requested", Some("requested_by"), Some("replacement"), Some("worker")),
+            ("review", Some("reviewer"), Some("reviewer-child"), None),
+            ("review_revoked", Some("revoked_by"), Some("replacement"), Some("worker")),
+            ("merge", Some("merged_by"), Some("worker"), Some("orchestrator")),
+            ("review_cancelled", None, None, None),
+        ];
+        store.with_conn(|conn| {
+            if historical {
+                conn.execute_batch("DROP TRIGGER notification_mr_event; DROP TRIGGER notification_mr_source; DROP TRIGGER notification_implementation_result; DROP TRIGGER implementation_delegation_capture;
+                    DROP TABLE ticket_implementation_results; DROP TABLE ticket_implementation_delegations; DROP TABLE merge_request_source_observations;
+                    UPDATE __yoi_schema_migrations SET version=95 WHERE version=96;")?;
+            }
+            conn.execute_batch("INSERT INTO merge_requests VALUES('w','actor-mr','main','open','work','main','3','3');
+                INSERT INTO merge_request_ticket_relations VALUES('w','actor-mr','tracking','implements','3');")?;
+            for (index, (kind, field, worker, _)) in events.iter().enumerate() {
+                let mut payload = serde_json::json!({"subject_ref":"source-a"});
+                if let (Some(field), Some(worker)) = (field, worker) {
+                    payload[*field] = serde_json::json!({"runtime_id":"r","worker_id":worker});
+                }
+                if *kind == "review_requested" {
+                    // A reviewer on a request is not its actor.
+                    payload["reviewer"] = serde_json::json!({"runtime_id":"r","worker_id":"worker"});
+                }
+                conn.execute("INSERT INTO merge_request_thread_events VALUES('w','actor-mr',?1,?2,?1,?3,NULL,'3')", params![kind,index as i64 + 1,payload.to_string()])?;
+            }
+            if historical { migrate_business_notifications_v95_to_v96(conn)?; }
+            notification_routing::route_pending(conn,"w")?;
+            for (kind, _, worker, suppressed_role) in events {
+                for role in ["worker", "orchestrator"] {
+                    let (actor,disposition,reason):(Option<String>,String,String) = conn.query_row(
+                        "SELECT s.actor,d.disposition,d.reason FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.input_event_id=?1 AND s.role=?2",
+                        params![format!("mr-event:actor-mr:{kind}"),role],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+                    assert_eq!(actor,worker.map(|w|format!("worker:r/{w}")),"{kind}, historical={historical}");
+                    if suppressed_role == Some(role) {
+                        assert_eq!((disposition.as_str(),reason.as_str()),("suppress","self_notification"),"{kind}, historical={historical}");
+                    } else {
+                        assert_eq!((disposition.as_str(),reason.as_str()),("deliver","attention"),"{kind}, {role}, historical={historical}");
+                    }
+                }
+            }
+            Ok(())
+        }).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn implementation_result_accepts_only_observations_with_matching_mr_ticket_workspace() {
+    let (_dir, store) = tracking_store_fixture().await;
+    tracking_store_assign(&store,"delegation","assign");
+    let worker = routing_worker_assign(&store,"implementation").worker;
+    seed_manual_start_ticket(&store,"unrelated","open");
+    store.with_conn(|conn| {
+        conn.execute_batch("INSERT INTO merge_requests VALUES('w','observed-mr','main','open','work','main','3','3');
+            INSERT INTO merge_request_ticket_relations VALUES('w','observed-mr','tracking','implements','3');
+            INSERT INTO merge_requests VALUES('w','other-mr','main','open','other','main','3','3');
+            INSERT INTO merge_request_ticket_relations VALUES('w','other-mr','unrelated','implements','3');")?;
+        Ok(())
+    }).unwrap();
+    store.observe_merge_request_source("w","main","work","source-b").unwrap();
+    store.observe_merge_request_source("w","main","other","other-source").unwrap();
+    for (workspace,mr,subject,accepted) in [
+        ("w","observed-mr","forged",false),
+        ("w","observed-mr","other-source",false),
+        ("w","other-mr","other-source",false),
+        ("other","observed-mr","source-b",false),
+        ("w","observed-mr","source-b",true),
+    ] {
+        let mut input = implementation_result_input();
+        input.merge_request = Some(server_api::MergeRequestReviewSubject {merge_request_id:mr.into(),subject_ref:subject.into()});
+        let result = store.record_implementation_result(workspace,"tracking",&input,&worker,"tracking-binding");
+        assert_eq!(result.is_ok(),accepted,"{workspace}/{mr}/{subject}: {result:?}");
+    }
+    store.with_conn(|conn| {
+        assert_eq!(conn.query_row("SELECT count(*) FROM merge_request_thread_events",[],|r|r.get::<_,i64>(0))?,0);
+        assert_eq!(conn.query_row("SELECT count(*) FROM ticket_implementation_results",[],|r|r.get::<_,i64>(0))?,1);
+        Ok(())
+    }).unwrap();
+}

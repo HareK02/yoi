@@ -70,7 +70,7 @@ impl SqliteWorkspaceStore {
             if let Some(mr) = &request.merge_request {
                 // References identify retained evidence, not a model's assertion that a branch
                 // is approved/current. Integration must resolve Git and reread the latest MR.
-                let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM merge_request_ticket_relations r JOIN merge_request_thread_events e ON e.workspace_id=r.workspace_id AND e.merge_request_id=r.merge_request_id WHERE r.workspace_id=?1 AND r.ticket_id=?2 AND r.merge_request_id=?3 AND (json_extract(e.payload_json,'$.subject_ref')=?4 OR json_extract(e.payload_json,'$.approved_source_ref')=?4))",params![workspace,ticket,mr.merge_request_id,mr.subject_ref],|r|r.get(0))?;
+                let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM merge_request_ticket_relations r WHERE r.workspace_id=?1 AND r.ticket_id=?2 AND r.merge_request_id=?3 AND (EXISTS(SELECT 1 FROM merge_request_thread_events e WHERE e.workspace_id=r.workspace_id AND e.merge_request_id=r.merge_request_id AND (json_extract(e.payload_json,'$.subject_ref')=?4 OR json_extract(e.payload_json,'$.approved_source_ref')=?4)) OR EXISTS(SELECT 1 FROM merge_request_source_observations o WHERE o.workspace_id=r.workspace_id AND o.merge_request_id=r.merge_request_id AND o.subject_ref=?4)))",params![workspace,ticket,mr.merge_request_id,mr.subject_ref],|r|r.get(0))?;
                 if !valid { return Err(Error::InvalidInput("MR/source reference does not identify retained evidence for this Ticket".into())); }
             }
             let result_id = uuid::Uuid::now_v7().to_string();

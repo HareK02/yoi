@@ -694,6 +694,17 @@ impl MergeRequestStore {
         &self,
         i: OpenMergeRequest,
     ) -> Result<MergeRequest, MergeRequestError> {
+        self.open_merge_request_with_evidence(i, |_| Ok(()))
+    }
+
+    /// Retain caller-owned evidence atomically with creation. The callback runs
+    /// after the MR and Ticket relation exist, under this store's transaction;
+    /// it must use that transaction rather than reacquire the store connection.
+    pub fn open_merge_request_with_evidence(
+        &self,
+        i: OpenMergeRequest,
+        retain_evidence: impl FnOnce(&Transaction<'_>) -> Result<(), MergeRequestError>,
+    ) -> Result<MergeRequest, MergeRequestError> {
         bounded_body("summary", &i.summary)?;
         for (n, v) in [
             ("merge_request_id", i.merge_request_id.as_str()),
@@ -756,6 +767,7 @@ impl MergeRequestStore {
                 None,
             )?
         }
+        retain_evidence(&t)?;
         t.commit()?;
         drop(c);
         self.get_by_id(&i.auth.workspace_id, &merge_request_id)

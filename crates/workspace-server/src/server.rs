@@ -17740,9 +17740,10 @@ async fn scoped_open_merge_request(
                 &repository_id,
                 &input.selector_to,
             )?;
-            let merge_request = merge_request_store(&api, &workspace_id)?.open_merge_request(
+            let merge_request_id = Uuid::now_v7().to_string();
+            let merge_request = merge_request_store(&api, &workspace_id)?.open_merge_request_with_evidence(
                 merge_request::OpenMergeRequest {
-                    merge_request_id: Uuid::now_v7().to_string(),
+                    merge_request_id: merge_request_id.clone(),
                     ticket_id,
                     repository_id: repository_id.clone(),
                     selector_from: input.selector_from,
@@ -17756,6 +17757,16 @@ async fn scoped_open_merge_request(
                         assignment_id: assignment.assignment_id,
                     },
                     now: Utc::now(),
+                },
+                |tx| {
+                    // The provider read preceded MR creation, so the general
+                    // recorder could not yet see this MR. Retain that exact read
+                    // before commit; a later first read must not erase this baseline.
+                    tx.execute(
+                        "INSERT INTO merge_request_source_observations(workspace_id,merge_request_id,subject_ref,previous_subject_ref,observed_at) VALUES(?1,?2,?3,NULL,?4)",
+                        rusqlite::params![workspace_id, merge_request_id, source_observation.resolved_ref, Utc::now().to_rfc3339()],
+                    )?;
+                    Ok(())
                 },
             )?;
             Ok(Json(public_merge_request(

@@ -322,8 +322,14 @@ pub(super) fn install(conn: &Connection) -> Result<()> {
 /// prove a typed result. MR input is an instruction to reread evidence, not approval.
 pub(super) fn install_business_events(conn: &Connection) -> Result<()> {
     conn.execute_batch(include_str!("implementation_result.sql"))?;
+    // Only identities retained by the typed event are actors. Cancellation and
+    // provider observations have no actor; never substitute the requester/reviewer.
+    let actor_path = "CASE NEW.kind WHEN 'review_requested' THEN '$.requested_by' WHEN 'review' THEN '$.reviewer' WHEN 'review_revoked' THEN '$.revoked_by' WHEN 'merge' THEN '$.merged_by' END";
+    let mr_actor = format!(
+        "'worker:' || json_extract(NEW.payload_json,({actor_path}) || '.runtime_id') || '/' || json_extract(NEW.payload_json,({actor_path}) || '.worker_id')"
+    );
     let mr = format!("INSERT OR IGNORE INTO notification_sources(workspace_id,ticket_id,input_event_id,role,assignment_id,kind,actor,event_index,facts_json)
- SELECT NEW.workspace_id,r.ticket_id,'mr-event:' || NEW.merge_request_id || ':' || NEW.event_id,roles.role,COALESCE(a.assignment_id,''),'mr_' || NEW.kind,NULL,NULL,
+ SELECT NEW.workspace_id,r.ticket_id,'mr-event:' || NEW.merge_request_id || ':' || NEW.event_id,roles.role,COALESCE(a.assignment_id,''),'mr_' || NEW.kind,{mr_actor},NULL,
  json_set({FACTS_SQL},'$.merge_request_id',NEW.merge_request_id,'$.event_id',NEW.event_id,'$.subject_ref',COALESCE(json_extract(NEW.payload_json,'$.subject_ref'),json_extract(NEW.payload_json,'$.approved_source_ref')),'$.request_event_id',json_extract(NEW.payload_json,'$.request_event_id'))
  FROM merge_request_ticket_relations r JOIN typed_tickets t ON t.workspace_id=r.workspace_id AND t.ticket_id=r.ticket_id
  CROSS JOIN (SELECT 'orchestrator' role UNION ALL SELECT 'worker') roles
@@ -331,7 +337,8 @@ pub(super) fn install_business_events(conn: &Connection) -> Result<()> {
  LEFT JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.assignment_id=c.assignment_id
  WHERE r.workspace_id=NEW.workspace_id AND r.merge_request_id=NEW.merge_request_id;");
     conn.execute_batch(&format!("CREATE TRIGGER notification_mr_event AFTER INSERT ON merge_request_thread_events WHEN NEW.kind!='comment' BEGIN {mr} END;"))?;
-    let source = mr.replace("'mr-event:' || NEW.merge_request_id || ':' || NEW.event_id", "'mr-source:' || NEW.merge_request_id || ':' || NEW.sequence")
+    let source = mr.replace(&mr_actor, "NULL")
+        .replace("'mr-event:' || NEW.merge_request_id || ':' || NEW.event_id", "'mr-source:' || NEW.merge_request_id || ':' || NEW.sequence")
         .replace("'mr_' || NEW.kind", "'mr_source_changed'")
         .replace("NEW.event_id", "NEW.sequence")
         .replace("COALESCE(json_extract(NEW.payload_json,'$.subject_ref'),json_extract(NEW.payload_json,'$.approved_source_ref'))", "NEW.subject_ref")
