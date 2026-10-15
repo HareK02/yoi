@@ -256,15 +256,22 @@ impl FsRuntimeStore {
     }
 
     pub(crate) fn delete_worker_record(&self, worker_id: &WorkerId) -> Result<(), RuntimeError> {
+        self.delete_worker_record_with_intent(
+            worker_id,
+            session_store::retention::SessionDeletionIntent::Ordinary,
+        )
+    }
+
+    pub(crate) fn delete_worker_record_with_intent(
+        &self,
+        worker_id: &WorkerId,
+        intent: session_store::retention::SessionDeletionIntent,
+    ) -> Result<(), RuntimeError> {
         let worker_dir = self.worker_dir(worker_id);
         if !worker_dir.exists() {
             return Ok(());
         }
-        fs::remove_dir_all(&worker_dir).map_err(|source| RuntimeError::StoreIo {
-            operation: "delete worker store",
-            path: worker_dir,
-            source,
-        })
+        crate::retention::delete_worker_aggregate(&self.root, &worker_dir, intent)
     }
 
     pub(crate) fn load_runtime_state(&self) -> Result<PersistedRuntimeState, RuntimeError> {

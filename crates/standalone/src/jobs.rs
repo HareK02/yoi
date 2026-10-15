@@ -157,6 +157,30 @@ impl StandaloneJobs {
         self.with_store(|store| store.unacknowledged())
     }
 
+    pub(crate) fn unknown_granted(&self) -> Result<Vec<JobSnapshot>, JobServiceError> {
+        self.with_store(|store| store.unknown_granted())
+    }
+
+    /// Release only an Unknown attempt's serialization reservation after the bound domain
+    /// has reconciled its receipts and durably fenced further effects. Never a generic retry.
+    pub(crate) fn reconcile_granted_attempt(
+        &self,
+        job_id: &str,
+        attempt_id: &str,
+        domain_receipt: &str,
+    ) -> Result<(), JobServiceError> {
+        let executions = self.executions.lock().expect("Job executions poisoned");
+        if executions.closed {
+            return Err(JobServiceError::Closed);
+        }
+        if executions.jobs.contains_key(job_id) {
+            return Err(JobServiceError::Cleanup(
+                "domain reconciliation requires observed execution cleanup".into(),
+            ));
+        }
+        self.with_store(|store| store.reconcile_granted_attempt(job_id, attempt_id, domain_receipt))
+    }
+
     /// Explicit new attempt, bounded by immutable intent limits. Unknown
     /// outcomes cannot be retried without domain reconciliation/new intent.
     pub fn retry(&self, job_id: &str) -> Result<JobSnapshot, JobServiceError> {

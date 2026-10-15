@@ -1,0 +1,6 @@
+import "./job.dcdl" // {
+    slug = "subjektiv-journal-recording";
+    description = "Host-bound sequential Journal recording Job.";
+    model = { ref = "codex-oauth/gpt-6-luna"; };
+    engine = { reasoning = "medium"; instruction = "internal.subjektiv_journal_system"; };
+}

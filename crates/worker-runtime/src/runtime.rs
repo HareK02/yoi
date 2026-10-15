@@ -3932,7 +3932,11 @@ impl Runtime {
         scope: &RuntimeWorkspaceScope,
         worker_ref: &WorkerRef,
     ) -> Result<WorkerDeleteResult, RuntimeError> {
-        self.delete_worker_with_scope(worker_ref, Some(scope))
+        self.delete_worker_with_scope(
+            worker_ref,
+            Some(scope),
+            session_store::retention::SessionDeletionIntent::Ordinary,
+        )
     }
 
     /// Delete a non-running Worker from Runtime state and persisted Worker storage.
@@ -3940,13 +3944,30 @@ impl Runtime {
         &self,
         worker_ref: &WorkerRef,
     ) -> Result<WorkerDeleteResult, RuntimeError> {
-        self.delete_worker_with_scope(worker_ref, None)
+        self.delete_worker_with_scope(
+            worker_ref,
+            None,
+            session_store::retention::SessionDeletionIntent::Ordinary,
+        )
+    }
+
+    /// A trusted Host must choose explicit erase intent separately from policy
+    /// Purge. This also permits finishing aggregate removal after source erasure.
+    #[cfg(feature = "fs-store")]
+    pub fn delete_worker_with_intent_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        worker_ref: &WorkerRef,
+        intent: session_store::retention::SessionDeletionIntent,
+    ) -> Result<WorkerDeleteResult, RuntimeError> {
+        self.delete_worker_with_scope(worker_ref, Some(scope), intent)
     }
 
     fn delete_worker_with_scope(
         &self,
         worker_ref: &WorkerRef,
         scope: Option<&RuntimeWorkspaceScope>,
+        intent: session_store::retention::SessionDeletionIntent,
     ) -> Result<WorkerDeleteResult, RuntimeError> {
         let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
         let _operation_guard = operation_lock
@@ -4002,7 +4023,17 @@ impl Runtime {
                 worker_ref.worker_id
             )));
         }
-        if state.delete_worker_record(&worker_ref.worker_id).is_err() {
+        #[cfg(feature = "fs-store")]
+        let deletion = match state.fs_store() {
+            Some(store) => store.delete_worker_record_with_intent(&worker_ref.worker_id, intent),
+            None => Ok(()),
+        };
+        #[cfg(not(feature = "fs-store"))]
+        let deletion = {
+            let _ = intent;
+            state.delete_worker_record(&worker_ref.worker_id)
+        };
+        if deletion.is_err() {
             state.record_worker_delete_persistence_failure(worker_ref);
             let _diagnostic_persistence = state.persist_runtime_snapshot();
             return Err(RuntimeError::WorkerDeletePersistenceFailed {
@@ -4773,6 +4804,245 @@ impl Runtime {
         )
     }
 
+    /// Retain only an authenticated source whose saved Session identity matches.
+    /// The existence check and pin publication share the physical deletion lock.
+    #[cfg(feature = "fs-store")]
+    pub fn pin_session_public_source_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        source: &runtime_api::SessionPublicSource,
+        expected_session_id: &str,
+        pin: session_store::retention::SessionRetentionPin,
+    ) -> Result<(), RuntimeError> {
+        let (root, _) = self.resolve_session_public_source(scope, source)?;
+        let session = expected_session_id
+            .parse::<session_store::SessionId>()
+            .map_err(|_| RuntimeError::InvalidRequest("Invalid Session identity".into()))?;
+        self.session_retention_store()?
+            .pin(session, pin, || {
+                let store = match session_store::WorkerSessionStore::open_read_only(&root) {
+                    Ok(store) => store,
+                    Err(session_store::StoreError::Io(error))
+                        if error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error),
+                };
+                Ok(store.session_id()? == Some(session))
+            })
+            .map_err(crate::retention::retention_error)
+    }
+
+    #[cfg(feature = "fs-store")]
+    pub fn release_session_public_source_pin_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        source: &runtime_api::SessionPublicSource,
+        expected_session_id: &str,
+        pin: session_store::retention::SessionRetentionPin,
+    ) -> Result<(), RuntimeError> {
+        let (root, _) = self.resolve_session_public_source(scope, source)?;
+        let session = expected_session_id
+            .parse::<session_store::SessionId>()
+            .map_err(|_| RuntimeError::InvalidRequest("Invalid Session identity".into()))?;
+        if session_store::WorkerSessionStore::open_read_only(&root)
+            .and_then(|store| store.session_id())
+            .map_err(crate::retention::retention_error)?
+            != Some(session)
+        {
+            return Err(RuntimeError::InvalidRequest(
+                "Session source identity mismatch".into(),
+            ));
+        }
+        self.session_retention_store()?
+            .release(session, pin)
+            .map_err(crate::retention::retention_error)
+    }
+
+    /// Physical source deletion is separate from Worker registration/lifecycle.
+    /// Only this explicit intent may invalidate pins and persist an erase fence;
+    /// a retention policy's Purge remains ordinary deletion.
+    #[cfg(feature = "fs-store")]
+    pub fn delete_session_public_source_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        source: &runtime_api::SessionPublicSource,
+        expected_session_id: &str,
+        intent: session_store::retention::SessionDeletionIntent,
+    ) -> Result<(), RuntimeError> {
+        let (root, archive) =
+            self.resolve_session_public_source_with_validation(scope, source, false)?;
+        let owner = match source {
+            runtime_api::SessionPublicSource::Retained { worker_id } => *worker_id,
+            runtime_api::SessionPublicSource::Archived { .. } => {
+                archive
+                    .as_ref()
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidRequest("Archive identity unavailable".into())
+                    })?
+                    .source_worker_id
+            }
+        };
+        let operation_lock = self.worker_operation_lock(owner)?;
+        let _operation_guard = operation_lock
+            .lock()
+            .map_err(|_| RuntimeError::StatePoisoned)?;
+        let state = self.lock()?;
+        if let Some(worker) = state.workers.get(&owner) {
+            if worker.workspace_id.as_deref() != Some(scope.workspace_id.as_str())
+                || worker.status != WorkerStatus::Stopped
+                || worker.pending_lifecycle_operation_name().is_some()
+            {
+                return Err(RuntimeError::InvalidRequest(
+                    "Session deletion requires a stopped, settled source Worker".into(),
+                ));
+            }
+        }
+        let store = state.fs_store().ok_or_else(|| {
+            RuntimeError::InvalidRequest("Session deletion requires filesystem storage".into())
+        })?;
+        let session = expected_session_id
+            .parse::<session_store::SessionId>()
+            .map_err(|_| RuntimeError::InvalidRequest("Invalid Session identity".into()))?;
+        let source_session = match archive.as_ref() {
+            Some(manifest) => manifest
+                .source_session_id
+                .parse::<session_store::SessionId>()
+                .ok(),
+            None => {
+                crate::retention::aggregate_session_id(root.parent().ok_or_else(|| {
+                    RuntimeError::InvalidRequest("Source root unavailable".into())
+                })?)?
+            }
+        };
+        if source_session != Some(session) {
+            return Err(RuntimeError::InvalidRequest(
+                "Session source identity mismatch".into(),
+            ));
+        }
+        crate::retention::runtime_session_retention(store.runtime_dir())
+            .delete(session, intent, || {
+                let saved = match archive.as_ref() {
+                    Some(manifest) => manifest
+                        .source_session_id
+                        .parse::<session_store::SessionId>()
+                        .ok(),
+                    None => crate::retention::aggregate_session_id(
+                        root.parent()
+                            .ok_or(session_store::StoreError::SessionSourceMissing(session))?,
+                    )
+                    .map_err(|error| {
+                        session_store::StoreError::Io(std::io::Error::other(error.to_string()))
+                    })?,
+                };
+                if saved != Some(session) {
+                    return Err(session_store::StoreError::SessionSourceMissing(session));
+                }
+                if intent == session_store::retention::SessionDeletionIntent::ErasePermanently {
+                    crate::retention::remove_archived_session_copies(store.runtime_dir(), session)?;
+                    let original = store
+                        .runtime_dir()
+                        .join("workers")
+                        .join(owner.to_string())
+                        .join("session");
+                    if original != root
+                        && original.is_dir()
+                        && session_store::WorkerSessionStore::open_read_only(&original)?
+                            .session_id()?
+                            == Some(session)
+                    {
+                        std::fs::remove_dir_all(original)?;
+                    }
+                }
+                match std::fs::remove_dir_all(&root) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error.into()),
+                }
+            })
+            .map_err(crate::retention::retention_error)
+    }
+
+    #[cfg(feature = "fs-store")]
+    pub fn session_material_catalog_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        request: &runtime_api::SessionMaterialCatalogRequest,
+    ) -> runtime_api::SessionMaterialCatalogAvailability {
+        crate::session_material::catalog(self, scope, request)
+    }
+
+    #[cfg(feature = "fs-store")]
+    pub fn session_material_read_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        request: &runtime_api::SessionMaterialReadRequest,
+    ) -> runtime_api::SessionMaterialReadAvailability {
+        crate::session_material::read(self, scope, request)
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn session_retention_store(
+        &self,
+    ) -> Result<session_store::retention::SessionRetentionStore, RuntimeError> {
+        let state = self.lock()?;
+        let store = state.fs_store().ok_or_else(|| {
+            RuntimeError::InvalidRequest("Session retention requires an fs-backed Runtime".into())
+        })?;
+        Ok(crate::retention::runtime_session_retention(
+            store.runtime_dir(),
+        ))
+    }
+
+    /// Resolve the Backend-selected source without exposing local storage paths.
+    /// The saved active pointer, never a caller-provided Segment, selects lineage.
+    #[cfg(feature = "fs-store")]
+    pub fn session_public_material_reader_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        source: &runtime_api::SessionPublicSource,
+        expected_session_id: &str,
+    ) -> Result<
+        session_store::public_material::SessionPublicMaterialReader,
+        crate::worker_backend::SessionMaterialSourceError,
+    > {
+        use crate::worker_backend::SessionMaterialSourceError::Source;
+        use session_store::public_material::{PublicMaterialLimits, SessionPublicMaterialReader};
+        let (session_root, archive) = self
+            .resolve_session_public_source(scope, source)
+            .map_err(|error| Source(error.to_string()))?;
+        let reader = match (source, archive) {
+            (runtime_api::SessionPublicSource::Retained { worker_id }, None) => {
+                crate::worker_backend::open_session_public_material_reader(
+                    session_root.parent().ok_or("Session root is unavailable")?,
+                    &scope.workspace_id,
+                    &WorkerRef::new(*worker_id),
+                    expected_session_id,
+                )?
+            }
+            (runtime_api::SessionPublicSource::Archived { .. }, Some(manifest)) => {
+                if manifest.source_session_id != expected_session_id {
+                    return Err(Source("Archive Session identity mismatch".into()));
+                }
+                SessionPublicMaterialReader::open_worker_with_retention(
+                    &session_root,
+                    manifest
+                        .source_active_segment_id
+                        .ok_or("Archive has no canonical active Segment")?,
+                    PublicMaterialLimits::default(),
+                    self.session_retention_store()
+                        .map_err(|error| Source(error.to_string()))?,
+                )?
+            }
+            _ => return Err(Source("Session source is unavailable".into())),
+        };
+        if reader.session_id().to_string() != expected_session_id {
+            return Err(Source("Session identity mismatch".into()));
+        }
+        Ok(reader)
+    }
+
     /// Search the committed public projection of one Backend-selected retained
     /// Session or verified archive without restoring a Worker.
     #[cfg(feature = "fs-store")]
@@ -4845,6 +5115,22 @@ impl Runtime {
         ),
         RuntimeError,
     > {
+        self.resolve_session_public_source_with_validation(scope, source, true)
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn resolve_session_public_source_with_validation(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        source: &runtime_api::SessionPublicSource,
+        verify_archive: bool,
+    ) -> Result<
+        (
+            std::path::PathBuf,
+            Option<crate::retention::WorkerSessionArchiveManifest>,
+        ),
+        RuntimeError,
+    > {
         let state = self.lock()?;
         let store = state.fs_store().ok_or_else(|| {
             RuntimeError::InvalidRequest(
@@ -4876,7 +5162,11 @@ impl Runtime {
                     )
                 })?;
                 let provider = FsWorkerRetentionProvider::new(store.runtime_dir());
-                let (manifest, session_root) = provider.session_archive(archive_id)?;
+                let (manifest, session_root) = if verify_archive {
+                    provider.session_archive(archive_id)?
+                } else {
+                    provider.session_archive_identity(archive_id)?
+                };
                 if manifest.workspace_id != scope.workspace_id
                     || manifest.source_runtime_id != runtime_id
                 {
@@ -4921,6 +5211,10 @@ impl Runtime {
         &self,
         request: &WorkerRetentionExecutionRequest,
     ) -> Result<WorkerRetentionExecutionResult, RuntimeError> {
+        let operation_lock = self.worker_operation_lock(request.worker_id)?;
+        let _operation_guard = operation_lock
+            .lock()
+            .map_err(|_| RuntimeError::StatePoisoned)?;
         let mut state = self.lock()?;
         let runtime_id = state.runtime_identity.clone().ok_or_else(|| {
             RuntimeError::InvalidRequest(
@@ -6451,7 +6745,8 @@ fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), R
             .validate()
             .map_err(|message| RuntimeError::InvalidRequest(message.into()))?;
         if request.workspace_api.is_none()
-            || (binding.subjektiv_consolidation && !request.subjektiv_attached)
+            || ((binding.subjektiv_consolidation || binding.subjektiv_journal)
+                && !request.subjektiv_attached)
         {
             return Err(RuntimeError::InvalidRequest("Backend Job capability requires Workspace authority and consolidation requires trusted subject attachment".into()));
         }
@@ -7302,6 +7597,7 @@ mod tests {
             attempt_id: "attempt-1".into(),
             input_digest: Some(format!("sha256:{}", "a".repeat(64))),
             subjektiv_consolidation: false,
+            subjektiv_journal: false,
         });
         let owner = scope("local", "server-job-test");
         let created = runtime
@@ -7351,6 +7647,7 @@ mod tests {
             attempt_id: "attempt-1".into(),
             input_digest: None,
             subjektiv_consolidation: true,
+            subjektiv_journal: false,
         });
         assert!(validate_create_worker_request(&request).is_err());
         request.workspace_api = Some(WorkspaceApiRef {

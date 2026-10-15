@@ -88,6 +88,7 @@ mod tests {
         ToolResultSummary {
             call_id: "tool-1".to_string(),
             tool_name: name.to_string(),
+            arguments: serde_json::json!({}),
             is_error,
             output: ToolOutput {
                 summary: "result".to_string(),

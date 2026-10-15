@@ -56,9 +56,17 @@ struct SealedResult {
 }
 
 #[derive(Clone)]
+struct ResultFinalizer {
+    finalizer: Arc<dyn crate::job::JobResultFinalizer>,
+    manifest: manifest::WorkerManifest,
+    client: Box<dyn agen::llm_client::LlmClient>,
+}
+
+#[derive(Clone)]
 struct SubmitResultTool {
     client: Arc<dyn WorkspaceClient>,
     surface: Option<SubjektivSurfaceLifecycleFeature>,
+    finalizer: Option<ResultFinalizer>,
     submission: Arc<tokio::sync::Mutex<ResultSubmissionState>>,
     active: Arc<Mutex<HashMap<String, BackgroundTaskCancellation>>>,
 }
@@ -80,8 +88,7 @@ impl Drop for ActiveResultGuard {
 
 fn cancelled_output() -> ToolError {
     ToolError::Cancelled(ToolOutput {
-        summary: "Job result submission cancelled; committed candidate decisions are preserved"
-            .into(),
+        summary: "Job result submission cancelled; saved domain operations are preserved".into(),
         content: None,
         attachments: Vec::new(),
     })
@@ -156,6 +163,17 @@ impl Tool for SubmitResultTool {
                     })?;
                 submission.reusable_surface = Some(outcome.clone());
                 object.insert("surface".into(), outcome);
+            }
+            if let Some(finalizer) = &self.finalizer {
+                result = finalizer
+                    .finalizer
+                    .finalize(
+                        result,
+                        finalizer.manifest.clone(),
+                        finalizer.client.clone_boxed(),
+                        cancellation.clone(),
+                    )
+                    .await?;
             }
             result
         };
@@ -238,6 +256,7 @@ impl Tool for SubmitResultTool {
 fn definition(
     client: Arc<dyn WorkspaceClient>,
     surface: Option<SubjektivSurfaceLifecycleFeature>,
+    finalizer: Option<ResultFinalizer>,
 ) -> ToolDefinition {
     let submission = Arc::new(tokio::sync::Mutex::new(ResultSubmissionState::default()));
     let active = Arc::new(Mutex::new(HashMap::new()));
@@ -255,6 +274,7 @@ fn definition(
             Arc::new(SubmitResultTool {
                 client: client.clone(),
                 surface: surface.clone(),
+                finalizer: finalizer.clone(),
                 submission: submission.clone(),
                 active: active.clone(),
             }) as Arc<dyn Tool>,
@@ -266,6 +286,7 @@ fn definition(
 pub struct BackendJobResultFeature {
     client: Arc<dyn WorkspaceClient>,
     surface: Option<SubjektivSurfaceLifecycleFeature>,
+    finalizer: Option<ResultFinalizer>,
 }
 
 impl BackendJobResultFeature {
@@ -273,11 +294,28 @@ impl BackendJobResultFeature {
         Self {
             client,
             surface: None,
+            finalizer: None,
         }
     }
 }
 
 impl BackendJobResultFeature {
+    pub(crate) fn with_finalizer(
+        mut self,
+        finalizer: Arc<dyn crate::job::JobResultFinalizer>,
+        manifest: manifest::WorkerManifest,
+        client: Box<dyn agen::llm_client::LlmClient>,
+    ) -> std::io::Result<Self> {
+        finalizer
+            .validate_profile(&manifest)
+            .map_err(std::io::Error::other)?;
+        self.finalizer = Some(ResultFinalizer {
+            finalizer,
+            manifest,
+            client,
+        });
+        Ok(self)
+    }
     pub(crate) fn with_surface(mut self, surface: SubjektivSurfaceLifecycleFeature) -> Self {
         self.surface = Some(surface);
         self
@@ -294,7 +332,11 @@ impl FeatureModule for BackendJobResultFeature {
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
         context.tools().register(ToolContribution::new(
             TOOL_NAME,
-            definition(self.client.clone(), self.surface.clone()),
+            definition(
+                self.client.clone(),
+                self.surface.clone(),
+                self.finalizer.clone(),
+            ),
         ))
     }
 }
@@ -364,7 +406,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_before_execution_never_submits_a_result() {
         let client = Arc::new(RecordingClient::default());
-        let (_, tool) = definition(client.clone(), None)();
+        let (_, tool) = definition(client.clone(), None, None)();
         let context = ToolExecutionContext::new("result-call", "batch", 0);
         tool.cancel_execution(&context).await.unwrap();
         let outcome = tool.execute(r#"{"result":{"valid":true}}"#, context).await;

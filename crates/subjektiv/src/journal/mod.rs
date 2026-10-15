@@ -37,9 +37,14 @@
 //! Hosts resuming at the processing cursor can use a bounded source point lookup instead of
 //! traversing already reflected pages. Receipt/entry keysets remain append-stable.
 
+mod lifecycle;
+pub(crate) use lifecycle::migrate as migrate_lifecycle;
+pub mod recording;
+pub mod service;
 mod store;
 #[cfg(test)]
 mod tests;
+pub mod transport;
 
 use crate::{SubjectSessionAttribution, SubjektivStore, api::JobAttemptBinding};
 use feature_storage::FeatureStorageError;
@@ -134,6 +139,27 @@ impl JournalJobContext {
             binding,
         };
         store.validate_journal_job(&context)?;
+        Ok(context)
+    }
+
+    /// Reconstructs a retained binding for exact completion/receipt recovery. Hosts still check
+    /// the external attempt lease. New record/checkpoint operations independently require an
+    /// active generation inside their transaction, so this never revives cancelled authority.
+    pub fn validated_recovery(
+        store: &SubjektivStore,
+        host: &JournalHostContext,
+        generation_id: &str,
+        binding: JobAttemptBinding,
+    ) -> JournalResult<Self> {
+        let context = Self {
+            host: host.clone(),
+            generation_id: generation_id.into(),
+            binding,
+        };
+        store.database.try_with_connection(|tx| {
+            self::store::job(store, tx, &context, false)?;
+            Ok::<_, JournalError>(())
+        })?;
         Ok(context)
     }
 }

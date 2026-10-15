@@ -7,6 +7,12 @@
 pub use crate::feature::builtin::memory::SubjektivConsolidationToolsFeature;
 pub use crate::feature::builtin::memory_surface_lifecycle::SubjektivSurfaceLifecycleFeature;
 
+pub use crate::feature::builtin::journal::{
+    JournalJobFinalizer, JournalJobHost, JournalJobToolsFeature, JournalRecordingFeature,
+};
+pub use subjektiv::journal::transport;
+use transport::{JournalRecordingReason, JournalRecordingRequest, JournalRecordingResponse};
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,6 +66,19 @@ impl From<SubjektivHostError> for ToolError {
 /// identifier is not a grant. No method grants ambient filesystem access.
 pub trait SubjektivHost: Send + Sync + 'static {
     fn settings(&self) -> SubjektivHostSettings;
+    /// Recording admission is separate from both Memory and Journal Job operation grants.
+    fn journal_recording_granted(&self) -> bool {
+        false
+    }
+    fn request_journal_recording(
+        &self,
+        _context: &SubjektivHostContext,
+        _reason: JournalRecordingReason,
+    ) -> Result<JournalRecordingResponse, SubjektivHostError> {
+        Err(SubjektivHostError::Unavailable(
+            "Journal recording not granted".into(),
+        ))
+    }
     /// Separate explicit grant for decision/surface execution; Profile policy
     /// alone must never authorize consolidation tools.
     fn consolidation_granted(&self) -> bool {
@@ -188,6 +207,33 @@ fn decode<T: serde::de::DeserializeOwned>(
 }
 
 impl SubjektivHost for BackendSubjektivHost {
+    fn journal_recording_granted(&self) -> bool {
+        // This adapter exists only for explicitly enabled, authenticated Host connections.
+        // The Backend still verifies the main Worker/Subject binding on every request.
+        true
+    }
+    fn request_journal_recording(
+        &self,
+        _context: &SubjektivHostContext,
+        reason: JournalRecordingReason,
+    ) -> Result<JournalRecordingResponse, SubjektivHostError> {
+        if !self.journal_recording_granted() {
+            return Err(SubjektivHostError::Unavailable(
+                "Journal recording not granted".into(),
+            ));
+        }
+        let request = WorkspaceRequest::json(
+            WorkspaceRequestMethod::Post,
+            format!("/api/w/{}/subjektiv/journal/recording", self.workspace_id),
+            serde_json::to_string(&JournalRecordingRequest { reason })
+                .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?,
+        );
+        decode(
+            self.client
+                .execute(request)
+                .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?,
+        )
+    }
     fn settings(&self) -> SubjektivHostSettings {
         SubjektivHostSettings {
             language: self.settings.language.clone(),
@@ -289,6 +335,79 @@ impl SubjektivHost for BackendSubjektivHost {
             candidate_count: response.candidate_count,
             total_bytes: response.total_bytes,
         })
+    }
+}
+
+/// Authenticated Backend Journal Job adapter, issued only from an explicit Host binding.
+/// The Backend resolves Subject, Journal, generation and current attempt from that
+/// authenticated Worker; no identity is copied into model input or request bodies.
+pub struct BackendJournalJobHost {
+    client: Arc<dyn WorkspaceClient>,
+    workspace_id: String,
+}
+impl BackendJournalJobHost {
+    pub fn new(
+        client: Arc<dyn WorkspaceClient>,
+        binding: &crate::BackendJobExecutionBinding,
+    ) -> std::io::Result<Self> {
+        binding.validate().map_err(std::io::Error::other)?;
+        if !binding.subjektiv_journal || !client.is_available() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Journal Job requires explicit Host grant and available Backend authority",
+            ));
+        }
+        let workspace_id = client
+            .workspace_id()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Journal Job requires authenticated Workspace identity",
+                )
+            })?
+            .to_string();
+        Ok(Self {
+            client,
+            workspace_id,
+        })
+    }
+    pub fn into_grant(self) -> crate::job::JobFeatureGrant {
+        let host = Arc::new(self);
+        crate::job::JobFeatureGrant {
+            features: crate::feature::FeatureRegistryBuilder::new()
+                .with_module(JournalJobToolsFeature::new(host.clone())),
+            satisfied_requirements: vec![],
+            finalizer: Some(Arc::new(JournalJobFinalizer::new(host))),
+        }
+    }
+    fn post<T: serde::de::DeserializeOwned>(
+        &self,
+        suffix: &str,
+        body: String,
+    ) -> Result<T, SubjektivHostError> {
+        decode(
+            self.client
+                .execute(WorkspaceRequest::json(
+                    WorkspaceRequestMethod::Post,
+                    format!("/api/w/{}/subjektiv/journal/job{suffix}", self.workspace_id),
+                    body,
+                ))
+                .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?,
+        )
+    }
+}
+impl JournalJobHost for BackendJournalJobHost {
+    fn execute(
+        &self,
+        request: transport::JournalJobRequest,
+    ) -> Result<transport::JournalJobResponse, SubjektivHostError> {
+        let body = serde_json::to_string(&request)
+            .map_err(|error| SubjektivHostError::InvalidArgument(error.to_string()))?;
+        self.post("", body)
+    }
+    fn finish(&self) -> Result<transport::JournalJobCompletion, SubjektivHostError> {
+        self.post("/finish", "{}".into())
     }
 }
 
@@ -429,8 +548,27 @@ mod tests {
     struct LocalHost {
         contexts: Mutex<Vec<SubjektivHostContext>>,
         attributed: Mutex<Vec<(SubjektivHostContext, bool)>>,
+        journal_observer:
+            Option<Arc<dyn Fn(&SubjektivHostContext, JournalRecordingReason) + Send + Sync>>,
     }
     impl SubjektivHost for LocalHost {
+        fn journal_recording_granted(&self) -> bool {
+            self.journal_observer.is_some()
+        }
+        fn request_journal_recording(
+            &self,
+            context: &SubjektivHostContext,
+            reason: JournalRecordingReason,
+        ) -> Result<JournalRecordingResponse, SubjektivHostError> {
+            if let Some(observer) = &self.journal_observer {
+                observer(context, reason);
+                Ok(JournalRecordingResponse::Accepted)
+            } else {
+                Err(SubjektivHostError::Unavailable(
+                    "test Host did not grant Journal recording".into(),
+                ))
+            }
+        }
         fn settings(&self) -> SubjektivHostSettings {
             SubjektivHostSettings {
                 language: "English".into(),
@@ -519,6 +657,266 @@ mod tests {
                 })),
             ])))
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct TaskScriptClient(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait]
+    impl LlmClient for TaskScriptClient {
+        fn clone_boxed(&self) -> Box<dyn LlmClient> {
+            Box::new(self.clone())
+        }
+        async fn stream(
+            &self,
+            _: Request,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, ClientError>> + Send>>, ClientError>
+        {
+            let step = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let call = match step {
+                0 => Some((
+                    "create",
+                    "TaskCreate",
+                    r#"{"subject":"verify boundary","description":"persist before admission"}"#,
+                )),
+                1 => Some((
+                    "failed",
+                    "TaskUpdate",
+                    r#"{"taskid":999,"status":"completed"}"#,
+                )),
+                2 => Some((
+                    "progress",
+                    "TaskUpdate",
+                    r#"{"taskid":1,"status":"inprogress"}"#,
+                )),
+                3 => Some((
+                    "complete",
+                    "TaskUpdate",
+                    r#"{"taskid":1,"status":"completed"}"#,
+                )),
+                _ => None,
+            };
+            if step > 4 {
+                return Err(ClientError::Config("scripted interruption".into()));
+            }
+            let mut events = if let Some((id, name, input)) = call {
+                vec![
+                    LlmEvent::tool_use_start(0, id, name),
+                    LlmEvent::tool_input_delta(0, input),
+                    LlmEvent::tool_use_stop(0),
+                ]
+            } else {
+                vec![
+                    LlmEvent::text_block_start(0),
+                    LlmEvent::text_delta(0, "Done."),
+                    LlmEvent::text_block_stop(0, None),
+                ]
+            };
+            events.push(LlmEvent::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }));
+            Ok(Box::pin(futures_util::stream::iter(
+                events.into_iter().map(Ok),
+            )))
+        }
+    }
+
+    // Integration boundary: real Bootstrap/controller, Task tools, Agen, annotation writer,
+    // and FsStore. Only the external Journal Host and LLM transport are replaced.
+    #[tokio::test]
+    async fn journal_task_admission_observes_saved_success_before_run_finishes_and_each_run_requests()
+     {
+        use session_store::{LogEntry, LoggedItem, Store};
+        let temp = tempfile::tempdir().unwrap();
+        let _sandbox =
+            crate::runtime::worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
+        let mut manifest = WorkerManifest::from_toml(&format!(
+            r#"
+[worker]
+name = "journal-boundary-{}"
+[model]
+scheme = "anthropic"
+model_id = "scripted-model"
+[engine]
+[scope]
+allow = []
+[feature.task]
+enabled = true
+"#,
+            uuid::Uuid::now_v7()
+        ))
+        .unwrap();
+        manifest.feature.subjektiv.profile.enabled = true;
+        manifest.feature.subjektiv.profile.extraction.enabled = false;
+        let store = CombinedStore::new(
+            FsStore::new(temp.path().join("sessions")).unwrap(),
+            FsWorkerStore::new(temp.path().join("workers")).unwrap(),
+        );
+        let read_store = store.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let host = Arc::new(LocalHost {
+            journal_observer: Some(Arc::new(move |context, reason| {
+                let session_id = context.session_id.parse().unwrap();
+                let logs = read_store
+                    .list_segments(session_id)
+                    .unwrap()
+                    .into_iter()
+                    .flat_map(|segment| read_store.read_all(session_id, segment).unwrap())
+                    .collect::<Vec<_>>();
+                let complete_saved = logs.iter().any(|entry| matches!(entry,
+                    LogEntry::AnnotatedToolResult { entry, .. }
+                    if matches!(&entry.item, LoggedItem::ToolResult { call_id, is_error: false, .. } if call_id == "complete")));
+                tx.send((reason, complete_saved)).unwrap();
+            })),
+            ..LocalHost::default()
+        });
+        let prepared = WorkerBootstrap::new(
+            manifest,
+            store,
+            crate::PromptCatalogSource::builtins_only(),
+            WorkerWorkspaceContext::local_filesystem(None),
+            WorkerFilesystemAuthority::None,
+            WorkerBootstrapLayout::Direct {
+                runtime_base: temp.path().join("runtime"),
+                bash_output_dir: temp.path().join("bash-output"),
+            },
+            WorkerControllerTransport::InProcess,
+        )
+        .with_model_client(TaskScriptClient::default())
+        .with_subjektiv_host(host)
+        .prepare()
+        .await
+        .unwrap();
+        let controller = prepared.start().await.unwrap();
+        controller
+            .handle
+            .send(Method::submit_text(
+                protocol::new_submission_request_id(),
+                "Use the task tools.",
+            ))
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first,
+            (JournalRecordingReason::TaskCompleted, true),
+            "Task failed/inprogress must not request admission; completed result must already be saved"
+        );
+        let second = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second, (JournalRecordingReason::RunCommitted, true));
+        controller
+            .handle
+            .send(Method::submit_text(
+                protocol::new_submission_request_id(),
+                "Short interrupted turn.",
+            ))
+            .await
+            .unwrap();
+        let third = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            third.0,
+            JournalRecordingReason::RunCommitted,
+            "interrupted short runs also request Host reconciliation"
+        );
+        controller
+            .handle
+            .send(Method::Shutdown {
+                command: protocol::WorkerCommandEnvelope::new(1),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), controller.shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        controller.controller_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn journal_boundaries_request_without_threshold_and_only_compact_rewrite_requests() {
+        use crate::hook::*;
+        let reasons = Arc::new(Mutex::new(Vec::new()));
+        let observed = reasons.clone();
+        let host = Arc::new(LocalHost {
+            journal_observer: Some(Arc::new(move |_, reason| {
+                observed.lock().unwrap().push(reason);
+            })),
+            ..LocalHost::default()
+        });
+        let connection = SubjektivHostConnection::new(
+            host,
+            SubjektivHostContext {
+                worker_id: "worker".into(),
+                session_id: "session".into(),
+            },
+        )
+        .unwrap();
+        let feature = JournalRecordingFeature::new(connection).unwrap();
+        for exit in [
+            RunCommittedExit::Finished,
+            RunCommittedExit::Interrupted,
+            RunCommittedExit::Paused,
+            RunCommittedExit::Yielded,
+        ] {
+            <JournalRecordingFeature as Hook<RunCommitted>>::call(
+                &feature,
+                &RunCommittedContext {
+                    invocation: HookInvocationContext::default(),
+                    exit,
+                    committed_history: HookHistoryRange::default(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        for kind in [
+            SessionRewriteKind::Rewind,
+            SessionRewriteKind::Compact,
+            SessionRewriteKind::Fork,
+            SessionRewriteKind::Restore,
+        ] {
+            assert_eq!(
+                <JournalRecordingFeature as Hook<BeforeSessionRewrite>>::call(
+                    &feature,
+                    &BeforeSessionRewriteContext {
+                        invocation: HookInvocationContext::default(),
+                        kind,
+                        current_history: HookHistoryRange::default(),
+                    }
+                )
+                .await
+                .unwrap(),
+                BeforeSessionRewriteAction::Continue
+            );
+        }
+        <JournalRecordingFeature as Hook<WorkerRestored>>::call(
+            &feature,
+            &WorkerRestoredContext::new(
+                HookInvocationContext::default(),
+                RestoreSystemItemAppendHandle::new(Arc::default()),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *reasons.lock().unwrap(),
+            vec![
+                JournalRecordingReason::RunCommitted,
+                JournalRecordingReason::RunCommitted,
+                JournalRecordingReason::RunCommitted,
+                JournalRecordingReason::RunCommitted,
+                JournalRecordingReason::BeforeCompact,
+                JournalRecordingReason::WorkerRestored,
+            ]
+        );
     }
 
     async fn launch_case(enabled: bool, attach: bool) {

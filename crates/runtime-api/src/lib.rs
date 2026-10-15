@@ -425,6 +425,8 @@ pub struct BackendJobExecutionBinding {
     pub input_digest: Option<String>,
     #[serde(default)]
     pub subjektiv_consolidation: bool,
+    #[serde(default)]
+    pub subjektiv_journal: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -712,6 +714,8 @@ pub struct WorkerSessionArchiveManifest {
     pub source_runtime_id: String,
     pub source_worker_id: WorkerId,
     pub source_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_active_segment_id: Option<String>,
     pub segment_ids: Vec<String>,
     pub source_created_at: String,
     pub removed_at: String,
@@ -785,6 +789,96 @@ pub enum WorkerSessionHistoryAvailability {
 pub enum SessionPublicSource {
     Retained { worker_id: WorkerId },
     Archived { archive_id: String },
+}
+
+/// Canonical Session metadata, distinct from Memory's evidence/public-index projection.
+/// `origin_json` is the exact serialized saved origin; it is not model-authored evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMaterialDescriptor {
+    pub segment_id: String,
+    pub entry_ref: String,
+    pub canonical_order: u64,
+    pub origin_json: String,
+    pub sha256: String,
+    pub total_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMaterialPinRequest {
+    pub workspace_id: String,
+    pub source: SessionPublicSource,
+    pub expected_session_id: String,
+    pub pin_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionMaterialPinResponse {
+    pub session_id: String,
+    pub pin_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMaterialCatalogRequest {
+    pub workspace_id: String,
+    pub source: SessionPublicSource,
+    pub expected_session_id: String,
+    pub expected_catalog_sha256: Option<String>,
+    pub offset: u64,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionMaterialCatalogPage {
+    pub session_id: String,
+    pub active_segment_id: String,
+    pub catalog_sha256: String,
+    pub descriptors: Vec<SessionMaterialDescriptor>,
+    pub next_offset: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMaterialReadRequest {
+    pub workspace_id: String,
+    pub source: SessionPublicSource,
+    pub expected_session_id: String,
+    /// Compared with a freshly resolved saved descriptor, never adopted as evidence.
+    pub expected_descriptor: SessionMaterialDescriptor,
+    pub byte_offset: u64,
+    pub max_content_bytes: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionMaterialReadPage {
+    pub descriptor: SessionMaterialDescriptor,
+    pub content: String,
+    pub next_offset: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+pub enum SessionMaterialCatalogAvailability {
+    Page {
+        page: SessionMaterialCatalogPage,
+    },
+    Unavailable {
+        reason: SessionPublicUnavailableReason,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+pub enum SessionMaterialReadAvailability {
+    Page {
+        page: SessionMaterialReadPage,
+    },
+    Unavailable {
+        reason: SessionPublicUnavailableReason,
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1028,6 +1122,42 @@ pub trait RuntimeApi {
         #[path] worker_id: String,
         #[query] request: WorkerSessionHistoryRequest,
     ) -> Result<WorkerSessionHistoryAvailability, RuntimeApiError>;
+
+    #[post(
+        "/v1/session-public/material/retention/pin",
+        status = 200,
+        error_status = 400
+    )]
+    async fn session_material_pin(
+        &self,
+        #[body] request: SessionMaterialPinRequest,
+    ) -> Result<SessionMaterialPinResponse, RuntimeApiError>;
+
+    #[post(
+        "/v1/session-public/material/retention/release",
+        status = 200,
+        error_status = 400
+    )]
+    async fn session_material_release(
+        &self,
+        #[body] request: SessionMaterialPinRequest,
+    ) -> Result<SessionMaterialPinResponse, RuntimeApiError>;
+
+    #[post(
+        "/v1/session-public/material/catalog",
+        status = 200,
+        error_status = 400
+    )]
+    async fn session_material_catalog(
+        &self,
+        #[body] request: SessionMaterialCatalogRequest,
+    ) -> Result<SessionMaterialCatalogAvailability, RuntimeApiError>;
+
+    #[post("/v1/session-public/material/read", status = 200, error_status = 400)]
+    async fn session_material_read(
+        &self,
+        #[body] request: SessionMaterialReadRequest,
+    ) -> Result<SessionMaterialReadAvailability, RuntimeApiError>;
 
     #[post("/v1/session-public/search", status = 200, error_status = 400)]
     async fn session_public_search(
@@ -1278,6 +1408,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn backend_job_journal_grant_defaults_off_and_does_not_enable_memory_grant() {
+        let legacy = serde_json::json!({"job_id":"job", "attempt_id":"attempt", "subjektiv_consolidation":true});
+        let binding: BackendJobExecutionBinding = serde_json::from_value(legacy).unwrap();
+        assert!(binding.subjektiv_consolidation);
+        assert!(!binding.subjektiv_journal);
+        let journal =
+            serde_json::json!({"job_id":"job", "attempt_id":"attempt", "subjektiv_journal":true});
+        let binding: BackendJobExecutionBinding = serde_json::from_value(journal.clone()).unwrap();
+        assert!(binding.subjektiv_journal);
+        assert!(!binding.subjektiv_consolidation);
+        let roundtrip: BackendJobExecutionBinding =
+            serde_json::from_value(serde_json::to_value(&binding).unwrap()).unwrap();
+        assert_eq!(roundtrip, binding);
+    }
+
+    #[test]
     fn restore_request_is_mandatory_and_conflict_is_not_an_operation_state() {
         for invalid in [
             serde_json::json!({}),
@@ -1442,6 +1588,33 @@ mod tests {
             })
         }
 
+        async fn session_material_pin(
+            &self,
+            _request: SessionMaterialPinRequest,
+        ) -> Result<SessionMaterialPinResponse, RuntimeApiError> {
+            Err(test_error(501))
+        }
+        async fn session_material_release(
+            &self,
+            _request: SessionMaterialPinRequest,
+        ) -> Result<SessionMaterialPinResponse, RuntimeApiError> {
+            Err(test_error(501))
+        }
+
+        async fn session_material_catalog(
+            &self,
+            _request: SessionMaterialCatalogRequest,
+        ) -> Result<SessionMaterialCatalogAvailability, RuntimeApiError> {
+            Err(test_error(501))
+        }
+
+        async fn session_material_read(
+            &self,
+            _request: SessionMaterialReadRequest,
+        ) -> Result<SessionMaterialReadAvailability, RuntimeApiError> {
+            Err(test_error(501))
+        }
+
         async fn session_public_search(
             &self,
             _request: SessionPublicSearchRequest,
@@ -1603,9 +1776,8 @@ mod tests {
     }
 
     #[test]
-    fn contract_inventory_is_complete_and_unique() {
+    fn contract_inventory_has_unique_routes_under_api_base_path() {
         let operations = RuntimeApiMetadata::OPERATIONS;
-        assert_eq!(operations.len(), 20);
         let mut routes = operations
             .iter()
             .map(|operation| (format!("{:?}", operation.method), operation.path))

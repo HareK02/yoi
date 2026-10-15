@@ -27,6 +27,7 @@
 use subjektiv::api::*;
 mod backend_job_profile;
 mod subjektiv_job;
+mod subjektiv_journal;
 mod worker_operations;
 mod worker_protocol;
 pub(crate) use worker_operations::{
@@ -1650,6 +1651,7 @@ pub struct WorkspaceApi {
         Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<Mutex<OrchestratorAttentionState>>>>>,
     notification_delivery_lifecycle: Arc<notification_delivery::NotificationDeliveryLifecycle>,
     backend_job_drain_requests: Arc<AtomicU64>,
+    journal_dispatch_owner: Option<Arc<WorkspaceApi>>,
     observation_proxy: BackendObservationProxy,
     runtime_subscription_broker: RuntimeSubscriptionBroker,
     pub(crate) worker_projection: Arc<crate::worker_projection::WorkerProjectionService>,
@@ -1728,6 +1730,9 @@ impl ServerApiContractService {
 #[derive(Clone)]
 struct WorkerRemovalService {
     workspace_id: String,
+    journal_storage: crate::WorkspaceFeatureStorage,
+    journal_registration: crate::RegisteredFeature,
+    journal_dispatch_api: Weak<WorkspaceApi>,
     store: Arc<dyn ControlPlaneStore>,
     host_executors: HostExecutors,
     runtime: Weak<RuntimeRegistry>,
@@ -1742,6 +1747,12 @@ impl WorkerRemovalService {
     fn new(api: &WorkspaceApi) -> Self {
         Self {
             workspace_id: api.config.workspace_id.clone(),
+            journal_storage: api.feature_storage.clone(),
+            journal_registration: api.subjektiv_registration.clone(),
+            journal_dispatch_api: api
+                .journal_dispatch_owner
+                .as_ref()
+                .map_or_else(Weak::new, Arc::downgrade),
             store: api.store.clone(),
             host_executors: api.host_executors.clone(),
             runtime: Arc::downgrade(&api.runtime),
@@ -1877,6 +1888,13 @@ impl WorkerRemovalService {
         target: &RuntimeWorkerRef,
         prepared: crate::retention::PreparedWorkerRemoval,
     ) -> std::result::Result<worker::WorkspaceResponse, String> {
+        if let Err(error) = subjektiv_journal::validate_removal_retention(self, target, &prepared) {
+            return Ok(worker_remove_error_response(
+                StatusCode::CONFLICT,
+                "journal_retention_unconfirmed",
+                &error.to_string(),
+            ));
+        }
         let result =
             match runtime.execute_worker_retention(target, prepared.runtime_request.clone()) {
                 Ok(result) => result,
@@ -1898,7 +1916,10 @@ impl WorkerRemovalService {
                 )
                 .map(|commit| ((), commit.catalog))
         }) {
-            Ok(()) => Ok(worker_remove_success_response(target)),
+            Ok(()) => {
+                subjektiv_journal::after_worker_removal(self, &result);
+                Ok(worker_remove_success_response(target))
+            }
             Err(error) => Ok(worker_retention_error_response(error)),
         }
     }
@@ -2166,6 +2187,13 @@ impl WorkerRemovalService {
             ));
         }
 
+        if let Err(error) = subjektiv_journal::prepare_worker_removal(self, runtime, target) {
+            return Ok(worker_remove_error_response(
+                StatusCode::CONFLICT,
+                "journal_handoff_incomplete",
+                &error.to_string(),
+            ));
+        }
         let inventory = match runtime.worker_retention_inventory(&target) {
             Ok(inventory) => inventory,
             Err(_) => {
@@ -2238,6 +2266,13 @@ impl WorkerRemovalService {
             ));
         }
 
+        if let Err(error) = subjektiv_journal::validate_removal_retention(self, target, &prepared) {
+            return Ok(worker_remove_error_response(
+                StatusCode::CONFLICT,
+                "journal_retention_unconfirmed",
+                &error.to_string(),
+            ));
+        }
         let retention_result =
             match runtime.execute_worker_retention(&target, prepared.runtime_request.clone()) {
                 Ok(result) => result,
@@ -2276,6 +2311,7 @@ impl WorkerRemovalService {
                 return Ok(worker_retention_error_response(error));
             }
         };
+        subjektiv_journal::after_worker_removal(self, &retention_result);
         Ok(worker_remove_success_response(&target))
     }
 }
@@ -3896,6 +3932,7 @@ impl WorkspaceApi {
             notification_delivery_lifecycle: Arc::new(Default::default()),
             orchestrator_attention: Arc::new(Mutex::new(HashMap::new())),
             backend_job_drain_requests: Arc::new(AtomicU64::new(0)),
+            journal_dispatch_owner: None,
             observation_proxy,
             runtime_subscription_broker,
             worker_projection,
@@ -3927,6 +3964,9 @@ impl WorkspaceApi {
         api.authority = api.authority.with_source_commit_resolver(Arc::new(
             RuntimeTicketSourceCommitResolver { api: observer_api },
         ));
+        // The owner snapshot does not retain itself. Runtime removal dispatchers hold only
+        // Weak to it, so durable handoff can wake the existing runner without a Runtime cycle.
+        api.journal_dispatch_owner = Some(Arc::new(api.clone()));
         if let Some(dispatcher) = worker_remove_dispatcher {
             dispatcher
                 .install_executor(Arc::new(
@@ -3979,6 +4019,7 @@ impl WorkspaceApi {
             .run(move || {
                 notification_delivery::recover_job_notifications(&api);
                 api.recover_backend_jobs()?;
+                subjektiv_journal::recover(&api)?;
                 if let Some(orchestrator) = find_online_workspace_orchestrator(&api) {
                     dispatch_orchestrator_assignment_attention(&api, &orchestrator.worker);
                 }
@@ -4037,6 +4078,7 @@ impl WorkspaceApi {
         {
             return Ok(reservation);
         }
+        subjektiv_journal::prepare(self, &reservation)?;
         let (reservation, claimed) = self.store.claim_backend_job_attempt_dispatch(
             &self.config.workspace_id,
             &reservation.job.request.job_id,
@@ -4076,6 +4118,7 @@ impl WorkspaceApi {
                     purpose: request.purpose.clone(),
                     input_digest: request.input_digest()?,
                     subjektiv_consolidation: request.grants.subjektiv_consolidation.is_some(),
+                    subjektiv_journal: request.grants.subjektiv_journal.is_some(),
                 },
                 acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                     expected_segments: 0,
@@ -4091,7 +4134,8 @@ impl WorkspaceApi {
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
                 resolved_memory_settings: None,
-                resolved_subjektiv_attached: request.grants.subjektiv_consolidation.is_some(),
+                resolved_subjektiv_attached: request.grants.subjektiv_consolidation.is_some()
+                    || request.grants.subjektiv_journal.is_some(),
                 resolved_control_operation: Some(control_operation),
             },
         ) {
@@ -4354,6 +4398,17 @@ impl WorkspaceApi {
         failure_category: &str,
         failure_detail: &str,
     ) -> Result<BackendJobAttemptRecord> {
+        if let Some(job) = self
+            .store
+            .get_backend_job(&self.config.workspace_id, job_id)?
+            && job.request.grants.subjektiv_journal.is_some()
+            && state != BackendJobAttemptState::Unknown
+            && let Some(attempt) =
+                self.store
+                    .get_backend_job_attempt(&self.config.workspace_id, job_id, attempt_id)?
+        {
+            subjektiv_journal::close(self, &job.request, &attempt)?;
+        }
         let attempt = self.store.finish_backend_job_attempt(
             &self.config.workspace_id,
             job_id,
@@ -4363,8 +4418,21 @@ impl WorkspaceApi {
             failure_detail,
             &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
         )?;
-        let _ = self.schedule_backend_job_worker_cleanup(&attempt);
-        Ok(attempt)
+        // A retained checkpoint can prove the Journal result even if teardown is
+        // blocked. Do not make outcome resolution depend on successful Session cleanup.
+        if attempt.state == BackendJobAttemptState::Unknown
+            && let Some(job) = self.store.get_backend_job(self.workspace_id(), job_id)?
+            && job.request.grants.subjektiv_journal.is_some()
+            && let Err(error) = subjektiv_journal::reconcile_unknown(self, &job, &attempt)
+        {
+            tracing::warn!(%error,%job_id,%attempt_id,"Journal Unknown outcome remains recoverable");
+        }
+        let current = self
+            .store
+            .get_backend_job_attempt(self.workspace_id(), job_id, attempt_id)?
+            .ok_or_else(|| Error::Store("finished Backend Job attempt disappeared".into()))?;
+        let _ = self.schedule_backend_job_worker_cleanup(&current);
+        Ok(current)
     }
 
     /// Admit on the independent cleanup lane before claiming durable work. Rejection leaves
@@ -4434,7 +4502,22 @@ impl WorkspaceApi {
             // the safety boundary for those legacy leftovers.
             return Ok(());
         };
+        let journal_request = self
+            .store
+            .get_backend_job(self.workspace_id(), &attempt.job_id)?
+            .filter(|job| job.request.grants.subjektiv_journal.is_some())
+            .map(|job| job.request);
+        let deadline = chrono::DateTime::parse_from_rfc3339(&attempt.deadline_at)
+            .map_err(|e| Error::Store(e.to_string()))?;
         loop {
+            if let Some(request) = &journal_request {
+                // Preserve normal result-response teardown ordering, but an explicit
+                // erasure or the immutable Job deadline must not wait on a stuck Run.
+                // Actual stop and canonical Purge still happen below this wait.
+                if Utc::now() >= deadline || subjektiv_journal::session_erased(self, request)? {
+                    return Ok(());
+                }
+            }
             match self.runtime.worker(worker) {
                 Ok(detail)
                     if detail.state.eq_ignore_ascii_case("stopped")
@@ -4525,6 +4608,27 @@ impl WorkspaceApi {
             })
         };
         let complete = || -> Result<()> {
+            let journal = self
+                .store
+                .get_backend_job(self.workspace_id(), job_id)?
+                .is_some_and(|job| job.request.grants.subjektiv_journal.is_some());
+            if journal {
+                let removal = self
+                    .config_store
+                    .recover_worker_removal_execution(self.workspace_id(), &worker)
+                    .map_err(|e| Error::Store(e.to_string()))?;
+                if !removal.is_some_and(|p| {
+                    p.plan.state == crate::retention::WorkerRemovalPlanState::Succeeded
+                        && p.runtime_request.session_disposition
+                            == worker_runtime::retention::SessionDisposition::Purge
+                }) {
+                    return fail(
+                        "journal_job_purge_unconfirmed",
+                        "Journal execution Session requires a committed canonical Purge receipt"
+                            .into(),
+                    );
+                }
+            }
             self.store.finish_backend_job_worker_cleanup(
                 &self.config.workspace_id,
                 job_id,
@@ -4534,6 +4638,26 @@ impl WorkspaceApi {
                 None,
                 &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
             )?;
+            if let Some(job) = self
+                .store
+                .get_backend_job(&self.config.workspace_id, job_id)?
+                && job.request.grants.subjektiv_journal.is_some()
+            {
+                // Cleanup completion is a durable stop/removal fence. Unknown is
+                // reconciled with retained domain receipts before closing its generation.
+                let current = self
+                    .store
+                    .get_backend_job_attempt(self.workspace_id(), job_id, attempt_id)?
+                    .ok_or_else(|| Error::Store("cleaned Journal attempt missing".into()))?;
+                if current.state == BackendJobAttemptState::Unknown {
+                    subjektiv_journal::reconcile_unknown(self, &job, &current)?;
+                } else if !subjektiv_journal::session_erased(self, &job.request)? {
+                    subjektiv_journal::close(self, &job.request, &current)?;
+                    if current.state == BackendJobAttemptState::Completed {
+                        subjektiv_journal::drain_after_completion(self, &job.request);
+                    }
+                }
+            }
             Ok(())
         };
 
@@ -4700,10 +4824,28 @@ impl WorkspaceApi {
                         )?;
                         continue;
                     }
-                    let worker_known = attempt
+                    let observed = attempt
                         .worker
                         .as_ref()
-                        .is_some_and(|worker| self.runtime.worker(worker).is_ok());
+                        .map(|worker| self.runtime.worker(worker));
+                    if observed.as_ref().is_some_and(|result| {
+                        result.as_ref().is_ok_and(|detail| {
+                            detail.state.eq_ignore_ascii_case("stopped")
+                                || detail.execution_reconstructed
+                        })
+                    }) && self
+                        .store
+                        .get_backend_job(self.workspace_id(), &attempt.job_id)?
+                        .is_some_and(|job| job.request.grants.subjektiv_journal.is_some())
+                    {
+                        // This is not success evidence. Move to Unknown to fence tools;
+                        // only domain completion or confirmed canonical cleanup resolves it.
+                        self.finish_backend_job_attempt(&attempt.job_id, &attempt.attempt_id,
+                            BackendJobAttemptState::Unknown, "recovery_journal_execution_ended",
+                            "Runtime reports the prior Journal execution ended; reconciling saved domain receipts")?;
+                        continue;
+                    }
+                    let worker_known = observed.as_ref().is_some_and(|result| result.is_ok());
                     if !worker_known {
                         self.finish_backend_job_attempt(
                             &attempt.job_id,
@@ -4725,6 +4867,7 @@ impl WorkspaceApi {
                 | BackendJobAttemptState::Unknown => {}
             }
         }
+        subjektiv_journal::recover_unknowns(self)?;
         self.recover_backend_job_worker_cleanups()?;
         self.drain_reserved_backend_jobs();
         Ok(())
@@ -4859,12 +5002,64 @@ impl WorkspaceApi {
             verified_submission.result =
                 subjektiv_job::with_dispositions(self, &job.request, &submission.result)?;
         }
+        if let Some(job) = self
+            .store
+            .get_backend_job(&self.config.workspace_id, &submission.job_id)?
+            && job.request.grants.subjektiv_journal.is_some()
+        {
+            let attempt = self
+                .store
+                .get_backend_job_attempt(
+                    &self.config.workspace_id,
+                    &submission.job_id,
+                    &submission.attempt_id,
+                )?
+                .ok_or_else(|| {
+                    Error::WorkspacePermissionDenied("Journal attempt missing".into())
+                })?;
+            if attempt.worker.as_ref() != Some(source_worker)
+                || job.current_attempt != attempt.attempt
+                || attempt.input_digest != submission.input_digest
+                || !matches!(
+                    attempt.state,
+                    BackendJobAttemptState::Dispatched | BackendJobAttemptState::Completed
+                )
+            {
+                return Err(Error::WorkspacePermissionDenied(
+                    "Journal result requires the bound live attempt".into(),
+                ));
+            }
+            if attempt.state != BackendJobAttemptState::Completed {
+                if chrono::DateTime::parse_from_rfc3339(&attempt.deadline_at)
+                    .map_err(|e| Error::Store(e.to_string()))?
+                    <= Utc::now()
+                {
+                    return Err(Error::WorkspacePermissionDenied(
+                        "Journal attempt expired".into(),
+                    ));
+                }
+                subjektiv_journal::validate_result(
+                    self,
+                    &job.request,
+                    &attempt,
+                    &submission.result,
+                )?;
+            }
+        }
         let acceptance = self.store.accept_backend_job_result(
             &self.config.workspace_id,
             source_worker,
             &verified_submission,
             &accepted_at,
         )?;
+        if let Some(job) = self
+            .store
+            .get_backend_job(&self.config.workspace_id, &submission.job_id)?
+            && job.request.grants.subjektiv_journal.is_some()
+        {
+            subjektiv_journal::close(self, &job.request, &acceptance.attempt)?;
+            subjektiv_journal::drain_after_completion(self, &job.request);
+        }
         notification_delivery::deliver_job_result(self, &acceptance);
         let _ = self.schedule_backend_job_worker_cleanup(&acceptance.attempt);
         self.drain_reserved_backend_jobs();
@@ -4907,13 +5102,21 @@ impl WorkspaceApi {
             .register_remote_runtime(remote_config);
         let projection = self.worker_projection.clone();
         let broker = self.runtime_subscription_broker.clone();
+        let journal_api = self.clone();
         tokio::spawn(async move {
             if let Err(error) = projection
                 .attach_runtime(&broker, runtime_id.as_str())
                 .await
             {
                 tracing::warn!(%runtime_id, %error, "failed to attach Worker projection Runtime");
+                return;
             }
+            let recovery = journal_api.clone();
+            if let Err(error)=journal_api.host_executors.host().and_then(|executor|executor.dispatch(move || {
+                if let Err(error)=subjektiv_journal::recover(&recovery) {
+                    tracing::warn!(%error,"Journal reconnect reconciliation blocked; saved requests retained");
+                }
+            })) {tracing::warn!(%error,"Journal reconnect reconciliation not admitted");}
         });
         Ok(())
     }
@@ -12417,6 +12620,9 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         "/api/w/{workspace_id}/workers/self/backend-job-result",
         post(scoped_submit_backend_job_result),
     )
+    .route("/api/w/{workspace_id}/subjektiv/journal/recording", post(subjektiv_journal::recording_route))
+    .route("/api/w/{workspace_id}/subjektiv/journal/job", post(subjektiv_journal::job_route))
+    .route("/api/w/{workspace_id}/subjektiv/journal/job/finish", post(subjektiv_journal::finish_route))
     .fallback(get(static_or_spa_fallback))
     .with_state(api)
     .merge(generated_workspace_contract_router(contract_service));
@@ -35878,6 +36084,7 @@ mod tests {
     mod protocol_backpressure_tests;
     mod subject_spawn_tests;
     mod subjektiv_jobs_tests;
+    mod subjektiv_journal_tests;
     mod ticket_evidence_tests;
     mod ticket_worker_claim_tests;
     mod ticket_worker_launch_tests;
@@ -46845,7 +47052,7 @@ mod tests {
             worker_root.join("session/session.json"),
             serde_json::to_vec_pretty(&json!({
                 "schema_version": 1,
-                "session_id": format!("backend-job-cleanup-{}", worker.worker_id)
+                "session_id": session_store::new_session_id()
             }))
             .unwrap(),
         )
@@ -55151,7 +55358,7 @@ mod tests {
             worker_root.join("session/session.json"),
             serde_json::to_vec_pretty(&json!({
                 "schema_version": 1,
-                "session_id": "worker-remove-session"
+                "session_id": session_store::new_session_id()
             }))
             .unwrap(),
         )
@@ -58360,7 +58567,7 @@ mod tests {
             worker_root.join("session/session.json"),
             serde_json::to_vec_pretty(&json!({
                 "schema_version": 1,
-                "session_id": "singleton-cleanup-session"
+                "session_id": session_store::new_session_id()
             }))
             .unwrap(),
         )
@@ -58466,7 +58673,7 @@ mod tests {
             worker_root.join("session/session.json"),
             serde_json::to_vec_pretty(&json!({
                 "schema_version": 1,
-                "session_id": "cleanup-removal-session"
+                "session_id": session_store::new_session_id()
             }))
             .unwrap(),
         )

@@ -204,7 +204,7 @@ pub(super) fn dispatch(
         instruction: "Resolve ONLY the immutable candidate_ids batch using MemoryStagingList/Read, confirmed Memory reads and MemoryApplyCandidate. Already resolved candidates are retained receipts, not work to repeat. Leave newly arriving candidates to a subsequent Job. When every batch candidate has a durable disposition, call SubmitBackendJobResult with {subject_id, candidate_ids}; its Host capability awaits bounded clean-context surface generation and adds the actual surface outcome before submission. Final prose is not completion.".into(),
         // Selection belongs here, never in the common runner's purpose switch.
         profile: format!("builtin:{SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE}"),
-        grants: BackendJobGrants { subjektiv_consolidation: Some(SubjektivConsolidationGrant { subject_id: subject_id.into(), candidate_ids }) },
+        grants: BackendJobGrants { subjektiv_consolidation: Some(SubjektivConsolidationGrant { subject_id: subject_id.into(), candidate_ids }), ..Default::default() },
         serialization_key: None,
         source_worker: None,
         notification_target: None,

@@ -432,6 +432,66 @@ impl WorkspacePromptProjectionCache {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum SessionMaterialSourceError {
+    #[error("{0}")]
+    Source(String),
+    #[error(transparent)]
+    Material(#[from] session_store::public_material::PublicMaterialError),
+}
+
+impl From<String> for SessionMaterialSourceError {
+    fn from(message: String) -> Self {
+        Self::Source(message)
+    }
+}
+impl From<&str> for SessionMaterialSourceError {
+    fn from(message: &str) -> Self {
+        Self::Source(message.into())
+    }
+}
+
+pub(crate) fn open_session_public_material_reader(
+    aggregate: &Path,
+    workspace_id: &str,
+    worker_ref: &WorkerRef,
+    expected_session_id: &str,
+) -> Result<session_store::public_material::SessionPublicMaterialReader, SessionMaterialSourceError>
+{
+    use session_store::public_material::{PublicMaterialLimits, SessionPublicMaterialReader};
+    let metadata = WorkerAggregateStore::open_read_only(
+        aggregate,
+        ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(worker_ref),
+    )
+    .and_then(|store| store.read_read_only())
+    .map_err(|error| format!("Session metadata unavailable: {error}"))?
+    .ok_or("Session metadata missing")?;
+    if metadata.workspace_id.as_deref() != Some(workspace_id) {
+        return Err("Session Workspace does not match the authorized source".into());
+    }
+    let active = metadata.active.ok_or("Session active pointer is missing")?;
+    if active.session_id.to_string() != expected_session_id {
+        return Err("Session identity does not match the authorized current Session".into());
+    }
+    let reader = SessionPublicMaterialReader::open_worker_with_retention(
+        &aggregate.join("session"),
+        active
+            .segment_id
+            .ok_or("Session active Segment is missing")?,
+        PublicMaterialLimits::default(),
+        crate::session_retention::runtime_session_retention(
+            aggregate
+                .parent()
+                .and_then(Path::parent)
+                .ok_or("Worker aggregate root is unavailable")?,
+        ),
+    )?;
+    if reader.session_id() != active.session_id {
+        return Err("Session storage identity does not match its active pointer".into());
+    }
+    Ok(reader)
+}
+
 #[derive(Clone)]
 pub struct ProfileRuntimeWorkerFactory {
     observation_hub: Arc<RuntimeWorkerObservationHub>,
@@ -534,6 +594,34 @@ impl ProfileRuntimeWorkerFactory {
                 "Runtime Worker aggregate root is not configured; global Session/metadata roots are migration-only"
                     .to_string()
             })
+    }
+
+    /// Open only the saved current Session of this Workspace's Worker. Paths and
+    /// restoration state remain inside the Runtime adapter.
+    pub fn session_public_material_reader(
+        &self,
+        workspace_id: &str,
+        worker_ref: &WorkerRef,
+        expected_session_id: &str,
+    ) -> Result<
+        session_store::public_material::SessionPublicMaterialReader,
+        SessionMaterialSourceError,
+    > {
+        open_session_public_material_reader(
+            &self.worker_aggregate_dir(worker_ref)?,
+            workspace_id,
+            worker_ref,
+            expected_session_id,
+        )
+    }
+
+    fn session_retention(&self) -> Result<session_store::retention::SessionRetentionStore, String> {
+        let root = self
+            .worker_aggregate_root
+            .as_ref()
+            .and_then(|root| root.parent())
+            .ok_or("Runtime Worker aggregate root is not configured")?;
+        Ok(crate::session_retention::runtime_session_retention(root))
     }
 
     fn worker_run_dir(&self, worker_ref: &WorkerRef) -> Result<PathBuf, String> {
@@ -1097,9 +1185,10 @@ fn validate_backend_job_profile(
     if let Some(binding) = &request.backend_job {
         let policy = &manifest.feature.subjektiv.profile;
         if policy.consolidation_tools != binding.subjektiv_consolidation
-            || (binding.subjektiv_consolidation && policy.extraction.enabled)
+            || ((binding.subjektiv_consolidation || binding.subjektiv_journal)
+                && policy.extraction.enabled)
         {
-            return Err("Backend Job consolidation_tools must match its trusted consolidation grant and extraction must be disabled".into());
+            return Err("Backend Job tools must match their independent trusted grants and extraction must be disabled".into());
         }
     }
     Ok(())
@@ -1392,12 +1481,14 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
 
         let worker_aggregate_dir = self.worker_aggregate_dir(&request.worker_ref)?;
         let session_dir = worker_aggregate_dir.join("session");
-        let session_store = WorkerSessionStore::new(&session_dir).map_err(|err| {
-            format!(
-                "failed to initialize canonical Worker Session store at {}: {err}",
-                session_dir.display()
-            )
-        })?;
+        let session_store =
+            WorkerSessionStore::new_with_retention(&session_dir, self.session_retention()?)
+                .map_err(|err| {
+                    format!(
+                        "failed to initialize canonical Worker Session store at {}: {err}",
+                        session_dir.display()
+                    )
+                })?;
         let worker_metadata_store =
             WorkerAggregateStore::new(&worker_aggregate_dir, worker_name.clone()).map_err(
                 |err| {
@@ -1545,8 +1636,14 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         if let Some(active) = metadata.active.as_ref()
             && let Some(segment_id) = active.segment_id
         {
-            let session_store = WorkerSessionStore::new(worker_aggregate_dir.join("session"))
-                .map_err(|error| format!("failed to read Worker Session store: {error}"))?;
+            // Preflight must not create lock files or migrate retained sources.
+            // Actual restore reacquires the live guard before any publication.
+            self.session_retention()?
+                .ensure_live(active.session_id)
+                .map_err(|error| format!("Worker Session source is unavailable: {error}"))?;
+            let session_store =
+                WorkerSessionStore::open_read_only(worker_aggregate_dir.join("session"))
+                    .map_err(|error| format!("failed to read Worker Session store: {error}"))?;
             if !session_store
                 .exists(active.session_id, segment_id)
                 .map_err(|error| format!("failed to inspect Worker Session segment: {error}"))?
@@ -1635,12 +1732,14 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
 
         let worker_aggregate_dir = self.worker_aggregate_dir(&request.worker_ref)?;
         let session_dir = worker_aggregate_dir.join("session");
-        let session_store = WorkerSessionStore::new(&session_dir).map_err(|err| {
-            format!(
-                "failed to initialize canonical Worker Session store at {}: {err}",
-                session_dir.display()
-            )
-        })?;
+        let session_store =
+            WorkerSessionStore::new_with_retention(&session_dir, self.session_retention()?)
+                .map_err(|err| {
+                    format!(
+                        "failed to initialize canonical Worker Session store at {}: {err}",
+                        session_dir.display()
+                    )
+                })?;
         let worker_metadata_store =
             WorkerAggregateStore::new(&worker_aggregate_dir, worker_name.clone()).map_err(
                 |err| {
@@ -7270,18 +7369,19 @@ mod tests {
         )
         .unwrap();
         let mut request = create_request("policy");
-        for granted in [false, true] {
+        for (granted, journal) in [(false, false), (true, false), (false, true)] {
             request.backend_job = Some(crate::catalog::BackendJobExecutionBinding {
                 job_id: "job-1".into(),
                 attempt_id: "attempt-1".into(),
                 input_digest: None,
                 subjektiv_consolidation: granted,
+                subjektiv_journal: journal,
             });
             for tools in [false, true] {
                 for extraction in [false, true] {
                     manifest.feature.subjektiv.profile.consolidation_tools = tools;
                     manifest.feature.subjektiv.profile.extraction.enabled = extraction;
-                    let expected = tools == granted && (!granted || !extraction);
+                    let expected = tools == granted && (!(granted || journal) || !extraction);
                     let before = serde_json::to_value(&manifest).unwrap();
                     assert_eq!(
                         validate_backend_job_profile(&manifest, &request).is_ok(),

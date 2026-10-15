@@ -10,6 +10,840 @@ use sha2::{Digest, Sha256};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+#[test]
+fn stable_legacy_run_references_are_accepted_without_relaxing_character_or_size_limits() {
+    let f = Fixture::new();
+    let mut range = source_range("source-session", 2, 64);
+    range.source.pointer.entry_ref =
+        format!("El-run-{}-{}-123456789", Uuid::now_v7(), Uuid::now_v7());
+    assert!(range.source.pointer.entry_ref.len() > 65);
+    f.store()
+        .accept_journal_sources(&f.host, "Journal", &[range.clone()])
+        .unwrap();
+    assert_eq!(
+        f.store()
+            .read_journal_source(&f.host, &f.journal_id, 2)
+            .unwrap()
+            .source,
+        range.source
+    );
+    let mut next = source_range("source-session", 3, 64);
+    for reference in [
+        format!("E{}", "a".repeat(129)),
+        "Einvalid_ref".into(),
+        "E".into(),
+    ] {
+        next.source.pointer.entry_ref = reference;
+        assert!(matches!(
+            f.store()
+                .accept_journal_sources(&f.host, "Journal", &[next.clone()]),
+            Err(JournalError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            f.store().read_journal_source(&f.host, &f.journal_id, 3),
+            Err(JournalError::NotFound(_))
+        ));
+    }
+    next.source.pointer.entry_ref = format!("E{}", "a".repeat(128));
+    f.store()
+        .accept_journal_sources(&f.host, "Journal", &[next])
+        .unwrap();
+}
+
+#[test]
+fn descriptor_only_job_cannot_record_unread_bytes_and_delivery_survives_reopen() {
+    let mut f = Fixture::new();
+    let text = "公開履歴から実際に供給された全文";
+    let (host, id, ranges) = recording_sources(&f, &[text]);
+    let binding = JobAttemptBinding {
+        job_id: "descriptor-only".into(),
+        attempt_id: "attempt".into(),
+    };
+    let generation = f
+        .store()
+        .prepare_journal_generation(&host, &id, binding.clone(), ranges.clone())
+        .unwrap();
+    let context =
+        JournalJobContext::validated(f.store(), &host, &generation.id, binding.clone()).unwrap();
+    let operation = JournalOperation {
+        request_id: "save-only-after-reading".into(),
+        expected_state: f.store().read_journal(&host, &id).unwrap().state_token,
+        action: open_action("ongoing"),
+        covered_ranges: ranges.clone(),
+    };
+    let execute = || transport::JournalJobRequest::Execute {
+        operation: operation.clone(),
+    };
+    assert!(matches!(
+        service::execute(f.store(), &context, execute(), |_| unreachable!()),
+        Err(JournalError::Conflict(_))
+    ));
+    let first = service::execute(
+        f.store(),
+        &context,
+        transport::JournalJobRequest::ReadText {
+            read: transport::JournalTextRead {
+                target: transport::JournalTextTarget::Source {
+                    pointer: ranges[0].source.pointer.clone(),
+                },
+                offset: 0,
+                limit: 6,
+                content_token: None,
+            },
+        },
+        |_| Ok(text.into()),
+    )
+    .unwrap();
+    let transport::JournalJobResponse::Text(first) = first else {
+        panic!("source page required")
+    };
+    assert_eq!(first.text, "公開");
+    assert!(matches!(
+        service::execute(f.store(), &context, execute(), |_| unreachable!()),
+        Err(JournalError::Conflict(_))
+    ));
+    f.reopen();
+    let context = JournalJobContext::validated(f.store(), &host, &generation.id, binding).unwrap();
+    let remainder = transport::JournalJobRequest::ReadText {
+        read: transport::JournalTextRead {
+            target: transport::JournalTextTarget::Source {
+                pointer: ranges[0].source.pointer.clone(),
+            },
+            offset: first.next_byte.unwrap(),
+            limit: MAX_JOURNAL_READ_BYTES,
+            content_token: Some(first.content_token),
+        },
+    };
+    // A failed source fetch must not turn allowed descriptors into delivered input.
+    assert!(
+        service::execute(f.store(), &context, remainder.clone(), |_| Err(
+            JournalError::NotFound("original source missing".into())
+        ))
+        .is_err()
+    );
+    assert!(service::execute(f.store(), &context, execute(), |_| unreachable!()).is_err());
+    service::execute(f.store(), &context, remainder, |_| Ok(text.into())).unwrap();
+    let response = service::execute(f.store(), &context, execute(), |_| unreachable!()).unwrap();
+    assert!(matches!(response, transport::JournalJobResponse::Saved(_)));
+    assert_eq!(
+        f.store()
+            .list_journal_entries(&host, &id, None, 32)
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    // Original bytes are not duplicated into the durable delivery ledger.
+    f.store()
+        .database
+        .try_with_connection(|tx| {
+            let delivered: String = tx.query_row(
+                "SELECT ranges_json FROM journal_generation_deliveries WHERE generation_id=?1",
+                [&generation.id],
+                |r| r.get(0),
+            )?;
+            assert!(!delivered.contains(text));
+            assert_eq!(
+                serde_json::from_str::<Vec<JournalByteRange>>(&delivered).unwrap(),
+                vec![ranges[0].bytes]
+            );
+            Ok::<_, JournalError>(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn oversized_source_response_does_not_attest_undelivered_bytes() {
+    let f = Fixture::new();
+    let text = "\u{1}".repeat(MAX_JOURNAL_READ_BYTES);
+    let (host, id, ranges) = recording_sources(&f, &[&text]);
+    let binding = JobAttemptBinding {
+        job_id: "escaped-source".into(),
+        attempt_id: "attempt".into(),
+    };
+    let generation = f
+        .store()
+        .prepare_journal_generation(&host, &id, binding.clone(), ranges.clone())
+        .unwrap();
+    let context = JournalJobContext::validated(f.store(), &host, &generation.id, binding).unwrap();
+    assert!(matches!(
+        service::execute(
+            f.store(),
+            &context,
+            transport::JournalJobRequest::ReadText {
+                read: transport::JournalTextRead {
+                    target: transport::JournalTextTarget::Source {
+                        pointer: ranges[0].source.pointer.clone()
+                    },
+                    offset: 0,
+                    limit: MAX_JOURNAL_READ_BYTES,
+                    content_token: None,
+                },
+            },
+            |_| Ok(text.clone())
+        ),
+        Err(JournalError::InvalidInput(_))
+    ));
+    let operation = JournalOperation {
+        request_id: "unread-create".into(),
+        expected_state: f.store().read_journal(&host, &id).unwrap().state_token,
+        action: open_action("must not save"),
+        covered_ranges: ranges,
+    };
+    assert!(matches!(
+        service::execute(
+            f.store(),
+            &context,
+            transport::JournalJobRequest::Execute { operation },
+            |_| unreachable!()
+        ),
+        Err(JournalError::Conflict(_))
+    ));
+    f.store()
+        .database
+        .try_with_connection(|tx| {
+            let count: u64 = tx.query_row(
+                "SELECT COUNT(*) FROM journal_generation_deliveries WHERE generation_id=?1",
+                [&generation.id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(count, 0);
+            Ok::<_, JournalError>(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn job_state_keeps_initial_position_and_bounds_current_text_with_stale_continuation_rejection() {
+    let f = Fixture::new();
+    let (_, context) = f.generation("state-reading-job", f.ranges.clone());
+    let current = "現在地".repeat(8192);
+    f.store()
+        .execute_journal(
+            &context,
+            f.operation(
+                "position-one",
+                JournalAction::UpdatePosition {
+                    current_position: current.clone(),
+                },
+                vec![],
+            ),
+        )
+        .unwrap();
+    let state = service::execute(
+        f.store(),
+        &context,
+        transport::JournalJobRequest::ReadState,
+        |_| unreachable!(),
+    )
+    .unwrap();
+    let transport::JournalJobResponse::State(state) = state else {
+        panic!("missing state")
+    };
+    assert_eq!(state.initial_journal.current_position_bytes, 0);
+    assert_eq!(state.current_journal.current_position_bytes, current.len());
+    assert!(serde_json::to_vec(&state).unwrap().len() < 4096);
+    let read = transport::JournalTextRead {
+        target: transport::JournalTextTarget::Position {
+            snapshot: transport::JournalSnapshot::Current,
+        },
+        offset: 0,
+        limit: 100,
+        content_token: None,
+    };
+    let page = service::execute(
+        f.store(),
+        &context,
+        transport::JournalJobRequest::ReadText { read: read.clone() },
+        |_| unreachable!(),
+    )
+    .unwrap();
+    let transport::JournalJobResponse::Text(page) = page else {
+        panic!("missing text")
+    };
+    assert!(page.text.len() <= 100);
+    assert_eq!(page.text, current[..page.text.len()]);
+    let next = page.next_byte.unwrap();
+    f.store()
+        .execute_journal(
+            &context,
+            f.operation(
+                "position-two",
+                JournalAction::UpdatePosition {
+                    current_position: "変更".repeat(8192),
+                },
+                vec![],
+            ),
+        )
+        .unwrap();
+    let continued = transport::JournalTextRead {
+        offset: next,
+        content_token: Some(page.content_token),
+        ..read
+    };
+    assert!(matches!(
+        service::execute(
+            f.store(),
+            &context,
+            transport::JournalJobRequest::ReadText { read: continued },
+            |_| unreachable!()
+        ),
+        Err(JournalError::Conflict(_))
+    ));
+    let initial = transport::JournalTextRead {
+        target: transport::JournalTextTarget::Position {
+            snapshot: transport::JournalSnapshot::Initial,
+        },
+        offset: 0,
+        limit: 100,
+        content_token: None,
+    };
+    let initial = service::execute(
+        f.store(),
+        &context,
+        transport::JournalJobRequest::ReadText { read: initial },
+        |_| unreachable!(),
+    )
+    .unwrap();
+    let transport::JournalJobResponse::Text(initial) = initial else {
+        panic!("missing initial text")
+    };
+    assert!(initial.text.is_empty());
+    assert_eq!(initial.next_byte, None);
+}
+
+#[test]
+fn bounded_material_selection_fetches_only_a_budgeted_fragment_of_a_large_source() {
+    let f = Fixture::with_sizes(&[16 * 1024 * 1024]);
+    let materials = recording::select_materials_bounded(
+        f.store(),
+        &f.host,
+        &f.journal_id,
+        1024,
+        |source, start, limit| {
+            assert_eq!(start, 0);
+            assert!(limit < 1024);
+            Ok(recording::JournalMaterial {
+                range: JournalSourceRange {
+                    source: source.clone(),
+                    bytes: JournalByteRange {
+                        start,
+                        end: start + limit as u64,
+                    },
+                },
+                text: "x".repeat(limit),
+            })
+        },
+    )
+    .unwrap();
+    assert_eq!(materials.len(), 1);
+    assert!(serde_json::to_vec(&materials).unwrap().len() <= 1024);
+    assert!(materials[0].range.bytes.end < f.ranges[0].source.total_bytes);
+    assert_eq!(f.state().0.process_order, 0);
+}
+
+#[test]
+fn bounded_material_selection_rejects_wrong_identity_range_and_unusable_input_budget() {
+    let f = Fixture::new();
+    for defect in 0..3 {
+        let result = recording::select_materials_bounded(
+            f.store(),
+            &f.host,
+            &f.journal_id,
+            4096,
+            |source, start, _| {
+                let mut material = recording::JournalMaterial {
+                    range: JournalSourceRange {
+                        source: source.clone(),
+                        bytes: JournalByteRange {
+                            start,
+                            end: start + 4,
+                        },
+                    },
+                    text: "text".into(),
+                };
+                match defect {
+                    0 => material.range.source.content_sha256 = "0".repeat(64),
+                    1 => material.range.bytes.start += 1,
+                    _ => material.range.bytes.end += 1,
+                }
+                Ok(material)
+            },
+        );
+        assert!(matches!(result, Err(JournalError::Conflict(_))));
+    }
+    assert!(matches!(
+        recording::select_materials_bounded(
+            f.store(),
+            &f.host,
+            &f.journal_id,
+            16,
+            |_, _, _| panic!("unusable budget must not fetch")
+        ),
+        Err(JournalError::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn erasure_failure_rolls_back_tombstone_and_content_then_exact_retry_succeeds() {
+    let f = Fixture::new();
+    let (_, job) = f.generation("erasure-fault", f.ranges.clone());
+    let operation = f.operation(
+        "record-before-fault",
+        open_action("preserved until erase commits"),
+        f.ranges.clone(),
+    );
+    f.store().execute_journal(&job, operation).unwrap();
+    f.store().database.try_with_connection::<_,JournalError>(|tx| {
+        tx.execute_batch("CREATE TRIGGER erase_fault BEFORE DELETE ON journal_entries BEGIN SELECT RAISE(ABORT,'erase fault'); END;")?;
+        Ok(())
+    }).unwrap();
+    assert!(
+        f.store()
+            .erase_journal_session(&f.host, "erasure-fault-request")
+            .is_err()
+    );
+    assert!(f.store().journal_for_session(&f.host).unwrap().is_some());
+    assert!(f.state().1.is_some());
+    assert!(
+        f.store()
+            .query_journal_operation(&f.host, &f.journal_id, "record-before-fault")
+            .unwrap()
+            .is_some()
+    );
+    f.store()
+        .database
+        .try_with_connection::<_, JournalError>(|tx| {
+            tx.execute_batch("DROP TRIGGER erase_fault;")?;
+            Ok(())
+        })
+        .unwrap();
+    f.store()
+        .erase_journal_session(&f.host, "erasure-fault-request")
+        .unwrap();
+    assert!(
+        f.store()
+            .list_journals(&f.host, None, 32)
+            .unwrap()
+            .items
+            .is_empty()
+    );
+}
+
+#[test]
+fn job_service_completion_requires_checkpoint_and_replays_saved_completion_after_new_generation() {
+    let mut f = Fixture::new();
+    let (generation, context) = f.generation("service-job", f.ranges.clone());
+    for range in &f.ranges {
+        service::execute_bounded(
+            f.store(),
+            &context,
+            transport::JournalJobRequest::ReadText {
+                read: transport::JournalTextRead {
+                    target: transport::JournalTextTarget::Source {
+                        pointer: range.source.pointer.clone(),
+                    },
+                    offset: 0,
+                    limit: MAX_JOURNAL_READ_BYTES,
+                    content_token: None,
+                },
+            },
+            |source, start, limit| {
+                let end = source.total_bytes.min(start + limit as u64);
+                Ok(recording::JournalMaterial {
+                    range: JournalSourceRange {
+                        source: source.clone(),
+                        bytes: JournalByteRange { start, end },
+                    },
+                    text: "x".repeat((end - start) as usize),
+                })
+            },
+        )
+        .unwrap();
+    }
+    let create = f.operation("service-create", open_action("ongoing"), f.ranges.clone());
+    let response = service::execute(
+        f.store(),
+        &context,
+        transport::JournalJobRequest::Execute { operation: create },
+        |_| panic!("record operation has no source fetch"),
+    )
+    .unwrap();
+    let transport::JournalJobResponse::Saved(receipt) = response else {
+        panic!("missing receipt")
+    };
+    assert!(matches!(
+        service::finish(f.store(), &context),
+        Err(JournalError::Conflict(_))
+    ));
+    service::execute(
+        f.store(),
+        &context,
+        transport::JournalJobRequest::Execute {
+            operation: JournalOperation {
+                request_id: "service-checkpoint".into(),
+                expected_state: receipt.state_token,
+                action: JournalAction::Checkpoint {
+                    record_operation_ids: vec!["service-create".into()],
+                },
+                covered_ranges: f.ranges.clone(),
+            },
+        },
+        |_| unreachable!(),
+    )
+    .unwrap();
+    let completion = service::finish(f.store(), &context).unwrap();
+    assert_eq!(completion.generation_id, generation.id);
+    assert_eq!((completion.process_order, completion.process_byte), (2, 0));
+    assert!(
+        f.store()
+            .active_journal_generation(&f.host, &f.journal_id)
+            .unwrap()
+            .is_none()
+    );
+    f.reopen();
+    assert!(
+        JournalJobContext::validated(f.store(), &f.host, &generation.id, generation.job.clone())
+            .is_err()
+    );
+    let context = JournalJobContext::validated_recovery(
+        f.store(),
+        &f.host,
+        &generation.id,
+        generation.job.clone(),
+    )
+    .unwrap();
+    assert_eq!(service::finish(f.store(), &context).unwrap(), completion);
+    let next_range = source_range("source-session", 2, 256);
+    f.store()
+        .accept_journal_sources(&f.host, "Journal", &[next_range.clone()])
+        .unwrap();
+    let (_, next) = f.generation("next-service-job", vec![next_range]);
+    let update = f.operation(
+        "later-position",
+        JournalAction::UpdatePosition {
+            current_position: "new generation".into(),
+        },
+        vec![],
+    );
+    f.store().execute_journal(&next, update.clone()).unwrap();
+    assert_eq!(service::finish(f.store(), &context).unwrap(), completion);
+    assert!(
+        service::execute(
+            f.store(),
+            &context,
+            transport::JournalJobRequest::Execute { operation: update },
+            |_| unreachable!()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn job_service_source_reads_are_generation_bound_and_stop_at_supplied_byte_end() {
+    let f = Fixture::new();
+    let text = "public source with tail";
+    let (host, id, ranges) = recording_sources(&f, &[text]);
+    let mut selected = ranges[0].clone();
+    selected.bytes.end = 6;
+    let binding = JobAttemptBinding {
+        job_id: "bounded-service".into(),
+        attempt_id: "attempt".into(),
+    };
+    let generation = f
+        .store()
+        .prepare_journal_generation(&host, &id, binding.clone(), vec![selected.clone()])
+        .unwrap();
+    let context = JournalJobContext::validated(f.store(), &host, &generation.id, binding).unwrap();
+    let read = transport::JournalTextRead {
+        target: transport::JournalTextTarget::Source {
+            pointer: selected.source.pointer.clone(),
+        },
+        offset: 0,
+        limit: 100,
+        content_token: None,
+    };
+    let response = service::execute(
+        f.store(),
+        &context,
+        transport::JournalJobRequest::ReadText { read },
+        |_| Ok(text.into()),
+    )
+    .unwrap();
+    let transport::JournalJobResponse::Text(page) = response else {
+        panic!("missing text page")
+    };
+    assert_eq!(page.text, "public");
+    assert_eq!(page.next_byte, None);
+    let read = transport::JournalTextRead {
+        target: transport::JournalTextTarget::Source {
+            pointer: f.ranges[0].source.pointer.clone(),
+        },
+        offset: 0,
+        limit: 100,
+        content_token: None,
+    };
+    assert!(matches!(
+        service::execute(
+            f.store(),
+            &context,
+            transport::JournalJobRequest::ReadText { read },
+            |_| panic!("foreign source must not be fetched")
+        ),
+        Err(JournalError::PermissionDenied(_))
+    ));
+}
+
+#[test]
+fn explicit_erasure_remains_available_for_retired_subject_without_reopening_recording() {
+    let f = Fixture::new();
+    f.store().retire_subject(&f.host.subject_id).unwrap();
+    assert!(f.store().journal_retention_required(&f.host).unwrap());
+    f.store()
+        .erase_journal_session(&f.host, "erase-retired")
+        .unwrap();
+    assert!(!f.store().journal_retention_required(&f.host).unwrap());
+    assert!(
+        f.store()
+            .list_journals(&f.host, None, 32)
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    assert!(
+        f.store()
+            .accept_journal_sources(&f.host, "late", &f.ranges)
+            .is_err()
+    );
+}
+
+#[test]
+fn explicit_erasure_removes_saved_content_and_fences_late_admission_after_reopen() {
+    let mut f = Fixture::new();
+    let (generation, job) = f.generation("erase-job", f.ranges.clone());
+    let operation = f.operation(
+        "created-before-erasure",
+        open_action("private content"),
+        f.ranges.clone(),
+    );
+    f.store().execute_journal(&job, operation.clone()).unwrap();
+    assert!(f.store().journal_retention_required(&f.host).unwrap());
+    assert!(!f.store().journal_session_erased(&f.host).unwrap());
+    f.store()
+        .erase_journal_session(&f.host, "erase-request")
+        .unwrap();
+    f.reopen();
+    f.store()
+        .erase_journal_session(&f.host, "erase-request")
+        .unwrap();
+    assert!(!f.store().journal_retention_required(&f.host).unwrap());
+    assert!(f.store().journal_session_erased(&f.host).unwrap());
+    let reader = JournalHostContext::validated_reader(f.store(), &f.host.subject_id).unwrap();
+    assert!(matches!(
+        f.store().journal_session_erased(&reader),
+        Err(JournalError::PermissionDenied(_))
+    ));
+    assert!(
+        f.store()
+            .list_journals(&f.host, None, 32)
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    assert!(matches!(
+        f.store()
+            .accept_journal_sources(&f.host, "late retry", &f.ranges),
+        Err(JournalError::PermissionDenied(_))
+    ));
+    assert!(f.store().execute_journal(&job, operation).is_err());
+    assert!(
+        JournalJobContext::validated(f.store(), &f.host, &generation.id, generation.job).is_err()
+    );
+}
+
+#[test]
+fn explicit_erasure_before_admission_prevents_later_creation_and_cross_session_key_reuse() {
+    let f = Fixture::new();
+    let other = session_host(f.store(), &f.host.subject_id, "not-yet-admitted");
+    f.store()
+        .erase_journal_session(&other, "erase-unadmitted")
+        .unwrap();
+    assert!(matches!(
+        f.store()
+            .accept_journal_sources(&other, "late", &[source_range("not-yet-admitted", 0, 8)]),
+        Err(JournalError::PermissionDenied(_))
+    ));
+    assert!(matches!(
+        f.store().erase_journal_session(&f.host, "erase-unadmitted"),
+        Err(JournalError::Conflict(_))
+    ));
+    assert!(f.store().read_journal(&f.host, &f.journal_id).is_ok());
+}
+
+#[test]
+fn retention_release_requires_checkpoint_not_saved_entry_or_unavailability() {
+    let f = Fixture::new();
+    let (_, job) = f.generation("retained-job", f.ranges.clone());
+    let operation = f.operation("record", open_action("ongoing activity"), f.ranges.clone());
+    let receipt = f.store().execute_journal(&job, operation).unwrap();
+    assert!(f.store().journal_retention_required(&f.host).unwrap());
+    f.store()
+        .mark_journal_sources_unavailable(&f.host, &f.journal_id, &f.ranges)
+        .unwrap();
+    assert!(f.store().journal_retention_required(&f.host).unwrap());
+    f.store()
+        .mark_journal_sources_available(&f.host, &f.journal_id, &f.ranges)
+        .unwrap();
+    f.store()
+        .checkpoint_journal(
+            &job,
+            JournalOperation {
+                request_id: "retained-checkpoint".into(),
+                expected_state: receipt.state_token,
+                action: JournalAction::Checkpoint {
+                    record_operation_ids: vec!["record".into()],
+                },
+                covered_ranges: f.ranges.clone(),
+            },
+        )
+        .unwrap();
+    assert!(!f.store().journal_retention_required(&f.host).unwrap());
+    assert!(f.state().1.is_some());
+}
+
+fn recording_sources(
+    f: &Fixture,
+    texts: &[&str],
+) -> (JournalHostContext, String, Vec<JournalSourceRange>) {
+    let host = session_host(f.store(), &f.host.subject_id, "recording-session");
+    let ranges = texts
+        .iter()
+        .enumerate()
+        .map(|(order, text)| {
+            let mut range = source_range("recording-session", order as u64, text.len() as u64);
+            range.source.content_sha256 = Sha256::digest(text.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            range
+        })
+        .collect::<Vec<_>>();
+    let id = f
+        .store()
+        .accept_journal_sources(&host, "Recording", &ranges)
+        .unwrap();
+    (host, id, ranges)
+}
+
+#[test]
+fn recording_materials_bound_escaped_utf8_without_advancing_reflection() {
+    let f = Fixture::new();
+    let text = "日本語\n\"\\".repeat(4000);
+    let (host, id, ranges) = recording_sources(&f, &[&text]);
+    let materials =
+        recording::select_materials(f.store(), &host, &id, 1024, |_| Ok(text.clone())).unwrap();
+    assert_eq!(materials.len(), 1);
+    assert!(serde_json::to_vec(&materials).unwrap().len() <= 1024);
+    let range = &materials[0].range;
+    assert_eq!(range.bytes.start, 0);
+    assert!(range.bytes.end < ranges[0].source.total_bytes);
+    assert_eq!(materials[0].text, text[..range.bytes.end as usize]);
+    let status = f.store().read_journal_source(&host, &id, 0).unwrap();
+    assert_eq!(status.reflected_bytes, 0);
+    assert_eq!(status.accepted, vec![ranges[0].bytes]);
+}
+
+#[test]
+fn recording_materials_reject_changed_bytes_instead_of_using_preview_identity() {
+    let f = Fixture::new();
+    let (host, id, _) = recording_sources(&f, &["canonical public text"]);
+    assert!(matches!(
+        recording::select_materials(f.store(), &host, &id, 4096, |_| Ok("preview".into())),
+        Err(JournalError::Conflict(_))
+    ));
+    assert_eq!(
+        f.store()
+            .read_journal_source(&host, &id, 0)
+            .unwrap()
+            .reflected_bytes,
+        0
+    );
+}
+
+#[test]
+fn recording_materials_stop_at_unavailable_old_source_without_reading_newer_input() {
+    let f = Fixture::new();
+    let (host, id, ranges) = recording_sources(&f, &["old", "new"]);
+    f.store()
+        .mark_journal_sources_unavailable(&host, &id, &ranges[..1])
+        .unwrap();
+    let materials = recording::select_materials(f.store(), &host, &id, 4096, |_| {
+        panic!("blocked prefix must not fetch newer input")
+    })
+    .unwrap();
+    assert!(materials.is_empty());
+}
+
+#[test]
+fn recording_materials_resume_exact_saved_byte_prefix_after_reopen() {
+    let mut f = Fixture::new();
+    let text = "first 日本語 second";
+    let (host, id, ranges) = recording_sources(&f, &[text]);
+    let selected =
+        recording::select_materials(f.store(), &host, &id, 512, |_| Ok(text.into())).unwrap();
+    let selected = vec![JournalSourceRange {
+        bytes: JournalByteRange { start: 0, end: 6 },
+        ..selected[0].range.clone()
+    }];
+    let binding = JobAttemptBinding {
+        job_id: "recording-job".into(),
+        attempt_id: "attempt".into(),
+    };
+    let generation = f
+        .store()
+        .prepare_journal_generation(&host, &id, binding.clone(), selected.clone())
+        .unwrap();
+    let job = JournalJobContext::validated(f.store(), &host, &generation.id, binding).unwrap();
+    let state = f.store().read_journal(&host, &id).unwrap().state_token;
+    let receipt = f
+        .store()
+        .execute_journal(
+            &job,
+            JournalOperation {
+                request_id: "unchanged".into(),
+                expected_state: state,
+                action: JournalAction::ConfirmUnchanged,
+                covered_ranges: selected.clone(),
+            },
+        )
+        .unwrap();
+    f.store()
+        .checkpoint_journal(
+            &job,
+            JournalOperation {
+                request_id: "checkpoint".into(),
+                expected_state: receipt.state_token,
+                action: JournalAction::Checkpoint {
+                    record_operation_ids: vec!["unchanged".into()],
+                },
+                covered_ranges: selected,
+            },
+        )
+        .unwrap();
+    f.reopen();
+    let remaining =
+        recording::select_materials(f.store(), &host, &id, 4096, |_| Ok(text.into())).unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(
+        remaining[0].range.bytes,
+        JournalByteRange {
+            start: 6,
+            end: ranges[0].source.total_bytes
+        }
+    );
+    assert_eq!(remaining[0].text, text[6..]);
+}
+
 struct Fixture {
     store: Option<SubjektivStore>,
     workspace: Option<ScopedFeatureStorage>,
@@ -37,7 +871,10 @@ impl Fixture {
             workspace
                 .register(feature_storage::FeatureRegistration::new(
                     crate::SUBJEKTIV_FEATURE_ID,
-                    &crate::MIGRATIONS[..crate::MIGRATIONS.len() - 1],
+                    &crate::MIGRATIONS[..crate::MIGRATIONS
+                        .iter()
+                        .position(|migration| migration.version() == 8)
+                        .expect("Journal introduction migration")],
                 ))
                 .unwrap()
         } else {

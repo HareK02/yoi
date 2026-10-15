@@ -1439,7 +1439,19 @@ where
 
     let worker_enabled = feature_config.worker.enabled;
     let sub_worker_enabled = feature_config.sub_worker.enabled;
-    let mut feature_registry = FeatureRegistryBuilder::new();
+    let journal_grant = backend_job
+        .as_ref()
+        .filter(|binding| binding.subjektiv_journal)
+        .map(|binding| {
+            crate::subjektiv::BackendJournalJobHost::new(worker.workspace_client_handle(), binding)
+                .map(|host| host.into_grant())
+        })
+        .transpose()?;
+    let (mut feature_registry, journal_finalizer) = if let Some(grant) = journal_grant {
+        (grant.features, grant.finalizer)
+    } else {
+        (FeatureRegistryBuilder::new(), None)
+    };
     feature_registry
         .add_module(crate::feature::builtin::chat_invocation::AttachmentInvocationFeature);
     if let Some(binding) = backend_job.as_ref() {
@@ -1460,6 +1472,13 @@ where
                 prompts.clone(), spawner_workspace_context.clone(),
             )?;
             result_feature = result_feature.with_surface(surface);
+        }
+        if let Some(finalizer) = journal_finalizer {
+            result_feature = result_feature.with_finalizer(
+                finalizer,
+                spawner_manifest.clone(),
+                worker.llm_client_handle(),
+            )?;
         }
         feature_registry.add_module(result_feature);
     }
@@ -1541,6 +1560,15 @@ where
             )?
     {
         feature_registry.add_module(subjektiv_sessions);
+    }
+    if ordinary_subjektiv_features_enabled
+        && lifecycle_enabled
+        && let Some(host) = subjektiv_host.as_ref()
+        && host.host.journal_recording_granted()
+    {
+        feature_registry.add_module(crate::subjektiv::JournalRecordingFeature::new(
+            host.clone(),
+        )?);
     }
     if let Some(memory_lifecycle) =
         crate::feature::builtin::memory_lifecycle::MemoryLifecycleFeature::from_resolved_config(

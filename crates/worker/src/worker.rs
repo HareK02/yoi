@@ -7778,12 +7778,12 @@ where
 
         if self
             .backend_job()
-            .is_some_and(|binding| binding.subjektiv_consolidation)
+            .is_some_and(crate::BackendJobExecutionBinding::has_subjektiv_job_grant)
         {
             if metadata.subjektiv_session_attribution.is_some() {
                 return Err(WorkerError::SubjektivSessionAttribution {
                     state: "job_attribution_forbidden",
-                    message: "consolidation Job execution must not carry subject-body Session attribution".into(),
+                    message: "Subject maintenance Job execution must not carry subject-body Session attribution".into(),
                 });
             }
             return Ok(());
@@ -11108,7 +11108,8 @@ mod build_summary_prompt_tests {
                     job_id: "job-1".into(),
                     attempt_id: "attempt-1".into(),
                     input_digest: None,
-                    subjektiv_consolidation: false
+                    subjektiv_consolidation: false,
+                    subjektiv_journal: false,
                 })
                 .is_err()
         );
@@ -11116,35 +11117,38 @@ mod build_summary_prompt_tests {
     }
 
     #[tokio::test]
-    async fn consolidation_job_binding_is_immutable_and_has_no_subject_body_attribution() {
-        let client = Arc::new(AttributionLifecycleClient::new([]));
-        let (mut worker, store, _temp) = attribution_lifecycle_worker(client.clone()).await;
-        let binding = crate::BackendJobExecutionBinding {
-            job_id: "job-1".into(),
-            attempt_id: "attempt-1".into(),
-            input_digest: Some("input-content-digest".into()),
-            subjektiv_consolidation: true,
-        };
-        worker.bind_backend_job(binding.clone()).unwrap();
-        assert_eq!(worker.backend_job(), Some(&binding));
-        assert!(worker.bind_backend_job(binding).is_err());
-        for lifecycle in [
-            SubjektivSessionAttributionLifecycle::NewSession,
-            SubjektivSessionAttributionLifecycle::RestoredSession,
-        ] {
-            worker
-                .finalize_subjektiv_session_attribution(true, lifecycle)
-                .unwrap();
+    async fn subject_maintenance_job_binding_is_immutable_and_has_no_subject_body_attribution() {
+        for (subjektiv_consolidation, subjektiv_journal) in [(true, false), (false, true)] {
+            let client = Arc::new(AttributionLifecycleClient::new([]));
+            let (mut worker, store, _temp) = attribution_lifecycle_worker(client.clone()).await;
+            let binding = crate::BackendJobExecutionBinding {
+                job_id: "job-1".into(),
+                attempt_id: "attempt-1".into(),
+                input_digest: Some("input-content-digest".into()),
+                subjektiv_consolidation,
+                subjektiv_journal,
+            };
+            worker.bind_backend_job(binding.clone()).unwrap();
+            assert_eq!(worker.backend_job(), Some(&binding));
+            assert!(worker.bind_backend_job(binding).is_err());
+            for lifecycle in [
+                SubjektivSessionAttributionLifecycle::NewSession,
+                SubjektivSessionAttributionLifecycle::RestoredSession,
+            ] {
+                worker
+                    .finalize_subjektiv_session_attribution(true, lifecycle)
+                    .unwrap();
+            }
+            assert!(client.requests.lock().unwrap().is_empty());
+            assert!(
+                store
+                    .read_by_name(&worker.manifest().worker.name)
+                    .unwrap()
+                    .unwrap()
+                    .subjektiv_session_attribution
+                    .is_none()
+            );
         }
-        assert!(client.requests.lock().unwrap().is_empty());
-        assert!(
-            store
-                .read_by_name(&worker.manifest().worker.name)
-                .unwrap()
-                .unwrap()
-                .subjektiv_session_attribution
-                .is_none()
-        );
     }
 
     #[tokio::test]

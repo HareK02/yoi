@@ -581,6 +581,7 @@ pub enum WorkerSpawnIntent {
         purpose: String,
         input_digest: String,
         subjektiv_consolidation: bool,
+        subjektiv_journal: bool,
     },
     TicketRole {
         ticket_id: String,
@@ -1285,6 +1286,32 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
                 worker_ref.worker_id
             ),
         })
+    }
+
+    fn session_material_pin(
+        &self,
+        _request: runtime_api::SessionMaterialPinRequest,
+    ) -> Result<runtime_api::SessionMaterialPinResponse, String> {
+        Err("Session source retention pin is unavailable on this Runtime".into())
+    }
+    fn session_material_release(
+        &self,
+        _request: runtime_api::SessionMaterialPinRequest,
+    ) -> Result<runtime_api::SessionMaterialPinResponse, String> {
+        Err("Session source retention release is unavailable on this Runtime".into())
+    }
+
+    fn session_material_catalog(
+        &self,
+        _request: runtime_api::SessionMaterialCatalogRequest,
+    ) -> Result<runtime_api::SessionMaterialCatalogAvailability, String> {
+        Err("canonical public material catalog is unavailable on this Runtime".into())
+    }
+    fn session_material_read(
+        &self,
+        _request: runtime_api::SessionMaterialReadRequest,
+    ) -> Result<runtime_api::SessionMaterialReadAvailability, String> {
+        Err("canonical public material read is unavailable on this Runtime".into())
     }
 
     fn session_public_search(
@@ -2208,6 +2235,64 @@ impl RuntimeRegistry {
                 },
             )?);
         runtime.worker_session_attachment(workspace_id, &worker_ref, session_id, attachment_id)
+    }
+
+    pub fn session_material_pin(
+        &self,
+        runtime_id: &str,
+        request: runtime_api::SessionMaterialPinRequest,
+    ) -> Result<runtime_api::SessionMaterialPinResponse, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        self.runtime(runtime_id)?
+            .session_material_pin(request)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.into(),
+                code: "session_material_pin_failed".into(),
+                message,
+            })
+    }
+    pub fn session_material_release(
+        &self,
+        runtime_id: &str,
+        request: runtime_api::SessionMaterialPinRequest,
+    ) -> Result<runtime_api::SessionMaterialPinResponse, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        self.runtime(runtime_id)?
+            .session_material_release(request)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.into(),
+                code: "session_material_release_failed".into(),
+                message,
+            })
+    }
+
+    pub fn session_material_catalog(
+        &self,
+        runtime_id: &str,
+        request: runtime_api::SessionMaterialCatalogRequest,
+    ) -> Result<runtime_api::SessionMaterialCatalogAvailability, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        self.runtime(runtime_id)?
+            .session_material_catalog(request)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.into(),
+                code: "session_material_catalog_failed".into(),
+                message,
+            })
+    }
+    pub fn session_material_read(
+        &self,
+        runtime_id: &str,
+        request: runtime_api::SessionMaterialReadRequest,
+    ) -> Result<runtime_api::SessionMaterialReadAvailability, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        self.runtime(runtime_id)?
+            .session_material_read(request)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.into(),
+                code: "session_material_read_failed".into(),
+                message,
+            })
     }
 
     pub fn session_public_search(
@@ -3188,6 +3273,78 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 .to_string(),
                 message: error.to_string(),
             })
+    }
+
+    fn session_material_pin(
+        &self,
+        request: runtime_api::SessionMaterialPinRequest,
+    ) -> Result<runtime_api::SessionMaterialPinResponse, String> {
+        if request.workspace_id != self.workspace_id {
+            return Err("Session pin Workspace mismatch".into());
+        }
+        let scope = RuntimeWorkspaceScope::new(&request.workspace_id, "embedded-backend");
+        let pin = session_store::retention::SessionRetentionPin(
+            uuid::Uuid::parse_str(&request.pin_id).map_err(|e| e.to_string())?,
+        );
+        self.runtime
+            .pin_session_public_source_scoped(
+                &scope,
+                &request.source,
+                &request.expected_session_id,
+                pin,
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(runtime_api::SessionMaterialPinResponse {
+            session_id: request.expected_session_id,
+            pin_id: request.pin_id,
+        })
+    }
+    fn session_material_release(
+        &self,
+        request: runtime_api::SessionMaterialPinRequest,
+    ) -> Result<runtime_api::SessionMaterialPinResponse, String> {
+        if request.workspace_id != self.workspace_id {
+            return Err("Session release Workspace mismatch".into());
+        }
+        let scope = RuntimeWorkspaceScope::new(&request.workspace_id, "embedded-backend");
+        let pin = session_store::retention::SessionRetentionPin(
+            uuid::Uuid::parse_str(&request.pin_id).map_err(|e| e.to_string())?,
+        );
+        self.runtime
+            .release_session_public_source_pin_scoped(
+                &scope,
+                &request.source,
+                &request.expected_session_id,
+                pin,
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(runtime_api::SessionMaterialPinResponse {
+            session_id: request.expected_session_id,
+            pin_id: request.pin_id,
+        })
+    }
+
+    fn session_material_catalog(
+        &self,
+        request: runtime_api::SessionMaterialCatalogRequest,
+    ) -> Result<runtime_api::SessionMaterialCatalogAvailability, String> {
+        if request.workspace_id != self.workspace_id {
+            return Err("canonical public material Workspace mismatch".into());
+        }
+        let scope = RuntimeWorkspaceScope::new(&request.workspace_id, "embedded-backend");
+        Ok(self
+            .runtime
+            .session_material_catalog_scoped(&scope, &request))
+    }
+    fn session_material_read(
+        &self,
+        request: runtime_api::SessionMaterialReadRequest,
+    ) -> Result<runtime_api::SessionMaterialReadAvailability, String> {
+        if request.workspace_id != self.workspace_id {
+            return Err("canonical public material Workspace mismatch".into());
+        }
+        let scope = RuntimeWorkspaceScope::new(&request.workspace_id, "embedded-backend");
+        Ok(self.runtime.session_material_read_scoped(&scope, &request))
     }
 
     fn session_public_search(
@@ -5323,6 +5480,52 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         })
     }
 
+    fn session_material_pin(
+        &self,
+        request: runtime_api::SessionMaterialPinRequest,
+    ) -> Result<runtime_api::SessionMaterialPinResponse, String> {
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.session_material_pin(request).await },
+        )
+        .map_err(|diagnostic| diagnostic.message)
+    }
+    fn session_material_release(
+        &self,
+        request: runtime_api::SessionMaterialPinRequest,
+    ) -> Result<runtime_api::SessionMaterialPinResponse, String> {
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.session_material_release(request).await },
+        )
+        .map_err(|diagnostic| diagnostic.message)
+    }
+
+    fn session_material_catalog(
+        &self,
+        request: runtime_api::SessionMaterialCatalogRequest,
+    ) -> Result<runtime_api::SessionMaterialCatalogAvailability, String> {
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.session_material_catalog(request).await },
+        )
+        .map_err(|diagnostic| diagnostic.message)
+    }
+    fn session_material_read(
+        &self,
+        request: runtime_api::SessionMaterialReadRequest,
+    ) -> Result<runtime_api::SessionMaterialReadAvailability, String> {
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.session_material_read(request).await },
+        )
+        .map_err(|diagnostic| diagnostic.message)
+    }
+
     fn session_public_search(
         &self,
         request: runtime_api::SessionPublicSearchRequest,
@@ -5602,12 +5805,14 @@ fn runtime_create_worker_request(
                 attempt_id,
                 input_digest,
                 subjektiv_consolidation,
+                subjektiv_journal,
                 ..
             } => Some(worker_runtime::catalog::BackendJobExecutionBinding {
                 job_id: job_id.clone(),
                 attempt_id: attempt_id.clone(),
                 input_digest: Some(input_digest.clone()),
                 subjektiv_consolidation: *subjektiv_consolidation,
+                subjektiv_journal: *subjektiv_journal,
             }),
             _ => None,
         },

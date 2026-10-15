@@ -155,6 +155,29 @@ pub(crate) fn authorized_index(
     )
 }
 
+pub(crate) fn authorized_sessions_path(
+    state_root: &Path,
+    scope_id: &str,
+    subject_id: &str,
+    store: &SubjektivStore,
+    session_id: &str,
+) -> Result<PathBuf, SubjektivHostError> {
+    let backend = Backend {
+        state_root,
+        scope_id,
+        subject_id,
+        store,
+        reader: session_store::public_index::read_fs_session_public_index,
+    };
+    (|| {
+        backend.check_scope()?;
+        required_selector(session_id)?;
+        let attribution = backend.attribution(session_id)?;
+        Ok(backend.authorize(attribution)?.sessions_path)
+    })()
+    .map_err(|error: Failure| SubjektivHostError::Unavailable(error.message))
+}
+
 fn authorized_index_with_reader(
     state_root: &Path,
     scope_id: &str,
@@ -221,13 +244,28 @@ impl Backend<'_> {
                 "Attributed standalone Worker state is missing",
             ));
         }
-        let workers = StandaloneWorkerStore::open_existing(self.state_root).map_err(|_| {
+        let mut workers = StandaloneWorkerStore::open_existing(self.state_root).map_err(|_| {
             failure(
                 SubjektivSessionDiagnosticCode::RuntimeUnavailable,
                 "Standalone Worker storage is inaccessible",
             )
         })?;
-        let record = workers.load(id).map_err(|error| match error {
+        let record = match workers.load(id) {
+            Err(StandaloneStoreError::WorkerNotFound(_)) => {
+                workers = StandaloneWorkerStore::open_existing(
+                    self.state_root.join("subjektiv").join("retained-workers"),
+                )
+                .map_err(|_| {
+                    failure(
+                        SubjektivSessionDiagnosticCode::RetentionMissing,
+                        "Original Session is not retained",
+                    )
+                })?;
+                workers.load(id)
+            }
+            result => result,
+        }
+        .map_err(|error| match error {
             StandaloneStoreError::WorkerNotFound(_) => failure(
                 SubjektivSessionDiagnosticCode::RetentionMissing,
                 "Attributed standalone Worker record is missing",
@@ -260,6 +298,13 @@ impl Backend<'_> {
             failure(
                 SubjektivSessionDiagnosticCode::CorruptLog,
                 "Attributed Session identity is invalid",
+            )
+        })?;
+        let retention = crate::store::session_retention(self.state_root);
+        let _guard = retention.lock_live(id).map_err(|_| {
+            failure(
+                SubjektivSessionDiagnosticCode::RetentionMissing,
+                "Original Session is erased or its retention fence is unavailable",
             )
         })?;
         let index = (self.reader)(&source.sessions_path, id, limits).map_err(index_failure)?;
@@ -1539,7 +1584,11 @@ allow = []
             )
         };
         let sessions = f.index_path.parent().unwrap();
-        let fs_store = session_store::FsStore::new(sessions).unwrap();
+        let fs_store = session_store::FsStore::new_with_retention(
+            sessions,
+            crate::store::session_retention(&f.temp.path().join("workers")),
+        )
+        .unwrap();
         let segment: SessionId = f.segment.parse().unwrap();
         fs_store
             .create_segment(

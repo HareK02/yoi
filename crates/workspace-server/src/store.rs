@@ -1679,6 +1679,29 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         submission: &BackendJobResultSubmission,
         now: &str,
     ) -> Result<BackendJobResultAcceptance>;
+    /// Host-only reconciliation of a saved domain completion, never model claims.
+    /// None requires completed canonical cleanup, not Worker liveness inference.
+    fn reconcile_backend_journal_attempt(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        completion: Option<&BackendJobResultSubmission>,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord>;
+    /// Bounded keyset over current Journal Unknown attempts, independent of source liveness.
+    fn list_backend_journal_unknown_attempts(
+        &self,
+        workspace_id: &str,
+        after_job_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<BackendJobAttemptRecord>>;
+    fn list_backend_journal_jobs(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<BackendJobRecord>>;
     fn finish_backend_job_attempt(
         &self,
         workspace_id: &str,
@@ -7026,6 +7049,82 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn list_backend_journal_unknown_attempts(
+        &self,
+        workspace_id: &str,
+        after_job_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<BackendJobAttemptRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT a.job_id,a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j ON j.workspace_id=a.workspace_id AND j.job_id=a.job_id WHERE a.workspace_id=?1 AND a.state='unknown' AND j.state='unknown' AND a.attempt=j.current_attempt AND json_type(j.request_json,'$.grants.subjektiv_journal')='object' AND (?2 IS NULL OR a.job_id>?2) ORDER BY a.job_id LIMIT ?3")?;
+            let ids = stmt.query_map(params![workspace_id,after_job_id,limit.clamp(1,100) as i64], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            ids.into_iter().map(|(job,id)| read_backend_job_attempt(conn,workspace_id,&job,&id)?.ok_or_else(|| Error::Store("Journal Unknown attempt disappeared".into()))).collect()
+        })
+    }
+
+    fn list_backend_journal_jobs(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<BackendJobRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT job_id FROM backend_jobs WHERE workspace_id=?1 AND json_extract(request_json,'$.grants.subjektiv_journal.session_id')=?2 AND (?3 IS NULL OR job_id>?3) ORDER BY job_id LIMIT ?4")?;
+            let ids = stmt.query_map(params![workspace_id,session_id,after,limit.clamp(1,100) as i64], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            ids.iter().map(|id| read_backend_job(conn, workspace_id, id)?.ok_or_else(|| Error::Store("Journal Job disappeared".into()))).collect()
+        })
+    }
+
+    fn reconcile_backend_journal_attempt(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        completion: Option<&BackendJobResultSubmission>,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let job = read_backend_job(&tx, workspace_id, &expected.job_id)?.ok_or_else(|| Error::InvalidInput("Journal Job missing".into()))?;
+            let attempt = read_backend_job_attempt(&tx, workspace_id, &expected.job_id, &expected.attempt_id)?.ok_or_else(|| Error::InvalidInput("Journal attempt missing".into()))?;
+            // Full snapshot CAS includes Worker, tracked Run, input and cleanup evidence.
+            if &attempt != expected || job.current_attempt != attempt.attempt
+                || job.request.grants.subjektiv_journal.is_none()
+                || attempt.input_digest != job.request.input_digest()?
+                || !matches!(job.state, BackendJobState::Unknown | BackendJobState::Completed | BackendJobState::Failed) {
+                return Err(Error::InvalidInput("Journal reconciliation binding changed".into()));
+            }
+            if let Some(submission) = completion {
+                if submission.job_id != expected.job_id || submission.attempt_id != expected.attempt_id || submission.input_digest != expected.input_digest {
+                    return Err(Error::InvalidInput("Journal completion binding mismatch".into()));
+                }
+                let (digest, json) = result_digest(&submission.result, job.request.limits.max_result_bytes)?;
+                if attempt.state == BackendJobAttemptState::Completed && attempt.result_digest.as_deref() == Some(digest.as_str()) { tx.commit()?; return Ok(attempt); }
+                if attempt.state != BackendJobAttemptState::Unknown || job.state != BackendJobState::Unknown {
+                    return Err(Error::InvalidInput("Journal completion cannot replace definitive outcome".into()));
+                }
+                tx.execute("UPDATE backend_job_attempts SET state='completed',result_json=?4,result_digest=?5,failure_category=NULL,failure_detail=NULL,updated_at=?6,completed_at=?6 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3 AND state='unknown'",params![workspace_id,expected.job_id,expected.attempt_id,json,digest,now])?;
+                tx.execute("UPDATE backend_jobs SET state='completed',result_json=?3,result_digest=?4,failure_category=NULL,failure_detail=NULL,updated_at=?5,completed_at=?5 WHERE workspace_id=?1 AND job_id=?2 AND state='unknown'",params![workspace_id,expected.job_id,json,digest,now])?;
+                notification_routing::jobs::capture(&tx,workspace_id,&expected.job_id,&expected.attempt_id)?;
+            } else {
+                if attempt.state == BackendJobAttemptState::Failed && attempt.failure_category.as_deref() == Some("journal_attempt_fenced") { tx.commit()?; return Ok(attempt); }
+                if attempt.state != BackendJobAttemptState::Unknown || job.state != BackendJobState::Unknown
+                    || attempt.worker_cleanup_state != Some(BackendJobWorkerCleanupState::Completed)
+                    || attempt.worker_cleanup_completed_at.is_none() {
+                    return Err(Error::InvalidInput("partial Journal Unknown requires completed canonical cleanup fence".into()));
+                }
+                let purged = if let Some(worker) = &attempt.worker {
+                    tx.query_row("SELECT EXISTS(SELECT 1 FROM worker_removal_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state='succeeded' AND session_disposition='purge')",params![workspace_id,worker.runtime_id,worker.worker_id],|r|r.get::<_,bool>(0))?
+                } else { false };
+                if !purged { return Err(Error::InvalidInput("partial Journal Unknown has no committed stop/Purge removal receipt".into())); }
+                tx.execute("UPDATE backend_job_attempts SET state='failed',failure_category='journal_attempt_fenced',failure_detail='Canonical Worker cleanup and domain generation fence confirmed; retained operations remain valid',updated_at=?4 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3 AND state='unknown'",params![workspace_id,expected.job_id,expected.attempt_id,now])?;
+                tx.execute("UPDATE backend_jobs SET state='failed',failure_category='journal_attempt_fenced',failure_detail='Canonical Worker cleanup and domain generation fence confirmed',updated_at=?3 WHERE workspace_id=?1 AND job_id=?2 AND state='unknown'",params![workspace_id,expected.job_id,now])?;
+            }
+            let result = read_backend_job_attempt(&tx,workspace_id,&expected.job_id,&expected.attempt_id)?.ok_or_else(|| Error::Store("Reconciled Journal attempt missing".into()))?;
+            tx.commit()?; Ok(result)
+        })
+    }
+
     fn finish_backend_job_attempt(
         &self,
         workspace_id: &str,
@@ -11355,6 +11454,31 @@ fn read_active_backend_job_for_resource(
     id.map(|id| read_backend_job(conn, workspace_id, &id))
         .transpose()
         .map(Option::flatten)
+}
+
+/// Purge authority comes from the immutable request and exact attempt/Worker/input
+/// binding, never from a profile or purpose string.
+pub(crate) fn terminal_journal_job_worker(
+    conn: &Connection,
+    workspace: &str,
+    worker: &RuntimeWorkerRef,
+) -> Result<bool> {
+    let identity: Option<(String, String)> = conn.query_row(
+        "SELECT job_id, attempt_id FROM backend_job_attempts WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",
+        params![workspace, worker.runtime_id, worker.worker_id], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional()?;
+    let Some((job_id, attempt_id)) = identity else {
+        return Ok(false);
+    };
+    let job = read_backend_job(conn, workspace, &job_id)?
+        .ok_or_else(|| Error::Store("Journal cleanup Job missing".into()))?;
+    let attempt = read_backend_job_attempt(conn, workspace, &job_id, &attempt_id)?
+        .ok_or_else(|| Error::Store("Journal cleanup attempt missing".into()))?;
+    job.request.validate()?;
+    Ok(job.request.grants.subjektiv_journal.is_some()
+        && attempt.state.terminal()
+        && attempt.worker.as_ref() == Some(worker)
+        && attempt.input_digest == job.request.input_digest()?)
 }
 
 fn read_backend_job(
@@ -24091,6 +24215,7 @@ INSERT INTO worker_registry (
                     subject_id: subject.into(),
                     candidate_ids: vec![candidate.into()],
                 }),
+                ..Default::default()
             },
             serialization_key: None,
             source_worker: None,

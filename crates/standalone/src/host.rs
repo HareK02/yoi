@@ -694,8 +694,11 @@ fn backing_store(
     store: &StandaloneWorkerStore,
     worker_id: WorkerId,
 ) -> Result<(StandaloneBackingStore, FsWorkerStore), StandaloneStartupError> {
-    let session_store = FsStore::new(store.sessions_dir(worker_id))
-        .map_err(|_| StandaloneStartupError::StateStore)?;
+    let session_store = FsStore::new_with_retention(
+        store.sessions_dir(worker_id),
+        crate::store::session_retention(store.root()),
+    )
+    .map_err(|_| StandaloneStartupError::StateStore)?;
     let worker_store = FsWorkerStore::new(store.worker_metadata_dir(worker_id))
         .map_err(|_| StandaloneStartupError::StateStore)?;
     Ok((
@@ -806,5 +809,53 @@ mod local_input_tests {
                 other => panic!("unexpected local input {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod source_retention_tests {
+    //! Host backing-store assembly uses the production publisher and an isolated external
+    //! erasure fence. No controller/model is substituted for the source authority under test.
+    use super::*;
+    use session_store::{LogEntry, Store, StoreError};
+
+    #[test]
+    fn backing_publisher_and_reopen_use_the_host_wide_erasure_fence() {
+        let temp = tempfile::tempdir().unwrap();
+        let workers = StandaloneWorkerStore::open(temp.path().join("state")).unwrap();
+        let allocation = workers
+            .allocate(temp.path(), StaleLeasePolicy::Reject)
+            .unwrap();
+        let worker = allocation.worker_id();
+        let (backing, _) = backing_store(&workers, worker).unwrap();
+        let session = session_store::SessionId::now_v7();
+        let segment = uuid::Uuid::now_v7();
+        let entry = LogEntry::TurnEnd {
+            ts: 1,
+            turn_count: 1,
+        };
+        backing
+            .create_segment(session, segment, &[entry.clone()])
+            .unwrap();
+        let retention = crate::store::session_retention(workers.root());
+        assert!(
+            retention
+                .delete(
+                    session,
+                    session_store::retention::SessionDeletionIntent::ErasePermanently,
+                    || Err::<(), StoreError>(
+                        std::io::Error::other("injected physical erase failure").into()
+                    )
+                )
+                .is_err()
+        );
+        assert!(
+            matches!(backing.append(session, segment, &entry), Err(StoreError::SessionErased(id)) if id == session)
+        );
+        let (reopened, _) = backing_store(&workers, worker).unwrap();
+        assert!(
+            matches!(reopened.append(session, segment, &entry), Err(StoreError::SessionErased(id)) if id == session)
+        );
+        assert!(!workers.sessions_dir(worker).join(".retention").exists());
     }
 }

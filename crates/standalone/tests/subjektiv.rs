@@ -354,6 +354,18 @@ impl LlmClient for ScriptedClient {
         request: Request,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, ClientError>> + Send>>, ClientError>
     {
+        // This suite observes Memory and dialog requests. Journal's independent model
+        // boundary fails explicitly rather than consuming their script or using live transport;
+        // the Journal adapter suite exercises its successful sequential tool execution.
+        if request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "ReadJournalState")
+        {
+            return Err(ClientError::Config(
+                "Journal model is outside this Memory suite".into(),
+            ));
+        }
         // Lifecycle-triggered consolidation uses a separate Internal Worker. It
         // must not consume the dialog script or silently become a live request.
         let job = request

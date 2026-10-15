@@ -869,6 +869,7 @@ async fn backend_job_capability_is_explicit_and_preserves_profile_features() {
                     attempt_id: "attempt-1".into(),
                     input_digest: Some("input-1".into()),
                     subjektiv_consolidation: false,
+                    subjektiv_journal: false,
                 })
                 .unwrap();
         }
@@ -889,6 +890,186 @@ async fn backend_job_capability_is_explicit_and_preserves_profile_features() {
             bound
         );
         assert_eq!(names.iter().any(|name| name == "TaskCreate"), bound);
+    }
+}
+
+#[derive(Debug, Default)]
+struct JournalWorkspaceClient {
+    requests: Mutex<Vec<WorkspaceRequest>>,
+    result_calls: AtomicUsize,
+}
+impl WorkspaceClient for JournalWorkspaceClient {
+    fn workspace_id(&self) -> Option<&str> {
+        Some("workspace-test")
+    }
+    fn kind(&self) -> &str {
+        "journal-test"
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn execute(
+        &self,
+        request: WorkspaceRequest,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        self.requests.lock().unwrap().push(request.clone());
+        let (status, body) = if request.path.ends_with("/subjektiv/journal/job/finish") {
+            (
+                200,
+                serde_json::json!({"generation_id":"generation", "state_token":"saved-state", "process_order":1,"process_byte":0}),
+            )
+        } else if request.path.ends_with("/subjektiv/journal/job") {
+            let input: subjektiv::journal::transport::JournalJobRequest =
+                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            assert!(
+                matches!(input, subjektiv::journal::transport::JournalJobRequest::ReadOperationCoverage { request_id, offset: 0, limit: 2 } if request_id == "prior-record")
+            );
+            (
+                200,
+                serde_json::json!({"result":"coverage","value":{"items":[{
+                    "source":{"session_id":"original-session","pointer":{"segment_id":"00000000-0000-0000-0000-000000000001","entry_ref":"Eoriginal"},"order":0,"content_sha256":"a".repeat(64),"total_bytes":4096},
+                    "bytes":{"start":0,"end":32}
+                }],"next":"1"}}),
+            )
+        } else if request.path.ends_with("/workers/self/backend-job-result") {
+            if self.result_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                (503, serde_json::json!({"message":"acceptance unknown"}))
+            } else {
+                (200, serde_json::json!({"accepted":true}))
+            }
+        } else {
+            panic!("unexpected Journal request {}", request.path)
+        };
+        Ok(WorkspaceResponse {
+            status,
+            body: body.to_string(),
+        })
+    }
+}
+
+// Real controller/Job Feature assembly, tools, finalizer and Backend adapter.
+// The authenticated Workspace client transport and LLM are replaced; server authorization/store
+// semantics are tested by the Backend owner, not by this request-contract fixture.
+#[tokio::test]
+async fn journal_backend_grant_installs_bound_tools_and_seals_saved_finish_before_uncertain_result_retry()
+ {
+    for granted in [false, true] {
+        let workspace = tempfile::tempdir().unwrap();
+        let manifest = ProfileResolver::new()
+            .with_workspace_base(workspace.path())
+            .resolve(
+                &ProfileSelector::source_named(
+                    ProfileRegistrySource::Builtin,
+                    "subjektiv-journal-recording",
+                ),
+                ProfileResolveOptions::with_worker_name("journal-backend-worker"),
+            )
+            .unwrap()
+            .manifest;
+        let call = |id: &str, tool: &str, args: serde_json::Value| {
+            MockResponse::Complete(vec![
+                LlmEvent::tool_use_start(0, id, tool),
+                LlmEvent::tool_input_delta(0, args.to_string()),
+                LlmEvent::tool_use_stop(0),
+                LlmEvent::Status(StatusEvent {
+                    status: ResponseStatus::Completed,
+                }),
+            ])
+        };
+        let responses = if granted {
+            vec![
+                call(
+                    "coverage",
+                    "ReadJournalOperationCoverage",
+                    serde_json::json!({"request_id":"prior-record","offset":0,"limit":2}),
+                ),
+                call(
+                    "result-unknown",
+                    "SubmitBackendJobResult",
+                    serde_json::json!({"result":{}}),
+                ),
+                call(
+                    "result-retry",
+                    "SubmitBackendJobResult",
+                    serde_json::json!({"result":{}}),
+                ),
+                MockResponse::Complete(simple_text_events()),
+            ]
+        } else {
+            vec![MockResponse::Complete(simple_text_events())]
+        };
+        let client = MockClient::sequential(responses);
+        let captured = client.clone();
+        let backend = Arc::new(JournalWorkspaceClient::default());
+        let (mut worker, _pwd) = make_worker_with_manifest_and_workspace_context(
+            client,
+            manifest,
+            WorkerWorkspaceContext::with_client(None, backend.clone()),
+        )
+        .await;
+        worker
+            .bind_backend_job(worker::BackendJobExecutionBinding {
+                job_id: "job".into(),
+                attempt_id: "attempt".into(),
+                input_digest: Some("digest".into()),
+                subjektiv_consolidation: false,
+                subjektiv_journal: granted,
+            })
+            .unwrap();
+        let handle = spawn_controller(worker).await;
+        handle
+            .send(Method::submit_text(
+                protocol::new_submission_request_id(),
+                "Record only admitted public input.",
+            ))
+            .await
+            .unwrap();
+        wait_for_status(&handle, WorkerStatus::Idle).await;
+        let request = wait_for_captured_request(&captured).await;
+        let tools = request_tool_names(&request);
+        assert_eq!(
+            tools.iter().any(|name| name == "CreateJournalEntry"),
+            granted,
+            "Profile alone must not grant Journal operations"
+        );
+        assert!(!tools.iter().any(|name| name == "SubjektivMemoryRemember"));
+        let requests = backend.requests.lock().unwrap();
+        if granted {
+            let history = history_from_sink(&handle);
+            let coverage = history
+                .iter()
+                .find_map(|item| match item {
+                    Item::ToolResult {
+                        call_id,
+                        content: Some(content),
+                        ..
+                    } if call_id == "coverage" => {
+                        Some(serde_json::from_str::<serde_json::Value>(content).unwrap())
+                    }
+                    _ => None,
+                })
+                .expect("coverage must reach model-visible committed history");
+            assert_eq!(coverage["value"]["items"][0]["bytes"]["end"], 32);
+            assert_eq!(
+                coverage["value"]["items"][0]["source"]["pointer"]["entry_ref"],
+                "Eoriginal"
+            );
+            assert_eq!(coverage["value"]["next"], "1");
+            assert_eq!(requests.len(), 4);
+            assert!(requests[0].path.ends_with("/subjektiv/journal/job"));
+            assert!(requests[1].path.ends_with("/subjektiv/journal/job/finish"));
+            assert_eq!(requests[1].body.as_deref(), Some("{}"));
+            assert_eq!(
+                requests[2].body, requests[3].body,
+                "unknown acceptance retries identical sealed completion without rerunning finish"
+            );
+            let result: serde_json::Value =
+                serde_json::from_str(requests[2].body.as_deref().unwrap()).unwrap();
+            assert_eq!(result["result"]["state_token"], "saved-state");
+            assert_eq!(result["result"]["generation_id"], "generation");
+        } else {
+            assert!(requests.is_empty());
+        }
     }
 }
 
@@ -933,6 +1114,7 @@ async fn consolidation_job_preserves_custom_instruction_and_explicit_tool_policy
             attempt_id: "attempt-1".into(),
             input_digest: None,
             subjektiv_consolidation: true,
+            subjektiv_journal: false,
         })
         .unwrap();
     let handle = spawn_controller(worker).await;

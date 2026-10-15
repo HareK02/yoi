@@ -747,6 +747,7 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
         let summary = ToolResultSummary {
             call_id: info.result.tool_use_id.clone(),
             tool_name: info.call.name.clone(),
+            arguments: info.call.input.clone(),
             is_error: info.result.is_error,
             output: ToolOutput {
                 summary: info.result.summary.clone(),

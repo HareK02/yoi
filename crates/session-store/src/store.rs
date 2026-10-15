@@ -33,6 +33,15 @@ pub enum StoreError {
     #[error("log corrupted at line {line}: {message}")]
     Corrupt { line: usize, message: String },
 
+    #[error("session source is missing: {0}")]
+    SessionSourceMissing(SessionId),
+
+    #[error("session original material is retained by a durable consumer: {0}")]
+    SessionPinned(SessionId),
+
+    #[error("session was permanently erased: {0}")]
+    SessionErased(SessionId),
+
     #[error("retained observation read limit exceeded")]
     ReadLimitExceeded,
 

@@ -226,7 +226,7 @@ impl SqliteWorkspaceStore {
         let now = Utc::now().to_rfc3339();
         self.with_conn_mut(|conn| {
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let policy=load_policy(&tx,&req.workspace_id)?.ok_or_else(|| StoreError::InvalidInput(format!("policy-missing:{}",req.workspace_id)))?;
+            let policy=load_removal_policy(&tx,&req.workspace_id,&req.worker)?.ok_or_else(|| StoreError::InvalidInput(format!("policy-missing:{}",req.workspace_id)))?;
             let worker=match load_worker(&tx,&req.workspace_id,&req.worker)? {
                 Some(v)=>v,
                 None=>{
@@ -272,7 +272,7 @@ impl SqliteWorkspaceStore {
                 return Err(StoreError::InvalidInput(format!("stale:{plan_id}:plan state {} is not executable", state_s(plan.state))));
             }
             if !plan.blockers.is_empty(){return Err(StoreError::InvalidInput(format!("blocked:{}",serde_json::to_string(&plan.blockers).unwrap())));}
-            let policy=load_policy(&tx,workspace_id)?.ok_or_else(||StoreError::InvalidInput(format!("policy-missing:{workspace_id}")))?;
+            let policy=load_removal_policy(&tx,workspace_id,&plan.worker)?.ok_or_else(||StoreError::InvalidInput(format!("policy-missing:{workspace_id}")))?;
             if policy.policy_id!=plan.policy_id||policy.policy_digest!=plan.policy_digest{
                 mark_stale(&tx,&plan,"policy content changed")?;tx.commit()?;
                 return Err(stale_error(&plan,"policy content changed"));
@@ -784,6 +784,36 @@ struct WorkerRow {
 }
 fn load_worker(c: &Connection, w: &str, r: &RuntimeWorkerRef) -> crate::Result<Option<WorkerRow>> {
     c.query_row("SELECT display_name,profile,retention_state,created_at,updated_at FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",params![w,r.runtime_id,r.worker_id],|x|Ok(WorkerRow{display_name:x.get(0)?,profile:x.get(1)?,retention_state:x.get(2)?,created_at:x.get(3)?,updated_at:x.get(4)?})).optional().map_err(StoreError::from)
+}
+/// Recording Sessions may contain original text in tool results. Only a terminal,
+/// Host-bound Journal attempt grants this exception; profile names grant nothing.
+/// This plan-local policy never changes the Workspace conversation policy.
+fn load_removal_policy(
+    c: &Connection,
+    w: &str,
+    worker: &RuntimeWorkerRef,
+) -> crate::Result<Option<WorkerRetentionPolicy>> {
+    let Some(mut policy) = load_policy(c, w)? else {
+        return Ok(None);
+    };
+    if crate::store::terminal_journal_job_worker(c, w, worker)? {
+        let update = WorkerRetentionPolicyUpdate {
+            policy_id: "backend-journal-ephemeral-session-v1".into(),
+            session_disposition: SessionDisposition::Purge,
+            metadata_disposition: MetadataDisposition::Tombstone,
+            archive_retention: ArchiveRetention::Forever,
+            diagnostics_disposition: DiagnosticsDisposition::Purge,
+            diagnostics_retention_seconds: None,
+        };
+        policy.policy_id = update.policy_id.clone();
+        policy.policy_digest = worker_retention_policy_digest(&update);
+        policy.session_disposition = update.session_disposition;
+        policy.metadata_disposition = update.metadata_disposition;
+        policy.archive_retention = update.archive_retention;
+        policy.diagnostics_disposition = update.diagnostics_disposition;
+        policy.diagnostics_retention_seconds = None;
+    }
+    Ok(Some(policy))
 }
 fn load_policy(c: &Connection, w: &str) -> crate::Result<Option<WorkerRetentionPolicy>> {
     c.query_row(
@@ -1424,6 +1454,7 @@ mod tests {
                 source_runtime_id: "r".into(),
                 source_worker_id: worker_id(),
                 source_session_id: "s".into(),
+                source_active_segment_id: None,
                 segment_ids: vec!["a".into()],
                 source_created_at: "created".into(),
                 removed_at: "removed".into(),
@@ -2361,6 +2392,7 @@ mod tests {
                 source_runtime_id: "r".into(),
                 source_worker_id: worker_id(),
                 source_session_id: "s".into(),
+                source_active_segment_id: None,
                 segment_ids: vec!["a".into()],
                 source_created_at: "created".into(),
                 removed_at: "removed".into(),

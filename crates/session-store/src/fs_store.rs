@@ -48,6 +48,7 @@ pub struct FsStore {
     /// `write_all` may have extended the file, so rollback is safe only while
     /// no sibling writer can append behind it.
     append_lock: Arc<Mutex<()>>,
+    retention: crate::retention::SessionRetentionStore,
 }
 
 impl FsStore {
@@ -55,10 +56,22 @@ impl FsStore {
     /// Creates the directory if it does not exist.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let root = root.into();
+        let retention = crate::retention::fs_retention(&root);
+        Self::new_with_retention(root, retention)
+    }
+
+    /// Hosts that relocate Worker originals must keep control state outside the relocated
+    /// aggregate and pass the same store to readers and deletion/transfer operations.
+    pub fn new_with_retention(
+        root: impl Into<PathBuf>,
+        retention: crate::retention::SessionRetentionStore,
+    ) -> Result<Self, StoreError> {
+        let root = root.into();
         fs::create_dir_all(&root)?;
         Ok(Self {
             root,
             append_lock: Arc::new(Mutex::new(())),
+            retention,
         })
     }
 
@@ -98,12 +111,46 @@ impl FsStore {
     /// Returns `Ok(true)` when a Session directory was removed and `Ok(false)`
     /// when it was already absent.
     pub fn delete_session(&self, session_id: SessionId) -> Result<bool, StoreError> {
-        let session_dir = self.session_dir(session_id);
-        match fs::remove_dir_all(&session_dir) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error.into()),
-        }
+        self.delete_session_with_intent(
+            session_id,
+            crate::retention::SessionDeletionIntent::Ordinary,
+        )
+    }
+
+    pub fn retention(&self) -> crate::retention::SessionRetentionStore {
+        self.retention.clone()
+    }
+
+    pub fn pin_session(
+        &self,
+        session_id: SessionId,
+        pin: crate::retention::SessionRetentionPin,
+    ) -> Result<(), StoreError> {
+        self.retention().pin(session_id, pin, || {
+            Ok(self.session_dir(session_id).is_dir())
+        })
+    }
+
+    pub fn release_session_pin(
+        &self,
+        session_id: SessionId,
+        pin: crate::retention::SessionRetentionPin,
+    ) -> Result<(), StoreError> {
+        self.retention().release(session_id, pin)
+    }
+
+    pub fn delete_session_with_intent(
+        &self,
+        session_id: SessionId,
+        intent: crate::retention::SessionDeletionIntent,
+    ) -> Result<bool, StoreError> {
+        self.retention().delete(session_id, intent, || {
+            match fs::remove_dir_all(self.session_dir(session_id)) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error.into()),
+            }
+        })
     }
 
     fn session_dir(&self, session_id: SessionId) -> PathBuf {
@@ -288,6 +335,7 @@ impl Store for FsStore {
         segment_id: SegmentId,
         entry: &LogEntry,
     ) -> Result<(), StoreError> {
+        let _retention = self.retention().lock_live(session_id)?;
         let line = serde_json::to_string(entry)?;
         self.append_line(&self.log_path(session_id, segment_id), &line)
     }
@@ -374,6 +422,7 @@ impl Store for FsStore {
         segment_id: SegmentId,
         entries: &[LogEntry],
     ) -> Result<(), StoreError> {
+        let _retention = self.retention().lock_live(session_id)?;
         let path = self.log_path(session_id, segment_id);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -423,6 +472,7 @@ impl Store for FsStore {
         content: &str,
         limits: PasteArtifactLimits,
     ) -> Result<PasteArtifactRef, StoreError> {
+        let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
             .lock()
@@ -451,6 +501,7 @@ impl Store for FsStore {
         content: &[u8],
         limits: UploadedFileLimits,
     ) -> Result<UploadedFileRef, StoreError> {
+        let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
             .lock()
@@ -474,6 +525,7 @@ impl Store for FsStore {
         context: &UploadedFileUploadContext,
         limits: UploadedFileLimits,
     ) -> Result<UploadedFileRef, StoreError> {
+        let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
             .lock()
@@ -510,6 +562,7 @@ impl Store for FsStore {
         reference: &UploadedFileRef,
         source_entry_id: &str,
     ) -> Result<UploadedFileRef, StoreError> {
+        let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
             .lock()
@@ -537,6 +590,7 @@ impl Store for FsStore {
         reference: &UploadedFileRef,
         owner_id: &str,
     ) -> Result<(), StoreError> {
+        let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
             .lock()
@@ -550,6 +604,7 @@ impl Store for FsStore {
         artifact_id: &str,
         owner_id: &str,
     ) -> Result<(), StoreError> {
+        let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
             .lock()
@@ -563,6 +618,7 @@ impl Store for FsStore {
         artifact_id: &str,
         source_entry_id: &str,
     ) -> Result<(), StoreError> {
+        let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
             .lock()
@@ -579,6 +635,7 @@ impl Store for FsStore {
         session_id: SessionId,
         live_owner_ids: &[String],
     ) -> Result<u64, StoreError> {
+        let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
             .lock()
@@ -591,6 +648,7 @@ impl Store for FsStore {
         session_id: SessionId,
         artifact_id: &str,
     ) -> Result<bool, StoreError> {
+        let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
             .lock()
@@ -599,6 +657,7 @@ impl Store for FsStore {
     }
 
     fn delete_uncommitted_uploaded_files(&self, session_id: SessionId) -> Result<u64, StoreError> {
+        let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
             .lock()
@@ -631,6 +690,13 @@ impl Store for FsStore {
         source_session_id: SessionId,
         target_session_id: SessionId,
     ) -> Result<u64, StoreError> {
+        let mut sessions = vec![source_session_id, target_session_id];
+        sessions.sort();
+        sessions.dedup();
+        let _retention = sessions
+            .into_iter()
+            .map(|id| self.retention().lock_live(id))
+            .collect::<Result<Vec<_>, _>>()?;
         let _guard = self
             .append_lock
             .lock()
@@ -647,6 +713,7 @@ impl Store for FsStore {
         segment_id: SegmentId,
         entry: &TraceEntry,
     ) -> Result<(), StoreError> {
+        let _retention = self.retention().lock_live(session_id)?;
         let line = serde_json::to_string(entry)?;
         self.append_line(&self.trace_path(session_id, segment_id), &line)
     }
