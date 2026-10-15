@@ -44,6 +44,7 @@ fn content_digest(title: &str) -> String {
             [title],
         )
         .unwrap();
+    connection.execute_batch("CREATE TABLE typed_ticket_events(workspace_id TEXT,ticket_id TEXT,event_index INTEGER,body TEXT); INSERT INTO typed_ticket_events VALUES('W','T',-1,'Requirements');").unwrap();
     ticket::sqlite_ticket_content_digest(&connection, "W", "T")
         .unwrap()
         .unwrap()
@@ -53,6 +54,7 @@ fn fixture() -> (tempfile::TempDir, MergeRequestStore) {
     let p = d.path().join("db");
     let c = Connection::open(&p).unwrap();
     c.execute_batch("CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY);CREATE TABLE repositories(workspace_id TEXT,repository_id TEXT,PRIMARY KEY(workspace_id,repository_id));CREATE TABLE ticket_current_worker_assignments(workspace_id TEXT,ticket_id TEXT,assignment_id TEXT,runtime_id TEXT,worker_id TEXT,updated_at TEXT,PRIMARY KEY(workspace_id,ticket_id));CREATE TABLE typed_tickets(workspace_id TEXT,ticket_id TEXT,workflow_state TEXT,workflow_state_explicit INTEGER,updated_at TEXT,title TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(workspace_id,ticket_id));CREATE TABLE typed_ticket_targets(workspace_id TEXT,ticket_id TEXT,ordinal INTEGER,repository_key TEXT,ref_selector TEXT,access TEXT);CREATE TABLE typed_ticket_events(workspace_id TEXT,ticket_id TEXT,event_index INTEGER,kind TEXT,author TEXT,at TEXT,from_state TEXT,to_state TEXT,heading TEXT,body TEXT,PRIMARY KEY(workspace_id,ticket_id,event_index));CREATE TABLE typed_ticket_event_attributes(workspace_id TEXT,ticket_id TEXT,event_index INTEGER,key TEXT,value TEXT,PRIMARY KEY(workspace_id,ticket_id,event_index,key));INSERT INTO workspaces VALUES('W');INSERT INTO repositories VALUES('W','R');INSERT INTO repositories VALUES('W','R2');INSERT INTO ticket_current_worker_assignments VALUES('W','T','A','runtime','coder','t');INSERT INTO typed_tickets VALUES('W','T','inprogress',1,'t','Title','Requirements');CREATE VIEW ticket_active_worker_assignments AS SELECT current.* FROM ticket_current_worker_assignments current JOIN typed_tickets ticket ON ticket.workspace_id=current.workspace_id AND ticket.ticket_id=current.ticket_id WHERE ticket.workflow_state NOT IN ('done','closed');").unwrap();
+    c.execute("INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,kind,body) VALUES('W','T',-1,'comment','Requirements')",[]).unwrap();
     drop(c);
     let a = Assignments(Arc::new(Mutex::new(CurrentAssignment {
         assignment_id: "A".into(),
