@@ -1,4 +1,22 @@
 use super::*;
+
+/// Commits one Journal effect with its exact retry response, using Journal-only authority.
+pub fn execute_journal(
+    store: &crate::SubjektivStore,
+    context: &JournalJobContext,
+    operation: journal::JournalOperation,
+) -> journal::JournalResult<journal::JournalReceipt> {
+    store.execute_journal(context, operation)
+}
+
+/// Advances only selected input backed by already committed Journal effects.
+pub fn checkpoint_journal(
+    store: &crate::SubjektivStore,
+    context: &JournalJobContext,
+    operation: journal::JournalOperation,
+) -> journal::JournalResult<journal::JournalReceipt> {
+    store.checkpoint_journal(context, operation)
+}
 use server_api::{
     SubjektivMemoryBackendOperation as Op, SubjektivMemoryBackendResponse as Response,
 };

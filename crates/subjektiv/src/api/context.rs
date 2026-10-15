@@ -1,8 +1,9 @@
 //! Trusted Host operation context, never deserialized from model input.
 use super::{OperationError, OperationResult, subjektiv_store_error};
+pub use crate::journal::{JournalHostContext, JournalJobContext};
 use crate::{SubjectSessionAttribution, SubjektivStore};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct JobAttemptBinding {
     pub job_id: String,
     pub attempt_id: String,

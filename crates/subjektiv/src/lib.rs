@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod job;
+pub mod journal;
 mod legacy_migrations;
 mod schema;
 use legacy_migrations::{
@@ -601,6 +602,11 @@ static MIGRATIONS: &[FeatureMigration] = &[
         7,
         "replace counters with immutable changes and content conditions",
         schema::migrate,
+    ),
+    FeatureMigration::new(
+        8,
+        "add durable journal operations and processing ranges",
+        journal::migrate,
     ),
 ];
 

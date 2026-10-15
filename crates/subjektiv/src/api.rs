@@ -11,8 +11,10 @@
 
 mod context;
 mod operation;
-pub use context::{HostOperationContext, JobAttemptBinding};
-pub use operation::execute;
+/// Shared Journal domain operations; no model tools or Host-specific transport.
+pub use crate::journal;
+pub use context::{HostOperationContext, JobAttemptBinding, JournalHostContext, JournalJobContext};
+pub use operation::{checkpoint_journal, execute, execute_journal};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
