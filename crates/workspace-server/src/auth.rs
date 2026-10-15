@@ -116,7 +116,7 @@ pub async fn resolve_request_actor(
 
 // One owned synchronous stage includes token usage marking and the user read.
 // Do not call async store wrappers here: they use the same executor themselves.
-fn resolve_request_actor_sync(
+pub(crate) fn resolve_request_actor_sync(
     store: &dyn ControlPlaneStore,
     bearer: Option<String>,
     session: Option<String>,

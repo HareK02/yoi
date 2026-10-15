@@ -305,7 +305,8 @@ impl WorkerE2eEnvironment {
         self.start_runtime()
     }
 
-    pub fn start_backend(&mut self) -> Result<()> {
+    /// 空のDBでBackendだけを起動し、Account／Workspaceは作成しない。
+    pub fn start_empty_backend(&mut self) -> Result<()> {
         assert_absent_or_empty(&self.server_data_dir, "Server data directory")?;
         assert_absent_or_empty(&self.runtime_data_dir, "Runtime data directory")?;
         let server_binary = self.binaries.binary("yoi-server")?;
@@ -328,7 +329,14 @@ impl WorkerE2eEnvironment {
         self.server = Some(server);
         self.server_url = Some(server_url.clone());
         self.wait_for_server_health(&server_url)?;
+        self.write_metadata("empty-backend-running")?;
+        Ok(())
+    }
 
+    pub fn start_backend(&mut self) -> Result<()> {
+        self.start_empty_backend()?;
+        let server_binary = self.binaries.binary("yoi-server")?;
+        let server_url = self.required_server_url()?.to_string();
         let bootstrap = self.run_command(
             &server_binary,
             &[

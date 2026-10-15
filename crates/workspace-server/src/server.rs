@@ -230,9 +230,12 @@ use crate::resource_broker::BackendResourceBroker;
 use crate::runtime_settings::RuntimeConfigSchemaProvider;
 use crate::runtime_subscription::RuntimeSubscriptionBroker;
 use crate::skills;
+#[cfg(test)]
+use crate::store::AccountRecord;
 use crate::store::{
-    AccountRecord, ApiTokenRecord, AuthChallengeRecord, BrowserSessionRecord, ControlPlaneStore,
-    DeviceLoginFlowRecord, ExternalWorkdirGrantRecord, FlowSourceRecord, PasskeyCredentialRecord,
+    ApiTokenRecord, AuthChallengeRecord, BrowserSessionRecord, ControlPlaneStore,
+    DeviceLoginFlowRecord, ExternalWorkdirGrantRecord, FlowSourceRecord,
+    PasskeyAuthenticationBinding, PasskeyCredentialRecord, PasskeyRegistrationTarget,
     RepositoryInsertOutcome, RepositoryRecord, RuntimeRemovalOperation,
     RuntimeRemovalOperationState, TicketAssignmentPrincipal, TicketAssignmentRole,
     TicketRoleAssignmentRecord, TicketWorkerAssignmentRecord, UserRecord,
@@ -6394,6 +6397,12 @@ fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
         ))
         .layer(middleware::from_fn(attach_server_origin_context));
     let actor_context = Router::new()
+        .merge(server_api::server_api_axum::auth_passkey_addition_options(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::auth_passkey_addition_complete(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::auth_device_login_approve(
             service.clone(),
         ))
@@ -7339,6 +7348,56 @@ impl server_api::ServerApi for ServerApiContractService {
             .map_err(ApiError::into_repository_api_error)?;
         Ok(
             server_api::server_api_responses::AuthPasskeyRegistrationComplete::Status200 {
+                body,
+                header_set_cookie,
+            },
+        )
+    }
+
+    async fn auth_passkey_addition_options(
+        &self,
+        context: server_api::ServerRequestContext,
+        request: server_api::PasskeyAdditionOptionsRequest,
+    ) -> std::result::Result<PasskeyRegistrationOptionsResponse, server_api::RepositoryApiError>
+    {
+        let headers = contract_request_headers(&context)?;
+        let api = self.auth_api();
+        api.store
+            .db_executor()
+            .run(move || {
+                let (user, authentication) = passkey_addition_authority(&api, &headers)?;
+                start_passkey_registration(
+                    &api,
+                    &headers,
+                    request.browser_origin.as_deref(),
+                    PasskeyRegistrationTarget::Addition {
+                        user,
+                        authentication,
+                    },
+                )
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn auth_passkey_addition_complete(
+        &self,
+        context: server_api::ServerRequestContext,
+        request: PasskeyRegistrationCompleteRequest,
+    ) -> std::result::Result<
+        server_api::server_api_responses::AuthPasskeyAdditionComplete,
+        server_api::RepositoryApiError,
+    > {
+        let headers = contract_request_headers(&context)?;
+        let api = self.auth_api();
+        let (body, header_set_cookie) = api
+            .store
+            .db_executor()
+            .run(move || complete_passkey_enrollment(&api, request, Some(&headers)))
+            .await
+            .map_err(ApiError::into_repository_api_error)?;
+        Ok(
+            server_api::server_api_responses::AuthPasskeyAdditionComplete::Status200 {
                 body,
                 header_set_cookie,
             },
@@ -28934,17 +28993,51 @@ async fn scoped_list_host_workers(
     list_host_workers(State(api), AxumPath(path.host_id)).await
 }
 
+/// Account creation requires a verified new-account ceremony. The old bootstrap
+/// endpoint must not reserve handles or make an existing identity enrollable.
 async fn post_auth_bootstrap_user(
-    State(api): State<ServerAuthApi>,
-    Json(request): Json<AuthBootstrapUserRequest>,
+    State(_api): State<ServerAuthApi>,
+    Json(_request): Json<AuthBootstrapUserRequest>,
 ) -> ApiResult<Json<AuthUserResponse>> {
-    api.store
-        .db_executor()
-        .run(move || {
-            let user = ensure_user_account(&api, &request.handle, request.display_name.as_deref())?;
-            Ok(Json(AuthUserResponse { user }))
-        })
-        .await
+    Err(auth_error(
+        "verified_registration_required",
+        "use new-account passkey registration",
+    )
+    .into())
+}
+
+/// Tagged state deliberately rejects pre-separation bare WebAuthn states. They
+/// carry no enrollment purpose or current-auth binding and cannot be upgraded safely.
+/// A caller can obtain new options and repeat new-account enrollment only for an
+/// unused, unpersisted handle. Existing credential/current authenticated authority
+/// instead permits login and actor-derived addition.
+///
+/// Old options could already have persisted an Account/User without credentials.
+/// Credential absence is not ownership proof: that existing handle cannot be
+/// claimed anonymously or restarted as a new account. Use a different unused
+/// handle or a separately authorized future recovery flow. Preserve those rows;
+/// no DB edits, automatic deletion, bare-state conversion or new recovery/admin
+/// feature is part of this migration.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasskeyRegistrationEnvelope {
+    target: PasskeyRegistrationTarget,
+    verifier: PasskeyRegistration,
+}
+
+/// An account gets one stable WebAuthn user handle, without storing a new schema
+/// field. Migration leaves all existing credentials, their random registration
+/// handles and key material unchanged. Credential-ID-scoped authentication must
+/// accept signed assertions both without userHandle and with the original random
+/// or newly registered stable userHandle; it is not discoverable-handle lookup.
+/// The real-verifier compatibility tests exercise each representation explicitly.
+fn passkey_user_handle(account_id: &str) -> Uuid {
+    let digest = Sha256::digest(account_id.as_bytes());
+    Uuid::from_bytes(
+        digest[..16]
+            .try_into()
+            .expect("SHA256 has at least 16 bytes"),
+    )
 }
 
 async fn post_passkey_registration_options(
@@ -28955,62 +29048,147 @@ async fn post_passkey_registration_options(
     api.store
         .db_executor()
         .run(move || {
-            let user = ensure_user_account(&api, &request.handle, request.display_name.as_deref())?;
-            let header_origin = request_origin(&headers);
-            let requested_origin = request
-                .browser_origin
-                .as_deref()
-                .or(header_origin.as_deref());
-            let auth = auth_config_for_origin(&api.config, requested_origin)?;
-            let webauthn = webauthn_for_auth(&auth)?;
-            let exclude_credentials = passkeys_for_user(&api, &user.user_id)?
-                .into_iter()
-                .map(|passkey| passkey.cred_id().clone())
-                .collect();
-            let user_unique_id = Uuid::now_v7();
-            let (public_key, state) = webauthn
-                .start_passkey_registration(
-                    user_unique_id,
-                    &user.handle,
-                    &user.display_name,
-                    Some(exclude_credentials),
-                )
-                .map_err(|error| {
-                    auth_error("webauthn_registration_options_failed", &error.to_string())
-                })?;
-            let challenge_id = new_id("webauthn-registration");
-            api.store.put_auth_challenge(&AuthChallengeRecord {
-                challenge_id: challenge_id.clone(),
-                ceremony: "passkey_registration".to_string(),
-                challenge: challenge_id.clone(),
-                user_id: Some(user.user_id),
-                rp_id: auth.rp_id,
-                origin: auth.origin,
-                state_json: Some(serde_json::to_string(&state).map_err(|error| {
-                    auth_error("webauthn_state_serialize_failed", &error.to_string())
-                })?),
-                expires_at: rfc3339_after(Duration::minutes(5)),
-                created_at: crate::auth::now_rfc3339(),
-                consumed_at: None,
-            })?;
-            Ok(Json(PasskeyRegistrationOptionsResponse {
-                challenge_id,
-                public_key,
-            }))
+            let user = allocate_new_user(&api, &request.handle, request.display_name.as_deref())?;
+            start_passkey_registration(
+                &api,
+                &headers,
+                request.browser_origin.as_deref(),
+                PasskeyRegistrationTarget::NewAccount { user },
+            )
+            .map(Json)
         })
         .await
 }
 
-/// Consumes a stored WebAuthn ceremony and registers only verified credentials.
+/// Re-resolves transport credentials instead of trusting a context actor snapshot.
+/// Cookie additions require the exact configured Origin even at direct API entry;
+/// browser_origin in a JSON body is not CSRF evidence.
+fn passkey_addition_authority(
+    api: &ServerAuthApi,
+    headers: &HeaderMap,
+) -> ApiResult<(UserRecord, PasskeyAuthenticationBinding)> {
+    let auth = auth_public_config(&api.config);
+    let actor = crate::auth::resolve_request_actor_sync(
+        api.store.as_ref(),
+        crate::auth::parse_bearer(headers),
+        parse_cookie(headers, &auth.cookie_name),
+    )?
+    .ok_or_else(|| {
+        auth_error(
+            "auth_required",
+            "passkey addition requires current authentication",
+        )
+    })?;
+    let binding = match actor.auth_method {
+        ActorAuthMethod::BrowserSession => {
+            if request_origin(headers).as_deref() != Some(auth.origin.as_str()) {
+                return Err(Error::WorkspacePermissionDenied(
+                    "cookie-authenticated passkey addition requires the configured Browser origin"
+                        .into(),
+                )
+                .into());
+            }
+            PasskeyAuthenticationBinding::BrowserSession(token_hash(
+                &parse_cookie(headers, &auth.cookie_name)
+                    .ok_or_else(|| auth_error("auth_required", "missing browser credential"))?,
+            ))
+        }
+        ActorAuthMethod::ApiToken => PasskeyAuthenticationBinding::ApiToken(token_hash(
+            &crate::auth::parse_bearer(headers)
+                .ok_or_else(|| auth_error("auth_required", "missing API credential"))?,
+        )),
+    };
+    let user = api
+        .store
+        .get_user(&actor.user_id)?
+        .filter(|user| user.account_id == actor.account_id)
+        .ok_or_else(|| auth_error("auth_required", "authenticated user no longer exists"))?;
+    Ok((user, binding))
+}
+
+fn start_passkey_registration(
+    api: &ServerAuthApi,
+    headers: &HeaderMap,
+    browser_origin: Option<&str>,
+    target: PasskeyRegistrationTarget,
+) -> ApiResult<PasskeyRegistrationOptionsResponse> {
+    let (user, exclude_credentials) = match &target {
+        PasskeyRegistrationTarget::NewAccount { user } => (user, Vec::new()),
+        PasskeyRegistrationTarget::Addition { user, .. } => (
+            user,
+            passkeys_for_user(api, &user.user_id)?
+                .into_iter()
+                .map(|passkey| passkey.cred_id().clone())
+                .collect(),
+        ),
+    };
+    let header_origin = request_origin(headers);
+    let auth = auth_config_for_origin(&api.config, browser_origin.or(header_origin.as_deref()))?;
+    let webauthn = webauthn_for_auth(&auth)?;
+    let (public_key, verifier) = webauthn
+        .start_passkey_registration(
+            passkey_user_handle(&user.account_id),
+            &user.handle,
+            &user.display_name,
+            Some(exclude_credentials),
+        )
+        .map_err(|error| auth_error("webauthn_registration_options_failed", &error.to_string()))?;
+    let challenge_id = new_id("webauthn-registration");
+    // New users do not exist yet, so the nullable FK remains empty. The complete
+    // target (including its allocated user ID) is inside the purpose-tagged state.
+    let user_id = match &target {
+        PasskeyRegistrationTarget::NewAccount { .. } => None,
+        PasskeyRegistrationTarget::Addition { user, .. } => Some(user.user_id.clone()),
+    };
+    api.store.put_auth_challenge(&AuthChallengeRecord {
+        challenge_id: challenge_id.clone(),
+        ceremony: "passkey_registration".into(),
+        challenge: challenge_id.clone(),
+        user_id,
+        rp_id: auth.rp_id,
+        origin: auth.origin,
+        state_json: Some(
+            serde_json::to_string(&PasskeyRegistrationEnvelope { target, verifier }).map_err(
+                |error| auth_error("webauthn_state_serialize_failed", &error.to_string()),
+            )?,
+        ),
+        expires_at: rfc3339_after(Duration::minutes(5)),
+        created_at: crate::auth::now_rfc3339(),
+        consumed_at: None,
+    })?;
+    Ok(PasskeyRegistrationOptionsResponse {
+        challenge_id,
+        public_key,
+    })
+}
+
+/// One-use ceremonies bind purpose, target, RP, origin and verifier state. A
+/// consumed challenge is never restored on failure. Only verified credentials
+/// reach the insert-only transaction; a concurrent handle winner cannot become
+/// an addition.
 ///
-/// Binds the challenge to User, RP, Origin, and stored verifier state, rejecting consumed or
-/// expired ceremonies. Browser assertions alone do not create keys or sessions: credentials
-/// are saved and browser sessions issued only after webauthn-rs verification succeeds.
-/// Login also verifies a stored ceremony.
+/// Credential commit precedes session issuance. If issuing the session or
+/// delivering the response fails, the credential can already exist: log in with
+/// that key rather than overwriting it or replaying the consumed completion.
+/// After an unknown commit outcome, try login first. Restart new-account
+/// enrollment with fresh options only for an unused handle with no persisted
+/// identity; legacy pre-created identities follow the migration policy on
+/// [`PasskeyRegistrationEnvelope`]. Neither recovery path requires DB edits.
 fn complete_passkey_registration(
     api: &ServerAuthApi,
     request: PasskeyRegistrationCompleteRequest,
 ) -> ApiResult<(AuthUserResponse, server_api::SetCookieHeader)> {
+    complete_passkey_enrollment(api, request, None)
+}
+
+fn complete_passkey_enrollment(
+    api: &ServerAuthApi,
+    request: PasskeyRegistrationCompleteRequest,
+    addition_headers: Option<&HeaderMap>,
+) -> ApiResult<(AuthUserResponse, server_api::SetCookieHeader)> {
+    let authority = addition_headers
+        .map(|headers| passkey_addition_authority(api, headers))
+        .transpose()?;
     let challenge = api
         .store
         .consume_auth_challenge_by_id(
@@ -29031,39 +29209,58 @@ fn complete_passkey_registration(
         )
         .into());
     }
-    let user_id = challenge.user_id.clone().ok_or_else(|| {
-        auth_error(
-            "invalid_passkey_challenge",
-            "passkey registration challenge is not bound to a user",
-        )
-    })?;
-    let user = api.store.get_user(&user_id)?.ok_or_else(|| {
-        auth_error(
-            "unknown_auth_user",
-            "passkey registration user does not exist",
-        )
-    })?;
-    let state_json = challenge.state_json.clone().ok_or_else(|| {
-        auth_error(
-            "missing_webauthn_state",
-            "passkey registration state was not persisted",
-        )
-    })?;
-    let state: PasskeyRegistration = serde_json::from_str(&state_json)
-        .map_err(|error| auth_error("webauthn_state_deserialize_failed", &error.to_string()))?;
-    let webauthn = webauthn_for_challenge(&api.config, &challenge)?;
-    let passkey = webauthn
-        .finish_passkey_registration(&request.credential, &state)
+    let envelope: PasskeyRegistrationEnvelope =
+        serde_json::from_str(challenge.state_json.as_deref().ok_or_else(|| {
+            auth_error(
+                "missing_webauthn_state",
+                "registration state was not persisted",
+            )
+        })?)
+        .map_err(|_| {
+            auth_error(
+                "invalid_registration_state",
+                "registration requires purpose-bound state",
+            )
+        })?;
+    let user = match (&envelope.target, authority) {
+        (PasskeyRegistrationTarget::NewAccount { user }, None)
+            if addition_headers.is_none() && challenge.user_id.is_none() =>
+        {
+            user.clone()
+        }
+        (
+            PasskeyRegistrationTarget::Addition {
+                user,
+                authentication,
+            },
+            Some((current, binding)),
+        ) if user.user_id == current.user_id
+            && user.account_id == current.account_id
+            && *authentication == binding
+            && challenge.user_id.as_deref() == Some(user.user_id.as_str()) =>
+        {
+            current
+        }
+        _ => {
+            return Err(auth_error(
+                "passkey_registration_binding_mismatch",
+                "registration purpose, target or authentication does not match",
+            )
+            .into());
+        }
+    };
+    let passkey = webauthn_for_challenge(&api.config, &challenge)?
+        .finish_passkey_registration(&request.credential, &envelope.verifier)
         .map_err(|error| {
             auth_error(
                 "webauthn_registration_verification_failed",
                 &error.to_string(),
             )
         })?;
-    let credential_id = passkey_credential_id(&passkey)?;
-    api.store
-        .upsert_passkey_credential(&PasskeyCredentialRecord {
-            credential_id,
+    api.store.register_verified_passkey(
+        &envelope.target,
+        &PasskeyCredentialRecord {
+            credential_id: passkey_credential_id(&passkey)?,
             user_id: user.user_id.clone(),
             public_key_cose: serde_json::to_string(&passkey).map_err(|error| {
                 auth_error("webauthn_passkey_serialize_failed", &error.to_string())
@@ -29072,8 +29269,9 @@ fn complete_passkey_registration(
             sign_count: 0,
             created_at: crate::auth::now_rfc3339(),
             last_used_at: None,
-        })?;
-    issue_browser_session(&api, user)
+        },
+    )?;
+    issue_browser_session(api, user)
 }
 
 async fn post_passkey_login_options(
@@ -29086,7 +29284,13 @@ async fn post_passkey_login_options(
         .run(move || {
             let user = match request.handle.as_deref() {
                 Some(handle) => api.store.get_user_by_handle(&normalize_handle(handle)?)?,
-                None => api.store.any_user()?,
+                None => {
+                    return Err(auth_error(
+                        "passkey_handle_required",
+                        "login requires an explicit handle",
+                    )
+                    .into());
+                }
             }
             .ok_or_else(|| auth_error("unknown_auth_user", "no matching user account exists"))?;
             let passkeys = passkeys_for_user(&api, &user.user_id)?;
@@ -29548,14 +29752,16 @@ fn auth_public_config(config: &ServerConfig) -> AuthPublicConfig {
     }
 }
 
-fn ensure_user_account(
+fn allocate_new_user(
     api: &ServerAuthApi,
     handle: &str,
     display_name: Option<&str>,
-) -> ApiResult<AuthenticatedUser> {
+) -> ApiResult<UserRecord> {
     let handle = normalize_handle(handle)?;
-    if let Some(user) = api.store.get_user_by_handle(&handle)? {
-        return Ok(user_response(user));
+    if api.store.get_user_by_handle(&handle)?.is_some()
+        || api.store.get_account_by_handle("user", &handle)?.is_some()
+    {
+        return Err(auth_error("auth_handle_exists", "handle is already registered").into());
     }
     let now = crate::auth::now_rfc3339();
     let display_name = display_name
@@ -29563,25 +29769,14 @@ fn ensure_user_account(
         .filter(|value| !value.is_empty())
         .unwrap_or(handle.as_str())
         .to_string();
-    let account = AccountRecord {
-        account_id: new_id("acct-user"),
-        kind: "user".to_string(),
-        handle: handle.clone(),
-        display_name: display_name.clone(),
-        created_at: now.clone(),
-        updated_at: now.clone(),
-    };
-    api.store.upsert_account(&account)?;
-    let user = UserRecord {
+    Ok(UserRecord {
         user_id: new_id("user"),
-        account_id: account.account_id,
+        account_id: new_id("acct-user"),
         handle,
         display_name,
         created_at: now.clone(),
         updated_at: now,
-    };
-    api.store.upsert_user(&user)?;
-    Ok(user_response(user))
+    })
 }
 
 fn user_response(user: UserRecord) -> AuthenticatedUser {
@@ -35671,6 +35866,12 @@ impl ApiError {
 
 fn api_error_status(error: &Error) -> StatusCode {
     match error {
+        Error::RuntimeOperationFailed {
+            runtime_id, code, ..
+        } if runtime_id == "workspace-auth" && code == "auth_required" => StatusCode::FORBIDDEN,
+        Error::RuntimeOperationFailed { runtime_id, .. } if runtime_id == "workspace-auth" => {
+            StatusCode::BAD_REQUEST
+        }
         Error::BrowserReopenConfirmationRequired | Error::WorkspacePermissionDenied(_) => {
             StatusCode::FORBIDDEN
         }
@@ -50269,6 +50470,1491 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(same_origin.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Generated HTTP admission, real SQLite and WebAuthn verification are connected
+    /// here. Only the physical authenticator is replaced with SoftPasskey; all
+    /// identities used for addition come from cookies/tokens issued by real login.
+    mod passkey_security {
+        use super::*;
+        use webauthn_authenticator_rs::{WebauthnAuthenticator, softpasskey::SoftPasskey};
+
+        const ORIGIN_URL: &str = "https://workspace.test";
+        type Authenticator = WebauthnAuthenticator<SoftPasskey>;
+
+        struct Fixture {
+            _root: tempfile::TempDir,
+            api: WorkspaceApi,
+            app: Router,
+        }
+
+        impl Fixture {
+            async fn new() -> Self {
+                let root = tempfile::tempdir().unwrap();
+                let mut api = test_api(root.path()).await;
+                let AuthConfig::Passkey {
+                    rp_id,
+                    origin,
+                    public_base_url,
+                    ..
+                } = &mut api.config.auth;
+                *rp_id = "workspace.test".into();
+                *origin = ORIGIN_URL.into();
+                *public_base_url = ORIGIN_URL.into();
+                let app = generated_auth_contract_router(ServerApiContractService::Workspace(
+                    api.clone(),
+                ));
+                Self {
+                    _root: root,
+                    api,
+                    app,
+                }
+            }
+
+            async fn post(
+                &self,
+                path: &str,
+                cookie: Option<&str>,
+                origin: Option<&str>,
+                body: Value,
+            ) -> (StatusCode, HeaderMap, Value) {
+                self.post_authenticated(path, cookie, None, origin, body)
+                    .await
+            }
+
+            async fn post_authenticated(
+                &self,
+                path: &str,
+                cookie: Option<&str>,
+                bearer: Option<&str>,
+                origin: Option<&str>,
+                body: Value,
+            ) -> (StatusCode, HeaderMap, Value) {
+                Self::post_to(self.app.clone(), path, cookie, bearer, origin, body).await
+            }
+
+            async fn post_to(
+                app: Router,
+                path: &str,
+                cookie: Option<&str>,
+                bearer: Option<&str>,
+                origin: Option<&str>,
+                body: Value,
+            ) -> (StatusCode, HeaderMap, Value) {
+                let mut request = Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header(CONTENT_TYPE, "application/json");
+                if let Some(cookie) = cookie {
+                    request = request.header(axum::http::header::COOKIE, cookie);
+                }
+                if let Some(token) = bearer {
+                    request = request
+                        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+                }
+                if let Some(origin) = origin {
+                    request = request.header(ORIGIN, origin);
+                }
+                let response = app
+                    .oneshot(
+                        request
+                            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let headers = response.headers().clone();
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let body = serde_json::from_slice(&bytes)
+                    .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into()));
+                (status, headers, body)
+            }
+
+            async fn device_token(&self, cookie: &str) -> String {
+                let (status, _, start) = self
+                    .post(
+                        "/api/auth/device-login/start",
+                        None,
+                        None,
+                        serde_json::json!({"client_name":"passkey-test-device"}),
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{start}");
+                let (status, _, pending) = self
+                    .post(
+                        "/api/auth/device-login/poll",
+                        None,
+                        None,
+                        serde_json::json!({"device_code":start["device_code"]}),
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{pending}");
+                assert_eq!(pending["status"], "pending");
+                assert!(pending.get("access_token").is_none_or(Value::is_null));
+                let (status, _, approval) = self
+                    .post(
+                        "/api/auth/device-login/approve",
+                        Some(cookie),
+                        Some(ORIGIN_URL),
+                        serde_json::json!({"user_code":start["user_code"]}),
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{approval}");
+                assert_eq!(approval["status"], "approved");
+                let (status, _, polled) = self
+                    .post(
+                        "/api/auth/device-login/poll",
+                        None,
+                        None,
+                        serde_json::json!({"device_code":start["device_code"]}),
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{polled}");
+                assert_eq!(polled["status"], "approved");
+                let (status, _, consumed) = self
+                    .post(
+                        "/api/auth/device-login/poll",
+                        None,
+                        None,
+                        serde_json::json!({"device_code":start["device_code"]}),
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{consumed}");
+                assert_eq!(consumed["status"], "consumed");
+                assert!(consumed.get("access_token").is_none_or(Value::is_null));
+                polled["access_token"].as_str().unwrap().to_string()
+            }
+
+            async fn options(
+                &self,
+                purpose: &str,
+                cookie: Option<&str>,
+                handle: &str,
+            ) -> PasskeyRegistrationOptionsResponse {
+                let body = if purpose == "registration" {
+                    serde_json::json!({"handle": handle})
+                } else {
+                    serde_json::json!({})
+                };
+                let (status, _, body) = self
+                    .post(
+                        &format!("/api/auth/passkeys/{purpose}/options"),
+                        cookie,
+                        Some(ORIGIN_URL),
+                        body,
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                serde_json::from_value(body).unwrap()
+            }
+
+            fn credential(
+                options: PasskeyRegistrationOptionsResponse,
+                authenticator: &mut Authenticator,
+            ) -> Value {
+                let credential = authenticator
+                    .do_registration(Url::parse(ORIGIN_URL).unwrap(), options.public_key)
+                    .unwrap();
+                serde_json::to_value(PasskeyRegistrationCompleteRequest {
+                    challenge_id: options.challenge_id,
+                    credential,
+                })
+                .unwrap()
+            }
+
+            async fn enroll(
+                &self,
+                purpose: &str,
+                cookie: Option<&str>,
+                handle: &str,
+                authenticator: &mut Authenticator,
+            ) -> (String, AuthenticatedUser) {
+                let options = self.options(purpose, cookie, handle).await;
+                let request = Self::credential(options, authenticator);
+                let (status, headers, body) = self
+                    .post(
+                        &format!("/api/auth/passkeys/{purpose}/complete"),
+                        cookie,
+                        Some(ORIGIN_URL),
+                        request,
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let cookie = headers[axum::http::header::SET_COOKIE]
+                    .to_str()
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                (
+                    cookie,
+                    serde_json::from_value::<AuthUserResponse>(body)
+                        .unwrap()
+                        .user,
+                )
+            }
+
+            async fn login_session(
+                &self,
+                handle: &str,
+                authenticator: &mut Authenticator,
+            ) -> (String, AuthenticatedUser) {
+                self.login_session_with_user_handle(handle, authenticator, None)
+                    .await
+            }
+
+            /// SoftPasskey 0.5.5 does not retain/return a registration user handle:
+            /// its actual signed assertion has user_handle=None. Exercise that
+            /// output and the response a real authenticator can return by supplying
+            /// the exact registered bytes. userHandle is not signature-covered;
+            /// all signed fields remain intact and the real verifier still runs.
+            async fn login_session_with_user_handle(
+                &self,
+                handle: &str,
+                authenticator: &mut Authenticator,
+                user_handle: Option<&[u8]>,
+            ) -> (String, AuthenticatedUser) {
+                let (status, _, body) = self
+                    .post(
+                        "/api/auth/passkeys/login/options",
+                        None,
+                        Some(ORIGIN_URL),
+                        serde_json::json!({"handle":handle}),
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let options: PasskeyLoginOptionsResponse = serde_json::from_value(body).unwrap();
+                let mut credential = authenticator
+                    .do_authentication(Url::parse(ORIGIN_URL).unwrap(), options.public_key)
+                    .unwrap();
+                assert!(
+                    credential.response.user_handle.is_none(),
+                    "inspect soft-authenticator output without logging assertion material"
+                );
+                let signed_fields = (
+                    credential.response.authenticator_data.clone(),
+                    credential.response.client_data_json.clone(),
+                    credential.response.signature.clone(),
+                );
+                credential.response.user_handle = user_handle.map(|bytes| bytes.to_vec().into());
+                assert_eq!(
+                    credential
+                        .response
+                        .user_handle
+                        .as_ref()
+                        .map(|bytes| bytes.as_slice()),
+                    user_handle
+                );
+                assert!(
+                    (
+                        &credential.response.authenticator_data,
+                        &credential.response.client_data_json,
+                        &credential.response.signature
+                    ) == (&signed_fields.0, &signed_fields.1, &signed_fields.2),
+                    "userHandle adjustment must not change signed assertion fields",
+                );
+                let (status, headers, body) = self
+                    .post(
+                        "/api/auth/passkeys/login/complete",
+                        None,
+                        None,
+                        serde_json::to_value(PasskeyLoginCompleteRequest {
+                            challenge_id: options.challenge_id,
+                            credential,
+                        })
+                        .unwrap(),
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let cookie = headers[axum::http::header::SET_COOKIE]
+                    .to_str()
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                (
+                    cookie,
+                    serde_json::from_value::<AuthUserResponse>(body)
+                        .unwrap()
+                        .user,
+                )
+            }
+
+            async fn login(
+                &self,
+                handle: &str,
+                authenticator: &mut Authenticator,
+            ) -> AuthenticatedUser {
+                self.login_session(handle, authenticator).await.1
+            }
+
+            fn credentials(&self, user: &AuthenticatedUser) -> Vec<PasskeyCredentialRecord> {
+                self.api
+                    .store
+                    .list_passkey_credentials_for_user(&user.user_id)
+                    .unwrap()
+            }
+
+            fn expire_challenge(&self, id: &str) {
+                self.api.config_store.with_conn(|conn| {
+                    conn.execute("UPDATE auth_challenges SET expires_at = '2000-01-01T00:00:00Z' WHERE challenge_id = ?1", [id])?;
+                    Ok(())
+                }).unwrap();
+            }
+        }
+
+        fn authenticator() -> Authenticator {
+            WebauthnAuthenticator::new(SoftPasskey::new(true))
+        }
+
+        fn rejected(result: (StatusCode, HeaderMap, Value), status: StatusCode, code: &str) {
+            assert_eq!(result.0, status, "{}", result.2);
+            assert!(result.2.to_string().contains(code), "{}", result.2);
+            assert!(!result.1.contains_key(axum::http::header::SET_COOKIE));
+        }
+
+        #[tokio::test]
+        async fn new_account_is_deferred_and_own_addition_preserves_old_keys_and_stable_user_handle()
+         {
+            let f = Fixture::new().await;
+            let mut first = authenticator();
+            let options = f.options("registration", None, "alice").await;
+            assert!(f.api.store.get_user_by_handle("alice").unwrap().is_none());
+            assert!(
+                f.api
+                    .store
+                    .get_account_by_handle("user", "alice")
+                    .unwrap()
+                    .is_none()
+            );
+            let original_handle =
+                serde_json::to_value(&options.public_key).unwrap()["publicKey"]["user"]["id"]
+                    .clone();
+            assert!(!original_handle.is_null());
+            let request = Fixture::credential(options, &mut first);
+            let (status, headers, body) = f
+                .post(
+                    "/api/auth/passkeys/registration/complete",
+                    None,
+                    Some(ORIGIN_URL),
+                    request.clone(),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let cookie = headers[axum::http::header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap();
+            let user = serde_json::from_value::<AuthUserResponse>(body)
+                .unwrap()
+                .user;
+            let originals = f.credentials(&user);
+            rejected(
+                f.post(
+                    "/api/auth/passkeys/registration/complete",
+                    None,
+                    None,
+                    request,
+                )
+                .await,
+                StatusCode::BAD_REQUEST,
+                "invalid_passkey_challenge",
+            );
+            for cookie in [None, Some(cookie)] {
+                rejected(
+                    f.post(
+                        "/api/auth/passkeys/registration/options",
+                        cookie,
+                        Some(ORIGIN_URL),
+                        serde_json::json!({"handle":"ALICE"}),
+                    )
+                    .await,
+                    StatusCode::BAD_REQUEST,
+                    "auth_handle_exists",
+                );
+            }
+            let options = f.options("addition", Some(cookie), "ignored").await;
+            assert_eq!(
+                serde_json::to_value(&options.public_key).unwrap()["publicKey"]["user"]["id"],
+                original_handle
+            );
+            let mut second = authenticator();
+            let request = Fixture::credential(options, &mut second);
+            let result = f
+                .post(
+                    "/api/auth/passkeys/addition/complete",
+                    Some(cookie),
+                    Some(ORIGIN_URL),
+                    request.clone(),
+                )
+                .await;
+            assert_eq!(result.0, StatusCode::OK, "{}", result.2);
+            assert_eq!(
+                serde_json::from_value::<AuthUserResponse>(result.2)
+                    .unwrap()
+                    .user,
+                user
+            );
+            assert_eq!(f.credentials(&user).len(), 2);
+            assert_eq!(
+                f.api
+                    .store
+                    .get_passkey_credential(&originals[0].credential_id)
+                    .unwrap()
+                    .as_ref(),
+                Some(&originals[0])
+            );
+            rejected(
+                f.post(
+                    "/api/auth/passkeys/addition/complete",
+                    Some(cookie),
+                    Some(ORIGIN_URL),
+                    request,
+                )
+                .await,
+                StatusCode::BAD_REQUEST,
+                "invalid_passkey_challenge",
+            );
+            assert_eq!(f.login("alice", &mut first).await, user);
+            assert_eq!(f.login("alice", &mut second).await, user);
+        }
+
+        #[tokio::test]
+        async fn addition_rejects_unauthenticated_and_target_injection_and_legacy_bootstrap() {
+            let f = Fixture::new().await;
+            let (cookie, user) = f
+                .enroll("registration", None, "alice", &mut authenticator())
+                .await;
+            let (_, other) = f
+                .enroll("registration", None, "bob", &mut authenticator())
+                .await;
+            let originals = f.credentials(&user);
+            rejected(
+                f.post(
+                    "/api/auth/passkeys/addition/options",
+                    None,
+                    Some(ORIGIN_URL),
+                    serde_json::json!({}),
+                )
+                .await,
+                StatusCode::FORBIDDEN,
+                "auth_required",
+            );
+            for field in ["handle", "user_id", "account_id"] {
+                let value = match field {
+                    "handle" => other.handle.clone(),
+                    "user_id" => other.user_id.clone(),
+                    _ => other.account_id.clone(),
+                };
+                let body = serde_json::json!({field:value});
+                let result = f
+                    .post(
+                        "/api/auth/passkeys/addition/options",
+                        Some(&cookie),
+                        Some(ORIGIN_URL),
+                        body,
+                    )
+                    .await;
+                assert_eq!(result.0, StatusCode::UNPROCESSABLE_ENTITY, "{}", result.2);
+            }
+            let options = f.options("addition", Some(&cookie), "").await;
+            let request = Fixture::credential(options, &mut authenticator());
+            for field in ["handle", "user_id", "account_id"] {
+                let mut injected = request.clone();
+                injected[field] = Value::String(other.user_id.clone());
+                let result = f
+                    .post(
+                        "/api/auth/passkeys/addition/complete",
+                        Some(&cookie),
+                        Some(ORIGIN_URL),
+                        injected,
+                    )
+                    .await;
+                assert_eq!(result.0, StatusCode::UNPROCESSABLE_ENTITY, "{}", result.2);
+            }
+            for handle in ["alice", "unused"] {
+                rejected(
+                    f.post(
+                        "/api/auth/bootstrap-user",
+                        None,
+                        None,
+                        serde_json::json!({"handle":handle}),
+                    )
+                    .await,
+                    StatusCode::BAD_REQUEST,
+                    "verified_registration_required",
+                );
+            }
+            assert!(f.api.store.get_user_by_handle("unused").unwrap().is_none());
+            assert!(
+                f.api
+                    .store
+                    .get_account_by_handle("user", "unused")
+                    .unwrap()
+                    .is_none()
+            );
+            rejected(
+                f.post(
+                    "/api/auth/passkeys/login/options",
+                    None,
+                    Some(ORIGIN_URL),
+                    serde_json::json!({}),
+                )
+                .await,
+                StatusCode::BAD_REQUEST,
+                "passkey_handle_required",
+            );
+            assert_eq!(f.credentials(&user), originals);
+        }
+
+        #[tokio::test]
+        async fn addition_completion_rechecks_account_session_revocation_and_expiry() {
+            let f = Fixture::new().await;
+            let mut alice_authenticator = authenticator();
+            let (alice_cookie, alice) = f
+                .enroll("registration", None, "alice", &mut alice_authenticator)
+                .await;
+            let (bob_cookie, bob) = f
+                .enroll("registration", None, "bob", &mut authenticator())
+                .await;
+            let bob_originals = f.credentials(&bob);
+            for failure in [
+                "unauthenticated",
+                "different_account",
+                "different_session",
+                "revoked",
+                "session_expired",
+                "challenge_expired",
+            ] {
+                // Each case starts with a live real session and actual verifier state.
+                let (cookie, current) = f.login_session("alice", &mut alice_authenticator).await;
+                assert_eq!(current, alice);
+                let originals = f.credentials(&alice);
+                let options = f.options("addition", Some(&cookie), "").await;
+                if failure == "challenge_expired" {
+                    f.expire_challenge(&options.challenge_id);
+                }
+                let request = Fixture::credential(options, &mut authenticator());
+                let current_cookie = match failure {
+                    "unauthenticated" => None,
+                    "different_account" => Some(bob_cookie.as_str()),
+                    "different_session" => Some(alice_cookie.as_str()),
+                    _ => Some(cookie.as_str()),
+                };
+                if failure == "revoked" {
+                    let result = f
+                        .post(
+                            "/api/auth/logout",
+                            Some(&cookie),
+                            Some(ORIGIN_URL),
+                            serde_json::json!({}),
+                        )
+                        .await;
+                    assert_eq!(result.0, StatusCode::OK, "{}", result.2);
+                }
+                if failure == "session_expired" {
+                    let token = cookie.split_once('=').unwrap().1;
+                    f.api.config_store.with_conn(|conn| {
+                        conn.execute("UPDATE browser_sessions SET expires_at='2000-01-01T00:00:00Z' WHERE token_hash=?1", [token_hash(token)])?;
+                        Ok(())
+                    }).unwrap();
+                }
+                let (status, code) = match failure {
+                    "unauthenticated" | "revoked" | "session_expired" => {
+                        (StatusCode::FORBIDDEN, "auth_required")
+                    }
+                    "challenge_expired" => (StatusCode::BAD_REQUEST, "expired_passkey_challenge"),
+                    _ => (
+                        StatusCode::BAD_REQUEST,
+                        "passkey_registration_binding_mismatch",
+                    ),
+                };
+                rejected(
+                    f.post(
+                        "/api/auth/passkeys/addition/complete",
+                        current_cookie,
+                        Some(ORIGIN_URL),
+                        request,
+                    )
+                    .await,
+                    status,
+                    code,
+                );
+                assert_eq!(f.credentials(&alice), originals, "{failure}");
+                assert_eq!(f.credentials(&bob), bob_originals, "{failure}");
+            }
+        }
+
+        #[tokio::test]
+        async fn enrollment_rejects_wrong_purpose_legacy_state_and_target_tampering() {
+            let f = Fixture::new().await;
+            let (cookie, user) = f
+                .enroll("registration", None, "alice", &mut authenticator())
+                .await;
+            let originals = f.credentials(&user);
+            for (purpose, other) in [("registration", "addition"), ("addition", "registration")] {
+                let options = f.options(purpose, Some(&cookie), "unused").await;
+                let request = Fixture::credential(options, &mut authenticator());
+                rejected(
+                    f.post(
+                        &format!("/api/auth/passkeys/{other}/complete"),
+                        Some(&cookie),
+                        Some(ORIGIN_URL),
+                        request,
+                    )
+                    .await,
+                    StatusCode::BAD_REQUEST,
+                    "passkey_registration_binding_mismatch",
+                );
+            }
+            for failure in ["legacy", "target"] {
+                let options = f.options("addition", Some(&cookie), "").await;
+                f.api
+                    .config_store
+                    .with_conn(|conn| {
+                        let json: String = conn.query_row(
+                            "SELECT state_json FROM auth_challenges WHERE challenge_id=?1",
+                            [&options.challenge_id],
+                            |row| row.get(0),
+                        )?;
+                        let mut state: Value = serde_json::from_str(&json).unwrap();
+                        if failure == "legacy" {
+                            state = state["verifier"].take();
+                        } else {
+                            state["target"]["user"]["account_id"] =
+                                Value::String("other-account".into());
+                        }
+                        conn.execute(
+                            "UPDATE auth_challenges SET state_json=?2 WHERE challenge_id=?1",
+                            rusqlite::params![options.challenge_id, state.to_string()],
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+                let request = Fixture::credential(options, &mut authenticator());
+                let code = if failure == "legacy" {
+                    "invalid_registration_state"
+                } else {
+                    "passkey_registration_binding_mismatch"
+                };
+                rejected(
+                    f.post(
+                        "/api/auth/passkeys/addition/complete",
+                        Some(&cookie),
+                        Some(ORIGIN_URL),
+                        request,
+                    )
+                    .await,
+                    StatusCode::BAD_REQUEST,
+                    code,
+                );
+            }
+            assert_eq!(f.credentials(&user), originals);
+            assert!(f.api.store.get_user_by_handle("unused").unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn parallel_new_account_handle_collision_has_one_identity_and_immutable_credential() {
+            let f = Fixture::new().await;
+            let one = f.options("registration", None, "racing").await;
+            let two = f.options("registration", None, "racing").await;
+            assert!(f.api.store.get_user_by_handle("racing").unwrap().is_none());
+            let request_one = Fixture::credential(one, &mut authenticator());
+            let request_two = Fixture::credential(two, &mut authenticator());
+            let (one, two) = tokio::join!(
+                f.post(
+                    "/api/auth/passkeys/registration/complete",
+                    None,
+                    None,
+                    request_one
+                ),
+                f.post(
+                    "/api/auth/passkeys/registration/complete",
+                    None,
+                    None,
+                    request_two
+                ),
+            );
+            assert_eq!(
+                [one.0, two.0]
+                    .into_iter()
+                    .filter(|status| *status == StatusCode::OK)
+                    .count(),
+                1
+            );
+            let (winner, loser) = if one.0 == StatusCode::OK {
+                (one, two)
+            } else {
+                (two, one)
+            };
+            rejected(loser, StatusCode::BAD_REQUEST, "auth_handle_exists");
+            let user = serde_json::from_value::<AuthUserResponse>(winner.2)
+                .unwrap()
+                .user;
+            let credentials = f.credentials(&user);
+            assert_eq!(credentials.len(), 1);
+            let account = f
+                .api
+                .store
+                .get_account_by_handle("user", "racing")
+                .unwrap()
+                .unwrap();
+            assert_eq!(account.account_id, user.account_id);
+            let persisted_user = f.api.store.get_user_by_handle("racing").unwrap().unwrap();
+            assert_eq!(persisted_user.user_id, user.user_id);
+            // A verified registration never uses the login-update upsert path.
+            // Duplicate credential IDs roll back the complete new identity too.
+            let new_user =
+                allocate_new_user(&ServerAuthApi::from(&f.api), "rollback", None).unwrap();
+            let mut duplicate = credentials[0].clone();
+            duplicate.user_id = new_user.user_id.clone();
+            duplicate.public_key_cose = "replacement-not-allowed".into();
+            assert!(
+                f.api
+                    .store
+                    .register_verified_passkey(
+                        &PasskeyRegistrationTarget::NewAccount { user: new_user },
+                        &duplicate
+                    )
+                    .is_err()
+            );
+            assert!(
+                f.api
+                    .store
+                    .get_user_by_handle("rollback")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                f.api
+                    .store
+                    .get_account_by_handle("user", "rollback")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(f.credentials(&user), credentials);
+        }
+
+        #[tokio::test]
+        async fn addition_requires_real_cookie_origin_even_at_direct_contract_entry() {
+            use server_api::ServerApi;
+            let f = Fixture::new().await;
+            let (cookie, user) = f
+                .enroll("registration", None, "alice", &mut authenticator())
+                .await;
+            let originals = f.credentials(&user);
+            for origin in [
+                None,
+                Some("https://evil.test"),
+                Some("https://workspace.test:444"),
+            ] {
+                rejected(
+                    f.post(
+                        "/api/auth/passkeys/addition/options",
+                        Some(&cookie),
+                        origin,
+                        serde_json::json!({"browser_origin":ORIGIN_URL}),
+                    )
+                    .await,
+                    StatusCode::FORBIDDEN,
+                    "origin",
+                );
+                let options = f.options("addition", Some(&cookie), "").await;
+                let request = Fixture::credential(options, &mut authenticator());
+                rejected(
+                    f.post(
+                        "/api/auth/passkeys/addition/complete",
+                        Some(&cookie),
+                        origin,
+                        request,
+                    )
+                    .await,
+                    StatusCode::FORBIDDEN,
+                    "origin",
+                );
+            }
+            let service = ServerApiContractService::Workspace(f.api.clone());
+            // Even a historical actor fixture with matching IDs is not authority.
+            let actor = RequestActor {
+                user_id: user.user_id.clone(),
+                account_id: user.account_id.clone(),
+                handle: user.handle.clone(),
+                display_name: user.display_name.clone(),
+                auth_method: ActorAuthMethod::BrowserSession,
+            };
+            let context = server_request_context(
+                Some(actor.clone()),
+                None,
+                None,
+                Some(ORIGIN_URL.into()),
+                &HeaderMap::new(),
+            );
+            let error = service
+                .auth_passkey_addition_options(
+                    context,
+                    server_api::PasskeyAdditionOptionsRequest {
+                        browser_origin: Some(ORIGIN_URL.into()),
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(api_macros::HttpError::status_code(&error), 403);
+            let mut headers = HeaderMap::new();
+            headers.insert(axum::http::header::COOKIE, cookie.parse().unwrap());
+            let context =
+                server_request_context(Some(actor), None, None, Some(ORIGIN_URL.into()), &headers);
+            let error = service
+                .auth_passkey_addition_options(
+                    context,
+                    server_api::PasskeyAdditionOptionsRequest {
+                        browser_origin: Some(ORIGIN_URL.into()),
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(api_macros::HttpError::status_code(&error), 403);
+            assert_eq!(f.credentials(&user), originals);
+        }
+
+        #[tokio::test]
+        async fn device_token_addition_is_actor_derived_and_bound_to_current_unrevoked_token() {
+            let f = Fixture::new().await;
+            let (cookie, user) = f
+                .enroll("registration", None, "alice", &mut authenticator())
+                .await;
+            let token = f.device_token(&cookie).await;
+            let second_token = f.device_token(&cookie).await;
+            let originals = f.credentials(&user);
+            let mut added = authenticator();
+            for failure in ["replacement_token", "revoked", "expired", "success"] {
+                let current_token = if failure == "revoked" || failure == "expired" {
+                    f.device_token(&cookie).await
+                } else {
+                    token.clone()
+                };
+                let (status, _, body) = f
+                    .post_authenticated(
+                        "/api/auth/passkeys/addition/options",
+                        None,
+                        Some(&current_token),
+                        None,
+                        serde_json::json!({}),
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let options: PasskeyRegistrationOptionsResponse =
+                    serde_json::from_value(body).unwrap();
+                let request = Fixture::credential(options, &mut added);
+                if failure == "revoked" || failure == "expired" {
+                    f.api.config_store.with_conn(|conn| {
+                        let sql = if failure == "revoked" { "UPDATE api_tokens SET revoked_at='2000-01-01T00:00:00Z' WHERE token_hash=?1" }
+                        else { "UPDATE api_tokens SET expires_at='2000-01-01T00:00:00Z' WHERE token_hash=?1" };
+                        conn.execute(sql, [token_hash(&current_token)])?;
+                        Ok(())
+                    }).unwrap();
+                }
+                let presented = if failure == "replacement_token" {
+                    &second_token
+                } else {
+                    &current_token
+                };
+                let result = f
+                    .post_authenticated(
+                        "/api/auth/passkeys/addition/complete",
+                        None,
+                        Some(presented),
+                        None,
+                        request,
+                    )
+                    .await;
+                if failure == "success" {
+                    assert_eq!(result.0, StatusCode::OK, "{}", result.2);
+                    assert_eq!(
+                        serde_json::from_value::<AuthUserResponse>(result.2)
+                            .unwrap()
+                            .user,
+                        user
+                    );
+                } else if failure == "replacement_token" {
+                    rejected(
+                        result,
+                        StatusCode::BAD_REQUEST,
+                        "passkey_registration_binding_mismatch",
+                    );
+                } else {
+                    rejected(result, StatusCode::FORBIDDEN, "auth_required");
+                }
+            }
+            assert_eq!(f.credentials(&user).len(), 2);
+            assert_eq!(
+                f.api
+                    .store
+                    .get_passkey_credential(&originals[0].credential_id)
+                    .unwrap()
+                    .as_ref(),
+                Some(&originals[0])
+            );
+            assert_eq!(f.login("alice", &mut added).await, user);
+        }
+
+        #[tokio::test]
+        async fn failed_new_account_verification_and_expired_challenge_never_create_identity() {
+            let f = Fixture::new().await;
+            let options = f.options("registration", None, "expired").await;
+            f.expire_challenge(&options.challenge_id);
+            let request = Fixture::credential(options, &mut authenticator());
+            rejected(
+                f.post(
+                    "/api/auth/passkeys/registration/complete",
+                    None,
+                    None,
+                    request,
+                )
+                .await,
+                StatusCode::BAD_REQUEST,
+                "expired_passkey_challenge",
+            );
+            let options = f.options("registration", None, "mismatch").await;
+            let other = f.options("registration", None, "other").await;
+            let mut request = Fixture::credential(options, &mut authenticator());
+            request["challenge_id"] = Value::String(other.challenge_id);
+            rejected(
+                f.post(
+                    "/api/auth/passkeys/registration/complete",
+                    None,
+                    None,
+                    request,
+                )
+                .await,
+                StatusCode::BAD_REQUEST,
+                "webauthn_registration_verification_failed",
+            );
+            for handle in ["expired", "mismatch", "other"] {
+                assert!(f.api.store.get_user_by_handle(handle).unwrap().is_none());
+                assert!(
+                    f.api
+                        .store
+                        .get_account_by_handle("user", handle)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn verified_addition_rejects_credential_revocation_or_expiry_at_storage_boundary() {
+            let f = Fixture::new().await;
+            let mut owner_authenticator = authenticator();
+            let (_, owner) = f
+                .enroll("registration", None, "alice", &mut owner_authenticator)
+                .await;
+            // A genuinely separate connection observes the same SQLite authority;
+            // it does not share the primary store's in-process connection mutex.
+            let other_store =
+                SqliteWorkspaceStore::open_for_test(&f.api.config.database_path).unwrap();
+            let api = ServerAuthApi::from(&f.api);
+            for (method, failure) in [
+                ("session", "revoked"),
+                ("session", "expired"),
+                ("token", "revoked"),
+                ("token", "expired"),
+            ] {
+                let (cookie, current) = f.login_session("alice", &mut owner_authenticator).await;
+                assert_eq!(current, owner);
+                let token = if method == "token" {
+                    Some(f.device_token(&cookie).await)
+                } else {
+                    None
+                };
+                let presented_cookie = (method == "session").then_some(cookie.as_str());
+                let originals = f.credentials(&owner);
+                let (status, _, body) = f
+                    .post_authenticated(
+                        "/api/auth/passkeys/addition/options",
+                        presented_cookie,
+                        token.as_deref(),
+                        Some(ORIGIN_URL),
+                        serde_json::json!({}),
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let options: PasskeyRegistrationOptionsResponse =
+                    serde_json::from_value(body).unwrap();
+                let request: PasskeyRegistrationCompleteRequest =
+                    serde_json::from_value(Fixture::credential(options, &mut authenticator()))
+                        .unwrap();
+                let mut headers = HeaderMap::new();
+                headers.insert(ORIGIN, ORIGIN_URL.parse().unwrap());
+                if let Some(cookie) = presented_cookie {
+                    headers.insert(axum::http::header::COOKIE, cookie.parse().unwrap());
+                }
+                if let Some(token) = &token {
+                    headers.insert(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {token}").parse().unwrap(),
+                    );
+                }
+                // Resolve the real transport credential, consume persisted state and
+                // verify the actual SoftPasskey attestation before invalidating auth.
+                let (current, authentication) = passkey_addition_authority(&api, &headers).unwrap();
+                let challenge = api
+                    .store
+                    .consume_auth_challenge_by_id(
+                        &request.challenge_id,
+                        "passkey_registration",
+                        &crate::auth::now_rfc3339(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert!(!is_expired(&challenge.expires_at));
+                assert_eq!(challenge.user_id.as_deref(), Some(owner.user_id.as_str()));
+                let envelope: PasskeyRegistrationEnvelope =
+                    serde_json::from_str(challenge.state_json.as_deref().unwrap()).unwrap();
+                assert!(
+                    envelope.target
+                        == PasskeyRegistrationTarget::Addition {
+                            user: current,
+                            authentication: authentication.clone()
+                        }
+                );
+                let passkey = webauthn_for_challenge(&api.config, &challenge)
+                    .unwrap()
+                    .finish_passkey_registration(&request.credential, &envelope.verifier)
+                    .unwrap();
+                let verified = PasskeyCredentialRecord {
+                    credential_id: passkey_credential_id(&passkey).unwrap(),
+                    user_id: owner.user_id.clone(),
+                    public_key_cose: serde_json::to_string(&passkey).unwrap(),
+                    transports_json: None,
+                    sign_count: 0,
+                    created_at: crate::auth::now_rfc3339(),
+                    last_used_at: None,
+                };
+                assert!(
+                    api.store
+                        .get_passkey_credential(&verified.credential_id)
+                        .unwrap()
+                        .is_none()
+                );
+                // Deterministic interleaving: auth was live through verification;
+                // this distinct connection commits revocation/expiry before insert.
+                other_store.with_conn(|conn| {
+                    let (table, hash) = match &authentication {
+                        PasskeyAuthenticationBinding::BrowserSession(hash) => ("browser_sessions", hash),
+                        PasskeyAuthenticationBinding::ApiToken(hash) => ("api_tokens", hash),
+                    };
+                    let column = if failure == "revoked" { "revoked_at" } else { "expires_at" };
+                    assert_eq!(conn.execute(&format!("UPDATE {table} SET {column}='2000-01-01T00:00:00Z' WHERE token_hash=?1"), [hash])?, 1);
+                    Ok(())
+                }).unwrap();
+                let error = api
+                    .store
+                    .register_verified_passkey(&envelope.target, &verified)
+                    .unwrap_err();
+                assert!(
+                    matches!(error, Error::RuntimeOperationFailed { code, .. } if code == "auth_required")
+                );
+                assert!(
+                    api.store
+                        .get_passkey_credential(&verified.credential_id)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    other_store
+                        .get_passkey_credential(&verified.credential_id)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(f.credentials(&owner), originals, "{method}/{failure}");
+                assert_eq!(
+                    other_store
+                        .list_passkey_credentials_for_user(&owner.user_id)
+                        .unwrap(),
+                    originals
+                );
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn same_addition_challenge_concurrent_complete_across_connections_commits_once() {
+            let f = Fixture::new().await;
+            let (cookie, owner) = f
+                .enroll("registration", None, "alice", &mut authenticator())
+                .await;
+            let originals = f.credentials(&owner);
+            let mut added = authenticator();
+            let options = f.options("addition", Some(&cookie), "").await;
+            let challenge_id = options.challenge_id.clone();
+            let request = Fixture::credential(options, &mut added);
+            let other_store =
+                Arc::new(SqliteWorkspaceStore::open_for_test(&f.api.config.database_path).unwrap());
+            let mut other_api = f.api.clone();
+            other_api.store = other_store.clone();
+            other_api.config_store = other_store.clone();
+            let other_app =
+                generated_auth_contract_router(ServerApiContractService::Workspace(other_api));
+            let start = Arc::new(tokio::sync::Barrier::new(2));
+            let attempt = |app: Router| {
+                let start = start.clone();
+                let cookie = cookie.clone();
+                let request = request.clone();
+                tokio::spawn(async move {
+                    start.wait().await;
+                    Fixture::post_to(
+                        app,
+                        "/api/auth/passkeys/addition/complete",
+                        Some(&cookie),
+                        None,
+                        Some(ORIGIN_URL),
+                        request,
+                    )
+                    .await
+                })
+            };
+            let (one, two) = tokio::join!(attempt(f.app.clone()), attempt(other_app));
+            let (one, two) = (one.unwrap(), two.unwrap());
+            assert_eq!(
+                [one.0, two.0]
+                    .into_iter()
+                    .filter(|status| *status == StatusCode::OK)
+                    .count(),
+                1
+            );
+            let (winner, loser) = if one.0 == StatusCode::OK {
+                (one, two)
+            } else {
+                (two, one)
+            };
+            assert!(winner.1.contains_key(axum::http::header::SET_COOKIE));
+            assert_eq!(
+                serde_json::from_value::<AuthUserResponse>(winner.2)
+                    .unwrap()
+                    .user,
+                owner
+            );
+            rejected(loser, StatusCode::BAD_REQUEST, "invalid_passkey_challenge");
+            assert_eq!(f.credentials(&owner).len(), 2);
+            assert_eq!(
+                other_store
+                    .list_passkey_credentials_for_user(&owner.user_id)
+                    .unwrap(),
+                f.credentials(&owner)
+            );
+            assert_eq!(
+                f.api
+                    .store
+                    .get_passkey_credential(&originals[0].credential_id)
+                    .unwrap()
+                    .as_ref(),
+                Some(&originals[0])
+            );
+            other_store
+                .with_conn(|conn| {
+                    let consumed: bool = conn.query_row(
+                        "SELECT consumed_at IS NOT NULL FROM auth_challenges WHERE challenge_id=?1",
+                        [&challenge_id],
+                        |row| row.get(0),
+                    )?;
+                    assert!(consumed);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(f.login("alice", &mut added).await, owner);
+        }
+
+        #[tokio::test]
+        async fn legacy_bare_registration_preserves_precreated_uncredentialed_identity_and_rejects_anonymous_reclaim()
+         {
+            let f = Fixture::new().await;
+            let mut known_key = authenticator();
+            let (_, known_user) = f
+                .enroll("registration", None, "known-user", &mut known_key)
+                .await;
+            let known_credentials = f.credentials(&known_user);
+            let api = ServerAuthApi::from(&f.api);
+            let now = crate::auth::now_rfc3339();
+            // Reproduce old options, not the new deferred-registration envelope:
+            // ensure_user_account persisted account/user before making a random-
+            // handle WebAuthn ceremony, even though no credential yet existed.
+            let account = AccountRecord {
+                account_id: new_id("acct-user"),
+                kind: "user".into(),
+                handle: "old-pending".into(),
+                display_name: "Old Pending Registration".into(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+            api.store.upsert_account(&account).unwrap();
+            let user = UserRecord {
+                user_id: new_id("user"),
+                account_id: account.account_id.clone(),
+                handle: account.handle.clone(),
+                display_name: account.display_name.clone(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+            api.store.upsert_user(&user).unwrap();
+            let webauthn = webauthn_for_auth(&auth_public_config(&api.config)).unwrap();
+            let (options, bare_state) = webauthn
+                .start_passkey_registration(
+                    Uuid::now_v7(),
+                    &user.handle,
+                    &user.display_name,
+                    Some(Vec::new()),
+                )
+                .unwrap();
+            let challenge_id = new_id("webauthn-registration");
+            api.store
+                .put_auth_challenge(&AuthChallengeRecord {
+                    challenge_id: challenge_id.clone(),
+                    ceremony: "passkey_registration".into(),
+                    challenge: challenge_id.clone(),
+                    user_id: Some(user.user_id.clone()),
+                    rp_id: "workspace.test".into(),
+                    origin: ORIGIN_URL.into(),
+                    state_json: Some(serde_json::to_string(&bare_state).unwrap()),
+                    expires_at: rfc3339_after(Duration::minutes(5)),
+                    created_at: now,
+                    consumed_at: None,
+                })
+                .unwrap();
+            let mut old_authenticator = authenticator();
+            let credential = old_authenticator
+                .do_registration(Url::parse(ORIGIN_URL).unwrap(), options)
+                .unwrap();
+            // The input is a valid real attestation for the stored old verifier,
+            // not a malformed-credential fixture that fails for another reason.
+            let verified = webauthn
+                .finish_passkey_registration(&credential, &bare_state)
+                .unwrap();
+            let old_credential_id = passkey_credential_id(&verified).unwrap();
+            let request = serde_json::to_value(PasskeyRegistrationCompleteRequest {
+                challenge_id,
+                credential,
+            })
+            .unwrap();
+            let unchanged = || {
+                assert_eq!(
+                    api.store.get_account(&account.account_id).unwrap().as_ref(),
+                    Some(&account)
+                );
+                assert_eq!(
+                    api.store
+                        .get_account_by_handle("user", &account.handle)
+                        .unwrap()
+                        .as_ref(),
+                    Some(&account)
+                );
+                assert_eq!(
+                    api.store.get_user(&user.user_id).unwrap().as_ref(),
+                    Some(&user)
+                );
+                assert_eq!(
+                    api.store.get_user_by_handle(&user.handle).unwrap().as_ref(),
+                    Some(&user)
+                );
+                assert!(
+                    api.store
+                        .list_passkey_credentials_for_user(&user.user_id)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    api.store
+                        .get_passkey_credential(&old_credential_id)
+                        .unwrap()
+                        .is_none()
+                );
+                f.api
+                    .config_store
+                    .with_conn(|conn| {
+                        let sessions: u64 = conn.query_row(
+                            "SELECT COUNT(*) FROM browser_sessions WHERE user_id=?1",
+                            [&user.user_id],
+                            |row| row.get(0),
+                        )?;
+                        assert_eq!(sessions, 0);
+                        Ok(())
+                    })
+                    .unwrap();
+            };
+            unchanged();
+            rejected(
+                f.post(
+                    "/api/auth/passkeys/registration/complete",
+                    None,
+                    Some(ORIGIN_URL),
+                    request.clone(),
+                )
+                .await,
+                StatusCode::BAD_REQUEST,
+                "invalid_registration_state",
+            );
+            unchanged();
+            rejected(
+                f.post(
+                    "/api/auth/passkeys/registration/complete",
+                    None,
+                    Some(ORIGIN_URL),
+                    request,
+                )
+                .await,
+                StatusCode::BAD_REQUEST,
+                "invalid_passkey_challenge",
+            );
+            unchanged();
+            rejected(
+                f.post(
+                    "/api/auth/passkeys/registration/options",
+                    None,
+                    Some(ORIGIN_URL),
+                    serde_json::json!({"handle":"OLD-PENDING"}),
+                )
+                .await,
+                StatusCode::BAD_REQUEST,
+                "auth_handle_exists",
+            );
+            unchanged();
+            rejected(
+                f.post(
+                    "/api/auth/passkeys/addition/options",
+                    None,
+                    Some(ORIGIN_URL),
+                    serde_json::json!({}),
+                )
+                .await,
+                StatusCode::FORBIDDEN,
+                "auth_required",
+            );
+            unchanged();
+            assert_eq!(f.credentials(&known_user), known_credentials);
+            let (_, new_user) = f
+                .enroll(
+                    "registration",
+                    None,
+                    "unused-alternative",
+                    &mut authenticator(),
+                )
+                .await;
+            assert_ne!(new_user.account_id, account.account_id);
+            assert_ne!(new_user.user_id, user.user_id);
+            assert_eq!(f.credentials(&new_user).len(), 1);
+            unchanged();
+            assert_eq!(f.login("known-user", &mut known_key).await, known_user);
+            unchanged();
+        }
+
+        #[tokio::test]
+        async fn legacy_random_user_handle_credential_authenticates_before_and_after_stable_handle_addition()
+         {
+            let f = Fixture::new().await;
+            let api = ServerAuthApi::from(&f.api);
+            let user = allocate_new_user(&api, "legacy", None).unwrap();
+            let random_handle = Uuid::now_v7();
+            assert_ne!(random_handle, passkey_user_handle(&user.account_id));
+            let webauthn = webauthn_for_auth(&auth_public_config(&api.config)).unwrap();
+            let (options, state) = webauthn
+                .start_passkey_registration(random_handle, &user.handle, &user.display_name, None)
+                .unwrap();
+            let legacy_user_handle = options.public_key.user.id.clone();
+            assert_eq!(legacy_user_handle.as_slice(), random_handle.as_bytes());
+            let mut legacy_authenticator = authenticator();
+            let credential = legacy_authenticator
+                .do_registration(Url::parse(ORIGIN_URL).unwrap(), options)
+                .unwrap();
+            let passkey = webauthn
+                .finish_passkey_registration(&credential, &state)
+                .unwrap();
+            let record = PasskeyCredentialRecord {
+                credential_id: passkey_credential_id(&passkey).unwrap(),
+                user_id: user.user_id.clone(),
+                public_key_cose: serde_json::to_string(&passkey).unwrap(),
+                transports_json: None,
+                sign_count: 0,
+                created_at: crate::auth::now_rfc3339(),
+                last_used_at: None,
+            };
+            f.api
+                .store
+                .register_verified_passkey(
+                    &PasskeyRegistrationTarget::NewAccount { user: user.clone() },
+                    &record,
+                )
+                .unwrap();
+            let expected = user_response(user.clone());
+            for returned_handle in [None, Some(legacy_user_handle.as_slice())] {
+                let (_, logged_in) = f
+                    .login_session_with_user_handle(
+                        "legacy",
+                        &mut legacy_authenticator,
+                        returned_handle,
+                    )
+                    .await;
+                assert_eq!(logged_in, expected);
+            }
+            let (cookie, _) = f
+                .login_session_with_user_handle(
+                    "legacy",
+                    &mut legacy_authenticator,
+                    Some(legacy_user_handle.as_slice()),
+                )
+                .await;
+            let before_add = f.credentials(&expected);
+            let mut added = authenticator();
+            let options = f.options("addition", Some(&cookie), "").await;
+            let stable_user_handle = options.public_key.public_key.user.id.clone();
+            assert_eq!(
+                stable_user_handle.as_slice(),
+                passkey_user_handle(&user.account_id).as_bytes()
+            );
+            assert_ne!(stable_user_handle, legacy_user_handle);
+            let request = Fixture::credential(options, &mut added);
+            let (status, _, body) = f
+                .post(
+                    "/api/auth/passkeys/addition/complete",
+                    Some(&cookie),
+                    Some(ORIGIN_URL),
+                    request,
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                serde_json::from_value::<AuthUserResponse>(body)
+                    .unwrap()
+                    .user,
+                expected
+            );
+            assert_eq!(
+                f.api
+                    .store
+                    .get_passkey_credential(&record.credential_id)
+                    .unwrap()
+                    .as_ref(),
+                Some(&before_add[0])
+            );
+            for returned_handle in [None, Some(legacy_user_handle.as_slice())] {
+                let (_, logged_in) = f
+                    .login_session_with_user_handle(
+                        "legacy",
+                        &mut legacy_authenticator,
+                        returned_handle,
+                    )
+                    .await;
+                assert_eq!(logged_in, expected);
+            }
+            for returned_handle in [None, Some(stable_user_handle.as_slice())] {
+                let (_, logged_in) = f
+                    .login_session_with_user_handle("legacy", &mut added, returned_handle)
+                    .await;
+                assert_eq!(logged_in, expected);
+            }
+        }
     }
 
     #[tokio::test]

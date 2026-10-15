@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "id": "account-passkeys",
+  "title": "Existing Account registration and self-only passkey addition",
+  "baseUrl": "http://127.0.0.1:15371",
+  "colorScheme": "light",
+  "reducedMotion": "reduce",
+  "personas": [
+    {
+      "id": "synthetic",
+      "label": "Synthetic browser session; no real credentials",
+      "auth": { "kind": "anonymous" }
+    }
+  ],
+  "viewports": [
+    { "label": "desktop", "width": 1440, "height": 900 },
+    { "label": "narrow", "width": 768, "height": 900 },
+    { "label": "mobile", "width": 390, "height": 844 }
+  ],
+  "routes": [
+    {
+      "id": "anonymous",
+      "label": "New registration or explicit-handle login",
+      "path": "/account",
+      "goal": "Identify registration as a new-account operation, distinct from logging into an existing handle.",
+      "dataState": "No browser session; existing Account page.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".account-panel:has-text('No browser session is active.')"
+      },
+      "capturePoints": [
+        { "id": "initial", "label": "Anonymous Account", "fullPage": true }
+      ]
+    },
+    {
+      "id": "authenticated",
+      "label": "Add only to current user",
+      "path": "/account?actor=authenticated",
+      "goal": "Identify the authenticated actor as the passkey addition target; identity fields cannot retarget addition.",
+      "dataState": "Synthetic passkey actor alice; existing Account page.",
+      "ready": { "kind": "selector", "selector": ".account-details" },
+      "capturePoints": [
+        { "id": "initial", "label": "Authenticated Account", "fullPage": true }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "id": "static-fixture",
+      "command": "deno",
+      "cwd": "../../../../tools/web-ux",
+      "args": [
+        "run",
+        "--allow-net",
+        "--allow-read",
+        "browser-tests/workspace_home_fixture_server.ts",
+        "15372",
+        "../../web/workspace/build"
+      ],
+      "readyUrl": "http://127.0.0.1:15372/health"
+    },
+    {
+      "id": "account-fixture",
+      "command": "deno",
+      "cwd": "../..",
+      "args": [
+        "run",
+        "--allow-net",
+        "test/visual-review/account-passkeys-fixture-server.ts",
+        "15371",
+        "http://127.0.0.1:15372"
+      ],
+      "readyUrl": "http://127.0.0.1:15371/health"
+    }
+  ]
+}
