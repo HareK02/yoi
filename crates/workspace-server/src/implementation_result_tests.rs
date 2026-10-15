@@ -381,6 +381,8 @@ async fn implementation_result_v97_to_v98_preserves_legacy_bytes_receipts_and_no
             DROP TABLE ticket_implementation_results;
             DROP TABLE ticket_implementation_delegations;
             DROP TABLE merge_request_source_observations;
+            DROP TABLE user_activations;
+            UPDATE __yoi_schema_migrations SET version=99 WHERE version=100;
             DROP TABLE hosting_administrators; DROP TABLE hosting_settings;
             UPDATE __yoi_schema_migrations SET version=98 WHERE version=99;
             UPDATE __yoi_schema_migrations SET version=96 WHERE version=98;")?;
@@ -511,6 +513,8 @@ async fn mr_notification_upgrade_recovers_events_not_comments_and_retains_unknow
         // Reconstruct the prior composition before its new business capture existed.
         conn.execute_batch("DROP TRIGGER notification_mr_event; DROP TRIGGER notification_mr_source; DROP TRIGGER notification_implementation_result; DROP TRIGGER IF EXISTS implementation_delegation_capture;
             DROP TABLE ticket_implementation_results; DROP TABLE ticket_implementation_delegations; DROP TABLE merge_request_source_observations;
+            DROP TABLE user_activations;
+            UPDATE __yoi_schema_migrations SET version=99 WHERE version=100;
             DROP TABLE hosting_administrators; DROP TABLE hosting_settings;
             UPDATE __yoi_schema_migrations SET version=98 WHERE version=99;
             UPDATE __yoi_schema_migrations SET version=96 WHERE version=98;")?;
@@ -667,7 +671,9 @@ async fn mr_event_actors_preserve_self_suppression_in_capture_and_backfill() {
             if historical {
                 conn.execute_batch("DROP TRIGGER notification_mr_event; DROP TRIGGER notification_mr_source; DROP TRIGGER notification_implementation_result; DROP TRIGGER IF EXISTS implementation_delegation_capture;
                     DROP TABLE ticket_implementation_results; DROP TABLE ticket_implementation_delegations; DROP TABLE merge_request_source_observations;
-                    DROP TABLE hosting_administrators; DROP TABLE hosting_settings;
+                    DROP TABLE user_activations;
+            UPDATE __yoi_schema_migrations SET version=99 WHERE version=100;
+            DROP TABLE hosting_administrators; DROP TABLE hosting_settings;
             UPDATE __yoi_schema_migrations SET version=98 WHERE version=99;
             UPDATE __yoi_schema_migrations SET version=96 WHERE version=98;")?;
             }

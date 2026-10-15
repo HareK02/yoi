@@ -7,6 +7,12 @@ export type HostingSettings = { self_registration_enabled: boolean, };
 
 export type HostingAccess = { is_admin: boolean, };
 
+export type ProvisionalAccountRequest = { handle: string, };
+
+export type ActivationCodeResponse = { user: AuthenticatedUser, code: string, expires_at: string, };
+
+export type ActivationOptionsRequest = { handle: string, code: string, browser_origin?: string | null, };
+
 export type ActorAuthMethod = "browser_session" | "api_token";
 
 export type AuthenticatedUser = { user_id: string, account_id: string, handle: string, display_name: string, };

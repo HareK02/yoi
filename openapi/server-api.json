@@ -31,6 +31,50 @@
         ],
         "type": "object"
       },
+      "ActivationCodeResponse": {
+        "additionalProperties": false,
+        "description": "The only response allowed to disclose an activation code. Clients must keep it\nout of URLs, persistent browser storage and diagnostics. A lost response is\nrecovered by reissuing, which invalidates the previous code and its ceremonies.",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": "string"
+          },
+          "user": {
+            "$ref": "#/components/schemas/AuthenticatedUser"
+          }
+        },
+        "required": [
+          "user",
+          "code",
+          "expires_at"
+        ],
+        "type": "object"
+      },
+      "ActivationOptionsRequest": {
+        "additionalProperties": false,
+        "description": "Proof for a pending account's initial passkey ceremony, never a bearer token\nor browser session. No caller-selected account ID or enrollment purpose is accepted.",
+        "properties": {
+          "browser_origin": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "code": {
+            "type": "string"
+          },
+          "handle": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "handle",
+          "code"
+        ],
+        "type": "object"
+      },
       "ActorAuthMethod": {
         "description": "Authentication method that established the current request actor.",
         "enum": [
@@ -6822,6 +6866,19 @@
           "profiles",
           "sources",
           "diagnostics"
+        ],
+        "type": "object"
+      },
+      "ProvisionalAccountRequest": {
+        "additionalProperties": false,
+        "description": "A hosting administrator reserves the same normalized ID used by passkey login.",
+        "properties": {
+          "handle": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "handle"
         ],
         "type": "object"
       },
@@ -17774,10 +17831,111 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:92f1f789f68d3c5d55c61d9bcf7d66451d4492cd0007aa178da1472af103719a"
+    "x-yoi-source-digest": "sha256:d6241af8f70efb7be45195dc27c01e36517d13484cd38f71490ce5d253dd84e8"
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/auth/activation/complete": {
+      "post": {
+        "operationId": "auth_activation_complete",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyRegistrationCompleteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthUserResponse"
+                }
+              }
+            },
+            "description": "Successful response",
+            "headers": {
+              "set-cookie": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetCookieHeader"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
+    "/api/auth/activation/options": {
+      "post": {
+        "operationId": "auth_activation_options",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ActivationOptionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasskeyRegistrationOptionsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
     "/api/auth/bootstrap-user": {
       "post": {
         "operationId": "auth_bootstrap_user",
@@ -18831,6 +18989,136 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/HostingAccess"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/hosting/accounts": {
+      "post": {
+        "operationId": "hosting_account_create",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProvisionalAccountRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivationCodeResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/hosting/accounts/activation-code": {
+      "post": {
+        "operationId": "hosting_activation_code_reissue",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProvisionalAccountRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivationCodeResponse"
                 }
               }
             },

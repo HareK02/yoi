@@ -1,5 +1,5 @@
 //! 隔離した実yoi-serverのhost CLI・HTTP APIで、管理者初期設定、登録可否の永続化、
-//! 明示handle login、本人の鍵追加、Workspace所有境界を検証する。DB・認証・routerは本番実装を使い、
+//! 明示handle login、本人の鍵追加、限定activation、Workspace所有境界を検証する。DB・認証・routerは本番実装を使い、
 //! authenticatorだけをSoftPasskeyに置換する（browser UI／OS authenticatorは対象外）。
 //! `cargo test -p yoi-e2e --features e2e --test auth_passkeys`で明示選択する。
 //! binary供給、HOME/XDG/DB/動的port、readiness、ログ、RAII回収は共有harnessが所有する。
@@ -14,10 +14,11 @@ use std::time::Duration;
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{COOKIE, ORIGIN, SET_COOKIE};
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use server_api::{
-    AuthUserResponse, PasskeyLoginCompleteRequest, PasskeyLoginOptionsResponse,
+    AuthUserResponse, AuthenticatedUser, PasskeyLoginCompleteRequest, PasskeyLoginOptionsResponse,
     PasskeyRegistrationCompleteRequest, PasskeyRegistrationOptionsResponse,
 };
 use webauthn_authenticator_rs::{WebauthnAuthenticator, softpasskey::SoftPasskey};
@@ -1001,6 +1002,825 @@ fn hosting_policy_rejects_spoofing_inflight_registration_and_survives_restart() 
         &artifacts,
     )?)?;
     assert_eq!(stored, json!({"self_registration_enabled": false}));
+    let report = environment.cleanup()?;
+    assert!(report.cleanup_success);
+    assert!(!report.fixture_root_exists_after);
+    Ok(())
+}
+
+// code発行とその拒否はsuccess/rejectedの本文診断へ渡さない。
+// 型にもDebugを付けず、失敗時にcode入りresponseをassertの値として出力しない。
+#[derive(Deserialize)]
+struct ActivationIssue {
+    user: AuthenticatedUser,
+    code: String,
+    expires_at: String,
+}
+
+fn activation_success(response: Response) -> Result<Response> {
+    let status = response.status();
+    assert!(status.is_success(), "activation request failed: {status}");
+    Ok(response)
+}
+
+#[track_caller]
+fn activation_denied(response: Response) -> Result {
+    let status = response.status();
+    assert!(
+        matches!(
+            status,
+            StatusCode::BAD_REQUEST
+                | StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN
+                | StatusCode::CONFLICT
+                | StatusCode::UNPROCESSABLE_ENTITY
+        ),
+        "activation boundary returned {status}"
+    );
+    assert!(response.headers().get(SET_COOKIE).is_none());
+    let text = response.text()?;
+    // axumのJSON extractorはunknown-field拒否をtext/plainで返す。
+    if status == StatusCode::UNPROCESSABLE_ENTITY {
+        assert!(
+            text.contains("unknown field"),
+            "unexpected schema rejection"
+        );
+        return Ok(());
+    }
+    let body: Value = serde_json::from_str(&text)?;
+    let object = body
+        .as_object()
+        .ok_or("rejection must be a structured API error")?;
+    let keys: Vec<_> = object.keys().map(String::as_str).collect();
+    let error_is_string = body
+        .get("error")
+        .and_then(Value::as_str)
+        .is_some_and(|error| !error.is_empty());
+    // cookie Origin middlewareは403のerror-only、typed handlerはmessage/diagnostics付き。
+    // 想定外の形でも診断はstatusとJSON keysだけに限定し、errorやcodeの値を表示しない。
+    let middleware_error = status == StatusCode::FORBIDDEN && object.len() == 1 && error_is_string;
+    let typed_error = error_is_string
+        && body
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| !message.is_empty())
+        && body.get("diagnostics").is_some_and(Value::is_array);
+    assert!(
+        middleware_error || typed_error,
+        "unexpected rejection shape: {status}, JSON keys={keys:?}"
+    );
+    for field in ["code", "user", "access_token", "token", "session"] {
+        assert!(
+            body.get(field).is_none_or(Value::is_null),
+            "rejection leaked {field}"
+        );
+    }
+    Ok(())
+}
+
+fn issue_activation(request: RequestBuilder, artifacts: &Path) -> Result<ActivationIssue> {
+    let response = activation_success(send(
+        request,
+        "administrator issues activation code",
+        artifacts,
+    )?)?;
+    assert!(response.headers().get(SET_COOKIE).is_none());
+    let body: Value = response.json()?;
+    for field in ["access_token", "token", "session"] {
+        assert!(
+            body.get(field).is_none_or(Value::is_null),
+            "issuance granted {field}"
+        );
+    }
+    let issue: ActivationIssue = serde_json::from_value(body)?;
+    assert!(!issue.code.is_empty());
+    assert!(!issue.expires_at.is_empty());
+    Ok(issue)
+}
+
+fn create_pending(
+    client: &Client,
+    base: &str,
+    artifacts: &Path,
+    cookie: &str,
+    handle: &str,
+) -> Result<ActivationIssue> {
+    let issue = issue_activation(
+        client
+            .post(format!("{base}/api/hosting/accounts"))
+            .header(COOKIE, cookie)
+            .header(ORIGIN, BROWSER_ORIGIN)
+            .json(&json!({"handle": handle})),
+        artifacts,
+    )?;
+    assert_eq!(issue.user.handle, handle);
+    Ok(issue)
+}
+
+fn activation_options_request(
+    client: &Client,
+    base: &str,
+    handle: &str,
+    code: &str,
+) -> RequestBuilder {
+    client
+        .post(format!("{base}/api/auth/activation/options"))
+        .header(ORIGIN, BROWSER_ORIGIN)
+        .json(&json!({"handle": handle, "code": code, "browser_origin": BROWSER_ORIGIN}))
+}
+
+fn activation_options(
+    client: &Client,
+    base: &str,
+    artifacts: &Path,
+    issue: &ActivationIssue,
+) -> Result<PasskeyRegistrationOptionsResponse> {
+    let response = activation_success(send(
+        activation_options_request(client, base, &issue.user.handle, &issue.code),
+        "code verification creates only limited registration options",
+        artifacts,
+    )?)?;
+    assert!(response.headers().get(SET_COOKIE).is_none());
+    let body: Value = response.json()?;
+    for field in ["code", "user", "access_token", "token", "session"] {
+        assert!(
+            body.get(field).is_none_or(Value::is_null),
+            "options granted {field}"
+        );
+    }
+    Ok(serde_json::from_value(body)?)
+}
+
+fn activation_credential(
+    options: PasskeyRegistrationOptionsResponse,
+    key: &mut WebauthnAuthenticator<SoftPasskey>,
+) -> Result<PasskeyRegistrationCompleteRequest> {
+    Ok(PasskeyRegistrationCompleteRequest {
+        challenge_id: options.challenge_id,
+        credential: key.do_registration(BROWSER_ORIGIN.parse()?, options.public_key)?,
+    })
+}
+
+fn activation_complete_request(
+    client: &Client,
+    base: &str,
+    complete: &PasskeyRegistrationCompleteRequest,
+) -> RequestBuilder {
+    client
+        .post(format!("{base}/api/auth/activation/complete"))
+        .header(ORIGIN, BROWSER_ORIGIN)
+        .json(complete)
+}
+
+// host CLIのFULL USER bearerを再利用せず、実sessionによるdevice承認からbearerを得る。
+fn device_bearer(client: &Client, base: &str, artifacts: &Path, cookie: &str) -> Result<String> {
+    let flow: Value = decode(send(
+        client
+            .post(format!("{base}/api/auth/device-login/start"))
+            .json(&json!({"client_name": "isolated activation E2E"})),
+        "start device login for live authority checks",
+        artifacts,
+    )?)?;
+    let approved: Value = decode(send(
+        client
+            .post(format!("{base}/api/auth/device-login/approve"))
+            .header(COOKIE, cookie)
+            .header(ORIGIN, BROWSER_ORIGIN)
+            .json(&json!({"user_code": flow["user_code"]})),
+        "real passkey session approves device bearer",
+        artifacts,
+    )?)?;
+    assert_eq!(approved["status"], "approved");
+    let response = activation_success(send(
+        client
+            .post(format!("{base}/api/auth/device-login/poll"))
+            .json(&json!({"device_code": flow["device_code"]})),
+        "deliver device bearer without body diagnostics",
+        artifacts,
+    )?)?;
+    let issued: Value = response.json()?;
+    assert_eq!(issued["status"], "approved");
+    Ok(issued["access_token"]
+        .as_str()
+        .ok_or("device bearer missing")?
+        .to_owned())
+}
+
+#[test]
+fn activation_with_disabled_self_registration_survives_reopen_and_enables_only_passkey_login()
+-> Result {
+    let mut environment = WorkerE2eEnvironment::new()?;
+    eprintln!(
+        "activation E2E artifacts: {}",
+        environment.artifacts_dir.display()
+    );
+    environment.start_empty_backend()?;
+    let client = http_client()?;
+    let artifacts = environment.artifacts_dir.clone();
+    let mut base = environment.server_url.clone().ok_or("missing server URL")?;
+    let mut admin_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (_, admin_cookie) = host_admin_login(&environment, &client, &mut admin_key)?;
+    policy(&client, &base, &artifacts, false)?;
+    let issue = create_pending(
+        &client,
+        &base,
+        &artifacts,
+        &admin_cookie,
+        &environment.account_handle,
+    )?;
+
+    // optionsだけで取消し／reloadしてもcodeを消費せず、鍵なしaccountに通常権限を与えない。
+    let _cancelled = activation_options(&client, &base, &artifacts, &issue)?;
+    let _reloaded = activation_options(&client, &base, &artifacts, &issue)?;
+    let whoami: Value = decode(send(
+        client.get(format!("{base}/api/auth/whoami")),
+        "activation options leave browser anonymous",
+        &artifacts,
+    )?)?;
+    assert!(whoami["actor"].is_null());
+    activation_denied(send(
+        client
+            .post(format!("{base}/api/auth/passkeys/login/options"))
+            .header(ORIGIN, BROWSER_ORIGIN)
+            .json(&json!({"handle": issue.user.handle, "browser_origin": BROWSER_ORIGIN})),
+        "cancelled activation has no usable passkey",
+        &artifacts,
+    )?)?;
+    environment.restart_backend()?;
+    base = environment
+        .server_url
+        .clone()
+        .ok_or("missing restarted server URL")?;
+    policy(&client, &base, &artifacts, false)?;
+    let options = activation_options(&client, &base, &artifacts, &issue)?;
+    let mut key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let complete = activation_credential(options, &mut key)?;
+    let (activated, cookie) = session(activation_success(send(
+        activation_complete_request(&client, &base, &complete),
+        "verified activation after reopened pending state",
+        &artifacts,
+    )?)?)?;
+    assert_eq!(activated.user, issue.user);
+    access(&client, &base, &artifacts, &cookie, false)?;
+    let workspaces: Value = decode(send(
+        client
+            .get(format!("{base}/api/workspaces"))
+            .header(COOKIE, &cookie),
+        "activation grants ordinary login without creating Workspace",
+        &artifacts,
+    )?)?;
+    assert_eq!(workspaces, json!([]));
+    activation_denied(send(
+        activation_options_request(&client, &base, &issue.user.handle, &issue.code),
+        "used activation code cannot log in again",
+        &artifacts,
+    )?)?;
+    activation_denied(send(
+        activation_complete_request(&client, &base, &complete),
+        "completed activation challenge cannot be reused",
+        &artifacts,
+    )?)?;
+    logout(&client, &base, &artifacts, &cookie)?;
+    let (logged_in, cookie) = login(&client, &base, &artifacts, &issue.user.handle, &mut key)?;
+    assert_eq!(logged_in.user, issue.user);
+    access(&client, &base, &artifacts, &cookie, false)?;
+
+    environment.restart_backend()?;
+    base = environment
+        .server_url
+        .clone()
+        .ok_or("missing reopened server URL")?;
+    let (persisted, cookie) = login(&client, &base, &artifacts, &issue.user.handle, &mut key)?;
+    assert_eq!(persisted.user, issue.user);
+    access(&client, &base, &artifacts, &cookie, false)?;
+    policy(&client, &base, &artifacts, false)?;
+    activation_denied(send(
+        activation_options_request(&client, &base, &issue.user.handle, &issue.code),
+        "consumed code remains unusable after DB reopen",
+        &artifacts,
+    )?)?;
+    let report = environment.cleanup()?;
+    assert!(report.cleanup_success);
+    assert!(!report.fixture_root_exists_after);
+    Ok(())
+}
+
+#[test]
+fn activation_issuance_requires_live_admin_and_cookie_origin_not_identity_claims() -> Result {
+    let mut environment = WorkerE2eEnvironment::new()?;
+    environment.start_empty_backend()?;
+    let client = http_client()?;
+    let artifacts = &environment.artifacts_dir;
+    let base = environment
+        .server_url
+        .as_deref()
+        .ok_or("missing server URL")?;
+    let mut admin_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (admin, admin_cookie) = host_admin_login(&environment, &client, &mut admin_key)?;
+    let ordinary = create_pending(
+        &client,
+        base,
+        artifacts,
+        &admin_cookie,
+        &environment.account_handle,
+    )?;
+    let mut ordinary_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let complete = activation_credential(
+        activation_options(&client, base, artifacts, &ordinary)?,
+        &mut ordinary_key,
+    )?;
+    let (_, ordinary_cookie) = session(activation_success(send(
+        activation_complete_request(&client, base, &complete),
+        "activate ordinary user for permission checks",
+        artifacts,
+    )?)?)?;
+    let ordinary_bearer = device_bearer(&client, base, artifacts, &ordinary_cookie)?;
+    let admin_bearer = device_bearer(&client, base, artifacts, &admin_cookie)?;
+    let pending_handle = format!("{}-pending", environment.account_handle);
+    let pending = create_pending(&client, base, artifacts, &admin_cookie, &pending_handle)?;
+
+    for path in [
+        "/api/hosting/accounts",
+        "/api/hosting/accounts/activation-code",
+    ] {
+        for authorization in [None, Some(&ordinary_cookie), Some(&ordinary_bearer)] {
+            let mut request = client
+                .post(format!("{base}{path}"))
+                .header(ORIGIN, BROWSER_ORIGIN)
+                .header("x-yoi-user-id", &admin.user.user_id)
+                .header("x-yoi-account-id", &admin.user.account_id)
+                .header("x-hosting-admin", "true")
+                .json(&json!({"handle": pending_handle}));
+            if let Some(authorization) = authorization {
+                request = if authorization == &ordinary_cookie {
+                    request.header(COOKIE, authorization)
+                } else {
+                    request.bearer_auth(authorization)
+                };
+            }
+            activation_denied(send(
+                request,
+                "anonymous or ordinary identity spoof cannot issue code",
+                artifacts,
+            )?)?;
+        }
+        for origin in [None, Some("http://localhost:5174")] {
+            let mut request = client
+                .post(format!("{base}{path}"))
+                .header(COOKIE, &admin_cookie)
+                .json(&json!({"handle": pending_handle}));
+            if let Some(origin) = origin {
+                request = request.header(ORIGIN, origin);
+            }
+            activation_denied(send(
+                request,
+                "administrator cookie requires actual configured Origin",
+                artifacts,
+            )?)?;
+        }
+        activation_denied(send(
+            client
+                .post(format!("{base}{path}"))
+                .bearer_auth(&admin_bearer)
+                .header(ORIGIN, "http://localhost:5174")
+                .json(&json!({"handle": pending_handle})),
+            "bearer cannot bypass supplied untrusted browser Origin",
+            artifacts,
+        )?)?;
+        for field in ["account_id", "user_id", "is_admin"] {
+            let mut body = json!({"handle": pending_handle});
+            body[field] = json!("forged");
+            activation_denied(send(
+                client
+                    .post(format!("{base}{path}"))
+                    .header(COOKIE, &admin_cookie)
+                    .header(ORIGIN, BROWSER_ORIGIN)
+                    .json(&body),
+                "issuance body cannot select identity or grant administrator",
+                artifacts,
+            )?)?;
+        }
+    }
+    // 拒否の後でも同じcodeで進める。拒否要求が暗黙に再発行していない。
+    let _ = activation_options(&client, base, artifacts, &pending)?;
+    let replacement = issue_activation(
+        client
+            .post(format!("{base}/api/hosting/accounts/activation-code"))
+            .bearer_auth(&admin_bearer)
+            .json(&json!({"handle": pending_handle})),
+        artifacts,
+    )?;
+    assert_eq!(replacement.user, pending.user);
+    activation_denied(send(
+        activation_options_request(&client, base, &pending_handle, &pending.code),
+        "legitimate bearer reissue invalidates old code",
+        artifacts,
+    )?)?;
+    let _ = activation_options(&client, base, artifacts, &replacement)?;
+    let bearer_created = issue_activation(
+        client
+            .post(format!("{base}/api/hosting/accounts"))
+            .bearer_auth(&admin_bearer)
+            .json(&json!({"handle": format!("{}-bearer", environment.account_handle)})),
+        artifacts,
+    )?;
+    assert_ne!(bearer_created.user.account_id, pending.user.account_id);
+    // 有効accountに対してcreateもcode再発行もcredential回復へ転用できない。
+    for path in [
+        "/api/hosting/accounts",
+        "/api/hosting/accounts/activation-code",
+    ] {
+        activation_denied(send(
+            client
+                .post(format!("{base}{path}"))
+                .header(COOKIE, &admin_cookie)
+                .header(ORIGIN, BROWSER_ORIGIN)
+                .json(&json!({"handle": ordinary.user.handle})),
+            "administrator cannot replace active account or issue recovery code",
+            artifacts,
+        )?)?;
+    }
+    logout(&client, base, artifacts, &admin_cookie)?;
+    for path in [
+        "/api/hosting/accounts",
+        "/api/hosting/accounts/activation-code",
+    ] {
+        activation_denied(send(
+            client
+                .post(format!("{base}{path}"))
+                .header(COOKIE, &admin_cookie)
+                .header(ORIGIN, BROWSER_ORIGIN)
+                .json(&json!({"handle": pending_handle})),
+            "revoked administrator cookie cannot issue code",
+            artifacts,
+        )?)?;
+    }
+    let (_, cookie) = login(
+        &client,
+        base,
+        artifacts,
+        &ordinary.user.handle,
+        &mut ordinary_key,
+    )?;
+    access(&client, base, artifacts, &cookie, false)?;
+    let report = environment.cleanup()?;
+    assert!(report.cleanup_success);
+    Ok(())
+}
+
+#[test]
+fn activation_codes_challenges_and_unverified_state_cannot_cross_account_or_purpose() -> Result {
+    let mut environment = WorkerE2eEnvironment::new()?;
+    environment.start_empty_backend()?;
+    let client = http_client()?;
+    let base = environment
+        .server_url
+        .as_deref()
+        .ok_or("missing server URL")?;
+    let artifacts = &environment.artifacts_dir;
+    let mut admin_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (_, admin_cookie) = host_admin_login(&environment, &client, &mut admin_key)?;
+    let issue = create_pending(
+        &client,
+        base,
+        artifacts,
+        &admin_cookie,
+        &environment.account_handle,
+    )?;
+    let other = create_pending(
+        &client,
+        base,
+        artifacts,
+        &admin_cookie,
+        &format!("{}-other", environment.account_handle),
+    )?;
+    for (handle, code) in [
+        (issue.user.handle.as_str(), "invalid-code"),
+        (other.user.handle.as_str(), issue.code.as_str()),
+        ("unknown-activation-handle", issue.code.as_str()),
+    ] {
+        activation_denied(send(
+            activation_options_request(&client, base, handle, code),
+            "invalid code or account binding cannot start activation",
+            artifacts,
+        )?)?;
+    }
+    activation_denied(send(
+        client
+            .post(format!("{base}/api/auth/activation/options"))
+            .header(ORIGIN, "https://example.invalid")
+            .json(&json!({"handle": issue.user.handle, "code": issue.code,
+                "browser_origin": "https://example.invalid"})),
+        "untrusted browser origin cannot start activation",
+        artifacts,
+    )?)?;
+    let options = activation_options(&client, base, artifacts, &issue)?;
+    let challenge_id = options.challenge_id.clone();
+    let mut key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let complete = activation_credential(options, &mut key)?;
+
+    // code／限定challenge IDのどちらも通常tokenではない。通常API、Workspace、device approvalに流用しない。
+    let flow: Value = decode(send(
+        client
+            .post(format!("{base}/api/auth/device-login/start"))
+            .json(&json!({"client_name": "pending activation must not approve"})),
+        "start device flow before passkey verification",
+        artifacts,
+    )?)?;
+    for bearer in [None, Some(issue.code.as_str()), Some(challenge_id.as_str())] {
+        let requests = [
+            client.get(format!("{base}/api/hosting/settings")),
+            client.post(format!("{base}/api/workspaces")).header(ORIGIN, BROWSER_ORIGIN)
+                .json(&json!({"operation_key": format!("pending-{}", environment.runtime_id),
+                    "display_name": "must not exist", "repository": {"repository_key": "fixture",
+                        "uri": "https://example.invalid/activation.git", "default_ref": "develop"}})),
+            client.post(format!("{base}/api/auth/device-login/approve")).header(ORIGIN, BROWSER_ORIGIN)
+                .json(&json!({"user_code": flow["user_code"]})),
+            client.post(format!("{base}/api/auth/passkeys/addition/options")).header(ORIGIN, BROWSER_ORIGIN)
+                .json(&json!({"browser_origin": BROWSER_ORIGIN})),
+        ];
+        for mut request in requests {
+            if let Some(bearer) = bearer {
+                request = request.bearer_auth(bearer);
+            }
+            activation_denied(send(
+                request,
+                "limited activation state grants no ordinary authority",
+                artifacts,
+            )?)?;
+        }
+    }
+    let polled: Value = decode(send(
+        client
+            .post(format!("{base}/api/auth/device-login/poll"))
+            .json(&json!({"device_code": flow["device_code"]})),
+        "failed pending-user approvals did not authorize device",
+        artifacts,
+    )?)?;
+    assert_eq!(polled["status"], "pending");
+    assert!(polled.get("access_token").is_none_or(Value::is_null));
+
+    // completionはchallengeのtargetを使い、本文で別accountへ切り替えられない。
+    for field in ["handle", "account_id", "user_id"] {
+        let mut body = serde_json::to_value(&complete)?;
+        body[field] = json!(&other.user.account_id);
+        activation_denied(send(
+            client
+                .post(format!("{base}/api/auth/activation/complete"))
+                .header(ORIGIN, BROWSER_ORIGIN)
+                .json(&body),
+            "activation completion rejects injected target identity",
+            artifacts,
+        )?)?;
+    }
+    for path in [
+        "/api/auth/passkeys/registration/complete",
+        "/api/auth/passkeys/addition/complete",
+    ] {
+        let mut request = client
+            .post(format!("{base}{path}"))
+            .header(ORIGIN, BROWSER_ORIGIN)
+            .json(&complete);
+        // additionでは実admin sessionを持っていてもactivation challengeの用途は変えられない。
+        if path.contains("addition") {
+            request = request.header(COOKIE, &admin_cookie);
+        }
+        activation_denied(send(
+            request,
+            "activation challenge cannot become public registration or self addition",
+            artifacts,
+        )?)?;
+    }
+    // 再発行はcodeだけでなく、それ以前に発行したchallengeも失効させる。
+    let replacement = issue_activation(
+        client
+            .post(format!("{base}/api/hosting/accounts/activation-code"))
+            .header(COOKIE, &admin_cookie)
+            .header(ORIGIN, BROWSER_ORIGIN)
+            .json(&json!({"handle": issue.user.handle})),
+        artifacts,
+    )?;
+    assert_eq!(replacement.user, issue.user);
+    activation_denied(send(
+        activation_options_request(&client, base, &issue.user.handle, &issue.code),
+        "old code cannot resume after reissue",
+        artifacts,
+    )?)?;
+    activation_denied(send(
+        activation_complete_request(&client, base, &complete),
+        "old challenge cannot activate after reissue",
+        artifacts,
+    )?)?;
+    // 別IDに対する誤ったcode入力が元のaccountを消費していない。
+    let _ = activation_options(&client, base, artifacts, &other)?;
+    let mut replacement_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let replacement_complete = activation_credential(
+        activation_options(&client, base, artifacts, &replacement)?,
+        &mut replacement_key,
+    )?;
+    let (user, cookie) = session(activation_success(send(
+        activation_complete_request(&client, base, &replacement_complete),
+        "replacement code activates only its bound account",
+        artifacts,
+    )?)?)?;
+    assert_eq!(user.user, issue.user);
+    access(&client, base, artifacts, &cookie, false)?;
+
+    // 逆向きも拒否する。通常登録や本人鍵追加のchallengeでpending accountを有効化できない。
+    set_policy(&client, base, artifacts, &admin_cookie, true)?;
+    let public_handle = format!("{}-public", environment.account_handle);
+    let public_options: PasskeyRegistrationOptionsResponse = decode(send(
+        client
+            .post(format!("{base}/api/auth/passkeys/registration/options"))
+            .header(ORIGIN, BROWSER_ORIGIN)
+            .json(&json!({"handle": public_handle, "browser_origin": BROWSER_ORIGIN})),
+        "start distinct public registration ceremony",
+        artifacts,
+    )?)?;
+    let mut public_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let public_complete = activation_credential(public_options, &mut public_key)?;
+    activation_denied(send(
+        activation_complete_request(&client, base, &public_complete),
+        "public registration challenge cannot finish activation",
+        artifacts,
+    )?)?;
+    let addition_options: PasskeyRegistrationOptionsResponse = decode(send(
+        client
+            .post(format!("{base}/api/auth/passkeys/addition/options"))
+            .header(COOKIE, &cookie)
+            .header(ORIGIN, BROWSER_ORIGIN)
+            .json(&json!({"browser_origin": BROWSER_ORIGIN})),
+        "start distinct authenticated self-addition ceremony",
+        artifacts,
+    )?)?;
+    let mut addition_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let addition_complete = activation_credential(addition_options, &mut addition_key)?;
+    activation_denied(send(
+        activation_complete_request(&client, base, &addition_complete),
+        "self-addition challenge cannot finish activation",
+        artifacts,
+    )?)?;
+    set_policy(&client, base, artifacts, &admin_cookie, false)?;
+    let (_, cookie) = login(
+        &client,
+        base,
+        artifacts,
+        &issue.user.handle,
+        &mut replacement_key,
+    )?;
+    access(&client, base, artifacts, &cookie, false)?;
+    let report = environment.cleanup()?;
+    assert!(report.cleanup_success);
+    Ok(())
+}
+
+#[test]
+fn activation_bad_attestation_stays_pending_and_concurrent_ceremonies_store_only_one_key() -> Result
+{
+    let mut environment = WorkerE2eEnvironment::new()?;
+    environment.start_empty_backend()?;
+    let client = http_client()?;
+    let artifacts = &environment.artifacts_dir;
+    let base = environment
+        .server_url
+        .as_deref()
+        .ok_or("missing server URL")?;
+    let mut admin_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (_, admin_cookie) = host_admin_login(&environment, &client, &mut admin_key)?;
+    let issue = create_pending(
+        &client,
+        base,
+        artifacts,
+        &admin_cookie,
+        &environment.account_handle,
+    )?;
+    let mut bad_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let bad_complete = activation_credential(
+        activation_options(&client, base, artifacts, &issue)?,
+        &mut bad_key,
+    )?;
+    let mut bad_attestation = serde_json::to_value(&bad_complete)?;
+    // 外部JSONとして受理されるcredentialのclientDataだけを壊し、本番verifierで拒否させる。
+    bad_attestation["credential"]["response"]["clientDataJSON"] = json!("e30");
+    activation_denied(send(
+        client
+            .post(format!("{base}/api/auth/activation/complete"))
+            .header(ORIGIN, BROWSER_ORIGIN)
+            .json(&bad_attestation),
+        "real WebAuthn verifier rejects malformed attestation",
+        artifacts,
+    )?)?;
+    activation_denied(send(
+        client
+            .post(format!("{base}/api/auth/passkeys/login/options"))
+            .header(ORIGIN, BROWSER_ORIGIN)
+            .json(&json!({"handle": issue.user.handle, "browser_origin": BROWSER_ORIGIN})),
+        "failed verifier did not activate or save a credential",
+        artifacts,
+    )?)?;
+    let mut first_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let first = activation_credential(
+        activation_options(&client, base, artifacts, &issue)?,
+        &mut first_key,
+    )?;
+    let mut second_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let second = activation_credential(
+        activation_options(&client, base, artifacts, &issue)?,
+        &mut second_key,
+    )?;
+    let gate = std::sync::Barrier::new(3);
+    let first_request = activation_complete_request(&client, base, &first);
+    let second_request = activation_complete_request(&client, base, &second);
+    // 独立した有効ceremonyを同時送信する。HTTP timeoutとRAII Server回収は既存harnessを使う。
+    let (first_response, second_response) =
+        std::thread::scope(|scope| -> Result<(Response, Response)> {
+            let first_thread = scope.spawn(|| {
+                gate.wait();
+                first_request.send()
+            });
+            let second_thread = scope.spawn(|| {
+                gate.wait();
+                second_request.send()
+            });
+            gate.wait();
+            Ok((
+                first_thread
+                    .join()
+                    .map_err(|_| "first completion thread panicked")??,
+                second_thread
+                    .join()
+                    .map_err(|_| "second completion thread panicked")??,
+            ))
+        })?;
+    let first_won = first_response.status().is_success();
+    let second_won = second_response.status().is_success();
+    assert_ne!(
+        first_won, second_won,
+        "exactly one concurrent activation may succeed"
+    );
+    let (winner_response, loser_response, winner, winner_key, loser_key) = if first_won {
+        (
+            first_response,
+            second_response,
+            &first,
+            &mut first_key,
+            &mut second_key,
+        )
+    } else {
+        (
+            second_response,
+            first_response,
+            &second,
+            &mut second_key,
+            &mut first_key,
+        )
+    };
+    activation_denied(loser_response)?;
+    let (user, cookie) = session(activation_success(winner_response)?)?;
+    assert_eq!(user.user, issue.user);
+    access(&client, base, artifacts, &cookie, false)?;
+    for complete in [&first, &second] {
+        activation_denied(send(
+            activation_complete_request(&client, base, complete),
+            "neither successful nor losing ceremony can add a second activation key",
+            artifacts,
+        )?)?;
+    }
+    activation_denied(send(
+        activation_options_request(&client, base, &issue.user.handle, &issue.code),
+        "parallel activation consumed code once",
+        artifacts,
+    )?)?;
+    let options: PasskeyLoginOptionsResponse = decode(send(
+        client
+            .post(format!("{base}/api/auth/passkeys/login/options"))
+            .header(ORIGIN, BROWSER_ORIGIN)
+            .json(&json!({"handle": issue.user.handle, "browser_origin": BROWSER_ORIGIN})),
+        "reread only persisted credential after concurrent activation",
+        artifacts,
+    )?)?;
+    let wire = serde_json::to_value(&options.public_key)?;
+    let allowed = wire["publicKey"]["allowCredentials"]
+        .as_array()
+        .ok_or("login credentials missing")?;
+    assert_eq!(
+        allowed.len(),
+        1,
+        "failed verifier and losing ceremony must not store credentials"
+    );
+    assert_eq!(
+        allowed[0]["id"],
+        serde_json::to_value(winner)?["credential"]["id"]
+    );
+    assert!(
+        loser_key
+            .do_authentication(BROWSER_ORIGIN.parse()?, options.public_key)
+            .is_err(),
+        "losing authenticator must have no usable persisted credential"
+    );
+    let (logged_in, cookie) = login(&client, base, artifacts, &issue.user.handle, winner_key)?;
+    assert_eq!(logged_in.user, issue.user);
+    access(&client, base, artifacts, &cookie, false)?;
     let report = environment.cleanup()?;
     assert!(report.cleanup_success);
     assert!(!report.fixture_root_exists_after);

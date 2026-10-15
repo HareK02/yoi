@@ -92,6 +92,9 @@ use crate::backend_job::{
 use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
+#[path = "activation.rs"]
+mod activation;
+pub use activation::ActivationCodeIssue;
 #[path = "assignment_delivery.rs"]
 mod assignment_delivery;
 #[path = "notification_diagnostics.rs"]
@@ -116,7 +119,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 99;
+const LATEST_SCHEMA_VERSION: i64 = 100;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -419,6 +422,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "Explicit hosting administrators and self-registration policy",
         apply: migrate_hosting_policy_v98_to_v99,
     },
+    Migration {
+        version: 100,
+        name: "Provisional users and scoped passkey activation",
+        apply: activation::migrate,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -710,6 +718,10 @@ pub struct UserRecord {
 pub enum PasskeyRegistrationTarget {
     NewAccount {
         user: UserRecord,
+    },
+    Activation {
+        user: UserRecord,
+        issuance_id: String,
     },
     Addition {
         user: UserRecord,
@@ -1663,6 +1675,19 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     fn get_user(&self, user_id: &str) -> Result<Option<UserRecord>>;
     fn get_user_by_handle(&self, handle: &str) -> Result<Option<UserRecord>>;
     fn any_user(&self) -> Result<Option<UserRecord>>;
+    fn create_provisional_user(
+        &self,
+        actor: &server_api::RequestActor,
+        handle: &str,
+    ) -> Result<ActivationCodeIssue>;
+    fn reissue_activation_code(
+        &self,
+        actor: &server_api::RequestActor,
+        handle: &str,
+    ) -> Result<ActivationCodeIssue>;
+    fn verify_activation_code(&self, handle: &str, code: &str)
+    -> Result<PasskeyRegistrationTarget>;
+    fn is_user_pending_activation(&self, user_id: &str) -> Result<bool>;
     /// Checks an explicit grant for a currently existing user, not Workspace ownership.
     fn is_hosting_admin(&self, user_id: &str) -> Result<bool>;
     fn hosting_self_registration_enabled(&self) -> Result<bool>;
@@ -2685,7 +2710,10 @@ impl SqliteWorkspaceStore {
             let (user, initial_bearer) = match (existing, create_user) {
                 (Some(_), true) => return Err(Error::Store("hosting-admin --create-user requires a new handle; no credentials issued".into())),
                 (None, false) => return Err(Error::Store("hosting-admin requires an existing user; use --create-user explicitly for a new user".into())),
-                (Some(user), false) => (user, None),
+                (Some(user), false) => {
+                    activation::require_active(tx, &user.user_id)?;
+                    (user, None)
+                },
                 (None, true) => {
                     let user = UserRecord {
                         user_id: crate::auth::new_id("user"),
@@ -4426,6 +4454,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                             |row| row.get::<_, String>(0),
                         )
                         .optional()?;
+                    activation::require_active_account(&tx, &record.owner_account_id)?;
                     if owner_kind.as_deref() != Some("user") {
                         return Err(Error::Store(format!(
                             "Workspace owner `{}` must reference an existing User Account",
@@ -4607,6 +4636,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
+            activation::require_active_account(&tx, &record.workspace.owner_account_id)?;
             if owner_kind.as_deref() != Some("user") {
                 return Err(Error::Store(format!(
                     "Workspace owner `{}` must reference an existing User Account",
@@ -6559,8 +6589,39 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn create_provisional_user(
+        &self,
+        actor: &server_api::RequestActor,
+        handle: &str,
+    ) -> Result<ActivationCodeIssue> {
+        activation::create(self, actor, handle)
+    }
+
+    fn reissue_activation_code(
+        &self,
+        actor: &server_api::RequestActor,
+        handle: &str,
+    ) -> Result<ActivationCodeIssue> {
+        activation::reissue(self, actor, handle)
+    }
+
+    fn verify_activation_code(
+        &self,
+        handle: &str,
+        code: &str,
+    ) -> Result<PasskeyRegistrationTarget> {
+        activation::verify(self, handle, code)
+    }
+
+    fn is_user_pending_activation(&self, user_id: &str) -> Result<bool> {
+        self.with_conn(|conn| activation::pending(conn, user_id))
+    }
+
     fn is_hosting_admin(&self, user_id: &str) -> Result<bool> {
         self.with_conn(|conn| {
+            if activation::pending(conn, user_id)? {
+                return Ok(false);
+            }
             conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM hosting_administrators h JOIN users u ON u.user_id = h.user_id WHERE u.user_id = ?1)",
                 [user_id], |row| row.get(0),
@@ -6585,6 +6646,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         enabled: bool,
     ) -> Result<()> {
         self.with_immediate_transaction(|tx| {
+            activation::require_active(tx, &actor.user_id)?;
             let allowed: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM hosting_administrators h JOIN users u ON u.user_id = h.user_id WHERE u.user_id = ?1 AND u.account_id = ?2)",
                 params![actor.user_id, actor.account_id], |row| row.get(0),
@@ -6638,7 +6700,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     )?;
                     user
                 }
+                PasskeyRegistrationTarget::Activation { user, issuance_id } => {
+                    activation::require_pending_target(tx, user, Some(issuance_id))?;
+                    user
+                }
                 PasskeyRegistrationTarget::Addition { user, authentication } => {
+                    activation::require_active(tx, &user.user_id)?;
                     let current = tx.query_row(
                         user_select_sql("WHERE user_id = ?1 AND account_id = ?2").as_str(),
                         params![user.user_id, user.account_id], read_user_record,
@@ -6669,12 +6736,18 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 "INSERT INTO passkey_credentials (credential_id, user_id, public_key_cose, transports_json, sign_count, created_at, last_used_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![credential.credential_id, credential.user_id, credential.public_key_cose, credential.transports_json, credential.sign_count, credential.created_at, credential.last_used_at],
             )?;
+            if let PasskeyRegistrationTarget::Activation { user, issuance_id } = target {
+                if tx.execute("DELETE FROM user_activations WHERE user_id=?1 AND issuance_id=?2", params![user.user_id, issuance_id])? != 1 {
+                    return Err(crate::auth::auth_error("activation_code_invalid", "activation issuance no longer exists"));
+                }
+            }
             Ok(())
         })
     }
 
     fn upsert_passkey_credential(&self, record: &PasskeyCredentialRecord) -> Result<()> {
-        self.with_conn(|conn| {
+        self.with_immediate_transaction(|conn| {
+            activation::require_active(conn, &record.user_id)?;
             conn.execute(
                 r#"INSERT INTO passkey_credentials (credential_id, user_id, public_key_cose, transports_json, sign_count, created_at, last_used_at)
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -6784,7 +6857,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     }
 
     fn create_browser_session(&self, record: &BrowserSessionRecord) -> Result<()> {
-        self.with_conn(|conn| {
+        self.with_immediate_transaction(|conn| {
+            activation::require_active(conn, &record.user_id)?;
             conn.execute(
                 r#"INSERT INTO browser_sessions (session_id, token_hash, user_id, created_at, expires_at, revoked_at)
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
@@ -6797,7 +6871,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn resolve_browser_session(&self, token_hash: &str) -> Result<Option<BrowserSessionRecord>> {
         self.with_conn(|conn| {
             conn.query_row(
-                browser_session_select_sql("WHERE token_hash = ?1 AND revoked_at IS NULL").as_str(),
+                browser_session_select_sql("WHERE token_hash = ?1 AND revoked_at IS NULL AND NOT EXISTS (SELECT 1 FROM user_activations p WHERE p.user_id=browser_sessions.user_id)").as_str(),
                 params![token_hash],
                 read_browser_session_record,
             )
@@ -6817,7 +6891,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     }
 
     fn create_api_token(&self, record: &ApiTokenRecord) -> Result<()> {
-        self.with_conn(|conn| {
+        self.with_immediate_transaction(|conn| {
+            activation::require_active(conn, &record.user_id)?;
             conn.execute(
                 r#"INSERT INTO api_tokens (token_id, token_hash, user_id, label, created_at, expires_at, revoked_at, last_used_at)
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
@@ -6830,7 +6905,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn resolve_api_token(&self, token_hash: &str) -> Result<Option<ApiTokenRecord>> {
         self.with_conn(|conn| {
             conn.query_row(
-                api_token_select_sql("WHERE token_hash = ?1 AND revoked_at IS NULL").as_str(),
+                api_token_select_sql("WHERE token_hash = ?1 AND revoked_at IS NULL AND NOT EXISTS (SELECT 1 FROM user_activations p WHERE p.user_id=api_tokens.user_id)").as_str(),
                 params![token_hash],
                 read_api_token_record,
             )
@@ -6850,7 +6925,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     }
 
     fn try_create_device_login_flow(&self, record: &DeviceLoginFlowRecord) -> Result<bool> {
-        self.with_conn(|conn| {
+        self.with_immediate_transaction(|conn| {
+            if let Some(user_id) = &record.user_id { activation::require_active(conn, user_id)?; }
             let changed = conn.execute(
                 r#"INSERT INTO device_login_flows (device_code, user_code, verification_uri, client_name, user_id, api_token_id, issued_access_token, created_at, expires_at, approved_at, consumed_at)
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -6899,7 +6975,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         issued_access_token: &str,
         approved_at: &str,
     ) -> Result<bool> {
-        self.with_conn(|conn| {
+        self.with_immediate_transaction(|conn| {
+            activation::require_active(conn, user_id)?;
             let changed = conn.execute(
                 r#"UPDATE device_login_flows
                    SET user_id = ?2, api_token_id = ?3, issued_access_token = ?4, approved_at = ?5
@@ -6921,8 +6998,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         device_code: &str,
         consumed_at: &str,
     ) -> Result<Option<DeviceLoginFlowRecord>> {
-        self.with_conn(|conn| {
-            let record = conn.query_row(device_login_select_sql("WHERE device_code = ?1 AND approved_at IS NOT NULL AND consumed_at IS NULL").as_str(), params![device_code], read_device_login_flow_record).optional()?;
+        self.with_immediate_transaction(|conn| {
+            let record = conn.query_row(device_login_select_sql("WHERE device_code = ?1 AND approved_at IS NOT NULL AND consumed_at IS NULL AND NOT EXISTS(SELECT 1 FROM user_activations p WHERE p.user_id=device_login_flows.user_id)").as_str(), params![device_code], read_device_login_flow_record).optional()?;
             if record.is_some() {
                 conn.execute("UPDATE device_login_flows SET consumed_at = ?2, issued_access_token = NULL WHERE device_code = ?1", params![device_code, consumed_at])?;
             }
@@ -14808,7 +14885,9 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
 // Fresh composition uses the posts contract. Retained fixtures pass frozen host
 // and component DDL to the shared cross-domain constraint composition below.
 fn create_workspace_schema_structure(conn: &Connection) -> Result<()> {
-    create_workspace_schema_structure_from_sql(conn, include_str!("latest_schema.sql"), true)
+    create_workspace_schema_structure_from_sql(conn, include_str!("latest_schema.sql"), true)?;
+    conn.execute_batch(include_str!("activation_schema.sql"))?;
+    Ok(())
 }
 
 fn create_workspace_schema_structure_from_sql(
@@ -18055,6 +18134,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         );
     }
 
+    include!("activation_tests.rs");
     include!("schema_equivalence_tests.rs");
     include!("ticket_tag_upgrade_tests.rs");
     include!("ticket_post_upgrade_tests.rs");
@@ -18396,6 +18476,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:97, name:"MR notifications and authenticated implementation results".into()},
                 WorkspaceSchemaMigrationStep {version:98, name:"Assignment-independent implementation reports".into()},
                 WorkspaceSchemaMigrationStep {version:99, name:"Explicit hosting administrators and self-registration policy".into()},
+                WorkspaceSchemaMigrationStep {version:100, name:"Provisional users and scoped passkey activation".into()},
             ]
         );
 
@@ -18505,6 +18586,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (97, "MR notifications and authenticated implementation results".to_string()),
 (98, "Assignment-independent implementation reports".to_string()),
 (99, "Explicit hosting administrators and self-registration policy".to_string()),
+(100, "Provisional users and scoped passkey activation".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -21128,7 +21210,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (96, "Backend Job common notification routing".into()),
                          (97, "MR notifications and authenticated implementation results".into()),
                          (98, "Assignment-independent implementation reports".into()),
-                         (99, "Explicit hosting administrators and self-registration policy".into())]);
+                         (99, "Explicit hosting administrators and self-registration policy".into()),
+                         (100, "Provisional users and scoped passkey activation".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }

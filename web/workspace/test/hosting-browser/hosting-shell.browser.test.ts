@@ -101,10 +101,10 @@ Deno.test("hosting UI keyboard navigation, policy editing, denial and unknown sa
           await page.keyboard.press("Enter");
           const edit = page.getByRole("button", { name: "Edit registration policy" });
           await edit.waitFor();
-          assertEquals(
-            await page.locator('a[href="/hosting/settings"]').getAttribute("aria-current"),
-            "page",
-          );
+          // Globalの入口からhostingへ進んだ後はWorkspace shellを離れる。
+          // Workspace未作成でも管理できることと整合させる。
+          assertEquals(await nav.count(), 0);
+          await page.getByRole("heading", { name: "Hosting settings", exact: true }).waitFor();
           if (
             await page.getByRole("button", { name: "Hide sidebar", exact: true }).isVisible() &&
             width < 768

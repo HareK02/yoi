@@ -26,6 +26,8 @@
   import { observeDeferred } from '#lib/workspace/navigation/observe-deferred.svelte.ts';
 
   let { children, data }: LayoutProps = $props();
+  // Hostingと初回登録はWorkspaceに依存しない。login全体の分離はここで扱わない。
+  const standalone = $derived(page.url.pathname === '/activate' || page.url.pathname.startsWith('/hosting/'));
   const catalog = observeDeferred(() => data.deferredCatalog, () => 'catalog');
   let sidebar = $state<SidebarSnippet | null>(null);
   const sidebarOverrides = createOverrideStack<SidebarSnippet>((activeSidebar) => {
@@ -55,7 +57,7 @@
   const sidebarOpen = $derived((!mobileLayout.current && sidebarMode === 'pinned') || sidebarTransientOpen);
 
   $effect(() => {
-    const error = catalog.data?.workspaceCatalogError;
+    const error = !standalone && catalog.data?.workspaceCatalogError;
     if (error) {
       pushWorkspaceAlert('error', error, {
         id: 'workspace-catalog-load',
@@ -95,6 +97,11 @@
 
 <WorkspaceAlerts />
 
+{#if standalone}
+  <main class="standalone-main">
+    {@render children()}
+  </main>
+{:else}
 <div class="app-shell" class:sidebar-open={sidebarOpen} class:sidebar-hover-mode={sidebarMode === 'hover'}>
   <SidebarFrame
     mode={sidebarMode}
@@ -139,8 +146,17 @@
     {@render children()}
   </main>
 </div>
+{/if}
 
 <style>
+  .standalone-main {
+    width: min(100%, 48rem);
+    min-width: 0;
+    min-height: 100dvh;
+    margin-inline: auto;
+    padding: var(--space-5) var(--space-4);
+  }
+
   .app-shell {
     display: grid;
     grid-template-columns: auto minmax(0, 1fr);

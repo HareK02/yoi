@@ -3389,7 +3389,7 @@ async fn dispatch_workspace_request(
     let path = request.uri().path().to_owned();
     // Hosting setup/settings belong to the Server, including zero or multiple
     // Workspaces. Serving their public shell does not grant their API authority.
-    if path.starts_with("/hosting/") {
+    if path.starts_with("/hosting/") || path == "/activate" {
         return serve_server_static_shell(&api, &path).await;
     }
     let workspace_id = scoped_workspace_id(&path);
@@ -6729,12 +6729,19 @@ async fn attach_server_request_context(
 fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
     let service = Arc::new(service);
     let origin_context = Router::new()
+        .merge(server_api::server_api_axum::auth_activation_options(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::auth_passkey_registration_options(service.clone()))
         .merge(server_api::server_api_axum::auth_passkey_login_options(
             service.clone(),
         ))
         .layer(middleware::from_fn(attach_server_origin_context));
     let actor_context = Router::new()
+        .merge(server_api::server_api_axum::hosting_account_create(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::hosting_activation_code_reissue(service.clone()))
         .merge(server_api::server_api_axum::hosting_access(service.clone()))
         .merge(server_api::server_api_axum::hosting_settings(
             service.clone(),
@@ -6762,6 +6769,9 @@ fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
             service.clone(),
         ))
         .merge(server_api::server_api_axum::auth_bootstrap_user(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::auth_activation_complete(
             service.clone(),
         ))
         .merge(server_api::server_api_axum::auth_passkey_registration_complete(service.clone()))
@@ -7738,6 +7748,100 @@ impl server_api::ServerApi for ServerApiContractService {
             .map_err(ApiError::into_repository_api_error)
     }
 
+    async fn hosting_account_create(
+        &self,
+        context: server_api::ServerRequestContext,
+        request: server_api::ProvisionalAccountRequest,
+    ) -> std::result::Result<server_api::ActivationCodeResponse, server_api::RepositoryApiError>
+    {
+        let api = self.auth_api();
+        api.store
+            .db_executor()
+            .run(move || {
+                let actor = live_hosting_actor(&api, &context, true)?;
+                let issued = api.store.create_provisional_user(&actor, &request.handle)?;
+                Ok::<_, ApiError>(server_api::ActivationCodeResponse {
+                    user: user_response(issued.user),
+                    code: issued.code,
+                    expires_at: issued.expires_at,
+                })
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn hosting_activation_code_reissue(
+        &self,
+        context: server_api::ServerRequestContext,
+        request: server_api::ProvisionalAccountRequest,
+    ) -> std::result::Result<server_api::ActivationCodeResponse, server_api::RepositoryApiError>
+    {
+        let api = self.auth_api();
+        api.store
+            .db_executor()
+            .run(move || {
+                let actor = live_hosting_actor(&api, &context, true)?;
+                let issued = api.store.reissue_activation_code(&actor, &request.handle)?;
+                Ok::<_, ApiError>(server_api::ActivationCodeResponse {
+                    user: user_response(issued.user),
+                    code: issued.code,
+                    expires_at: issued.expires_at,
+                })
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn auth_activation_options(
+        &self,
+        context: server_api::ServerRequestContext,
+        request: server_api::ActivationOptionsRequest,
+    ) -> std::result::Result<PasskeyRegistrationOptionsResponse, server_api::RepositoryApiError>
+    {
+        let api = self.auth_api();
+        api.store
+            .db_executor()
+            .run(move || {
+                // Validate the allowed WebAuthn origin before spending an attempt. Neither
+                // a browser cookie nor a bearer token can select this enrollment target.
+                let origin = request
+                    .browser_origin
+                    .as_deref()
+                    .or(context.origin.as_deref());
+                auth_config_for_origin(&api.config, origin)?;
+                let target = api
+                    .store
+                    .verify_activation_code(&request.handle, &request.code)?;
+                start_passkey_registration(&api, &HeaderMap::new(), origin, target)
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn auth_activation_complete(
+        &self,
+        request: PasskeyRegistrationCompleteRequest,
+    ) -> std::result::Result<
+        server_api::server_api_responses::AuthActivationComplete,
+        server_api::RepositoryApiError,
+    > {
+        let api = self.auth_api();
+        let (body, header_set_cookie) = api
+            .store
+            .db_executor()
+            .run(move || {
+                complete_passkey_enrollment(&api, request, EnrollmentCompletion::Activation)
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)?;
+        Ok(
+            server_api::server_api_responses::AuthActivationComplete::Status200 {
+                body,
+                header_set_cookie,
+            },
+        )
+    }
+
     async fn auth_bootstrap_user(
         &self,
         request: AuthBootstrapUserRequest,
@@ -7824,7 +7928,9 @@ impl server_api::ServerApi for ServerApiContractService {
         let (body, header_set_cookie) = api
             .store
             .db_executor()
-            .run(move || complete_passkey_enrollment(&api, request, Some(&headers)))
+            .run(move || {
+                complete_passkey_enrollment(&api, request, EnrollmentCompletion::Addition(&headers))
+            })
             .await
             .map_err(ApiError::into_repository_api_error)?;
         Ok(
@@ -29557,6 +29663,13 @@ fn passkey_addition_authority(
         .get_user(&actor.user_id)?
         .filter(|user| user.account_id == actor.account_id)
         .ok_or_else(|| auth_error("auth_required", "authenticated user no longer exists"))?;
+    if api.store.is_user_pending_activation(&user.user_id)? {
+        return Err(auth_error(
+            "passkey_activation_required",
+            "initial passkey activation is required",
+        )
+        .into());
+    }
     Ok((user, binding))
 }
 
@@ -29567,7 +29680,8 @@ fn start_passkey_registration(
     target: PasskeyRegistrationTarget,
 ) -> ApiResult<PasskeyRegistrationOptionsResponse> {
     let (user, exclude_credentials) = match &target {
-        PasskeyRegistrationTarget::NewAccount { user } => (user, Vec::new()),
+        PasskeyRegistrationTarget::NewAccount { user }
+        | PasskeyRegistrationTarget::Activation { user, .. } => (user, Vec::new()),
         PasskeyRegistrationTarget::Addition { user, .. } => (
             user,
             passkeys_for_user(api, &user.user_id)?
@@ -29592,7 +29706,8 @@ fn start_passkey_registration(
     // target (including its allocated user ID) is inside the purpose-tagged state.
     let user_id = match &target {
         PasskeyRegistrationTarget::NewAccount { .. } => None,
-        PasskeyRegistrationTarget::Addition { user, .. } => Some(user.user_id.clone()),
+        PasskeyRegistrationTarget::Addition { user, .. }
+        | PasskeyRegistrationTarget::Activation { user, .. } => Some(user.user_id.clone()),
     };
     api.store.put_auth_challenge(&AuthChallengeRecord {
         challenge_id: challenge_id.clone(),
@@ -29632,17 +29747,26 @@ fn complete_passkey_registration(
     api: &ServerAuthApi,
     request: PasskeyRegistrationCompleteRequest,
 ) -> ApiResult<(AuthUserResponse, server_api::SetCookieHeader)> {
-    complete_passkey_enrollment(api, request, None)
+    complete_passkey_enrollment(api, request, EnrollmentCompletion::NewAccount)
+}
+
+/// Completion endpoints select a purpose, not a caller-controlled body field.
+/// Activation authority never satisfies the public registration or addition path.
+enum EnrollmentCompletion<'a> {
+    NewAccount,
+    Addition(&'a HeaderMap),
+    Activation,
 }
 
 fn complete_passkey_enrollment(
     api: &ServerAuthApi,
     request: PasskeyRegistrationCompleteRequest,
-    addition_headers: Option<&HeaderMap>,
+    completion: EnrollmentCompletion<'_>,
 ) -> ApiResult<(AuthUserResponse, server_api::SetCookieHeader)> {
-    let authority = addition_headers
-        .map(|headers| passkey_addition_authority(api, headers))
-        .transpose()?;
+    let authority = match completion {
+        EnrollmentCompletion::Addition(headers) => Some(passkey_addition_authority(api, headers)?),
+        _ => None,
+    };
     let challenge = api
         .store
         .consume_auth_challenge_by_id(
@@ -29676,10 +29800,12 @@ fn complete_passkey_enrollment(
                 "registration requires purpose-bound state",
             )
         })?;
-    let user = match (&envelope.target, authority) {
-        (PasskeyRegistrationTarget::NewAccount { user }, None)
-            if addition_headers.is_none() && challenge.user_id.is_none() =>
-        {
+    let user = match (&envelope.target, authority, completion) {
+        (
+            PasskeyRegistrationTarget::NewAccount { user },
+            None,
+            EnrollmentCompletion::NewAccount,
+        ) if challenge.user_id.is_none() => {
             require_self_registration(api)?;
             user.clone()
         }
@@ -29689,12 +29815,22 @@ fn complete_passkey_enrollment(
                 authentication,
             },
             Some((current, binding)),
+            EnrollmentCompletion::Addition(_),
         ) if user.user_id == current.user_id
             && user.account_id == current.account_id
             && *authentication == binding
             && challenge.user_id.as_deref() == Some(user.user_id.as_str()) =>
         {
             current
+        }
+        (
+            PasskeyRegistrationTarget::Activation { user, .. },
+            None,
+            EnrollmentCompletion::Activation,
+        ) if challenge.user_id.as_deref() == Some(user.user_id.as_str()) => {
+            // The verified credential transaction rechecks the live pending row,
+            // issuance, code expiry and attempts before atomically activating it.
+            user.clone()
         }
         _ => {
             return Err(auth_error(
@@ -29748,6 +29884,13 @@ async fn post_passkey_login_options(
                 }
             }
             .ok_or_else(|| auth_error("unknown_auth_user", "no matching user account exists"))?;
+            if api.store.is_user_pending_activation(&user.user_id)? {
+                return Err(auth_error(
+                    "passkey_activation_required",
+                    "initial passkey activation is required",
+                )
+                .into());
+            }
             let passkeys = passkeys_for_user(&api, &user.user_id)?;
             if passkeys.is_empty() {
                 return Err(auth_error(
@@ -30253,7 +30396,8 @@ async fn resolve_actor(
 
 // Hosting endpoints re-resolve actual transport credentials, not actor-like headers,
 // JSON or a stale middleware snapshot. The store rechecks live admin authority in
-// the settings transaction; cookie writes also enforce Origin at this direct entry.
+// the write transaction. Cookie writes require Origin; non-browser bearer calls
+// may omit it, but a supplied foreign Origin never becomes trusted via a bearer.
 fn live_hosting_actor(
     api: &ServerAuthApi,
     context: &server_api::ServerRequestContext,
@@ -30268,12 +30412,14 @@ fn live_hosting_actor(
         parse_cookie(&headers, &auth.cookie_name),
     )?
     .ok_or_else(|| auth_error("auth_required", "current authentication required"))?;
+    let origin = request_origin(&headers);
     if mutating
-        && actor.auth_method == ActorAuthMethod::BrowserSession
-        && request_origin(&headers).as_deref() != Some(auth.origin.as_str())
+        && (actor.auth_method == ActorAuthMethod::BrowserSession || origin.is_some())
+        && origin.as_deref() != Some(auth.origin.as_str())
     {
         return Err(Error::WorkspacePermissionDenied(
-            "hosting settings require configured Browser origin".into(),
+            "hosting mutations require configured Browser origin when supplied, and for cookies"
+                .into(),
         )
         .into());
     }
@@ -51516,6 +51662,8 @@ mod tests {
     mod passkey_security {
         use super::*;
         use webauthn_authenticator_rs::{WebauthnAuthenticator, softpasskey::SoftPasskey};
+
+        include!("server_activation_tests.rs");
 
         const ORIGIN_URL: &str = "https://workspace.test";
         type Authenticator = WebauthnAuthenticator<SoftPasskey>;

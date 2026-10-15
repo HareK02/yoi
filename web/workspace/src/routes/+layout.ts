@@ -4,8 +4,12 @@ import type { Load } from "@sveltejs/kit";
 
 export const ssr = false;
 
-export const load = ({ fetch }: Parameters<Load>[0]) => ({
+export const load = ({ fetch, url }: Parameters<Load>[0]) => ({
   deferredCatalog: settle((async () => {
+    // 初回有効化とhosting管理はWorkspace未作成でも利用する。
+    if (url.pathname === "/activate" || url.pathname.startsWith("/hosting/")) {
+      return { accessibleWorkspaces: [], workspaceCatalogError: null };
+    }
     try {
       return {
         accessibleWorkspaces: await listWorkspaces(fetch),
@@ -14,7 +18,9 @@ export const load = ({ fetch }: Parameters<Load>[0]) => ({
     } catch (error) {
       return {
         accessibleWorkspaces: [],
-        workspaceCatalogError: error instanceof Error ? error.message : "Unable to load Workspaces",
+        workspaceCatalogError: error instanceof Error
+          ? error.message
+          : "Unable to load Workspaces",
       };
     }
   })()),

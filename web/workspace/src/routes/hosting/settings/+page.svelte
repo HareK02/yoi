@@ -128,6 +128,7 @@
     <p class="error" role="alert">{error}</p>
     <button type="button" onclick={load}>Retry loading settings</button>
   {:else if settings}
+    <a href="/hosting/accounts">Create accounts or reissue activation codes</a>
     <section aria-labelledby="registration-heading">
       <h2 id="registration-heading">Self-registration</h2>
       <p class="muted">Applies to this hosting, across all Workspaces.</p>
