@@ -9,7 +9,8 @@
 //! | --- | --- | --- |
 //! | Assign, Answer, content and post edits, case, tags, tracking, release | Ticket transaction captures facts; `notification_routing` decides both recipients and non-notification reasons | Saved assignment/Worker requests and ACKs; mutation wakeup and periodic rounds |
 //! | Workspace startup, Orchestrator create/restore/replacement, idle | Wakeup only; never a new request or a second policy | Same saved pending decisions |
-//! | MR/handoff and Backend Job | Separate adapters to be connected by follow-up work | Not inferred from comments or display state |
+//! | Backend Job result | Result transaction captures source; checker supplies domain facts; common routing records result/suppression/failure | Fixed Worker request bytes, binding, ACK and legacy receipt; same recovery rounds |
+//! | MR/handoff | Separate adapter to be connected by follow-up work | Not inferred from comments or display state |
 //! | Explicit WorkerNotify/WorkerSendInput | Authenticated caller communication | Not automatic business routing |
 //! | Internal SubWorker result and Web subscription | Parent/child execution and UI synchronization respectively | Remain separate; no Ticket policy in Runtime |
 //!
@@ -122,9 +123,16 @@ pub(super) fn notification_target(
     api: &WorkspaceApi,
     input: &TicketWorkerNotification,
 ) -> std::result::Result<TicketWorkerNotificationTarget, NotificationFailureCode> {
+    fixed_worker_target(api, &input.worker)
+}
+
+fn fixed_worker_target(
+    api: &WorkspaceApi,
+    recipient: &RuntimeWorkerRef,
+) -> std::result::Result<TicketWorkerNotificationTarget, NotificationFailureCode> {
     let worker = api
         .runtime
-        .worker(&input.worker)
+        .worker(recipient)
         .map_err(|_| NotificationFailureCode::TargetUnavailable)?;
     if worker.workspace.workspace_id.as_deref() != Some(&api.config.workspace_id) {
         return Err(NotificationFailureCode::WorkspaceMismatch);
@@ -134,14 +142,14 @@ pub(super) fn notification_target(
     }
     let binding = api
         .config_store
-        .get_workspace_runtime_binding(&api.config.workspace_id, &input.worker.runtime_id)
+        .get_workspace_runtime_binding(&api.config.workspace_id, &recipient.runtime_id)
         .map_err(|_| NotificationFailureCode::SourceLookupFailed)?
         .ok_or(NotificationFailureCode::TargetUnavailable)?;
     if binding.revoked_at.is_some() {
         return Err(NotificationFailureCode::BindingRevoked);
     }
     Ok(TicketWorkerNotificationTarget {
-        worker: input.worker.clone(),
+        worker: recipient.clone(),
         authentication_binding_id: binding.binding_id,
     })
 }
@@ -264,6 +272,7 @@ pub(super) fn recover_ticket_notifications(api: &WorkspaceApi) {
     let Some(_permit) = api.notification_delivery_lifecycle.begin() else {
         return;
     };
+    recover_job_notifications(api);
     dispatch_ticket_worker_notifications(api);
     if let Some(orchestrator) = find_workspace_orchestrator(api) {
         dispatch_orchestrator_assignment_attention(api, &orchestrator.worker);
@@ -337,5 +346,197 @@ mod tests {
             .await
             .unwrap();
         assert!(lifecycle.begin().is_none());
+    }
+}
+
+/// Recover notification sources, not Job execution. This same bounded round runs
+/// on startup and periodically; no Worker restoration or assignment is implicit.
+pub(super) fn recover_job_notifications(api: &WorkspaceApi) {
+    let Some(_permit) = api.notification_delivery_lifecycle.begin() else {
+        return;
+    };
+    let sources = match api
+        .store
+        .list_pending_job_notifications(&api.config.workspace_id, 20)
+    {
+        Ok(sources) => sources,
+        Err(error) => {
+            tracing::warn!(%error,"Job notification scan failed");
+            return;
+        }
+    };
+    for source in sources {
+        if api.notification_delivery_lifecycle.stopped() {
+            break;
+        }
+        let acceptance = (|| -> Result<BackendJobResultAcceptance> {
+            let job = api
+                .store
+                .get_backend_job(&api.config.workspace_id, &source.job_id)?
+                .ok_or_else(|| Error::Store("Job notification result disappeared".into()))?;
+            let attempt = api
+                .store
+                .get_backend_job_attempt(
+                    &api.config.workspace_id,
+                    &source.job_id,
+                    &source.attempt_id,
+                )?
+                .ok_or_else(|| Error::Store("Job notification attempt disappeared".into()))?;
+            Ok(BackendJobResultAcceptance {
+                job,
+                attempt,
+                replayed: true,
+            })
+        })();
+        match acceptance {
+            Ok(acceptance) => deliver_job_result(api, &acceptance),
+            Err(error) => tracing::warn!(%error,"Job notification source lookup failed"),
+        }
+    }
+}
+
+fn job_result_facts(
+    api: &WorkspaceApi,
+    acceptance: &BackendJobResultAcceptance,
+) -> crate::store::JobNotificationFacts {
+    use crate::store::JobNotificationFacts as F;
+    let content = if acceptance.job.request.purpose == ticket_item_checker::PURPOSE {
+        let input = match ticket_item_checker::parse_input(&acceptance.job.request.input) {
+            Ok(input) => input,
+            Err(_) => return F::Failed(NotificationFailureCode::InvalidResult),
+        };
+        let ticket = match browser_ticket_backend(api)
+            .and_then(|backend| backend.show(input.ticket_id.into()).map_err(Error::from))
+        {
+            Ok(ticket) => ticket,
+            Err(Error::Ticket(ticket::TicketError::NotFound(_))) => {
+                return F::Failed(NotificationFailureCode::SourceNotFound);
+            }
+            Err(_) => return F::Failed(NotificationFailureCode::SourceLookupFailed),
+        };
+        match ticket_item_checker::result_facts(acceptance, &ticket) {
+            Ok(ticket_item_checker::TicketItemCheckFacts::Findings(content)) => content,
+            Ok(ticket_item_checker::TicketItemCheckFacts::NoFindings) => {
+                return F::NoFindings;
+            }
+            Ok(ticket_item_checker::TicketItemCheckFacts::Stale) => return F::StaleContent,
+            Err(_) => return F::Failed(NotificationFailureCode::InvalidResult),
+        }
+    } else {
+        format!(
+            "Backend Job `{}` completed attempt `{}` for `{}`. Durable result digest: {}.",
+            acceptance.job.request.job_id,
+            acceptance.attempt.attempt_id,
+            acceptance.job.request.purpose,
+            acceptance
+                .job
+                .result_digest
+                .as_deref()
+                .unwrap_or("unavailable")
+        )
+    };
+    if content.len() > MAX_JOB_DELIVERY_BYTES {
+        F::Failed(NotificationFailureCode::ContentTooLarge)
+    } else {
+        F::Result(content)
+    }
+}
+
+pub(super) fn deliver_job_result(api: &WorkspaceApi, acceptance: &BackendJobResultAcceptance) {
+    use crate::store::JobNotificationFacts;
+    let Some(_permit) = api.notification_delivery_lifecycle.begin() else {
+        return;
+    };
+    let source = match api.store.job_notification_source(
+        &api.config.workspace_id,
+        &acceptance.job.request.job_id,
+        &acceptance.attempt.attempt_id,
+    ) {
+        Ok(source) => source,
+        Err(error) => {
+            tracing::warn!(%error,"Job notification source lookup failed");
+            return;
+        }
+    };
+    let workspace = &api.config.workspace_id;
+    let key = NotificationDeliveryKey::WorkerNotification {
+        delivery_id: source.delivery_id.clone(),
+    };
+    // The prepared body wins over all subsequent rendering and content changes.
+    let request = match api
+        .store
+        .job_notification_request(workspace, &source.delivery_id)
+    {
+        Ok(request) => request,
+        Err(error) => {
+            tracing::warn!(%error,"Job notification request lookup failed");
+            return;
+        }
+    };
+    let facts = match &request {
+        Some((content, _)) => JobNotificationFacts::Result(content.clone()),
+        None => job_result_facts(api, acceptance),
+    };
+    match api.store.route_job_notification(workspace, &source, &facts) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            tracing::warn!(%error,"Job notification routing failed; committed source retained");
+            return;
+        }
+    }
+    let request = match api
+        .store
+        .job_notification_request(workspace, &source.delivery_id)
+    {
+        Ok(Some(request)) => request,
+        _ => {
+            record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
+            return;
+        }
+    };
+    let (content, target) = request;
+    if acceptance.job.request.notification_target.as_ref() != Some(&target) {
+        record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
+        return;
+    }
+    let authorized = match fixed_worker_target(api, &target) {
+        Ok(target) => target,
+        Err(code) => {
+            record_notification_failure(api, &key, code);
+            return;
+        }
+    };
+    match api
+        .store
+        .authorize_job_notification(workspace, &source.delivery_id, &authorized)
+    {
+        Ok(None) => {}
+        Ok(Some(code)) => {
+            record_notification_failure(api, &key, code);
+            return;
+        }
+        Err(_) => {
+            record_notification_failure(api, &key, NotificationFailureCode::SourceLookupFailed);
+            return;
+        }
+    }
+    let result = api.runtime.send_input(
+        &target,
+        WorkerInputRequest {
+            kind: WorkerInputKind::Notify,
+            content,
+            submission_request_id: Some(source.delivery_id.clone()),
+            segments: None,
+        },
+    );
+    if let Some(failure) = notification_failure(&result) {
+        record_notification_failure(api, &key, failure);
+    } else if api
+        .store
+        .ack_job_notification(workspace, &source.delivery_id, &target)
+        .is_err()
+    {
+        record_notification_failure(api, &key, NotificationFailureCode::AcknowledgementFailed);
     }
 }

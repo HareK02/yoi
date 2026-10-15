@@ -2,6 +2,9 @@
 //! Runtime acceptance, handling and execution authority remain independent. Explicit user
 //! communication, internal child notifications and Web subscriptions are not business routes.
 use super::*;
+#[path = "job_notification_routing.rs"]
+pub(super) mod jobs;
+pub use jobs::{JobNotificationFacts, JobNotificationSource};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,6 +42,7 @@ impl NotificationEventKind {
             "tags" | "tags_set" | "tags_changed" => Self::Tags,
             "release" => Self::Release,
             "assignment_changed" => Self::AssignmentChanged,
+            "backend_job_result" => Self::Result,
             _ => Self::Unknown,
         }
     }
@@ -51,6 +55,9 @@ pub enum NotificationReason {
     Attention,
     Result,
     NoRecipient,
+    NoFindings,
+    StaleContent,
+    SourceUnavailable,
     UnsupportedRecipient,
     HistoricalOnly,
     CaseClosed,
@@ -66,7 +73,10 @@ pub enum NotificationReason {
 pub enum NotificationFailureCode {
     ConfigurationUnavailable,
     RenderingFailed,
+    ContentTooLarge,
+    InvalidResult,
     SourceLookupFailed,
+    SourceNotFound,
     TargetUnavailable,
     TargetStopped,
     WorkspaceMismatch,
@@ -371,7 +381,7 @@ fn read_source(
     Ok((
         row.get(0)?,
         row.get(1)?,
-        row.get(2)?,
+        row.get::<_, Option<String>>(2)?.unwrap_or_default(),
         row.get(3)?,
         row.get(4)?,
         row.get(5)?,
@@ -469,7 +479,7 @@ fn decision_for_source(
 }
 
 pub(super) fn route_pending(conn: &Connection, workspace: &str) -> Result<()> {
-    let mut stmt = conn.prepare("SELECT s.* FROM notification_sources s LEFT JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.workspace_id=?1 AND d.source_sequence IS NULL ORDER BY s.sequence LIMIT 500")?;
+    let mut stmt = conn.prepare("SELECT s.* FROM notification_sources s LEFT JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.workspace_id=?1 AND s.role!='backend_job' AND d.source_sequence IS NULL ORDER BY s.sequence LIMIT 500")?;
     let mut rows = stmt.query([workspace])?;
     while let Some(row) = rows.next()? {
         let source = source_from_row(row)?;

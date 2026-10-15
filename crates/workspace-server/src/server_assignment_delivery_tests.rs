@@ -1765,3 +1765,5 @@ async fn catalog_shutdown_stops_notification_hook_and_fences_later_dispatch() {
     );
     delivery_stop(&api, &orchestrator);
 }
+
+include!("server_job_notification_tests.rs");

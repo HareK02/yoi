@@ -45,6 +45,8 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "repository_ssh_host_trust_keys",
     "repository_ssh_host_trusts",
     "server_secret_objects",
+    "notification_job_targets",
+    "notification_job_legacy_receipts",
     "notification_assignment_targets",
     "notification_acknowledgements",
     "notification_requests",
@@ -489,6 +491,8 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
             // commit; update guards remain installed throughout.
             let mut ticket_delete_guards = Vec::new();
             for (table, trigger) in [
+                ("notification_job_targets", "notification_job_targets_no_delete"),
+                ("notification_job_legacy_receipts", "notification_job_legacy_no_delete"),
                 ("notification_assignment_targets", "notification_assignment_targets_no_delete"),
                 ("notification_sources", "notification_sources_no_delete"),
                 ("notification_decisions", "notification_decisions_no_delete"),
