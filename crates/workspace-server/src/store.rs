@@ -70,6 +70,8 @@ pub use notification_routing::{
 };
 #[path = "assignment_tracking.rs"]
 mod assignment_tracking;
+#[path = "implementation_result.rs"]
+mod implementation_result;
 pub use assignment_delivery::TicketAssignmentDelivery;
 pub use assignment_tracking::TicketOrchestratorAssignmentSourceContext;
 pub use ticket::{
@@ -79,7 +81,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 95;
+const LATEST_SCHEMA_VERSION: i64 = 96;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -361,6 +363,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 95,
         name: "Common notification routing and durable Worker delivery",
         apply: migrate_notification_routing_v94_to_v95,
+    },
+    Migration {
+        version: 96,
+        name: "MR notifications and authenticated implementation results",
+        apply: migrate_business_notifications_v95_to_v96,
     },
 ];
 
@@ -14123,11 +14130,30 @@ fn migrate_notification_routing_v94_to_v95(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_business_notifications_v95_to_v96(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 95 {
+        return Err(Error::Store(
+            "Business notifications migration requires schema 95".into(),
+        ));
+    }
+    // Older Workspace databases may not have opened the MR domain yet. Complete
+    // its owner-managed, idempotent migration before composing business triggers.
+    // A failed host migration leaves that independent domain upgrade intact.
+    merge_request::migrate(conn)?;
+    let tx = conn.unchecked_transaction()?;
+    notification_routing::install_business_events(&tx)?;
+    tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES(96,'MR notifications and authenticated implementation results')", [])?;
+    verify_workspace_resource_constraints(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     create_workspace_schema_structure(conn)?;
     assignment_delivery::install(conn)?;
     assignment_delivery::install_post_inputs(conn)?;
     notification_routing::install(conn)?;
+    notification_routing::install_business_events(conn)?;
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
         Error::Store(format!(
             "fresh Workspace Ticket schema verification failed: {error}"
@@ -15141,6 +15167,7 @@ mod tests {
     include!("assignment_tracking_tests.rs");
     include!("assignment_delivery_tests.rs");
     include!("notification_routing_tests.rs");
+    include!("implementation_result_tests.rs");
     include!("store_workspace_config_tests.rs");
 
     fn drive_grant_fixture(store: &SqliteWorkspaceStore) -> server_api::DriveGrantResponse {
@@ -17354,6 +17381,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:93, name:"Durable assignment deliveries and source-bound startup fences".into()},
                 WorkspaceSchemaMigrationStep {version:94, name:"Canonical Ticket posts".into()},
                 WorkspaceSchemaMigrationStep {version:95, name:"Common notification routing and durable Worker delivery".into()},
+                WorkspaceSchemaMigrationStep {version:96, name:"MR notifications and authenticated implementation results".into()},
             ]
         );
 
@@ -17459,6 +17487,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (93, "Durable assignment deliveries and source-bound startup fences".to_string()),
 (94, "Canonical Ticket posts".to_string()),
 (95, "Common notification routing and durable Worker delivery".to_string()),
+(96, "MR notifications and authenticated implementation results".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -20078,7 +20107,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (92, "Ticket-owned assignment tracking".into()),
                          (93, "Durable assignment deliveries and source-bound startup fences".into()),
                          (94, "Canonical Ticket posts".into()),
-                         (95, "Common notification routing and durable Worker delivery".into())]);
+                         (95, "Common notification routing and durable Worker delivery".into()),
+                         (96, "MR notifications and authenticated implementation results".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }

@@ -58,6 +58,16 @@ fn cases() -> Vec<(PublicAssignmentKind, Value, Value)> {
             json!({"assignment_id":"delegation", "current":true, "input_origin_known":true, "actionable":true, "inputs":[], "next_input_event_id":null, "starts":[], "next_start_operation_id":null}),
         ),
         (
+            PublicAssignmentKind::ImplementationResult,
+            json!({"ticket":"T-743","assignment_id":"implementation","orchestrator_assignment_id":"delegation","operation_key":"result-1","kind":"result","body":"Research without an MR","merge_request":null}),
+            json!({"result_id":"result-id","ticket_id":"T-743","created_at":"now","request":{"assignment_id":"implementation","orchestrator_assignment_id":"delegation","operation_key":"result-1","kind":"result","body":"Research without an MR","merge_request":null}}),
+        ),
+        (
+            PublicAssignmentKind::ImplementationResultQuery,
+            json!({"ticket":"T-743","result_id":"result-id"}),
+            json!({"result_id":"result-id","ticket_id":"T-743","created_at":"now","request":{"assignment_id":"implementation","orchestrator_assignment_id":"delegation","operation_key":"result-1","kind":"result","body":"Research without an MR","merge_request":null}}),
+        ),
+        (
             PublicAssignmentKind::Answer,
             json!({"ticket":"T-743", "assignment_id":"delegation", "expected_last_event_id":"waiting", "operation_key":"answer-1", "body":"Proceed with option A"}),
             json!({"assignment_id":"delegation", "input_event_id":"ticket-event:8", "event_index":8}),

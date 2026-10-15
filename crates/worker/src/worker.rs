@@ -754,6 +754,14 @@ pub enum WorkspaceServerOperation {
         ticket_id: String,
         request: server_api::TicketAssignmentAnswerRequest,
     },
+    TicketImplementationResult {
+        ticket_id: String,
+        request: server_api::TicketImplementationResultRequest,
+    },
+    TicketImplementationResultGet {
+        ticket_id: String,
+        result_id: String,
+    },
     WorkerControlList,
     WorkerControlSpawn(server_api::CreateWorkspaceWorkerRequest),
     WorkerControlInput {
@@ -925,6 +933,23 @@ fn workspace_server_operation_request(
                 &request,
             )
         }
+        WorkspaceServerOperation::TicketImplementationResult { ticket_id, request } => {
+            workspace_server_json_request(
+                format!(
+                    "/workspaces/{workspace_id}/tickets/{}/implementation-results",
+                    encode_workspace_path_segment(&ticket_id)
+                ),
+                &request,
+            )
+        }
+        WorkspaceServerOperation::TicketImplementationResultGet {
+            ticket_id,
+            result_id,
+        } => Ok(WorkspaceRequest::get(format!(
+            "/workspaces/{workspace_id}/tickets/{}/implementation-results/{}",
+            encode_workspace_path_segment(&ticket_id),
+            encode_workspace_path_segment(&result_id)
+        ))),
         WorkspaceServerOperation::WorkerControlList => Ok(WorkspaceRequest::get(format!(
             "{base}/worker-control/workers"
         ))),

@@ -26,6 +26,9 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "flow_sources",
     "memory_staging_records",
     "memory_staging_resolutions",
+    "merge_request_source_observations",
+    "ticket_implementation_results",
+    "ticket_implementation_delegations",
     "merge_request_review_grants",
     "merge_request_reviewer_child_sessions",
     "merge_request_thread_events",
@@ -490,6 +493,9 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
             let mut ticket_delete_guards = Vec::new();
             for (table, trigger) in [
                 ("notification_assignment_targets", "notification_assignment_targets_no_delete"),
+                ("merge_request_source_observations", "mr_source_observations_no_delete"),
+                ("ticket_implementation_results", "implementation_results_no_delete"),
+                ("ticket_implementation_delegations", "implementation_delegations_no_delete"),
                 ("notification_sources", "notification_sources_no_delete"),
                 ("notification_decisions", "notification_decisions_no_delete"),
                 ("notification_requests", "notification_requests_no_delete"),

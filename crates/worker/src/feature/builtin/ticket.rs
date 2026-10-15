@@ -639,7 +639,10 @@ impl TicketFeatureAccess {
                         assignment_public::READ_TOOL_NAMES.contains(name)
                             || self.authoring
                             || self.workflow
-                            || (*name == "TicketAssignmentAnswer" && self.thread)
+                            || (matches!(
+                                *name,
+                                "TicketAssignmentAnswer" | "TicketImplementationResult"
+                            ) && self.thread)
                     }),
             )
             .collect()
@@ -665,6 +668,7 @@ const READ_ONLY_TOOL_NAMES: &[&str] = &[
     "TicketAssignmentTrackingHistory",
     "TicketAssignmentsQuery",
     "TicketAssignmentDiagnostics",
+    "TicketImplementationResultQuery",
 ];
 
 const AUTHORING_TOOL_NAMES: &[&str] = &[
@@ -676,7 +680,7 @@ const AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketRelationRemove",
 ];
 
-const THREAD_TOOL_NAMES: &[&str] = &["TicketComment"];
+const THREAD_TOOL_NAMES: &[&str] = &["TicketComment", "TicketImplementationResult"];
 
 #[cfg(test)]
 const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
@@ -701,6 +705,8 @@ const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketAssignmentsQuery",
     "TicketAssignmentDiagnostics",
     "TicketAssignmentAnswer",
+    "TicketImplementationResult",
+    "TicketImplementationResultQuery",
 ];
 
 #[cfg(test)]
@@ -727,6 +733,8 @@ const WORKFLOW_TOOL_NAMES: &[&str] = &[
     "TicketAssignmentsQuery",
     "TicketAssignmentDiagnostics",
     "TicketAssignmentAnswer",
+    "TicketImplementationResult",
+    "TicketImplementationResultQuery",
 ];
 
 const WORKFLOW_ADDITIONAL_TOOL_NAMES: &[&str] = &[
@@ -1637,6 +1645,18 @@ fn native_ticket_operation(tool_name: &str) -> Option<NativeTicketOperation> {
             identity_field: Some("ticket"),
             mutating: false,
         },
+        "TicketImplementationResult" => NativeTicketOperation {
+            operation: "implementation_result",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: true,
+        },
+        "TicketImplementationResultQuery" => NativeTicketOperation {
+            operation: "implementation_result_query",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: false,
+        },
         "TicketAssignmentAnswer" => NativeTicketOperation {
             operation: "assignment_answer",
             surface: NativeTicketSurface::Item,
@@ -1765,6 +1785,8 @@ pub(crate) fn enabled_ticket_definitions(
         assignment_public::PublicAssignmentKind::Assignments,
         assignment_public::PublicAssignmentKind::Diagnostics,
         assignment_public::PublicAssignmentKind::Answer,
+        assignment_public::PublicAssignmentKind::ImplementationResult,
+        assignment_public::PublicAssignmentKind::ImplementationResultQuery,
     ] {
         if allowed.contains(&kind.name()) {
             definitions.push(assignment_public::definition(client.clone(), kind));

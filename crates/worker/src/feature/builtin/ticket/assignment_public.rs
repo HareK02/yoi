@@ -22,9 +22,14 @@ pub(super) const TOOL_NAMES: &[&str] = &[
     "TicketAssignmentsQuery",
     "TicketAssignmentDiagnostics",
     "TicketAssignmentAnswer",
+    "TicketImplementationResult",
+    "TicketImplementationResultQuery",
 ];
-pub(super) const READ_TOOL_NAMES: &[&str] =
-    &["TicketAssignmentsQuery", "TicketAssignmentDiagnostics"];
+pub(super) const READ_TOOL_NAMES: &[&str] = &[
+    "TicketAssignmentsQuery",
+    "TicketAssignmentDiagnostics",
+    "TicketImplementationResultQuery",
+];
 
 #[derive(Clone, Copy)]
 pub(super) enum PublicAssignmentKind {
@@ -33,6 +38,8 @@ pub(super) enum PublicAssignmentKind {
     Assignments,
     Diagnostics,
     Answer,
+    ImplementationResult,
+    ImplementationResultQuery,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -80,6 +87,20 @@ struct AnswerInput {
     request: server_api::TicketAssignmentAnswerRequest,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ImplementationResultInput {
+    ticket: String,
+    #[serde(flatten)]
+    request: server_api::TicketImplementationResultRequest,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ImplementationResultQuery {
+    ticket: String,
+    result_id: String,
+}
+
 impl PublicAssignmentKind {
     pub(super) fn name(self) -> &'static str {
         match self {
@@ -88,6 +109,8 @@ impl PublicAssignmentKind {
             Self::Assignments => TOOL_NAMES[2],
             Self::Diagnostics => TOOL_NAMES[3],
             Self::Answer => TOOL_NAMES[4],
+            Self::ImplementationResult => TOOL_NAMES[5],
+            Self::ImplementationResultQuery => TOOL_NAMES[6],
         }
     }
     fn schema(self) -> Value {
@@ -109,6 +132,10 @@ impl PublicAssignmentKind {
             Self::Assignments => json!(schemars::schema_for!(AssignmentsInput)),
             Self::Diagnostics => json!(schemars::schema_for!(DiagnosticsInput)),
             Self::Answer => json!(schemars::schema_for!(AnswerInput)),
+            Self::ImplementationResult => json!(schemars::schema_for!(ImplementationResultInput)),
+            Self::ImplementationResultQuery => {
+                json!(schemars::schema_for!(ImplementationResultQuery))
+            }
         }
     }
 }
@@ -128,6 +155,12 @@ pub(super) fn description(name: &str) -> &'static str {
         }
         "TicketAssignmentAnswer" => {
             "Append continuing input to the observed current waiting/inprogress assignment with assignment_id, expected_last_event_id, stable operation_key and bounded answer body. Query current tracking first. Answers continue the same row without automatic inprogress; done requires explicit new Assign/reissue instead. Backend authenticates/fences source, current assignment and event CAS, then saves input/audit/exact receipt atomically and notifies committed input. Exact retry retains full input/key; stale/cleared/replaced conflicts require rereading, and unknown outcome must not be retried as a fresh operation. No model actor/role claims, new assignment, case closure or Worker start."
+        }
+        "TicketImplementationResult" => {
+            "Save an explicit handoff, result or blocker for the current implementation assignment and its original Orchestrator delegation. Read ShowTicket first for assignment identities. Backend authenticates the implementation Worker and fences both assignments; this is not AssignmentAnswer or a handling update. Optional MR/source identifies retained evidence, never approval. Retry an unknown response using exactly the same operation_key and full input; changed input with the same key is rejected. Result and durable notification source commit together. No case closure, new Assign, Worker stop or integration occurs."
+        }
+        "TicketImplementationResultQuery" => {
+            "Read one saved implementation result by Ticket and result_id from a result notification/receipt. Historical evidence is not a new request or approval; reread current delegation and MR before acting."
         }
         _ => unreachable!("unknown public assignment tool"),
     }
@@ -245,6 +278,47 @@ impl Tool for PublicAssignmentTool {
                     query: input.query,
                 }
             }
+            PublicAssignmentKind::ImplementationResult => {
+                let input: ImplementationResultInput =
+                    serde_json::from_str(input).map_err(parse)?;
+                identity("ticket", &input.ticket)?;
+                for (name, value) in [
+                    ("assignment_id", &input.request.assignment_id),
+                    (
+                        "orchestrator_assignment_id",
+                        &input.request.orchestrator_assignment_id,
+                    ),
+                    ("operation_key", &input.request.operation_key),
+                ] {
+                    identity(name, value)?;
+                }
+                if input.request.body.trim().is_empty()
+                    || input.request.body.len() > 16384
+                    || input.request.body.contains('\0')
+                {
+                    return Err(ToolError::InvalidArgument(
+                        "Result body must be nonblank, NUL-free and at most 16384 bytes".into(),
+                    ));
+                }
+                if let Some(mr) = &input.request.merge_request {
+                    identity("merge_request_id", &mr.merge_request_id)?;
+                    identity("subject_ref", &mr.subject_ref)?;
+                }
+                WorkspaceServerOperation::TicketImplementationResult {
+                    ticket_id: input.ticket,
+                    request: input.request,
+                }
+            }
+            PublicAssignmentKind::ImplementationResultQuery => {
+                let input: ImplementationResultQuery =
+                    serde_json::from_str(input).map_err(parse)?;
+                identity("ticket", &input.ticket)?;
+                identity("result_id", &input.result_id)?;
+                WorkspaceServerOperation::TicketImplementationResultGet {
+                    ticket_id: input.ticket,
+                    result_id: input.result_id,
+                }
+            }
             PublicAssignmentKind::Answer => {
                 let input: AnswerInput = serde_json::from_str(input).map_err(parse)?;
                 identity("ticket", &input.ticket)?;
@@ -320,6 +394,13 @@ impl Tool for PublicAssignmentTool {
                 }
                 serde_json::to_value(result)
             }
+            PublicAssignmentKind::ImplementationResult
+            | PublicAssignmentKind::ImplementationResultQuery => serde_json::to_value(
+                serde_json::from_str::<server_api::TicketImplementationResultReceipt>(
+                    &response.body,
+                )
+                .map_err(decode)?,
+            ),
             PublicAssignmentKind::Answer => serde_json::to_value(
                 serde_json::from_str::<server_api::TicketAssignmentAnswerResponse>(&response.body)
                     .map_err(decode)?,

@@ -9,7 +9,8 @@
 //! | --- | --- | --- |
 //! | Assign, Answer, content and post edits, case, tags, tracking, release | Ticket transaction captures facts; `notification_routing` decides both recipients and non-notification reasons | Saved assignment/Worker requests and ACKs; mutation wakeup and periodic rounds |
 //! | Workspace startup, Orchestrator create/restore/replacement, idle | Wakeup only; never a new request or a second policy | Same saved pending decisions |
-//! | MR/handoff and Backend Job | Separate adapters to be connected by follow-up work | Not inferred from comments or display state |
+//! | MR review/request/revoke/cancel/merge and typed implementation result | Atomic business source capture; central policy | Same durable routing and periodic recovery; never inferred from comments |
+//! | Backend Job | Separately owned adapter | Not inferred from display state |
 //! | Explicit WorkerNotify/WorkerSendInput | Authenticated caller communication | Not automatic business routing |
 //! | Internal SubWorker result and Web subscription | Parent/child execution and UI synchronization respectively | Remain separate; no Ticket policy in Runtime |
 //!

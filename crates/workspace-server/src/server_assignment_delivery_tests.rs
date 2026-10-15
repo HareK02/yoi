@@ -5,6 +5,7 @@
 use super::*;
 use session_store::{LogEntry, Store, WorkerSessionStore};
 use worker_runtime::execution as delivery_execution;
+include!("server_implementation_result_tests.rs");
 
 fn delivery_assignment_path(ticket: &str) -> String {
     format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator")

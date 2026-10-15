@@ -366,6 +366,8 @@ impl_openapi_schema!(
     TicketAssignmentsPage,
     TicketAssignmentAnswerRequest,
     TicketAssignmentAnswerResponse,
+    TicketImplementationResultRequest,
+    TicketImplementationResultReceipt,
     TicketAssignmentDiagnosticsQuery,
     TicketAssignmentDiagnosticsPage,
     TicketQueryRequest,
@@ -3276,6 +3278,33 @@ pub trait ServerApi {
         #[path] ticket_id: String,
         #[body] request: TicketAssignmentAnswerRequest,
     ) -> Result<TicketAssignmentAnswerResponse, RepositoryApiError>;
+
+    #[post("/workspaces/{workspace_id}/tickets/{ticket_id}/implementation-results", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_implementation_result(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[body] request: TicketImplementationResultRequest,
+    ) -> Result<TicketImplementationResultReceipt, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{ticket_id}/implementation-results", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_implementation_result_browser(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[body] request: TicketImplementationResultRequest,
+    ) -> Result<TicketImplementationResultReceipt, RepositoryApiError>;
+
+    #[get("/workspaces/{workspace_id}/tickets/{ticket_id}/implementation-results/{result_id}", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_implementation_result_get(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] ticket_id: String,
+        #[path] result_id: String,
+    ) -> Result<TicketImplementationResultReceipt, RepositoryApiError>;
 
     #[get("/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_assignment_tracking_get(
@@ -8005,6 +8034,34 @@ transparent_ticket_dto!(
     TicketAssignmentAnswerResponse,
     ticket::TicketAssignmentAnswerReceipt
 );
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketImplementationResultKind {
+    Handoff,
+    Result,
+    Blocker,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketImplementationResultRequest {
+    pub operation_key: String,
+    pub assignment_id: String,
+    pub orchestrator_assignment_id: String,
+    pub kind: TicketImplementationResultKind,
+    pub body: String,
+    pub merge_request: Option<MergeRequestReviewSubject>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketImplementationResultReceipt {
+    pub result_id: String,
+    pub ticket_id: String,
+    pub request: TicketImplementationResultRequest,
+    pub created_at: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
