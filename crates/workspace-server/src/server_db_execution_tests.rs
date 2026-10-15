@@ -1858,8 +1858,11 @@ async fn runtime_metadata_reads_wait_off_tokio_and_db_and_retain_cancelled_host_
         );
         reply.finish();
         observed(fixture.host_executor.drain()).await.unwrap();
+        // Runtime metadata also awaits binding reads owned by the DB executor.
+        // Its reply can wake Host before DB reply/lifetime cleanup has finished;
+        // draining Host alone is not a barrier for that separately-owned job.
+        observed(fixture.executor.drain()).await.unwrap();
         assert_eq!(leases.load(Ordering::SeqCst), 0);
-        fixture.executor.drain().await.unwrap();
     }
 }
 
