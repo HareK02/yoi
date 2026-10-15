@@ -102,8 +102,48 @@ impl WorkerExecutionBackend for LaunchExecutionBackend {
         Ok(WorkspaceConfigFetchResult::Modified(bundle))
     }
 
-    fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
+    fn observe_repository_ref(
+        &self,
+        request: &RepositoryRefObservationRequest,
+    ) -> std::result::Result<
+        RepositoryRefObservation,
+        worker_runtime::working_directory::WorkingDirectoryDiagnostic,
+    > {
+        self.execution.materializer.observe_repository_ref(request)
+    }
+
+    fn working_directory(
+        &self,
+        id: &str,
+    ) -> std::result::Result<
+        worker_runtime::catalog::WorkingDirectoryStatus,
+        worker_runtime::working_directory::WorkingDirectoryDiagnostic,
+    > {
+        self.execution.working_directory(id)
+    }
+
+    fn create_working_directory(
+        &self,
+        request: &worker_runtime::catalog::WorkingDirectoryRequest,
+    ) -> std::result::Result<
+        worker_runtime::catalog::WorkingDirectoryStatus,
+        worker_runtime::working_directory::WorkingDirectoryDiagnostic,
+    > {
+        self.execution.create_working_directory(request)
+    }
+
+    fn spawn_worker(&self, mut request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
         self.creates.lock().unwrap().push(request.request.clone());
+        for claim in &request.request.workdir_attachments {
+            let binding = self
+                .execution
+                .materializer
+                .bind_working_directory(&claim.working_directory_id, claim.relative_cwd.as_deref())
+                .unwrap();
+            request
+                .workdir_attachments
+                .insert(claim.alias.clone(), binding);
+        }
         self.execution.spawn_worker(request)
     }
 
@@ -130,6 +170,7 @@ struct LaunchFixture {
     backend: Arc<LaunchExecutionBackend>,
     runtime_id: String,
     runtime_server: Option<tokio::task::JoinHandle<()>>,
+    runtime_identity: Option<RuntimeIdentityMaterial>,
 }
 
 impl Drop for LaunchFixture {
@@ -156,6 +197,7 @@ impl LaunchFixture {
             backend,
             runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
             runtime_server: None,
+            runtime_identity: None,
         };
         if remote {
             fixture.runtime_id = "ticket-worker-real-http".to_string();
@@ -164,6 +206,7 @@ impl LaunchFixture {
                 WorkspaceIssuerTrustRecord, WorkspaceIssuerTrustState,
             };
             let runtime_identity = RuntimeIdentityMaterial::generate(&fixture.runtime_id).unwrap();
+            fixture.runtime_identity = Some(runtime_identity.clone());
             let workspace_identity = fixture
                 .api
                 .signing_identities
@@ -1414,4 +1457,243 @@ async fn assignment_inputs_replace_queue_interest_without_reviving_released_work
             .any(|input| input.ticket_id == active_id)
             == false
     );
+}
+
+// Real Git publication, signed HTTP, Runtime source reads, and SQLite capture.
+// Execution is the deterministic fixture backend; no LLM/reviewer is needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mr_open_retains_source_before_first_review_and_observed_result() {
+    let fixture = LaunchFixture::new(true).await;
+    let dir = &fixture._temp;
+    init_clean_git_workspace(dir.path());
+    let git = |root: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(dir.path(), &["branch", "work/open-observation"]);
+    let source_a = git(dir.path(), &["rev-parse", "work/open-observation"]);
+    let api = &fixture.api;
+    fixture.backend.publish_profile(api, "builtin:coder");
+    let identity = fixture.runtime_identity.as_ref().unwrap();
+    let mut input = ticket::NewTicket::new("Opening observation and pre-review push");
+    set_test_ticket_target(&mut input, "test-repository", "develop");
+    let ticket = browser_ticket_backend(&api).unwrap().create(input).unwrap();
+    assign_test_orchestrator(&api, &ticket.id);
+    let (_, Json(workdir)) = create_workspace_working_directory(
+        api,
+        TEST_WORKSPACE_ID,
+        Some(&fixture.runtime_id),
+        BrowserWorkingDirectoryCreateRequest {
+            runtime_id: Some(fixture.runtime_id.clone()),
+            display_name: None,
+            repository_key: "test-repository".into(),
+            selector: Some("work/open-observation".into()),
+            operation_id: Some("opening-workdir".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let checkout = fixture
+        .backend
+        .execution
+        .materializer
+        .bind_working_directory(&workdir.item.working_directory_id, None)
+        .unwrap();
+    git(
+        checkout.root(),
+        &["checkout", "-B", "work/open-observation"],
+    );
+    let Json(created) = create_workspace_worker(
+        State(api.clone()),
+        HeaderMap::new(),
+        Json(CreateWorkspaceWorkerRequest {
+            runtime_id: fixture.runtime_id.clone(),
+            display_name: "source-observation-coder".into(),
+            singleton_key: None,
+            profile: Some("builtin:coder".into()),
+            ticket_assignment: None,
+            initial_submit: Vec::new(),
+            workdir_attachments: vec![server_api::BrowserWorkerWorkingDirectorySelection {
+                alias: "checkout".into(),
+                working_directory_id: workdir.item.working_directory_id,
+                relative_cwd: None,
+            }],
+            feature_connections: Default::default(),
+            control_operation_id: None,
+        }),
+    )
+    .await
+    .unwrap();
+    let coder = RuntimeWorkerRef::new(created.runtime_id, created.worker_id);
+    seed_worker_source_member(&api, &coder.runtime_id, &coder.worker_id);
+    api.store
+        .set_current_ticket_worker_assignment(
+            &TicketWorkerAssignmentRecord {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                ticket_id: ticket.id.clone(),
+                assignment_id: "opening-coder".into(),
+                worker: coder.clone(),
+                assigned_by: "test".into(),
+                assigned_at: Utc::now().to_rfc3339(),
+            },
+            None,
+            "opening-assigned",
+            "opening-operation",
+            false,
+        )
+        .unwrap();
+    let app = build_router(api.clone());
+    let call = |method: &'static str, path: String, input: Value, expected: StatusCode| {
+        let body = if method == "GET" {
+            Vec::new()
+        } else {
+            serde_json::to_vec(&input).unwrap()
+        };
+        let proof = worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&identity)
+            .issue(
+                api.config.backend_base_url.as_deref().unwrap(),
+                TEST_WORKSPACE_ID,
+                Some(&coder.worker_id),
+                worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION,
+                method,
+                &path,
+                &body,
+                worker_runtime::auth::unix_now_seconds() as i64,
+                30,
+            )
+            .unwrap();
+        let request = Request::builder()
+            .method(method)
+            .uri(&path)
+            .header(
+                worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+                proof,
+            )
+            .header("x-yoi-runtime-id", &coder.runtime_id)
+            .header("x-yoi-worker-id", &coder.worker_id)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let app = app.clone();
+        async move {
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(status, expected, "{}", String::from_utf8_lossy(&bytes));
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        }
+    };
+    let open_path = format!(
+        "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/merge-request",
+        ticket.id
+    );
+    let open_input = json!({"repository_key":"test-repository","selector_from":"work/open-observation","selector_to":"develop","summary":""});
+    // A failed opening observation cannot leave behind a successfully opened MR.
+    api.config_store.with_conn(|conn| {
+        conn.execute_batch("CREATE TRIGGER reject_opening_observation BEFORE INSERT ON merge_request_source_observations BEGIN SELECT RAISE(ABORT,'injected opening capture failure'); END;")?;
+        Ok(())
+    }).unwrap();
+    call(
+        "POST",
+        open_path.clone(),
+        open_input.clone(),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    api.config_store
+        .with_conn(|conn| {
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM merge_requests", [], |r| r
+                    .get::<_, i64>(0))?,
+                0
+            );
+            conn.execute_batch("DROP TRIGGER reject_opening_observation;")?;
+            Ok(())
+        })
+        .unwrap();
+    let opened = call("POST", open_path, open_input, StatusCode::OK).await;
+    let mr = opened["merge_request_id"].as_str().unwrap();
+    api.config_store.with_conn(|conn| {
+        assert_eq!(conn.query_row("SELECT subject_ref FROM merge_request_source_observations WHERE merge_request_id=?1",[mr],|r|r.get::<_,String>(0))?,source_a);
+        assert_eq!(conn.query_row("SELECT count(*) FROM notification_sources WHERE kind='mr_source_changed'",[],|r|r.get::<_,i64>(0))?,0);
+        Ok(())
+    }).unwrap();
+    let publisher = tempfile::tempdir().unwrap();
+    git(
+        publisher.path(),
+        &["clone", dir.path().to_str().unwrap(), "."],
+    );
+    git(publisher.path(), &["checkout", "work/open-observation"]);
+    git(
+        publisher.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "source-b",
+        ],
+    );
+    git(
+        publisher.path(),
+        &["push", "origin", "work/open-observation"],
+    );
+    let source_b = git(publisher.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(source_a, source_b);
+    for _ in 0..2 {
+        call(
+            "GET",
+            format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests/{mr}"),
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    }
+    api.config_store.with_conn(|conn| {
+        assert_eq!(conn.query_row("SELECT count(*) FROM merge_request_thread_events WHERE merge_request_id=?1",[mr],|r|r.get::<_,i64>(0))?,0,"no review event mentions B");
+        let (previous,current):(String,String)=conn.query_row("SELECT previous_subject_ref,subject_ref FROM merge_request_source_observations WHERE merge_request_id=?1 ORDER BY sequence DESC LIMIT 1",[mr],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        assert_eq!((previous,current),(source_a.clone(),source_b.clone()));
+        assert_eq!(conn.query_row("SELECT count(*) FROM notification_sources WHERE kind='mr_source_changed' AND json_extract(facts_json,'$.merge_request_id')=?1",[mr],|r|r.get::<_,i64>(0))?,2,"one source per logical recipient, not per read");
+        Ok(())
+    }).unwrap();
+    let result_path = format!(
+        "/workspaces/{TEST_WORKSPACE_ID}/tickets/{}/implementation-results",
+        ticket.id
+    );
+    let mut result = json!({"operation_key":"observed-result","assignment_id":"opening-coder","orchestrator_assignment_id":format!("orchestrator-{}",ticket.id),"kind":"handoff","body":"Published new source; review not requested yet.","merge_request":{"merge_request_id":mr,"subject_ref":"forged-source"}});
+    call(
+        "POST",
+        result_path.clone(),
+        result.clone(),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    result["merge_request"]["subject_ref"] = json!(source_b);
+    let receipt = call("POST", result_path.clone(), result.clone(), StatusCode::OK).await;
+    assert_eq!(
+        call("POST", result_path, result, StatusCode::OK).await,
+        receipt
+    );
+    api.runtime
+        .stop_worker(
+            &coder,
+            WorkerLifecycleRequest {
+                reason: None,
+                ticket_assignment: None,
+            },
+        )
+        .unwrap();
 }

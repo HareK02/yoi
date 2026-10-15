@@ -470,7 +470,8 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
                         95,
                         "Common notification routing and durable Worker delivery".into()
                     ),
-                    (96,"Backend Job common notification routing".into())
+                    (96,"Backend Job common notification routing".into()),
+                    (97, "MR notifications and authenticated implementation results".into())
                 ]
             );
             for (table, rows) in retained.iter().zip(original.iter()) {

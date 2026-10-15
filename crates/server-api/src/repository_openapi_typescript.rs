@@ -551,6 +551,27 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketAssignmentDiagnosticsPage")],
         },
         OperationContract {
+            path: "/workspaces/{workspace_id}/tickets/{ticket_id}/implementation-results",
+            method: "post",
+            operation_id: "ticket_implementation_result",
+            request: Some("TicketImplementationResultRequest"),
+            successes: &[("200", "TicketImplementationResultReceipt")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/tickets/{ticket_id}/implementation-results",
+            method: "post",
+            operation_id: "ticket_implementation_result_browser",
+            request: Some("TicketImplementationResultRequest"),
+            successes: &[("200", "TicketImplementationResultReceipt")],
+        },
+        OperationContract {
+            path: "/workspaces/{workspace_id}/tickets/{ticket_id}/implementation-results/{result_id}",
+            method: "get",
+            operation_id: "ticket_implementation_result_get",
+            request: None,
+            successes: &[("200", "TicketImplementationResultReceipt")],
+        },
+        OperationContract {
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-answer",
             method: "post",
             operation_id: "ticket_assignment_answer",

@@ -3356,6 +3356,10 @@ fn canonical_ticket_operation_workspace_id(path: &str) -> Option<&str> {
         && resource == "tickets"
         && !ticket_id.is_empty()
         && match operation {
+            "implementation-results" => match segments.next() {
+                None => true,
+                Some(id) => !id.is_empty() && segments.next().is_none(),
+            },
             "case" | "assignment-diagnostics" | "assignment-answer" => segments.next().is_none(),
             "assignment-tracking" => match segments.next() {
                 None => true,
@@ -6750,6 +6754,11 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
             service.clone(),
         ))
         .merge(server_api::server_api_axum::ticket_assignment_answer_browser(service.clone()))
+        .merge(server_api::server_api_axum::ticket_implementation_result(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_implementation_result_browser(service.clone()))
+        .merge(server_api::server_api_axum::ticket_implementation_result_get(service.clone()))
         .merge(server_api::server_api_axum::ticket_assignment_tracking_get(
             service.clone(),
         ))
@@ -11054,6 +11063,99 @@ impl server_api::ServerApi for ServerApiContractService {
         server_api::RepositoryApiError,
     > {
         self.ticket_assignment_answer(context, workspace_id, ticket_id, request)
+            .await
+    }
+
+    async fn ticket_implementation_result(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        ticket_id: String,
+        request: server_api::TicketImplementationResultRequest,
+    ) -> std::result::Result<
+        server_api::TicketImplementationResultReceipt,
+        server_api::RepositoryApiError,
+    > {
+        let api = self.workspace_api()?.clone();
+        api.host_executors
+            .host()?
+            .run(move || {
+                let result = (|| -> ApiResult<_> {
+                    validate_workspace_scope(&api, &workspace_id)?;
+                    let ticket =
+                        resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
+                    let source = context.runtime_source.as_ref().ok_or_else(|| {
+                        Error::WorkspacePermissionDenied(
+                            "Implementation results require an authenticated Runtime Worker".into(),
+                        )
+                    })?;
+                    let worker = RuntimeWorkerRef::new(
+                        &source.runtime_id,
+                        source.worker_id.as_ref().ok_or_else(|| {
+                            Error::WorkspacePermissionDenied(
+                                "Implementation results require Worker identity".into(),
+                            )
+                        })?,
+                    );
+                    let receipt = api.config_store.record_implementation_result(
+                        &workspace_id,
+                        &ticket,
+                        &request,
+                        &worker,
+                        &source.authentication_binding_id,
+                    )?;
+                    recover_ticket_notifications(&api);
+                    Ok(receipt)
+                })();
+                result
+                    .map_err(ApiError::from)
+                    .map_err(ApiError::into_repository_api_error)
+            })
+            .await
+    }
+
+    async fn ticket_implementation_result_browser(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        ticket_id: String,
+        request: server_api::TicketImplementationResultRequest,
+    ) -> std::result::Result<
+        server_api::TicketImplementationResultReceipt,
+        server_api::RepositoryApiError,
+    > {
+        self.ticket_implementation_result(context, workspace_id, ticket_id, request)
+            .await
+    }
+
+    async fn ticket_implementation_result_get(
+        &self,
+        _context: server_api::ServerRequestContext,
+        workspace_id: String,
+        ticket_id: String,
+        result_id: String,
+    ) -> std::result::Result<
+        server_api::TicketImplementationResultReceipt,
+        server_api::RepositoryApiError,
+    > {
+        let api = self.workspace_api()?.clone();
+        api.host_executors
+            .host()?
+            .run(move || {
+                let result = (|| -> ApiResult<_> {
+                    validate_workspace_scope(&api, &workspace_id)?;
+                    let ticket =
+                        resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
+                    Ok(api.config_store.implementation_result(
+                        &workspace_id,
+                        &ticket,
+                        &result_id,
+                    )?)
+                })();
+                result
+                    .map_err(ApiError::from)
+                    .map_err(ApiError::into_repository_api_error)
+            })
             .await
     }
 
@@ -16563,8 +16665,16 @@ fn observe_published_source_ref(
     repository_id: &str,
     selector: &str,
 ) -> ApiResult<RepositoryRefObservation> {
-    observe_published_merge_ref(api, workspace_id, runtime_id, repository_id, selector)
-        .map_err(remap_source_ref_error)
+    let observation =
+        observe_published_merge_ref(api, workspace_id, runtime_id, repository_id, selector)
+            .map_err(remap_source_ref_error)?;
+    api.config_store.observe_merge_request_source(
+        workspace_id,
+        repository_id,
+        selector,
+        &observation.resolved_ref,
+    )?;
+    Ok(observation)
 }
 
 /// Before opening an MR or granting review of an open MR, re-read the current
@@ -17466,9 +17576,10 @@ async fn scoped_open_merge_request(
                 &repository_id,
                 &input.selector_to,
             )?;
-            let merge_request = merge_request_store(&api, &workspace_id)?.open_merge_request(
+            let merge_request_id = Uuid::now_v7().to_string();
+            let merge_request = merge_request_store(&api, &workspace_id)?.open_merge_request_with_evidence(
                 merge_request::OpenMergeRequest {
-                    merge_request_id: Uuid::now_v7().to_string(),
+                    merge_request_id: merge_request_id.clone(),
                     ticket_id,
                     repository_id: repository_id.clone(),
                     selector_from: input.selector_from,
@@ -17482,6 +17593,16 @@ async fn scoped_open_merge_request(
                         assignment_id: assignment.assignment_id,
                     },
                     now: Utc::now(),
+                },
+                |tx| {
+                    // The provider read preceded MR creation, so the general
+                    // recorder could not yet see this MR. Retain that exact read
+                    // before commit; a later first read must not erase this baseline.
+                    tx.execute(
+                        "INSERT INTO merge_request_source_observations(workspace_id,merge_request_id,subject_ref,previous_subject_ref,observed_at) VALUES(?1,?2,?3,NULL,?4)",
+                        rusqlite::params![workspace_id, merge_request_id, source_observation.resolved_ref, Utc::now().to_rfc3339()],
+                    )?;
+                    Ok(())
                 },
             )?;
             Ok(Json(public_merge_request(

@@ -5,6 +5,7 @@
 use super::*;
 use session_store::{LogEntry, Store, WorkerSessionStore};
 use worker_runtime::execution as delivery_execution;
+include!("server_implementation_result_tests.rs");
 
 #[tokio::test]
 async fn notification_diagnostics_http_auth_scope_and_readonly_evidence() {

@@ -28,6 +28,7 @@ pub enum NotificationEventKind {
     Release,
     AssignmentChanged,
     Result,
+    MergeRequest,
     Unknown,
 }
 impl NotificationEventKind {
@@ -43,6 +44,13 @@ impl NotificationEventKind {
             "release" => Self::Release,
             "assignment_changed" => Self::AssignmentChanged,
             "backend_job_result" => Self::Result,
+            "implementation_result" => Self::Result,
+            "mr_review_requested"
+            | "mr_review"
+            | "mr_review_revoked"
+            | "mr_review_cancelled"
+            | "mr_merge"
+            | "mr_source_changed" => Self::MergeRequest,
             _ => Self::Unknown,
         }
     }
@@ -200,6 +208,7 @@ fn policy(
                 | NotificationEventKind::Answer
                 | NotificationEventKind::ContentEdit
                 | NotificationEventKind::Result
+                | NotificationEventKind::MergeRequest
         ) {
             return ("suppress", R::NotRequest);
         }
@@ -317,6 +326,86 @@ pub(super) fn install(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Capture business facts in the same SQLite transaction as their owners. Historical
+/// MR events are bounded by their original assignment interval, never today's delegation.
+/// Comments are deliberately excluded: neither legacy handoff prose nor review comments
+/// prove a typed result. MR input is an instruction to reread evidence, not approval.
+pub(super) fn install_business_events(conn: &Connection) -> Result<()> {
+    conn.execute_batch(include_str!("implementation_result.sql"))?;
+    // Only identities retained by the typed event are actors. Cancellation and
+    // provider observations have no actor; never substitute the requester/reviewer.
+    let actor_path = "CASE NEW.kind WHEN 'review_requested' THEN '$.requested_by' WHEN 'review' THEN '$.reviewer' WHEN 'review_revoked' THEN '$.revoked_by' WHEN 'merge' THEN '$.merged_by' END";
+    let mr_actor = format!(
+        "'worker:' || json_extract(NEW.payload_json,({actor_path}) || '.runtime_id') || '/' || json_extract(NEW.payload_json,({actor_path}) || '.worker_id')"
+    );
+    let mr = format!("INSERT OR IGNORE INTO notification_sources(workspace_id,ticket_id,input_event_id,role,assignment_id,kind,actor,event_index,facts_json)
+ SELECT NEW.workspace_id,r.ticket_id,'mr-event:' || NEW.merge_request_id || ':' || NEW.event_id,roles.role,COALESCE(a.assignment_id,''),'mr_' || NEW.kind,{mr_actor},NULL,
+ json_set({FACTS_SQL},'$.merge_request_id',NEW.merge_request_id,'$.event_id',NEW.event_id,'$.subject_ref',COALESCE(json_extract(NEW.payload_json,'$.subject_ref'),json_extract(NEW.payload_json,'$.approved_source_ref')),'$.request_event_id',json_extract(NEW.payload_json,'$.request_event_id'))
+ FROM merge_request_ticket_relations r JOIN typed_tickets t ON t.workspace_id=r.workspace_id AND t.ticket_id=r.ticket_id
+ CROSS JOIN (SELECT 'orchestrator' role UNION ALL SELECT 'worker') roles
+ LEFT JOIN ticket_current_worker_assignments c ON c.workspace_id=t.workspace_id AND c.ticket_id=t.ticket_id AND c.role=roles.role
+ LEFT JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.assignment_id=c.assignment_id
+ WHERE r.workspace_id=NEW.workspace_id AND r.merge_request_id=NEW.merge_request_id;");
+    conn.execute_batch(&format!("CREATE TRIGGER notification_mr_event AFTER INSERT ON merge_request_thread_events WHEN NEW.kind!='comment' BEGIN {mr} END;"))?;
+    let source = mr.replace(&mr_actor, "NULL")
+        .replace("'mr-event:' || NEW.merge_request_id || ':' || NEW.event_id", "'mr-source:' || NEW.merge_request_id || ':' || NEW.sequence")
+        .replace("'mr_' || NEW.kind", "'mr_source_changed'")
+        .replace("NEW.event_id", "NEW.sequence")
+        .replace("COALESCE(json_extract(NEW.payload_json,'$.subject_ref'),json_extract(NEW.payload_json,'$.approved_source_ref'))", "NEW.subject_ref")
+        .replace("json_extract(NEW.payload_json,'$.request_event_id')", "NULL");
+    conn.execute_batch(&format!("CREATE TRIGGER notification_mr_source AFTER INSERT ON merge_request_source_observations WHEN NEW.previous_subject_ref IS NOT NULL BEGIN {source} END;"))?;
+    // Recover retained review/merge evidence once. A source identity is the immutable
+    // MR event, so re-review is distinct and retry cannot duplicate an input.
+    // Equal/ambiguous assignment timestamps cannot prove event-time ownership;
+    // retain a no-recipient source instead of guessing by row order.
+    let historical = mr.replace("NEW.", "e.").replace(
+        "FROM merge_request_ticket_relations r", "FROM merge_request_thread_events e JOIN merge_request_ticket_relations r ON r.workspace_id=e.workspace_id AND r.merge_request_id=e.merge_request_id"
+    ).replace(
+        "LEFT JOIN ticket_current_worker_assignments c ON c.workspace_id=t.workspace_id AND c.ticket_id=t.ticket_id AND c.role=roles.role\n LEFT JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.assignment_id=c.assignment_id",
+        "LEFT JOIN ticket_worker_assignments a ON a.workspace_id=t.workspace_id AND a.ticket_id=t.ticket_id AND a.role=roles.role AND a.assignment_id=(SELECT CASE WHEN COUNT(*)=1 THEN MIN(h.assignment_id) END FROM ticket_worker_assignments h WHERE h.workspace_id=t.workspace_id AND h.ticket_id=t.ticket_id AND h.role=roles.role AND h.assigned_at=(SELECT MAX(prior.assigned_at) FROM ticket_worker_assignments prior WHERE prior.workspace_id=t.workspace_id AND prior.ticket_id=t.ticket_id AND prior.role=roles.role AND prior.assigned_at<e.created_at))"
+    ).replace("WHERE r.workspace_id=e.workspace_id AND r.merge_request_id=e.merge_request_id;", "WHERE e.kind!='comment';");
+    conn.execute_batch(&historical)?;
+    conn.execute_batch(&format!("CREATE TRIGGER notification_implementation_result AFTER INSERT ON ticket_implementation_results BEGIN
+ INSERT INTO notification_sources(workspace_id,ticket_id,input_event_id,role,assignment_id,kind,actor,event_index,facts_json)
+ SELECT NEW.workspace_id,NEW.ticket_id,'implementation-result:' || NEW.result_id,'orchestrator',a.assignment_id,'implementation_result','worker:' || NEW.runtime_id || '/' || NEW.worker_id,NULL,
+ json_set({FACTS_SQL},'$.result_id',NEW.result_id,'$.implementation_assignment_id',NEW.assignment_id)
+ FROM ticket_worker_assignments a JOIN typed_tickets t ON t.workspace_id=a.workspace_id AND t.ticket_id=a.ticket_id
+ WHERE a.workspace_id=NEW.workspace_id AND a.assignment_id=NEW.orchestrator_assignment_id;
+ END;"))?;
+    Ok(())
+}
+
+impl SqliteWorkspaceStore {
+    /// Record a provider-resolved source observation, not approval. Git has no local
+    /// transactional event log: transitions are captured when the existing MR paths
+    /// observe them. Identical observations (including concurrent scans) are deduplicated.
+    pub(crate) fn observe_merge_request_source(
+        &self,
+        workspace: &str,
+        repository: &str,
+        selector: &str,
+        subject: &str,
+    ) -> Result<()> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let ids = tx.prepare("SELECT merge_request_id FROM merge_requests WHERE workspace_id=?1 AND repository_id=?2 AND selector_from=?3 AND state='open'")?.query_map(params![workspace,repository,selector],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            for id in ids {
+                let previous: Option<String> = tx.query_row("SELECT subject_ref FROM merge_request_source_observations WHERE workspace_id=?1 AND merge_request_id=?2 ORDER BY sequence DESC LIMIT 1", params![workspace,id], |r|r.get(0)).optional()?;
+                // New MRs may already have a review before the first observation.
+                let previous = match previous {
+                    Some(previous) => Some(previous),
+                    None => tx.query_row("SELECT json_extract(payload_json,'$.subject_ref') FROM merge_request_thread_events WHERE workspace_id=?1 AND merge_request_id=?2 AND json_extract(payload_json,'$.subject_ref') IS NOT NULL ORDER BY sequence DESC LIMIT 1",params![workspace,id],|r|r.get(0)).optional()?,
+                };
+                if previous.as_deref() != Some(subject) {
+                    tx.execute("INSERT INTO merge_request_source_observations(workspace_id,merge_request_id,subject_ref,previous_subject_ref,observed_at) VALUES(?1,?2,?3,?4,?5)",params![workspace,id,subject,previous,chrono::Utc::now().to_rfc3339()])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+}
+
 pub(super) fn verify(conn: &Connection) -> Result<()> {
     let mut names = vec![
         "notification_sources".to_owned(),
@@ -348,6 +437,27 @@ pub(super) fn verify(conn: &Connection) -> Result<()> {
         "notification_unassigned_content",
     ] {
         names.push(name.into());
+    }
+    if current_schema_version(conn)? >= 96 {
+        names.extend(
+            [
+                "ticket_implementation_delegations",
+                "ticket_implementation_results",
+                "implementation_delegation_capture",
+                "implementation_results_no_update",
+                "implementation_results_no_delete",
+                "implementation_delegations_no_update",
+                "implementation_delegations_no_delete",
+                "notification_mr_event",
+                "notification_implementation_result",
+                "notification_mr_source",
+                "merge_request_source_observations",
+                "mr_source_observations_no_update",
+                "mr_source_observations_no_delete",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
     }
     for name in names {
         let present: bool = conn.query_row(
@@ -726,6 +836,10 @@ pub(super) fn ack_worker(
         tx.commit()?;Ok(())
     })
 }
+
+#[cfg(test)]
+#[path = "notification_registration_tests.rs"]
+mod registration_tests;
 
 #[cfg(test)]
 mod tests {

@@ -660,6 +660,26 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
                                     .await,
                             )
                         }
+                        WorkspaceServerOperation::TicketImplementationResult {
+                            ticket_id,
+                            request,
+                        } => generated_workspace_response(
+                            client
+                                .ticket_implementation_result(workspace_id, ticket_id, request)
+                                .await,
+                        ),
+                        WorkspaceServerOperation::TicketImplementationResultGet {
+                            ticket_id,
+                            result_id,
+                        } => generated_workspace_response(
+                            client
+                                .ticket_implementation_result_get(
+                                    workspace_id,
+                                    ticket_id,
+                                    result_id,
+                                )
+                                .await,
+                        ),
                         WorkspaceServerOperation::WorkerControlList => {
                             generated_workspace_response(
                                 client.worker_control_list(workspace_id).await,
