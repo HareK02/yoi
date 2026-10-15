@@ -63,11 +63,7 @@ Deno.test("ticket detail fences stale mutation responses", () => {
 
 Deno.test("ticket responsibility display does not claim Worker liveness or work authority", () => {
   assertStringIncludes(pageSource, "Role assignments and manual Workers");
-  assertStringIncludes(pageSource, "after work ends and Worker removal");
-  assertStringIncludes(
-    pageSource,
-    "does not indicate a running Worker or active work authority",
-  );
+  assertStringIncludes(pageSource, "Assignments are retained independently of Worker state.");
   assertStringIncludes(pageSource, "assignment.principal.runtime_id");
   assertStringIncludes(pageSource, "assignment.principal.worker_id");
   assert(!pageSource.includes("No active role assignment."));

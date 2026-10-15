@@ -524,23 +524,60 @@
     <div class="ticket-column-divider"><BevelLine direction="y" length="100%" decorative /></div>
     <aside class="ticket-control-rail" aria-label="Ticket details">
       <div class="ticket-mobile-sidebar-divider"><BevelLine decorative /></div>
-      <section class="ticket-control-card ticket-metadata" aria-label="Ticket metadata">
-        <dl>
-          <dt>Created by</dt><dd>{ticket.created_by ?? "Unknown author"}</dd>
-          <dt>Created</dt><dd><time datetime={ticket.created_at ?? undefined}>{prettyDate(ticket.created_at)}</time></dd>
-          <dt>Updated</dt><dd><time datetime={ticket.updated_at ?? undefined}>{prettyDate(ticket.updated_at)}</time></dd>
-        </dl>
-        <button class="workspace-secondary-button" type="button" onclick={() => { editTitle = ticket.title; editing = !editing; }}>
-          {editing ? "Cancel title edit" : "Edit title"}
-        </button>
-        {#if editing}
-          <form class="ticket-editor" aria-label="Edit ticket title" onsubmit={saveEdit}>
-            <label>Title<input bind:value={editTitle} required disabled={busy !== null} /></label>
-            <button class="workspace-primary-button" type="submit" disabled={busy !== null || !editTitle.trim()}>
-              {busy === "edit" ? "Saving…" : "Save title"}
+      <section class="ticket-control-card ticket-resources" aria-label="Repository resources">
+        <div class="ticket-section-heading"><h2>Repository resources</h2><span>{ticket.targets.length}</span></div>
+        <ul class="ticket-resource-summary">
+          {#each ticket.targets as target}
+            <li>
+              <strong>{target.repository_key}</strong>
+              <span class="ticket-resource-access">{target.access === "read_write" ? "Read/write" : "Read only"}</span>
+              <code>{target.ref_selector ?? "Ref not specified"}</code>
+            </li>
+          {:else}
+            <li class="workspace-empty-copy">No repository targets.</li>
+          {/each}
+        </ul>
+        {#if data.repositories.error}<p class="workspace-callout is-error">Repository catalog unavailable: {data.repositories.error}</p>{/if}
+        <details class="ticket-resource-editor">
+          <summary>Edit resources</summary>
+          <p class="workspace-empty-copy">Target changes do not reconnect Workers or change live permissions.</p>
+          <form class="ticket-control-form" onsubmit={saveTarget}>
+            <div class="ticket-target-list">
+              {#each targetDrafts as target, index}
+                {@const selectedRepository = repositoryFor(target.repository_key)}
+                <fieldset class="ticket-target-row">
+                  <legend>Target {index + 1}</legend>
+                  <label>Repository
+                    <select bind:value={target.repository_key} disabled={busy !== null} required>
+                      <option value="">Choose repository</option>
+                      {#each loadedRepositories?.items ?? [] as repository}
+                        <option value={repository.repository_key}>{repository.repository_key}</option>
+                      {/each}
+                    </select>
+                  </label>
+                  <label>Ref selector<input bind:value={target.ref_selector} placeholder={selectedRepository?.default_selector ?? "branch, tag, or commit"} disabled={busy !== null} /></label>
+                  <label>Access
+                    <select bind:value={target.access} disabled={busy !== null}>
+                      <option value="read_write">Read and write</option>
+                      <option value="read_only">Read only</option>
+                    </select>
+                  </label>
+                    <button class="workspace-secondary-button" type="button" onclick={() => removeTarget(index)}>Remove target</button>
+                </fieldset>
+              {:else}
+                <p class="workspace-empty-copy">No repository targets.</p>
+              {/each}
+            </div>
+              <button
+                class="workspace-secondary-button"
+                type="button"
+                onclick={() => addTarget()}
+              >Add target</button>
+            <button class="workspace-secondary-button" type="submit" disabled={busy !== null || !targetCandidateValid}>
+              {busy === "target" ? "Saving…" : "Save targets"}
             </button>
           </form>
-        {/if}
+        </details>
       </section>
       <BevelLine decorative />
       {#each ticket.action_eligibility.blockers as blocker}<p class="workspace-callout">{blocker}</p>{/each}
@@ -602,6 +639,50 @@
         </div>
       </section>
 
+      {#if mergeRequests.length > 0}
+      <BevelLine decorative />
+      <details class="ticket-control-card">
+        <summary>MR requirement evidence</summary>
+        <p><strong>Current requirements:</strong> {ticket.evidence.complete_for_integration ? "satisfied for integration" : "not satisfied for integration"}.</p>
+        <p><strong>Current requirement approval:</strong> {currentRequirementApprovalStatus(ticket.evidence)}.</p>
+        {#if ticket.evidence.missing.length > 0}
+          <ul>
+            {#each ticket.evidence.missing as missing}<li>{missing}</li>{/each}
+          </ul>
+        {/if}
+        <p class="workspace-empty-copy">This evaluates linked MR requirements, separately from the Ticket case judgment and persisted integration approval.</p>
+        {#if ticket.state === "closed"}
+          <p class="workspace-empty-copy">This case remains closed. Incomplete MR evidence does not alter the recorded case judgment.</p>
+        {/if}
+      </details>
+      {/if}
+      <BevelLine decorative />
+      <section class="ticket-control-card">
+        <header><h2>Merge Requests</h2></header>
+        {#if mergeRequests.length > 0}
+          {#each mergeRequests as mergeRequest (mergeRequest.merge_request_id)}
+            <article class="ticket-control-card">
+              <p><strong>{mergeRequest.repository_key}: {mergeRequest.state}</strong></p>
+              <p>
+                From <code>{mergeRequest.selector_from ?? "requires repair"}</code>
+                to <code>{mergeRequest.selector_to}</code>
+              </p>
+              <p><strong>{mergeRequest.state === "merged" ? "Immutable integration evidence" : "Live source review"}:</strong> {summarySourceReviewStatus(mergeRequest)}</p>
+              {#if mergeRequest.integration_evidence_error !== null}
+                <p class="workspace-callout is-error"><strong>Integration evidence error:</strong> {mergeRequest.integration_evidence_error}</p>
+              {/if}
+              <p><strong>Target integration:</strong> {mergeRequest.state === "merged" ? "recorded" : `awaiting Orchestrator integration into ${mergeRequest.selector_to}`}.</p>
+              <a
+                class="workspace-secondary-button"
+                href={mergeRequestPagePath(data.workspaceId, mergeRequest.merge_request_id)}
+              >Open Merge Request</a>
+            </article>
+          {/each}
+        {:else}
+          <p class="workspace-empty-copy">No Merge Requests linked.</p>
+        {/if}
+      </section>
+
       <BevelLine decorative />
       {#key JSON.stringify([data.workspaceId, ticket.id])}
         <TicketWorkerObservation workspaceId={data.workspaceId} {ticket} />
@@ -609,7 +690,7 @@
       <BevelLine decorative />
       <details class="ticket-control-card ticket-worker-card">
         <summary>Role assignments and manual Workers</summary>
-        <p class="workspace-empty-copy">Responsibility is retained after work ends and Worker removal; it does not indicate a running Worker or active work authority.</p>
+        <p class="workspace-empty-copy">Assignments are retained independently of Worker state.</p>
         {#if ticket.assignments.length > 0}
           <ul class="ticket-assignment-list">
             {#each ticket.assignments as assignment}
@@ -633,11 +714,10 @@
         {#if implementationStartEligible}
           <a class="workspace-secondary-button" href={ticketWorkerLaunchHref(data.workspaceId, ticket)}>Start a Ticket Worker</a>
           <details><summary>Assign an existing Worker</summary>
-          <p class="workspace-empty-copy">Explicit assignment is separate from state. Backend validates the Worker and resource binding; a retained assignment is not execution authority.</p>
           <form class="ticket-control-form" onsubmit={assignExistingWorker}>
             <label>Runtime ID<input bind:value={manualRuntimeId} required /></label>
             <label>Worker ID<input bind:value={manualWorkerId} required /></label>
-            <p class="workspace-empty-copy">Select only resources needed for this request. No selection binds no Workdirs; unrelated existing attachments are not inherited. Use authorized connection IDs for explicit rebind.</p>
+            <p class="workspace-empty-copy">Only selected Workdirs are bound. Rebinding requires authorized connection IDs.</p>
             {#each manualBindings as binding, index}
               <fieldset class="ticket-target-row"><legend>Resource binding {index + 1}</legend>
                 <label>Alias<input bind:value={binding.alias} required /></label>
@@ -682,95 +762,22 @@
       </details>
 
       <BevelLine decorative />
-      <details class="ticket-control-card ticket-resources">
-        <summary>Repository resources ({ticket.targets.length})</summary>
-        <p class="workspace-empty-copy">Targets describe permitted resources, not connected attachments. Editing targets or the body does not expand live permissions. Changed resources require explicit reconnection; stale or unavailable connections are rejected by Backend.</p>
-        {#if data.repositories.error}<p class="workspace-callout is-error">Repository catalog unavailable: {data.repositories.error}</p>{/if}
-        <form class="ticket-control-form" onsubmit={saveTarget}>
-          <div class="ticket-target-list">
-            {#each targetDrafts as target, index}
-              {@const selectedRepository = repositoryFor(target.repository_key)}
-              <fieldset class="ticket-target-row">
-                <legend>Target {index + 1}</legend>
-                <label>Repository
-                  <select bind:value={target.repository_key} disabled={busy !== null} required>
-                    <option value="">Choose repository</option>
-                    {#each loadedRepositories?.items ?? [] as repository}
-                      <option value={repository.repository_key}>{repository.repository_key}</option>
-                    {/each}
-                  </select>
-                </label>
-                <label>Ref selector<input bind:value={target.ref_selector} placeholder={selectedRepository?.default_selector ?? "branch, tag, or commit"} disabled={busy !== null} /></label>
-                <label>Access
-                  <select bind:value={target.access} disabled={busy !== null}>
-                    <option value="read_write">Read and write</option>
-                    <option value="read_only">Read only</option>
-                  </select>
-                </label>
-                  <button class="workspace-secondary-button" type="button" onclick={() => removeTarget(index)}>Remove target</button>
-              </fieldset>
-            {:else}
-              <p class="workspace-empty-copy">No repository targets.</p>
-            {/each}
-          </div>
-            <button
-              class="workspace-secondary-button"
-              type="button"
-              onclick={() => addTarget()}
-            >Add target</button>
-          <button class="workspace-secondary-button" type="submit" disabled={busy !== null || !targetCandidateValid}>
-            {busy === "target" ? "Saving…" : "Save targets"}
-          </button>
-        </form>
-      </details>
-
-      {#if mergeRequests.length > 0}
-      <BevelLine decorative />
-      <details class="ticket-control-card">
-        <summary>MR requirement evidence</summary>
-        <p><strong>Current requirements:</strong> {ticket.evidence.complete_for_integration ? "satisfied for integration" : "not satisfied for integration"}.</p>
-        <p><strong>Current requirement approval:</strong> {currentRequirementApprovalStatus(ticket.evidence)}.</p>
-        {#if ticket.evidence.missing.length > 0}
-          <ul>
-            {#each ticket.evidence.missing as missing}<li>{missing}</li>{/each}
-          </ul>
-        {/if}
-        <p class="workspace-empty-copy">This evaluates linked MR requirements, separately from the Ticket case judgment and persisted integration approval.</p>
-        {#if ticket.state === "closed"}
-          <p class="workspace-empty-copy">This case remains closed. Incomplete MR evidence does not alter the recorded case judgment.</p>
-        {/if}
-      </details>
-      {/if}
-      <BevelLine decorative />
-      <section class="ticket-control-card">
-        <header><h2>Merge Requests</h2></header>
-        <p class="workspace-empty-copy">Ticket closure is not MR approval or integration.</p>
-        {#if mergeRequests.length > 0}
-          {#each mergeRequests as mergeRequest (mergeRequest.merge_request_id)}
-            <article class="ticket-control-card">
-              <p><strong>{mergeRequest.repository_key}: {mergeRequest.state}</strong></p>
-              <p>
-                From <code>{mergeRequest.selector_from ?? "requires repair"}</code>
-                to <code>{mergeRequest.selector_to}</code>
-              </p>
-              <p><strong>{mergeRequest.state === "merged" ? "Immutable integration evidence" : "Live source review"}:</strong> {summarySourceReviewStatus(mergeRequest)}</p>
-              {#if mergeRequest.integration_evidence_error !== null}
-                <p class="workspace-callout is-error"><strong>Integration evidence error:</strong> {mergeRequest.integration_evidence_error}</p>
-              {/if}
-              <p><strong>Target integration:</strong> {mergeRequest.state === "merged" ? "recorded" : `awaiting Orchestrator integration into ${mergeRequest.selector_to}`}.</p>
-              {#if mergeRequest.state === "merged"}
-                <p class="workspace-empty-copy">The merged source and integration approval are persisted evidence, not a live selector observation.</p>
-              {:else}
-                <p class="workspace-empty-copy">Target-only movement refreshes integration evidence; it does not invalidate approval for an unchanged source.</p>
-              {/if}
-              <a
-                class="workspace-secondary-button"
-                href={mergeRequestPagePath(data.workspaceId, mergeRequest.merge_request_id)}
-              >Open Merge Request</a>
-            </article>
-          {/each}
-        {:else}
-          <p class="workspace-empty-copy">No Merge Requests linked. A Ticket can be closed with a comment or document result.</p>
+      <section class="ticket-control-card ticket-metadata" aria-label="Ticket metadata">
+        <dl>
+          <dt>Created by</dt><dd>{ticket.created_by ?? "Unknown author"}</dd>
+          <dt>Created</dt><dd><time datetime={ticket.created_at ?? undefined}>{prettyDate(ticket.created_at)}</time></dd>
+          <dt>Updated</dt><dd><time datetime={ticket.updated_at ?? undefined}>{prettyDate(ticket.updated_at)}</time></dd>
+        </dl>
+        <button class="workspace-secondary-button" type="button" onclick={() => { editTitle = ticket.title; editing = !editing; }}>
+          {editing ? "Cancel title edit" : "Edit title"}
+        </button>
+        {#if editing}
+          <form class="ticket-editor" aria-label="Edit ticket title" onsubmit={saveEdit}>
+            <label>Title<input bind:value={editTitle} required disabled={busy !== null} /></label>
+            <button class="workspace-primary-button" type="submit" disabled={busy !== null || !editTitle.trim()}>
+              {busy === "edit" ? "Saving…" : "Save title"}
+            </button>
+          </form>
         {/if}
       </section>
 

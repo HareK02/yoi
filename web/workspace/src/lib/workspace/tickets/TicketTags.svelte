@@ -60,7 +60,6 @@
 </script>
 <section class="ticket-detail-section ticket-tags">
   <div class="ticket-section-heading"><h2>Classification tags</h2></div>
-  <p class="workspace-empty-copy">Classification only. Tag changes do not close or reopen this case.</p>
   <div class="ticket-tag-chips">{#each ticket.tags as tag (tag.id)}<span class="ticket-tag-chip">{tag.name}</span>{:else}<span>No tags</span>{/each}</div>
   {#if loading}<p role="status">Loading tag catalog…</p>{/if}
   {#if error}<p class="workspace-callout is-error" role="alert">{error}</p>{/if}

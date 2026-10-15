@@ -408,14 +408,20 @@ async function assertThreadLayout(page: Page) {
   assertEquals(await page.locator(".ticket-delivery").count(), 0);
   assertEquals(await page.getByText("Delivery and execution", { exact: true }).count(), 0);
   assertEquals(await rail.locator(".ticket-thread-event[data-initial=true], .ticket-thread-event, .ticket-thread-composer").count(), 0);
-  for (const selector of [".ticket-orchestrator-worker", ".ticket-worker-observation", ".ticket-worker-card", ".ticket-resources"]) {
+  for (const selector of [".ticket-orchestrator-worker", ".ticket-worker-observation", ".ticket-worker-card", ".ticket-resource-editor"]) {
     const details = rail.locator(selector);
     assertEquals(await details.evaluate((element) => element.tagName), "DETAILS");
     assertEquals(await details.getAttribute("open"), null);
     assert(await details.locator(":scope > summary").isVisible());
   }
   assertEquals(await rail.locator(".ticket-worker-card > summary").textContent(), "Role assignments and manual Workers");
-  assert(/^Repository resources \(\d+\)$/.test((await rail.locator(".ticket-resources > summary").textContent())!));
+  assert(await rail.getByRole("heading", { name: "Repository resources", exact: true }).isVisible());
+  assert(await rail.locator(".ticket-resource-summary").isVisible());
+  assertEquals(await rail.locator(":scope > section").first().getAttribute("aria-label"), "Repository resources");
+  assert(await rail.locator(".ticket-resources").evaluate((element) =>
+    element.getBoundingClientRect().bottom <= element.parentElement!.querySelector(".ticket-handling")!.getBoundingClientRect().top
+  ));
+  assertEquals(await rail.locator(".ticket-resource-editor > summary").textContent(), "Edit resources");
   const evidence = rail.locator("details").filter({ has: page.locator("summary", { hasText: /^MR requirement evidence$/ }) });
   if (await evidence.count()) assertEquals(await evidence.getAttribute("open"), null);
 }
@@ -1090,6 +1096,43 @@ Deno.test("canonical thread renders long initial post and chronological multilin
   });
 });
 
+Deno.test("Repository summary stays visible while edits remain explicit and refresh after saving", async () => {
+  await withFixture(async (browser, base) => {
+    const page = await browser.newPage();
+    const wire = await detail(base, "T-1");
+    wire.targets = [{ repository_key: "main", ref_selector: null, access: "read_only" }];
+    const writes: unknown[] = [];
+    await page.route("**/api/w/tickets/tickets/*", async (route) => {
+      const reference = decodeURIComponent(new URL(route.request().url()).pathname.split("/").at(-1)!);
+      if (reference !== "T-1" && reference !== wire.id) return await route.continue();
+      if (route.request().method() === "PATCH") {
+        const body = route.request().postDataJSON();
+        writes.push(body);
+        wire.targets = body.target.action === "clear" ? [] : body.target.targets;
+      }
+      await route.fulfill({ status: 200, json: wire });
+    });
+    await page.goto(`${base}/w/tickets/tickets/T-1`);
+    const resources = page.getByRole("region", { name: "Repository resources", exact: true });
+    await resources.getByText("Ref not specified", { exact: true }).waitFor();
+    const summary = resources.locator(".ticket-resource-editor > summary");
+    await summary.focus();
+    await summary.press("Enter");
+    await resources.getByLabel("Ref selector", { exact: true }).fill("feature/sidebar");
+    await resources.getByRole("combobox", { name: /^Access/ }).selectOption("read_write");
+    assertEquals(writes, []);
+    assertEquals(await resources.locator(".ticket-resource-summary code").textContent(), "Ref not specified");
+    await resources.getByRole("button", { name: "Save targets", exact: true }).click();
+    await resources.locator(".ticket-resource-summary code").filter({ hasText: "feature/sidebar" }).waitFor();
+    assertEquals(writes, [{ target: { action: "set", targets: [{ repository_key: "main", ref_selector: "feature/sidebar", access: "read_write" }] } }]);
+    assertEquals(await resources.locator(".ticket-resource-access").textContent(), "Read/write");
+    await resources.getByRole("button", { name: "Remove target", exact: true }).click();
+    await resources.getByRole("button", { name: "Save targets", exact: true }).click();
+    await resources.locator(".ticket-resource-summary").getByText("No repository targets.", { exact: true }).waitFor();
+    assertEquals(writes[1], { target: { action: "clear" } });
+  });
+});
+
 Deno.test("Ticket metadata stays in the rail with flat links, wrapping labels and keyboard navigation", async () => {
   await withFixture(async (browser, base) => {
     const output = artifactPath("metadata");
@@ -1102,6 +1145,10 @@ Deno.test("Ticket metadata stays in the rail with flat links, wrapping labels an
           const body = await response.json();
           if (body.resource_key === "T-1" && body.relations) {
             body.tags[0].name = "Classification-with-a-long-name-".repeat(4);
+            body.targets = [
+              { repository_key: "Repository-with-a-long-name-".repeat(4), ref_selector: "feature/long-selector-".repeat(6), access: "read_write" },
+              { repository_key: "docs", ref_selector: null, access: "read_only" },
+            ];
             body.relations.outgoing = [{ at: "2026-01-01T00:00:00Z", author: "fixture-owner", kind: "related", target: "internal-T-2", target_resource_key: "T-2", ticket_id: body.id, note: "Related investigation with a long note. ".repeat(5) }];
           }
           await route.fulfill({ response, json: body });
@@ -1111,6 +1158,13 @@ Deno.test("Ticket metadata stays in the rail with flat links, wrapping labels an
         const link = rail.getByRole("link", { name: /T-2/ });
         await link.waitFor();
         assertEquals(await link.getAttribute("href"), "/w/tickets/tickets/T-2");
+        const resources = rail.getByRole("region", { name: "Repository resources", exact: true });
+        assertEquals(await resources.locator(".ticket-resource-summary strong").allTextContents(), ["Repository-with-a-long-name-".repeat(4), "docs"]);
+        assertEquals(await resources.locator(".ticket-resource-summary code").allTextContents(), ["feature/long-selector-".repeat(6), "Ref not specified"]);
+        assertEquals(await resources.locator(".ticket-resource-access").allTextContents(), ["Read/write", "Read only"]);
+        assert(await resources.locator(".ticket-resource-summary").evaluate((element) => element.scrollWidth <= element.clientWidth));
+        assertEquals(await resources.locator(".ticket-resource-editor").getAttribute("open"), null);
+        await resources.screenshot({ path: `${output}/resources-${colorScheme}-${width}.png` });
         assertEquals(await page.locator(".ticket-detail-main .ticket-tags, .ticket-detail-main .ticket-relations").count(), 0);
         assertEquals(await page.evaluate("document.documentElement.scrollWidth > innerWidth"), false);
         assert(await rail.locator(".ticket-tag-chip, .ticket-relations-list a").evaluateAll((elements) => elements.every((element) => {
