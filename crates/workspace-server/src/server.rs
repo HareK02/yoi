@@ -181,7 +181,7 @@ use crate::authority::{
 };
 use crate::backend_job::{
     ABSOLUTE_MAX_CONCURRENT_JOBS, BackendJobAttemptRecord, BackendJobAttemptState,
-    BackendJobDeliveryState, BackendJobRequest, BackendJobReservation, BackendJobResultAcceptance,
+    BackendJobRequest, BackendJobReservation, BackendJobResultAcceptance,
     BackendJobResultSubmission, BackendJobState, BackendJobWorkerCleanupState,
     MAX_JOB_DELIVERY_BYTES, allocation_key,
 };
@@ -3973,38 +3973,7 @@ impl WorkspaceApi {
         api.host_executors
             .host()?
             .run(move || {
-                let recovery_now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-                let deliveries = api
-                    .store
-                    .recover_backend_job_deliveries(&api.config.workspace_id, &recovery_now)?;
-                for delivery in deliveries {
-                    let Some(job) = api
-                        .store
-                        .get_backend_job(&api.config.workspace_id, &delivery.job_id)?
-                    else {
-                        continue;
-                    };
-                    let Some(attempt) = api.store.get_backend_job_attempt(
-                        &api.config.workspace_id,
-                        &delivery.job_id,
-                        &delivery.attempt_id,
-                    )?
-                    else {
-                        continue;
-                    };
-                    if job.state == BackendJobState::Completed
-                        && attempt.state == BackendJobAttemptState::Completed
-                    {
-                        api.deliver_backend_job_result(
-                            &BackendJobResultAcceptance {
-                                job,
-                                attempt,
-                                replayed: true,
-                            },
-                            &delivery.target,
-                        );
-                    }
-                }
+                notification_delivery::recover_job_notifications(&api);
                 api.recover_backend_jobs()?;
                 if let Some(orchestrator) = find_online_workspace_orchestrator(&api) {
                     dispatch_orchestrator_assignment_attention(&api, &orchestrator.worker);
@@ -4892,175 +4861,19 @@ impl WorkspaceApi {
             &verified_submission,
             &accepted_at,
         )?;
-        if let Some(target) = acceptance.job.request.notification_target.as_ref() {
-            self.deliver_backend_job_result(&acceptance, target);
-        }
+        notification_delivery::deliver_job_result(self, &acceptance);
         let _ = self.schedule_backend_job_worker_cleanup(&acceptance.attempt);
         self.drain_reserved_backend_jobs();
         Ok(acceptance)
     }
 
+    #[cfg(test)]
     fn deliver_backend_job_result(
         &self,
         acceptance: &BackendJobResultAcceptance,
-        target: &RuntimeWorkerRef,
+        _target: &RuntimeWorkerRef,
     ) {
-        let delivery_id = crate::backend_job::delivery_id(
-            &acceptance.job.request.job_id,
-            &acceptance.attempt.attempt_id,
-        );
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-        let Ok((delivery, claimed)) = self.store.reserve_backend_job_delivery(
-            &self.config.workspace_id,
-            &delivery_id,
-            &acceptance.job.request.job_id,
-            target,
-            &now,
-        ) else {
-            return;
-        };
-        if !claimed || delivery.state != BackendJobDeliveryState::Sending {
-            return;
-        }
-
-        let content = if acceptance.job.request.purpose == ticket_item_checker::PURPOSE {
-            let checker_input =
-                match ticket_item_checker::parse_input(&acceptance.job.request.input) {
-                    Ok(input) => input,
-                    Err(error) => {
-                        let _ = self.store.finish_backend_job_delivery(
-                            &self.config.workspace_id,
-                            &delivery_id,
-                            BackendJobDeliveryState::Failed,
-                            Some("invalid_checker_input"),
-                            Some(&error.to_string()),
-                            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-                        );
-                        return;
-                    }
-                };
-            let current_ticket = match browser_ticket_backend(self).and_then(|backend| {
-                backend
-                    .show(checker_input.ticket_id.clone().into())
-                    .map_err(Error::from)
-            }) {
-                Ok(ticket) => ticket,
-                Err(error) => {
-                    let _ = self.store.finish_backend_job_delivery(
-                        &self.config.workspace_id,
-                        &delivery_id,
-                        BackendJobDeliveryState::Failed,
-                        Some("current_ticket_content_unavailable"),
-                        Some(&error.to_string()),
-                        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-                    );
-                    return;
-                }
-            };
-            match ticket_item_checker::notification(acceptance, &current_ticket) {
-                Ok(ticket_item_checker::TicketItemCheckNotification::Deliver(content)) => content,
-                Ok(ticket_item_checker::TicketItemCheckNotification::NoFindings) => {
-                    let _ = self.store.finish_backend_job_delivery(
-                        &self.config.workspace_id,
-                        &delivery_id,
-                        BackendJobDeliveryState::Completed,
-                        Some("notification_suppressed_no_findings"),
-                        None,
-                        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-                    );
-                    return;
-                }
-                Ok(ticket_item_checker::TicketItemCheckNotification::Stale) => {
-                    let detail = format!(
-                        "checked Ticket content digest {} is no longer current ({})",
-                        checker_input.content_digest,
-                        ticket_item_checker::content_digest(&current_ticket)
-                    );
-                    let _ = self.store.finish_backend_job_delivery(
-                        &self.config.workspace_id,
-                        &delivery_id,
-                        BackendJobDeliveryState::Completed,
-                        Some("notification_suppressed_stale_ticket_content"),
-                        Some(&detail),
-                        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-                    );
-                    return;
-                }
-                Err(error) => {
-                    let _ = self.store.finish_backend_job_delivery(
-                        &self.config.workspace_id,
-                        &delivery_id,
-                        BackendJobDeliveryState::Failed,
-                        Some("invalid_checker_result"),
-                        Some(&error.to_string()),
-                        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-                    );
-                    return;
-                }
-            }
-        } else {
-            format!(
-                "Backend Job `{}` completed attempt `{}` for `{}`. Durable result digest: {}.",
-                acceptance.job.request.job_id,
-                acceptance.attempt.attempt_id,
-                acceptance.job.request.purpose,
-                acceptance
-                    .job
-                    .result_digest
-                    .as_deref()
-                    .unwrap_or("unavailable")
-            )
-        };
-        if content.len() > MAX_JOB_DELIVERY_BYTES {
-            let _ = self.store.finish_backend_job_delivery(
-                &self.config.workspace_id,
-                &delivery_id,
-                BackendJobDeliveryState::Failed,
-                Some("notification_too_large"),
-                Some("Backend Job notification content exceeded its configured byte limit"),
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            );
-            return;
-        }
-        let delivery_result = self.runtime.send_input(
-            target,
-            WorkerInputRequest {
-                kind: WorkerInputKind::Notify,
-                content,
-                submission_request_id: Some(delivery.delivery_id.clone()),
-                segments: None,
-            },
-        );
-        let (state, category, detail): (_, Option<String>, Option<String>) = match delivery_result {
-            Ok(result) if result.state == InternalWorkerOperationState::Accepted => {
-                (BackendJobDeliveryState::Completed, None, None)
-            }
-            Ok(result) if result.disposition == WorkerInputDisposition::Unknown => (
-                BackendJobDeliveryState::Unknown,
-                Some("notification_outcome_unknown".to_string()),
-                result.diagnostics.first().map(|item| item.message.clone()),
-            ),
-            Ok(result) => (
-                BackendJobDeliveryState::Failed,
-                Some("notification_rejected".to_string()),
-                result.diagnostics.first().map(|item| item.message.clone()),
-            ),
-            Err(error) => (
-                BackendJobDeliveryState::Unknown,
-                Some("notification_outcome_unknown".to_string()),
-                Some(error.message()),
-            ),
-        };
-        // Delivery is intentionally separate from result authority. A delivery
-        // bookkeeping failure must never roll back or re-run completed work.
-        let _ = self.store.finish_backend_job_delivery(
-            &self.config.workspace_id,
-            &delivery_id,
-            state,
-            category.as_deref(),
-            detail.as_deref(),
-            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-        );
+        notification_delivery::deliver_job_result(self, acceptance);
     }
 
     fn register_workspace_runtime_binding(&self, binding: WorkspaceRuntimeBinding) -> Result<()> {
@@ -46923,7 +46736,16 @@ mod tests {
         .unwrap();
     }
 
+    fn job_notification_evidence(
+        api: &WorkspaceApi,
+        id: &str,
+    ) -> (String, String, bool, Option<String>) {
+        let conn = rusqlite::Connection::open(&api.config.database_path).unwrap();
+        conn.query_row("SELECT d.disposition,d.reason,EXISTS(SELECT 1 FROM notification_acknowledgements a WHERE a.workspace_id=d.workspace_id AND a.delivery_id=d.delivery_id),(SELECT code FROM notification_failures f WHERE f.workspace_id=d.workspace_id AND f.delivery_id=d.delivery_id ORDER BY sequence DESC LIMIT 1) FROM notification_decisions d WHERE d.workspace_id=?1 AND d.delivery_id=?2",rusqlite::params![TEST_WORKSPACE_ID,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap()
+    }
+
     fn spawn_ticket_check_source(api: &WorkspaceApi, name: &str) -> RuntimeWorkerRef {
+        seed_test_delivery_binding(api);
         api.spawn_workspace_worker(
             EMBEDDED_WORKER_RUNTIME_ID,
             WorkerSpawnRequest {
@@ -47601,21 +47423,9 @@ mod tests {
         );
         let stale_delivery_id =
             crate::backend_job::delivery_id(&stale_job.request.job_id, &stale_attempt.attempt_id);
-        let (stale_delivery, claimed) = api
-            .store
-            .reserve_backend_job_delivery(
-                TEST_WORKSPACE_ID,
-                &stale_delivery_id,
-                &stale_job.request.job_id,
-                &source,
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )
-            .unwrap();
-        assert!(!claimed);
-        assert_eq!(stale_delivery.state, BackendJobDeliveryState::Completed);
         assert_eq!(
-            stale_delivery.failure_category.as_deref(),
-            Some("notification_suppressed_stale_ticket_content")
+            job_notification_evidence(&api, &stale_delivery_id),
+            ("suppress".into(), "stale_content".into(), false, None)
         );
 
         api.accept_backend_job_result(
@@ -47633,20 +47443,9 @@ mod tests {
             &current_job.request.job_id,
             &current_attempt.attempt_id,
         );
-        let (clean_delivery, claimed) = api
-            .store
-            .reserve_backend_job_delivery(
-                TEST_WORKSPACE_ID,
-                &clean_delivery_id,
-                &current_job.request.job_id,
-                &source,
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )
-            .unwrap();
-        assert!(!claimed);
         assert_eq!(
-            clean_delivery.failure_category.as_deref(),
-            Some("notification_suppressed_no_findings")
+            job_notification_evidence(&api, &clean_delivery_id),
+            ("suppress".into(), "no_findings".into(), false, None)
         );
 
         let Json(_) = execute_worker_ticket_test_operation(
@@ -47962,21 +47761,15 @@ mod tests {
         );
         let delivery_id =
             crate::backend_job::delivery_id(&request.job_id, &dispatched.attempt.attempt_id);
-        let (delivery, claimed) = api
-            .store
-            .reserve_backend_job_delivery(
-                TEST_WORKSPACE_ID,
-                &delivery_id,
-                &request.job_id,
-                &notification_target,
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )
-            .unwrap();
-        assert!(!claimed);
-        assert_eq!(delivery.state, BackendJobDeliveryState::Unknown);
-        assert_eq!(
-            delivery.failure_category.as_deref(),
-            Some("notification_outcome_unknown")
+        let evidence = job_notification_evidence(&api, &delivery_id);
+        assert_eq!(evidence.0, "deliver");
+        assert!(!evidence.2);
+        assert_eq!(evidence.3.as_deref(), Some("acceptance_unknown"));
+        assert!(
+            api.store
+                .job_notification_request(TEST_WORKSPACE_ID, &delivery_id)
+                .unwrap()
+                .is_some()
         );
     }
 
@@ -48444,6 +48237,7 @@ mod tests {
         )
         .await
         .unwrap();
+        seed_test_delivery_binding(&api);
         let target = api
             .spawn_workspace_worker(
                 EMBEDDED_WORKER_RUNTIME_ID,
@@ -48535,18 +48329,15 @@ mod tests {
                 .any(|request_id| request_id.as_deref() == Some(delivery_id.as_str())),
             "recovery must replay the durable delivery id as the tracked notification id: {request_ids:?}"
         );
-        let (delivery, claimed) = api
-            .store
-            .reserve_backend_job_delivery(
-                TEST_WORKSPACE_ID,
-                &delivery_id,
-                &request.job_id,
-                &target,
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )
-            .unwrap();
-        assert!(!claimed);
-        assert_eq!(delivery.state, BackendJobDeliveryState::Completed);
+        assert_eq!(job_notification_evidence(&api, &delivery_id).2, true);
+        assert!(
+            api.store
+                .list_pending_job_notifications(TEST_WORKSPACE_ID, 100)
+                .unwrap()
+                .is_empty()
+        );
+        notification_delivery::recover_job_notifications(&api);
+        assert!(execution.take_input_request_ids().is_empty());
     }
 
     #[tokio::test]

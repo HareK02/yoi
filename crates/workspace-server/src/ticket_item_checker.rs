@@ -13,9 +13,10 @@
 //!
 //! Results are checked for unknown fields, duplicates, count/string limits, and quotes that are
 //! exact substrings of the checked title/body. Invalid results end as invalid_result.
-//! Delivery rereads the Ticket and notifies the original Worker only of findings matching the
-//! saved digest. No findings and stale results end delivery with distinct suppression reasons,
-//! without redelivery on recovery. Advice is neither an approval gate nor implementation guidance;
+//! Before routing, the adapter rereads the Ticket and reports findings/content freshness.
+//! Common routing records clean/stale suppression separately from Runtime acceptance. Once
+//! a request is pinned, recovery reuses those bytes even if the Ticket later changes.
+//! Advice is neither an approval gate nor implementation guidance;
 //! no findings do not prove the entire specification correct.
 
 use std::collections::BTreeSet;
@@ -217,18 +218,18 @@ fn validate_finding_text(field: &str, value: &str, max_bytes: usize) -> Result<(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TicketItemCheckNotification {
-    Deliver(String),
+pub enum TicketItemCheckFacts {
+    Findings(String),
     NoFindings,
     Stale,
 }
 
-/// Decide whether a completed check should produce an advisory. Clean and stale
-/// results remain distinct so delivery recovery can record why no input was sent.
-pub fn notification(
+/// Domain facts about validated results and the current checked content.
+/// The common routing policy owns whether these facts produce an advisory.
+pub fn result_facts(
     acceptance: &BackendJobResultAcceptance,
     current_ticket: &ticket::Ticket,
-) -> Result<TicketItemCheckNotification> {
+) -> Result<TicketItemCheckFacts> {
     let input = parse_input(&acceptance.job.request.input)?;
     let result = validate_result(
         &acceptance.job.request.input,
@@ -239,12 +240,32 @@ pub fn notification(
     if input.content_digest != content_digest(current_ticket)
         || input.ticket_id != current_ticket.meta.id
     {
-        return Ok(TicketItemCheckNotification::Stale);
+        return Ok(TicketItemCheckFacts::Stale);
     }
     if result.findings.is_empty() {
-        return Ok(TicketItemCheckNotification::NoFindings);
+        return Ok(TicketItemCheckFacts::NoFindings);
     }
 
+    Ok(TicketItemCheckFacts::Findings(render_result(acceptance)?))
+}
+
+/// Stable rendering from the original checked snapshot. Used to pin pre-upgrade
+/// unacknowledged requests without reinterpreting them against newer Ticket text.
+pub(crate) fn render_result(acceptance: &BackendJobResultAcceptance) -> Result<String> {
+    let input = parse_input(&acceptance.job.request.input)?;
+    let result = validate_result(
+        &acceptance.job.request.input,
+        acceptance
+            .job
+            .result
+            .as_ref()
+            .ok_or_else(|| Error::InvalidInput("completed checker has no result".into()))?,
+    )?;
+    if result.findings.is_empty() {
+        return Err(Error::InvalidInput(
+            "clean checker result has no advisory body".into(),
+        ));
+    }
     let mut content = format!(
         "[Ticket item checker advisory]\nTicket: {}\nContent digest: {}\n\nThis is a post-save advisory based only on the inspected Ticket text. It is not a new user request, approval gate, workflow blocker, or implementation instruction.\n",
         input.ticket_resource_key, input.content_digest
@@ -262,7 +283,7 @@ pub fn notification(
             finding.suggestion
         ));
     }
-    Ok(TicketItemCheckNotification::Deliver(content))
+    Ok(content)
 }
 
 #[cfg(test)]

@@ -67,8 +67,9 @@ mod notification_diagnostics;
 #[path = "notification_routing.rs"]
 mod notification_routing;
 pub use notification_routing::{
-    NotificationDeliveryKey, NotificationEventKind, NotificationFailureCode, NotificationPurpose,
-    NotificationReason, TicketWorkerNotification, TicketWorkerNotificationTarget,
+    JobNotificationFacts, JobNotificationSource, NotificationDeliveryKey, NotificationEventKind,
+    NotificationFailureCode, NotificationPurpose, NotificationReason, TicketWorkerNotification,
+    TicketWorkerNotificationTarget,
 };
 #[path = "assignment_tracking.rs"]
 mod assignment_tracking;
@@ -81,7 +82,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 95;
+const LATEST_SCHEMA_VERSION: i64 = 96;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -363,6 +364,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 95,
         name: "Common notification routing and durable Worker delivery",
         apply: migrate_notification_routing_v94_to_v95,
+    },
+    Migration {
+        version: 96,
+        name: "Backend Job common notification routing",
+        apply: migrate_job_notifications_v95_to_v96,
     },
 ];
 
@@ -1704,6 +1710,40 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         failure_detail: Option<&str>,
         now: &str,
     ) -> Result<BackendJobAttemptRecord>;
+    fn job_notification_source(
+        &self,
+        workspace: &str,
+        job: &str,
+        attempt: &str,
+    ) -> Result<JobNotificationSource>;
+    fn list_pending_job_notifications(
+        &self,
+        workspace: &str,
+        limit: usize,
+    ) -> Result<Vec<JobNotificationSource>>;
+    fn route_job_notification(
+        &self,
+        workspace: &str,
+        source: &JobNotificationSource,
+        facts: &JobNotificationFacts,
+    ) -> Result<bool>;
+    fn job_notification_request(
+        &self,
+        workspace: &str,
+        id: &str,
+    ) -> Result<Option<(String, RuntimeWorkerRef)>>;
+    fn authorize_job_notification(
+        &self,
+        workspace: &str,
+        id: &str,
+        target: &TicketWorkerNotificationTarget,
+    ) -> Result<Option<NotificationFailureCode>>;
+    fn ack_job_notification(
+        &self,
+        workspace: &str,
+        id: &str,
+        target: &RuntimeWorkerRef,
+    ) -> Result<()>;
     fn reserve_backend_job_delivery(
         &self,
         workspace_id: &str,
@@ -6973,6 +7013,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 .ok_or_else(|| Error::Store("accepted Backend Job disappeared".to_string()))?;
             let attempt = read_backend_job_attempt(&tx, workspace_id, &submission.job_id, &submission.attempt_id)?
                 .ok_or_else(|| Error::Store("accepted Backend Job attempt disappeared".to_string()))?;
+            notification_routing::jobs::capture(&tx,workspace_id,&submission.job_id,&submission.attempt_id)?;
             tx.commit()?;
             Ok(BackendJobResultAcceptance { job, attempt, replayed: false })
         })
@@ -7185,6 +7226,53 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             tx.commit()?;
             Ok(attempt)
         })
+    }
+
+    fn job_notification_source(
+        &self,
+        workspace: &str,
+        job: &str,
+        attempt: &str,
+    ) -> Result<JobNotificationSource> {
+        notification_routing::jobs::source(self, workspace, job, attempt)
+    }
+    fn list_pending_job_notifications(
+        &self,
+        workspace: &str,
+        limit: usize,
+    ) -> Result<Vec<JobNotificationSource>> {
+        notification_routing::jobs::pending(self, workspace, limit)
+    }
+    fn route_job_notification(
+        &self,
+        workspace: &str,
+        source: &JobNotificationSource,
+        facts: &JobNotificationFacts,
+    ) -> Result<bool> {
+        notification_routing::jobs::route(self, workspace, source, facts)
+    }
+    fn job_notification_request(
+        &self,
+        workspace: &str,
+        id: &str,
+    ) -> Result<Option<(String, RuntimeWorkerRef)>> {
+        notification_routing::jobs::request(self, workspace, id)
+    }
+    fn authorize_job_notification(
+        &self,
+        workspace: &str,
+        id: &str,
+        target: &TicketWorkerNotificationTarget,
+    ) -> Result<Option<NotificationFailureCode>> {
+        notification_routing::jobs::authorize(self, workspace, id, target)
+    }
+    fn ack_job_notification(
+        &self,
+        workspace: &str,
+        id: &str,
+        target: &RuntimeWorkerRef,
+    ) -> Result<()> {
+        notification_routing::jobs::ack(self, workspace, id, target)
     }
 
     fn reserve_backend_job_delivery(
@@ -14137,11 +14225,48 @@ fn migrate_notification_routing_v94_to_v95(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_job_notifications_v95_to_v96(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 95 {
+        return Err(Error::Store(
+            "Job notification migration requires schema 95".into(),
+        ));
+    }
+    let foreign_keys: bool = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+    let legacy_alter: bool = conn.query_row("PRAGMA legacy_alter_table", [], |r| r.get(0))?;
+    conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")?;
+    let result = (|| -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+        notification_routing::jobs::install(&tx)?;
+        let violations: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
+            [],
+            |r| r.get(0),
+        )?;
+        if violations {
+            return Err(Error::Store(
+                "Job notification migration foreign-key violation".into(),
+            ));
+        }
+        tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES(96,'Backend Job common notification routing')",[])?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let restore = conn
+        .execute_batch(&format!(
+            "PRAGMA legacy_alter_table={}; PRAGMA foreign_keys={};",
+            i32::from(legacy_alter),
+            i32::from(foreign_keys)
+        ))
+        .map_err(Error::from);
+    result.and(restore)
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     create_workspace_schema_structure(conn)?;
     assignment_delivery::install(conn)?;
     assignment_delivery::install_post_inputs(conn)?;
     notification_routing::install(conn)?;
+    notification_routing::jobs::install(conn)?;
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
         Error::Store(format!(
             "fresh Workspace Ticket schema verification failed: {error}"
@@ -14399,6 +14524,9 @@ fn verify_workspace_resource_constraints(conn: &Connection) -> Result<()> {
     }
     if current_schema_version(conn)? >= 95 {
         notification_routing::verify(conn)?;
+    }
+    if current_schema_version(conn)? >= 96 {
+        notification_routing::jobs::verify(conn)?;
     }
     Ok(())
 }
@@ -15156,6 +15284,7 @@ mod tests {
     include!("assignment_delivery_tests.rs");
     include!("notification_routing_tests.rs");
     include!("notification_diagnostics_tests.rs");
+    include!("job_notification_tests.rs");
     include!("store_workspace_config_tests.rs");
 
     fn drive_grant_fixture(store: &SqliteWorkspaceStore) -> server_api::DriveGrantResponse {
@@ -17369,6 +17498,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:93, name:"Durable assignment deliveries and source-bound startup fences".into()},
                 WorkspaceSchemaMigrationStep {version:94, name:"Canonical Ticket posts".into()},
                 WorkspaceSchemaMigrationStep {version:95, name:"Common notification routing and durable Worker delivery".into()},
+                WorkspaceSchemaMigrationStep {version:96, name:"Backend Job common notification routing".into()},
             ]
         );
 
@@ -17474,6 +17604,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (93, "Durable assignment deliveries and source-bound startup fences".to_string()),
 (94, "Canonical Ticket posts".to_string()),
 (95, "Common notification routing and durable Worker delivery".to_string()),
+(96, "Backend Job common notification routing".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -20093,7 +20224,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (92, "Ticket-owned assignment tracking".into()),
                          (93, "Durable assignment deliveries and source-bound startup fences".into()),
                          (94, "Canonical Ticket posts".into()),
-                         (95, "Common notification routing and durable Worker delivery".into())]);
+                         (95, "Common notification routing and durable Worker delivery".into()),
+                         (96, "Backend Job common notification routing".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }

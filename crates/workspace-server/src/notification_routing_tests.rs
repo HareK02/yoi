@@ -843,6 +843,7 @@ async fn notification_routing_fresh_and_upgraded_schema_and_guards_match() {
     migrate_assignment_delivery_v92_to_v93(&conn).unwrap();
     migrate_ticket_posts_v93_to_v94(&conn).unwrap();
     migrate_notification_routing_v94_to_v95(&conn).unwrap();
+    migrate_job_notifications_v95_to_v96(&conn).unwrap();
     let snapshot = |conn: &Connection| -> Vec<(String, String)> {
         conn.prepare("SELECT name,sql FROM sqlite_schema WHERE name LIKE 'notification_%' OR name LIKE 'ticket_assignment_content%' OR name IN ('ticket_assignment_title_input','ticket_assignment_initial_post_input') ORDER BY name").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap()
     };
