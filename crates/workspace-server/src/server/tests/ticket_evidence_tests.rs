@@ -18,6 +18,48 @@ const EVIDENCE_MR: &str = "ticket-evidence-mr";
 const EVIDENCE_SOURCE: &str = "immutable-approved-source";
 const EVIDENCE_TARGET: &str = "immutable-target-result";
 
+#[tokio::test]
+async fn ticket_browse_does_not_observe_sources_but_authoritative_query_and_show_still_do() {
+    struct CountingObserver(Arc<std::sync::atomic::AtomicUsize>);
+    impl crate::authority::TicketSourceCommitResolver for CountingObserver {
+        fn resolve_source_commit(
+            &self,
+            _ticket: &str,
+            _repository: &str,
+            _selector: &str,
+        ) -> std::result::Result<String, MergeRequestRefDiagnostic> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(EVIDENCE_SOURCE.into())
+        }
+    }
+    let mut fixture = EvidenceApiFixture::new().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    fixture.api.authority = fixture
+        .api
+        .authority
+        .clone()
+        .with_source_commit_resolver(Arc::new(CountingObserver(calls.clone())));
+    let response = request_json(
+        build_inner_router(fixture.api.clone()),
+        "POST",
+        &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/browse"),
+        Some(json!({"limit":30})),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(response["items"][0]["id"], fixture.ticket_id);
+    assert!(response["items"][0].get("evidence").is_none());
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    fixture
+        .api
+        .authority
+        .query_tickets(Default::default())
+        .unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    fixture.api.authority.ticket(&fixture.ticket_id).unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
 // Deliberately freeze review dates: freshness must follow the exact item
 // content digest and source/result snapshot, not a comparison of wall-clock dates.
 fn evidence_time() -> chrono::DateTime<Utc> {

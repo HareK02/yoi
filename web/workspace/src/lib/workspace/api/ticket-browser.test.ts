@@ -2,6 +2,7 @@ declare const Deno: {
   test(name: string, fn: () => Promise<void> | void): void;
 };
 
+import type { TicketBrowseQueryResponse } from "#lib/generated/ticket-api.ts";
 import { loadJson } from "./http.ts";
 import { fixturePost } from "../home/dashboard.test-fixtures.ts";
 import {
@@ -12,6 +13,7 @@ import {
   parseObjectiveListResponse,
   parseTicketDetail,
   parseTicketListResponse,
+  parseTicketBrowseQueryResponse,
   parseTicketRecordRef,
   parseTicketRoleAssignmentMutationResponse,
   parseTicketSummary,
@@ -44,6 +46,97 @@ const page = {
   source_limit: null,
   source_truncated: false,
 };
+
+function browseFixture(): TicketBrowseQueryResponse {
+  return {
+    record_authority: "sqlite",
+    page: { ...page, has_more: true, next_cursor: "opaque-cursor" },
+    items: [{
+      id: "ticket-id", resource_key: "T-1", title: "Minimal browse row",
+      state: "open", updated_at: null, tags: [], current_closure: null,
+      assignment_tracking: [],
+    }],
+  };
+}
+
+Deno.test("Ticket browse accepts the generated minimal row and preserves cursor metadata without enriched query fields", () => {
+  const fixture = browseFixture();
+  const parsed = parseTicketBrowseQueryResponse(fixture);
+  assertEquals(parsed, { page: fixture.page, record_authority: "sqlite", items: fixture.items });
+  for (const field of ["evidence", "merge_requests", "content_digest", "snippet", "blocker_count", "current_worker"]) {
+    assertEquals(field in parsed.items[0], false);
+    assertThrows(() => parseTicketBrowseQueryResponse({ ...fixture, items: [{ ...fixture.items[0], [field]: null }] }), "unknown field");
+  }
+  assertEquals(parseTicketBrowseQueryResponse({ ...fixture, items: [], page: { ...page, returned: 0 } }).items, []);
+});
+
+Deno.test("Ticket browse preserves case, tags and self-reported handling independently", () => {
+  const fixture = browseFixture();
+  const assignment = {
+    workspace_id: "workspace-a", ticket_id: "ticket-id", assignment_id: "delegation-1",
+    role: "orchestrator", principal: { kind: "workspace_agent", agent_key: "workspace-orchestrator" },
+    assigned_by: "user:alice", assigned_at: "2026-10-15T00:00:00Z", current: true,
+    release: null, last_event_id: "event-1", updated_at: null, migration_diagnostic: null,
+    tracking: { status: "done", waiting_reason: null, progress: "Investigated", next_action: "Human decision", result: "Options returned" },
+  };
+  for (const state of ["open", "closed"]) {
+    const row = parseTicketBrowseQueryResponse({
+      ...fixture,
+      items: [{ ...fixture.items[0], state, tags, current_closure: state === "closed" ? closure : null, assignment_tracking: [assignment] }],
+    }).items[0];
+    assertEquals(row.state, state);
+    assertEquals(row.tags, tags);
+    for (const [field, expected] of Object.entries(assignment)) {
+      assertEquals((row.assignment_tracking[0] as unknown as Record<string, unknown>)[field], expected);
+    }
+    assertEquals(row.current_closure, state === "closed" ? closure : null);
+  }
+  assertThrows(() => parseTicketBrowseQueryResponse({ ...fixture, items: [{ ...fixture.items[0], assignment_tracking: [{ ...assignment, tracking: { status: "running" } }] }] }), "status is invalid");
+});
+
+Deno.test("Ticket browse rejects missing required fields, legacy states and malformed row values", () => {
+  const fixture = browseFixture();
+  for (const field of ["id", "resource_key", "title", "state", "tags", "assignment_tracking"]) {
+    const row: Record<string, unknown> = { ...fixture.items[0] };
+    delete row[field];
+    assertThrows(() => parseTicketBrowseQueryResponse({ ...fixture, items: [row] }), `items[0].${field}`);
+  }
+  for (const [field, value] of [
+    ["id", 1], ["title", false], ["state", "done"], ["state", "queued"],
+    ["updated_at", 7], ["tags", null], ["tags", [{ ...tags[0], id: " " }]],
+    ["assignment_tracking", {}], ["current_closure", { ...closure, reason: "done" }],
+  ] as const) {
+    assertThrows(() => parseTicketBrowseQueryResponse({ ...fixture, items: [{ ...fixture.items[0], [field]: value }] }), `items[0].${field}`);
+  }
+});
+
+Deno.test("Ticket browse validates envelope, pagination and collection bounds", () => {
+  const fixture = browseFixture();
+  for (const field of ["items", "page", "record_authority"]) {
+    const wire: Record<string, unknown> = { ...fixture };
+    delete wire[field];
+    assertThrows(() => parseTicketBrowseQueryResponse(wire), `response.${field}`);
+  }
+  assertThrows(() => parseTicketBrowseQueryResponse({ ...fixture, unexpected: true }), "unknown field");
+  for (const [field, value] of [["has_more", "yes"], ["next_cursor", 42], ["limit", -1], ["returned", 1.5], ["source_truncated", null]] as const) {
+    assertThrows(() => parseTicketBrowseQueryResponse({ ...fixture, page: { ...fixture.page, [field]: value } }), `page.${field}`);
+  }
+  assertThrows(() => parseTicketBrowseQueryResponse({ ...fixture, page: { ...fixture.page, extra: true } }), "unknown field");
+  assertThrows(() => parseTicketBrowseQueryResponse({ ...fixture, items: Array(4097).fill(fixture.items[0]) }), "items exceeds its item limit");
+  assertThrows(() => parseTicketBrowseQueryResponse({ ...fixture, items: [{ ...fixture.items[0], title: "x".repeat(262145) }] }), "title exceeds its length limit");
+});
+
+Deno.test("Ticket browse load diagnostics identify the malformed field without exposing row content", async () => {
+  const fixture = browseFixture();
+  const result = await loadJson(
+    (async () => Response.json({ ...fixture, items: [{ ...fixture.items[0], title: "PRIVATE_TITLE", tags: null }] })) as typeof fetch,
+    "/api/w/workspace-a/tickets/browse", { method: "POST" },
+    parseTicketBrowseQueryResponse, TICKET_BROWSER_API_LOAD_POLICY,
+  );
+  assertEquals(result.data, null);
+  assertEquals(result.error, "Ticket Browser API: Ticket browse response.items[0].tags must be an array");
+  assertEquals(result.error?.includes("PRIVATE_TITLE"), false);
+});
 
 Deno.test("Ticket post parser preserves author and edit metadata independently of pagination", () => {
   const initial = fixturePost("Current initial post", { edited_at: "2026-10-13T10:00:00Z", edited_by: "Rin" });

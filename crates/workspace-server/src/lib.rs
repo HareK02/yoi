@@ -26,6 +26,8 @@ pub mod server;
 pub mod skills;
 pub mod store;
 pub mod subjektiv;
+#[cfg(test)]
+mod ticket_browse_performance_tests;
 mod ticket_item_checker;
 pub mod workdir_create_operations;
 mod workdir_removal;

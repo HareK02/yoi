@@ -59,13 +59,13 @@ fn cases() -> Vec<(PublicAssignmentKind, Value, Value)> {
         ),
         (
             PublicAssignmentKind::ImplementationResult,
-            json!({"ticket":"T-743","assignment_id":"implementation","orchestrator_assignment_id":"delegation","operation_key":"result-1","kind":"result","body":"Research without an MR","merge_request":null}),
-            json!({"result_id":"result-id","ticket_id":"T-743","created_at":"now","request":{"assignment_id":"implementation","orchestrator_assignment_id":"delegation","operation_key":"result-1","kind":"result","body":"Research without an MR","merge_request":null}}),
+            json!({"ticket":"T-743","kind":"result","body":"Research without an MR","merge_request":null}),
+            json!({"result_id":"result-id","ticket_id":"T-743","created_at":"now","request":{"operation_key":"result-1","kind":"result","body":"Research without an MR","merge_request":null}}),
         ),
         (
             PublicAssignmentKind::ImplementationResultQuery,
             json!({"ticket":"T-743","result_id":"result-id"}),
-            json!({"result_id":"result-id","ticket_id":"T-743","created_at":"now","request":{"assignment_id":"implementation","orchestrator_assignment_id":"delegation","operation_key":"result-1","kind":"result","body":"Research without an MR","merge_request":null}}),
+            json!({"result_id":"result-id","ticket_id":"T-743","created_at":"now","request":{"operation_key":"result-1","kind":"result","body":"Research without an MR","merge_request":null}}),
         ),
         (
             PublicAssignmentKind::Answer,
@@ -175,6 +175,203 @@ async fn assign_reissue_and_clear_forward_observed_identity_and_exact_retry_with
         }
     }
 }
+#[tokio::test]
+async fn implementation_result_schema_exposes_only_report_facts_and_rejects_forged_fields() {
+    let (kind, input, response) = cases().remove(4);
+    let client = transport(200, response);
+    let (meta, tool) = definition(client.clone(), kind)();
+    let properties = meta.input_schema["properties"].as_object().unwrap();
+    assert_eq!(properties.len(), 4);
+    for field in ["ticket", "kind", "body", "merge_request"] {
+        assert!(properties.contains_key(field), "missing {field}");
+    }
+    assert_eq!(meta.input_schema["additionalProperties"], false);
+    let schema = jsonschema::validator_for(&meta.input_schema).unwrap();
+    let mut minimal = input.clone();
+    minimal.as_object_mut().unwrap().remove("merge_request");
+    assert!(schema.is_valid(&minimal));
+    assert!(serde_json::from_value::<ImplementationResultInput>(minimal).is_ok());
+    for field in [
+        "operation_key",
+        "assignment_id",
+        "orchestrator_assignment_id",
+        "result_id",
+        "call_id",
+        "request",
+        "actor",
+        "runtime_id",
+        "worker_id",
+    ] {
+        let mut forged = input.clone();
+        forged[field] = json!("forged");
+        assert!(!schema.is_valid(&forged), "schema accepts {field}");
+        assert!(serde_json::from_value::<ImplementationResultInput>(forged.clone()).is_err());
+        assert!(matches!(
+            tool.execute(&forged.to_string(), ToolExecutionContext::direct())
+                .await,
+            Err(ToolError::InvalidArgument(_))
+        ));
+    }
+    assert!(client.requests.lock().unwrap().is_empty());
+    let query = PublicAssignmentKind::ImplementationResultQuery.schema();
+    assert!(query["properties"].get("result_id").is_some());
+    assert!(
+        query["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("result_id"))
+    );
+}
+
+#[tokio::test]
+async fn implementation_result_transport_key_uses_only_trusted_invocation_identity() {
+    let (kind, input, response) = cases().remove(4);
+    let client = transport(200, response);
+    let (_, tool) = definition(client.clone(), kind)();
+    for ctx in [
+        ToolExecutionContext::new("call-a", "batch-a", 0),
+        ToolExecutionContext::new("call-a", "batch-b", 7),
+        ToolExecutionContext::new("call-b", "batch-a", 0),
+    ] {
+        tool.execute(&input.to_string(), ctx).await.unwrap();
+    }
+    let requests = client.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0], requests[1]);
+    assert_ne!(requests[0], requests[2]);
+    for (request, call_id) in requests.iter().zip(["call-a", "call-a", "call-b"]) {
+        assert_eq!(request.method, WorkspaceRequestMethod::Post);
+        assert!(
+            request
+                .path
+                .ends_with("/tickets/T-743/implementation-results")
+        );
+        let body: Value = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+        let mut expected = input.clone();
+        expected.as_object_mut().unwrap().remove("ticket");
+        expected["operation_key"] = json!(format!("ticket-implementation-result:T-743:{call_id}"));
+        assert_eq!(body, expected);
+        assert!(body.get("assignment_id").is_none());
+        assert!(body.get("orchestrator_assignment_id").is_none());
+    }
+}
+
+#[tokio::test]
+async fn implementation_result_missing_or_invalid_context_fails_before_dispatch() {
+    let (kind, input, response) = cases().remove(4);
+    let client = transport(200, response);
+    let (_, tool) = definition(client.clone(), kind)();
+    for call_id in [
+        String::new(),
+        " \t".into(),
+        "call\nforged".into(),
+        "x".repeat(1025),
+    ] {
+        let error = tool
+            .execute(
+                &input.to_string(),
+                ToolExecutionContext::new(call_id, "batch", 0),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArgument(_)));
+        assert!(error.to_string().contains("tool call_id"));
+    }
+    // A valid call ID must also fit the bounded transport key after namespacing.
+    assert!(matches!(
+        tool.execute(
+            &input.to_string(),
+            ToolExecutionContext::new("x".repeat(1024), "batch", 0),
+        )
+        .await,
+        Err(ToolError::InvalidArgument(_))
+    ));
+    assert!(client.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn implementation_result_validates_report_body_ticket_kind_and_optional_mr() {
+    let (kind, input, response) = cases().remove(4);
+    let client = transport(200, response);
+    let (meta, tool) = definition(client.clone(), kind)();
+    let schema = jsonschema::validator_for(&meta.input_schema).unwrap();
+    let mut invalid_inputs = vec![];
+    for body in [
+        String::new(),
+        " \n".into(),
+        "x".repeat(16385),
+        "text\0hidden".into(),
+        "é".repeat(8193),
+    ] {
+        let mut invalid = input.clone();
+        invalid["body"] = json!(body);
+        invalid_inputs.push(invalid);
+    }
+    for value in [String::new(), " \t".into(), "x\n".into(), "x".repeat(1025)] {
+        let mut invalid = input.clone();
+        invalid["ticket"] = json!(value);
+        invalid_inputs.push(invalid);
+        for field in ["merge_request_id", "subject_ref"] {
+            let mut invalid = input.clone();
+            invalid["merge_request"] = json!({"merge_request_id":"MR-1","subject_ref":"source"});
+            invalid["merge_request"][field] = json!(value);
+            invalid_inputs.push(invalid);
+        }
+    }
+    for value in [json!("done"), json!(null), json!(42)] {
+        let mut invalid = input.clone();
+        invalid["kind"] = value;
+        assert!(!schema.is_valid(&invalid));
+        invalid_inputs.push(invalid);
+    }
+    for mr in [
+        json!({"merge_request_id":"MR-1"}),
+        json!({"merge_request_id":"MR-1","subject_ref":"source","operation_key":"forged"}),
+    ] {
+        let mut invalid = input.clone();
+        invalid["merge_request"] = mr;
+        assert!(!schema.is_valid(&invalid));
+        invalid_inputs.push(invalid);
+    }
+    for invalid in invalid_inputs {
+        assert!(matches!(
+            tool.execute(&invalid.to_string(), ToolExecutionContext::direct())
+                .await,
+            Err(ToolError::InvalidArgument(_))
+        ));
+    }
+    assert!(client.requests.lock().unwrap().is_empty());
+    for (index, report_kind) in ["handoff", "result", "blocker"].into_iter().enumerate() {
+        let mut valid = input.clone();
+        valid["kind"] = json!(report_kind);
+        valid["body"] = json!("é".repeat(8192));
+        if index == 0 {
+            valid.as_object_mut().unwrap().remove("merge_request");
+        } else if index == 2 {
+            valid["merge_request"] = json!({"merge_request_id":"MR-1","subject_ref":"source"});
+        }
+        assert!(schema.is_valid(&valid));
+        tool.execute(
+            &valid.to_string(),
+            ToolExecutionContext::new(format!("call-{index}"), "batch", index),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(client.requests.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn implementation_result_guidance_keeps_retry_identity_host_owned() {
+    let description = description("TicketImplementationResult");
+    assert!(description.contains("authenticated active Workspace Worker"));
+    assert!(description.contains("Host owns transport retry identity"));
+    assert!(description.contains("a new invocation is a new report"));
+    assert!(description.contains("rather than blindly submitting"));
+    assert!(!description.contains("operation_key"));
+    assert!(!description.contains("fences both assignments"));
+}
+
 #[tokio::test]
 async fn continuing_answer_forwards_same_assignment_event_cas_and_saved_receipt() {
     let (kind, input, response) = cases().pop().unwrap();
@@ -509,6 +706,105 @@ async fn invalid_answer_body_and_assignment_identities_fail_before_dispatch() {
         }
     }
     assert!(client.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn implementation_result_wip_and_native_dispatch_preserve_trusted_call_context() {
+    let (kind, input, response) = cases().remove(4);
+    let client = transport(200, response);
+    let (_, direct_tool) = definition(client.clone(), kind)();
+    direct_tool
+        .execute(
+            &input.to_string(),
+            ToolExecutionContext::new("call-a", "native", 0),
+        )
+        .await
+        .unwrap();
+    let tools = native_ticket_tools(client.clone(), TicketFeatureAccess::workflow()).unwrap();
+    let handler = TicketItemWipHandler {
+        tools: operation_map(
+            tools
+                .into_iter()
+                .filter(|t| t.projection.surface == NativeTicketSurface::Item)
+                .collect(),
+        ),
+        permissions: None,
+        ticket_reference: "T-743".into(),
+        observations: Arc::new(Mutex::new(TicketObservationState::default())),
+    };
+    let args: BTreeMap<_, _> = input
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(key, _)| key.as_str() != "ticket")
+        .map(|(key, value)| (key.clone(), json_to_wip(value).unwrap()))
+        .collect();
+    for call_id in ["call-a", "call-b"] {
+        handler
+            .call(
+                "implementation_result",
+                &args,
+                WipCallContext {
+                    execution: ToolExecutionContext::new(call_id, "wip", 3),
+                    security_context: "worker".into(),
+                },
+            )
+            .await
+            .unwrap_or_else(|_| panic!("WIP implementation_result rejected {call_id}"));
+    }
+    {
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0], requests[1]);
+        assert_ne!(requests[1], requests[2]);
+        let body: Value = serde_json::from_str(requests[2].body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body["operation_key"],
+            "ticket-implementation-result:T-743:call-b"
+        );
+    }
+    assert!(matches!(
+        handler
+            .call(
+                "implementation_result",
+                &args,
+                WipCallContext {
+                    execution: ToolExecutionContext::new("", "wip", 0),
+                    security_context: "worker".into(),
+                },
+            )
+            .await,
+        Err(WipOperationError::Protocol(ProtocolError {
+            code: ProtocolErrorCode::InvalidArguments,
+            ..
+        }))
+    ));
+    for field in [
+        "operation_key",
+        "assignment_id",
+        "orchestrator_assignment_id",
+        "call_id",
+    ] {
+        let mut forged = args.clone();
+        forged.insert(field.into(), WipValue::String("forged".into()));
+        assert!(matches!(
+            handler
+                .call(
+                    "implementation_result",
+                    &forged,
+                    WipCallContext {
+                        execution: ToolExecutionContext::new("call-c", "wip", 0),
+                        security_context: "worker".into(),
+                    },
+                )
+                .await,
+            Err(WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::InvalidArguments,
+                ..
+            }))
+        ));
+    }
+    assert_eq!(client.requests.lock().unwrap().len(), 3);
 }
 
 #[tokio::test]

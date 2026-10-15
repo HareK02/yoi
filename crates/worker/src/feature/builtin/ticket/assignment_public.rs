@@ -91,8 +91,9 @@ struct AnswerInput {
 #[serde(deny_unknown_fields)]
 struct ImplementationResultInput {
     ticket: String,
-    #[serde(flatten)]
-    request: server_api::TicketImplementationResultRequest,
+    kind: server_api::TicketImplementationResultKind,
+    body: String,
+    merge_request: Option<server_api::MergeRequestReviewSubject>,
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -157,7 +158,7 @@ pub(super) fn description(name: &str) -> &'static str {
             "Append continuing input to the observed current waiting/inprogress assignment with assignment_id, expected_last_event_id, stable operation_key and bounded answer body. Query current tracking first. Answers continue the same row without automatic inprogress; done requires explicit new Assign/reissue instead. Backend authenticates/fences source, current assignment and event CAS, then saves input/audit/exact receipt atomically and notifies committed input. Exact retry retains full input/key; stale/cleared/replaced conflicts require rereading, and unknown outcome must not be retried as a fresh operation. No model actor/role claims, new assignment, case closure or Worker start."
         }
         "TicketImplementationResult" => {
-            "Save an explicit handoff, result or blocker for the current implementation assignment and its original Orchestrator delegation. Read ShowTicket first for assignment identities. Backend authenticates the implementation Worker and fences both assignments; this is not AssignmentAnswer or a handling update. Optional MR/source identifies retained evidence, never approval. Retry an unknown response using exactly the same operation_key and full input; changed input with the same key is rejected. Result and durable notification source commit together. No case closure, new Assign, Worker stop or integration occurs."
+            "Report facts as the authenticated active Workspace Worker for this Ticket: an explicit handoff, result or blocker with kind, bounded body and optional retained MR/source evidence. No current or pinned implementation assignment or Orchestrator delegation match is required; do not supply assignment identities or actor claims. The Host owns transport retry identity: retries of the same tool invocation and full input are idempotent; a new invocation is a new report. If the outcome is uncertain, reconcile saved evidence rather than blindly submitting a new invocation. This is not AssignmentAnswer, a handling update or approval. Result and durable notification source commit together. No case closure, new Assign, Worker stop or integration occurs."
         }
         "TicketImplementationResultQuery" => {
             "Read one saved implementation result by Ticket and result_id from a result notification/receipt. Historical evidence is not a new request or approval; reread current delegation and MR before acting."
@@ -196,7 +197,11 @@ struct PublicAssignmentTool {
 }
 #[async_trait]
 impl Tool for PublicAssignmentTool {
-    async fn execute(&self, input: &str, _: ToolExecutionContext) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: &str,
+        ctx: ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         self.client
             .workspace_id()
             .filter(|id| !id.trim().is_empty())
@@ -282,31 +287,34 @@ impl Tool for PublicAssignmentTool {
                 let input: ImplementationResultInput =
                     serde_json::from_str(input).map_err(parse)?;
                 identity("ticket", &input.ticket)?;
-                for (name, value) in [
-                    ("assignment_id", &input.request.assignment_id),
-                    (
-                        "orchestrator_assignment_id",
-                        &input.request.orchestrator_assignment_id,
-                    ),
-                    ("operation_key", &input.request.operation_key),
-                ] {
-                    identity(name, value)?;
-                }
-                if input.request.body.trim().is_empty()
-                    || input.request.body.len() > 16384
-                    || input.request.body.contains('\0')
+                // Retry identity belongs to the Host, never model input. Missing trusted
+                // context must fail closed rather than minting a replacement identity.
+                identity("tool call_id", &ctx.call_id)?;
+                let operation_key = format!(
+                    "ticket-implementation-result:{}:{}",
+                    input.ticket, ctx.call_id
+                );
+                identity("operation_key", &operation_key)?;
+                if input.body.trim().is_empty()
+                    || input.body.len() > 16384
+                    || input.body.contains('\0')
                 {
                     return Err(ToolError::InvalidArgument(
                         "Result body must be nonblank, NUL-free and at most 16384 bytes".into(),
                     ));
                 }
-                if let Some(mr) = &input.request.merge_request {
+                if let Some(mr) = &input.merge_request {
                     identity("merge_request_id", &mr.merge_request_id)?;
                     identity("subject_ref", &mr.subject_ref)?;
                 }
                 WorkspaceServerOperation::TicketImplementationResult {
                     ticket_id: input.ticket,
-                    request: input.request,
+                    request: server_api::TicketImplementationResultRequest {
+                        operation_key,
+                        kind: input.kind,
+                        body: input.body,
+                        merge_request: input.merge_request,
+                    },
                 }
             }
             PublicAssignmentKind::ImplementationResultQuery => {

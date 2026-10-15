@@ -10,15 +10,17 @@
     workspaceApiPath,
   } from "#lib/workspace/api/http.ts";
   import { parseBrowserWorkspaceOrchestratorResponse } from "#lib/workspace/api/workers.ts";
+  import { loadWorkspaceRepositoryList } from "#lib/workspace/api/repositories.ts";
+  import type { RepositoryListResponse } from "#lib/generated/repository-api.ts";
   import {
     TICKET_BROWSER_API_LOAD_POLICY,
     TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
-    parseTicketQueryResponse,
+    parseTicketBrowseQueryResponse,
     parseTicketRecordRef,
   } from "#lib/workspace/api/ticket-browser.ts";
   import type {
     NewTicket,
-    TicketQueryItem as TicketSummary,
+    TicketBrowseQueryItem as TicketSummary,
     TicketTarget,
     TicketTargetAccess,
   } from "#lib/generated/ticket-api.ts";
@@ -44,19 +46,33 @@
   let searchBusy = $state(false);
   let pageBusy = $state(false);
   let navigationError = $state<string | null>(null);
+  let routeGeneration = 0;
   $effect(() => {
     const currentData = data;
+    const generation = ++routeGeneration;
     untrack(() => {
       response = currentData.tickets;
       searchText = currentData.search;
+      searchBusy = false;
       pageBusy = false;
       navigationError = null;
-      orchestrator = currentData.orchestrator;
+      orchestrator = { data: null, error: null };
+      orchestratorLoading = true;
+      orchestratorStarting = false;
+      repositoryResponse = { data: null, error: null };
+      repositoriesLoading = false;
+      creatingTicket = false;
+      createBusy = false;
+      createError = null;
+      createTitle = "";
+      createBody = "";
+      createTargets = [];
+      void loadOrchestrator(currentData, generation);
     });
+    return () => { ++routeGeneration; };
   });
-  let orchestrator = $state<ApiResult<WorkspaceOrchestratorStatus>>(
-    untrack(() => data.orchestrator),
-  );
+  let orchestrator = $state<ApiResult<WorkspaceOrchestratorStatus>>({ data: null, error: null });
+  let orchestratorLoading = $state(true);
   let orchestratorStarting = $state(false);
   let creatingTicket = $state(false);
   let createBusy = $state(false);
@@ -64,8 +80,11 @@
   let createTitle = $state("");
   let createBody = $state("");
   let createTargets = $state<EditableTicketTarget[]>([]);
-  const repositories = $derived(data.repositories.data?.items ?? []);
+  let repositoryResponse = $state<ApiResult<RepositoryListResponse>>({ data: null, error: null });
+  let repositoriesLoading = $state(false);
+  const repositories = $derived(repositoryResponse.data?.items ?? []);
   const createTargetsSavable = $derived.by(() => {
+    if (repositoriesLoading || !repositoryResponse.data) return false;
     const keys = new Set<string>();
     for (const target of createTargets) {
       if (
@@ -77,9 +96,42 @@
     }
     return true;
   });
+  function isCurrent(observedData: PageData, generation: number): boolean {
+    return data === observedData && routeGeneration === generation;
+  }
+
+  async function loadOrchestrator(observedData: PageData, generation: number): Promise<void> {
+    const result = await loadJson(
+      fetch, workspaceApiPath(observedData.workspaceId, "/orchestrator"), undefined,
+      parseBrowserWorkspaceOrchestratorResponse,
+    );
+    if (!isCurrent(observedData, generation)) return;
+    orchestrator = result;
+    orchestratorLoading = false;
+  }
+
+  async function loadRepositories(): Promise<void> {
+    if (repositoriesLoading) return;
+    const observedData = data;
+    const generation = routeGeneration;
+    repositoriesLoading = true;
+    repositoryResponse = { data: null, error: null };
+    const result = await loadWorkspaceRepositoryList(fetch, observedData.workspaceId);
+    if (!isCurrent(observedData, generation)) return;
+    repositoryResponse = result;
+    repositoriesLoading = false;
+  }
+
+  function toggleCreate(): void {
+    creatingTicket = !creatingTicket;
+    if (creatingTicket && !repositoryResponse.data) void loadRepositories();
+  }
+
   async function searchTickets(event?: SubmitEvent) {
     event?.preventDefault();
     if (searchBusy) return;
+    const observedData = data;
+    const generation = routeGeneration;
     searchBusy = true;
     navigationError = null;
     try {
@@ -88,9 +140,11 @@
         reset: false, refreshAll: true,
       });
     } catch (error) {
-      navigationError = error instanceof Error ? error.message : String(error);
+      if (isCurrent(observedData, generation)) {
+        navigationError = error instanceof Error ? error.message : String(error);
+      }
     } finally {
-      searchBusy = false;
+      if (isCurrent(observedData, generation)) searchBusy = false;
     }
   }
 
@@ -106,21 +160,22 @@
   async function loadMore(): Promise<void> {
     if (pageBusy || searchBusy || !data.queryRequest || (response.data && !response.data.page.has_more)) return;
     const observedData = data;
+    const generation = routeGeneration;
     const previous = response.data;
     pageBusy = true;
     response = { data: previous, error: null };
     const result = await loadJson(
       fetch,
-      workspaceApiPath(observedData.workspaceId, "/tickets/query"),
+      workspaceApiPath(observedData.workspaceId, "/tickets/browse"),
       {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ ...observedData.queryRequest, cursor: previous?.page.next_cursor ?? null }),
       },
-      parseTicketQueryResponse,
+      parseTicketBrowseQueryResponse,
       TICKET_BROWSER_API_LOAD_POLICY,
     );
     // 旧query/Workspaceの遅延応答で、現在の一覧やページ状態を上書きしない。
-    if (data !== observedData) return;
+    if (!isCurrent(observedData, generation)) return;
     response = result.data
       ? { data: { ...result.data, items: mergeTickets(previous?.items ?? [], result.data.items) }, error: null }
       : { data: previous, error: result.error };
@@ -152,6 +207,8 @@
   async function createTicket(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     if (createBusy || !createTitle.trim() || !createTargetsSavable) return;
+    const observedData = data;
+    const generation = routeGeneration;
     createBusy = true;
     createError = null;
     const request: NewTicket = {
@@ -166,31 +223,38 @@
     };
     try {
       const created = await workspaceApiJsonWithBody(
-        workspaceApiPath(data.workspaceId, "/tickets"),
+        workspaceApiPath(observedData.workspaceId, "/tickets"),
         { method: "POST", body: JSON.stringify(request) },
         parseTicketRecordRef,
         TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
       );
+      if (!isCurrent(observedData, generation)) return;
       const reference = created.resource_key ?? created.id;
       await goto(
         `/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(reference)}`,
       );
     } catch (error) {
-      createError = error instanceof Error ? error.message : String(error);
+      if (isCurrent(observedData, generation)) {
+        createError = error instanceof Error ? error.message : String(error);
+      }
     } finally {
-      createBusy = false;
+      if (isCurrent(observedData, generation)) createBusy = false;
     }
   }
 
   async function startOrchestrator() {
-    if (orchestratorStarting || orchestrator.data?.online) return;
+    if (orchestratorLoading || orchestratorStarting || orchestrator.data?.online) return;
+    const observedData = data;
+    const generation = routeGeneration;
     orchestratorStarting = true;
-    orchestrator = await loadJson<WorkspaceOrchestratorStatus>(
+    const result = await loadJson<WorkspaceOrchestratorStatus>(
       fetch,
-      workspaceApiPath(data.workspaceId, "/orchestrator"),
+      workspaceApiPath(observedData.workspaceId, "/orchestrator"),
       { method: "POST" },
       parseBrowserWorkspaceOrchestratorResponse,
     );
+    if (!isCurrent(observedData, generation)) return;
+    orchestrator = result;
     orchestratorStarting = false;
   }
 
@@ -214,13 +278,13 @@
       <button
         class="workspace-primary-button"
         type="button"
-        onclick={() => creatingTicket = !creatingTicket}
+        onclick={toggleCreate}
       >{creatingTicket ? "Cancel" : "Add Ticket"}</button>
-      <div class="orchestrator-status" data-online={orchestrator.data?.online ?? false}>
+      <div class="orchestrator-status" data-online={orchestrator.data?.online} aria-busy={orchestratorLoading}>
         <span class="orchestrator-status-dot"></span>
         <div>
           <strong>Orchestrator</strong>
-          <span>{orchestrator.data ? orchestrator.data.online ? "Online" : "Offline" : "Unavailable"}</span>
+          <span>{orchestratorLoading ? "Checking…" : orchestrator.data ? orchestrator.data.online ? "Online" : "Offline" : "Unavailable"}</span>
         </div>
         {#if orchestrator.data && !orchestrator.data.online}
           <button
@@ -240,8 +304,11 @@
     <form class="ticket-editor ticket-create-form" onsubmit={createTicket}>
       <h2>New Ticket</h2>
       {#if createError}<p class="workspace-callout is-error" role="alert">{createError}</p>{/if}
-      {#if data.repositories.error}
-        <p class="workspace-callout is-error" role="alert">Repositories: {data.repositories.error}</p>
+      {#if repositoriesLoading}
+        <p role="status">Loading repositories…</p>
+      {:else if repositoryResponse.error}
+        <p class="workspace-callout is-error" role="alert">Repositories: {repositoryResponse.error}</p>
+        <button class="workspace-secondary-button" type="button" onclick={loadRepositories}>Retry repositories</button>
       {/if}
       <label>Title<input bind:value={createTitle} required /></label>
       <label>Body<textarea bind:value={createBody} rows="8"></textarea></label>

@@ -29,7 +29,7 @@ server-api.workspace = true
 project-record.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls"] }
 ring.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["functions"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_yaml.workspace = true

@@ -460,6 +460,13 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "Array_of_WorkspaceTag")],
         },
         OperationContract {
+            path: "/api/w/{workspace_id}/tickets/browse",
+            method: "post",
+            operation_id: "ticket_browse",
+            request: Some("TicketBrowseQueryRequest"),
+            successes: &[("200", "TicketBrowseQueryResponse")],
+        },
+        OperationContract {
             path: "/api/w/{workspace_id}/tickets/query",
             method: "post",
             operation_id: "ticket_query",

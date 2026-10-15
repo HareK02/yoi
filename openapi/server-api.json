@@ -11605,6 +11605,164 @@
         ],
         "type": "object"
       },
+      "TicketBrowseQueryItem": {
+        "additionalProperties": false,
+        "properties": {
+          "assignment_tracking": {
+            "items": {
+              "$ref": "#/components/schemas/TicketAssignmentTrackingProjection"
+            },
+            "type": "array"
+          },
+          "current_closure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketClosureJudgment"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "resource_key": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/BrowserTicketState"
+          },
+          "tags": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceTag"
+            },
+            "type": "array"
+          },
+          "title": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "resource_key",
+          "title",
+          "state",
+          "tags",
+          "assignment_tracking"
+        ],
+        "type": "object"
+      },
+      "TicketBrowseQueryRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "assigned_principal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketAssignmentPrincipalSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "closure_reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketClosureReason"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Exact current closed-case reason; historical reasons do not match this filter."
+          },
+          "cursor": {
+            "description": "Browse-only cursor bound to the Workspace, canonical filters, and sort.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "handling_status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TicketAssignmentTrackingStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limit": {
+            "format": "uint",
+            "maximum": 1000,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "query": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sort": {
+            "description": "Only updated_desc is supported; defaults to updated_desc.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "states": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/TicketState"
+            },
+            "type": "array"
+          },
+          "tag_ids": {
+            "default": [],
+            "description": "Every supplied active tag ID must match (AND).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "TicketBrowseQueryResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/TicketBrowseQueryItem"
+            },
+            "type": "array"
+          },
+          "page": {
+            "$ref": "#/components/schemas/QueryPage"
+          },
+          "record_authority": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "items",
+          "page",
+          "record_authority"
+        ],
+        "type": "object"
+      },
       "TicketCaseAction": {
         "description": "Close requires an open case; reopen and correction require a closed case.\nReopen clears the current judgment but retains its history and last closure key.\nCorrection appends a new judgment without rewriting the old one.",
         "oneOf": [
@@ -12734,9 +12892,6 @@
       "TicketImplementationResultRequest": {
         "additionalProperties": false,
         "properties": {
-          "assignment_id": {
-            "type": "string"
-          },
           "body": {
             "type": "string"
           },
@@ -12754,16 +12909,12 @@
             ]
           },
           "operation_key": {
-            "type": "string"
-          },
-          "orchestrator_assignment_id": {
+            "description": "Host-owned replay identity; model-facing tools derive it from the Tool call.",
             "type": "string"
           }
         },
         "required": [
           "operation_key",
-          "assignment_id",
-          "orchestrator_assignment_id",
           "kind",
           "body"
         ],
@@ -17582,7 +17733,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:230dd390bd140496b25b27e4ddf96cf07af1c48721654d0bcda8e5dc6733622c"
+    "x-yoi-source-digest": "sha256:04100376ce54b912df019137dbf7414f9cb2930293ee237a905bc6a5543c294f"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -34631,6 +34782,103 @@
             "description": "Error response"
           },
           "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/tickets/browse": {
+      "post": {
+        "operationId": "ticket_browse",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TicketBrowseQueryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketBrowseQueryResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
             "content": {
               "application/json": {
                 "schema": {

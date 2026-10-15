@@ -12,7 +12,7 @@ Ticket case/handling, MR approval, Job execution, or Worker lifecycle.
 | Ticket Assign, Answer, item/content edits | Ticket transaction triggers → `notification_routing` | Original delegation; explicit request vs attention. No recipient, released/history, closed/done, unsupported recipient and self-notification are recorded separately. | Assignment reservations, pinned requests, authorized targets and ACKs; common recovery; `assignment_delivery_tests.rs` and `server_assignment_delivery_tests.rs`. |
 | Ticket comments/post edits, tags, case, tracking, release | Same capture and routing ledger | They do not become new Orchestrator requests. Applicable implementation-Worker attention is distinct from new delegation. | Same evidence; `notification_routing_tests.rs` covers positive and negative routes. Unknown source kinds defer explicitly. |
 | MR review requested/result/revoked/cancelled/merge and observed source changes | MR transaction/source-observation triggers → common routing | Ticket delegation and implementation recipient captured at the event. MR remains the freshness/approval authority. | Stable MR event identity; current MR must be reread before action. Ordinary review comments are not inferred handoffs. `implementation_result_tests.rs` and `server_implementation_result_tests.rs` cover capture, self-suppression, recovery and public diagnostics. |
-| Explicit implementation result/handoff/blocker | Authenticated `TicketImplementationResult` transaction | Implementation assignment and its pinned Orchestrator delegation, with exact-replay identity. No substitution of AssignmentAnswer or self-reported handling. | Result and source persist together; same common delivery/receipt path. No MR is required. |
+| Explicit implementation result/handoff/blocker | Authenticated `TicketImplementationResult` transaction | Authenticated Workspace Worker and Ticket, without assignment membership requirements. The current Orchestrator is captured at report-save time, or no-recipient is recorded. No substitution of AssignmentAnswer or self-reported handling. | Result and source persist together; same common delivery/receipt path. No MR is required. |
 | Backend Job accepted result | Result transaction → `notification_routing::jobs` | Fixed recipient, never replacement by the current Orchestrator. No target, checker no-findings and stale content suppress without ACK. Domain validation/rendering remains in the adapter. | Common request/ACK/failure ledger, fixed bytes/recipient, startup and periodic recovery; `job_notification_tests.rs` and `server_job_notification_tests.rs`. |
 | Explicit WorkerNotify/WorkerSendInput | Authenticated caller | Explicit communication, not automatic business routing. | Existing Worker control boundary; not inferred from Ticket activity. |
 | Internal SubWorker → parent / Web subscriptions | Parent-owned execution / UI synchronization | Separate ownership and authorization. | Not migrated into business-notification routing. |
@@ -31,8 +31,14 @@ uses real Git publication and signed HTTP to cover the opening baseline, a later
 source change before review, and result reporting against observation-only evidence.
 
 Schema 96 migrates Job notifications; schema 97 installs MR/implementation-result
-capture. Legacy Job ACKs and suppressions remain distinct. Ambiguous legacy
-implementation ownership remains unknown; comments never synthesize a result.
+capture. Schema 98 removes assignment ownership and caller-supplied assignment IDs
+from result reporting, preserving prior result bytes and notification evidence.
+Legacy Job ACKs and suppressions remain distinct; comments never synthesize a result.
+The model supplies only Ticket, kind, body and optional MR evidence. Host-side tools
+use the durable Tool call identity as the transport replay key. Retrying the same
+invocation cannot duplicate a report; a new invocation is a new report, so an unknown
+outcome must not be retried blindly with a fresh call. Stored notifications retain
+their captured recipient rather than being reassigned during delivery recovery.
 Preparation failures remain retryable and visible after recovery; durable fair
 scheduling prevents repeated failures from starving healthy or already-pinned work.
 

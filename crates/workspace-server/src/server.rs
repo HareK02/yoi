@@ -6671,6 +6671,7 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::ticket_create_record(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::ticket_browse(service.clone()))
         .merge(server_api::server_api_axum::ticket_query(service.clone()))
         .merge(server_api::server_api_axum::ticket_get_alias(
             service.clone(),
@@ -10146,6 +10147,25 @@ impl server_api::ServerApi for ServerApiContractService {
         })
         .map_err(ApiError::into_repository_api_error)?;
         Ok(server_api::TicketRecordRef(response))
+    }
+
+    async fn ticket_browse(
+        &self,
+        workspace_id: String,
+        request: server_api::TicketBrowseQueryRequest,
+    ) -> std::result::Result<server_api::TicketBrowseQueryResponse, server_api::RepositoryApiError>
+    {
+        let api = self.workspace_api()?.clone();
+        api.store
+            .db_executor()
+            .run(move || {
+                validate_workspace_scope(&api, &workspace_id)?;
+                api.authority
+                    .query_ticket_browse(request)
+                    .map_err(ApiError::from)
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn ticket_query(
@@ -35866,6 +35886,10 @@ mod tests {
 
     mod ticket_tags_tests {
         include!("server_ticket_tags_tests.rs");
+    }
+
+    mod ticket_browse_tests {
+        include!("server_ticket_browse_tests.rs");
     }
 
     mod api_logging_tests;

@@ -43,7 +43,7 @@ async fn assert_result_diagnostics(api: &WorkspaceApi, recipient: &RuntimeWorker
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn implementation_result_signed_http_reaches_persistent_orchestrator_once_without_mr() {
+async fn implementation_result_signed_http_reaches_persistent_orchestrator_without_assignment_or_mr() {
     let dir = tempfile::tempdir().unwrap();
     let (mut api, execution, _) = delivery_real_fixture(dir.path(), false).await;
     let identity = RuntimeIdentityMaterial::generate(EMBEDDED_WORKER_RUNTIME_ID).unwrap();
@@ -66,22 +66,14 @@ async fn implementation_result_signed_http_reaches_persistent_orchestrator_once_
     .await;
     let coder = spawn_ticket_check_source(&api, "research-coder");
     seed_worker_source_member(&api, &coder.runtime_id, &coder.worker_id);
-    delivery_assign_worker(&api, &ticket.id, &coder, "research-implementation", None);
+    // Reporting does not require an implementation assignment.
     recover_ticket_notifications(&api);
     let before = delivery_tracking(&api, &ticket.id, delegation);
-    let input = json!({"operation_key":"research-result","assignment_id":"research-implementation","orchestrator_assignment_id":delegation,"kind":"result","body":"Documented findings; no repository or MR was required.","merge_request":null});
-    // The registered Orchestrator is not the implementation assignee and cannot forge this result.
-    result_signed_http(
-        &api,
-        &identity,
-        &orchestrator,
-        &ticket.id,
-        &input,
-        StatusCode::FORBIDDEN,
-    )
-    .await;
+    let input = json!({"operation_key":"research-result","kind":"result","body":"Documented findings; no repository or MR was required.","merge_request":null});
     let receipt =
         result_signed_http(&api, &identity, &coder, &ticket.id, &input, StatusCode::OK).await;
+    // Another authenticated Worker may report, but cannot replay this Workers receipt.
+    result_signed_http(&api, &identity, &orchestrator, &ticket.id, &input, StatusCode::CONFLICT).await;
     delivery_wait_idle(&api, &orchestrator, 2).await;
     assert_eq!(
         result_signed_http(&api, &identity, &coder, &ticket.id, &input, StatusCode::OK).await,
@@ -239,7 +231,7 @@ async fn mr_result_recovery_and_handoff_are_distinct_persistent_inputs() {
     assert_eq!(pending["source_checks"][0]["captured"], true);
     recover_ticket_notifications(&api);
     delivery_wait_idle(&api, &orchestrator, 3).await;
-    let input = json!({"operation_key":"approved-handoff","assignment_id":"mr-implementation","orchestrator_assignment_id":delegation,"kind":"handoff","body":"Implementation and validation complete; integration remains separate.","merge_request":{"merge_request_id":"result-mr","subject_ref":"source-a"}});
+    let input = json!({"operation_key":"approved-handoff","kind":"handoff","body":"Implementation and validation complete; integration remains separate.","merge_request":{"merge_request_id":"result-mr","subject_ref":"source-a"}});
     let receipt =
         result_signed_http(&api, &identity, &coder, &ticket.id, &input, StatusCode::OK).await;
     delivery_wait_idle(&api, &orchestrator, 4).await;

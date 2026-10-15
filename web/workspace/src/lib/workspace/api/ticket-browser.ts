@@ -41,6 +41,8 @@ import type {
   TicketListItemSummary,
   TicketListResponse,
   TicketMergeRequestSummary,
+  TicketBrowseQueryItem,
+  TicketBrowseQueryResponse,
   TicketQueryItem,
   TicketQueryResponse,
   TicketQueueOutcome,
@@ -1773,6 +1775,37 @@ export function parseMergeRequestDetailResponse(
     ticket_ids: strings(item.ticket_ids, `${label}.ticket_ids`),
     updated_at: string(item.updated_at, `${label}.updated_at`),
     workspace_id: string(item.workspace_id, `${label}.workspace_id`),
+  };
+}
+
+export function parseTicketBrowseQueryResponse(value: unknown): TicketBrowseQueryResponse {
+  const label = "Ticket browse response";
+  const page = object(value, label);
+  exact(page, ["items", "page", "record_authority"], label);
+  return {
+    page: parseQueryPage(page.page, `${label}.page`),
+    record_authority: string(page.record_authority, `${label}.record_authority`),
+    items: array(page.items, `${label}.items`, (value, label): TicketBrowseQueryItem => {
+      const item = object(value, label);
+      exact(item, [
+        "id", "resource_key", "title", "state", "updated_at", "tags",
+        "current_closure", "assignment_tracking",
+      ], label);
+      return {
+        id: string(item.id, `${label}.id`),
+        resource_key: string(item.resource_key, `${label}.resource_key`),
+        title: string(item.title, `${label}.title`),
+        state: parseTicketState(item.state, `${label}.state`),
+        updated_at: optionalNullableString(item.updated_at, `${label}.updated_at`),
+        tags: array(item.tags, `${label}.tags`, parseWorkspaceTag),
+        current_closure: item.current_closure == null
+          ? item.current_closure as null | undefined
+          : parseClosure(item.current_closure, `${label}.current_closure`),
+        assignment_tracking: array(
+          item.assignment_tracking, `${label}.assignment_tracking`, parseAssignmentTrackingProjection,
+        ),
+      };
+    }),
   };
 }
 

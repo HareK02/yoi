@@ -9,6 +9,8 @@ pub use api_macros::{ApiContract, BinaryBody, HttpMethod, TransportMetadata, Web
 mod drive;
 mod notification;
 pub use notification::*;
+mod ticket_browse;
+pub use ticket_browse::*;
 pub mod repository_openapi_typescript;
 pub use drive::*;
 mod workspace_config;
@@ -376,6 +378,8 @@ impl_openapi_schema!(
     TicketAssignmentDiagnosticsPage,
     TicketQueryRequest,
     TicketQueryResponse,
+    TicketBrowseQueryRequest,
+    TicketBrowseQueryResponse,
     TicketQueueResponse,
     TicketRecord,
     TicketRecordRef,
@@ -3032,6 +3036,14 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: TicketTagsSetRequest,
     ) -> Result<WorkspaceTicketTagList, RepositoryApiError>;
+
+    /// Lightweight browser list; deliberately excludes live MR evidence and external observations.
+    #[post("/api/w/{workspace_id}/tickets/browse", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_browse(
+        &self,
+        #[path] workspace_id: String,
+        #[body] request: TicketBrowseQueryRequest,
+    ) -> Result<TicketBrowseQueryResponse, RepositoryApiError>;
 
     #[post("/api/w/{workspace_id}/tickets/query", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_query(
@@ -8058,9 +8070,8 @@ pub enum TicketImplementationResultKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TicketImplementationResultRequest {
+    /// Host-owned replay identity; model-facing tools derive it from the Tool call.
     pub operation_key: String,
-    pub assignment_id: String,
-    pub orchestrator_assignment_id: String,
     pub kind: TicketImplementationResultKind,
     pub body: String,
     pub merge_request: Option<MergeRequestReviewSubject>,

@@ -84,7 +84,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 97;
+const LATEST_SCHEMA_VERSION: i64 = 98;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -376,6 +376,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 97,
         name: "MR notifications and authenticated implementation results",
         apply: migrate_business_notifications_v96_to_v97,
+    },
+    Migration {
+        version: 98,
+        name: "Assignment-independent implementation reports",
+        apply: migrate_result_reports_v97_to_v98,
     },
 ];
 
@@ -14286,6 +14291,32 @@ fn migrate_business_notifications_v96_to_v97(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_result_reports_v97_to_v98(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 97 {
+        return Err(Error::Store(
+            "Result reports migration requires schema 97".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    notification_routing::upgrade_result_reports(&tx)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(98,?1)",
+        ["Assignment-independent implementation reports"],
+    )?;
+    verify_workspace_resource_constraints(&tx)?;
+    let violations: i64 =
+        tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })?;
+    if violations != 0 {
+        return Err(Error::Store(
+            "Result reports migration foreign-key violation".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     create_workspace_schema_structure(conn)?;
     assignment_delivery::install(conn)?;
@@ -14293,6 +14324,7 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     notification_routing::install(conn)?;
     notification_routing::jobs::install(conn)?;
     notification_routing::install_business_events(conn)?;
+    notification_routing::upgrade_result_reports(conn)?;
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
         Error::Store(format!(
             "fresh Workspace Ticket schema verification failed: {error}"
@@ -17527,6 +17559,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:95, name:"Common notification routing and durable Worker delivery".into()},
                 WorkspaceSchemaMigrationStep {version:96, name:"Backend Job common notification routing".into()},
                 WorkspaceSchemaMigrationStep {version:97, name:"MR notifications and authenticated implementation results".into()},
+                WorkspaceSchemaMigrationStep {version:98, name:"Assignment-independent implementation reports".into()},
             ]
         );
 
@@ -17634,6 +17667,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (95, "Common notification routing and durable Worker delivery".to_string()),
 (96, "Backend Job common notification routing".to_string()),
 (97, "MR notifications and authenticated implementation results".to_string()),
+(98, "Assignment-independent implementation reports".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -20255,7 +20289,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (94, "Canonical Ticket posts".into()),
                          (95, "Common notification routing and durable Worker delivery".into()),
                          (96, "Backend Job common notification routing".into()),
-                         (97, "MR notifications and authenticated implementation results".into())]);
+                         (97, "MR notifications and authenticated implementation results".into()),
+                         (98, "Assignment-independent implementation reports".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }

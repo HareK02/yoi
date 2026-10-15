@@ -1673,7 +1673,7 @@ async fn mr_open_retains_source_before_first_review_and_observed_result() {
         "/workspaces/{TEST_WORKSPACE_ID}/tickets/{}/implementation-results",
         ticket.id
     );
-    let mut result = json!({"operation_key":"observed-result","assignment_id":"opening-coder","orchestrator_assignment_id":format!("orchestrator-{}",ticket.id),"kind":"handoff","body":"Published new source; review not requested yet.","merge_request":{"merge_request_id":mr,"subject_ref":"forged-source"}});
+    let mut result = json!({"operation_key":"observed-result","kind":"handoff","body":"Published new source; review not requested yet.","merge_request":{"merge_request_id":mr,"subject_ref":"forged-source"}});
     call(
         "POST",
         result_path.clone(),

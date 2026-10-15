@@ -391,7 +391,7 @@ Deno.test("workspace Tickets surface provides query list and lifecycle controls"
   // クエリ・ページングの振舞いはticket-search.testとTicket browser suiteで検証する。
   assert(
     ticketsLoad.includes("compileTicketSearch") &&
-      ticketsLoad.includes("/tickets/query") &&
+      ticketsLoad.includes("/tickets/browse") &&
       ticketsPage.includes('class="ticket-list"') &&
       !ticketsPage.includes("TicketQueryFilters") &&
       !ticketsPage.includes("ticket-kanban"),

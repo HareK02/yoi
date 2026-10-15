@@ -50,6 +50,9 @@ use crate::store::{
 };
 use crate::{Error, Result};
 
+#[path = "ticket_browse.rs"]
+mod ticket_browse;
+
 const DETAIL_BODY_LIMIT: usize = 64 * 1024;
 const TICKET_EVENT_LIMIT: usize = 100;
 const TICKET_EVENT_BODY_LIMIT: usize = 16 * 1024;

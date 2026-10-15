@@ -1,8 +1,6 @@
-import { parseBrowserWorkspaceOrchestratorResponse } from "#lib/workspace/api/workers.ts";
-import { loadWorkspaceRepositoryList } from "#lib/workspace/api/repositories.ts";
 import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 import {
-  parseTicketQueryResponse,
+  parseTicketBrowseQueryResponse,
   TICKET_BROWSER_API_LOAD_POLICY,
 } from "#lib/workspace/api/ticket-browser.ts";
 import { parseTags } from "#lib/workspace/api/ticket-operations.ts";
@@ -12,7 +10,7 @@ import {
   ticketSearchNeedsTags,
 } from "#lib/workspace/tickets/ticket-search.ts";
 import type {
-  TicketQueryRequest,
+  TicketBrowseQueryRequest,
   WorkspaceTag,
 } from "#lib/generated/ticket-api.ts";
 import type { PageLoad } from "./$types";
@@ -22,7 +20,7 @@ export const load = deferPage(async ({ fetch, params, url }: Parameters<PageLoad
   const workspaceId = params.workspaceId;
   const search = url.searchParams.get("q") ?? DEFAULT_TICKET_SEARCH;
   const loadTickets = async () => {
-    let queryRequest: TicketQueryRequest | null = null;
+    let queryRequest: TicketBrowseQueryRequest | null = null;
     try {
       const tags: WorkspaceTag[] = [];
       // タグ名をstable IDへ解決する場合だけ一覧を取得する。状態検索をタグAPIに依存させない。
@@ -54,13 +52,13 @@ export const load = deferPage(async ({ fetch, params, url }: Parameters<PageLoad
       queryRequest = compileTicketSearch(search, tags);
       const tickets = await loadJson(
         fetch,
-        workspaceApiPath(workspaceId, "/tickets/query"),
+        workspaceApiPath(workspaceId, "/tickets/browse"),
         {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(queryRequest),
         },
-        parseTicketQueryResponse,
+        parseTicketBrowseQueryResponse,
         TICKET_BROWSER_API_LOAD_POLICY,
       );
       return { queryRequest, tickets };
@@ -74,15 +72,6 @@ export const load = deferPage(async ({ fetch, params, url }: Parameters<PageLoad
       };
     }
   };
-  const [result, orchestrator, repositories] = await Promise.all([
-    loadTickets(),
-    loadJson(
-      fetch,
-      workspaceApiPath(workspaceId, "/orchestrator"),
-      undefined,
-      parseBrowserWorkspaceOrchestratorResponse,
-    ),
-    loadWorkspaceRepositoryList(fetch, workspaceId),
-  ]);
-  return { workspaceId, search, ...result, orchestrator, repositories };
+  const result = await loadTickets();
+  return { workspaceId, search, ...result };
 });

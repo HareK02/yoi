@@ -1,7 +1,7 @@
 import type {
   TicketAssignmentPrincipalSnapshot,
   TicketClosureReason,
-  TicketQueryRequest,
+  TicketBrowseQueryRequest,
   WorkspaceTag,
 } from "../../generated/ticket-api.ts";
 
@@ -114,15 +114,15 @@ function reason(value: string, quoted: boolean): TicketClosureReason {
 export function compileTicketSearch(
   input: string,
   tags: readonly WorkspaceTag[],
-): TicketQueryRequest {
-  const request: TicketQueryRequest = {
+): TicketBrowseQueryRequest {
+  const request: TicketBrowseQueryRequest = {
     query: null,
     states: [],
     tag_ids: [],
     assigned_principal: null,
     handling_status: null,
     sort: "updated_desc",
-    limit: 30 as TicketQueryRequest["limit"],
+    limit: 30 as TicketBrowseQueryRequest["limit"],
     cursor: null,
   };
   const text: string[] = [];

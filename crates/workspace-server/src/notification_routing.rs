@@ -375,6 +375,23 @@ pub(super) fn install_business_events(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// New reports notify the delegation present when the report is saved. Assignment
+/// identity only fences this saved notification against later retargeting; it is
+/// neither a caller input nor permission to publish a report.
+pub(super) fn upgrade_result_reports(conn: &Connection) -> Result<()> {
+    conn.execute_batch(include_str!("implementation_result_reports.sql"))?;
+    conn.execute_batch(&format!("CREATE TRIGGER notification_implementation_result AFTER INSERT ON ticket_implementation_results BEGIN
+ INSERT INTO notification_sources(workspace_id,ticket_id,input_event_id,role,assignment_id,kind,actor,event_index,facts_json)
+ SELECT NEW.workspace_id,NEW.ticket_id,'implementation-result:' || NEW.result_id,'orchestrator',COALESCE(a.assignment_id,''),'implementation_result','worker:' || NEW.runtime_id || '/' || NEW.worker_id,NULL,
+ json_set({FACTS_SQL},'$.result_id',NEW.result_id,'$.merge_request_id',json_extract(NEW.request_json,'$.merge_request.merge_request_id'))
+ FROM typed_tickets t
+ LEFT JOIN ticket_current_worker_assignments c ON c.workspace_id=t.workspace_id AND c.ticket_id=t.ticket_id AND c.role='orchestrator'
+ LEFT JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.assignment_id=c.assignment_id
+ WHERE t.workspace_id=NEW.workspace_id AND t.ticket_id=NEW.ticket_id;
+ END;"))?;
+    Ok(())
+}
+
 impl SqliteWorkspaceStore {
     /// Record a provider-resolved source observation, not approval. Git has no local
     /// transactional event log: transitions are captured when the existing MR paths
@@ -438,12 +455,14 @@ pub(super) fn verify(conn: &Connection) -> Result<()> {
     ] {
         names.push(name.into());
     }
-    if current_schema_version(conn)? >= 96 {
+    if current_schema_version(conn)? == 97 {
+        names.push("implementation_delegation_capture".into());
+    }
+    if current_schema_version(conn)? >= 97 {
         names.extend(
             [
                 "ticket_implementation_delegations",
                 "ticket_implementation_results",
-                "implementation_delegation_capture",
                 "implementation_results_no_update",
                 "implementation_results_no_delete",
                 "implementation_delegations_no_update",
