@@ -42,6 +42,9 @@ pub enum StoreError {
     #[error("session was permanently erased: {0}")]
     SessionErased(SessionId),
 
+    #[error("session source retention is unsupported by this store")]
+    SessionRetentionUnsupported,
+
     #[error("retained observation read limit exceeded")]
     ReadLimitExceeded,
 
@@ -89,6 +92,17 @@ pub enum StoreError {
 /// take `(SessionId, SegmentId)` so segments can be physically grouped
 /// per Session on disk (or per session_id in a DB).
 pub trait Store: Send + Sync {
+    /// Establish durable retention intent before the Host accepts public input.
+    /// This does not attest source availability; it must use the same control store
+    /// as publishers and physical deletion. Unsupported stores fail closed.
+    fn retain_session_before_publication(
+        &self,
+        _session_id: SessionId,
+        _pin: crate::retention::SessionRetentionPin,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::SessionRetentionUnsupported)
+    }
+
     /// Append a single log entry to the segment log.
     ///
     /// One committed line per successful call. Implementations must not expose

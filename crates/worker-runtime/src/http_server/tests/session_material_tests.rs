@@ -195,6 +195,101 @@ impl Fixture {
 }
 
 #[test]
+fn pending_session_proof_is_not_missing_material_and_pin_release_allows_empty_archive() {
+    let f = Fixture::new();
+    std::fs::remove_dir_all(f.root()).unwrap();
+    let aggregate = f.root().parent().unwrap().to_path_buf();
+    let metadata =
+        WorkerAggregateStore::new(&aggregate, format!("worker-runtime-{}", f.worker.worker_id))
+            .unwrap();
+    metadata
+        .write(
+            &session_store::WorkerMetadata::new(
+                format!("worker-runtime-{}", f.worker.worker_id),
+                Some(session_store::WorkerActiveSegmentRef::pending_segment(
+                    f.session,
+                )),
+            )
+            .with_workspace_id(&f.scope.workspace_id),
+        )
+        .unwrap();
+    let pin = SessionRetentionPin(uuid::Uuid::now_v7());
+    let retention = runtime_session_retention(f.temp.path());
+    retention.retain_before_publication(f.session, pin).unwrap();
+    assert!(
+        matches!(f.runtime.session_material_catalog_scoped(&f.scope, &f.request()), Catalog::NotMaterialized { session_id } if session_id == f.session.to_string())
+    );
+    assert!(
+        f.runtime
+            .pin_session_public_source_scoped(&f.scope, &f.source(), &f.session.to_string(), pin)
+            .is_err(),
+        "retention intent is not source availability"
+    );
+    // A missing committed source is never the same fact as a pending pointer.
+    metadata
+        .write(
+            &session_store::WorkerMetadata::new(
+                format!("worker-runtime-{}", f.worker.worker_id),
+                Some(session_store::WorkerActiveSegmentRef::active_segment(
+                    f.session, f.segment,
+                )),
+            )
+            .with_workspace_id(&f.scope.workspace_id),
+        )
+        .unwrap();
+    assert!(matches!(
+        f.runtime
+            .session_material_catalog_scoped(&f.scope, &f.request()),
+        Catalog::Unavailable { .. }
+    ));
+    metadata
+        .write(
+            &session_store::WorkerMetadata::new(
+                format!("worker-runtime-{}", f.worker.worker_id),
+                Some(session_store::WorkerActiveSegmentRef::pending_segment(
+                    f.session,
+                )),
+            )
+            .with_workspace_id(&f.scope.workspace_id),
+        )
+        .unwrap();
+    // Any unexpected source file invalidates the empty proof, too.
+    std::fs::create_dir_all(f.root()).unwrap();
+    std::fs::write(f.root().join("unattested-original"), "do not discard").unwrap();
+    assert!(matches!(
+        f.runtime
+            .session_material_catalog_scoped(&f.scope, &f.request()),
+        Catalog::Unavailable { .. }
+    ));
+    std::fs::remove_file(f.root().join("unattested-original")).unwrap();
+    f.runtime
+        .release_session_public_source_pin_scoped(
+            &f.scope,
+            &f.source(),
+            &f.session.to_string(),
+            pin,
+        )
+        .unwrap();
+    assert!(retention.pins(f.session).unwrap().is_empty());
+    f.stop();
+    let inventory = f
+        .runtime
+        .worker_retention_inventory(&f.scope.workspace_id, &f.worker)
+        .unwrap();
+    assert_eq!(inventory.session_id, None);
+    assert_eq!(inventory.session_bytes, 0);
+    let removed = f
+        .runtime
+        .execute_worker_retention(&f.retention_request(SessionDisposition::Archive))
+        .unwrap();
+    let archive = removed.archive.unwrap();
+    assert!(removed.source_removed);
+    assert_eq!(archive.source_session_id, f.session.to_string());
+    assert_eq!(archive.content_file_count, 0);
+    assert!(archive.source_active_segment_id.is_none());
+}
+
+#[test]
 fn canonical_pages_read_frozen_originals_after_tail_append_and_reject_forged_descriptors() {
     let f = Fixture::new();
     let first = f.catalog();
@@ -524,14 +619,10 @@ fn explicit_erase_invalidates_pins_and_fences_old_readers_publishers_and_retry()
             SessionDeletionIntent::ErasePermanently,
         )
         .unwrap();
-    // Removing the remaining Worker registration/metadata still requires the
-    // caller's explicit erase intent; ordinary deletion may not infer it.
+    // Ordinary registration removal can resume a pre-existing permanent erase
+    // decision. It cannot establish one or recreate original Session material.
     f.runtime
-        .delete_worker_with_intent_scoped(
-            &f.scope,
-            &f.worker,
-            SessionDeletionIntent::ErasePermanently,
-        )
+        .delete_worker_with_intent_scoped(&f.scope, &f.worker, SessionDeletionIntent::Ordinary)
         .unwrap();
     assert!(!f.root().parent().unwrap().exists());
     assert!(matches!(
@@ -808,13 +899,47 @@ async fn signed_generated_client_reads_canonical_pages_and_pins_with_real_router
                 .len(),
             1
         );
-        client.session_material_release(pin).await.unwrap();
+        client.session_material_release(pin.clone()).await.unwrap();
         assert!(
             runtime_session_retention(f.temp.path())
                 .pins(f.session)
                 .unwrap()
                 .is_empty()
         );
+        client.session_material_pin(pin).await.unwrap();
+        f.stop();
+        let erase = runtime_api::SessionMaterialEraseRequest {
+            workspace_id: f.scope.workspace_id.clone(),
+            source: f.source(),
+            expected_session_id: f.session.to_string(),
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                client
+                    .session_material_erase(erase.clone())
+                    .await
+                    .unwrap()
+                    .session_id,
+                f.session.to_string()
+            );
+        }
+        assert!(!f.root().exists());
+        assert!(matches!(
+            client.session_material_catalog(f.request()).await.unwrap(),
+            Catalog::Unavailable { .. }
+        ));
+        assert!(matches!(
+            runtime_session_retention(f.temp.path()).ensure_live(f.session),
+            Err(session_store::StoreError::SessionErased(_))
+        ));
+        // Register/lifecycle cleanup after erasure must not need a fresh archive or Job.
+        let result = f
+            .runtime
+            .execute_worker_retention(&f.retention_request(SessionDisposition::Purge))
+            .unwrap();
+        assert!(result.source_removed);
+        assert!(result.archive.is_none());
+        assert!(!f.root().parent().unwrap().exists());
     })
     .await
     .expect("bounded signed client integration");
@@ -865,4 +990,40 @@ async fn canonical_http_rejects_replay_tampered_body_and_workspace_mismatch() {
         .await
         .unwrap();
     assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn explicit_material_erasure_requires_delete_capability_and_matching_scope() {
+    let f = Fixture::new();
+    f.stop();
+    let identity = RuntimeIdentityMaterial::generate("erase-key").unwrap();
+    let trust = workspace_trust(&identity);
+    let app = runtime_http_router_with_workspace_auth(
+        f.runtime.clone(),
+        None,
+        workspace_test_auth(vec![trust.clone()]),
+    );
+    let path = "/v1/session-public/material/retention/erase";
+    let mut request = runtime_api::SessionMaterialEraseRequest {
+        workspace_id: f.scope.workspace_id.clone(),
+        source: f.source(),
+        expected_session_id: f.session.to_string(),
+    };
+    let body = serde_json::to_vec(&request).unwrap();
+    let mut claims = signed_claims(&trust, "POST", path, &body);
+    claims.operation = "workers:read".into();
+    let response = signed_request(app.clone(), &identity, &claims, body, "workspace-a").await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(f.root().exists());
+    request.workspace_id = "other-workspace".into();
+    let body = serde_json::to_vec(&request).unwrap();
+    let claims = signed_claims(&trust, "POST", path, &body);
+    let response = signed_request(app, &identity, &claims, body, "workspace-a").await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        runtime_session_retention(f.temp.path())
+            .ensure_live(f.session)
+            .is_ok()
+    );
+    assert!(f.root().exists());
 }

@@ -2190,13 +2190,17 @@ impl WorkerRemovalService {
             ));
         }
 
-        if let Err(error) = subjektiv_journal::prepare_worker_removal(self, runtime, target) {
-            return Ok(worker_remove_error_response(
-                StatusCode::CONFLICT,
-                "journal_handoff_incomplete",
-                &error.to_string(),
-            ));
-        }
+        let journal_erasure = match subjektiv_journal::prepare_worker_removal(self, runtime, target)
+        {
+            Ok(proof) => proof,
+            Err(error) => {
+                return Ok(worker_remove_error_response(
+                    StatusCode::CONFLICT,
+                    "journal_handoff_incomplete",
+                    &error.to_string(),
+                ));
+            }
+        };
         let inventory = match runtime.worker_retention_inventory(&target) {
             Ok(inventory) => inventory,
             Err(_) => {
@@ -2211,6 +2215,7 @@ impl WorkerRemovalService {
             workspace_id: self.workspace_id.clone(),
             worker: target.clone(),
             reason: reason.to_string(),
+            journal_erasure,
         };
         let plan = match self.store.plan_worker_removal(&request, &inventory) {
             Ok(plan) => plan,

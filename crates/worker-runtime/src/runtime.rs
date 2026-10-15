@@ -4842,15 +4842,20 @@ impl Runtime {
         expected_session_id: &str,
         pin: session_store::retention::SessionRetentionPin,
     ) -> Result<(), RuntimeError> {
-        let (root, _) = self.resolve_session_public_source(scope, source)?;
+        let (root, archive) =
+            self.resolve_session_public_source_with_validation(scope, source, false)?;
         let session = expected_session_id
             .parse::<session_store::SessionId>()
             .map_err(|_| RuntimeError::InvalidRequest("Invalid Session identity".into()))?;
-        if session_store::WorkerSessionStore::open_read_only(&root)
-            .and_then(|store| store.session_id())
-            .map_err(crate::retention::retention_error)?
-            != Some(session)
-        {
+        let owned_session = match archive {
+            Some(manifest) => manifest.source_session_id.parse().ok(),
+            None => {
+                crate::retention::aggregate_session_id(root.parent().ok_or_else(|| {
+                    RuntimeError::InvalidRequest("Session root unavailable".into())
+                })?)?
+            }
+        };
+        if owned_session != Some(session) {
             return Err(RuntimeError::InvalidRequest(
                 "Session source identity mismatch".into(),
             ));
@@ -4993,6 +4998,33 @@ impl Runtime {
         Ok(crate::retention::runtime_session_retention(
             store.runtime_dir(),
         ))
+    }
+
+    /// Prove an attributed but not yet materialized Session without treating a
+    /// missing committed log as empty. The source/Workspace binding is resolved first.
+    #[cfg(feature = "fs-store")]
+    pub(crate) fn session_not_materialized_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        source: &runtime_api::SessionPublicSource,
+        expected_session_id: &str,
+    ) -> Result<bool, RuntimeError> {
+        let (root, archive) = self.resolve_session_public_source(scope, source)?;
+        if archive.is_some() {
+            return Ok(false);
+        }
+        let session = expected_session_id
+            .parse::<session_store::SessionId>()
+            .map_err(|_| RuntimeError::InvalidRequest("Invalid Session identity".into()))?;
+        let retention = self.session_retention_store()?;
+        let _guard = retention
+            .lock_live(session)
+            .map_err(crate::retention::retention_error)?;
+        Ok(crate::retention::unmaterialized_session(
+            root.parent()
+                .ok_or_else(|| RuntimeError::InvalidRequest("Session root unavailable".into()))?,
+            &scope.workspace_id,
+        )? == Some(session))
     }
 
     /// Resolve the Backend-selected source without exposing local storage paths.

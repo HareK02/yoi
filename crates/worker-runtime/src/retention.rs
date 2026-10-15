@@ -178,6 +178,40 @@ pub(crate) trait WorkerRetentionProvider: Send + Sync {
 
 pub use crate::session_retention::runtime_session_retention;
 
+/// Prove the legitimate pre-publication state, rather than interpreting a missing
+/// source as empty. A committed active pointer or any source file defeats this proof.
+pub(crate) fn unmaterialized_session(
+    worker_dir: &Path,
+    workspace_id: &str,
+) -> Result<Option<session_store::SessionId>, RuntimeError> {
+    let metadata_path = worker_dir.join("metadata.json");
+    let bytes = match fs::read(&metadata_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(RuntimeError::StoreIo {
+                operation: "inspect pending Session",
+                path: metadata_path,
+                source,
+            });
+        }
+    };
+    let metadata: session_store::WorkerMetadata = serde_json::from_slice(&bytes)
+        .map_err(|_| RuntimeError::InvalidRequest("Pending Session metadata is invalid".into()))?;
+    if metadata.workspace_id.as_deref() != Some(workspace_id) {
+        return Ok(None);
+    }
+    let Some(active) = metadata.active.filter(|active| active.segment_id.is_none()) else {
+        return Ok(None);
+    };
+    let root = worker_dir.join("session");
+    if collect_files(&root, "inspect pending Session")?.is_empty() {
+        Ok(Some(active.session_id))
+    } else {
+        Ok(None)
+    }
+}
+
 pub(crate) fn aggregate_session_id(
     worker_dir: &Path,
 ) -> Result<Option<session_store::SessionId>, RuntimeError> {
@@ -303,6 +337,19 @@ pub(crate) fn delete_worker_aggregate(
     intent: session_store::retention::SessionDeletionIntent,
 ) -> Result<(), RuntimeError> {
     let session = aggregate_session_id(worker_dir)?;
+    let retention = runtime_session_retention(runtime_root);
+    // Ordinary policy never creates erase authority. A pre-existing permanent
+    // tombstone is an irrevocable decision whose physical cleanup may be resumed.
+    let intent = match session
+        .map(|session| retention.ensure_live(session))
+        .transpose()
+    {
+        Err(session_store::StoreError::SessionErased(_)) => {
+            session_store::retention::SessionDeletionIntent::ErasePermanently
+        }
+        Err(error) => return Err(retention_error(error)),
+        Ok(_) => intent,
+    };
     let remove = || -> Result<(), session_store::StoreError> {
         if intent == session_store::retention::SessionDeletionIntent::ErasePermanently {
             if let Some(session) = session {
@@ -561,33 +608,36 @@ impl WorkerRetentionProvider for FsWorkerRetentionProvider {
             return Err(RuntimeError::WorkerNotFound { worker_id });
         }
         let session_dir = worker_dir.join("session");
-        let (session_id, segment_ids, session_bytes) = if session_dir.is_dir() {
-            let manifest: CanonicalSessionManifest = read_json(
-                &session_dir.join("session.json"),
-                "inventory Worker retention",
-            )?;
-            let files = collect_files(&session_dir, "inventory Worker retention")?;
-            let mut segment_ids = BTreeSet::new();
-            let mut bytes = 0_u64;
-            for (relative, path) in files {
-                bytes = bytes.saturating_add(file_len(&path, "inventory Worker retention")?);
-                if let Some(name) = relative.file_name().and_then(|value| value.to_str()) {
-                    let segment = name
-                        .strip_suffix(".trace.jsonl")
-                        .or_else(|| name.strip_suffix(".jsonl"));
-                    if let Some(segment) = segment {
-                        segment_ids.insert(segment.to_string());
+        let (session_id, segment_ids, session_bytes) =
+            if unmaterialized_session(&worker_dir, workspace_id)?.is_some() {
+                (None, Vec::new(), 0)
+            } else if session_dir.is_dir() {
+                let manifest: CanonicalSessionManifest = read_json(
+                    &session_dir.join("session.json"),
+                    "inventory Worker retention",
+                )?;
+                let files = collect_files(&session_dir, "inventory Worker retention")?;
+                let mut segment_ids = BTreeSet::new();
+                let mut bytes = 0_u64;
+                for (relative, path) in files {
+                    bytes = bytes.saturating_add(file_len(&path, "inventory Worker retention")?);
+                    if let Some(name) = relative.file_name().and_then(|value| value.to_str()) {
+                        let segment = name
+                            .strip_suffix(".trace.jsonl")
+                            .or_else(|| name.strip_suffix(".jsonl"));
+                        if let Some(segment) = segment {
+                            segment_ids.insert(segment.to_string());
+                        }
                     }
                 }
-            }
-            (
-                Some(manifest.session_id),
-                segment_ids.into_iter().collect(),
-                bytes,
-            )
-        } else {
-            (None, Vec::new(), 0)
-        };
+                (
+                    Some(manifest.session_id),
+                    segment_ids.into_iter().collect(),
+                    bytes,
+                )
+            } else {
+                (None, Vec::new(), 0)
+            };
         let diagnostics_bytes = diagnostics_files(&worker_dir, "inventory Worker retention")?
             .into_iter()
             .try_fold(0_u64, |total, path| {
@@ -909,14 +959,14 @@ fn commit_session_archive(
         RuntimeError::InvalidRequest("archive disposition requires archive_id".to_string())
     })?;
     let session_dir = worker_dir.join("session");
-    if !session_dir.is_dir() {
-        return Err(RuntimeError::StoreMissing {
-            operation: "archive Worker Session",
-            path: session_dir,
-        });
-    }
-    let session: CanonicalSessionManifest =
-        read_json(&session_dir.join("session.json"), "archive Worker Session")?;
+    let pending = unmaterialized_session(worker_dir, &request.workspace_id)?;
+    let session: CanonicalSessionManifest = if let Some(session) = pending {
+        CanonicalSessionManifest {
+            session_id: session.to_string(),
+        }
+    } else {
+        read_json(&session_dir.join("session.json"), "archive Worker Session")?
+    };
     let source_files = collect_files(&session_dir, "archive Worker Session")?;
     let (checksum, bytes, count) = checksum_files(&source_files, "archive Worker Session")?;
     let mut segment_ids = BTreeSet::new();

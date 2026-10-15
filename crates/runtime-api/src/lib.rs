@@ -803,6 +803,20 @@ pub struct SessionMaterialDescriptor {
     pub total_bytes: u64,
 }
 
+/// Explicit Host erasure, distinct from ordinary retention policy or pin release.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMaterialEraseRequest {
+    pub workspace_id: String,
+    pub source: SessionPublicSource,
+    pub expected_session_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionMaterialEraseResponse {
+    pub session_id: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionMaterialPinRequest {
@@ -860,6 +874,11 @@ pub struct SessionMaterialReadPage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "availability", rename_all = "snake_case")]
 pub enum SessionMaterialCatalogAvailability {
+    /// The saved active pointer is pending and storage proves no Session material
+    /// has ever been published. Missing/corrupt materialized sources are not empty.
+    NotMaterialized {
+        session_id: String,
+    },
     Page {
         page: SessionMaterialCatalogPage,
     },
@@ -1122,6 +1141,16 @@ pub trait RuntimeApi {
         #[path] worker_id: String,
         #[query] request: WorkerSessionHistoryRequest,
     ) -> Result<WorkerSessionHistoryAvailability, RuntimeApiError>;
+
+    #[post(
+        "/v1/session-public/material/retention/erase",
+        status = 200,
+        error_status = 400
+    )]
+    async fn session_material_erase(
+        &self,
+        #[body] request: SessionMaterialEraseRequest,
+    ) -> Result<SessionMaterialEraseResponse, RuntimeApiError>;
 
     #[post(
         "/v1/session-public/material/retention/pin",
@@ -1586,6 +1615,13 @@ mod tests {
                 reason: WorkerSessionHistoryUnavailableReason::Unsupported,
                 message: "unsupported".to_string(),
             })
+        }
+
+        async fn session_material_erase(
+            &self,
+            _request: SessionMaterialEraseRequest,
+        ) -> Result<SessionMaterialEraseResponse, RuntimeApiError> {
+            Err(test_error(501))
         }
 
         async fn session_material_pin(

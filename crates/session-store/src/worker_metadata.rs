@@ -806,6 +806,15 @@ where
     S: crate::Store,
     W: Send + Sync,
 {
+    fn retain_session_before_publication(
+        &self,
+        session_id: SessionId,
+        pin: crate::retention::SessionRetentionPin,
+    ) -> Result<(), crate::StoreError> {
+        self.session_store
+            .retain_session_before_publication(session_id, pin)
+    }
+
     fn append(
         &self,
         session_id: SessionId,

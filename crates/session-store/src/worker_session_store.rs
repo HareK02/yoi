@@ -716,6 +716,17 @@ impl WorkerSessionStore {
 }
 
 impl Store for WorkerSessionStore {
+    fn retain_session_before_publication(
+        &self,
+        session_id: SessionId,
+        pin: crate::retention::SessionRetentionPin,
+    ) -> Result<(), StoreError> {
+        self.retention
+            .as_ref()
+            .ok_or(StoreError::SessionRetentionUnsupported)?
+            .retain_before_publication(session_id, pin)
+    }
+
     fn append(
         &self,
         session_id: SessionId,

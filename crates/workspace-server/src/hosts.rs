@@ -1301,6 +1301,13 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         Err("Session source retention release is unavailable on this Runtime".into())
     }
 
+    fn session_material_erase(
+        &self,
+        _request: runtime_api::SessionMaterialEraseRequest,
+    ) -> Result<runtime_api::SessionMaterialEraseResponse, String> {
+        Err("Session source permanent erasure is unavailable on this Runtime".into())
+    }
+
     fn session_material_catalog(
         &self,
         _request: runtime_api::SessionMaterialCatalogRequest,
@@ -2262,6 +2269,21 @@ impl RuntimeRegistry {
             .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
                 runtime_id: runtime_id.into(),
                 code: "session_material_release_failed".into(),
+                message,
+            })
+    }
+
+    pub fn session_material_erase(
+        &self,
+        runtime_id: &str,
+        request: runtime_api::SessionMaterialEraseRequest,
+    ) -> Result<runtime_api::SessionMaterialEraseResponse, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        self.runtime(runtime_id)?
+            .session_material_erase(request)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.into(),
+                code: "session_material_erase_failed".into(),
                 message,
             })
     }
@@ -3321,6 +3343,27 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         Ok(runtime_api::SessionMaterialPinResponse {
             session_id: request.expected_session_id,
             pin_id: request.pin_id,
+        })
+    }
+
+    fn session_material_erase(
+        &self,
+        request: runtime_api::SessionMaterialEraseRequest,
+    ) -> Result<runtime_api::SessionMaterialEraseResponse, String> {
+        if request.workspace_id != self.workspace_id {
+            return Err("Session erase Workspace mismatch".into());
+        }
+        let scope = RuntimeWorkspaceScope::new(&request.workspace_id, "embedded-backend");
+        self.runtime
+            .delete_session_public_source_scoped(
+                &scope,
+                &request.source,
+                &request.expected_session_id,
+                session_store::retention::SessionDeletionIntent::ErasePermanently,
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(runtime_api::SessionMaterialEraseResponse {
+            session_id: request.expected_session_id,
         })
     }
 
@@ -5499,6 +5542,18 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             self.request_timeout,
             MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
             move |client| async move { client.session_material_release(request).await },
+        )
+        .map_err(|diagnostic| diagnostic.message)
+    }
+
+    fn session_material_erase(
+        &self,
+        request: runtime_api::SessionMaterialEraseRequest,
+    ) -> Result<runtime_api::SessionMaterialEraseResponse, String> {
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.session_material_erase(request).await },
         )
         .map_err(|diagnostic| diagnostic.message)
     }
@@ -8263,9 +8318,55 @@ mod tests {
             "workers:read"
         );
         assert_eq!(
+            workspace_runtime_operation("POST", "/v1/session-public/material/retention/erase"),
+            "workers:delete"
+        );
+        assert_eq!(
             workspace_runtime_operation("POST", SSH_HOST_KEY_PROBE_PATH),
             SSH_HOST_KEY_PROBE_OPERATION
         );
+    }
+
+    #[test]
+    fn remote_session_erasure_uses_the_generated_management_transport() {
+        // The loopback fixture substitutes only the remote Runtime. This covers
+        // Registry/remote-adapter DTO and route wiring, not Runtime authorization or deletion.
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let (base_url, server) = serve_mock_http(vec![mock_response(
+            "POST",
+            "/v1/session-public/material/retention/erase",
+            true,
+            200,
+            json!({"session_id": session_id}).to_string(),
+        )]);
+        let registry = RuntimeRegistry::new(Vec::new());
+        registry.register(
+            RemoteWorkerRuntime::new(
+                RemoteRuntimeConfig::new(
+                    "remote:erase",
+                    "Erase transport fixture",
+                    base_url,
+                    Some("secret-token".into()),
+                ),
+                "workspace-test".into(),
+                "http://127.0.0.1:8787".into(),
+            )
+            .unwrap(),
+        );
+        let response = registry
+            .session_material_erase(
+                "remote:erase",
+                runtime_api::SessionMaterialEraseRequest {
+                    workspace_id: "workspace-test".into(),
+                    source: runtime_api::SessionPublicSource::Retained {
+                        worker_id: EmbeddedWorkerId::from_legacy_u64(1),
+                    },
+                    expected_session_id: session_id.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(response.session_id, session_id);
+        server.join().unwrap();
     }
 
     #[test]

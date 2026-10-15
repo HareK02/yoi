@@ -369,6 +369,43 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
             .map_err(api_error)
     }
 
+    async fn session_material_erase(
+        &self,
+        request: runtime_api::SessionMaterialEraseRequest,
+    ) -> Result<runtime_api::SessionMaterialEraseResponse, runtime_api::RuntimeApiError> {
+        let scope = material_scope(&self.state, &request.workspace_id)?;
+        #[cfg(feature = "fs-store")]
+        {
+            self.state
+                .runtime
+                .delete_session_public_source_scoped(
+                    &scope,
+                    &request.source,
+                    &request.expected_session_id,
+                    session_store::retention::SessionDeletionIntent::ErasePermanently,
+                )
+                .map_err(|_| {
+                    runtime_api::RuntimeApiError::new(
+                        409,
+                        "session_erasure_incomplete",
+                        "Session erasure could not complete; retain erasure intent and retry",
+                    )
+                })?;
+            Ok(runtime_api::SessionMaterialEraseResponse {
+                session_id: request.expected_session_id,
+            })
+        }
+        #[cfg(not(feature = "fs-store"))]
+        {
+            let _ = scope;
+            Err(runtime_api::RuntimeApiError::new(
+                503,
+                "session_retention_unavailable",
+                "Session erasure requires filesystem storage",
+            ))
+        }
+    }
+
     async fn session_material_pin(
         &self,
         request: runtime_api::SessionMaterialPinRequest,

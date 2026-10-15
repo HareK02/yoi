@@ -57,6 +57,18 @@ pub(crate) fn catalog(
     scope: &RuntimeWorkspaceScope,
     request: &SessionMaterialCatalogRequest,
 ) -> SessionMaterialCatalogAvailability {
+    if scope.workspace_id == request.workspace_id
+        && (1..=100).contains(&request.limit)
+        && request.offset == 0
+        && request.expected_catalog_sha256.is_none()
+        && runtime
+            .session_not_materialized_scoped(scope, &request.source, &request.expected_session_id)
+            .is_ok_and(|empty| empty)
+    {
+        return SessionMaterialCatalogAvailability::NotMaterialized {
+            session_id: request.expected_session_id.clone(),
+        };
+    }
     let result = (|| -> Result<_, SessionMaterialSourceError> {
         if scope.workspace_id != request.workspace_id {
             return Err("Session Workspace scope mismatch".into());

@@ -63,6 +63,51 @@ pub struct WorkerRemovalPlanRequest {
     pub workspace_id: String,
     pub worker: RuntimeWorkerRef,
     pub reason: String,
+    /// Internal evidence cannot be supplied through serialized deletion requests.
+    #[serde(skip)]
+    pub(crate) journal_erasure: Option<ErasedJournalSession>,
+}
+
+const ERASED_JOURNAL_POLICY_ID: &str = "backend-journal-erased-session-v1";
+
+/// Monotonic domain erasure proof, bound to the exact source Worker and Session.
+/// The only constructor rereads the Journal tombstone; ordinary Purge grants no erase authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ErasedJournalSession {
+    workspace_id: String,
+    worker: RuntimeWorkerRef,
+    session_id: String,
+}
+impl ErasedJournalSession {
+    pub(crate) fn validated(
+        workspace_id: &str,
+        store: &crate::subjektiv::SubjektivStore,
+        attr: &crate::subjektiv::SubjectSessionAttribution,
+    ) -> crate::Result<Option<Self>> {
+        let host = subjektiv::journal::JournalHostContext::validated_session(store, attr.clone())
+            .map_err(|e| StoreError::Store(e.to_string()))?;
+        Ok(store
+            .journal_session_erased(&host)
+            .map_err(|e| StoreError::Store(e.to_string()))?
+            .then(|| Self {
+                workspace_id: workspace_id.into(),
+                worker: RuntimeWorkerRef::new(&attr.runtime_id, &attr.worker_id),
+                session_id: attr.session_id.clone(),
+            }))
+    }
+
+    fn matches(
+        &self,
+        req: &WorkerRemovalPlanRequest,
+        inventory: &WorkerRetentionInventory,
+    ) -> bool {
+        self.workspace_id == req.workspace_id
+            && self.worker == req.worker
+            && inventory
+                .session_id
+                .as_ref()
+                .is_none_or(|id| *id == self.session_id)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,10 +268,20 @@ impl SqliteWorkspaceStore {
         inv: &WorkerRetentionInventory,
     ) -> Result<WorkerRemovalPlan, WorkerRetentionError> {
         validate_plan(req, inv)?;
+        if req
+            .journal_erasure
+            .as_ref()
+            .is_some_and(|proof| !proof.matches(req, inv))
+        {
+            return Err(WorkerRetentionError::Invalid(
+                "Journal erasure proof does not match removal source".into(),
+            ));
+        }
+        let erased_journal = req.journal_erasure.is_some();
         let now = Utc::now().to_rfc3339();
         self.with_conn_mut(|conn| {
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let policy=load_removal_policy(&tx,&req.workspace_id,&req.worker)?.ok_or_else(|| StoreError::InvalidInput(format!("policy-missing:{}",req.workspace_id)))?;
+            let policy=load_removal_policy(&tx,&req.workspace_id,&req.worker,erased_journal)?.ok_or_else(|| StoreError::InvalidInput(format!("policy-missing:{}",req.workspace_id)))?;
             let worker=match load_worker(&tx,&req.workspace_id,&req.worker)? {
                 Some(v)=>v,
                 None=>{
@@ -272,7 +327,7 @@ impl SqliteWorkspaceStore {
                 return Err(StoreError::InvalidInput(format!("stale:{plan_id}:plan state {} is not executable", state_s(plan.state))));
             }
             if !plan.blockers.is_empty(){return Err(StoreError::InvalidInput(format!("blocked:{}",serde_json::to_string(&plan.blockers).unwrap())));}
-            let policy=load_removal_policy(&tx,workspace_id,&plan.worker)?.ok_or_else(||StoreError::InvalidInput(format!("policy-missing:{workspace_id}")))?;
+            let policy=load_removal_policy(&tx,workspace_id,&plan.worker,plan.policy_id==ERASED_JOURNAL_POLICY_ID)?.ok_or_else(||StoreError::InvalidInput(format!("policy-missing:{workspace_id}")))?;
             if policy.policy_id!=plan.policy_id||policy.policy_digest!=plan.policy_digest{
                 mark_stale(&tx,&plan,"policy content changed")?;tx.commit()?;
                 return Err(stale_error(&plan,"policy content changed"));
@@ -785,20 +840,28 @@ struct WorkerRow {
 fn load_worker(c: &Connection, w: &str, r: &RuntimeWorkerRef) -> crate::Result<Option<WorkerRow>> {
     c.query_row("SELECT display_name,profile,retention_state,created_at,updated_at FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",params![w,r.runtime_id,r.worker_id],|x|Ok(WorkerRow{display_name:x.get(0)?,profile:x.get(1)?,retention_state:x.get(2)?,created_at:x.get(3)?,updated_at:x.get(4)?})).optional().map_err(StoreError::from)
 }
-/// Recording Sessions may contain original text in tool results. Only a terminal,
-/// Host-bound Journal attempt grants this exception; profile names grant nothing.
+/// Recording Sessions may contain original text in tool results. A terminal,
+/// Host-bound Journal attempt or a validated source-erasure proof grants this
+/// exception; profile names and serialized deletion input grant nothing.
+/// A saved erasure plan retains the monotonic decision across restart, but creates
+/// no Runtime erase authority: the domain/physical tombstones must already exist.
 /// This plan-local policy never changes the Workspace conversation policy.
 fn load_removal_policy(
     c: &Connection,
     w: &str,
     worker: &RuntimeWorkerRef,
+    erased_journal: bool,
 ) -> crate::Result<Option<WorkerRetentionPolicy>> {
     let Some(mut policy) = load_policy(c, w)? else {
         return Ok(None);
     };
-    if crate::store::terminal_journal_job_worker(c, w, worker)? {
+    if erased_journal || crate::store::terminal_journal_job_worker(c, w, worker)? {
         let update = WorkerRetentionPolicyUpdate {
-            policy_id: "backend-journal-ephemeral-session-v1".into(),
+            policy_id: if erased_journal {
+                ERASED_JOURNAL_POLICY_ID.into()
+            } else {
+                "backend-journal-ephemeral-session-v1".into()
+            },
             session_disposition: SessionDisposition::Purge,
             metadata_disposition: MetadataDisposition::Tombstone,
             archive_retention: ArchiveRetention::Forever,
@@ -1194,6 +1257,7 @@ mod tests {
                 worker_id: worker_id().to_string(),
             },
             reason: "cleanup".into(),
+            journal_erasure: None,
         }
     }
     #[test]

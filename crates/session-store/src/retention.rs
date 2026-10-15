@@ -109,6 +109,23 @@ impl SessionRetentionStore {
         Ok(guard)
     }
 
+    /// Protect a Host-owned Session before its first source publication. This is
+    /// retention intent, not proof that any original material exists. The owner must
+    /// establish it before accepting input and use the same control store for writes
+    /// and deletion. Source-serving APIs must still verify actual material separately.
+    pub fn retain_before_publication(
+        &self,
+        session: SessionId,
+        pin: SessionRetentionPin,
+    ) -> Result<(), StoreError> {
+        let _guard = self.lock_live(session)?;
+        let mut state = self.read(session)?;
+        if state.pins.insert(pin) {
+            self.save(session, &state)?;
+        }
+        Ok(())
+    }
+
     /// Call `source_exists` under the same lock used by deletion. Replaying the
     /// same pin is idempotent; missing source never becomes a successful lease.
     pub fn pin(
@@ -183,6 +200,43 @@ pub(crate) fn fs_retention(root: &Path) -> SessionRetentionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_intent_survives_reopen_without_attesting_missing_originals() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let controls = temp.path().join("controls");
+        let session = crate::new_session_id();
+        let pin = SessionRetentionPin(uuid::Uuid::now_v7());
+        let retention = SessionRetentionStore::new(&controls);
+        retention.retain_before_publication(session, pin).unwrap();
+        let reopened = SessionRetentionStore::new(&controls);
+        assert_eq!(reopened.pins(session).unwrap(), [pin]);
+        // An early owner is not a successful source-availability receipt.
+        assert!(
+            matches!(reopened.pin(session, pin, || Ok(source.is_file())), Err(StoreError::SessionSourceMissing(id)) if id == session)
+        );
+        {
+            let _publication = reopened.lock_live(session).unwrap();
+            fs::write(&source, "committed before notification").unwrap();
+        }
+        assert!(
+            matches!(reopened.delete(session, SessionDeletionIntent::Ordinary, || { fs::remove_file(&source)?; Ok(()) }), Err(StoreError::SessionPinned(id)) if id == session)
+        );
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "committed before notification"
+        );
+        reopened
+            .delete(session, SessionDeletionIntent::ErasePermanently, || {
+                fs::remove_file(&source)?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            matches!(retention.retain_before_publication(session, pin), Err(StoreError::SessionErased(id)) if id == session)
+        );
+    }
 
     #[test]
     fn pin_survives_reopen_blocks_delete_and_releases_idempotently() {

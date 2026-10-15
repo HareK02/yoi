@@ -62,6 +62,25 @@ pub const MAX_JOURNAL_READ_BYTES: usize = 16 * 1024;
 /// Whole pretty-serialized public page budget, including escaped text and metadata.
 pub const MAX_JOURNAL_RESPONSE_BYTES: usize = 64 * 1024;
 
+/// Stable owner of Backend source retention, shared by attribution-time protection
+/// and later source admission/release. This identifier confers no read authority.
+/// Local standalone storage uses its scope-exclusive Session UUID as the owner.
+pub fn source_retention_pin(workspace: &str, subject: &str, session: &str) -> Uuid {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(
+        serde_json::to_vec(&(
+            "subjektiv-journal-retention-v1",
+            workspace,
+            subject,
+            session,
+        ))
+        .expect("string tuple serialization"),
+    );
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
     #[error("journal permission denied: {0}")]

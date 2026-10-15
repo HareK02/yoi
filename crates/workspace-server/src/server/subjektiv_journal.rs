@@ -320,6 +320,22 @@ fn admit(
         ));
     }
     let mut id = store.journal_for_session(&host).map_err(domain)?;
+    let reader = material_reader(api, &attribution)?;
+    if reader.not_materialized {
+        if store.journal_retention_required(&host).map_err(domain)? {
+            return Err(Error::RepositoryConflict(
+                "Admitted Journal original Session is not materialized".into(),
+            ));
+        }
+        retain_source(
+            api.runtime.as_ref(),
+            api.workspace_id(),
+            &attribution,
+            material_source(api, &attribution)?,
+            true,
+        )?;
+        return Ok(JournalRecordingResponse::NoNewSources);
+    }
     retain_source(
         api.runtime.as_ref(),
         api.workspace_id(),
@@ -327,7 +343,10 @@ fn admit(
         material_source(api, &attribution)?,
         false,
     )?;
-    let sources = canonical_catalog(api, &attribution)?;
+    let sources: Vec<_> = reader
+        .descriptors()
+        .map(|d| source_from_descriptor(&attribution.session_id, d))
+        .collect();
     for batch in sources.chunks(MAX_JOURNAL_RANGES) {
         id = Some(
             store
@@ -374,7 +393,7 @@ pub(super) async fn recording_route(
                 )
                 .into());
             }
-            require_enabled(api.clone(), &worker)?;
+            require_enabled(&api, &worker)?;
             let store = store(&api)?;
             let attributions = store
                 .subject_session_attributions(subject)
@@ -424,7 +443,16 @@ pub(super) async fn job_route(
         .await
 }
 
-fn require_enabled(api: WorkspaceApi, worker: &RuntimeWorkerRef) -> Result<()> {
+fn require_enabled(api: &WorkspaceApi, worker: &RuntimeWorkerRef) -> Result<()> {
+    if !enabled(api, worker)? {
+        return Err(Error::WorkspacePermissionDenied(
+            "Journal Feature is disabled".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn enabled(api: &WorkspaceApi, worker: &RuntimeWorkerRef) -> Result<bool> {
     let projection = api
         .store
         .worker_registry_projection(api.workspace_id(), worker)?
@@ -459,12 +487,7 @@ fn require_enabled(api: WorkspaceApi, worker: &RuntimeWorkerRef) -> Result<()> {
         .ok_or_else(|| Error::Config("Journal Worker Profile bundle missing".into()))?;
     let manifest =
         crate::profile_settings::resolve_profile_manifest_from_config_bundle(&bundle, key)?;
-    if !manifest.feature.subjektiv.enabled() {
-        return Err(Error::WorkspacePermissionDenied(
-            "Journal Feature is disabled".into(),
-        ));
-    }
-    Ok(())
+    Ok(manifest.feature.subjektiv.enabled())
 }
 
 pub(super) fn drain_after_completion(api: &WorkspaceApi, request: &BackendJobRequest) {
@@ -538,16 +561,6 @@ fn source_from_descriptor(
             end: d.total_bytes,
         },
     }
-}
-fn canonical_catalog(
-    api: &WorkspaceApi,
-    attribution: &crate::subjektiv::SubjectSessionAttribution,
-) -> Result<Vec<JournalSourceRange>> {
-    let reader = material_reader(api, attribution)?;
-    Ok(reader
-        .descriptors()
-        .map(|d| source_from_descriptor(&attribution.session_id, d))
-        .collect())
 }
 fn read_canonical(
     reader: &MaterialReader<'_>,
@@ -626,20 +639,14 @@ pub(super) fn recover(api: &WorkspaceApi) -> Result<()> {
                     }
                     if erased {
                         if let Err(error) = material_source(api, attr).and_then(|source| {
-                            retain_source(
-                                api.runtime.as_ref(),
-                                api.workspace_id(),
-                                attr,
-                                source,
-                                true,
-                            )
+                            erase_source(api.runtime.as_ref(), api.workspace_id(), attr, source)
                         }) {
-                            tracing::warn!(%error,session_id=%attr.session_id,"Erased Session source pin release remains recoverable");
+                            tracing::warn!(%error,session_id=%attr.session_id,"Erased Session physical cleanup remains recoverable");
                         }
                         continue;
                     }
                     let source = RuntimeWorkerRef::new(&attr.runtime_id, &attr.worker_id);
-                    if require_enabled(api.clone(), &source).is_err() {
+                    if require_enabled(api, &source).is_err() {
                         // Disablement or removal does not erase previously admitted work, but
                         // also does not authorize collecting a new disabled Worker's history.
                         let host = JournalHostContext::validated_session(&store, attr.clone())
@@ -710,16 +717,13 @@ fn removal_attribution(
     service: &WorkerRemovalService,
     target: &RuntimeWorkerRef,
 ) -> Result<Option<crate::subjektiv::SubjectSessionAttribution>> {
-    let Some(p) = service
+    let Some(lease) = service
         .store
-        .worker_registry_projection(&service.workspace_id, target)?
+        .require_current_worker_singleton_owner(&service.workspace_id, target)?
     else {
         return Ok(None);
     };
-    let Some(key) = p.resource_key.as_deref() else {
-        return Ok(None);
-    };
-    let Some(subject) = key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX) else {
+    let Some(subject) = lease.key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX) else {
         return Ok(None);
     };
     let store = crate::subjektiv::SubjektivStore::open(
@@ -767,9 +771,9 @@ pub(super) fn prepare_worker_removal(
     service: &WorkerRemovalService,
     runtime: &RuntimeRegistry,
     target: &RuntimeWorkerRef,
-) -> Result<()> {
+) -> Result<Option<crate::retention::ErasedJournalSession>> {
     let Some(attr) = removal_attribution(service, target)? else {
-        return Ok(());
+        return Ok(None);
     };
     let store = crate::subjektiv::SubjektivStore::open(
         &service.journal_storage,
@@ -781,31 +785,59 @@ pub(super) fn prepare_worker_removal(
         worker_id: worker_runtime::identity::WorkerId::parse(&target.worker_id)
             .ok_or_else(|| Error::Store("Worker identity invalid".into()))?,
     };
-    retain_source(runtime, &service.workspace_id, &attr, source.clone(), false)?;
+    let api = service.journal_dispatch_api.upgrade().ok_or_else(|| {
+        Error::Store("Workspace API unavailable for Journal removal Feature gate".into())
+    })?;
+    if let Some(proof) =
+        crate::retention::ErasedJournalSession::validated(&service.workspace_id, &store, &attr)?
+    {
+        // Erasure is monotonic. Retry the same physical intent, never admission or generation.
+        reconcile_session_jobs(&api, &attr, true)?;
+        erase_source(runtime, &service.workspace_id, &attr, source)?;
+        return Ok(Some(proof));
+    }
+    let collect_new_sources = enabled(&api, target)?;
+    let mut id = store.journal_for_session(&host).map_err(domain)?;
+    // Disablement forbids new admission, not recovery of an already admitted prefix.
+    // With no admitted remainder there is no source reader or Job to create at removal.
+    if !collect_new_sources && !store.journal_retention_required(&host).map_err(domain)? {
+        return Ok(None);
+    }
     let reader = MaterialReader::open(
         runtime,
         &service.workspace_id,
         &target.runtime_id,
-        source,
+        source.clone(),
         &attr.session_id,
     )?;
-    let ranges: Vec<_> = reader
-        .descriptors()
-        .map(|d| source_from_descriptor(&attr.session_id, d))
-        .collect();
-    let mut id = store.journal_for_session(&host).map_err(domain)?;
-    for batch in ranges.chunks(MAX_JOURNAL_RANGES) {
-        id = Some(
-            store
-                .accept_journal_sources(&host, "Session activity", batch)
-                .map_err(domain)?,
-        );
+    if reader.not_materialized {
+        if store.journal_retention_required(&host).map_err(domain)? {
+            return Err(Error::RepositoryConflict(
+                "Admitted Journal original Session is not materialized".into(),
+            ));
+        }
+        retain_source(runtime, &service.workspace_id, &attr, source, true)?;
+        return Ok(None);
+    }
+    retain_source(runtime, &service.workspace_id, &attr, source, false)?;
+    if collect_new_sources {
+        let ranges: Vec<_> = reader
+            .descriptors()
+            .map(|d| source_from_descriptor(&attr.session_id, d))
+            .collect();
+        for batch in ranges.chunks(MAX_JOURNAL_RANGES) {
+            id = Some(
+                store
+                    .accept_journal_sources(&host, "Session activity", batch)
+                    .map_err(domain)?,
+            );
+        }
     }
     let Some(id) = id else {
-        return Ok(());
+        return Ok(None);
     };
     if !store.journal_retention_required(&host).map_err(domain)? {
-        return Ok(());
+        return Ok(None);
     }
     if let Some(g) = store
         .active_journal_generation(&host, &id)
@@ -817,7 +849,7 @@ pub(super) fn prepare_worker_removal(
             .get_backend_job(&service.workspace_id, &g.job.job_id)?
             .is_some()
         {
-            return Ok(());
+            return Ok(None);
         }
         return Err(Error::Store(
             "Journal generation's existing Job intent is missing".into(),
@@ -843,7 +875,7 @@ pub(super) fn prepare_worker_removal(
         // only starts the existing bounded Job; it never waits for Journal generation.
         api.drain_reserved_backend_jobs();
     }
-    Ok(())
+    Ok(None)
 }
 
 pub(super) fn validate_removal_retention(
@@ -860,6 +892,22 @@ pub(super) fn validate_removal_retention(
     )
     .map_err(|e| Error::Store(e.to_string()))?;
     let host = JournalHostContext::validated_session(&store, attr.clone()).map_err(domain)?;
+    if store.journal_session_erased(&host).map_err(domain)? {
+        if prepared.runtime_request.session_disposition
+            != worker_runtime::retention::SessionDisposition::Purge
+            || prepared.runtime_request.diagnostics_disposition
+                != worker_runtime::retention::DiagnosticsDisposition::Purge
+            || prepared.runtime_request.archive_id.is_some()
+        {
+            return Err(Error::RepositoryConflict(
+                "Erased Journal Session requires source and diagnostics Purge, not an archive"
+                    .into(),
+            ));
+        }
+        // Physical erasure precedes the plan. Runtime resumes aggregate cleanup with
+        // its retained permanent fence, including recovery after the aggregate is gone.
+        return Ok(());
+    }
     let source = runtime_api::SessionPublicSource::Retained {
         worker_id: worker_runtime::identity::WorkerId::parse(&target.worker_id)
             .ok_or_else(|| Error::Store("Worker identity invalid".into()))?,
@@ -926,6 +974,7 @@ struct MaterialReader<'a> {
     runtime_id: String,
     source: runtime_api::SessionPublicSource,
     session_id: String,
+    not_materialized: bool,
     descriptors: Vec<session_store::public_material::PublicMaterialDescriptor>,
 }
 fn material_descriptor(
@@ -968,6 +1017,25 @@ impl<'a> MaterialReader<'a> {
                 )
                 .map_err(|e| e.into_error())?
             {
+                runtime_api::SessionMaterialCatalogAvailability::NotMaterialized {
+                    session_id: observed,
+                } => {
+                    if observed != session_id || offset != 0 || condition.is_some() {
+                        return Err(Error::RepositoryConflict(
+                            "Journal Session materialization proof changed during catalog read"
+                                .into(),
+                        ));
+                    }
+                    return Ok(Self {
+                        runtime,
+                        workspace_id,
+                        runtime_id: runtime_id.into(),
+                        source,
+                        session_id: session_id.into(),
+                        not_materialized: true,
+                        descriptors,
+                    });
+                }
                 runtime_api::SessionMaterialCatalogAvailability::Page { page } => page,
                 runtime_api::SessionMaterialCatalogAvailability::Unavailable {
                     reason,
@@ -1015,6 +1083,7 @@ impl<'a> MaterialReader<'a> {
             runtime_id: runtime_id.into(),
             source,
             session_id: session_id.into(),
+            not_materialized: false,
             descriptors,
         })
     }
@@ -1075,24 +1144,30 @@ impl<'a> MaterialReader<'a> {
     }
 }
 
-pub(super) fn source_pin_id(
+fn erase_source(
+    runtime: &RuntimeRegistry,
     workspace: &str,
     attr: &crate::subjektiv::SubjectSessionAttribution,
-) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(
-        serde_json::to_vec(&(
-            "subjektiv-journal-retention-v1",
-            workspace,
-            &attr.subject_id,
-            &attr.session_id,
-        ))
-        .expect("string tuple serialization"),
-    );
-    let mut bytes = [0; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    Uuid::from_bytes(bytes).to_string()
+    source: runtime_api::SessionPublicSource,
+) -> Result<()> {
+    let response = runtime
+        .session_material_erase(
+            &attr.runtime_id,
+            runtime_api::SessionMaterialEraseRequest {
+                workspace_id: workspace.into(),
+                source,
+                expected_session_id: attr.session_id.clone(),
+            },
+        )
+        .map_err(|e| e.into_error())?;
+    if response.session_id != attr.session_id {
+        return Err(Error::RepositoryConflict(
+            "Session erase receipt differs from the requested identity".into(),
+        ));
+    }
+    Ok(())
 }
+
 fn retain_source(
     runtime: &RuntimeRegistry,
     workspace: &str,
@@ -1100,7 +1175,9 @@ fn retain_source(
     source: runtime_api::SessionPublicSource,
     release: bool,
 ) -> Result<()> {
-    let pin_id = source_pin_id(workspace, attr);
+    let pin_id =
+        subjektiv::journal::source_retention_pin(workspace, &attr.subject_id, &attr.session_id)
+            .to_string();
     let request = runtime_api::SessionMaterialPinRequest {
         workspace_id: workspace.into(),
         source,
@@ -1340,8 +1417,10 @@ fn reconcile_session_jobs(
 }
 
 impl WorkspaceApi {
-    /// Host-only explicit erasure hook. The existing domain tombstone is the durable
-    /// cancellation intent; interrupted Worker Purge is retried by ordinary Job cleanup.
+    /// Host-only erasure saves the domain fence, cancels Jobs, then erases originals.
+    /// Runtime requires a stopped source Worker. Physical failure leaves the domain
+    /// tombstone and cancellations committed for exact retry or removal preflight;
+    /// terminal Job execution Sessions remain owned by ordinary Job cleanup.
     pub fn erase_subjektiv_journal_session(
         &self,
         session_id: &str,
@@ -1359,12 +1438,11 @@ impl WorkspaceApi {
             .erase_journal_session(&host, request_id)
             .map_err(domain)?;
         reconcile_session_jobs(self, &attr, true)?;
-        retain_source(
+        erase_source(
             self.runtime.as_ref(),
             self.workspace_id(),
             &attr,
             material_source(self, &attr)?,
-            true,
         )
     }
 }

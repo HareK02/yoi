@@ -659,6 +659,253 @@ impl agen::llm_client::LlmClient for JournalScript {
     }
 }
 
+#[derive(Clone, Default)]
+struct DialogAndJournal {
+    journal: JournalScript,
+    dialog_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl agen::llm_client::LlmClient for DialogAndJournal {
+    async fn stream(
+        &self,
+        request: agen::llm_client::Request,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = Result<
+                            agen::llm_client::event::Event,
+                            agen::llm_client::error::ClientError,
+                        >,
+                    > + Send,
+            >,
+        >,
+        agen::llm_client::error::ClientError,
+    > {
+        if request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "ReadJournalState")
+        {
+            return agen::llm_client::LlmClient::stream(&self.journal, request).await;
+        }
+        use agen::llm_client::{
+            event::{Event, StopReason},
+            types::Item,
+        };
+        let surface = request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "SubmitMemorySurface");
+        if surface
+            || request
+                .tools
+                .iter()
+                .any(|tool| tool.name == "SubmitJobResult")
+        {
+            let events = if request.items.iter().any(|item| matches!(item, Item::ToolResult { call_id, .. } if call_id == "empty-memory")) {
+                vec![Event::text_block_start(0), Event::text_delta(0, "empty Memory acknowledged"), Event::text_block_stop(0, Some(StopReason::EndTurn))]
+            } else {
+                let (tool, value) = if surface {
+                    ("SubmitMemorySurface", serde_json::json!({"points":[]}))
+                } else {
+                    let input: serde_json::Value = request.items.iter().filter_map(Item::as_text).find_map(|text| text.lines().find_map(|line| line.strip_prefix("input_json: "))).map(|json| serde_json::from_str(json).unwrap()).expect("Memory Job input");
+                    assert_eq!(input["candidate_ids"], serde_json::json!([]), "fixture has no staged Memory; do not synthesize decisions");
+                    ("SubmitJobResult", serde_json::json!({"result":input}))
+                };
+                vec![Event::tool_use_start(0, "empty-memory", tool), Event::tool_input_delta(0, value.to_string()), Event::tool_use_stop(0)]
+            };
+            return Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))));
+        }
+        self.dialog_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(futures::stream::iter(
+            [
+                Event::text_block_start(0),
+                Event::text_delta(0, "public scripted response"),
+                Event::text_block_stop(0, Some(StopReason::EndTurn)),
+            ]
+            .into_iter()
+            .map(Ok),
+        )))
+    }
+    fn clone_boxed(&self) -> Box<dyn agen::llm_client::LlmClient> {
+        Box::new(self.clone())
+    }
+}
+
+async fn submit_dialog(host: &crate::StandaloneHost, input: &str) {
+    let mut client = host.connect();
+    client
+        .send(&protocol::Method::submit_text(
+            protocol::new_submission_request_id(),
+            input,
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let mut answered = false;
+        loop {
+            match client.next_event().await.unwrap().unwrap() {
+                protocol::Event::TextDelta { text }
+                    if text.contains("public scripted response") =>
+                {
+                    answered = true
+                }
+                protocol::Event::RunEnd { .. } => {
+                    assert!(answered);
+                    return;
+                }
+                protocol::Event::Error { code, message } => panic!("{code:?}: {message}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("bounded main dialog completion");
+}
+
+/// Public standalone launch/protocol -> real controller/Worker Feature -> LocalSubjectHost ->
+/// original FsStore -> generic Job runner/tools -> Journal read API. Only the two model clients
+/// are scripted; no manual admission, generation reservation, source append or domain mutation.
+#[tokio::test]
+async fn public_host_dialog_auto_records_while_generation_waits_and_drains_without_another_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let catalog = StandaloneSubjects::open(&state).unwrap();
+    let subject = catalog.create("public-dialog-owner", None).unwrap();
+    let model = DialogAndJournal {
+        journal: JournalScript {
+            gate_first: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let launch = crate::StandaloneLaunchConfig::new(
+        temp.path(),
+        &state,
+        manifest::ProfileSelector::source_named(
+            manifest::ProfileRegistrySource::Builtin,
+            "standalone-subjektiv",
+        ),
+        "public-journal-dialog",
+    )
+    .with_subject(subject.id.clone())
+    .resolve()
+    .unwrap();
+    let host = crate::StandaloneHost::start_with_model_client(launch, model.clone())
+        .await
+        .unwrap();
+    let session = host.record().active_session_id;
+    assert_eq!(
+        crate::store::session_retention(&state)
+            .pins(session)
+            .unwrap(),
+        [session_store::retention::SessionRetentionPin(session)]
+    );
+    submit_dialog(&host, "first small public turn").await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        model.journal.entered.notified(),
+    )
+    .await
+    .unwrap();
+    let reader = JournalHostContext::validated_reader(&catalog.store, &subject.id).unwrap();
+    let journal = catalog
+        .store
+        .list_journals(&reader, None, 1)
+        .unwrap()
+        .items
+        .pop()
+        .unwrap();
+    let attr = catalog
+        .store
+        .session_attribution(&session.to_string())
+        .unwrap()
+        .unwrap();
+    let context = JournalHostContext::validated_session(&catalog.store, attr).unwrap();
+    let first = catalog
+        .store
+        .active_journal_generation(&context, &journal.id)
+        .unwrap()
+        .unwrap();
+    submit_dialog(&host, "second small public turn").await;
+    submit_dialog(&host, "last input; no further turn follows").await;
+    assert_eq!(model.dialog_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        catalog
+            .store
+            .active_journal_generation(&context, &journal.id)
+            .unwrap()
+            .unwrap(),
+        first,
+        "running generation/input remain frozen while dialog proceeds"
+    );
+    model.journal.release.notify_one();
+    let jobs = host.jobs();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        jobs.wait(&first.job.job_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        model.journal.entered.notified(),
+    )
+    .await
+    .unwrap();
+    let second = catalog
+        .store
+        .active_journal_generation(&context, &journal.id)
+        .unwrap()
+        .unwrap();
+    assert_ne!(first.id, second.id);
+    model.journal.release.notify_one();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        jobs.wait(&second.job.job_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!catalog.store.journal_retention_required(&context).unwrap());
+    let saved = catalog.store.read_journal(&reader, &journal.id).unwrap();
+    assert!(saved.current_position_bytes > 0);
+    let position = catalog
+        .store
+        .read_journal_text(
+            &reader,
+            &journal.id,
+            None,
+            JournalTextField::CurrentPosition,
+            None,
+            0,
+            MAX_JOURNAL_READ_BYTES,
+        )
+        .unwrap();
+    assert!(!position.text.is_empty());
+    let (_, open) = catalog
+        .store
+        .journal_resume_state(&context, &journal.id)
+        .unwrap();
+    let open = open.unwrap();
+    let body = catalog
+        .store
+        .read_journal_text(
+            &reader,
+            &journal.id,
+            Some(&open.id),
+            JournalTextField::Body,
+            None,
+            0,
+            MAX_JOURNAL_READ_BYTES,
+        )
+        .unwrap();
+    assert!(body.text.contains("last input"));
+    host.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn real_job_tools_save_and_drain_last_input_without_another_turn() {
     let fixture = Fixture::new("Proposed A, corrected to B; partly performed; interrupted");

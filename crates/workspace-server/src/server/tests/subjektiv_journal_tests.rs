@@ -395,6 +395,24 @@ fn seed_session(
     item: session_store::LoggedItem,
     origin: session_store::LoggedSessionHistoryOrigin,
 ) {
+    seed_session_history(
+        root,
+        session,
+        vec![session_store::LoggedHistoryEntry {
+            item,
+            metadata: session_store::LoggedSessionHistoryMetadata {
+                entry_id: session_store::LoggedSessionHistoryEntryId("read-source-original".into()),
+                origin,
+                derivation: None,
+            },
+        }],
+    );
+}
+fn seed_session_history(
+    root: &std::path::Path,
+    session: session_store::SessionId,
+    history: Vec<session_store::LoggedHistoryEntry>,
+) {
     use session_store::{LogEntry, Store as _, WorkerSessionStore};
     let segment = Uuid::new_v4();
     WorkerSessionStore::new(root)
@@ -407,16 +425,7 @@ fn seed_session(
                 session_id: session,
                 system_prompt: None,
                 config: agen::llm_client::RequestConfig::default(),
-                history: vec![session_store::LoggedHistoryEntry {
-                    item,
-                    metadata: session_store::LoggedSessionHistoryMetadata {
-                        entry_id: session_store::LoggedSessionHistoryEntryId(
-                            "read-source-original".into(),
-                        ),
-                        origin,
-                        derivation: None,
-                    },
-                }],
+                history,
                 forked_from: None,
                 compacted_from: None,
             }],
@@ -486,7 +495,12 @@ impl RuntimeFixture {
                     workspace_id: TEST_WORKSPACE_ID.into(),
                     source: src.clone(),
                     expected_session_id: session.to_string(),
-                    pin_id: subjektiv_journal::source_pin_id(TEST_WORKSPACE_ID, &attr),
+                    pin_id: subjektiv::journal::source_retention_pin(
+                        TEST_WORKSPACE_ID,
+                        &attr.subject_id,
+                        &attr.session_id,
+                    )
+                    .to_string(),
                 },
             )
             .unwrap();
@@ -558,6 +572,18 @@ impl RuntimeFixture {
             range,
             id,
         }
+    }
+    fn stop_source(&self) {
+        self.api
+            .runtime
+            .stop_worker(
+                &self.source,
+                WorkerLifecycleRequest {
+                    reason: Some("settle original source before permanent erase".into()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
     }
     fn dispatch_and_read(&self) -> BackendJobReservation {
         let dispatched = self
@@ -664,9 +690,10 @@ impl RuntimeFixture {
                 .unwrap()
                 .is_none()
         );
-        assert!(
+        assert_eq!(
             session_root(self.dir.path(), &self.source).exists(),
-            "the original conversation was not purged"
+            !self.store.journal_session_erased(&self.host).unwrap(),
+            "only explicit source erasure, never Job cleanup, removes the original conversation"
         );
     }
 }
@@ -713,6 +740,7 @@ async fn terminal_journal_attempts_purge_real_tool_result_sessions_without_chang
                     .unwrap();
             }
             "erased" => {
+                f.stop_source();
                 f.api
                     .erase_subjektiv_journal_session(
                         &f.session.to_string(),
@@ -1126,6 +1154,7 @@ async fn journal_profile_name_without_host_job_binding_keeps_normal_archive_poli
                 workspace_id: TEST_WORKSPACE_ID.into(),
                 worker: f.source,
                 reason: "profile is not purge authority".into(),
+                journal_erasure: None,
             },
             &inventory,
         )
@@ -1364,6 +1393,7 @@ async fn failed_cancelled_and_erased_job_sessions_retry_purge_after_cleanup_fail
             )
             .unwrap();
         if outcome == "erased" {
+            f.stop_source();
             f.api
                 .erase_subjektiv_journal_session(
                     &f.session.to_string(),
@@ -1472,6 +1502,7 @@ async fn explicit_erasure_interrupts_completed_journal_cleanup_waiting_for_run_t
         session_root(f.dir.path(), worker).exists(),
         "normal cleanup still waits for tracked response teardown"
     );
+    f.stop_source();
     f.api
         .erase_subjektiv_journal_session(&f.session.to_string(), "erase-while-completed-run-busy")
         .unwrap();
@@ -1496,4 +1527,617 @@ async fn explicit_erasure_interrupts_completed_journal_cleanup_waiting_for_run_t
     );
     assert!(f.store.journal_session_erased(&f.host).unwrap());
     assert!(subjektiv_journal::execute(&f.api, worker, JournalJobRequest::ReadState).is_err());
+}
+
+/// Removal uses the production embedded WorkerRemove forwarder, target-bound proof,
+/// common reception, catalog/retention planner, Runtime and SQLite. Source creation
+/// calls the create handler directly (no HTTP auth); canonical Session contents,
+/// attribution and profile disablement are fixtures, not model execution or proofs
+/// of the normal publication/attribution connection.
+struct SubjectRemovalFixture {
+    dir: tempfile::TempDir,
+    api: WorkspaceApi,
+    dispatcher: Arc<crate::worker_source::EmbeddedServerWorkerMutationDispatcher>,
+    controller: RuntimeWorkerRef,
+    target: RuntimeWorkerRef,
+    store: crate::subjektiv::SubjektivStore,
+    attr: crate::subjektiv::SubjectSessionAttribution,
+    host: JournalHostContext,
+}
+impl SubjectRemovalFixture {
+    async fn new() -> Self {
+        Self::with_materialized_source(true).await
+    }
+    async fn with_materialized_source(materialized: bool) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_server_config(dir.path());
+        let control = Arc::new(test_control_store(&config));
+        seed_test_registered_workspace(control.as_ref(), &config)
+            .await
+            .unwrap();
+        let dispatcher = Arc::new(
+            crate::worker_source::EmbeddedServerWorkerMutationDispatcher::new(
+                config.clone(),
+                control.clone(),
+            ),
+        );
+        let api = WorkspaceApi::new_with_execution_backend_and_broker(
+            config,
+            control,
+            Arc::new(DeterministicExecutionBackend::default()),
+            BackendResourceBroker::default(),
+            HostExecutors::default(),
+            Some(dispatcher.clone()),
+        )
+        .await
+        .unwrap();
+        let Json(orchestrator) = scoped_start_workspace_orchestrator(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let controller = orchestrator.worker.unwrap();
+        let controller = RuntimeWorkerRef::new(controller.runtime_id, controller.worker_id);
+        let store = open_subjektiv_store(&api).unwrap();
+        let subject = store
+            .create_subject(crate::subjektiv::SubjectRole::new("removal-source").unwrap())
+            .unwrap();
+        let Json(created) = scoped_create_workspace_worker(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+            }),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),
+                display_name: "removal-source".into(),
+                singleton_key: None,
+                profile: Some("builtin:companion".into()),
+                ticket_assignment: None,
+                initial_submit: vec![],
+                workdir_attachments: vec![],
+                feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
+                    subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
+                        subject_id: subject.id.clone(),
+                    }),
+                },
+                control_operation_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let target = RuntimeWorkerRef::new(created.runtime_id, created.worker_id);
+        let session = store
+            .subject_session_attributions(&subject.id)
+            .unwrap()
+            .first()
+            .map(|attr| attr.session_id.parse().unwrap())
+            .unwrap_or_else(session_store::new_session_id);
+        if materialized {
+            seed_session_history(
+                &session_root(dir.path(), &target),
+                session,
+                ["admitted-prefix", "disabled-new-history"]
+                    .into_iter()
+                    .map(|text| session_store::LoggedHistoryEntry {
+                        item: message(text),
+                        metadata: session_store::LoggedSessionHistoryMetadata {
+                            entry_id: session_store::LoggedSessionHistoryEntryId(text.into()),
+                            origin: session_store::LoggedSessionHistoryOrigin::LocalHumanInput,
+                            derivation: None,
+                        },
+                    })
+                    .collect(),
+            );
+        } else {
+            use session_store::WorkerMetadataStore as _;
+            let root = session_root(dir.path(), &target);
+            let aggregate = root.parent().unwrap();
+            let name = format!("worker-runtime-{}", target.worker_id);
+            session_store::WorkerAggregateStore::new(aggregate, &name)
+                .unwrap()
+                .write(
+                    &session_store::WorkerMetadata::new(
+                        &name,
+                        Some(session_store::WorkerActiveSegmentRef::pending_segment(
+                            session,
+                        )),
+                    )
+                    .with_workspace_id(TEST_WORKSPACE_ID),
+                )
+                .unwrap();
+        }
+        let attr = store
+            .record_session_attribution(
+                crate::subjektiv::SubjectSessionAttribution::new(
+                    &subject.id,
+                    &target.runtime_id,
+                    &target.worker_id,
+                    session.to_string(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let host = JournalHostContext::validated_session(&store, attr.clone()).unwrap();
+        seed_worker_control_grant(&api, &controller, &target, "subject-removal-fixture");
+        api.runtime
+            .stop_worker(
+                &target,
+                WorkerLifecycleRequest {
+                    reason: Some("test stopped Subject removal".into()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        let summary = api.runtime.worker(&target).unwrap();
+        assert_eq!(summary.state, "stopped");
+        sync_worker_observation(&api, &summary).unwrap();
+        Self {
+            dir,
+            api,
+            dispatcher,
+            controller,
+            target,
+            store,
+            attr,
+            host,
+        }
+    }
+    fn disable(&self) {
+        let mut registry = self
+            .api
+            .store
+            .get_worker_registry(TEST_WORKSPACE_ID, &self.target)
+            .unwrap()
+            .unwrap();
+        registry.profile = Some("builtin:default".into());
+        self.api.store.upsert_worker_registry(&registry).unwrap();
+    }
+    fn remove(&self) -> worker::WorkspaceResponse {
+        let key = self
+            .api
+            .store
+            .worker_resource_key(TEST_WORKSPACE_ID, &self.target)
+            .unwrap()
+            .unwrap();
+        worker_runtime::worker_source::RuntimeWorkerMutationForwarder::embedded(
+            &self.controller.runtime_id,
+            worker_runtime::RuntimeWorkspaceScope::new(TEST_WORKSPACE_ID, "embedded-backend"),
+            &self.controller.worker_id,
+            self.dispatcher.clone(),
+        )
+        .execute_worker_remove(&self.target.runtime_id, &key, "remove stopped Subject")
+        .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn disabled_subject_removal_does_not_admit_new_public_history_or_reserve_a_job() {
+    let f = SubjectRemovalFixture::new().await;
+    f.disable();
+    let response = f.remove();
+    assert_eq!(
+        response.status,
+        StatusCode::OK.as_u16(),
+        "{}",
+        response.body
+    );
+    assert!(
+        f.api
+            .store
+            .get_worker_registry(TEST_WORKSPACE_ID, &f.target)
+            .unwrap()
+            .is_none()
+    );
+    assert!(f.store.journal_for_session(&f.host).unwrap().is_none());
+    assert!(
+        f.api
+            .store
+            .list_backend_journal_jobs(TEST_WORKSPACE_ID, &f.attr.session_id, None, 100)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn disabled_subject_removal_retains_only_the_already_admitted_prefix() {
+    let f = SubjectRemovalFixture::new().await;
+    let runtime_api::SessionMaterialCatalogAvailability::Page { page } = f
+        .api
+        .runtime
+        .session_material_catalog(
+            &f.target.runtime_id,
+            runtime_api::SessionMaterialCatalogRequest {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                source: runtime_api::SessionPublicSource::Retained {
+                    worker_id: worker_runtime::identity::WorkerId::parse(&f.target.worker_id)
+                        .unwrap(),
+                },
+                expected_session_id: f.attr.session_id.clone(),
+                expected_catalog_sha256: None,
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("canonical source catalog required")
+    };
+    let ranges: Vec<_> = page
+        .descriptors
+        .into_iter()
+        .map(|d| JournalSourceRange {
+            source: JournalSource {
+                session_id: f.attr.session_id.clone(),
+                pointer: JournalSourcePointer {
+                    segment_id: d.segment_id.parse().unwrap(),
+                    entry_ref: d.entry_ref,
+                },
+                order: d.canonical_order,
+                content_sha256: d.sha256,
+                total_bytes: d.total_bytes,
+            },
+            bytes: JournalByteRange {
+                start: 0,
+                end: d.total_bytes,
+            },
+        })
+        .collect();
+    assert_eq!(ranges.len(), 2);
+    let id = f
+        .store
+        .accept_journal_sources(&f.host, "accepted before disablement", &ranges[..1])
+        .unwrap();
+    f.disable();
+    let response = f.remove();
+    assert_eq!(
+        response.status,
+        StatusCode::OK.as_u16(),
+        "{}",
+        response.body
+    );
+    assert!(
+        f.api
+            .store
+            .get_worker_registry(TEST_WORKSPACE_ID, &f.target)
+            .unwrap()
+            .is_none()
+    );
+    let jobs = f
+        .api
+        .store
+        .list_backend_journal_jobs(TEST_WORKSPACE_ID, &f.attr.session_id, None, 100)
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        jobs[0]
+            .request
+            .grants
+            .subjektiv_journal
+            .as_ref()
+            .unwrap()
+            .selected_ranges,
+        ranges[..1]
+    );
+    assert_eq!(
+        f.store.journal_for_session(&f.host).unwrap().as_deref(),
+        Some(id.as_str())
+    );
+    assert!(f.store.journal_retention_required(&f.host).unwrap());
+    let archive = f
+        .api
+        .config_store
+        .worker_session_archive(TEST_WORKSPACE_ID, &f.target, &f.attr.session_id)
+        .unwrap()
+        .unwrap();
+    assert!(!session_root(f.dir.path(), &f.target).exists());
+    let source = runtime_api::SessionPublicSource::Archived {
+        archive_id: archive.archive_id,
+    };
+    let response = f
+        .api
+        .runtime
+        .session_material_catalog(
+            &f.target.runtime_id,
+            runtime_api::SessionMaterialCatalogRequest {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                source,
+                expected_session_id: f.attr.session_id.clone(),
+                expected_catalog_sha256: None,
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        response,
+        runtime_api::SessionMaterialCatalogAvailability::Page { .. }
+    ));
+}
+
+#[tokio::test]
+async fn attributed_unmaterialized_subject_removal_needs_no_journal_job() {
+    let f = SubjectRemovalFixture::with_materialized_source(false).await;
+    let retention = source_retention(f.dir.path());
+    let session = f.attr.session_id.parse().unwrap();
+    // Fixture the pre-publication pin without materializing the Session.
+    retention
+        .pin(
+            session,
+            session_store::retention::SessionRetentionPin(
+                subjektiv::journal::source_retention_pin(
+                    TEST_WORKSPACE_ID,
+                    &f.attr.subject_id,
+                    &f.attr.session_id,
+                )
+                .to_string()
+                .parse()
+                .unwrap(),
+            ),
+            || Ok(true),
+        )
+        .unwrap();
+    assert_eq!(retention.pins(session).unwrap().len(), 1);
+    let response = f.remove();
+    assert!(retention.pins(session).unwrap().is_empty());
+    assert_eq!(
+        response.status,
+        StatusCode::OK.as_u16(),
+        "{}",
+        response.body
+    );
+    assert!(
+        f.api
+            .store
+            .get_worker_registry(TEST_WORKSPACE_ID, &f.target)
+            .unwrap()
+            .is_none()
+    );
+    assert!(f.store.journal_for_session(&f.host).unwrap().is_none());
+    assert!(
+        f.api
+            .store
+            .list_backend_journal_jobs(TEST_WORKSPACE_ID, &f.attr.session_id, None, 100)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn missing_materialized_subject_source_blocks_removal_without_marking_it_empty() {
+    let f = SubjectRemovalFixture::new().await;
+    std::fs::remove_dir_all(session_root(f.dir.path(), &f.target)).unwrap();
+    let response = f.remove();
+    assert_eq!(
+        response.status,
+        StatusCode::CONFLICT.as_u16(),
+        "{}",
+        response.body
+    );
+    assert!(response.body.contains("journal_handoff_incomplete"));
+    assert!(
+        f.api
+            .store
+            .get_worker_registry(TEST_WORKSPACE_ID, &f.target)
+            .unwrap()
+            .is_some()
+    );
+    assert!(f.store.journal_for_session(&f.host).unwrap().is_none());
+    assert!(
+        f.api
+            .store
+            .list_backend_journal_jobs(TEST_WORKSPACE_ID, &f.attr.session_id, None, 100)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+fn source_retention(root: &std::path::Path) -> session_store::retention::SessionRetentionStore {
+    session_store::retention::SessionRetentionStore::new(
+        root.join(".test-embedded-runtime-store/retention/session-sources"),
+    )
+}
+
+#[tokio::test]
+async fn explicitly_erased_subject_removal_purges_without_generating_or_archiving() {
+    let f = SubjectRemovalFixture::new().await;
+    let policy = f
+        .api
+        .config_store
+        .worker_retention_policy(TEST_WORKSPACE_ID)
+        .unwrap();
+    f.api
+        .erase_subjektiv_journal_session(&f.attr.session_id, "erase-before-normal-remove")
+        .unwrap();
+    assert!(f.store.journal_session_erased(&f.host).unwrap());
+    assert!(!session_root(f.dir.path(), &f.target).exists());
+    // Exact erase replay must resume the same permanent intent even after source removal.
+    f.api
+        .erase_subjektiv_journal_session(&f.attr.session_id, "erase-before-normal-remove")
+        .unwrap();
+    let response = f.remove();
+    assert_eq!(
+        response.status,
+        StatusCode::OK.as_u16(),
+        "{}",
+        response.body
+    );
+    assert!(
+        f.api
+            .store
+            .get_worker_registry(TEST_WORKSPACE_ID, &f.target)
+            .unwrap()
+            .is_none()
+    );
+    let saved = f
+        .api
+        .config_store
+        .recover_worker_removal_execution(TEST_WORKSPACE_ID, &f.target)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        saved.plan.session_disposition,
+        worker_runtime::retention::SessionDisposition::Purge
+    );
+    assert_eq!(
+        saved.plan.diagnostics_disposition,
+        worker_runtime::retention::DiagnosticsDisposition::Purge
+    );
+    assert!(saved.plan.archive_id.is_none());
+    assert!(
+        f.api
+            .config_store
+            .worker_session_archive(TEST_WORKSPACE_ID, &f.target, &f.attr.session_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        f.api
+            .store
+            .list_backend_journal_jobs(TEST_WORKSPACE_ID, &f.attr.session_id, None, 100)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        f.api
+            .config_store
+            .worker_retention_policy(TEST_WORKSPACE_ID)
+            .unwrap(),
+        policy
+    );
+    assert!(matches!(
+        source_retention(f.dir.path()).ensure_live(f.attr.session_id.parse().unwrap()),
+        Err(session_store::StoreError::SessionErased(_))
+    ));
+}
+
+#[tokio::test]
+async fn erased_subject_removal_retries_interrupted_physical_erasure_under_the_permanent_fence() {
+    let f = SubjectRemovalFixture::new().await;
+    // Fixture boundary: interrupt the real retention deletion after its durable fence,
+    // before physical removal. WorkerRemove below uses the real Backend/Runtime erase path.
+    f.store
+        .erase_journal_session(&f.host, "erase-interrupted")
+        .unwrap();
+    let retention = source_retention(f.dir.path());
+    let session = f.attr.session_id.parse().unwrap();
+    assert!(
+        retention
+            .delete(
+                session,
+                session_store::retention::SessionDeletionIntent::ErasePermanently,
+                || {
+                    Err::<(), _>(session_store::StoreError::Io(std::io::Error::other(
+                        "injected physical cleanup failure",
+                    )))
+                }
+            )
+            .is_err()
+    );
+    assert!(session_root(f.dir.path(), &f.target).exists());
+    let response = f.remove();
+    assert_eq!(
+        response.status,
+        StatusCode::OK.as_u16(),
+        "{}",
+        response.body
+    );
+    assert!(
+        !session_root(f.dir.path(), &f.target)
+            .parent()
+            .unwrap()
+            .exists()
+    );
+    assert!(
+        f.api
+            .store
+            .get_worker_registry(TEST_WORKSPACE_ID, &f.target)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        f.api
+            .config_store
+            .worker_session_archive(TEST_WORKSPACE_ID, &f.target, &f.attr.session_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        f.api
+            .store
+            .list_backend_journal_jobs(TEST_WORKSPACE_ID, &f.attr.session_id, None, 100)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        retention.ensure_live(session),
+        Err(session_store::StoreError::SessionErased(_))
+    ));
+}
+
+#[tokio::test]
+async fn physical_erase_failure_keeps_domain_tombstone_and_job_cancellation_for_exact_retry() {
+    let f = RuntimeFixture::new().await;
+    let dispatched = f.dispatch_and_read();
+    // Original source is not stopped: Runtime must reject physical erasure, after
+    // the Backend has durably fenced all Journal adoption and cancelled its Job.
+    assert!(
+        f.api
+            .erase_subjektiv_journal_session(&f.session.to_string(), "erase-unsettled-source")
+            .is_err()
+    );
+    assert!(f.store.journal_session_erased(&f.host).unwrap());
+    assert!(session_root(f.dir.path(), &f.source).exists());
+    let job = f
+        .api
+        .store
+        .get_backend_job(TEST_WORKSPACE_ID, &f.request.job_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.state, BackendJobState::Failed);
+    assert!(
+        subjektiv_journal::execute(
+            &f.api,
+            dispatched.attempt.worker.as_ref().unwrap(),
+            JournalJobRequest::ReadState
+        )
+        .is_err()
+    );
+    f.stop_source();
+    f.api
+        .erase_subjektiv_journal_session(&f.session.to_string(), "erase-unsettled-source")
+        .unwrap();
+    assert!(!session_root(f.dir.path(), &f.source).exists());
+    assert_eq!(
+        f.api
+            .store
+            .list_backend_journal_jobs(TEST_WORKSPACE_ID, &f.session.to_string(), None, 100)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn serialized_removal_input_cannot_supply_journal_erasure_authority() {
+    let f = SubjectRemovalFixture::new().await;
+    let request: crate::retention::WorkerRemovalPlanRequest = serde_json::from_value(json!({
+        "workspace_id": TEST_WORKSPACE_ID, "worker": f.target, "reason": "untrusted erase claim",
+        "journal_erasure": {"workspace_id": TEST_WORKSPACE_ID, "worker": f.target, "session_id": f.attr.session_id},
+    })).unwrap();
+    let inventory = f.api.runtime.worker_retention_inventory(&f.target).unwrap();
+    let plan = f
+        .api
+        .store
+        .plan_worker_removal(&request, &inventory)
+        .unwrap();
+    assert_eq!(
+        plan.session_disposition,
+        worker_runtime::retention::SessionDisposition::Archive
+    );
+    assert!(!f.store.journal_session_erased(&f.host).unwrap());
+    assert!(session_root(f.dir.path(), &f.target).exists());
 }
