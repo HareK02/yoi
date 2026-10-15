@@ -32,6 +32,7 @@ struct RealDriveFixture {
     api: WorkspaceApi,
     owner: String,
     second: String,
+    foreign: String,
     _temp: tempfile::TempDir,
 }
 impl RealDriveFixture {
@@ -41,7 +42,7 @@ impl RealDriveFixture {
         config.repositories.clear();
         let store = Arc::new(SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap());
         let owner = seed_test_api_token(store.as_ref(), "drive-web-owner");
-        let second = seed_test_api_token(store.as_ref(), "drive-web-second");
+        let foreign = seed_test_api_token(store.as_ref(), "drive-web-foreign");
         let server_api = WorkspaceServerApi::new_for_test(config, store.clone());
         let server = LoopbackServer::start(workspace_server_router(server_api.clone())).await;
         // Exercise T-717's real repositoryless Workspace bootstrap, not a
@@ -56,6 +57,25 @@ impl RealDriveFixture {
         let created = http_json(response, StatusCode::CREATED).await;
         assert!(created["repository"].is_null(), "{created}");
         let workspace_id = created["workspace"]["workspace_id"].as_str().unwrap();
+        // Both concurrent clients need current owner authority. A foreign
+        // Account must be rejected by admission before it can reach Drive CAS.
+        let second = "api-token-drive-web-second".to_string();
+        store
+            .create_api_token(&ApiTokenRecord {
+                token_hash: crate::auth::token_hash(&second),
+                token_id: "drive-web-second-token".into(),
+                user_id: store
+                    .get_user_by_handle("user-drive-web-owner")
+                    .unwrap()
+                    .unwrap()
+                    .user_id,
+                label: "second owner client".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                expires_at: None,
+                last_used_at: None,
+                revoked_at: None,
+            })
+            .unwrap();
         assert!(store.list_repositories(workspace_id).unwrap().is_empty());
         let api = server_api
             .api_for_workspace(workspace_id)
@@ -76,6 +96,7 @@ impl RealDriveFixture {
             api,
             owner,
             second,
+            foreign,
             _temp: temp,
         }
     }
@@ -405,7 +426,7 @@ async fn repositoryless_drive_real_web_adapter_preserves_bytes_cas_and_latest_re
         .expect("Deno must be installed for this explicit process test");
     let wire = serde_json::to_vec(&json!({
         "origin":fixture.server.origin,"workspace_id":fixture.api.workspace_id(),
-        "owner_token":fixture.owner,"second_token":fixture.second,"worker_entry":worker_entry,
+        "owner_token":fixture.owner,"second_token":fixture.second,"foreign_token":fixture.foreign,"worker_entry":worker_entry,
     }))
     .unwrap();
     let mut stdin = child.stdin.take().unwrap();
@@ -422,6 +443,7 @@ async fn repositoryless_drive_real_web_adapter_preserves_bytes_cas_and_latest_re
         String::from_utf8_lossy(bytes)
             .replace(&fixture.owner, "[redacted]")
             .replace(&fixture.second, "[redacted]")
+            .replace(&fixture.foreign, "[redacted]")
     };
     assert!(
         output.status.success(),

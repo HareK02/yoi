@@ -3416,6 +3416,32 @@
         ],
         "type": "object"
       },
+      "HostingAccess": {
+        "additionalProperties": false,
+        "description": "Hosting authority for the current authenticated human, not Workspace permissions.",
+        "properties": {
+          "is_admin": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "is_admin"
+        ],
+        "type": "object"
+      },
+      "HostingSettings": {
+        "additionalProperties": false,
+        "description": "The only public registration policy. No administrator identities or host secrets are exposed.",
+        "properties": {
+          "self_registration_enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "self_registration_enabled"
+        ],
+        "type": "object"
+      },
       "InitialRepositoryIntent": {
         "additionalProperties": false,
         "description": "Initial Repository registration intent for Workspace creation.",
@@ -17748,7 +17774,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:21dfcde7b03c0b08f9ede1012962ff69a05d4f8373d5a9c5abe6ab43ba5c3720"
+    "x-yoi-source-digest": "sha256:92f1f789f68d3c5d55c61d9bcf7d66451d4492cd0007aa178da1472af103719a"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -18450,6 +18476,33 @@
         }
       }
     },
+    "/api/auth/registration-policy": {
+      "get": {
+        "operationId": "auth_registration_policy",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostingSettings"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
     "/api/auth/whoami": {
       "get": {
         "operationId": "auth_whoami",
@@ -18729,6 +18782,179 @@
             "description": "Error response"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/hosting/access": {
+      "get": {
+        "operationId": "hosting_access",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostingAccess"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/hosting/settings": {
+      "get": {
+        "operationId": "hosting_settings",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostingSettings"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "put": {
+        "operationId": "hosting_settings_update",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HostingSettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostingSettings"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
             "content": {
               "application/json": {
                 "schema": {

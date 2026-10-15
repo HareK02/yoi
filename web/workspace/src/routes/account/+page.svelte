@@ -9,6 +9,7 @@
   } from '#lib/workspace/auth/api.ts';
   import '#lib/workspace/styles/settings.css';
   import type { RequestActor } from '#lib/workspace/auth/model.ts';
+  import { loadRegistrationPolicy, notifySessionChanged } from '#lib/workspace/auth/hosting.ts';
 
   let actor = $state<RequestActor | null>(null);
   let handle = $state('local');
@@ -18,6 +19,25 @@
   let busy = $state(false);
   let status = $state('');
   let error = $state('');
+  let policy = $state<boolean | null>(null);
+  let policyLoading = $state(true);
+  let policyError = $state('');
+  let policyRequest = 0;
+
+  async function refreshPolicy() {
+    const request = ++policyRequest;
+    policyLoading = true;
+    policy = null;
+    policyError = '';
+    try {
+      const settings = await loadRegistrationPolicy();
+      if (request === policyRequest) policy = settings.self_registration_enabled;
+    } catch {
+      if (request === policyRequest) policyError = 'Registration availability could not be loaded.';
+    } finally {
+      if (request === policyRequest) policyLoading = false;
+    }
+  }
 
   async function refreshWhoami() {
     loading = true;
@@ -27,6 +47,7 @@
       const whoami = await loadWhoami();
       actor = whoami.actor;
       sessionReady = true;
+      notifySessionChanged();
       if (actor?.handle) {
         handle = actor.handle;
         displayName = actor.display_name;
@@ -39,7 +60,7 @@
   }
 
   async function register() {
-    if (busy || !sessionReady) return;
+    if (busy || !sessionReady || (!actor && policy !== true)) return;
     const adding = actor !== null;
     busy = true;
     status = adding ? 'Waiting for passkey addition…' : 'Waiting for new account registration…';
@@ -55,6 +76,7 @@
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
       status = '';
+      if (!adding) void refreshPolicy();
     } finally {
       busy = false;
     }
@@ -82,6 +104,8 @@
     try {
       await logout();
       actor = null;
+      notifySessionChanged();
+      void refreshPolicy();
       status = 'Logged out.';
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
@@ -92,6 +116,12 @@
 
   onMount(() => {
     void refreshWhoami();
+    void refreshPolicy();
+    window.addEventListener('focus', refreshPolicy);
+    return () => {
+      ++policyRequest;
+      window.removeEventListener('focus', refreshPolicy);
+    };
   });
 </script>
 
@@ -153,13 +183,25 @@
       </label>
       <label>
         Display name (new account only)
-        <input bind:value={displayName} disabled={busy || loading || !sessionReady || actor !== null} autocomplete="name" placeholder="Local User" />
+        <input bind:value={displayName} disabled={busy || loading || !sessionReady || actor !== null || policy !== true} autocomplete="name" placeholder="Local User" />
       </label>
       <div class="settings-action-row">
-        <button type="button" disabled={busy || loading || !sessionReady || (!actor && !handle.trim())} onclick={register}>{actor ? `Add passkey to ${actor.handle}` : 'Register new account'}</button>
+        {#if actor || policy === true}
+          <button type="button" disabled={busy || loading || !sessionReady || (!actor && !handle.trim())} onclick={register}>{actor ? `Add passkey to ${actor.handle}` : 'Register new account'}</button>
+        {/if}
         <button type="button" disabled={busy || loading || !sessionReady || actor !== null || !handle.trim()} onclick={login}>Log in with passkey</button>
       </div>
     </form>
+    {#if !actor}
+      {#if policyLoading}
+        <p class="muted" role="status">Checking registration availability…</p>
+      {:else if policyError}
+        <p class="error-message" role="alert">{policyError}</p>
+        <button type="button" onclick={refreshPolicy}>Retry registration availability</button>
+      {:else if policy === false}
+        <p class="muted">New account registration is disabled. Existing users can still log in.</p>
+      {/if}
+    {/if}
   </section>
 
   {#if status}

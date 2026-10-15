@@ -577,7 +577,7 @@ async fn typed_and_generic_case_dispatch_keep_the_same_verified_worker_and_recei
 async fn authenticated_human_case_actor_and_replay_are_bound_to_verified_account_and_user() {
     let dir = tempfile::tempdir().unwrap();
     let api = test_api(dir.path()).await;
-    let token = seed_test_api_token(api.store.as_ref(), "case-human");
+    let token = seed_test_workspace_owner_token(api.store.as_ref(), "case-human").await;
     let other_token = seed_test_api_token(api.store.as_ref(), "other-human");
     let backend = browser_ticket_backend(&api).unwrap();
     let reference = backend
@@ -613,11 +613,17 @@ async fn authenticated_human_case_actor_and_replay_are_bound_to_verified_account
     let response = case_response(typed.clone(), human_request(&token, true), StatusCode::OK).await;
     let closed = backend.show(reference.id.clone().into()).unwrap();
     let event = closed.events.last().unwrap();
-    assert_eq!(event.attributes["source_account_id"], "account-case-human");
+    assert_eq!(
+        event.attributes["source_account_id"],
+        format!("account-{TEST_WORKSPACE_ID}")
+    );
     assert_eq!(event.attributes["source_user_id"], "user-case-human");
     assert_eq!(
         event.author.as_deref(),
-        Some("workspace-user:[\"account-case-human\",\"user-case-human\"]")
+        Some(
+            format!("workspace-user:[\"account-{TEST_WORKSPACE_ID}\",\"user-case-human\"]")
+                .as_str()
+        )
     );
     assert_eq!(
         closed.case_history.last().unwrap().author,
@@ -630,7 +636,7 @@ async fn authenticated_human_case_actor_and_replay_are_bound_to_verified_account
     case_response(
         typed,
         human_request(&other_token, true),
-        StatusCode::CONFLICT,
+        StatusCode::FORBIDDEN,
     )
     .await;
     // Generic dispatch receives an explicit untrusted author but must override it.

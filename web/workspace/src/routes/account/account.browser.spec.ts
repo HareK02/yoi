@@ -11,6 +11,7 @@ import Account from "./+page.svelte";
 import {
   authUser,
   credentialFixture,
+  loginOptions,
   registrationOptions,
 } from "#lib/workspace/auth/api.test-fixtures.ts";
 
@@ -20,9 +21,14 @@ afterEach(() => {
 });
 
 // UIから本番HTTP adapterまでを接続し、fetch/ブラウザーcredential境界だけを代替する。
-function boundary(authenticated: boolean, completeStatus = 200) {
+function boundary(
+  authenticated: boolean,
+  completeStatus = 200,
+  policy: boolean | "error" | "loading" = true,
+) {
   const create = vi.fn(async () => credentialFixture());
-  vi.stubGlobal("navigator", { credentials: { create } });
+  const get = vi.fn(async () => credentialFixture(true));
+  vi.stubGlobal("navigator", { credentials: { create, get } });
   const fetcher = vi.fn<typeof fetch>().mockImplementation(async (input) => {
     const path = String(input);
     if (path === "/api/auth/whoami") {
@@ -32,9 +38,20 @@ function boundary(authenticated: boolean, completeStatus = 200) {
           : null,
       });
     }
+    if (path === "/api/auth/registration-policy") {
+      if (policy === "loading") return await new Promise<Response>(() => {});
+      if (policy === "error") return new Response(null, { status: 503 });
+      return Response.json({ self_registration_enabled: policy });
+    }
+    if (path === "/api/auth/passkeys/login/options") {
+      return Response.json(loginOptions);
+    }
     if (path.endsWith("/options")) return Response.json(registrationOptions);
     if (path.endsWith("/complete")) {
       if (completeStatus !== 200) {
+        if (completeStatus === 403 && path.includes("/registration/")) {
+          policy = false;
+        }
         return new Response(null, { status: completeStatus });
       }
       authenticated = true;
@@ -43,7 +60,7 @@ function boundary(authenticated: boolean, completeStatus = 200) {
     throw new Error(`Unexpected API: ${path}`);
   });
   vi.stubGlobal("fetch", fetcher);
-  return { fetcher, create };
+  return { fetcher, create, get };
 }
 
 function posted(fetcher: ReturnType<typeof boundary>["fetcher"]) {
@@ -90,7 +107,7 @@ test("anonymous existing Account page registers a new account via registration e
 });
 
 test("authenticated Account locks identity fields and adds only through self-only addition endpoints", async () => {
-  const { fetcher, create } = boundary(true);
+  const { fetcher, create } = boundary(true, 200, false);
   render(Account);
   const button = await screen.findByRole("button", {
     name: "Add passkey to alice",
@@ -168,13 +185,86 @@ test("unknown session never enables registration or addition", async () => {
   render(Account);
   await screen.findByText("Auth request failed (503).");
   expect(
-    (screen.getByRole("button", {
-      name: "Register new account",
-    }) as HTMLButtonElement).disabled,
-  ).toBe(true);
-  expect(
     (screen.getByLabelText(
       "User handle (new registration or login)",
     ) as HTMLInputElement).disabled,
   ).toBe(true);
+  expect(screen.queryByRole("button", { name: /Add passkey/ })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Register new account" }))
+    .toBeNull();
 });
+
+for (const policy of [false, "error", "loading"] as const) {
+  test(`policy ${policy} still permits the existing passkey login HTTP flow`, async () => {
+    const { fetcher, get, create } = boundary(false, 200, policy);
+    render(Account);
+    await screen.findByText("No browser session is active.");
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Log in with passkey" }),
+    );
+    await screen.findByText("Logged in.");
+    expect(posted(fetcher).map((request) => request.path)).toEqual([
+      "/api/auth/passkeys/login/options",
+      "/api/auth/passkeys/login/complete",
+    ]);
+    expect(get).toHaveBeenCalledOnce();
+    expect(create).not.toHaveBeenCalled();
+  });
+}
+
+test("registration disabled during WebAuthn completion shows rejection and reloads policy without fallback", async () => {
+  const { fetcher } = boundary(false, 403, true);
+  render(Account);
+  await fireEvent.click(
+    await screen.findByRole("button", { name: "Register new account" }),
+  );
+  await screen.findByText("Auth request failed (403).");
+  await screen.findByText(/New account registration is disabled/);
+  expect(screen.queryByRole("button", { name: "Register new account" }))
+    .toBeNull();
+  expect(screen.queryByText("New account registered.")).toBeNull();
+  expect(posted(fetcher).map((request) => request.path)).toEqual([
+    "/api/auth/passkeys/registration/options",
+    "/api/auth/passkeys/registration/complete",
+  ]);
+});
+
+for (const policy of [false, "error", "loading"] as const) {
+  test(`registration policy ${policy} hides registration without disabling login`, async () => {
+    const { fetcher } = boundary(false, 200, policy);
+    render(Account);
+    await screen.findByText("No browser session is active.");
+    if (policy === false) {
+      await screen.findByText(/New account registration is disabled/);
+    }
+    if (policy === "error") {
+      await screen.findByText("Registration availability could not be loaded.");
+    }
+    if (policy === "loading") {
+      await screen.findByText("Checking registration availability…");
+    }
+    expect(screen.queryByRole("button", { name: "Register new account" }))
+      .toBeNull();
+    expect(
+      (screen.getByRole("button", {
+        name: "Log in with passkey",
+      }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+    expect(posted(fetcher)).toEqual([]);
+  });
+}
+
+for (const policy of ["error", "loading"] as const) {
+  test(`policy ${policy} does not block actor-self passkey addition`, async () => {
+    const { fetcher } = boundary(true, 200, policy);
+    render(Account);
+    await fireEvent.click(
+      await screen.findByRole("button", { name: "Add passkey to alice" }),
+    );
+    await screen.findByText("Passkey added to your account.");
+    expect(posted(fetcher).map((request) => request.path)).toEqual([
+      "/api/auth/passkeys/addition/options",
+      "/api/auth/passkeys/addition/complete",
+    ]);
+  });
+}

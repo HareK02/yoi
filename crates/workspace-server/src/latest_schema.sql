@@ -12,6 +12,15 @@ DROP TABLE typed_ticket_events;
 DROP TABLE typed_tickets;
 DROP TABLE workspace_resource_key_counters;
 DROP TABLE workspace_resource_keys;
+CREATE TABLE hosting_administrators (
+    user_id TEXT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE hosting_settings (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    self_registration_enabled INTEGER NOT NULL DEFAULT 0 CHECK (self_registration_enabled IN (0, 1))
+);
+INSERT INTO hosting_settings(singleton, self_registration_enabled) VALUES(1, 0);
 CREATE TABLE accounts (
     account_id TEXT PRIMARY KEY,
     kind TEXT NOT NULL CHECK (kind IN ('user', 'organization')),

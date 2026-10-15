@@ -1,0 +1,404 @@
+{
+  "schemaVersion": 1,
+  "id": "hosting-settings-dark",
+  "title": "Hosting settings: synthetic UI conditions on production shell",
+  "baseUrl": "http://127.0.0.1:15378",
+  "colorScheme": "dark",
+  "reducedMotion": "reduce",
+  "personas": [
+    {
+      "id": "fixture",
+      "label": "Synthetic API projection; no real authentication",
+      "auth": {
+        "kind": "anonymous"
+      }
+    }
+  ],
+  "viewports": [
+    {
+      "label": "desktop",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "label": "narrow",
+      "width": 768,
+      "height": 900
+    },
+    {
+      "label": "mobile",
+      "width": 390,
+      "height": 844
+    }
+  ],
+  "routes": [
+    {
+      "id": "admin-on",
+      "label": "admin-on",
+      "path": "/hosting/settings?fixture=admin-on",
+      "goal": "Verify production shell UI projection, not server authorization.",
+      "dataState": "Synthetic admin; policy on.",
+      "ready": {
+        "kind": "selector",
+        "selector": "button:has-text(\"Edit registration policy\")"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Loaded hosting-wide policy"
+        },
+        {
+          "id": "edit",
+          "label": "Keyboard edit focus",
+          "interaction": [
+            {
+              "action": "press",
+              "selector": "button:has-text(\"Edit registration policy\")",
+              "key": "Enter"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "input[type=\"checkbox\"]:focus"
+          }
+        },
+        {
+          "id": "saved",
+          "label": "Confirmed save",
+          "interaction": [
+            {
+              "action": "press",
+              "selector": "input[type=\"checkbox\"]",
+              "key": "Space"
+            },
+            {
+              "action": "click",
+              "selector": "button:has-text(\"Save settings\")"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "[role=\"status\"]:has-text(\"Hosting settings saved.\")"
+          }
+        }
+      ]
+    },
+    {
+      "id": "admin-off",
+      "label": "admin-off",
+      "path": "/hosting/settings?fixture=admin-off",
+      "goal": "Verify production shell UI projection, not server authorization.",
+      "dataState": "Synthetic admin; policy off.",
+      "ready": {
+        "kind": "selector",
+        "selector": "button:has-text(\"Edit registration policy\")"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Loaded hosting-wide policy"
+        },
+        {
+          "id": "edit",
+          "label": "Keyboard edit focus",
+          "interaction": [
+            {
+              "action": "press",
+              "selector": "button:has-text(\"Edit registration policy\")",
+              "key": "Enter"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "input[type=\"checkbox\"]:focus"
+          }
+        },
+        {
+          "id": "saved",
+          "label": "Confirmed save",
+          "interaction": [
+            {
+              "action": "press",
+              "selector": "input[type=\"checkbox\"]",
+              "key": "Space"
+            },
+            {
+              "action": "click",
+              "selector": "button:has-text(\"Save settings\")"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "[role=\"status\"]:has-text(\"Hosting settings saved.\")"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ordinary",
+      "label": "ordinary",
+      "path": "/hosting/settings?fixture=ordinary",
+      "goal": "Verify production shell UI projection, not server authorization.",
+      "dataState": "Synthetic authenticated ordinary user, no admin controls.",
+      "ready": {
+        "kind": "selector",
+        "selector": "p:has-text(\"Hosting administrator access is required.\")"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state"
+        }
+      ]
+    },
+    {
+      "id": "anonymous",
+      "label": "anonymous",
+      "path": "/hosting/settings?fixture=anonymous",
+      "goal": "Verify production shell UI projection, not server authorization.",
+      "dataState": "Synthetic anonymous visitor; sign-in guidance, no controls.",
+      "ready": {
+        "kind": "selector",
+        "selector": "a:has-text(\"Open Account\")"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state"
+        }
+      ]
+    },
+    {
+      "id": "admin-loading",
+      "label": "admin-loading",
+      "path": "/hosting/settings?fixture=admin-loading",
+      "goal": "Verify production shell UI projection, not server authorization.",
+      "dataState": "Settings GET intentionally held pending; shell remains usable.",
+      "ready": {
+        "kind": "selector",
+        "selector": "[role=\"status\"]:has-text(\"Loading hosting settings\")"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state"
+        }
+      ]
+    },
+    {
+      "id": "admin-load-error",
+      "label": "admin-load-error",
+      "path": "/hosting/settings?fixture=admin-load-error",
+      "goal": "Verify production shell UI projection, not server authorization.",
+      "dataState": "Intentional HTTP503; expected console resource error and visible alert.",
+      "ready": {
+        "kind": "selector",
+        "selector": "button:has-text(\"Retry loading settings\")"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state"
+        }
+      ]
+    },
+    {
+      "id": "admin-saving",
+      "label": "admin-saving",
+      "path": "/hosting/settings?fixture=admin-saving",
+      "goal": "Verify production shell UI projection, not server authorization.",
+      "dataState": "PUT held pending; last loaded policy retained, edit controls disabled.",
+      "ready": {
+        "kind": "selector",
+        "selector": "button:has-text(\"Edit registration policy\")"
+      },
+      "capturePoints": [
+        {
+          "id": "saving",
+          "label": "saving",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": "button:has-text(\"Edit registration policy\")"
+            },
+            {
+              "action": "press",
+              "selector": "input[type=\"checkbox\"]",
+              "key": "Space"
+            },
+            {
+              "action": "click",
+              "selector": "button:has-text(\"Save settings\")"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "button:has-text(\"Saving…\")"
+          }
+        }
+      ]
+    },
+    {
+      "id": "admin-save-error",
+      "label": "admin-save-error",
+      "path": "/hosting/settings?fixture=admin-save-error",
+      "goal": "Verify production shell UI projection, not server authorization.",
+      "dataState": "Intentional PUT HTTP503; outcome unknown, retry blocked until reload.",
+      "ready": {
+        "kind": "selector",
+        "selector": "button:has-text(\"Edit registration policy\")"
+      },
+      "capturePoints": [
+        {
+          "id": "save-error",
+          "label": "save-error",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": "button:has-text(\"Edit registration policy\")"
+            },
+            {
+              "action": "press",
+              "selector": "input[type=\"checkbox\"]",
+              "key": "Space"
+            },
+            {
+              "action": "click",
+              "selector": "button:has-text(\"Save settings\")"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "[role=\"alert\"]"
+          }
+        }
+      ]
+    },
+    {
+      "id": "account-on",
+      "label": "account-on",
+      "path": "/account?fixture=account-on",
+      "goal": "Verify production shell UI projection, not server authorization.",
+      "dataState": "Anonymous policy on; registration and login available.",
+      "ready": {
+        "kind": "selector",
+        "selector": "button:has-text(\"Register new account\"):enabled"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "account-off",
+      "label": "account-off",
+      "path": "/account?fixture=account-off",
+      "goal": "Verify production shell UI projection, not server authorization.",
+      "dataState": "Anonymous policy off; no registration action, login available.",
+      "ready": {
+        "kind": "selector",
+        "selector": "p:has-text(\"New account registration is disabled.\")"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "admin-account",
+      "label": "admin-account",
+      "path": "/account?fixture=admin-account",
+      "goal": "Verify production shell UI projection, not server authorization.",
+      "dataState": "Authenticated admin; own passkey addition and global settings link.",
+      "ready": {
+        "kind": "selector",
+        "selector": "button:has-text(\"Add passkey to alice\")"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "ordinary-account-off",
+      "label": "ordinary-account-off",
+      "path": "/account?fixture=ordinary-account-off",
+      "goal": "Verify production shell UI projection, not server authorization.",
+      "dataState": "Authenticated ordinary user with policy off; own passkey addition available without admin nav.",
+      "ready": {
+        "kind": "selector",
+        "selector": "button:has-text(\"Add passkey to alice\")"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "account-error",
+      "label": "account-error",
+      "path": "/account?fixture=account-error",
+      "goal": "Verify production shell UI projection, not server authorization.",
+      "dataState": "Intentional policy HTTP503; expected console resource error and visible alert; login retained.",
+      "ready": {
+        "kind": "selector",
+        "selector": "button:has-text(\"Retry registration availability\")"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "account-loading",
+      "label": "account-loading",
+      "path": "/account?fixture=account-loading",
+      "goal": "Verify production shell UI projection, not server authorization.",
+      "dataState": "Policy request held pending; login remains available after session loads.",
+      "ready": {
+        "kind": "selector",
+        "selector": "[role=\"status\"]:has-text(\"Checking registration availability\")"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "id": "hosting-ui-fixture",
+      "command": "deno",
+      "cwd": "../../..",
+      "args": [
+        "run",
+        "--config",
+        "tools/web-ux/deno.json",
+        "--allow-read",
+        "--allow-net",
+        "web/workspace/test/hosting-browser/fixture-server.ts",
+        "15378",
+        "web/workspace/build"
+      ],
+      "readyUrl": "http://127.0.0.1:15378/health"
+    }
+  ]
+}

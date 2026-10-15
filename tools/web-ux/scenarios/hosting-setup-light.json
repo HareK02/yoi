@@ -1,0 +1,178 @@
+{
+  "schemaVersion": 1,
+  "id": "hosting-setup-light",
+  "title": "Hosting setup production UI: synthetic HTTP and navigator.credentials boundary only",
+  "baseUrl": "http://127.0.0.1:15378",
+  "colorScheme": "light",
+  "reducedMotion": "reduce",
+  "personas": [
+    {
+      "id": "fixture",
+      "label": "Synthetic API projection; no real authentication",
+      "auth": {
+        "kind": "anonymous"
+      }
+    }
+  ],
+  "viewports": [
+    {
+      "label": "desktop",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "label": "narrow",
+      "width": 768,
+      "height": 900
+    },
+    {
+      "label": "mobile",
+      "width": 390,
+      "height": 844
+    }
+  ],
+  "routes": [
+    {
+      "id": "setup-flow",
+      "label": "Setup enrollment and login UI",
+      "path": "/hosting/setup?fixture=setup-flow",
+      "goal": "Separate host-token enrollment from explicit passkey login and verified settings access.",
+      "dataState": "Synthetic actor, API and non-cryptographic navigator.credentials; no real token/authentication. Test-only bootstrap changes browser API boundary, not production UI modules/styles.",
+      "ready": {
+        "kind": "selector",
+        "selector": "#host-setup-token:enabled"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Empty password field; enrollment disabled",
+          "fullPage": true
+        },
+        {
+          "id": "host-help",
+          "label": "Trusted-host instructions expanded",
+          "interaction": [
+            {
+              "action": "press",
+              "selector": "summary",
+              "key": "Enter"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "details[open]"
+          },
+          "fullPage": true
+        },
+        {
+          "id": "masked-entry",
+          "label": "Synthetic input password-masked; action enabled",
+          "interaction": [
+            {
+              "action": "press",
+              "selector": "summary",
+              "key": "Enter"
+            },
+            {
+              "action": "fill",
+              "selector": "#host-setup-token",
+              "value": "${WEB_UX_SYNTHETIC_SETUP_INPUT}"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "button:has-text(\"Add administrator passkey\"):enabled"
+          },
+          "fullPage": true
+        },
+        {
+          "id": "enrolled",
+          "label": "Enrollment is not login; explicit login handoff",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": "button:has-text(\"Add administrator passkey\")"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "button:has-text(\"Sign in with new passkey\"):enabled"
+          },
+          "fullPage": true
+        },
+        {
+          "id": "verified",
+          "label": "Matching actor/session/access projected verified; settings link",
+          "interaction": [
+            {
+              "action": "press",
+              "selector": "button:has-text(\"Sign in with new passkey\")",
+              "key": "Enter"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "a:has-text(\"Open hosting settings\")"
+          },
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "setup-reject",
+      "label": "Rejected setup enrollment",
+      "path": "/hosting/setup?fixture=setup-reject",
+      "goal": "Show safe unconfirmed-enrollment guidance with empty cleared token and no settings action.",
+      "dataState": "Intentional addition/options HTTP403. Expected console/resource diagnostics; no real authorization exercised.",
+      "ready": {
+        "kind": "selector",
+        "selector": "#host-setup-token:enabled"
+      },
+      "capturePoints": [
+        {
+          "id": "rejected",
+          "label": "Rejected attempt; token cleared",
+          "interaction": [
+            {
+              "action": "fill",
+              "selector": "#host-setup-token",
+              "value": "${WEB_UX_SYNTHETIC_SETUP_INPUT}"
+            },
+            {
+              "action": "click",
+              "selector": "button:has-text(\"Add administrator passkey\")"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "[role=\"alert\"]"
+          },
+          "fullPage": true
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "id": "hosting-ui-fixture",
+      "command": "deno",
+      "cwd": "../../..",
+      "args": [
+        "run",
+        "--config",
+        "tools/web-ux/deno.json",
+        "--allow-read",
+        "--allow-net",
+        "web/workspace/test/hosting-browser/fixture-server.ts",
+        "15378",
+        "web/workspace/build"
+      ],
+      "readyUrl": "http://127.0.0.1:15378/health"
+    }
+  ],
+  "redact": {
+    "text": [
+      "${WEB_UX_SYNTHETIC_SETUP_INPUT}"
+    ]
+  }
+}

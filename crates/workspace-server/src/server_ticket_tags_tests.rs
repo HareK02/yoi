@@ -858,16 +858,15 @@ async fn ticket_tag_routes_require_workspace_authority_and_reject_forged_worker_
     )
     .await;
     assert_eq!(tag["workspace_id"], TEST_WORKSPACE_ID);
-    // Classification follows shared Ticket Workspace write authority, not the
-    // owner-only repository/secrets-management policy. A distinct authenticated
-    // actor may manage tags but cannot replay another actor's receipt.
+    // An authenticated foreign account cannot mutate classification or replay
+    // the owner's receipt; classification does not grant Workspace authority.
     request_json_authenticated(
         app.clone(),
         "POST",
         &path,
         Some(json!({"operation_key":"authorized", "action":{"kind":"create", "name":"ready"}})),
         &collaborator_token,
-        StatusCode::CONFLICT,
+        StatusCode::FORBIDDEN,
     )
     .await;
     request_json_authenticated(
@@ -876,7 +875,7 @@ async fn ticket_tag_routes_require_workspace_authority_and_reject_forged_worker_
         "/api/w/other-workspace/ticket-tags",
         Some(json!({"operation_key":"foreign", "action":{"kind":"create", "name":"foreign"}})),
         &collaborator_token,
-        StatusCode::NOT_FOUND,
+        StatusCode::FORBIDDEN,
     )
     .await;
     let response = app

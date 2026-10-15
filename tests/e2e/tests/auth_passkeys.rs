@@ -1,5 +1,5 @@
-//! 隔離した実yoi-serverのHTTP APIで、新規登録→明示handle login→本人の鍵追加→
-//! owner-first Workspace作成を検証する。DB、認証、routerは本番実装を使い、
+//! 隔離した実yoi-serverのhost CLI・HTTP APIで、管理者初期設定、登録可否の永続化、
+//! 明示handle login、本人の鍵追加、Workspace所有境界を検証する。DB・認証・routerは本番実装を使い、
 //! authenticatorだけをSoftPasskeyに置換する（browser UI／OS authenticatorは対象外）。
 //! `cargo test -p yoi-e2e --features e2e --test auth_passkeys`で明示選択する。
 //! binary供給、HOME/XDG/DB/動的port、readiness、ログ、RAII回収は共有harnessが所有する。
@@ -151,8 +151,153 @@ fn login(
     )?)
 }
 
+fn http_client() -> Result<Client> {
+    Ok(Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(5))
+        .build()?)
+}
+
+fn policy(client: &Client, base: &str, artifacts: &Path, enabled: bool) -> Result {
+    let public: Value = decode(send(
+        client.get(format!("{base}/api/auth/registration-policy")),
+        "anonymous public registration policy",
+        artifacts,
+    )?)?;
+    assert_eq!(public, json!({"self_registration_enabled": enabled}));
+    Ok(())
+}
+
+fn set_policy(
+    client: &Client,
+    base: &str,
+    artifacts: &Path,
+    cookie: &str,
+    enabled: bool,
+) -> Result {
+    let updated: Value = decode(send(
+        client
+            .put(format!("{base}/api/hosting/settings"))
+            .header(COOKIE, cookie)
+            .header(ORIGIN, BROWSER_ORIGIN)
+            .json(&json!({"self_registration_enabled": enabled})),
+        "administrator updates registration policy",
+        artifacts,
+    )?)?;
+    assert_eq!(updated, json!({"self_registration_enabled": enabled}));
+    let stored: Value = decode(send(
+        client
+            .get(format!("{base}/api/hosting/settings"))
+            .header(COOKIE, cookie),
+        "administrator rereads stored hosting settings",
+        artifacts,
+    )?)?;
+    assert_eq!(stored, updated);
+    policy(client, base, artifacts, enabled)
+}
+
+fn access(client: &Client, base: &str, artifacts: &Path, cookie: &str, is_admin: bool) -> Result {
+    let value: Value = decode(send(
+        client
+            .get(format!("{base}/api/hosting/access"))
+            .header(COOKIE, cookie),
+        "authenticated hosting access",
+        artifacts,
+    )?)?;
+    assert_eq!(value, json!({"is_admin": is_admin}));
+    Ok(())
+}
+
+fn logout(client: &Client, base: &str, artifacts: &Path, cookie: &str) -> Result {
+    let response = success(send(
+        client
+            .post(format!("{base}/api/auth/logout"))
+            .header(COOKIE, cookie)
+            .header(ORIGIN, BROWSER_ORIGIN),
+        "revoke real browser session",
+        artifacts,
+    )?)?;
+    assert!(
+        response
+            .headers()
+            .get(SET_COOKIE)
+            .ok_or("missing logout cookie")?
+            .to_str()?
+            .contains("Max-Age=0")
+    );
+    let whoami: Value = decode(send(
+        client
+            .get(format!("{base}/api/auth/whoami"))
+            .header(COOKIE, cookie),
+        "revoked cookie is no longer authenticated",
+        artifacts,
+    )?)?;
+    assert!(whoami["actor"].is_null());
+    Ok(())
+}
+
+fn host_admin_login(
+    environment: &WorkerE2eEnvironment,
+    client: &Client,
+    key: &mut WebauthnAuthenticator<SoftPasskey>,
+) -> Result<(AuthUserResponse, String)> {
+    let base = environment
+        .server_url
+        .as_deref()
+        .ok_or("missing server URL")?;
+    let artifacts = &environment.artifacts_dir;
+    let handle = format!("{}-admin", environment.account_handle);
+    let setup = environment.setup_hosting_admin(&handle, true)?;
+    assert_eq!(setup["hosting_admin"], true);
+    assert_eq!(setup["token_type"], "bearer");
+    assert!(
+        setup["expires_at"].as_str().is_some(),
+        "initial bearer must have finite expiry"
+    );
+    let bearer = setup["access_token"]
+        .as_str()
+        .ok_or("host setup omitted initial bearer")?;
+    let options: PasskeyRegistrationOptionsResponse = decode(send(
+        client
+            .post(format!("{base}/api/auth/passkeys/addition/options"))
+            .bearer_auth(bearer)
+            .json(&json!({"browser_origin": BROWSER_ORIGIN})),
+        "host-created administrator bearer starts actor-derived passkey addition",
+        artifacts,
+    )?)?;
+    let credential = key.do_registration(BROWSER_ORIGIN.parse()?, options.public_key)?;
+    let (activated, cookie) = session(send(
+        client
+            .post(format!("{base}/api/auth/passkeys/addition/complete"))
+            .bearer_auth(bearer)
+            .json(&PasskeyRegistrationCompleteRequest {
+                challenge_id: options.challenge_id,
+                credential,
+            }),
+        "host-created administrator verifies initial passkey",
+        artifacts,
+    )?)?;
+    assert_eq!(activated.user.account_id, setup["user"]["account_id"]);
+    logout(client, base, artifacts, &cookie)?;
+    let (logged_in, cookie) = login(client, base, artifacts, &handle, key)?;
+    assert_eq!(logged_in.user, activated.user);
+    access(client, base, artifacts, &cookie, true)?;
+    let workspaces: Value = decode(send(
+        client
+            .get(format!("{base}/api/workspaces"))
+            .header(COOKIE, &cookie),
+        "host administrator setup and login do not create a Workspace",
+        artifacts,
+    )?)?;
+    assert_eq!(workspaces, json!([]));
+    Ok((logged_in, cookie))
+}
+
 #[test]
-fn fresh_account_adds_own_passkey_and_creates_owned_workspace() -> Result {
+fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ownership() -> Result
+{
     let mut environment = WorkerE2eEnvironment::new()?;
     eprintln!(
         "passkey E2E artifacts: {}",
@@ -167,12 +312,12 @@ fn fresh_account_adds_own_passkey_and_creates_owned_workspace() -> Result {
         .as_deref()
         .ok_or("missing server URL")?;
     let artifacts = &environment.artifacts_dir;
-    let client = Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(1))
-        .timeout(Duration::from_secs(5))
-        .build()?;
+    let client = http_client()?;
+    policy(&client, base, artifacts, false)?;
+    let mut admin_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (admin, admin_cookie) = host_admin_login(&environment, &client, &mut admin_key)?;
+    policy(&client, base, artifacts, false)?;
+    set_policy(&client, base, artifacts, &admin_cookie, true)?;
     let whoami: Value = decode(send(
         client.get(format!("{base}/api/auth/whoami")),
         "fresh whoami",
@@ -261,6 +406,9 @@ fn fresh_account_adds_own_passkey_and_creates_owned_workspace() -> Result {
         register(&client, base, artifacts, &other_handle, &mut other_key)?;
     assert_ne!(other.user.account_id, registered.user.account_id);
     assert_ne!(other_user_handle, user_handle);
+    access(&client, base, artifacts, &cookie, false)?;
+    set_policy(&client, base, artifacts, &admin_cookie, false)?;
+    // 以下の本人鍵追加と両方の鍵によるloginは、自己登録停止中にも必要。
     rejected(
         send(
             client
@@ -458,6 +606,457 @@ fn fresh_account_adds_own_passkey_and_creates_owned_workspace() -> Result {
     assert_eq!(items[0]["workspace_id"], workspace_id);
     assert_eq!(items[0]["owner_account_id"], registered.user.account_id);
 
+    access(&client, base, artifacts, &new_cookie, false)?;
+    rejected(
+        send(
+            client
+                .get(format!("{base}/api/hosting/settings"))
+                .header(COOKIE, &new_cookie),
+            "Workspace ownership does not grant hosting administrator access",
+            artifacts,
+        )?,
+        StatusCode::FORBIDDEN,
+        "hosting administrator required",
+    )?;
+    let admin_workspaces: Value = decode(send(
+        client
+            .get(format!("{base}/api/workspaces"))
+            .header(COOKIE, &admin_cookie),
+        "hosting administrator cannot list another owner's Workspace",
+        artifacts,
+    )?)?;
+    assert_eq!(admin_workspaces, json!([]));
+    assert_ne!(admin.user.account_id, registered.user.account_id);
+    rejected(
+        send(
+            client
+                .get(format!("{base}/api/workspaces/{workspace_id}/deletion"))
+                .header(COOKIE, &admin_cookie),
+            "hosting administrator cannot manage another owner's Workspace deletion",
+            artifacts,
+        )?,
+        StatusCode::FORBIDDEN,
+        "owner",
+    )?;
+
+    let report = environment.cleanup()?;
+    assert!(report.cleanup_success);
+    assert!(!report.fixture_root_exists_after);
+    Ok(())
+}
+
+fn ordinary_device_login_does_not_grant_hosting_authority(
+    client: &Client,
+    base: &str,
+    artifacts: &Path,
+    user: &AuthUserResponse,
+    cookie: &str,
+) -> Result {
+    let flow: Value = decode(send(
+        client
+            .post(format!("{base}/api/auth/device-login/start"))
+            .json(&json!({"client_name": "isolated policy E2E"})),
+        "start device login while registration is disabled",
+        artifacts,
+    )?)?;
+    let approval = json!({"user_code": flow["user_code"]});
+    rejected(
+        send(
+            client
+                .post(format!("{base}/api/auth/device-login/approve"))
+                .header(ORIGIN, BROWSER_ORIGIN)
+                .json(&approval),
+            "anonymous device approval cannot authenticate",
+            artifacts,
+        )?,
+        StatusCode::UNAUTHORIZED,
+        "request requires",
+    )?;
+    for origin in [None, Some("http://localhost:5174")] {
+        let mut request = client
+            .post(format!("{base}/api/auth/device-login/approve"))
+            .header(COOKIE, cookie)
+            .json(&approval);
+        if let Some(origin) = origin {
+            request = request.header(ORIGIN, origin);
+        }
+        rejected(
+            send(
+                request,
+                "device approval cookie retains Origin boundary",
+                artifacts,
+            )?,
+            StatusCode::FORBIDDEN,
+            "origin",
+        )?;
+    }
+    let approved: Value = decode(send(
+        client
+            .post(format!("{base}/api/auth/device-login/approve"))
+            .header(COOKIE, cookie)
+            .header(ORIGIN, BROWSER_ORIGIN)
+            .json(&approval),
+        "existing ordinary user approves device login while registration disabled",
+        artifacts,
+    )?)?;
+    assert_eq!(approved["status"], "approved");
+    assert_eq!(approved["user"]["account_id"], user.user.account_id);
+    let issued: Value = decode(send(
+        client
+            .post(format!("{base}/api/auth/device-login/poll"))
+            .json(&json!({"device_code": flow["device_code"]})),
+        "device poll returns approved ordinary user's bearer",
+        artifacts,
+    )?)?;
+    assert_eq!(issued["status"], "approved");
+    let token = issued["access_token"]
+        .as_str()
+        .ok_or("device poll omitted bearer")?;
+    let access: Value = decode(send(
+        client
+            .get(format!("{base}/api/hosting/access"))
+            .bearer_auth(token),
+        "device bearer retains ordinary hosting access",
+        artifacts,
+    )?)?;
+    assert_eq!(access, json!({"is_admin": false}));
+    rejected(
+        send(
+            client
+                .put(format!("{base}/api/hosting/settings"))
+                .bearer_auth(token)
+                .header("x-hosting-admin", "true")
+                .json(&json!({"self_registration_enabled": true})),
+            "device bearer cannot elevate ordinary user to hosting administrator",
+            artifacts,
+        )?,
+        StatusCode::FORBIDDEN,
+        "hosting_admin_required",
+    )?;
+    let consumed: Value = decode(send(
+        client
+            .post(format!("{base}/api/auth/device-login/poll"))
+            .json(&json!({"device_code": flow["device_code"]})),
+        "device credential delivery remains one-use",
+        artifacts,
+    )?)?;
+    assert_eq!(consumed["status"], "consumed");
+    assert!(consumed.get("access_token").is_none_or(Value::is_null));
+    policy(client, base, artifacts, false)
+}
+
+#[test]
+fn hosting_policy_rejects_spoofing_inflight_registration_and_survives_restart() -> Result {
+    let mut environment = WorkerE2eEnvironment::new()?;
+    eprintln!(
+        "hosting policy E2E artifacts: {}",
+        environment.artifacts_dir.display()
+    );
+    environment.start_empty_backend()?;
+    let client = http_client()?;
+    let mut base = environment.server_url.clone().ok_or("missing server URL")?;
+    let artifacts = environment.artifacts_dir.clone();
+    policy(&client, &base, &artifacts, false)?;
+
+    let mut admin_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (admin, admin_cookie) = host_admin_login(&environment, &client, &mut admin_key)?;
+    policy(&client, &base, &artifacts, false)?;
+    for path in ["/api/hosting/access", "/api/hosting/settings"] {
+        rejected(
+            send(
+                client
+                    .get(format!("{base}{path}"))
+                    .header("x-yoi-user-id", &admin.user.user_id)
+                    .header("x-yoi-account-id", &admin.user.account_id)
+                    .header("x-hosting-admin", "true"),
+                "anonymous identity headers cannot authenticate hosting access",
+                &artifacts,
+            )?,
+            StatusCode::FORBIDDEN,
+            "auth_required",
+        )?;
+    }
+    rejected(
+        send(
+            client
+                .put(format!("{base}/api/hosting/settings"))
+                .header(ORIGIN, BROWSER_ORIGIN)
+                .header("x-hosting-admin", "true")
+                .json(&json!({"self_registration_enabled": true})),
+            "anonymous spoof cannot enable registration",
+            &artifacts,
+        )?,
+        StatusCode::FORBIDDEN,
+        "auth_required",
+    )?;
+    policy(&client, &base, &artifacts, false)?;
+
+    let denied_handle = format!("{}-denied", environment.account_handle);
+    rejected(
+        send(
+            client
+                .post(format!("{base}/api/auth/passkeys/registration/options"))
+                .header(ORIGIN, BROWSER_ORIGIN)
+                .json(&json!({"handle": denied_handle, "browser_origin": BROWSER_ORIGIN})),
+            "disabled public registration rejects direct options",
+            &artifacts,
+        )?,
+        StatusCode::FORBIDDEN,
+        "self_registration_disabled",
+    )?;
+    rejected(
+        send(
+            client
+                .post(format!("{base}/api/auth/bootstrap-user"))
+                .header(ORIGIN, BROWSER_ORIGIN)
+                .json(&json!({"handle": denied_handle})),
+            "disabled policy cannot be bypassed through legacy bootstrap",
+            &artifacts,
+        )?,
+        StatusCode::BAD_REQUEST,
+        "verified_registration_required",
+    )?;
+
+    for origin in [None, Some("http://localhost:5174")] {
+        let mut request = client
+            .put(format!("{base}/api/hosting/settings"))
+            .header(COOKIE, &admin_cookie)
+            .json(&json!({"self_registration_enabled": true}));
+        if let Some(origin) = origin {
+            request = request.header(ORIGIN, origin);
+        }
+        rejected(
+            send(
+                request,
+                "admin cookie settings require configured Origin",
+                &artifacts,
+            )?,
+            StatusCode::FORBIDDEN,
+            "origin",
+        )?;
+    }
+    policy(&client, &base, &artifacts, false)?;
+    set_policy(&client, &base, &artifacts, &admin_cookie, true)?;
+    environment.restart_backend()?;
+    base = environment
+        .server_url
+        .clone()
+        .ok_or("missing restarted server URL")?;
+    policy(&client, &base, &artifacts, true)?;
+    let (_, admin_cookie) = login(
+        &client,
+        &base,
+        &artifacts,
+        &admin.user.handle,
+        &mut admin_key,
+    )?;
+    access(&client, &base, &artifacts, &admin_cookie, true)?;
+
+    // 拒否されたhandleも予約されておらず、許可後には通常の新規登録ができる。
+    let mut ordinary_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (ordinary, ordinary_cookie, _) = register(
+        &client,
+        &base,
+        &artifacts,
+        &denied_handle,
+        &mut ordinary_key,
+    )?;
+    access(&client, &base, &artifacts, &ordinary_cookie, false)?;
+    rejected(
+        send(
+            client
+                .get(format!("{base}/api/hosting/settings"))
+                .header(COOKIE, &ordinary_cookie)
+                .header("x-hosting-admin", "true")
+                .header("x-yoi-user-id", &admin.user.user_id)
+                .header("x-yoi-account-id", &admin.user.account_id),
+            "ordinary user cannot read settings by impersonating administrator headers",
+            &artifacts,
+        )?,
+        StatusCode::FORBIDDEN,
+        "hosting administrator required",
+    )?;
+    rejected(
+        send(
+            client
+                .put(format!("{base}/api/hosting/settings"))
+                .header(COOKIE, &ordinary_cookie)
+                .header(ORIGIN, BROWSER_ORIGIN)
+                .header("x-hosting-admin", "true")
+                .header("x-yoi-user-id", &admin.user.user_id)
+                .json(&json!({"self_registration_enabled": false})),
+            "ordinary user cannot change policy with administrator headers",
+            &artifacts,
+        )?,
+        StatusCode::FORBIDDEN,
+        "hosting_admin_required",
+    )?;
+    for field in ["is_admin", "user_id", "account_id"] {
+        let mut body = json!({"self_registration_enabled": false});
+        body[field] = match field {
+            "is_admin" => json!(true),
+            "user_id" => json!(admin.user.user_id),
+            _ => json!(admin.user.account_id),
+        };
+        rejected(
+            send(
+                client
+                    .put(format!("{base}/api/hosting/settings"))
+                    .header(COOKIE, &ordinary_cookie)
+                    .header(ORIGIN, BROWSER_ORIGIN)
+                    .json(&body),
+                "hosting settings reject actor and role fields in JSON",
+                &artifacts,
+            )?,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unknown field",
+        )?;
+    }
+    policy(&client, &base, &artifacts, true)?;
+
+    let pending_handle = format!("{}-inflight", environment.account_handle);
+    let options: PasskeyRegistrationOptionsResponse = decode(send(
+        client
+            .post(format!("{base}/api/auth/passkeys/registration/options"))
+            .header(ORIGIN, BROWSER_ORIGIN)
+            .json(&json!({"handle": pending_handle, "browser_origin": BROWSER_ORIGIN})),
+        "registration starts while enabled",
+        &artifacts,
+    )?)?;
+    let mut pending_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let credential = pending_key.do_registration(BROWSER_ORIGIN.parse()?, options.public_key)?;
+    let complete = PasskeyRegistrationCompleteRequest {
+        challenge_id: options.challenge_id,
+        credential,
+    };
+    set_policy(&client, &base, &artifacts, &admin_cookie, false)?;
+    // challenge自体も実DBから再読させ、停止後の完了で現在の設定を使うことを確かめる。
+    environment.restart_backend()?;
+    base = environment
+        .server_url
+        .clone()
+        .ok_or("missing restarted server URL")?;
+    policy(&client, &base, &artifacts, false)?;
+    rejected(
+        send(
+            client
+                .post(format!("{base}/api/auth/passkeys/registration/complete"))
+                .header(ORIGIN, BROWSER_ORIGIN)
+                .json(&complete),
+            "registration completion rechecks disabled policy after restart",
+            &artifacts,
+        )?,
+        StatusCode::FORBIDDEN,
+        "self_registration_disabled",
+    )?;
+    rejected(
+        send(
+            client
+                .post(format!("{base}/api/auth/passkeys/login/options"))
+                .header(ORIGIN, BROWSER_ORIGIN)
+                .json(&json!({"handle": pending_handle, "browser_origin": BROWSER_ORIGIN})),
+            "rejected in-flight registration did not create an account",
+            &artifacts,
+        )?,
+        StatusCode::BAD_REQUEST,
+        "unknown_auth_user",
+    )?;
+    rejected(
+        send(
+            client
+                .post(format!("{base}/api/auth/passkeys/registration/options"))
+                .header(ORIGIN, BROWSER_ORIGIN)
+                .json(&json!({"handle": pending_handle, "browser_origin": BROWSER_ORIGIN})),
+            "registration remains disabled on reopened DB",
+            &artifacts,
+        )?,
+        StatusCode::FORBIDDEN,
+        "self_registration_disabled",
+    )?;
+    let (logged_in, cookie) = login(
+        &client,
+        &base,
+        &artifacts,
+        &ordinary.user.handle,
+        &mut ordinary_key,
+    )?;
+    assert_eq!(logged_in.user, ordinary.user);
+    access(&client, &base, &artifacts, &cookie, false)?;
+    ordinary_device_login_does_not_grant_hosting_authority(
+        &client, &base, &artifacts, &logged_in, &cookie,
+    )?;
+    let (_, cookie) = login(
+        &client,
+        &base,
+        &artifacts,
+        &admin.user.handle,
+        &mut admin_key,
+    )?;
+    access(&client, &base, &artifacts, &cookie, true)?;
+    let stored: Value = decode(send(
+        client
+            .get(format!("{base}/api/hosting/settings"))
+            .header(COOKIE, &cookie),
+        "administrator settings access persists after reopen",
+        &artifacts,
+    )?)?;
+    assert_eq!(stored, json!({"self_registration_enabled": false}));
+    let report = environment.cleanup()?;
+    assert!(report.cleanup_success);
+    assert!(!report.fixture_root_exists_after);
+    Ok(())
+}
+
+#[test]
+fn legacy_host_bootstrap_is_ordinary_until_explicit_host_selection() -> Result {
+    let mut environment = WorkerE2eEnvironment::new()?;
+    environment.start_empty_backend()?;
+    let client = http_client()?;
+    let base = environment
+        .server_url
+        .as_deref()
+        .ok_or("missing server URL")?;
+    let artifacts = &environment.artifacts_dir;
+    let setup = environment.bootstrap_auth_user(&environment.account_handle)?;
+    let bearer = setup["access_token"]
+        .as_str()
+        .ok_or("bootstrap omitted bearer")?;
+    policy(&client, base, artifacts, false)?;
+    let ordinary: Value = decode(send(
+        client
+            .get(format!("{base}/api/hosting/access"))
+            .bearer_auth(bearer),
+        "legacy host bootstrap does not implicitly grant administrator",
+        artifacts,
+    )?)?;
+    assert_eq!(ordinary, json!({"is_admin": false}));
+    rejected(
+        send(
+            client
+                .put(format!("{base}/api/hosting/settings"))
+                .bearer_auth(bearer)
+                .json(&json!({"self_registration_enabled": true})),
+            "legacy bootstrap bearer cannot change hosting settings",
+            artifacts,
+        )?,
+        StatusCode::FORBIDDEN,
+        "hosting_admin_required",
+    )?;
+    let selected = environment.setup_hosting_admin(&environment.account_handle, false)?;
+    assert_eq!(selected["hosting_admin"], true);
+    assert!(
+        selected.get("access_token").is_none(),
+        "selection must not mint credentials"
+    );
+    let admin: Value = decode(send(
+        client
+            .get(format!("{base}/api/hosting/access"))
+            .bearer_auth(bearer),
+        "explicit host selection grants existing user administrator",
+        artifacts,
+    )?)?;
+    assert_eq!(admin, json!({"is_admin": true}));
+    policy(&client, base, artifacts, false)?;
     let report = environment.cleanup()?;
     assert!(report.cleanup_success);
     assert!(!report.fixture_root_exists_after);

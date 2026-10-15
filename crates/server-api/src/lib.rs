@@ -170,6 +170,8 @@ macro_rules! impl_openapi_schema {
 impl_openapi_schema!(
     AuthBootstrapUserRequest,
     AuthPublicConfig,
+    HostingSettings,
+    HostingAccess,
     AuthUserResponse,
     DeviceLoginApproveRequest,
     DeviceLoginApproveResponse,
@@ -514,6 +516,28 @@ pub trait ServerApi {
 
     #[get("/api/auth/config", status = 200, error_status = 400)]
     async fn auth_config(&self) -> Result<AuthPublicConfig, RepositoryApiError>;
+
+    #[get("/api/auth/registration-policy", status = 200, error_status = 400)]
+    async fn auth_registration_policy(&self) -> Result<HostingSettings, RepositoryApiError>;
+
+    #[get("/api/hosting/access", status = 200, error_status = 403, additional_error_statuses = [400, 500], bearer_auth = true, browser_auth = true)]
+    async fn hosting_access(
+        &self,
+        #[extension] context: ServerRequestContext,
+    ) -> Result<HostingAccess, RepositoryApiError>;
+
+    #[get("/api/hosting/settings", status = 200, error_status = 403, additional_error_statuses = [400, 500], bearer_auth = true, browser_auth = true)]
+    async fn hosting_settings(
+        &self,
+        #[extension] context: ServerRequestContext,
+    ) -> Result<HostingSettings, RepositoryApiError>;
+
+    #[put("/api/hosting/settings", status = 200, error_status = 403, additional_error_statuses = [400, 500], bearer_auth = true, browser_auth = true)]
+    async fn hosting_settings_update(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[body] request: HostingSettings,
+    ) -> Result<HostingSettings, RepositoryApiError>;
 
     #[post(
         "/api/auth/bootstrap-user",
@@ -3844,6 +3868,22 @@ pub struct AuthPublicConfig {
     pub origin: String,
     pub public_base_url: String,
     pub cookie_name: String,
+}
+
+/// The only public registration policy. No administrator identities or host secrets are exposed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct HostingSettings {
+    pub self_registration_enabled: bool,
+}
+
+/// Hosting authority for the current authenticated human, not Workspace permissions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct HostingAccess {
+    pub is_admin: bool,
 }
 
 /// Authentication method that established the current request actor.
@@ -11395,6 +11435,8 @@ pub fn auth_api_typescript() -> String {
     let config = ts_rs::Config::default();
     let declarations = [
         AuthPublicConfig::decl(&config),
+        HostingSettings::decl(&config),
+        HostingAccess::decl(&config),
         ActorAuthMethod::decl(&config),
         AuthenticatedUser::decl(&config),
         RequestActor::decl(&config),
@@ -14380,6 +14422,7 @@ mod openapi_artifact_tests {
         const PUBLIC_UNAUTHENTICATED: &[&str] = &[
             "health",
             "auth_config",
+            "auth_registration_policy",
             "auth_bootstrap_user",
             "auth_passkey_registration_options",
             "auth_passkey_registration_complete",

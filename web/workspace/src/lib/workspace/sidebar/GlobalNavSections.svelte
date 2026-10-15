@@ -1,5 +1,42 @@
 <script lang="ts">
   import type { WorkspaceCatalogRecord } from "#lib/workspace/api/workspace-catalog.ts";
+  import { onMount, untrack } from "svelte";
+  import { loadWhoami } from "#lib/workspace/auth/api.ts";
+  import { loadHostingAccess, SESSION_CHANGED_EVENT } from "#lib/workspace/auth/hosting.ts";
+
+  let mounted = $state(false);
+  let isAdmin = $state(false);
+  let accessRequest = 0;
+
+  async function refreshAccess() {
+    const request = ++accessRequest;
+    isAdmin = false;
+    try {
+      const whoami = await loadWhoami();
+      if (request !== accessRequest || !whoami.actor) return;
+      const access = await loadHostingAccess();
+      if (request === accessRequest) isAdmin = access.is_admin;
+    } catch {
+      // 未確認の権限では管理導線を表示しない。直接screenでも独立して検証する。
+    }
+  }
+
+  onMount(() => {
+    mounted = true;
+    const refresh = () => { void refreshAccess(); };
+    window.addEventListener(SESSION_CHANGED_EVENT, refresh);
+    window.addEventListener("focus", refresh);
+    return () => {
+      ++accessRequest;
+      window.removeEventListener(SESSION_CHANGED_EVENT, refresh);
+      window.removeEventListener("focus", refresh);
+    };
+  });
+
+  $effect(() => {
+    currentPath;
+    if (mounted) untrack(() => { void refreshAccess(); });
+  });
 
   type Props = {
     currentPath: string;
@@ -37,6 +74,14 @@
           <span>{item.label}</span>
         </a>
       {/each}
+      {#if isAdmin}
+        <a
+          class="sidebar-link"
+          class:active={currentPath === "/hosting/settings"}
+          href="/hosting/settings"
+          aria-current={currentPath === "/hosting/settings" ? "page" : undefined}
+        >Hosting settings</a>
+      {/if}
     </div>
   </section>
 
