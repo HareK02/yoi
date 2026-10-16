@@ -791,58 +791,17 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_prompt_uses_normal_branch_integration_before_escalation() {
+    fn merge_request_prompts_keep_recording_and_reviewer_contracts() {
         let catalog = PromptCatalog::builtins_only().unwrap();
-        let prompt = &catalog.projection.templates["role.orchestrator"];
-
-        assert!(prompt.contains("`merge_from`"));
-        assert!(prompt.contains("`merge_to`"));
-        assert!(prompt.contains("normal source-control operations"));
-        assert!(prompt.contains("switch to `merge_to`"));
-        assert!(prompt.contains("concrete source-control or provider failure"));
-        assert!(prompt.contains("does not update the branch itself"));
-        assert!(!prompt.contains("use the Ticket repository `origin` transport"));
-    }
-
-    #[test]
-    fn merge_request_prompts_use_selector_refs_and_verb_first_operations() {
-        let catalog = PromptCatalog::builtins_only().unwrap();
-        let templates = &catalog.projection.templates;
-        let common = &templates["common.merge_request"];
-        let coder = &templates["role.coder"];
-        let orchestrator = &templates["role.orchestrator"];
-        let reviewer = &templates["role.reviewer"];
-        let combined = format!("{common}\n{coder}\n{orchestrator}\n{reviewer}");
-
-        for operation in [
-            "OpenMergeRequest",
-            "ShowMergeRequest",
-            "ReviewMergeRequest",
-            "CheckMergeRequestReadiness",
-            "CompleteMergeRequest",
-            "TicketCaseUpdate",
-        ] {
-            assert!(combined.contains(operation), "missing {operation}");
-        }
-        for stale_operation in [
-            "MergeRequestOpen",
-            "MergeRequestShow",
-            "MergeRequestReview",
-            "MergeRequestReadinessCheck",
-            "MergeRequestComplete",
-        ] {
-            assert!(
-                !combined.contains(stale_operation),
-                "stale operation {stale_operation} remains in prompt authority"
-            );
-        }
+        let common = &catalog.projection.templates["common.merge_request"];
+        let reviewer = &catalog.projection.templates["role.reviewer"];
         assert!(common.contains("selector_from"));
+        assert!(common.contains("selector_to"));
         assert!(common.contains("normal non-force push"));
-        assert!(common.contains("Moving only the target ref does not invalidate approval"));
-        assert!(common.contains("take precedence over stale Memory"));
-        assert!(coder.contains("Never invent an operation to append another source candidate"));
-        assert!(orchestrator.contains("Target-only movement preserves source approval"));
-        assert!(reviewer.contains("target-only movement does not invalidate approval"));
+        assert!(common.contains("target-only movement preserves approval"));
+        assert!(reviewer.contains("complete linked MR/result snapshot"));
+        assert!(reviewer.contains("Submit `ReviewMergeRequest` once"));
+        assert!(reviewer.contains("without modifying implementation files"));
     }
 
     #[test]
@@ -1076,28 +1035,12 @@ mod tests {
             .unwrap();
 
         assert!(rendered.contains("This policy governs naming only"));
-        assert!(rendered.contains("Worker cleanup is a separate lifecycle decision"));
-        assert!(rendered.contains("not an automatic consequence of a Ticket state"));
-        assert!(rendered.contains("perform one cleanup pass before ending the orchestration turn"));
-        assert!(rendered.contains("Never predeclare `delete_on_completion`"));
-        assert!(rendered.contains("call `WorkerStop`"));
-        assert!(rendered.contains("call `WorkerRemove`"));
-        assert!(rendered.contains("only then call `WorkdirDelete`"));
-        assert!(rendered.contains("must have no unfinished Ticket work"));
-        assert!(rendered.contains("does not require unassignment before cleanup"));
-        assert!(rendered.contains("`UnfinishedWork` (`unfinished_work` on the wire)"));
-        assert!(rendered.contains("requires explicit work end or reassignment"));
+        assert!(rendered.contains("stop the Worker, remove it, then delete the Workdir"));
+        assert!(rendered.contains("releases attachments but preserves the Workdir"));
+        assert!(
+            rendered.contains("Retained terminal responsibility does not require unassignment")
+        );
         assert!(rendered.contains("idle or stopped status does not end unfinished work"));
-        for stale_policy in [
-            "no current Ticket assignment",
-            "unassign it through the available orchestration authority",
-            "`CurrentAssignment`",
-        ] {
-            assert!(
-                !rendered.contains(stale_policy),
-                "stale cleanup policy: {stale_policy}"
-            );
-        }
         assert!(!rendered.contains("{% include"));
     }
 }

@@ -17176,7 +17176,7 @@ impl merge_request::AssignmentSource for MergeRequestAssignmentSource {
         ticket_id: &str,
     ) -> std::result::Result<Option<merge_request::CurrentAssignment>, String> {
         self.store
-            .get_active_ticket_worker_assignment(workspace_id, ticket_id)
+            .get_current_ticket_worker_assignment(workspace_id, ticket_id)
             .map(|value| {
                 value.map(|assignment| merge_request::CurrentAssignment {
                     assignment_id: assignment.assignment_id,
@@ -17210,7 +17210,7 @@ impl TicketSourceCommitResolver for RuntimeTicketSourceCommitResolver {
         let assignment = self
             .api
             .store
-            .get_active_ticket_worker_assignment(self.api.workspace_id(), ticket_id)
+            .get_current_ticket_worker_assignment(self.api.workspace_id(), ticket_id)
             .map_err(|error| merge_ref_diagnostic(error.into()))?
             .ok_or_else(|| MergeRequestRefDiagnostic {
                 code: "source_ref_runtime_unavailable".into(),
@@ -17905,7 +17905,7 @@ async fn scoped_list_merge_requests(
                     ) {
                         (Some(selector), Some(ticket_id)) => match api
                             .store
-                            .get_active_ticket_worker_assignment(&workspace_id, ticket_id)?
+                            .get_current_ticket_worker_assignment(&workspace_id, ticket_id)?
                         {
                             Some(assignment) => match observe_published_source_ref(
                                 &api,
@@ -18086,7 +18086,7 @@ async fn scoped_show_merge_request(
             })?;
             let assignment = api
                 .store
-                .get_active_ticket_worker_assignment(&workspace_id, ticket_id)?;
+                .get_current_ticket_worker_assignment(&workspace_id, ticket_id)?;
             let (source, target) = if let Some(refs) = integrated_refs {
                 refs
             } else {
@@ -18170,7 +18170,7 @@ async fn scoped_merge_request_readiness(
             let ticket_id = merge_request_ticket_id(&mr)?;
             let assignment = api
                 .store
-                .get_active_ticket_worker_assignment(&workspace_id, &ticket_id)?;
+                .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?;
             let (current_subject_ref, source_blocker) =
                 if mr.state == merge_request::MergeRequestState::Merged {
                     (
@@ -18245,10 +18245,10 @@ async fn scoped_open_merge_request(
             let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
             let assignment = api
                 .store
-                .get_active_ticket_worker_assignment(&workspace_id, &ticket_id)?
+                .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
                 .ok_or_else(|| {
                     Error::TicketAssignmentConflict(
-                        "Ticket has no active Coder work assignment".into(),
+                        "Ticket has no current implementation assignment".into(),
                     )
                 })?;
             if assignment.worker.runtime_id != source.runtime_id
@@ -18370,10 +18370,10 @@ async fn scoped_repair_merge_request_selector(
             let ticket_id = merge_request_ticket_id(&mr)?;
             let assignment = api
                 .store
-                .get_active_ticket_worker_assignment(&workspace_id, &ticket_id)?
+                .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
                 .ok_or_else(|| {
                     Error::TicketAssignmentConflict(
-                        "Ticket has no active Coder work assignment".into(),
+                        "Ticket has no current implementation assignment".into(),
                     )
                 })?;
             let resolved_subject_ref = observe_published_source_ref(
@@ -18454,20 +18454,12 @@ async fn scoped_register_merge_request_review_capability(
             }
             let assignment = api
                 .store
-                .get_active_ticket_worker_assignment(&workspace_id, &ticket_id)?
+                .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
                 .ok_or_else(|| {
                     Error::TicketAssignmentConflict(
-                        "Ticket has no active Coder work assignment".into(),
+                        "Ticket has no current implementation assignment".into(),
                     )
                 })?;
-            if assignment.worker.runtime_id != source.runtime_id
-                || assignment.worker.worker_id != source.worker_id
-            {
-                return Err(Error::TicketAssignmentConflict(
-                    "authenticated Worker is not current assignee".into(),
-                )
-                .into());
-            }
             let subject_ref = match mr.state {
                 merge_request::MergeRequestState::Merged => merged_result_source_ref(&mr)?,
                 merge_request::MergeRequestState::Open => {
@@ -18572,10 +18564,10 @@ async fn scoped_submit_merge_request_review(
             let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
             let assignment = api
                 .store
-                .get_active_ticket_worker_assignment(&workspace_id, &ticket_id)?
+                .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
                 .ok_or_else(|| {
                     Error::TicketAssignmentConflict(
-                        "Ticket has no active Coder work assignment".into(),
+                        "Ticket has no current implementation assignment".into(),
                     )
                 })?;
             let current_subject_ref = match mr.state {
@@ -18641,20 +18633,12 @@ async fn scoped_revoke_merge_request_review(
             let ticket_id = merge_request_ticket_id(&mr)?;
             let assignment = api
                 .store
-                .get_active_ticket_worker_assignment(&workspace_id, &ticket_id)?
+                .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
                 .ok_or_else(|| {
                     Error::TicketAssignmentConflict(
-                        "Ticket has no active Coder work assignment".into(),
+                        "Ticket has no current implementation assignment".into(),
                     )
                 })?;
-            if assignment.worker.runtime_id != source.runtime_id
-                || assignment.worker.worker_id != source.worker_id
-            {
-                return Err(Error::TicketAssignmentConflict(
-                    "authenticated Worker is not current assignee".into(),
-                )
-                .into());
-            }
             let event = store.revoke_review(merge_request::RevokeMergeRequestReview {
                 merge_request_id,
                 ticket_id,
@@ -18718,10 +18702,10 @@ async fn scoped_complete_merge_request(
             }
             let assignment = api
                 .store
-                .get_active_ticket_worker_assignment(&workspace_id, &ticket_id)?
+                .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
                 .ok_or_else(|| {
                     Error::TicketAssignmentConflict(
-                        "Ticket has no active Coder work assignment".into(),
+                        "Ticket has no current implementation assignment".into(),
                     )
                 })?;
             let selector = mr
@@ -54587,6 +54571,25 @@ mod tests {
         .unwrap();
         let orchestrator = started.worker.unwrap();
         let orchestrator = RuntimeWorkerRef::new(orchestrator.runtime_id, orchestrator.worker_id);
+        merge_request_store(&api, TEST_WORKSPACE_ID)
+            .unwrap()
+            .open_merge_request(merge_request::OpenMergeRequest {
+                merge_request_id: "retained-review-context".into(),
+                ticket_id: ticket.id.clone(),
+                repository_id: test_repository_id(&api),
+                selector_from: "work/old-coder".into(),
+                selector_to: "develop".into(),
+                summary: String::new(),
+                auth: merge_request::MergeRequestAuth {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                    repository_id: test_repository_id(&api),
+                    runtime_id: old_coder.runtime_id.clone(),
+                    worker_id: old_coder.worker_id.clone(),
+                    assignment_id: "old-coder".into(),
+                },
+                now: Utc::now(),
+            })
+            .unwrap();
         execution.take_inputs();
         let before = browser_ticket_backend(&api)
             .unwrap()
@@ -54704,7 +54707,7 @@ mod tests {
                     repository_key: "test-repository".to_string(),
                     selector_from: "work/old-coder".to_string(),
                     selector_to: "develop".to_string(),
-                    summary: "Old responsibility is not implementation authority".to_string(),
+                    summary: "Retained context supports MR processing after closure".to_string(),
                 }),
             )
             .await
@@ -54713,11 +54716,30 @@ mod tests {
             let status = response.status();
             let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let body = String::from_utf8_lossy(&bytes);
-            assert_eq!(status, StatusCode::CONFLICT, "state={state}: {body}");
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "state={state}: {body}");
             assert!(
-                body.contains("Ticket has no active Coder work assignment"),
+                body.contains("source_ref_provider_unavailable"),
                 "state={state}: {body}"
             );
+            // The Orchestrator can initiate review itself after close/reopen.
+            // This backend deliberately lacks ref observation: failure must be
+            // at the provider, not a Coder-only or active-assignment guard.
+            let response = scoped_register_merge_request_review_capability(
+                State(api.clone()),
+                ticket_check_headers(&orchestrator),
+                AxumPath((TEST_WORKSPACE_ID.into(), "retained-review-context".into())),
+                Json(server_api::RegisterMergeRequestReviewCapabilityRequest {
+                    ticket_id: ticket.id.clone(),
+                    child_session_id: "orchestrator-reviewer".into(),
+                    capability_token: "test-review-token".into(),
+                }),
+            )
+            .await
+            .unwrap_err()
+            .into_response();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert!(String::from_utf8_lossy(&bytes).contains("source_ref_provider_unavailable"));
         }
         execute_ticket_rest_operation(
             &api,
@@ -61664,7 +61686,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merge_request_assignment_authority_rejects_terminal_ticket_responsibility() {
+    async fn merge_request_assignment_authority_retains_closed_and_reopened_ticket_context() {
         let workspace = tempfile::tempdir().unwrap();
         let api = test_api(workspace.path()).await;
         let worker_id = seed_cleanup_worker(&api, 3, "normal");
@@ -61705,8 +61727,8 @@ mod tests {
                     ticket_id,
                 )
                 .unwrap()
-                .is_none(),
-                "terminal responsibility must not authorize MR operations: {state}"
+                .is_some(),
+                "MR operations retain current implementation context: {state}"
             );
         }
     }

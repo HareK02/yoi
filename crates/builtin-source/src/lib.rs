@@ -133,7 +133,7 @@ pub const BUILTIN_PROFILE_RESOURCES: &[BuiltinProfileResource] = &[
         selector: Some("builtin:orchestrator"),
         path: "profiles/orchestrator.dcdl",
         source: include_str!("../../../resources/profiles/orchestrator.dcdl"),
-        description: "Intent-led Ticket orchestration with separate guarded MR integration authority.",
+        description: "Outcome-led orchestration, selection of candidate changes, and risk-proportionate validation.",
         imports: BASE_IMPORT,
     },
     BuiltinProfileResource {

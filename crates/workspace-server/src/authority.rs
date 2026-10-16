@@ -169,7 +169,7 @@ impl merge_request::AssignmentSource for AuthorityMergeRequestSource {
         ticket_id: &str,
     ) -> std::result::Result<Option<merge_request::CurrentAssignment>, String> {
         self.store
-            .get_active_ticket_worker_assignment(workspace_id, ticket_id)
+            .get_current_ticket_worker_assignment(workspace_id, ticket_id)
             .map(|assignment| {
                 assignment.map(|assignment| merge_request::CurrentAssignment {
                     assignment_id: assignment.assignment_id,

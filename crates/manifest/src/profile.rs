@@ -1746,7 +1746,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_orchestrator_keeps_cleanup_tool_providers_enabled() {
+    fn builtin_orchestrator_enables_reviewer_handoff_and_cleanup_without_self_review() {
         let tmp = TempDir::new().unwrap();
         let resolved = ProfileResolver::new()
             .with_workspace_base(tmp.path())
@@ -1757,6 +1757,7 @@ mod tests {
             .unwrap();
         let feature = resolved.manifest.feature;
 
+        assert!(feature.sub_worker.enabled);
         assert!(feature.worker.enabled);
         assert!(!feature.worker.direct_spawn);
         assert!(feature.manage_workdir.enabled);

@@ -1,6 +1,6 @@
 import "./base.dcdl" // {
     slug = "orchestrator";
-    description = "Intent-led Ticket delegation and self-reported assignment handling; case closure and guarded MR integration are separate.";
+    description = "Owns outcome delivery, selection and validation of candidate changes, and useful delegation; MR workflows are optional.";
     scope = "workspace_write";
     engine = { instruction = "role.orchestrator"; };
 
@@ -10,7 +10,7 @@ import "./base.dcdl" // {
         memory = { enabled = false; };
         subjektiv = { enabled = true; };
         web = { enabled = true; };
-        sub_worker = { enabled = false; };
+        sub_worker = { enabled = true; };
         worker = { enabled = true; direct_spawn = false; };
         manage_workdir = { enabled = true; };
         ticket = { enabled = true; thread = true; workflow = true; };

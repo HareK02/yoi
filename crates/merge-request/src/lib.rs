@@ -826,7 +826,7 @@ impl MergeRequestStore {
             ));
         }
         let mr = self.get_for_operation(&i.auth.workspace_id, &i.merge_request_id, &i.ticket_id)?;
-        self.assigned(&i.auth, &i.ticket_id, &mr.repository_id)?;
+        self.current_assignment_auth(&i.auth, &i.ticket_id, &mr.repository_id)?;
         if mr.state == MergeRequestState::Closed
             || (mr.state == MergeRequestState::Open && mr.selector_from.is_none())
         {
@@ -1035,7 +1035,7 @@ impl MergeRequestStore {
     ) -> Result<ReviewRevokedEvent, MergeRequestError> {
         bounded_body("revocation reason", &i.reason)?;
         let mr = self.get_for_operation(&i.auth.workspace_id, &i.merge_request_id, &i.ticket_id)?;
-        self.assigned(&i.auth, &i.ticket_id, &mr.repository_id)?;
+        self.current_assignment_auth(&i.auth, &i.ticket_id, &mr.repository_id)?;
         let r = mr
             .thread
             .iter()
@@ -1152,7 +1152,7 @@ impl MergeRequestStore {
                 "operation fingerprint mismatch".into(),
             ));
         }
-        self.completion_auth(&i.auth, &i.ticket_id, &mr.repository_id)?;
+        self.current_assignment_auth(&i.auth, &i.ticket_id, &mr.repository_id)?;
         if mr.state != MergeRequestState::Open {
             return Err(MergeRequestError::Conflict(
                 "Merge Request is not open".into(),
@@ -1186,7 +1186,7 @@ impl MergeRequestStore {
             ));
         }
         // Case openness is not an integration phase. Exact source approval,
-        // current Ticket content and active assignment fencing above remain
+        // current Ticket content and current assignment fencing above remain
         // the independent MR integration guards.
         Ok(())
     }
@@ -1229,7 +1229,7 @@ impl MergeRequestStore {
         }
         let assignment_is_current: bool = transaction.query_row(
             "SELECT EXISTS(
-                SELECT 1 FROM ticket_active_worker_assignments
+                SELECT 1 FROM ticket_current_worker_assignments
                  WHERE workspace_id=?1 AND ticket_id=?2 AND assignment_id=?3
              )",
             params![i.auth.workspace_id, i.ticket_id, i.auth.assignment_id],
@@ -1548,7 +1548,7 @@ impl MergeRequestStore {
         }
         Ok(())
     }
-    fn completion_auth(
+    fn current_assignment_auth(
         &self,
         a: &MergeRequestAuth,
         t: &str,

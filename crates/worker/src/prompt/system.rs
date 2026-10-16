@@ -409,7 +409,19 @@ mod tests {
     }
 
     #[test]
-    fn effective_code_instructions_preserve_independent_review_before_merge() {
+    fn effective_orchestrator_instructions_separate_adoption_from_optional_mr_receipts() {
+        let (without_mr, without_mr_tools) =
+            ticket_workflow_fixture("role.orchestrator", MergeRequestFeatureConfig::default());
+        assert!(without_mr.contains("Select, adapt, or reject Coder changes"));
+        assert!(
+            without_mr.contains("Use Tickets and Merge Requests by default, adapting the workflow when the request calls for a different approach.")
+        );
+        assert!(
+            !without_mr_tools
+                .iter()
+                .any(|meta| meta.name == "CompleteMergeRequest")
+        );
+
         let (prompt, tools) = ticket_workflow_fixture(
             "role.orchestrator",
             MergeRequestFeatureConfig {
@@ -419,16 +431,15 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(prompt.contains("Trusted Reviewer authority"));
-        assert!(
-            prompt.contains(
-                "Target integration and `CompleteMergeRequest` are Orchestrator authority"
-            )
-        );
-        assert!(
-            prompt.contains("does not bypass the guarded review requirements for MR integration")
-        );
-        assert!(prompt.contains("not a universal Ticket pipeline"));
+        for policy in [
+            "Select, adapt, or reject Coder changes",
+            "validate the combined result",
+            "Use Tickets and Merge Requests by default, adapting the workflow when the request calls for a different approach.",
+            "its approval requirement is not a general Git adoption gate",
+            "Partial or adapted adoption is not full MR integration",
+        ] {
+            assert!(prompt.contains(policy), "missing {policy}");
+        }
         assert!(!tools.iter().any(|meta| meta.name == "ReviewMergeRequest"));
         let complete = tools
             .iter()
@@ -453,7 +464,10 @@ mod tests {
         for role in ["role.ticket_worker", "role.coder", "role.orchestrator"] {
             let (prompt, tools) =
                 ticket_workflow_fixture(role, MergeRequestFeatureConfig::default());
-            assert!(prompt.contains("return without conclusion"), "{role}");
+            assert!(
+                prompt.contains("return without concluding the Ticket"),
+                "{role}"
+            );
             assert!(
                 prompt.contains(
                     "a turn ending or a result report is not itself a completion decision"
@@ -534,9 +548,8 @@ mod tests {
                     | "TicketClose"
             )));
             if role == "role.orchestrator" {
-                assert!(prompt.contains("observed current `orchestrator_assignment_id`"));
                 assert!(prompt.contains(
-                    "generic `WorkerSpawn` Ticket starts and existing-Worker assignment"
+                    "`SpawnTicketWorker` using the current `orchestrator_assignment_id`"
                 ));
             }
         }

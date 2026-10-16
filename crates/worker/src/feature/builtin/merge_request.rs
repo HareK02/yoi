@@ -1108,7 +1108,7 @@ pub fn description(n: &str) -> Option<&'static str> {
             "Open one repository-scoped Merge Request linked to the Ticket; reuse an existing Merge Request for that repository and advance only its selector_from with a normal non-force push.",
         ),
         "CompleteMergeRequest" => Some(
-            "Record Orchestrator-owned integration for the explicitly addressed Merge Request using current trusted exact-source approval and provider evidence. This records an already-applied integration, not a Ticket conclusion or assignment release; a review-not-required Ticket request does not bypass MR integration guards.",
+            "Record an exact-source MR integration receipt using current trusted exact-source approval and provider evidence. This optional recording workflow describes an already-applied integration; it does not update a branch, select which Coder changes to adopt, conclude a Ticket, or release an assignment. Do not record partial or adapted adoption as full integration of the reviewed source.",
         ),
         "ReviewMergeRequest" => Some(
             "Submit the injected trusted Reviewer capability result for its captured exact source ref; source movement cancels it, while target-only movement does not. The capability authenticates the attempt, not the verdict: independent natural-language judgment and validation remain the Reviewer's responsibility.",

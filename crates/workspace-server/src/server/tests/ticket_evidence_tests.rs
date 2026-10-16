@@ -541,12 +541,17 @@ async fn latest_postmerge_approval_requires_exact_content_and_stored_source_resu
 }
 
 #[tokio::test]
-async fn open_source_without_runtime_is_typed_unavailable_not_stale_after_rescope() {
+async fn released_assignment_still_observes_provider_and_reports_real_unavailability() {
     let fixture = EvidenceApiFixture::new().await;
     let approval = fixture.approve("open-review");
     fixture.rescope();
-    // End this assignment identity's work without erasing its responsibility.
-    // A retained Coder must not silently supply a Runtime for an open source.
+    // Work release must not short-circuit MR provider observation. This fixture
+    // has no live Runtime, so retain the same real provider failure after release.
+    let baseline = fixture.detail(approval.sequence, 1).await;
+    let source_code = baseline.source.diagnostic.unwrap().code;
+    let target_code = baseline.target.diagnostic.unwrap().code;
+    assert_ne!(source_code, "source_ref_runtime_unavailable");
+    assert_ne!(target_code, "target_ref_runtime_unavailable");
     let connection = Connection::open(&fixture.api.config.database_path).unwrap();
     assert_eq!(connection.execute(
         "INSERT INTO ticket_assignment_work_releases(workspace_id,assignment_id,released_at) VALUES(?1,?2,?3)",
@@ -577,7 +582,7 @@ async fn open_source_without_runtime_is_typed_unavailable_not_stale_after_rescop
     assert_eq!(
         summary.source_ref_observation,
         TicketSourceRefObservation::Unavailable {
-            code: "source_ref_runtime_unavailable".into(),
+            code: source_code.clone(),
         }
     );
     assert_eq!(shown.evidence.review_status.as_deref(), Some("unknown"));
@@ -598,23 +603,14 @@ async fn open_source_without_runtime_is_typed_unavailable_not_stale_after_rescop
     let listed = fixture.list().await;
     assert_eq!(listed.items.len(), 1);
     assert_eq!(&listed.items[0].summary, summary);
-    assert_eq!(
-        listed.items[0].ref_diagnostics[0].code,
-        "source_ref_runtime_unavailable"
-    );
+    assert_eq!(listed.items[0].ref_diagnostics[0].code, source_code);
     let detail = fixture.detail(approval.sequence, 1).await;
     assert!(detail.merge_request.thread.is_empty());
     assert_eq!(detail.source.status, "unknown");
     assert_eq!(detail.source.resolved_ref, None);
-    assert_eq!(
-        detail.source.diagnostic.unwrap().code,
-        "source_ref_runtime_unavailable"
-    );
+    assert_eq!(detail.source.diagnostic.unwrap().code, source_code);
     assert_eq!(detail.target.status, "unknown");
-    assert_eq!(
-        detail.target.diagnostic.unwrap().code,
-        "target_ref_runtime_unavailable"
-    );
+    assert_eq!(detail.target.diagnostic.unwrap().code, target_code);
 }
 
 #[tokio::test]
@@ -1133,4 +1129,123 @@ async fn case_route_rejects_stale_content_state_and_invalid_actions_without_audi
     )
     .await;
     assert_eq!(backend.show(reference.id.into()).unwrap(), closed);
+}
+
+// Production case transition, assignment adapter, review store and completion
+// transaction. Provider refs are supplied at the store boundary in this fixture.
+#[tokio::test]
+async fn closed_and_reopened_tickets_allow_orchestrator_review_and_integration_without_reassignment()
+ {
+    for reopen in [false, true] {
+        let mut fixture = EvidenceApiFixture::new().await;
+        fixture
+            .backend
+            .update_case(&fixture.ticket_id, fixture.closure())
+            .unwrap();
+        if reopen {
+            fixture
+                .backend
+                .update_case(
+                    &fixture.ticket_id,
+                    ticket::TicketCaseUpdate {
+                        operation_key: "reopen-for-test".into(),
+                        expected_content_digest: fixture.content_digest(),
+                        expected_state: ticket::TicketState::Closed,
+                        expected_closure_operation_key: Some("evidence-ticket-closure".into()),
+                        action: ticket::TicketCaseAction::Reopen,
+                        explanation: "Continue the case without replacing implementation context"
+                            .into(),
+                        references: vec![],
+                        author: Some("fixture".into()),
+                    },
+                )
+                .unwrap();
+        }
+        assert!(
+            fixture
+                .api
+                .store
+                .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+                .unwrap()
+                .is_none()
+        );
+        // The review owner is not the implementing Coder. Its own attested child
+        // still owns the verdict; changing the owner never grants self-review.
+        fixture
+            .store
+            .register_reviewer_child_session(RegisterReviewerChildSession {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                parent_runtime_id: fixture.auth.runtime_id.clone(),
+                parent_worker_id: fixture.auth.worker_id.clone(),
+                child_session_id: "coder-owned-child".into(),
+                reviewer_profile: "builtin:reviewer".into(),
+                now: evidence_time(),
+            })
+            .unwrap();
+        fixture.auth.runtime_id = "orchestrator-runtime".into();
+        fixture.auth.worker_id = "orchestrator".into();
+        let foreign_child = fixture.store.request_review(RequestMergeRequestReview {
+            merge_request_id: EVIDENCE_MR.into(),
+            ticket_id: fixture.ticket_id.clone(),
+            ticket_content_digest: fixture.content_digest(),
+            ticket_merge_request_subjects: fixture.subjects(),
+            subject_ref: EVIDENCE_SOURCE.into(),
+            child_session_id: "coder-owned-child".into(),
+            capability_token: "foreign-child-token".into(),
+            auth: fixture.auth.clone(),
+            now: evidence_time(),
+        });
+        assert!(matches!(
+            foreign_child,
+            Err(merge_request::MergeRequestError::Unauthorized(_))
+        ));
+        let old = fixture.approve("old-review");
+        let revoked = fixture
+            .store
+            .revoke_review(merge_request::RevokeMergeRequestReview {
+                merge_request_id: EVIDENCE_MR.into(),
+                ticket_id: fixture.ticket_id.clone(),
+                review_event_id: old.event_id,
+                reason: "Request a fresh independent review".into(),
+                auth: fixture.auth.clone(),
+                now: evidence_time(),
+            })
+            .unwrap();
+        assert_eq!(revoked.revoked_by.worker_id, "orchestrator");
+        let approval = fixture.approve("fresh-review");
+        let ready = fixture
+            .store
+            .readiness(merge_request::ReadinessCheck {
+                merge_request_id: EVIDENCE_MR.into(),
+                ticket_id: fixture.ticket_id.clone(),
+                current_subject_ref: Some(EVIDENCE_SOURCE.into()),
+                auth: fixture.auth.clone(),
+            })
+            .unwrap();
+        assert!(ready.ready, "{:?}", ready.blockers);
+        let integrated = fixture.integrate(&approval);
+        assert_eq!(integrated.merged_by.worker_id, "orchestrator");
+        assert_eq!(integrated.approval_event_id, approval.event_id);
+        let shown = fixture.show().await;
+        assert_eq!(shown.state.as_str(), if reopen { "open" } else { "closed" });
+        assert_eq!(shown.merge_requests[0].state, "merged");
+        assert!(
+            fixture
+                .api
+                .store
+                .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            fixture
+                .api
+                .store
+                .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+                .unwrap()
+                .unwrap()
+                .assignment_id,
+            fixture.auth.assignment_id
+        );
+    }
 }
