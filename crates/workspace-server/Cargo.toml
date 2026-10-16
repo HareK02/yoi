@@ -53,7 +53,8 @@ ts-rs = "12.0.1"
 url.workspace = true
 uuid = { workspace = true, features = ["v7"] }
 zeroize.workspace = true
-webauthn-rs = { workspace = true }
+webauthn-rs = { workspace = true, features = ["conditional-ui"] }
+webauthn-rs-proto = "0.5.5"
 
 [dev-dependencies]
 wip-protocol.workspace = true

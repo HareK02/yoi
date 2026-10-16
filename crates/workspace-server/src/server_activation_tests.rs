@@ -1,5 +1,5 @@
 // Production generated routes, SQLite and WebAuthn verifier share the passkey
-// security fixture. Only the authenticator is SoftPasskey, not a browser/OS key.
+// security fixture. The authenticator is a resident model, not a browser/OS key.
 // The ordinary Server test target selects these isolated integration cases.
 
 impl Fixture {
