@@ -28,6 +28,10 @@ git diff --check HEAD
 
 Workspace全体、`--all-targets`、Nix/Dockerなどの重い検証は、変更した境界を狭い検証では確認できない場合か、明示的に求められた場合に選ぶ。既存の無関係なformat差分を混ぜない。公開APIや生成元を変えた場合は、所有する生成処理と差分検査で生成物との一致を確認する。
 
+Linuxで通常suite全体を選ぶ場合は、rootの `deno task test` を使える。Cargoが選択した通常Rust test targetを毎回build・列挙し、doctest、Web unit/component、検証toolのテストも実行する。大きいRust targetは列挙した全ケースを重複なくprocessへ分配し、同一process内の共有資源への競合を減らす。`--jobs N` は同時実行するtop-level suite数の上限で、内部のCargoやWeb runnerの並列性とは別である。個別調査には引き続きCargoのtarget/filterを使う。
+
+外側buildと実行の壁時計時間を分け、通常テストの失敗・timeout・列挙失敗は全体の失敗とする。各processの途中ログ、選択したケース、結果は `target/normal-tests/` に保存する。timeout・取消時の回収はLinuxの同じprocess group内を対象とし、自ら別sessionへ離脱した子孫までは保証しない。E2E/browserなど明示選択のsuiteは別に実行し、このrunnerの成功で代替しない。
+
 ## 状態契約の命名検査
 
 完了前に次を実行する。例外一覧を機械的に増やして合格させず、必要な保存互換・検証・禁止規則の記述だけを理由付きで扱う。
