@@ -11,6 +11,7 @@ pub use crate::feature::builtin::journal::{
     JournalJobFinalizer, JournalJobHost, JournalJobToolsFeature, JournalRecordingFeature,
 };
 pub use subjektiv::journal::memory_links::{MemoryJournalRequest, MemoryJournalResponse};
+use subjektiv::journal::startup::JournalStartupSnapshot;
 pub use subjektiv::journal::transport;
 use transport::{JournalRecordingReason, JournalRecordingRequest, JournalRecordingResponse};
 
@@ -67,6 +68,18 @@ impl From<SubjektivHostError> for ToolError {
 /// identifier is not a grant. No method grants ambient filesystem access.
 pub trait SubjektivHost: Send + Sync + 'static {
     fn settings(&self) -> SubjektivHostSettings;
+    /// Startup reads are a body-only capability, independent of recording Jobs.
+    fn journal_startup_granted(&self) -> bool {
+        false
+    }
+    fn journal_startup_context(
+        &self,
+        _context: &SubjektivHostContext,
+    ) -> Result<JournalStartupSnapshot, SubjektivHostError> {
+        Err(SubjektivHostError::Unavailable(
+            "Journal startup not granted".into(),
+        ))
+    }
     /// Recording admission is separate from both Memory and Journal Job operation grants.
     fn journal_recording_granted(&self) -> bool {
         false
@@ -232,6 +245,25 @@ impl SubjektivHost for BackendSubjektivHost {
                     serde_json::to_string(&request)
                         .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?,
                 ))
+                .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?,
+        )
+    }
+    fn journal_startup_granted(&self) -> bool {
+        true
+    }
+    fn journal_startup_context(
+        &self,
+        _context: &SubjektivHostContext,
+    ) -> Result<JournalStartupSnapshot, SubjektivHostError> {
+        decode(
+            self.client
+                .execute_with_timeout(
+                    WorkspaceRequest::get(format!(
+                        "/api/w/{}/subjektiv/journal/startup",
+                        self.workspace_id
+                    )),
+                    Duration::from_secs(5),
+                )
                 .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?,
         )
     }
@@ -448,6 +480,14 @@ pub struct SubjektivHostConnection {
 }
 
 impl SubjektivHostConnection {
+    pub fn journal_startup_context(&self) -> Result<JournalStartupSnapshot, SubjektivHostError> {
+        if !self.host.journal_startup_granted() {
+            return Err(SubjektivHostError::Unavailable(
+                "Journal startup not granted".into(),
+            ));
+        }
+        self.host.journal_startup_context(&self.context)
+    }
     pub fn new(
         host: Arc<dyn SubjektivHost>,
         context: SubjektivHostContext,
@@ -580,12 +620,33 @@ mod tests {
 
     #[derive(Default)]
     struct LocalHost {
+        startup: Option<JournalStartupSnapshot>,
+        startup_error: bool,
+        startup_calls: std::sync::atomic::AtomicUsize,
         contexts: Mutex<Vec<SubjektivHostContext>>,
         attributed: Mutex<Vec<(SubjektivHostContext, bool)>>,
         journal_observer:
             Option<Arc<dyn Fn(&SubjektivHostContext, JournalRecordingReason) + Send + Sync>>,
     }
     impl SubjektivHost for LocalHost {
+        fn journal_startup_granted(&self) -> bool {
+            self.startup.is_some() || self.startup_error
+        }
+        fn journal_startup_context(
+            &self,
+            _context: &SubjektivHostContext,
+        ) -> Result<JournalStartupSnapshot, SubjektivHostError> {
+            self.startup_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.startup_error {
+                return Err(SubjektivHostError::Unavailable(
+                    "startup read failed".into(),
+                ));
+            }
+            self.startup
+                .clone()
+                .ok_or_else(|| SubjektivHostError::Unavailable("startup not granted".into()))
+        }
         fn journal_recording_granted(&self) -> bool {
             self.journal_observer.is_some()
         }
@@ -953,6 +1014,223 @@ enabled = true
         );
     }
 
+    // Production Direct bootstrap, Feature selection/rendering, Core, FsStore,
+    // and model Request. The authenticated Host boundary and provider are fake;
+    // real Backend/standalone authority and live continuation are not claimed.
+    #[tokio::test]
+    async fn direct_startup_journal_is_durable_before_first_user_and_provider_exactly_once() {
+        use session_store::{LogEntry, LoggedSessionHistoryOrigin, Store, SystemItem};
+        use std::sync::atomic::Ordering;
+        for empty in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let _sandbox =
+                crate::runtime::worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
+            let name = format!("startup-{}", uuid::Uuid::now_v7());
+            let mut manifest = WorkerManifest::from_toml(&format!("[worker]\nname='{name}'\n[model]\nscheme='anthropic'\nmodel_id='scripted'\n[engine]\n[scope]\nallow=[]")).unwrap();
+            manifest.feature.subjektiv.profile.enabled = true;
+            manifest.feature.subjektiv.profile.extraction.enabled = false;
+            let snapshot = JournalStartupSnapshot {
+                subject_id: "subject".into(),
+                omitted: false,
+                journals: if empty {
+                    vec![]
+                } else {
+                    vec![subjektiv::journal::startup::StartupJournal {
+                        journal_id: "journal".into(),
+                        source_session_id: "previous-session".into(),
+                        state_token: "consistent-token".into(),
+                        process_order: 4,
+                        process_byte: 0,
+                        current_position: "B adopted after correcting A; implementation unfinished"
+                            .into(),
+                        entries: vec![],
+                        omitted: true,
+                    }]
+                },
+            };
+            let host = Arc::new(LocalHost {
+                startup: Some(snapshot.clone()),
+                ..LocalHost::default()
+            });
+            let store = CombinedStore::new(
+                FsStore::new(temp.path().join("sessions")).unwrap(),
+                FsWorkerStore::new(temp.path().join("workers")).unwrap(),
+            );
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let prepared = WorkerBootstrap::new(
+                manifest,
+                store.clone(),
+                crate::PromptCatalogSource::builtins_only(),
+                WorkerWorkspaceContext::local_filesystem(None),
+                WorkerFilesystemAuthority::None,
+                WorkerBootstrapLayout::Direct {
+                    runtime_base: temp.path().join("runtime"),
+                    bash_output_dir: temp.path().join("bash"),
+                },
+                WorkerControllerTransport::InProcess,
+            )
+            .with_model_client(ScriptedClient(tx))
+            .with_subjektiv_host(host.clone())
+            .prepare()
+            .await
+            .unwrap();
+            let (session, segment) = (
+                prepared.worker().session_id(),
+                prepared.worker().segment_id(),
+            );
+            let controller = prepared.start().await.unwrap();
+            let initial = store.read_all(session, segment).unwrap();
+            let journal = initial
+                .iter()
+                .find_map(|entry| match entry {
+                    LogEntry::AnnotatedSystemItem { entry, .. }
+                        if matches!(entry.item, SystemItem::JournalStartup { .. }) =>
+                    {
+                        Some(entry)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                journal.metadata.origin,
+                LoggedSessionHistoryOrigin::DerivedSummary
+            );
+            let SystemItem::JournalStartup {
+                body,
+                snapshot: saved,
+                snapshot_sha256,
+                prompt_provenance,
+            } = &journal.item
+            else {
+                unreachable!()
+            };
+            assert_eq!(*saved, serde_json::to_value(&snapshot).unwrap());
+            use sha2::{Digest, Sha256};
+            assert_eq!(
+                *snapshot_sha256,
+                Sha256::digest(serde_json::to_vec(saved).unwrap())
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            assert_eq!(
+                prompt_provenance.logical_name,
+                "internal.subjektiv_journal_startup"
+            );
+            assert!(
+                !initial
+                    .iter()
+                    .any(|e| matches!(e, LogEntry::AnnotatedUserInput { .. }))
+            );
+            let mut events = controller.handle.subscribe();
+            for user in ["FIRST_USER_REQUEST", "SECOND_USER_REQUEST"] {
+                controller
+                    .handle
+                    .send(Method::submit_text(
+                        protocol::new_submission_request_id(),
+                        user,
+                    ))
+                    .await
+                    .unwrap();
+                let request = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let index = request
+                    .items
+                    .iter()
+                    .position(|item| item.as_text() == Some(body.as_str()))
+                    .unwrap();
+                let user_index = request
+                    .items
+                    .iter()
+                    .position(|item| item.as_text() == Some("FIRST_USER_REQUEST"))
+                    .unwrap();
+                assert!(index < user_index);
+                assert_eq!(
+                    request
+                        .items
+                        .iter()
+                        .filter(|item| item.as_text() == Some(body.as_str()))
+                        .count(),
+                    1
+                );
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if matches!(events.recv().await.unwrap(), protocol::Event::RunEnd { .. }) {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            assert_eq!(host.startup_calls.load(Ordering::SeqCst), 1);
+            let logs = store.read_all(session, segment).unwrap();
+            assert_eq!(logs.iter().filter(|entry| matches!(entry, LogEntry::AnnotatedSystemItem { entry, .. } if matches!(entry.item, SystemItem::JournalStartup { .. }))).count(), 1);
+            controller
+                .handle
+                .send(Method::Shutdown {
+                    command: protocol::WorkerCommandEnvelope::new(1),
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), controller.shutdown)
+                .await
+                .unwrap()
+                .unwrap();
+            controller.controller_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_startup_read_error_rejects_exposure_without_initialized_head() {
+        use session_store::Store;
+        let temp = tempfile::tempdir().unwrap();
+        let _sandbox =
+            crate::runtime::worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
+        let mut manifest = WorkerManifest::from_toml(&format!("[worker]\nname='startup-error-{}'\n[model]\nscheme='anthropic'\nmodel_id='scripted'\n[engine]\n[scope]\nallow=[]", uuid::Uuid::now_v7())).unwrap();
+        manifest.feature.subjektiv.profile.enabled = true;
+        manifest.feature.subjektiv.profile.extraction.enabled = false;
+        let store = CombinedStore::new(
+            FsStore::new(temp.path().join("sessions")).unwrap(),
+            FsWorkerStore::new(temp.path().join("workers")).unwrap(),
+        );
+        let host = Arc::new(LocalHost {
+            startup_error: true,
+            ..LocalHost::default()
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let prepared = WorkerBootstrap::new(
+            manifest,
+            store.clone(),
+            crate::PromptCatalogSource::builtins_only(),
+            WorkerWorkspaceContext::local_filesystem(None),
+            WorkerFilesystemAuthority::None,
+            WorkerBootstrapLayout::Direct {
+                runtime_base: temp.path().join("runtime"),
+                bash_output_dir: temp.path().join("bash"),
+            },
+            WorkerControllerTransport::InProcess,
+        )
+        .with_model_client(ScriptedClient(tx))
+        .with_subjektiv_host(host.clone())
+        .prepare()
+        .await
+        .unwrap();
+        let (session, segment) = (
+            prepared.worker().session_id(),
+            prepared.worker().segment_id(),
+        );
+        assert!(prepared.start().await.is_err());
+        assert!(!store.exists(session, segment).unwrap());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            host.startup_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
     async fn launch_case(enabled: bool, attach: bool) {
         let temp = tempfile::tempdir().unwrap();
         let _runtime_sandbox =
@@ -1072,7 +1350,7 @@ enabled = true
         if enabled && attach {
             assert_eq!(
                 *host.attributed.lock().unwrap(),
-                vec![(expected.clone(), true)]
+                vec![(expected.clone(), true), (expected.clone(), false)]
             );
             assert!(
                 host.contexts

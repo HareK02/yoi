@@ -78,7 +78,45 @@ impl WorkerHandle {
         self.method_tx.same_channel(&other.method_tx)
     }
 
+    /// Ask the actual Controller to acknowledge quiescence. No catalog status,
+    /// profile, or model protocol message grants this Host lifecycle capability.
+    pub async fn reserve_subject_release(
+        &self,
+    ) -> Result<crate::SubjectReleaseReservation, String> {
+        if self.protocol_is_closed() {
+            return Err("Controller is unavailable".into());
+        }
+        if self.shared_state.snapshot().state != WorkerState::Idle {
+            return Err("Controller is not Idle".into());
+        }
+        let control = self
+            .shared_state
+            .subject_release
+            .get()
+            .ok_or("Controller release authority unavailable")?;
+        tokio::select! {
+            result = control.request() => result,
+            _ = self.method_tx.closed() => Err("Controller closed before release acknowledgement".into()),
+        }
+    }
+
     pub async fn send(&self, method: Method) -> Result<(), mpsc::error::SendError<Method>> {
+        // The lease covers enqueue itself. The Controller's exclusive barrier
+        // cannot overlook an accepted send between its queue check and ack.
+        let _admission = if release_fenced_method(&method) {
+            match self
+                .shared_state
+                .subject_release
+                .get()
+                .map(|control| control.authority.enter())
+                .transpose()
+            {
+                Ok(lease) => lease,
+                Err(_) => return Err(mpsc::error::SendError(method)),
+            }
+        } else {
+            None
+        };
         // Reject known-busy sends before channel dispatch, including maintenance
         // that cannot receive methods until it finishes. The controller checks
         // again at admission to cover an Idle -> busy race after this snapshot.
@@ -287,6 +325,49 @@ impl WorkerHandle {
     /// Emit a user-facing alert. Thin wrapper over `Alerter::alert`.
     pub fn alert(&self, level: AlertLevel, source: AlertSource, message: String) {
         self.alerter.alert(level, source, message);
+    }
+}
+
+fn answer_idle_release<St: Store + Clone>(
+    control: &Arc<crate::subject_release::ReleaseControl>,
+    shared_state: &WorkerSharedState,
+    methods: &mpsc::Receiver<Method>,
+    staged: bool,
+    pending: &PendingSubmissionHandle<St>,
+    notifications: &NotifyBuffer,
+    attention: bool,
+) {
+    control.respond(|| {
+        // Read ingress and durable pending state only after acquiring exclusivity.
+        // Actor-local staged/deferred/attention flags cannot change during this call.
+        if shared_state.snapshot().state != WorkerState::Idle
+            || staged
+            || attention
+            || !methods.is_empty()
+            || methods.is_closed()
+            || !notifications.is_empty()
+            || pending.has_unfinished_admission()
+        {
+            return Err("Controller has pending, staged, busy, or unavailable work".into());
+        }
+        Ok(())
+    });
+}
+
+fn release_fenced_method(method: &Method) -> bool {
+    !matches!(
+        method,
+        Method::Shutdown { .. }
+            | Method::ListWorkers
+            | Method::ListPendingSubmissions
+            | Method::ListCompletions { .. }
+    )
+}
+
+async fn release_requested(shared_state: &WorkerSharedState) {
+    match shared_state.subject_release.get() {
+        Some(control) => control.notified().await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -802,6 +883,10 @@ impl WorkerController {
         C: LlmClient + Clone + 'static,
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
+        worker
+            .validate_subjektiv_body_publication()
+            .map_err(std::io::Error::other)?;
+
         // === 1. Initialization (channels / RuntimeDir / worker-immutable
         //         snapshots / SpawnedWorkerRegistry / alerter attach /
         //         bash-output scope) ===
@@ -911,13 +996,13 @@ impl WorkerController {
         // the actual registered set instead of a hand-maintained mirror.
         worker.engine().tool_server_handle().flush_pending();
 
-        // Runtime-owned Workers persist their current model-visible head before
+        // Fresh Workers persist their current model-visible head before
         // controller exposure. Feature installation above must happen first so a
         // fresh subject Worker captures the current resident surface in its durable
         // prompt. Restored Workers defer generic Feature restore notification until
         // the next model-visible context materialization; only an installed
         // Feature may then request a typed durable history append.
-        if runtime_managed && worker.needs_initial_session_head_materialization() {
+        if worker.needs_initial_session_head_materialization() {
             worker
                 .materialize_durable_session_head()
                 .await
@@ -958,6 +1043,13 @@ impl WorkerController {
         let artifact_store: Arc<dyn Store> = Arc::new(worker.store().clone());
         let session_id = worker.session_id();
         let pending_activations = worker.pending_activation_state();
+        let release_control =
+            crate::subject_release::ReleaseControl::new(worker.mutation_authority());
+        shared_state
+            .subject_release
+            .set(release_control)
+            .ok()
+            .expect("one Controller release authority");
         let handle = WorkerHandle {
             method_tx,
             working_event_tx: working_event_tx.clone(),
@@ -1560,6 +1652,18 @@ where
             )?
     {
         feature_registry.add_module(subjektiv_sessions);
+    }
+    if ordinary_subjektiv_features_enabled
+        && lifecycle_enabled
+        && let Some(host) = subjektiv_host.as_ref()
+        && host.host.journal_startup_granted()
+    {
+        worker.install_initial_context_source(Arc::new(
+            crate::feature::builtin::journal::JournalStartupContextSource::new(
+                host.clone(),
+                worker.prompts(),
+            ),
+        ));
     }
     if ordinary_subjektiv_features_enabled
         && lifecycle_enabled
@@ -2232,6 +2336,12 @@ async fn controller_loop<C, St>(
     C: LlmClient + Clone + 'static,
     St: Store + WorkerMetadataStore + Clone + 'static,
 {
+    let release_control = shared_state
+        .subject_release
+        .get()
+        .expect("Controller release authority installed")
+        .clone();
+    let _release_lifetime = crate::subject_release::ControllerLifetime(release_control.clone());
     // Hold an optional external attach server alive for the controller lifetime.
     // In-process runtimes retain and drive the WorkerHandle directly.
     let _socket_server = socket_server;
@@ -2452,6 +2562,13 @@ async fn controller_loop<C, St>(
                         break 'controller;
                     }
                 },
+                _ = release_control.notified() => {
+                    answer_idle_release(&release_control, &shared_state, &method_rx,
+                        pending.is_some() || !deferred_methods.is_empty(),
+                        &pending_submissions, &notify_buffer,
+                        worker.has_pending_compaction_cleanup() || worker.has_failed_segment_activation());
+                    continue;
+                }
                 _ = notify_buffer.notified() => continue,
                 _ = tokio::time::sleep(remaining) => {
                     match prepare_pending_run(
@@ -2486,8 +2603,30 @@ async fn controller_loop<C, St>(
                         break 'controller;
                     }
                 },
+                _ = release_control.notified() => {
+                    answer_idle_release(&release_control, &shared_state, &method_rx,
+                        pending.is_some() || !deferred_methods.is_empty(),
+                        &pending_submissions, &notify_buffer,
+                        worker.has_pending_compaction_cleanup() || worker.has_failed_segment_activation());
+                    continue;
+                }
                 _ = notify_buffer.notified() => continue,
             }
+        };
+
+        let _method_admission = if release_fenced_method(&method) {
+            match release_control.authority.enter() {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    let _ = working_event_tx.send(Event::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: error.to_string(),
+                    });
+                    continue;
+                }
+            }
+        } else {
+            None
         };
 
         if shared_state.snapshot().state != WorkerState::Idle
@@ -2885,6 +3024,7 @@ async fn controller_loop<C, St>(
                     let mut compact = Box::pin(worker.manual_compact_with_cancel(cancel_rx));
                     loop {
                         tokio::select! {
+                            _ = release_control.notified() => { release_control.reject_busy(); }
                             result = &mut compact => break result,
                             method = method_rx.recv() => {
                                 match method {
@@ -3142,6 +3282,7 @@ async fn controller_loop<C, St>(
         }
     }
 
+    release_control.close();
     // Close method admission before any fallible child/session cleanup. Existing
     // senders then fail instead of accepting work that this execution can no
     // longer process.
@@ -3286,6 +3427,9 @@ where
             // Running only after processing the commit fence. This makes the
             // Running snapshot contract deterministic even for immediate clients.
             biased;
+            _ = release_requested(shared_state) => {
+                if let Some(control) = shared_state.subject_release.get() { control.reject_busy(); }
+            }
             committed = async {
                 input_commit
                     .as_mut()
@@ -3907,6 +4051,10 @@ fn worker_error_code(e: &WorkerError) -> ErrorCode {
 }
 
 #[cfg(test)]
+#[path = "controller_subject_release_tests.rs"]
+mod subject_release_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use protocol::WorkerEvent;
@@ -4251,7 +4399,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_session_head_is_materialized_after_feature_installation_before_exposure() {
+    fn fresh_session_head_is_materialized_after_feature_installation_before_exposure() {
         let production = include_str!("controller.rs")
             .split_once("#[cfg(test)]\nmod tests")
             .map(|(production, _)| production)
@@ -4270,8 +4418,8 @@ mod tests {
             .find("let handle = WorkerHandle")
             .expect("controller handle exposure");
         let materialize_gate = startup[..materialize]
-            .rfind("if runtime_managed && worker.needs_initial_session_head_materialization() {")
-            .expect("fresh runtime-managed materialization gate");
+            .rfind("if worker.needs_initial_session_head_materialization() {")
+            .expect("fresh materialization gate");
 
         assert!(feature_install < materialize_gate);
         assert!(materialize_gate < materialize);

@@ -41,7 +41,10 @@ impl Fixture {
         let attr =
             SubjectSessionAttribution::new(&subject.id, "runtime", "worker", "session").unwrap();
         store.record_session_attribution(attr.clone()).unwrap();
-        let host = JournalHostContext::validated_session(&store, attr).unwrap();
+        let binding = store
+            .claim_journal_writer(&subject.id, "runtime", "worker")
+            .unwrap();
+        let host = store.bind_journal_session(&binding, attr).unwrap();
         // Canonical order crosses two Segments; legacy numeric ranges below intentionally do not
         // agree with this order. Stable E identities, not display positions, are the join contract.
         let segments = [Uuid::now_v7(), Uuid::now_v7()];
@@ -179,8 +182,14 @@ impl Fixture {
                         .read_journal(&self.host, &self.journal_id)
                         .unwrap()
                         .state_token,
+                    covered_ranges: match action {
+                        JournalAction::UpdatePosition { .. } => vec![],
+                        // Leave the final source pending so a subsequent Fix is a valid
+                        // activity write, while the staged anchor is already checkpointed.
+                        JournalAction::Checkpoint { .. } => self.ranges[..3].to_vec(),
+                        _ => self.ranges.clone(),
+                    },
                     action,
-                    covered_ranges: self.ranges.clone(),
                 },
             )
             .unwrap();
@@ -568,6 +577,12 @@ fn delayed_fixed_endpoint_connects_only_on_explicit_reconcile_without_using_chec
         .entry_id
         .unwrap();
     f.action(
+        "position-before-checkpoint",
+        JournalAction::UpdatePosition {
+            current_position: "Still working; no final endpoint is available".into(),
+        },
+    );
+    f.action(
         "checkpoint",
         JournalAction::Checkpoint {
             record_operation_ids: vec!["open".into()],
@@ -742,15 +757,17 @@ fn missing_target_never_retargets_saved_edge_to_a_later_event() {
 fn ambiguous_saved_anchor_does_not_choose_between_attributed_sessions() {
     let f = Fixture::new();
     f.fixed("first", 1, vec![]);
-    let attr = SubjectSessionAttribution::new(
-        &f.host.subject_id,
-        "runtime",
-        "other-worker",
-        "other-session",
-    )
-    .unwrap();
+    // Two Sessions of the same current body may contain an identical saved anchor.
+    // Bind both through the live writer; cross-body ownership is not part of this ambiguity.
+    let attr =
+        SubjectSessionAttribution::new(&f.host.subject_id, "runtime", "worker", "other-session")
+            .unwrap();
     f.store().record_session_attribution(attr.clone()).unwrap();
-    let other_host = JournalHostContext::validated_session(f.store(), attr).unwrap();
+    let binding = f
+        .store()
+        .claim_journal_writer(&f.host.subject_id, "runtime", "worker")
+        .unwrap();
+    let other_host = f.store().bind_journal_session(&binding, attr).unwrap();
     let mut range = f.ranges[0].clone();
     range.source.session_id = "other-session".into();
     f.store()
@@ -950,7 +967,7 @@ fn historical_candidates_page_all_immutable_sources_without_reextracting_or_losi
 fn before_links() -> &'static [feature_storage::FeatureMigration] {
     &crate::MIGRATIONS[..crate::MIGRATIONS
         .iter()
-        .position(|m| m.version() == 10)
+        .position(|m| m.version() == 11)
         .unwrap()]
 }
 
@@ -1086,9 +1103,9 @@ fn failed_link_migration_rolls_back_ddl_and_preserves_existing_data_for_retry() 
             crate::MIGRATIONS
                 .iter()
                 .map(|migration| {
-                    if migration.version() == 10 {
+                    if migration.version() == 11 {
                         feature_storage::FeatureMigration::new(
-                            10,
+                            11,
                             migration.name(),
                             fail_after_link_schema,
                         )
@@ -1118,7 +1135,7 @@ fn failed_link_migration_rolls_back_ddl_and_preserves_existing_data_for_retry() 
         assert!(matches!(
             SubjektivStore::open(&workspace, &registration),
             Err(crate::SubjektivError::Storage(
-                feature_storage::FeatureStorageError::MigrationFailed { version: 10, .. }
+                feature_storage::FeatureStorageError::MigrationFailed { version: 11, .. }
             ))
         ));
         drop(workspace);

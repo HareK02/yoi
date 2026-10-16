@@ -406,6 +406,18 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         }
     }
 
+    async fn subject_release(
+        &self,
+        request: runtime_api::SubjectReleaseRequest,
+    ) -> Result<runtime_api::SubjectReleaseResponse, runtime_api::RuntimeApiError> {
+        let scope = material_scope(&self.state, &request.workspace_id)?;
+        self.state
+            .runtime
+            .subject_release_scoped(&scope, request)
+            .map_err(RuntimeHttpRestError::runtime)
+            .map_err(api_error)
+    }
+
     async fn session_material_pin(
         &self,
         request: runtime_api::SessionMaterialPinRequest,

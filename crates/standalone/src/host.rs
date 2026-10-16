@@ -57,6 +57,15 @@ pub struct StandaloneHost {
     lease: Option<StandaloneWorkerLease>,
     jobs: crate::jobs::StandaloneJobs,
     subject: Option<crate::subjektiv::SubjectConnection>,
+    subject_release: Option<worker::SubjectReleaseReservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum StandaloneSubjectDisconnectError {
+    #[error("Subject release requires an actual Idle Controller without pending work: {0}")]
+    Controller(String),
+    #[error("Subject release remains incomplete; retained binding/lease must be reconciled: {0}")]
+    Incomplete(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -89,6 +98,10 @@ pub enum StandaloneStartupError {
     FeatureComposition,
     #[error("the in-process Worker controller could not start")]
     Controller,
+    #[error(
+        "mandatory initial context remains unconfirmed; restore retained Worker {worker_id} to retry this Session"
+    )]
+    InitialContextPending { worker_id: WorkerId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -171,7 +184,7 @@ impl StandaloneHost {
         let jobs = match crate::jobs::StandaloneJobs::open(&jobs_path, launch.cwd.clone()) {
             Ok(jobs) => jobs,
             Err(_) => {
-                let _ = store.abandon_allocation(allocation);
+                cancel_unpublished_start(&store, &mut subject, allocation)?;
                 return Err(StandaloneStartupError::StateStore);
             }
         };
@@ -179,8 +192,11 @@ impl StandaloneHost {
         if let Some(client) = &model_client {
             jobs.bind_model_client(client.clone_boxed());
         }
-        if let Some(subject) = &subject {
-            subject.host.bind_jobs(jobs.clone())?;
+        if let Some(connection) = &subject
+            && let Err(error) = connection.host.bind_jobs(jobs.clone())
+        {
+            cancel_unpublished_start(&store, &mut subject, allocation)?;
+            return Err(error);
         }
         // WorkerId is the stable identity. The current Worker store remains
         // name-keyed, so keep its derived storage key separate from the
@@ -192,7 +208,7 @@ impl StandaloneHost {
         let (backing_store, worker_store) = match backing_store(&store, worker_id) {
             Ok(stores) => stores,
             Err(error) => {
-                let _ = store.abandon_allocation(allocation);
+                cancel_unpublished_start(&store, &mut subject, allocation)?;
                 return Err(error);
             }
         };
@@ -220,12 +236,61 @@ impl StandaloneHost {
         if let Some(model_client) = model_client {
             bootstrap = bootstrap.with_model_client(model_client);
         }
+        let prepared = match bootstrap.prepare().await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                cancel_unpublished_start(&store, &mut subject, allocation)?;
+                return Err(classify_startup_error(error));
+            }
+        };
+        // Reserve a recoverable identity before mandatory initial-context persistence.
+        // A failed/unknown seed must be reopened as this Session, never abandoned and
+        // replaced by a newly fetched context under an invisible ghost binding.
+        let pending_record = if subject.is_some() {
+            match store.commit_created_connected(
+                &allocation,
+                manifest.clone(),
+                storage_key.clone(),
+                prepared.worker().session_id(),
+                None,
+                subject.as_ref().map(|s| s.binding.clone()),
+            ) {
+                Ok(record) => Some(record),
+                Err(_) => {
+                    if let Some(subject) = &mut subject {
+                        subject.retain();
+                    }
+                    allocation.into_lease().retain();
+                    return Err(StandaloneStartupError::StateStore);
+                }
+            }
+        } else {
+            None
+        };
         if let Some(subject) = &mut subject {
             subject.arm();
         }
-        let started = match bootstrap.start().await {
+        let started = match prepared.start().await {
             Ok(started) => started,
             Err(error) => {
+                if let Some(record) = &pending_record {
+                    let cleanup = jobs.shutdown().await;
+                    let saved = store.mark_stopped(
+                        record,
+                        record.active_session_id,
+                        record.active_segment_id,
+                        StandaloneShutdownReason::StartupFailed,
+                    );
+                    let closed = cleanup.is_ok()
+                        && saved.is_ok()
+                        && subject.as_mut().is_some_and(|s| s.close().is_ok());
+                    if closed {
+                        let _ = allocation.into_lease().release();
+                    } else {
+                        allocation.into_lease().retain();
+                    }
+                    return Err(StandaloneStartupError::InitialContextPending { worker_id });
+                }
                 let _ = store.abandon_allocation(allocation);
                 return Err(classify_startup_error(error));
             }
@@ -234,22 +299,35 @@ impl StandaloneHost {
             Ok(active) => active,
             Err(error) => {
                 stop_started_worker(started).await;
-                let _ = store.abandon_allocation(allocation);
+                if pending_record.is_some() {
+                    allocation.into_lease().retain();
+                } else {
+                    let _ = store.abandon_allocation(allocation);
+                }
                 return Err(error);
             }
         };
-        let record = match store.commit_created_connected(
-            &allocation,
-            manifest,
-            storage_key,
-            active.session_id,
-            active.segment_id,
-            subject.as_ref().map(|s| s.binding.clone()),
-        ) {
+        let committed = if let Some(record) = &pending_record {
+            store.update_active_pointer(record, active.session_id, active.segment_id)
+        } else {
+            store.commit_created_connected(
+                &allocation,
+                manifest,
+                storage_key,
+                active.session_id,
+                active.segment_id,
+                None,
+            )
+        };
+        let record = match committed {
             Ok(record) => record,
             Err(_) => {
                 stop_started_worker(started).await;
-                let _ = store.abandon_allocation(allocation);
+                if pending_record.is_some() {
+                    allocation.into_lease().retain();
+                } else {
+                    let _ = store.abandon_allocation(allocation);
+                }
                 return Err(StandaloneStartupError::StateStore);
             }
         };
@@ -427,6 +505,7 @@ impl StandaloneHost {
             lease: Some(lease),
             jobs,
             subject,
+            subject_release: None,
         }
     }
 
@@ -455,6 +534,45 @@ impl StandaloneHost {
         let (socket, peer) = InProcessSocket::pair();
         tokio::spawn(run_protocol_session(self.handle.clone(), streams, peer));
         Client::new(socket)
+    }
+
+    /// Logical Subject disconnection, not Worker shutdown or completion of its represented work.
+    /// A successful release keeps the old Controller fenced; a fresh Worker/Session may then
+    /// acquire the Subject. Failures before durable revocation allow normal recovery and retry.
+    pub async fn disconnect_subject(&mut self) -> Result<(), StandaloneSubjectDisconnectError> {
+        let Some(subject) = &mut self.subject else {
+            return Ok(());
+        };
+        let mut reservation = match self.subject_release.take() {
+            Some(reservation) => reservation,
+            None => self
+                .handle
+                .reserve_subject_release()
+                .await
+                .map_err(StandaloneSubjectDisconnectError::Controller)?,
+        };
+        let release = match subject.release_for_handoff(&self.record, &mut reservation) {
+            Ok(()) => match self.jobs.shutdown().await {
+                Ok(()) => subject.close().map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            },
+            Err(error) => Err(error),
+        };
+        match release {
+            Ok(()) => {
+                self.subject_release = Some(reservation);
+                self.subject = None;
+                Ok(())
+            }
+            Err(error) => {
+                // If revocation committed, keep the actual Controller reserved even if closing
+                // storage/unlocking failed. Dropping a reservation must not undo revocation.
+                if subject.writer_released_or_unknown() {
+                    self.subject_release = Some(reservation);
+                }
+                Err(StandaloneSubjectDisconnectError::Incomplete(error))
+            }
+        }
     }
 
     pub fn with_shutdown_timeout(mut self, shutdown_timeout: Duration) -> Self {
@@ -693,6 +811,23 @@ async fn send_protocol_event(peer: &InProcessPeer, event: Event) -> bool {
         return false;
     };
     peer.send(message).await.is_ok()
+}
+
+fn cancel_unpublished_start(
+    store: &StandaloneWorkerStore,
+    subject: &mut Option<crate::subjektiv::SubjectConnection>,
+    allocation: crate::store::StandaloneWorkerAllocation,
+) -> Result<(), StandaloneStartupError> {
+    if let Some(connection) = subject {
+        if connection.abort_unpublished_start().is_err() {
+            connection.retain();
+            allocation.into_lease().retain();
+            return Err(StandaloneStartupError::StateStore);
+        }
+    }
+    store
+        .abandon_allocation(allocation)
+        .map_err(classify_store_startup_error)
 }
 
 fn backing_store(

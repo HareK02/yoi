@@ -274,6 +274,12 @@ where
 }
 
 impl PendingActivationState {
+    pub(crate) fn has_unfinished_admission(&self) -> bool {
+        self.activating.is_some()
+            || !self.pending.is_empty()
+            || !self.pending_notifications.is_empty()
+            || !self.activating_notifications.is_empty()
+    }
     pub(crate) fn snapshot(&self) -> protocol::PendingSubmissionsSnapshot {
         let pending_notification = self.pending_notifications.front();
         let head_id = match (self.pending.front(), pending_notification) {
@@ -1721,6 +1727,7 @@ pub struct SegmentState {
     location: ArcSwap<SegmentLocation>,
     entries_written: AtomicUsize,
     append_lock: Mutex<()>,
+    mutation_authority: Arc<crate::subject_release::MutationAuthority>,
     activation_failed: AtomicBool,
 }
 
@@ -1733,6 +1740,7 @@ impl SegmentState {
             }),
             entries_written: AtomicUsize::new(entries_written),
             append_lock: Mutex::new(()),
+            mutation_authority: Arc::default(),
             activation_failed: AtomicBool::new(false),
         })
     }
@@ -1912,6 +1920,7 @@ where
     }
 
     fn append_entry_locked(&self, entry: LogEntry) -> Result<(), StoreError> {
+        let _admission = self.state.mutation_authority.enter()?;
         self.state.ensure_append_allowed()?;
         let loc = self.state.location();
         self.store.append(loc.session_id, loc.segment_id, &entry)?;
@@ -2111,6 +2120,7 @@ where
         provenance: WorkerHistoryProvenance,
         activate_now: bool,
     ) -> Result<SubmissionAcceptance, PendingSubmissionError> {
+        let _admission = self.writer.state.mutation_authority.enter()?;
         if submission_request_id.trim().is_empty() {
             return Err(PendingSubmissionError::EmptyRequestId);
         }
@@ -2257,6 +2267,7 @@ where
         source_namespace: String,
         provenance: WorkerHistoryProvenance,
     ) -> Result<bool, PendingSubmissionError> {
+        let _admission = self.writer.state.mutation_authority.enter()?;
         if notification_request_id.trim().is_empty() {
             return Err(PendingSubmissionError::EmptyRequestId);
         }
@@ -2377,6 +2388,7 @@ where
         &self,
         fence: Option<&str>,
     ) -> Result<Option<PendingActivation>, PendingSubmissionError> {
+        let _admission = self.writer.state.mutation_authority.enter()?;
         let _append_guard = self
             .writer
             .state
@@ -2472,6 +2484,13 @@ where
         format!("direct:{}", self.writer.state.location().session_id)
     }
 
+    pub(crate) fn has_unfinished_admission(&self) -> bool {
+        self.state
+            .lock()
+            .expect("pending activation state poisoned")
+            .has_unfinished_admission()
+    }
+
     pub(crate) fn snapshot(&self) -> protocol::PendingSubmissionsSnapshot {
         self.state
             .lock()
@@ -2495,6 +2514,7 @@ where
         &self,
         submission_id: &str,
     ) -> Result<protocol::PendingSubmissionsSnapshot, PendingSubmissionError> {
+        let _admission = self.writer.state.mutation_authority.enter()?;
         let _append_guard = self
             .writer
             .state
@@ -2529,6 +2549,7 @@ where
         &self,
         expected_submission_ids: &[String],
     ) -> Result<protocol::PendingSubmissionsSnapshot, PendingSubmissionError> {
+        let _admission = self.writer.state.mutation_authority.enter()?;
         let _append_guard = self
             .writer
             .state
@@ -2616,6 +2637,7 @@ impl<St: Store + Clone> DurableNotificationCommitter for PendingSubmissionHandle
         item: SystemItem,
         provenance: Option<WorkerHistoryProvenance>,
     ) -> Result<Option<HistoryEntry<SessionHistoryMetadata>>, StoreError> {
+        let _admission = self.writer.state.mutation_authority.enter()?;
         let _append = self
             .writer
             .state
@@ -2744,6 +2766,7 @@ where
         after_commit: &mut dyn FnMut(),
         post_metrics: &[session_metrics::Metric],
     ) -> Result<(), StoreError> {
+        let _admission = self.state.mutation_authority.enter()?;
         let _append_guard = self
             .state
             .append_lock
@@ -2894,6 +2917,12 @@ pub(crate) struct ResidentContextRefresh {
     pub behavior_md: String,
 }
 
+/// Initial-only Feature contributions; prepared with the head, never at restore/request hooks.
+#[async_trait::async_trait]
+pub(crate) trait InitialContextSource: Send + Sync {
+    async fn load(&self) -> Result<Vec<SystemItem>, String>;
+}
+
 #[async_trait::async_trait]
 pub(crate) trait SystemPromptContributionSource: Send + Sync {
     async fn load(&self) -> SystemPromptContribution;
@@ -3005,8 +3034,7 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// The provider reauthorizes every capture and never derives authority from model input.
     worker_observation_provider: Option<Arc<dyn WorkerObservationProvider>>,
     /// Parsed system-prompt template awaiting first-turn materialisation.
-    /// `Some` until `ensure_system_prompt_materialized` renders it once,
-    /// then `None` forever — including after compaction.
+    /// Retained until the complete initial seed and active metadata are durable.
     system_prompt_template: Option<SystemPromptTemplate>,
     /// Mandatory prompt sections contributed by enabled Worker features.
     /// These are appended by Rust-owned prompt assembly so authored top-level
@@ -3080,6 +3108,10 @@ pub struct Worker<C: LlmClient, St: Store> {
     inject_resident_summary: bool,
     /// Deferred resident prompt source installed by an enabled Feature.
     feature_resident_summary_source: Option<Arc<dyn SystemPromptContributionSource>>,
+    initial_context_source: Option<Arc<dyn InitialContextSource>>,
+    /// Exact complete seed retained across ambiguous Store responses. The committed
+    /// segment remains authoritative; metadata must be repaired before accepting input.
+    prepared_initial_seed: Option<Vec<LogEntry>>,
     subjektiv_host: Option<Arc<dyn crate::subjektiv::SubjektivHost>>,
     /// One-shot generic Feature lifecycle notification required after restore.
     restore_feature_lifecycle_pending: bool,
@@ -3172,6 +3204,10 @@ impl<C: LlmClient + 'static, St: Store + Clone + 'static> Worker<C, St> {
             sink: self.sink.clone(),
             in_flight: self.in_flight.clone(),
         }
+    }
+
+    pub(crate) fn mutation_authority(&self) -> Arc<crate::subject_release::MutationAuthority> {
+        self.segment_state.mutation_authority.clone()
     }
 
     pub(crate) fn pending_activation_state(&self) -> Arc<Mutex<PendingActivationState>> {
@@ -3344,6 +3380,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
+            initial_context_source: None,
+            prepared_initial_seed: None,
             subjektiv_host: None,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
@@ -3388,6 +3426,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Internal/test gate for installed resident prompt contributions.
     pub fn set_resident_summary_injection(&mut self, enabled: bool) {
         self.inject_resident_summary = enabled;
+    }
+
+    pub(crate) fn install_initial_context_source(&mut self, source: Arc<dyn InitialContextSource>) {
+        self.initial_context_source = Some(source);
     }
 
     pub(crate) fn install_system_prompt_contribution(
@@ -3716,6 +3758,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// broadcast sink. The Store is the commit boundary: a failed write is
     /// never counted or published.
     pub(crate) fn commit_entry(&self, mut entry: LogEntry) -> Result<(), StoreError> {
+        let _admission = self.segment_state.mutation_authority.enter()?;
         entry.ensure_session_entry_id();
         let loc = self.segment_state.location();
         self.store.append(loc.session_id, loc.segment_id, &entry)?;
@@ -3894,6 +3937,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// between truncation and checkpoint append. Rewinding history does not undo committed
     /// business side effects.
     pub async fn rewind_to(&mut self, entry_id: String) -> Result<RewindAppliedState, RewindError> {
+        let _admission = self
+            .segment_state
+            .mutation_authority
+            .enter()
+            .map_err(|error| RewindError::Invalid(error.to_string()))?;
         // Reject invalid targets before invoking rewrite hooks or quiescing tasks.
         // Resolve again under the append lock after the asynchronous barrier.
         let loc = self.segment_state.location();
@@ -4347,6 +4395,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// The Controller holds a clone so that `Method::Notify` arriving
     /// while `worker.run()` is in flight can still reach the interceptor.
     pub fn notify_buffer_handle(&self) -> NotifyBuffer {
+        self.pending_notifies
+            .bind_mutation_authority(self.segment_state.mutation_authority.clone());
         self.pending_notifies.clone()
     }
 
@@ -4558,21 +4608,17 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// just before the first LLM turn, append the fixed trailing
     /// section (scope summary + optional AGENTS.md), and hand the
     /// resulting string to the Engine via `set_system_prompt`.
-    /// Subsequent invocations are no-ops: the template field is
-    /// consumed with `Option::take()`, so the materialised value
-    /// persists across all later turns and compaction.
-    async fn ensure_system_prompt_materialized(&mut self) -> Result<(), WorkerError>
-    where
-        St: Clone + 'static,
-    {
-        let Some(template) = self.system_prompt_template.take() else {
-            return self.notify_features_of_restore().await;
+    /// Keep the template until the atomic initial seed is committed. A failed
+    /// preparation must not accidentally turn into an ordinary restore.
+    async fn ensure_system_prompt_materialized(&mut self) -> Result<(), WorkerError> {
+        let Some(template) = self.system_prompt_template.as_ref() else {
+            return Ok(());
         };
-        if let Some(rendered) = self.feature_system_prompt_override.take() {
+        if let Some(rendered) = self.feature_system_prompt_override.as_ref() {
             self.engine
                 .as_mut()
                 .expect("worker present")
-                .set_system_prompt(rendered);
+                .set_system_prompt(rendered.clone());
             return Ok(());
         }
         let alerter = self.alerter.clone();
@@ -4663,21 +4709,21 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     }
 
     pub(crate) fn needs_initial_session_head_materialization(&self) -> bool {
-        self.system_prompt_template.is_some()
+        self.segment_state.entries_written() == 0
     }
 
     /// Materialize the initial durable session head without running the model.
     ///
-    /// Runtime-managed Workers call this before creation is accepted so even a
-    /// zero-input Worker has an authoritative restore snapshot independent of
+    /// Controllers call this before exposure so even a zero-input Worker has
+    /// an authoritative restore snapshot independent of
     /// operation-owned launch configuration.
     pub async fn materialize_durable_session_head(&mut self) -> Result<(), WorkerError>
     where
         St: Clone + 'static,
     {
         self.refresh_prompt_projection_for_future_operations()?;
-        self.ensure_system_prompt_materialized().await?;
         self.ensure_segment_head().await?;
+        self.notify_features_of_restore().await?;
         Ok(())
     }
 
@@ -4768,6 +4814,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         &mut self,
         snapshot: EmptyTurnRollbackSnapshot,
     ) -> Result<(), StoreError> {
+        let _admission = self.segment_state.mutation_authority.enter()?;
         self.session.history_mut().truncate(snapshot.history_len);
 
         self.last_run_interrupted = snapshot.last_run_interrupted;
@@ -5791,38 +5838,118 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         }
     }
 
-    /// Ensure the session exists and the writer's tally still matches
-    /// the on-disk entry count.
-    ///
-    /// On the first call for a Worker built via `from_manifest`, the session
-    /// has not been written to the store yet — this is when we append the
-    /// initial `SegmentStart` entry, carrying the system prompt that
-    /// `ensure_system_prompt_materialized` has just rendered. Subsequent
-    /// calls fall through to entry-count comparison, which auto-forks
-    /// when another writer has appended behind our back.
+    /// Commit the complete initial context atomically and repair the active
+    /// pointer from that seed before admitting any input. A read error is not
+    /// an initialized-empty contribution; an ambiguous write is reconciled
+    /// from the segment instead of fetching and appending again.
+    async fn initialize_session_head(&mut self) -> Result<(), WorkerError> {
+        let _admission = self.segment_state.mutation_authority.enter()?;
+        let loc = self.segment_state.location();
+        // A lost create response must be reconciled before any Host refetch. Empty
+        // pre-created logs are not initialized heads and may still receive a seed.
+        let committed = if self.store.exists(loc.session_id, loc.segment_id)? {
+            self.store.read_all(loc.session_id, loc.segment_id)?
+        } else {
+            Vec::new()
+        };
+        let seed = if !committed.is_empty() {
+            committed
+        } else {
+            if self.prepared_initial_seed.is_none() {
+                self.ensure_system_prompt_materialized().await?;
+                let items = match &self.initial_context_source {
+                    Some(source) => source.load().await.map_err(WorkerError::InvalidState)?,
+                    None => Vec::new(),
+                };
+                let engine = self.engine.as_ref().expect("worker present");
+                let mut seed = vec![LogEntry::AnnotatedSegmentStart {
+                    ts: segment_log::now_millis(),
+                    session_id: loc.session_id,
+                    system_prompt: engine.get_system_prompt().map(String::from),
+                    config: engine.request_config().clone(),
+                    history: self
+                        .session
+                        .history()
+                        .entries()
+                        .iter()
+                        .map(to_logged_history_entry)
+                        .collect(),
+                    forked_from: None,
+                    compacted_from: None,
+                }];
+                for item in items {
+                    seed.push(LogEntry::AnnotatedSystemItem {
+                        ts: segment_log::now_millis(),
+                        entry: session_store::LoggedSystemHistoryEntry {
+                            item,
+                            metadata: new_history_metadata(
+                                WorkerHistoryProvenance::DerivedSummary,
+                                None,
+                            ),
+                        },
+                        extensions: Vec::new(),
+                    });
+                }
+                for entry in &mut seed {
+                    entry.ensure_session_entry_id();
+                }
+                self.prepared_initial_seed = Some(seed);
+            }
+            let seed = self.prepared_initial_seed.as_ref().expect("prepared seed");
+            self.store
+                .create_segment(loc.session_id, loc.segment_id, seed)?;
+            seed.clone()
+        };
+        let Some(LogEntry::AnnotatedSegmentStart {
+            session_id,
+            system_prompt,
+            forked_from: None,
+            compacted_from: None,
+            ..
+        }) = seed.first()
+        else {
+            return Err(WorkerError::InvalidState(
+                "initial segment is not a complete seed".into(),
+            ));
+        };
+        if *session_id != loc.session_id
+            || seed.iter().skip(1).any(|entry| {
+                !matches!(entry,
+                    LogEntry::AnnotatedSystemItem { entry, .. }
+                        if entry.metadata.origin == WorkerHistoryProvenance::DerivedSummary
+                )
+            })
+        {
+            return Err(WorkerError::InvalidState(
+                "unexpected records in initial segment seed".into(),
+            ));
+        }
+        let history = restore_history_entries(loc.session_id, loc.segment_id, &seed)
+            .map_err(WorkerError::InvalidState)?;
+        // Keep entries_written at zero until this succeeds, so retry repairs a
+        // metadata failure instead of permitting User input after an orphaned seed.
+        self.write_worker_metadata_active(loc)?;
+        if let Some(prompt) = system_prompt {
+            self.engine
+                .as_mut()
+                .expect("worker present")
+                .set_system_prompt(prompt.clone());
+        }
+        self.session.replace_history(history);
+        self.sink.reset_with_initial_entries(seed.clone());
+        self.segment_state.set_entries_written(seed.len());
+        self.system_prompt_template = None;
+        self.feature_system_prompt_override = None;
+        self.prepared_initial_seed = None;
+        Ok(())
+    }
+
     async fn ensure_segment_head(&mut self) -> Result<(), WorkerError> {
+        let _admission = self.segment_state.mutation_authority.enter()?;
         let loc = self.segment_state.location();
         let entries_written = self.segment_state.entries_written();
         if entries_written == 0 {
-            let w = self.engine.as_ref().unwrap();
-            let initial = LogEntry::AnnotatedSegmentStart {
-                ts: segment_log::now_millis(),
-                session_id: loc.session_id,
-                system_prompt: w.get_system_prompt().map(String::from),
-                config: w.request_config().clone(),
-                history: self
-                    .session
-                    .history()
-                    .entries()
-                    .iter()
-                    .map(to_logged_history_entry)
-                    .collect(),
-                forked_from: None,
-                compacted_from: None,
-            };
-            self.commit_entry(initial)?;
-            self.write_worker_metadata_active(loc)?;
-            return Ok(());
+            return self.initialize_session_head().await;
         }
         // Check store count + auto-fork if it drifted.
         let store_count = self
@@ -7400,6 +7527,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 })?,
             });
         }
+        let _admission = self.segment_state.mutation_authority.enter()?;
         self.store
             .create_segment(old_loc.session_id, new_segment_id, &initial_entries)?;
 
@@ -7549,6 +7677,59 @@ fn worker_language(cfg: &manifest::EngineManifest) -> &str {
         manifest::defaults::WORKER_LANGUAGE
     } else {
         language
+    }
+}
+
+impl<C: LlmClient + 'static, St: Store + WorkerMetadataStore> Worker<C, St> {
+    /// Revalidate current body authority before Controller initialization. Historical
+    /// attribution is not a publication grant, and denial must not rewrite it.
+    /// This verification never creates attribution or fetches startup Journal context.
+    pub(crate) fn validate_subjektiv_body_publication(&self) -> Result<(), WorkerError> {
+        if self
+            .backend_job()
+            .is_some_and(crate::BackendJobExecutionBinding::has_subjektiv_job_grant)
+        {
+            return Ok(());
+        }
+        let Some(metadata) = self.store.read_by_name(&self.manifest.worker.name)? else {
+            return Ok(());
+        };
+        let Some(attribution) = metadata.subjektiv_session_attribution.as_ref() else {
+            return Ok(());
+        };
+        let denied = |message: String| WorkerError::SubjektivSessionAttribution {
+            state: "publication_denied",
+            message: bounded_attribution_diagnostic(message),
+        };
+        let session_id = self.session_id();
+        if metadata.active.as_ref().map(|active| active.session_id) != Some(session_id)
+            || attribution.session_id() != session_id
+        {
+            return Err(denied(
+                "retained body attribution does not match the constructed Session".into(),
+            ));
+        }
+        let SubjektivSessionAttributionState::Confirmed { subject_id, .. } = attribution else {
+            return Err(denied(
+                "body publication requires separately confirmed Session attribution".into(),
+            ));
+        };
+        let connection = self
+            .subjektiv_host_connection()
+            .map_err(|error| denied(error.to_string()))?
+            .ok_or_else(|| {
+                denied("body publication requires authenticated Host authority".into())
+            })?;
+        let output = connection
+            .host
+            .record_session(&connection.context, false)
+            .map_err(|error| denied(error.to_string()))?;
+        if output.session_id != session_id.to_string() || output.subject_id != *subject_id {
+            return Err(denied(
+                "Host publication authorization does not match retained Session and Subject".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -7723,6 +7904,8 @@ where
             prompts: common.prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
+            initial_context_source: None,
+            prepared_initial_seed: None,
             subjektiv_host: None,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
@@ -8102,6 +8285,8 @@ where
             prompts: common.prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
+            initial_context_source: None,
+            prepared_initial_seed: None,
             subjektiv_host: None,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
@@ -8232,6 +8417,8 @@ where
             prompts: common.prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
+            initial_context_source: None,
+            prepared_initial_seed: None,
             subjektiv_host: None,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
@@ -8374,7 +8561,28 @@ where
             .ok_or_else(|| WorkerError::WorkerMetadataInactive {
                 worker_name: worker_name.to_string(),
             })?;
-        if let Some(segment_id) = active.segment_id {
+        // A seed may have committed while the separate active-pointer write or
+        // its response failed. Pending metadata names the Session; its sole
+        // committed segment is the receipt. Never refetch/reseed that Session.
+        let segment_id = match active.segment_id {
+            Some(id) => Some(id),
+            None => {
+                let segments = store.list_segments(active.session_id)?;
+                match segments.as_slice() {
+                    [] => None,
+                    [id] => {
+                        let seed = store.read_all(active.session_id, *id)?;
+                        if seed.is_empty() { None } else { Some(*id) }
+                    }
+                    _ => {
+                        return Err(WorkerError::InvalidState(
+                            "ambiguous pending Session segments".into(),
+                        ));
+                    }
+                }
+            }
+        };
+        if let Some(segment_id) = segment_id {
             return Self::restore_from_manifest_with_context_and_model_client(
                 active.session_id,
                 segment_id,
@@ -8620,6 +8828,8 @@ where
             prompts: common.prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
+            initial_context_source: None,
+            prepared_initial_seed: None,
             subjektiv_host: None,
             restore_feature_lifecycle_pending: true,
             feature_system_prompt_override: None,
@@ -11256,6 +11466,7 @@ mod build_summary_prompt_tests {
                 worker
                     .finalize_subjektiv_session_attribution(true, lifecycle)
                     .unwrap();
+                worker.validate_subjektiv_body_publication().unwrap();
             }
             assert!(client.requests.lock().unwrap().is_empty());
             assert!(
@@ -16448,6 +16659,627 @@ permission = "write"
                     if domain == "yoi.compaction"
             )
         }));
+    }
+
+    fn startup_test_item() -> SystemItem {
+        SystemItem::JournalStartup {
+            body: "PRIOR_JOURNAL_REFERENCE".into(),
+            snapshot: serde_json::json!({"subject_id":"subject", "journals":[], "omitted":false}),
+            snapshot_sha256: "snapshot-digest".into(),
+            prompt_provenance: PromptRenderProvenance {
+                workspace_id: None,
+                source_digest: "source".into(),
+                projection_digest: "projection".into(),
+                logical_name: "internal.subjektiv_journal_startup".into(),
+            },
+        }
+    }
+    struct StartupTestSource {
+        calls: Arc<AtomicUsize>,
+        fail: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl InitialContextSource for StartupTestSource {
+        async fn load(&self) -> Result<Vec<SystemItem>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                return Err("startup read failed".into());
+            }
+            Ok(vec![startup_test_item()])
+        }
+    }
+
+    // Real FsStore atomic seed/replay and Core initial lifecycle. Only the model
+    // boundary and returned Store response are replaced; no live Host is claimed.
+    #[tokio::test]
+    async fn initial_seed_write_failures_retry_exact_context_before_user() {
+        for failure in [3, 4] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = FailRunTerminalStore {
+                inner: session_store::FsStore::new(temp.path()).unwrap(),
+                fail_run_terminal: Arc::new(AtomicBool::new(false)),
+                invocation_failure: Arc::new(AtomicUsize::new(failure)),
+            };
+            let mut worker = Worker::new(
+                minimal_manifest(),
+                Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+                store.clone(),
+                WorkerWorkspaceContext::no_workspace(),
+                WorkerFilesystemAuthority::None,
+                Scope::empty(),
+            )
+            .await
+            .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            worker.install_initial_context_source(Arc::new(StartupTestSource {
+                calls: calls.clone(),
+                fail: Arc::new(AtomicBool::new(false)),
+            }));
+            assert!(worker.run_text("must not be saved").await.is_err());
+            assert!(worker.history().is_empty());
+            assert_eq!(worker.segment_state.entries_written(), 0);
+            worker.materialize_durable_session_head().await.unwrap();
+            worker.materialize_durable_session_head().await.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let entries = store
+                .read_all(worker.session_id(), worker.segment_id())
+                .unwrap();
+            assert_eq!(entries.len(), 2);
+            let replay =
+                restore_history_entries(worker.session_id(), worker.segment_id(), &entries)
+                    .unwrap();
+            assert_eq!(replay.len(), 1);
+            assert_eq!(replay[0].item.as_text(), Some("PRIOR_JOURNAL_REFERENCE"));
+            assert_eq!(
+                replay[0].annotation.origin,
+                WorkerHistoryProvenance::DerivedSummary
+            );
+            let view =
+                crate::session_capture::SessionCapture::from_history_entries("startup", replay);
+            let extract =
+                crate::feature::builtin::memory_staging_output::render_extract_input(&view);
+            assert!(!extract.contains("PRIOR_JOURNAL_REFERENCE"));
+            let _ = worker.run_text("first accepted User").await;
+            let entries = store
+                .read_all(worker.session_id(), worker.segment_id())
+                .unwrap();
+            let journal = entries.iter().position(|entry| matches!(entry, LogEntry::AnnotatedSystemItem { entry, .. } if matches!(entry.item, SystemItem::JournalStartup { .. }))).unwrap();
+            let user = entries
+                .iter()
+                .position(|entry| matches!(entry, LogEntry::AnnotatedUserInput { .. }))
+                .unwrap();
+            assert!(journal < user);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_read_error_is_not_initialized_empty_and_retries_before_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(temp.path()).unwrap();
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store.clone(),
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fail = Arc::new(AtomicBool::new(true));
+        worker.install_initial_context_source(Arc::new(StartupTestSource {
+            calls: calls.clone(),
+            fail: fail.clone(),
+        }));
+        assert!(worker.run_text("blocked User").await.is_err());
+        assert!(
+            !store
+                .exists(worker.session_id(), worker.segment_id())
+                .unwrap()
+        );
+        fail.store(false, Ordering::SeqCst);
+        worker.materialize_durable_session_head().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(worker.history().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn initial_metadata_failure_repairs_pointer_without_refetch_or_user_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(temp.path()).unwrap();
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store.clone(),
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        worker.install_initial_context_source(Arc::new(StartupTestSource {
+            calls: calls.clone(),
+            fail: Arc::new(AtomicBool::new(false)),
+        }));
+        let fail = Arc::new(AtomicBool::new(true));
+        worker.worker_metadata_writer = Some(Arc::new(move |_| {
+            if fail.swap(false, Ordering::SeqCst) {
+                Err(std::io::Error::other("metadata response lost").into())
+            } else {
+                Ok(())
+            }
+        }));
+        assert!(worker.run_text("blocked User").await.is_err());
+        assert_eq!(worker.segment_state.entries_written(), 0);
+        assert_eq!(
+            store
+                .read_all(worker.session_id(), worker.segment_id())
+                .unwrap()
+                .len(),
+            2
+        );
+        worker.materialize_durable_session_head().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(worker.segment_state.entries_written(), 2);
+    }
+
+    #[tokio::test]
+    async fn pending_reopen_recovers_committed_seed_before_refetch_and_normal_restore_keeps_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let _sandbox = worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
+        let store = session_store::CombinedStore::new(
+            FailRunTerminalStore {
+                inner: session_store::FsStore::new(temp.path().join("sessions")).unwrap(),
+                fail_run_terminal: Arc::new(AtomicBool::new(false)),
+                invocation_failure: Arc::new(AtomicUsize::new(4)),
+            },
+            session_store::FsWorkerStore::new(temp.path().join("workers")).unwrap(),
+        );
+        let mut manifest = minimal_manifest();
+        manifest.worker.name = format!("startup-reopen-{}", uuid::Uuid::now_v7());
+        manifest.scope.allow.clear();
+        let mut engine = Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient);
+        engine.set_system_prompt("persisted initial prompt");
+        let mut worker = Worker::new(
+            manifest.clone(),
+            engine,
+            store.clone(),
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        worker.enable_worker_metadata_write_through().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        worker.install_initial_context_source(Arc::new(StartupTestSource {
+            calls: calls.clone(),
+            fail: Arc::new(AtomicBool::new(false)),
+        }));
+        let (session, segment) = (worker.session_id(), worker.segment_id());
+        assert!(worker.materialize_durable_session_head().await.is_err());
+        assert!(
+            store
+                .read_by_name(&manifest.worker.name)
+                .unwrap()
+                .unwrap()
+                .active
+                .unwrap()
+                .segment_id
+                .is_none()
+        );
+        drop(worker);
+        for _ in 0..2 {
+            let mut restored = Worker::<Box<dyn LlmClient>, _>::restore_pending_from_worker_metadata_with_context_and_model_client(
+                &manifest.worker.name, manifest.clone(), store.clone(),
+                PromptCatalogSource::builtins_only(), WorkerWorkspaceContext::no_workspace(),
+                WorkerFilesystemAuthority::None, Some(Box::new(NoopClient))).await.unwrap();
+            restored.install_initial_context_source(Arc::new(StartupTestSource {
+                calls: calls.clone(),
+                fail: Arc::new(AtomicBool::new(true)),
+            }));
+            restored.materialize_durable_session_head().await.unwrap();
+            assert_eq!(
+                (restored.session_id(), restored.segment_id()),
+                (session, segment)
+            );
+            assert_eq!(
+                restored.history()[0].as_text(),
+                Some("PRIOR_JOURNAL_REFERENCE")
+            );
+            assert_eq!(
+                store
+                    .read_by_name(&manifest.worker.name)
+                    .unwrap()
+                    .unwrap()
+                    .active
+                    .unwrap()
+                    .segment_id,
+                Some(segment)
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(store.list_segments(session).unwrap(), vec![segment]);
+        assert_eq!(store.read_all(session, segment).unwrap().len(), 2);
+    }
+
+    #[derive(Clone, Copy, Default)]
+    enum BodyPublicationAuthorization {
+        #[default]
+        Allowed,
+        Denied,
+        Unavailable,
+        WrongSession,
+        WrongSubject,
+        MissingHost,
+    }
+
+    #[derive(Default)]
+    struct BodyPublicationHost {
+        authorization: Mutex<BodyPublicationAuthorization>,
+        calls: Mutex<Vec<(crate::subjektiv::SubjektivHostContext, bool)>>,
+        startup_calls: AtomicUsize,
+        startup_unavailable: AtomicBool,
+    }
+
+    impl crate::subjektiv::SubjektivHost for BodyPublicationHost {
+        fn settings(&self) -> crate::subjektiv::SubjektivHostSettings {
+            crate::subjektiv::SubjektivHostSettings {
+                language: "English".into(),
+            }
+        }
+        fn journal_startup_granted(&self) -> bool {
+            true
+        }
+        fn journal_startup_context(
+            &self,
+            _: &crate::subjektiv::SubjektivHostContext,
+        ) -> Result<
+            subjektiv::journal::startup::JournalStartupSnapshot,
+            crate::subjektiv::SubjektivHostError,
+        > {
+            self.startup_calls.fetch_add(1, Ordering::SeqCst);
+            if self.startup_unavailable.load(Ordering::SeqCst) {
+                return Err(crate::subjektiv::SubjektivHostError::Unavailable(
+                    "startup fetch must not occur on normal restore".into(),
+                ));
+            }
+            Ok(subjektiv::journal::startup::JournalStartupSnapshot {
+                subject_id: "publication-subject".into(),
+                journals: vec![],
+                omitted: false,
+            })
+        }
+        fn record_session(
+            &self,
+            context: &crate::subjektiv::SubjektivHostContext,
+            create_if_missing: bool,
+        ) -> Result<server_api::SubjektivRecordSessionResponse, crate::subjektiv::SubjektivHostError>
+        {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((context.clone(), create_if_missing));
+            let mut output = server_api::SubjektivRecordSessionResponse {
+                subject_id: "publication-subject".into(),
+                session_id: context.session_id.clone(),
+            };
+            if !create_if_missing {
+                match *self.authorization.lock().unwrap() {
+                    BodyPublicationAuthorization::Allowed
+                    | BodyPublicationAuthorization::MissingHost => {}
+                    BodyPublicationAuthorization::Denied => {
+                        return Err(crate::subjektiv::SubjektivHostError::Conflict {
+                            code: "body_disconnected".into(),
+                            message: "current body publication denied".into(),
+                        });
+                    }
+                    BodyPublicationAuthorization::Unavailable => {
+                        return Err(crate::subjektiv::SubjektivHostError::Unavailable(
+                            "current authority unavailable".into(),
+                        ));
+                    }
+                    BodyPublicationAuthorization::WrongSession => {
+                        output.session_id = "other-session".into();
+                    }
+                    BodyPublicationAuthorization::WrongSubject => {
+                        output.subject_id = "other-subject".into();
+                    }
+                }
+            }
+            Ok(output)
+        }
+        fn memory(
+            &self,
+            _: &crate::subjektiv::SubjektivHostContext,
+            operation: server_api::SubjektivMemoryBackendOperation,
+        ) -> Result<server_api::SubjektivMemoryBackendResponse, crate::subjektiv::SubjektivHostError>
+        {
+            match operation {
+                server_api::SubjektivMemoryBackendOperation::ResidentContext(_) => {
+                    Ok(server_api::SubjektivMemoryBackendResponse::ResidentContext(
+                        server_api::SubjektivResidentContextOutput {
+                            behavior_md: "Publication test behavior".into(),
+                            memory_surface: memory::backend::MemoryResidentSummaryOutput {
+                                availability:
+                                    memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
+                                content: None,
+                            },
+                        },
+                    ))
+                }
+                _ => Err(crate::subjektiv::SubjektivHostError::Unavailable(
+                    "not used".into(),
+                )),
+            }
+        }
+        fn session(
+            &self,
+            _: &crate::subjektiv::SubjektivHostContext,
+            _: server_api::SubjektivSessionBackendOperation,
+        ) -> Result<server_api::SubjektivSessionBackendResponse, crate::subjektiv::SubjektivHostError>
+        {
+            Err(crate::subjektiv::SubjektivHostError::Unavailable(
+                "not used".into(),
+            ))
+        }
+        fn stage_candidate(
+            &self,
+            _: &crate::subjektiv::SubjektivHostContext,
+            _: memory::backend::MemoryStageCandidateOperation,
+        ) -> Result<server_api::SubjektivStageCandidateResponse, crate::subjektiv::SubjektivHostError>
+        {
+            Err(crate::subjektiv::SubjektivHostError::Unavailable(
+                "not used".into(),
+            ))
+        }
+        fn request_consolidation(
+            &self,
+            _: &crate::subjektiv::SubjektivHostContext,
+            _: memory::backend::MemoryConsolidateStagingOperation,
+        ) -> Result<memory::backend::MemoryConsolidationOutput, crate::subjektiv::SubjektivHostError>
+        {
+            Err(crate::subjektiv::SubjektivHostError::Unavailable(
+                "not used".into(),
+            ))
+        }
+    }
+
+    type BodyPublicationStore =
+        session_store::CombinedStore<session_store::FsStore, session_store::FsWorkerStore>;
+
+    fn body_publication_bootstrap(
+        temp: &tempfile::TempDir,
+        manifest: WorkerManifest,
+        store: BodyPublicationStore,
+        host: Arc<BodyPublicationHost>,
+        runtime_managed: bool,
+    ) -> crate::WorkerBootstrap<BodyPublicationStore> {
+        let layout = if runtime_managed {
+            crate::WorkerBootstrapLayout::RuntimeManagedRun {
+                run_dir: temp.path().join("runtime/runs/1"),
+                bash_output_dir: temp.path().join("bash"),
+            }
+        } else {
+            crate::WorkerBootstrapLayout::Direct {
+                runtime_base: temp.path().join("runtime"),
+                bash_output_dir: temp.path().join("bash"),
+            }
+        };
+        crate::WorkerBootstrap::new(
+            manifest,
+            store,
+            PromptCatalogSource::builtins_only(),
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            layout,
+            crate::WorkerControllerTransport::InProcess,
+        )
+        .with_model_client(NoopClient)
+        .with_subjektiv_host(host)
+    }
+
+    fn body_publication_fixture(
+        temp: &tempfile::TempDir,
+    ) -> (WorkerManifest, BodyPublicationStore) {
+        let mut manifest = minimal_manifest();
+        manifest.worker.name = format!("body-publication-{}", uuid::Uuid::now_v7());
+        manifest.scope.allow.clear();
+        manifest.feature.subjektiv.profile.enabled = true;
+        manifest.feature.subjektiv.profile.extraction.enabled = false;
+        let store = session_store::CombinedStore::new(
+            session_store::FsStore::new(temp.path().join("sessions")).unwrap(),
+            session_store::FsWorkerStore::new(temp.path().join("workers")).unwrap(),
+        );
+        (manifest, store)
+    }
+
+    async fn stop_body_publication_controller(controller: crate::BootstrappedWorker) {
+        controller
+            .handle
+            .send(protocol::Method::Shutdown {
+                command: protocol::WorkerCommandEnvelope::new(1),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), controller.shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        controller.controller_task.await.unwrap();
+    }
+
+    // Production Direct/runtime-managed Controller bootstrap and FsStore; only
+    // the Host boundary and model are replaced. Host-side races are not claimed.
+    #[tokio::test]
+    async fn confirmed_body_publication_denial_preserves_attribution_without_controller_initialization()
+     {
+        for runtime_managed in [false, true] {
+            for authorization in [
+                BodyPublicationAuthorization::Denied,
+                BodyPublicationAuthorization::Unavailable,
+                BodyPublicationAuthorization::WrongSession,
+                BodyPublicationAuthorization::WrongSubject,
+                BodyPublicationAuthorization::MissingHost,
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let _sandbox = worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
+                let (manifest, store) = body_publication_fixture(&temp);
+                let host = Arc::new(BodyPublicationHost::default());
+                let mut prepared = body_publication_bootstrap(
+                    &temp,
+                    manifest.clone(),
+                    store.clone(),
+                    host.clone(),
+                    runtime_managed,
+                )
+                .prepare()
+                .await
+                .unwrap();
+                let session = prepared.worker().session_id();
+                let before = store.read_by_name(&manifest.worker.name).unwrap().unwrap();
+                assert!(matches!(
+                    before.subjektiv_session_attribution,
+                    Some(SubjektivSessionAttributionState::Confirmed { .. })
+                ));
+                *host.authorization.lock().unwrap() = authorization;
+                let missing_host =
+                    matches!(authorization, BodyPublicationAuthorization::MissingHost);
+                if missing_host {
+                    prepared.worker_mut().bind_subjektiv_host(None);
+                }
+                let error = match prepared.start().await {
+                    Err(crate::WorkerBootstrapError::Controller { source, .. }) => source,
+                    Err(other) => panic!("expected publication rejection, got {other:?}"),
+                    Ok(controller) => {
+                        stop_body_publication_controller(controller).await;
+                        panic!("denied body was exposed");
+                    }
+                };
+                assert!(error.to_string().contains("publication_denied"));
+                let after = store.read_by_name(&manifest.worker.name).unwrap().unwrap();
+                assert_eq!(
+                    before.subjektiv_session_attribution,
+                    after.subjektiv_session_attribution
+                );
+                assert_eq!(before.active, after.active);
+                assert!(store.list_segments(session).unwrap().is_empty());
+                assert!(!temp.path().join("runtime").exists());
+                assert_eq!(host.startup_calls.load(Ordering::SeqCst), 0);
+                let calls = host.calls.lock().unwrap();
+                assert_eq!(calls.len(), if missing_host { 1 } else { 2 });
+                assert!(calls[0].1);
+                if !missing_host {
+                    assert!(!calls[1].1);
+                    assert_eq!(calls[1].0.worker_id, manifest.worker.name);
+                    assert_eq!(calls[1].0.session_id, session.to_string());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_restore_revalidates_current_body_authority_without_startup_fetch() {
+        let temp = tempfile::tempdir().unwrap();
+        let _sandbox = worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
+        let (manifest, store) = body_publication_fixture(&temp);
+        let host = Arc::new(BodyPublicationHost::default());
+        let prepared =
+            body_publication_bootstrap(&temp, manifest.clone(), store.clone(), host.clone(), false)
+                .prepare()
+                .await
+                .unwrap();
+        let (session, segment) = (
+            prepared.worker().session_id(),
+            prepared.worker().segment_id(),
+        );
+        let controller = prepared.start().await.unwrap();
+        let initial = store.read_all(session, segment).unwrap();
+        let saved_startup = initial
+            .iter()
+            .find_map(|entry| match entry {
+                LogEntry::AnnotatedSystemItem { entry, .. }
+                    if matches!(entry.item, SystemItem::JournalStartup { .. }) =>
+                {
+                    Some(entry.item.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        stop_body_publication_controller(controller).await;
+        assert_eq!(host.startup_calls.load(Ordering::SeqCst), 1);
+        host.startup_unavailable.store(true, Ordering::SeqCst);
+        for allowed in [true, false] {
+            *host.authorization.lock().unwrap() = if allowed {
+                BodyPublicationAuthorization::Allowed
+            } else {
+                BodyPublicationAuthorization::Denied
+            };
+            let calls_before = host.calls.lock().unwrap().len();
+            let before = store.read_all(session, segment).unwrap();
+            let attribution = store
+                .read_by_name(&manifest.worker.name)
+                .unwrap()
+                .unwrap()
+                .subjektiv_session_attribution;
+            let prepared = body_publication_bootstrap(
+                &temp,
+                manifest.clone(),
+                store.clone(),
+                host.clone(),
+                false,
+            )
+            .prepare_restored(&manifest.worker.name)
+            .await
+            .unwrap();
+            assert_eq!(
+                host.calls.lock().unwrap().len(),
+                calls_before,
+                "finalization of historical Confirmed attribution remains separate"
+            );
+            let result = prepared.start().await;
+            let calls = host.calls.lock().unwrap().clone();
+            assert_eq!(calls.len(), calls_before + 1);
+            assert!(!calls.last().unwrap().1);
+            assert_eq!(host.startup_calls.load(Ordering::SeqCst), 1);
+            if allowed {
+                let controller = result.unwrap();
+                let entries = controller.handle.committed_entries();
+                let saved = entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        LogEntry::AnnotatedSystemItem { entry, .. }
+                            if matches!(entry.item, SystemItem::JournalStartup { .. }) =>
+                        {
+                            Some(&entry.item)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    serde_json::to_value(saved).unwrap(),
+                    serde_json::to_value(vec![&saved_startup]).unwrap()
+                );
+                stop_body_publication_controller(controller).await;
+            } else {
+                assert!(result.is_err());
+                assert_eq!(
+                    serde_json::to_value(store.read_all(session, segment).unwrap()).unwrap(),
+                    serde_json::to_value(before).unwrap()
+                );
+            }
+            assert_eq!(
+                store
+                    .read_by_name(&manifest.worker.name)
+                    .unwrap()
+                    .unwrap()
+                    .subjektiv_session_attribution,
+                attribution
+            );
+        }
     }
 
     fn minimal_manifest() -> WorkerManifest {

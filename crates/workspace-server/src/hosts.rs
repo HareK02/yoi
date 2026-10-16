@@ -1288,6 +1288,13 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         })
     }
 
+    fn subject_release(
+        &self,
+        _request: runtime_api::SubjectReleaseRequest,
+    ) -> Result<runtime_api::SubjectReleaseResponse, String> {
+        Err("actual Subject Controller reservation is unavailable on this Runtime".into())
+    }
+
     fn session_material_pin(
         &self,
         _request: runtime_api::SessionMaterialPinRequest,
@@ -2242,6 +2249,21 @@ impl RuntimeRegistry {
                 },
             )?);
         runtime.worker_session_attachment(workspace_id, &worker_ref, session_id, attachment_id)
+    }
+
+    pub fn subject_release(
+        &self,
+        runtime_id: &str,
+        request: runtime_api::SubjectReleaseRequest,
+    ) -> Result<runtime_api::SubjectReleaseResponse, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        self.runtime(runtime_id)?
+            .subject_release(request)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.into(),
+                code: "subject_release_unproven".into(),
+                message,
+            })
     }
 
     pub fn session_material_pin(
@@ -3297,6 +3319,19 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             })
     }
 
+    fn subject_release(
+        &self,
+        request: runtime_api::SubjectReleaseRequest,
+    ) -> Result<runtime_api::SubjectReleaseResponse, String> {
+        if request.workspace_id != self.workspace_id {
+            return Err("Subject release Workspace mismatch".into());
+        }
+        let scope = RuntimeWorkspaceScope::new(&request.workspace_id, "embedded-backend");
+        self.runtime
+            .subject_release_scoped(&scope, request)
+            .map_err(|e| e.to_string())
+    }
+
     fn session_material_pin(
         &self,
         request: runtime_api::SessionMaterialPinRequest,
@@ -4114,7 +4149,10 @@ fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static s
     {
         return "workers:input";
     }
-    if path.ends_with("/stop") || path.ends_with("/cancel") {
+    if path.ends_with("/stop")
+        || path.ends_with("/cancel")
+        || (path == "/v1/subject-release" && method == "POST")
+    {
         return "workers:stop";
     }
     if path == "/v1/protocol/ws" {
@@ -5521,6 +5559,18 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 message: diagnostic.message,
             }
         })
+    }
+
+    fn subject_release(
+        &self,
+        request: runtime_api::SubjectReleaseRequest,
+    ) -> Result<runtime_api::SubjectReleaseResponse, String> {
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.subject_release(request).await },
+        )
+        .map_err(|diagnostic| diagnostic.message)
     }
 
     fn session_material_pin(

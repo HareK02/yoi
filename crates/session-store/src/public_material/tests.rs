@@ -561,6 +561,28 @@ fn reasoning_proves_rollback_safety_but_private_and_derived_items_are_not_materi
                     session,
                     vec![derived, message("system", LoggedRole::System, "secret")],
                 ),
+                LogEntry::AnnotatedSystemItem {
+                    ts: 1,
+                    entry: crate::LoggedSystemHistoryEntry {
+                        item: crate::SystemItem::JournalStartup {
+                            body: "previous Journal must not become new recording material".into(),
+                            snapshot: serde_json::json!({"journals": []}),
+                            snapshot_sha256: "retained-digest".into(),
+                            prompt_provenance: crate::PromptRenderProvenance {
+                                workspace_id: None,
+                                source_digest: "source".into(),
+                                projection_digest: "projection".into(),
+                                logical_name: "internal.subjektiv_journal_startup".into(),
+                            },
+                        },
+                        metadata: LoggedSessionHistoryMetadata {
+                            entry_id: LoggedSessionHistoryEntryId("startup-journal".into()),
+                            origin: LoggedSessionHistoryOrigin::DerivedSummary,
+                            derivation: None,
+                        },
+                    },
+                    extensions: vec![],
+                },
                 invoke(),
                 input("u"),
                 LogEntry::AnnotatedAssistantItem {

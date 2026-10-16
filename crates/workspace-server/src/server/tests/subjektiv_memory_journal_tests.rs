@@ -126,7 +126,10 @@ impl Fixture {
                 .unwrap(),
             )
             .unwrap();
-        let host = JournalHostContext::validated_session(&store, attr.clone()).unwrap();
+        let writer = store
+            .claim_journal_writer(&subject.id, RUNTIME, &source_worker.worker_id)
+            .unwrap();
+        let host = store.bind_journal_session(&writer, attr.clone()).unwrap();
         let journal_id = store
             .accept_journal_sources(&host, "original activity", &ranges)
             .unwrap();

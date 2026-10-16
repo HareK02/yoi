@@ -183,7 +183,7 @@ async fn public_mid_turn_compactions_preserve_originals_and_drain_after_cancel_a
             retained_tokens: 0,
             ..Default::default()
         });
-        let host = crate::StandaloneHost::start_with_model_client(launch, model.clone())
+        let mut host = crate::StandaloneHost::start_with_model_client(launch, model.clone())
             .await
             .unwrap();
         let session = host.record().active_session_id;
@@ -422,6 +422,13 @@ async fn public_mid_turn_compactions_preserve_originals_and_drain_after_cancel_a
             )
             .unwrap();
         assert!(!position.text.is_empty());
+        loop {
+            match host.disconnect_subject().await {
+                Ok(()) => break,
+                Err(crate::StandaloneSubjectDisconnectError::Incomplete(message)) if message.contains("dispatcher") || message.contains("cleanup") => tokio::task::yield_now().await,
+                Err(error) => panic!("recorded compaction/cancellation lineage must remain releasable while work is unfinished: {error}"),
+            }
+        }
         host.shutdown().await.unwrap();
     })
     .await

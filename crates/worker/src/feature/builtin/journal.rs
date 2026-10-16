@@ -26,6 +26,59 @@ use subjektiv::journal::{
     MAX_JOURNAL_RESPONSE_BYTES,
 };
 
+/// Subjektiv owns startup projection; Core only commits its typed initial items.
+pub(crate) struct JournalStartupContextSource {
+    host: SubjektivHostConnection,
+    prompts: Arc<arc_swap::ArcSwap<crate::prompt::catalog::PromptCatalog>>,
+}
+impl JournalStartupContextSource {
+    pub(crate) fn new(
+        host: SubjektivHostConnection,
+        prompts: Arc<arc_swap::ArcSwap<crate::prompt::catalog::PromptCatalog>>,
+    ) -> Self {
+        Self { host, prompts }
+    }
+}
+#[async_trait]
+impl crate::worker::InitialContextSource for JournalStartupContextSource {
+    async fn load(&self) -> Result<Vec<session_store::SystemItem>, String> {
+        use sha2::{Digest, Sha256};
+        let snapshot = self
+            .host
+            .journal_startup_context()
+            .map_err(|e| e.to_string())?;
+        // Hash the same canonical JSON value retained by SystemItem, so replay
+        // can verify provenance without depending on domain struct field order.
+        let snapshot = serde_json::to_value(snapshot).map_err(|e| e.to_string())?;
+        let snapshot_json = serde_json::to_string(&snapshot).map_err(|e| e.to_string())?;
+        if snapshot_json.len() > subjektiv::journal::startup::STARTUP_MAX_BYTES {
+            return Err("Host Journal startup snapshot exceeds independent byte budget".into());
+        }
+        let prompts = self.prompts.load();
+        let body = prompts
+            .subjektiv_journal_startup(&snapshot_json)
+            .map_err(|e| e.to_string())?;
+        if body.len() > subjektiv::journal::startup::STARTUP_MAX_BYTES + 4096 {
+            return Err("Journal startup prompt exceeds rendered byte budget".into());
+        }
+        let projection = prompts.projection();
+        Ok(vec![session_store::SystemItem::JournalStartup {
+            body,
+            snapshot,
+            snapshot_sha256: Sha256::digest(snapshot_json.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            prompt_provenance: session_store::PromptRenderProvenance {
+                workspace_id: self.host.host.workspace_id(),
+                source_digest: projection.source_digest.clone(),
+                projection_digest: projection.catalog_digest.clone(),
+                logical_name: "internal.subjektiv_journal_startup".into(),
+            },
+        }])
+    }
+}
+
 #[derive(Clone)]
 pub struct JournalRecordingFeature {
     host: SubjektivHostConnection,

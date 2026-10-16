@@ -11,6 +11,450 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 #[test]
+fn explicit_erasure_releases_only_after_all_body_sessions_including_unadmitted_history_are_erased()
+{
+    let f = Fixture::new();
+    let subject = f.host.subject_id.clone();
+    let binding = f
+        .store()
+        .claim_journal_writer(&subject, "runtime", "worker")
+        .unwrap();
+    let attr = f
+        .store()
+        .record_session_attribution(
+            SubjectSessionAttribution::new(&subject, "runtime", "worker", "saved-before-admission")
+                .unwrap(),
+        )
+        .unwrap();
+    let unadmitted = f.store().bind_journal_session(&binding, attr).unwrap();
+    assert!(!f.store().release_erased_journal_body(&f.host).unwrap());
+    f.store()
+        .erase_journal_session(&f.host, "erase-first")
+        .unwrap();
+    assert!(!f.store().release_erased_journal_body(&f.host).unwrap());
+    assert!(f.store().journal_writer_active(&binding).unwrap());
+    f.store()
+        .erase_journal_session(&unadmitted, "erase-last")
+        .unwrap();
+    assert!(f.store().release_erased_journal_body(&unadmitted).unwrap());
+    assert!(f.store().release_erased_journal_body(&unadmitted).unwrap());
+    assert!(!f.store().journal_writer_active(&binding).unwrap());
+    assert!(
+        f.store()
+            .journal_worker_was_released(&subject, "runtime", "worker")
+            .unwrap()
+    );
+    let next = f
+        .store()
+        .claim_journal_writer(&subject, "runtime", "replacement")
+        .unwrap();
+    assert!(f.store().release_erased_journal_body(&f.host).unwrap());
+    assert!(
+        f.store().journal_writer_active(&next).unwrap(),
+        "late erase retry cannot revoke another body"
+    );
+}
+
+#[test]
+fn released_binding_preserves_open_and_receipts_but_never_revives_old_session_writes() {
+    let mut f = Fixture::new();
+    let subject = f.host.subject_id.clone();
+    let binding = f
+        .store()
+        .claim_journal_writer(&subject, "runtime", "worker")
+        .unwrap();
+    assert!(
+        f.store()
+            .claim_journal_writer(&subject, "runtime", "other-worker")
+            .is_err()
+    );
+    assert!(f.store().release_journal_writer(&binding).is_err());
+    let (generation, context) = f.generation("first-body", f.ranges.clone());
+    let create = f.operation(
+        "create",
+        open_action("A was proposed; user corrected a constraint; B selected and partly executed"),
+        f.ranges.clone(),
+    );
+    let receipt = f.store().execute_journal(&context, create.clone()).unwrap();
+    f.execute(
+        &context,
+        "position",
+        JournalAction::UpdatePosition {
+            current_position:
+                "B: configuration changed; tests not executed; external result Unknown".into(),
+        },
+        vec![],
+    );
+    assert!(f.store().release_journal_writer(&binding).is_err());
+    f.execute(
+        &context,
+        "checkpoint",
+        JournalAction::Checkpoint {
+            record_operation_ids: vec!["create".into()],
+        },
+        f.ranges.clone(),
+    );
+    // A saved checkpoint is not proof that the generation has stopped executing.
+    assert!(f.store().release_journal_writer(&binding).is_err());
+    f.close(&generation);
+    f.store().release_journal_writer(&binding).unwrap();
+    f.store().release_journal_writer(&binding).unwrap();
+    f.reopen();
+    let old = f
+        .store()
+        .query_journal_operation(&f.host, &f.journal_id, "create")
+        .unwrap();
+    assert_eq!(old, Some(receipt.clone()));
+    assert_eq!(
+        f.store().execute_journal(&context, create).unwrap(),
+        receipt
+    );
+    let reader = JournalHostContext::validated_reader(f.store(), &subject).unwrap();
+    let snapshot = f
+        .store()
+        .journal_startup_snapshot(&reader, Some("source-session"))
+        .unwrap();
+    assert_eq!(
+        snapshot.journals[0].entries[0].state,
+        JournalEntryState::Open
+    );
+    assert!(snapshot.journals[0].current_position.contains("Unknown"));
+    let new = f
+        .store()
+        .claim_journal_writer(&subject, "runtime", "worker")
+        .unwrap();
+    assert_ne!(new.binding_id, binding.binding_id);
+    assert!(
+        f.store()
+            .bind_journal_session(&new, f.host.attribution.clone().unwrap())
+            .is_err()
+    );
+    let late = source_range("source-session", 2, 64);
+    assert!(matches!(
+        f.store().accept_journal_sources(&f.host, "late", &[late]),
+        Err(JournalError::PermissionDenied(_))
+    ));
+    assert!(
+        f.store()
+            .prepare_journal_generation(
+                &f.host,
+                &f.journal_id,
+                JobAttemptBinding {
+                    job_id: "late".into(),
+                    attempt_id: "late".into()
+                },
+                f.ranges.clone()
+            )
+            .is_err()
+    );
+    let operation = JournalOperation {
+        request_id: "late-position".into(),
+        expected_state: snapshot.journals[0].state_token.clone(),
+        action: JournalAction::UpdatePosition {
+            current_position: "forged".into(),
+        },
+        covered_ranges: vec![],
+    };
+    assert!(f.store().execute_journal(&context, operation).is_err());
+}
+
+#[test]
+fn release_rejects_unbound_legacy_body_sessions_even_without_admitted_sources() {
+    let f = Fixture::new();
+    let (generation, context) = f.generation("recorded-body", f.ranges.clone());
+    f.execute(
+        &context,
+        "record",
+        JournalAction::ConfirmUnchanged,
+        f.ranges.clone(),
+    );
+    save_position(f.store(), &context, "position");
+    f.execute(
+        &context,
+        "checkpoint",
+        checkpoint(&["record"]),
+        f.ranges.clone(),
+    );
+    f.close(&generation);
+    let binding = f
+        .store()
+        .claim_journal_writer(&f.host.subject_id, "runtime", "worker")
+        .unwrap();
+    let legacy = f
+        .store()
+        .record_session_attribution(
+            SubjectSessionAttribution::new(
+                &f.host.subject_id,
+                "runtime",
+                "worker",
+                "legacy-not-admitted",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        f.store().release_journal_writer(&binding),
+        Err(JournalError::Conflict(_))
+    ));
+    assert!(f.store().journal_writer_active(&binding).unwrap());
+    // The Host must bind and reconcile this original Session, even if its canonical
+    // history proves empty and therefore creates no Journal.
+    f.store().bind_journal_session(&binding, legacy).unwrap();
+    f.store().release_journal_writer(&binding).unwrap();
+}
+
+#[test]
+fn predecessor_prefers_latest_journal_activity_not_session_attachment_order() {
+    let f = Fixture::new();
+    let binding = f
+        .store()
+        .claim_journal_writer(&f.host.subject_id, "runtime", "worker")
+        .unwrap();
+    let second = session_host(f.store(), &f.host.subject_id, "later-attached-session");
+    let second_ranges = vec![source_range("later-attached-session", 0, 8)];
+    let second_id = f
+        .store()
+        .accept_journal_sources(&second, "Earlier activity", &second_ranges)
+        .unwrap();
+    for (host, journal_id, ranges) in [
+        (&f.host, &f.journal_id, &f.ranges),
+        (&second, &second_id, &second_ranges),
+    ] {
+        let job = JobAttemptBinding {
+            job_id: journal_id.clone(),
+            attempt_id: "recording".into(),
+        };
+        let generation = f
+            .store()
+            .prepare_journal_generation(host, journal_id, job.clone(), ranges.clone())
+            .unwrap();
+        let context = JournalJobContext::validated(f.store(), host, &generation.id, job).unwrap();
+        let state = f
+            .store()
+            .read_journal(host, journal_id)
+            .unwrap()
+            .state_token;
+        f.store()
+            .execute_journal(
+                &context,
+                JournalOperation {
+                    request_id: "record".into(),
+                    expected_state: state,
+                    action: open_action("Unfinished activity"),
+                    covered_ranges: ranges.clone(),
+                },
+            )
+            .unwrap();
+        let position = save_position(f.store(), &context, "position");
+        f.store()
+            .checkpoint_journal(
+                &context,
+                JournalOperation {
+                    request_id: "checkpoint".into(),
+                    expected_state: position.state_token,
+                    action: checkpoint(&["record"]),
+                    covered_ranges: ranges.clone(),
+                },
+            )
+            .unwrap();
+        f.store()
+            .close_journal_generation(host, &generation.id, &generation.job)
+            .unwrap();
+    }
+    // Stored timestamps model a later update to the earlier-attached Session without
+    // using elapsed wall time as a synchronization or ordering assertion.
+    f.store()
+        .database
+        .try_transaction::<_, JournalError>(|tx| {
+            tx.execute(
+                "UPDATE journals SET updated_at='2001-01-01T00:00:00Z' WHERE id=?1",
+                [&f.journal_id],
+            )?;
+            tx.execute(
+                "UPDATE journals SET updated_at='2000-01-01T00:00:00Z' WHERE id=?1",
+                [&second_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let _empty = session_host(
+        f.store(),
+        &f.host.subject_id,
+        "latest-attachment-no-journal",
+    );
+    f.store().release_journal_writer(&binding).unwrap();
+    let replacement = f
+        .store()
+        .claim_journal_writer(&f.host.subject_id, "runtime", "replacement")
+        .unwrap();
+    assert_eq!(
+        f.store()
+            .journal_predecessor_session(&replacement)
+            .unwrap()
+            .as_deref(),
+        Some("source-session")
+    );
+}
+
+#[test]
+fn concurrent_body_claims_from_independent_connections_bind_only_one_worker() {
+    let f = Fixture::new();
+    let subject = f
+        .store()
+        .create_subject(SubjectRole::new("claim-race").unwrap())
+        .unwrap();
+    let manager = FeatureStorage::new(f.temp.path().join("storage"));
+    let workspace = manager.workspace("journal-tests").unwrap();
+    let registration = SubjektivStore::register(&workspace).unwrap();
+    let second = SubjektivStore::open(&workspace, &registration).unwrap();
+    let barrier = Arc::new(Barrier::new(3));
+    let spawn = |store: SubjektivStore, worker: &'static str| {
+        let barrier = barrier.clone();
+        let subject = subject.id.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            store.claim_journal_writer(&subject, "runtime", worker)
+        })
+    };
+    let first = spawn(f.store().clone(), "first");
+    let second = spawn(second, "second");
+    barrier.wait();
+    let outcomes = [first.join().unwrap(), second.join().unwrap()];
+    assert_eq!(outcomes.iter().filter(|r| r.is_ok()).count(), 1);
+    let winner = outcomes.into_iter().find_map(Result::ok).unwrap();
+    assert!(f.store().journal_writer_active(&winner).unwrap());
+    let loser = if winner.worker_id == "first" {
+        "second"
+    } else {
+        "first"
+    };
+    assert!(
+        f.store()
+            .claim_journal_writer(&subject.id, "runtime", loser)
+            .is_err()
+    );
+    drop(workspace);
+    manager.shutdown().unwrap();
+}
+
+#[test]
+fn release_and_late_admission_are_serialized_by_the_persisted_binding_check() {
+    let f = Fixture::new();
+    let binding = f
+        .store()
+        .claim_journal_writer(&f.host.subject_id, "runtime", "worker")
+        .unwrap();
+    let (generation, context) = f.generation("release-race", f.ranges.clone());
+    f.execute(
+        &context,
+        "record",
+        open_action("unfinished"),
+        f.ranges.clone(),
+    );
+    f.execute(
+        &context,
+        "position",
+        JournalAction::UpdatePosition {
+            current_position: "remaining work".into(),
+        },
+        vec![],
+    );
+    f.execute(
+        &context,
+        "checkpoint",
+        JournalAction::Checkpoint {
+            record_operation_ids: vec!["record".into()],
+        },
+        f.ranges.clone(),
+    );
+    f.close(&generation);
+    let manager = FeatureStorage::new(f.temp.path().join("storage"));
+    let workspace = manager.workspace("journal-tests").unwrap();
+    let registration = SubjektivStore::register(&workspace).unwrap();
+    let second = SubjektivStore::open(&workspace, &registration).unwrap();
+    let barrier = Arc::new(Barrier::new(3));
+    let b = barrier.clone();
+    let store = f.store().clone();
+    let released = binding.clone();
+    let release = thread::spawn(move || {
+        b.wait();
+        store.release_journal_writer(&released)
+    });
+    let b = barrier.clone();
+    let host = f.host.clone();
+    let late = source_range("source-session", 2, 16);
+    let admission = thread::spawn(move || {
+        b.wait();
+        second.accept_journal_sources(&host, "late", &[late])
+    });
+    barrier.wait();
+    let release = release.join().unwrap();
+    let admission = admission.join().unwrap();
+    assert_ne!(
+        release.is_ok(),
+        admission.is_ok(),
+        "exactly one ordered effect may commit"
+    );
+    assert_eq!(
+        f.store().journal_writer_active(&binding).unwrap(),
+        admission.is_ok()
+    );
+    assert_eq!(
+        f.store()
+            .read_journal_source(&f.host, &f.journal_id, 2)
+            .is_ok(),
+        admission.is_ok()
+    );
+    drop(workspace);
+    manager.shutdown().unwrap();
+}
+
+#[test]
+fn startup_snapshot_distinguishes_none_is_subject_local_and_bounds_utf8_at_storage() {
+    let f = Fixture::new();
+    let (_, context) = f.generation("snapshot", f.ranges.clone());
+    f.execute(
+        &context,
+        "large-open",
+        open_action(&"日本語\\\"\\n".repeat(6000)),
+        f.ranges.clone(),
+    );
+    let reader = JournalHostContext::validated_reader(f.store(), &f.host.subject_id).unwrap();
+    let snapshot = f
+        .store()
+        .journal_startup_snapshot(&reader, Some("source-session"))
+        .unwrap();
+    let encoded = serde_json::to_vec(&snapshot).unwrap();
+    assert!(encoded.len() <= startup::STARTUP_MAX_BYTES);
+    assert!(snapshot.journals[0].entries[0].omitted);
+    assert!(snapshot.journals[0].entries[0].body.len() <= 2048);
+    assert_eq!(snapshot.journals[0].source_session_id, "source-session");
+    let other = f
+        .store()
+        .create_subject_with_behavior(
+            SubjectRole::new("other").unwrap(),
+            "behavior unchanged".into(),
+        )
+        .unwrap();
+    let other_reader = JournalHostContext::validated_reader(f.store(), &other.id).unwrap();
+    assert!(matches!(
+        f.store()
+            .journal_startup_snapshot(&other_reader, Some("source-session")),
+        Err(JournalError::PermissionDenied(_))
+    ));
+    let none = f
+        .store()
+        .journal_startup_snapshot(&other_reader, None)
+        .unwrap();
+    assert!(none.journals.is_empty());
+    assert!(!none.omitted);
+    assert_eq!(
+        f.store().subject(&other.id).unwrap().unwrap().behavior_md,
+        "behavior unchanged"
+    );
+}
+
+#[test]
 fn stable_legacy_run_references_are_accepted_without_relaxing_character_or_size_limits() {
     let f = Fixture::new();
     let mut range = source_range("source-session", 2, 64);
@@ -431,6 +875,111 @@ fn erasure_failure_rolls_back_tombstone_and_content_then_exact_retry_succeeds() 
 }
 
 #[test]
+fn checkpointed_generation_rejects_late_activity_but_retains_saved_receipts() {
+    let f = Fixture::new();
+    let (generation, context) = f.generation("checkpointed-job", f.ranges.clone());
+    let operation = f.operation("record", open_action("B partly executed"), f.ranges.clone());
+    let receipt = f
+        .store()
+        .execute_journal(&context, operation.clone())
+        .unwrap();
+    let entry_id = receipt.entry_id.clone().unwrap();
+    save_position(f.store(), &context, "position");
+    f.execute(
+        &context,
+        "checkpoint",
+        checkpoint(&["record"]),
+        f.ranges.clone(),
+    );
+    let before = f.state();
+    for (index, action) in [
+        open_action("late create"),
+        JournalAction::Rewrite {
+            entry_id: entry_id.clone(),
+            title: "late rewrite".into(),
+            body: "late".into(),
+            ongoing: "late".into(),
+        },
+        JournalAction::Fix {
+            entry_id,
+            source_end: f.ranges.last().unwrap().source.pointer.clone(),
+        },
+        JournalAction::ConfirmUnchanged,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let late = f.operation(&format!("late-{index}"), action, f.ranges.clone());
+        assert!(matches!(
+            f.store().execute_journal(&context, late),
+            Err(JournalError::Conflict(_))
+        ));
+        assert_eq!(f.state(), before);
+    }
+    assert_eq!(
+        f.store().execute_journal(&context, operation).unwrap(),
+        receipt
+    );
+    f.close(&generation);
+    let binding = f
+        .store()
+        .claim_journal_writer(&f.host.subject_id, "runtime", "worker")
+        .unwrap();
+    f.store().release_journal_writer(&binding).unwrap();
+}
+
+#[test]
+fn checkpoint_without_current_position_leaves_failed_job_input_recoverable_after_reopen() {
+    let mut f = Fixture::new();
+    let (failed, context) = f.generation("incomplete-position", f.ranges.clone());
+    save_position(f.store(), &context, "outdated-position");
+    f.execute(
+        &context,
+        "record",
+        open_action("B selected; tests not run"),
+        f.ranges.clone(),
+    );
+    let checkpoint_operation = f.operation("checkpoint", checkpoint(&["record"]), f.ranges.clone());
+    let before = f.state();
+    assert!(matches!(
+        f.store().execute_journal(&context, checkpoint_operation),
+        Err(JournalError::Conflict(_))
+    ));
+    assert_eq!(f.state(), before);
+    assert!(f.sources().iter().all(|source| source.reflected_bytes == 0));
+    assert!(f.receipt("checkpoint").is_none());
+    f.close(&failed);
+    f.reopen();
+    let (replacement, context) = f.generation("recover-position", f.ranges.clone());
+    f.execute(
+        &context,
+        "recovered-position",
+        JournalAction::UpdatePosition {
+            current_position: "B partly performed; tests unperformed; external result Unknown"
+                .into(),
+        },
+        vec![],
+    );
+    // Use the saved record receipt rather than duplicating the old activity entry.
+    f.execute(
+        &context,
+        "checkpoint",
+        checkpoint(&["record"]),
+        f.ranges.clone(),
+    );
+    f.close(&replacement);
+    let binding = f
+        .store()
+        .claim_journal_writer(&f.host.subject_id, "runtime", "worker")
+        .unwrap();
+    assert_eq!(f.entries().len(), 1);
+    assert_eq!(f.entries()[0].state, JournalEntryState::Open);
+    assert!(f.state().0.current_position.contains("Unknown"));
+    f.store().release_journal_writer(&binding).unwrap();
+    assert!(!f.store().journal_writer_active(&binding).unwrap());
+}
+
+#[test]
 fn job_service_completion_requires_checkpoint_and_replays_saved_completion_after_new_generation() {
     let mut f = Fixture::new();
     let (generation, context) = f.generation("service-job", f.ranges.clone());
@@ -476,22 +1025,43 @@ fn job_service_completion_requires_checkpoint_and_replays_saved_completion_after
         service::finish(f.store(), &context),
         Err(JournalError::Conflict(_))
     ));
-    service::execute(
-        f.store(),
-        &context,
-        transport::JournalJobRequest::Execute {
-            operation: JournalOperation {
-                request_id: "service-checkpoint".into(),
-                expected_state: receipt.state_token,
-                action: JournalAction::Checkpoint {
-                    record_operation_ids: vec!["service-create".into()],
-                },
-                covered_ranges: f.ranges.clone(),
-            },
+    let checkpoint_operation = JournalOperation {
+        request_id: "service-checkpoint".into(),
+        expected_state: receipt.state_token,
+        action: JournalAction::Checkpoint {
+            record_operation_ids: vec!["service-create".into()],
         },
-        |_| unreachable!(),
-    )
-    .unwrap();
+        covered_ranges: f.ranges.clone(),
+    };
+    // Reject the checkpoint atomically: failed/terminal Jobs must leave pending input
+    // recoverable rather than stranding a fully reflected prefix without a position memo.
+    assert!(matches!(
+        service::execute(
+            f.store(),
+            &context,
+            transport::JournalJobRequest::Execute {
+                operation: checkpoint_operation
+            },
+            |_| unreachable!(),
+        ),
+        Err(JournalError::Conflict(_))
+    ));
+    assert!(f.sources().iter().all(|source| source.reflected_bytes == 0));
+    assert!(f.receipt("service-checkpoint").is_none());
+    f.execute(
+        &context,
+        "service-position",
+        JournalAction::UpdatePosition {
+            current_position: "ongoing; work remains".into(),
+        },
+        vec![],
+    );
+    f.execute(
+        &context,
+        "service-checkpoint",
+        checkpoint(&["service-create"]),
+        f.ranges.clone(),
+    );
     let completion = service::finish(f.store(), &context).unwrap();
     assert_eq!(completion.generation_id, generation.id);
     assert_eq!((completion.process_order, completion.process_byte), (2, 0));
@@ -685,7 +1255,7 @@ fn retention_release_requires_checkpoint_not_saved_entry_or_unavailability() {
     let f = Fixture::new();
     let (_, job) = f.generation("retained-job", f.ranges.clone());
     let operation = f.operation("record", open_action("ongoing activity"), f.ranges.clone());
-    let receipt = f.store().execute_journal(&job, operation).unwrap();
+    f.store().execute_journal(&job, operation).unwrap();
     assert!(f.store().journal_retention_required(&f.host).unwrap());
     f.store()
         .mark_journal_sources_unavailable(&f.host, &f.journal_id, &f.ranges)
@@ -694,6 +1264,7 @@ fn retention_release_requires_checkpoint_not_saved_entry_or_unavailability() {
     f.store()
         .mark_journal_sources_available(&f.host, &f.journal_id, &f.ranges)
         .unwrap();
+    let receipt = save_position(f.store(), &job, "retained-position");
     f.store()
         .checkpoint_journal(
             &job,
@@ -805,8 +1376,7 @@ fn recording_materials_resume_exact_saved_byte_prefix_after_reopen() {
         .unwrap();
     let job = JournalJobContext::validated(f.store(), &host, &generation.id, binding).unwrap();
     let state = f.store().read_journal(&host, &id).unwrap().state_token;
-    let receipt = f
-        .store()
+    f.store()
         .execute_journal(
             &job,
             JournalOperation {
@@ -817,6 +1387,7 @@ fn recording_materials_resume_exact_saved_byte_prefix_after_reopen() {
             },
         )
         .unwrap();
+    let receipt = save_position(f.store(), &job, "recording-position");
     f.store()
         .checkpoint_journal(
             &job,
@@ -891,7 +1462,12 @@ impl Fixture {
                 },
             )
             .unwrap();
-        let host = session_host(&store, &subject.id, "source-session");
+        let attribution =
+            SubjectSessionAttribution::new(&subject.id, "runtime", "worker", "source-session")
+                .unwrap();
+        store
+            .record_session_attribution(attribution.clone())
+            .unwrap();
         let (manager, workspace, store) = if upgrade {
             let has_journals: bool = store.database.try_with_connection::<_, JournalError>(|connection| {
                 Ok(connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='journals')", [], |row| row.get(0))?)
@@ -905,15 +1481,16 @@ impl Fixture {
             let workspace = manager.workspace("journal-tests").unwrap();
             let registration = SubjektivStore::register(&workspace).unwrap();
             let store = SubjektivStore::open(&workspace, &registration).unwrap();
-            assert_eq!(store.subject(&subject.id).unwrap(), Some(subject));
+            assert_eq!(store.subject(&subject.id).unwrap(), Some(subject.clone()));
             assert_eq!(
                 store.session_attribution("source-session").unwrap(),
-                host.attribution
+                Some(attribution)
             );
             (manager, workspace, store)
         } else {
             (manager, workspace, store)
         };
+        let host = session_host(&store, &subject.id, "source-session");
         let ranges = sizes
             .iter()
             .enumerate()
@@ -1070,10 +1647,11 @@ impl Drop for Fixture {
 fn session_host(store: &SubjektivStore, subject: &str, session: &str) -> JournalHostContext {
     let attribution =
         SubjectSessionAttribution::new(subject, "runtime", "worker", session).unwrap();
-    store
-        .record_session_attribution(attribution.clone())
+    let attribution = store.record_session_attribution(attribution).unwrap();
+    let binding = store
+        .claim_journal_writer(subject, "runtime", "worker")
         .unwrap();
-    JournalHostContext::validated_session(store, attribution).unwrap()
+    store.bind_journal_session(&binding, attribution).unwrap()
 }
 
 fn source_range(session: &str, order: u64, total_bytes: u64) -> JournalSourceRange {
@@ -1125,6 +1703,32 @@ fn fixed_action(body: &str, range: &JournalSourceRange, corrections: Vec<String>
         source_end: Some(range.source.pointer.clone()),
         correction_refs: corrections,
     }
+}
+
+fn save_position(
+    store: &SubjektivStore,
+    context: &JournalJobContext,
+    request_id: &str,
+) -> JournalReceipt {
+    let generation = store
+        .read_journal_generation(&context.host, &context.generation_id)
+        .unwrap();
+    let (journal, _) = store
+        .journal_resume_state(&context.host, &generation.journal_id)
+        .unwrap();
+    store
+        .execute_journal(
+            context,
+            JournalOperation {
+                request_id: request_id.into(),
+                expected_state: journal.state_token,
+                action: JournalAction::UpdatePosition {
+                    current_position: journal.current_position,
+                },
+                covered_ranges: vec![],
+            },
+        )
+        .unwrap()
 }
 
 fn checkpoint(ids: &[&str]) -> JournalAction {
@@ -1249,6 +1853,7 @@ fn sequential_open_rewrite_fix_and_correction_preserve_fixed_history() {
     assert_eq!(entries[1].correction_refs, vec![first_id]);
     assert_eq!(entries[1].previous_fixed_end, fixed.source_end);
     assert_eq!(fixture.state().0.process_order, 0);
+    save_position(fixture.store(), &ctx, "final-position");
     let cp = fixture.execute(
         &ctx,
         "checkpoint",
@@ -1966,6 +2571,7 @@ fn checkpoint_requires_saved_record_correspondence_and_never_position_only_evide
         JournalAction::ConfirmUnchanged,
         vec![fixture.ranges[1].clone()],
     );
+    save_position(fixture.store(), &ctx, "checked-position");
     let receipt = fixture.execute(
         &ctx,
         "valid-checkpoint",
@@ -2017,6 +2623,7 @@ fn huge_source_partial_generations_checkpoint_only_read_prefix_and_fix_only_at_e
         fixture.store().execute_journal(&first_ctx, unread_end),
         Err(JournalError::InvalidInput(_))
     ));
+    save_position(fixture.store(), &first_ctx, "partial-position");
     let cp = fixture.execute(
         &first_ctx,
         "partial-checkpoint",
@@ -2082,6 +2689,7 @@ fn huge_source_partial_generations_checkpoint_only_read_prefix_and_fix_only_at_e
         vec![],
     );
     assert_eq!(fixture.state().0.process_byte, head.bytes.end);
+    save_position(fixture.store(), &next_ctx, "tail-position");
     let cp = fixture.execute(
         &next_ctx,
         "tail-checkpoint",
@@ -2913,6 +3521,7 @@ fn failure_before_receipt_rolls_back_record_and_checkpoint_then_exact_retry_succ
         fixture.store().execute_journal(&ctx, record).unwrap(),
         saved
     );
+    save_position(fixture.store(), &ctx, "fault-position");
     let cp = fixture.operation(
         "fault-checkpoint",
         checkpoint(&["fault-record"]),
@@ -2994,6 +3603,7 @@ fn per_operation_reopen_recovers_a_realistic_investigation_and_later_correction_
     assert!(fixture.state().1.is_none());
     assert_eq!(fixture.state().0.process_order, 0);
     let fixed_before_correction = fixture.entries()[0].clone();
+    save_position(fixture.store(), &first_ctx, "investigation-fixed-position");
     fixture.execute_and_reopen(
         &first_ctx,
         "investigation-checkpoint",
@@ -3117,6 +3727,7 @@ fn split_input_and_replacement_job_reconcile_old_record_coverage_without_duplica
         .unwrap();
     assert_eq!(coverage.items, vec![whole.clone()]);
     let (_, replacement) = fixture.generation("replacement-job", vec![whole.clone()]);
+    save_position(fixture.store(), &replacement, "replacement-position");
     let cp = fixture.operation("recover-reflection", checkpoint(&["record"]), vec![whole]);
     let result = fixture
         .store()
@@ -3200,86 +3811,95 @@ fn serialized_metadata_and_text_budgets_preserve_continuation_and_availability_r
 
 #[test]
 fn journal_migration_failure_rolls_back_ddl_and_retries_without_changing_existing_subject() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("storage");
-    let manager = FeatureStorage::new(&root);
-    let scope = manager.scope("migration-rollback").unwrap();
-    let registration = scope
-        .register(feature_storage::FeatureRegistration::new(
-            crate::SUBJEKTIV_FEATURE_ID,
-            &crate::MIGRATIONS[..7],
-        ))
-        .unwrap();
-    let store = SubjektivStore::open(&scope, &registration).unwrap();
-    let subject = store
-        .create_subject_with_behavior(
-            SubjectRole::new("preserved").unwrap(),
-            "Original behavior".into(),
-        )
-        .unwrap();
-    store
-        .database
-        .try_transaction::<_, JournalError>(|tx| {
-            tx.execute_batch("CREATE TABLE journal_entries(injected INTEGER)")?;
-            Ok(())
-        })
-        .unwrap();
-    drop(store);
-    drop(scope);
-    manager.shutdown().unwrap();
-    drop(manager);
-    let manager = FeatureStorage::new(&root);
-    let scope = manager.scope("migration-rollback").unwrap();
-    let registration = SubjektivStore::register(&scope).unwrap();
-    assert!(matches!(
-        SubjektivStore::open(&scope, &registration),
-        Err(crate::SubjektivError::Storage(
-            feature_storage::FeatureStorageError::MigrationFailed { .. }
-        ))
-    ));
-    drop(scope);
-    manager.shutdown().unwrap();
-    drop(manager);
-    let manager = FeatureStorage::new(&root);
-    let scope = manager.scope("migration-rollback").unwrap();
-    let registration = scope
-        .register(feature_storage::FeatureRegistration::new(
-            crate::SUBJEKTIV_FEATURE_ID,
-            &crate::MIGRATIONS[..7],
-        ))
-        .unwrap();
-    let store = SubjektivStore::open(&scope, &registration).unwrap();
-    assert_eq!(store.subject(&subject.id).unwrap(), Some(subject.clone()));
-    store
-        .database
-        .try_transaction::<_, JournalError>(|tx| {
-            assert!(!tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='journals')",
-                [],
-                |r| r.get::<_, bool>(0)
-            )?);
-            tx.execute_batch("DROP TABLE journal_entries")?;
-            Ok(())
-        })
-        .unwrap();
-    drop(store);
-    drop(scope);
-    manager.shutdown().unwrap();
-    drop(manager);
-    let manager = FeatureStorage::new(&root);
-    let scope = manager.scope("migration-rollback").unwrap();
-    let registration = SubjektivStore::register(&scope).unwrap();
-    let store = SubjektivStore::open(&scope, &registration).unwrap();
-    assert_eq!(store.subject(&subject.id).unwrap(), Some(subject.clone()));
-    let host = session_host(&store, &subject.id, "post-migration-session");
-    let range = source_range("post-migration-session", 0, 8);
-    let id = store
-        .accept_journal_sources(&host, "Recovered migration", &[range])
-        .unwrap();
-    assert_eq!(
-        store.read_journal(&host, &id).unwrap().source_session_id,
-        "post-migration-session"
-    );
+    for (baseline, collision, rolled_back) in [
+        (&crate::MIGRATIONS[..7], "journal_entries", "journals"),
+        (
+            &crate::MIGRATIONS[..9],
+            "journal_session_bindings",
+            "journal_writer_bindings",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("storage");
+        let manager = FeatureStorage::new(&root);
+        let scope = manager.scope("migration-rollback").unwrap();
+        let registration = scope
+            .register(feature_storage::FeatureRegistration::new(
+                crate::SUBJEKTIV_FEATURE_ID,
+                baseline,
+            ))
+            .unwrap();
+        let store = SubjektivStore::open(&scope, &registration).unwrap();
+        let subject = store
+            .create_subject_with_behavior(
+                SubjectRole::new("preserved").unwrap(),
+                "Original behavior".into(),
+            )
+            .unwrap();
+        store
+            .database
+            .try_transaction::<_, JournalError>(|tx| {
+                tx.execute_batch(&format!("CREATE TABLE {collision}(injected INTEGER)"))?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        drop(scope);
+        manager.shutdown().unwrap();
+        drop(manager);
+        let manager = FeatureStorage::new(&root);
+        let scope = manager.scope("migration-rollback").unwrap();
+        let registration = SubjektivStore::register(&scope).unwrap();
+        assert!(matches!(
+            SubjektivStore::open(&scope, &registration),
+            Err(crate::SubjektivError::Storage(
+                feature_storage::FeatureStorageError::MigrationFailed { .. }
+            ))
+        ));
+        drop(scope);
+        manager.shutdown().unwrap();
+        drop(manager);
+        let manager = FeatureStorage::new(&root);
+        let scope = manager.scope("migration-rollback").unwrap();
+        let registration = scope
+            .register(feature_storage::FeatureRegistration::new(
+                crate::SUBJEKTIV_FEATURE_ID,
+                baseline,
+            ))
+            .unwrap();
+        let store = SubjektivStore::open(&scope, &registration).unwrap();
+        assert_eq!(store.subject(&subject.id).unwrap(), Some(subject.clone()));
+        store
+            .database
+            .try_transaction::<_, JournalError>(|tx| {
+                assert!(!tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",
+                    [rolled_back],
+                    |r| r.get::<_, bool>(0)
+                )?);
+                tx.execute_batch(&format!("DROP TABLE {collision}"))?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        drop(scope);
+        manager.shutdown().unwrap();
+        drop(manager);
+        let manager = FeatureStorage::new(&root);
+        let scope = manager.scope("migration-rollback").unwrap();
+        let registration = SubjektivStore::register(&scope).unwrap();
+        let store = SubjektivStore::open(&scope, &registration).unwrap();
+        assert_eq!(store.subject(&subject.id).unwrap(), Some(subject.clone()));
+        let host = session_host(&store, &subject.id, "post-migration-session");
+        let range = source_range("post-migration-session", 0, 8);
+        let id = store
+            .accept_journal_sources(&host, "Recovered migration", &[range])
+            .unwrap();
+        assert_eq!(
+            store.read_journal(&host, &id).unwrap().source_session_id,
+            "post-migration-session"
+        );
+    }
 }
 
 #[test]
@@ -3365,6 +3985,7 @@ fn late_gap_admission_and_partial_updates_reject_stale_source_page_cursors() {
             .list_journal_sources(&fixture.host, &fixture.journal_id, fresh.next.as_deref(), 2)
             .is_ok()
     );
+    save_position(fixture.store(), &job, "listing-position");
     fixture.execute(
         &job,
         "checkpoint",

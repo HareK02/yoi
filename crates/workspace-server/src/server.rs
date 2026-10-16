@@ -1655,6 +1655,7 @@ pub struct WorkspaceApi {
         Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<Mutex<OrchestratorAttentionState>>>>>,
     notification_delivery_lifecycle: Arc<notification_delivery::NotificationDeliveryLifecycle>,
     backend_job_drain_requests: Arc<AtomicU64>,
+    journal_lifecycle: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     journal_dispatch_owner: Option<Arc<WorkspaceApi>>,
     observation_proxy: BackendObservationProxy,
     runtime_subscription_broker: RuntimeSubscriptionBroker,
@@ -3380,6 +3381,7 @@ fn workspace_request_is_callback(method: &Method, path: &str, workspace_id: &str
             || path == format!("/api/runtime/v1/workspaces/{workspace_id}/resources/fetch")))
         || (*method == Method::GET
             && (path == format!("/api/w/{workspace_id}/runtime-config")
+                || path == format!("/api/w/{workspace_id}/subjektiv/journal/startup")
                 || path == format!("/api/w/{workspace_id}/worker-discovery/workers")))
 }
 
@@ -4161,6 +4163,7 @@ impl WorkspaceApi {
             notification_delivery_lifecycle: Arc::new(Default::default()),
             orchestrator_attention: Arc::new(Mutex::new(HashMap::new())),
             backend_job_drain_requests: Arc::new(AtomicU64::new(0)),
+            journal_lifecycle: Arc::new(Mutex::new(HashMap::new())),
             journal_dispatch_owner: None,
             observation_proxy,
             runtime_subscription_broker,
@@ -4363,8 +4366,9 @@ impl WorkspaceApi {
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
                 resolved_memory_settings: None,
-                resolved_subjektiv_attached: request.grants.subjektiv_consolidation.is_some()
-                    || request.grants.subjektiv_journal.is_some(),
+                // Journal Jobs use their independent frozen Job Host grant, not the
+                // main-Subject/Memory attachment or its resident/extraction policy.
+                resolved_subjektiv_attached: request.grants.subjektiv_consolidation.is_some(),
                 resolved_control_operation: Some(control_operation),
             },
         ) {
@@ -5469,6 +5473,22 @@ impl WorkspaceApi {
                     .map(|assignment| assignment.operation_id.clone())
             })
             .unwrap_or_else(|| format!("manual:{}", WorkerId::now_v7()));
+        let subject = singleton_key
+            .as_deref()
+            .and_then(|key| key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX));
+        let subject_gate = subject
+            .map(|s| subjektiv_journal::lifecycle_lock(self, s))
+            .transpose()?;
+        let subject_guard = subject_gate
+            .as_ref()
+            .map(|gate| {
+                gate.lock()
+                    .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))
+            })
+            .transpose()?;
+        if let Some(subject) = subject {
+            subjektiv_journal::check_start_allowed(self, subject)?;
+        }
         let reservation = match self.config_store.reserve_worker_create(
             &self.config.workspace_id,
             runtime_id,
@@ -5491,6 +5511,7 @@ impl WorkspaceApi {
                 return Err(ApiError::with_diagnostics(error, diagnostics));
             }
         };
+        drop(subject_guard);
         let worker_id = reservation.worker_id;
         if let Some(assignment) = request.ticket_assignment.as_ref() {
             self.store.bind_ticket_assignment_operation_worker(
@@ -5803,6 +5824,9 @@ impl WorkspaceApi {
                 Error::Config(error.to_string()),
                 diagnostics,
             ));
+        }
+        if let Err(error) = subjektiv_journal::reconcile_created_worker(self, &worker_ref) {
+            tracing::warn!(%error, worker_id=%worker_ref.worker_id, "Journal first-run reconciliation remains recoverable; saved history retained");
         }
         Ok(result)
     }
@@ -13123,6 +13147,8 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         "/api/w/{workspace_id}/workers/self/backend-job-result",
         post(scoped_submit_backend_job_result),
     )
+    .route("/api/w/{workspace_id}/subjektiv/journal/release", post(subjektiv_journal::release_route))
+    .route("/api/w/{workspace_id}/subjektiv/journal/startup", get(subjektiv_journal::startup_route))
     .route("/api/w/{workspace_id}/subjektiv/journal/recording", post(subjektiv_journal::recording_route))
     .route("/api/w/{workspace_id}/subjektiv/journal/memory", post(subjektiv_memory_journal::route))
     .route("/api/w/{workspace_id}/subjektiv/journal/job", post(subjektiv_journal::job_route))
@@ -22369,6 +22395,7 @@ async fn scoped_record_subjektiv_session(
                     &request.session_id,
                 )?
             };
+            subjektiv_journal::bind_host_session(&api, attribution.clone())?;
             Ok(Json(server_api::SubjektivRecordSessionResponse {
                 subject_id: attribution.subject_id,
                 session_id: attribution.session_id,
@@ -46578,8 +46605,8 @@ mod tests {
         let runtime = WorkdirlessFixtureRuntime::default();
         api.runtime.register_or_replace(runtime.clone());
         let request = |operation_id: &str| WorkerSpawnRequest {
-            requested_worker_name: Some("Subject Worker".to_string()),
-            singleton_key: Some("subjektiv:subject-retry".to_string()),
+            requested_worker_name: Some("Generic singleton Worker".to_string()),
+            singleton_key: Some("fixture:subject-retry".to_string()),
             intent: WorkerSpawnIntent::WorkspaceCompanion,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 0,
@@ -46616,7 +46643,7 @@ mod tests {
         // Runtime dispatch. The restarted request receives a fresh manual allocation key, yet its
         // identical singleton intent replays the reserved Worker and dispatches that generation.
         let mut restart_request = request("ignored-manual-operation");
-        restart_request.singleton_key = Some("subjektiv:restart-retry".to_string());
+        restart_request.singleton_key = Some("fixture:restart-retry".to_string());
         restart_request.resolved_control_operation = None;
         let restart_fingerprint = worker_spawn_create_fingerprint(&restart_request).unwrap();
         let memory = api
@@ -46663,7 +46690,7 @@ mod tests {
         assert_eq!(rejected.state, InternalWorkerOperationState::Rejected);
         assert!(
             api.store
-                .current_worker_singleton_owner(&api.config.workspace_id, "subjektiv:subject-retry")
+                .current_worker_singleton_owner(&api.config.workspace_id, "fixture:subject-retry")
                 .unwrap()
                 .is_none()
         );
@@ -46677,14 +46704,14 @@ mod tests {
         let worker = created.worker.unwrap();
         let current_owner = api
             .store
-            .current_worker_singleton_owner(&api.config.workspace_id, "subjektiv:subject-retry")
+            .current_worker_singleton_owner(&api.config.workspace_id, "fixture:subject-retry")
             .unwrap()
             .unwrap();
         assert_eq!(current_owner.worker, worker.worker);
         assert_eq!(current_owner.generation, 3);
         assert_eq!(
             worker.singleton_key,
-            Some("subjektiv:subject-retry".to_string())
+            Some("fixture:subject-retry".to_string())
         );
 
         // Idle and paused Runtime metadata never releases Backend ownership, and a conflict is
@@ -46714,7 +46741,7 @@ mod tests {
         assert_eq!(restored.state, server_api::WorkerRestoreState::Accepted);
         assert_eq!(
             restored.worker.unwrap().singleton_key.as_deref(),
-            Some("subjektiv:subject-retry")
+            Some("fixture:subject-retry")
         );
 
         // Replacing the connected Runtime with an empty instance models an unavailable/restarted
@@ -46734,10 +46761,7 @@ mod tests {
         );
         assert_eq!(
             api.store
-                .current_worker_singleton_owner(
-                    &api.config.workspace_id,
-                    "subjektiv:subject-retry",
-                )
+                .current_worker_singleton_owner(&api.config.workspace_id, "fixture:subject-retry",)
                 .unwrap()
                 .unwrap()
                 .worker,
@@ -46814,10 +46838,7 @@ mod tests {
         ));
         assert_eq!(
             api.store
-                .current_worker_singleton_owner(
-                    &api.config.workspace_id,
-                    "subjektiv:subject-retry",
-                )
+                .current_worker_singleton_owner(&api.config.workspace_id, "fixture:subject-retry",)
                 .unwrap()
                 .unwrap()
                 .worker,

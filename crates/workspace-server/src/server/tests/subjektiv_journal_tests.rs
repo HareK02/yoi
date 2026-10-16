@@ -8,6 +8,19 @@ use sha2::{Digest, Sha256};
 use subjektiv::journal::transport::*;
 use subjektiv::journal::*;
 
+#[path = "subjektiv_journal_connected_tests.rs"]
+mod connected;
+
+fn bind_fixture_session(
+    store: &crate::subjektiv::SubjektivStore,
+    attr: crate::subjektiv::SubjectSessionAttribution,
+) -> JournalHostContext {
+    let binding = store
+        .claim_journal_writer(&attr.subject_id, &attr.runtime_id, &attr.worker_id)
+        .unwrap();
+    store.bind_journal_session(&binding, attr).unwrap()
+}
+
 #[tokio::test]
 async fn journal_job_reserves_before_binding_and_retains_partial_receipts_on_cancel() {
     let Fixture {
@@ -195,7 +208,7 @@ impl Fixture {
                 .unwrap(),
             )
             .unwrap();
-        let host = JournalHostContext::validated_session(&store, attr.clone()).unwrap();
+        let host = bind_fixture_session(&store, attr.clone());
         let text = "original public input";
         let range = JournalSourceRange {
             source: JournalSource {
@@ -228,6 +241,7 @@ impl Fixture {
             profile: "builtin:subjektiv-journal-recording".into(),
             grants: BackendJobGrants {
                 subjektiv_journal: Some(SubjektivJournalGrant {
+                    binding_id: host.writer_binding_id().unwrap().into(),
                     subject_id: subject.id,
                     session_id: attr.session_id,
                     journal_id: id.clone(),
@@ -288,13 +302,14 @@ async fn journal_completion_replays_only_saved_checkpoint_and_fences_late_operat
         panic!("receipt required")
     };
     assert!(subjektiv_journal::finish(&f.api, worker).is_err());
+    let position = save_fixture_position(&f.api, worker, receipt.state_token);
     subjektiv_journal::execute(
         &f.api,
         worker,
         JournalJobRequest::Execute {
             operation: JournalOperation {
                 request_id: "checkpoint".into(),
-                expected_state: receipt.state_token,
+                expected_state: position,
                 action: JournalAction::Checkpoint {
                     record_operation_ids: vec!["no-change".into()],
                 },
@@ -332,6 +347,69 @@ async fn journal_completion_replays_only_saved_checkpoint_and_fences_late_operat
     );
     assert!(subjektiv_journal::execute(&f.api, worker, JournalJobRequest::ReadState).is_err());
     assert!(!f.store.journal_retention_required(&f.host).unwrap());
+    // Store authority boundary: Host Job-state gating is separate from revocation itself.
+    let grant = f.request.grants.subjektiv_journal.as_ref().unwrap();
+    let attr = f
+        .store
+        .session_attribution(&grant.session_id)
+        .unwrap()
+        .unwrap();
+    let binding = JournalWriterBinding {
+        subject_id: attr.subject_id.clone(),
+        runtime_id: attr.runtime_id.clone(),
+        worker_id: attr.worker_id.clone(),
+        binding_id: grant.binding_id.clone(),
+    };
+    f.store.release_journal_writer(&binding).unwrap();
+    let next = f
+        .store
+        .claim_journal_writer(&attr.subject_id, &attr.runtime_id, &attr.worker_id)
+        .unwrap();
+    assert_ne!(next.binding_id, binding.binding_id);
+    assert!(f.store.bind_journal_session(&next, attr).is_err());
+    let mut stale = dispatched.clone();
+    stale
+        .job
+        .request
+        .grants
+        .subjektiv_journal
+        .as_mut()
+        .unwrap()
+        .binding_id = next.binding_id;
+    assert!(subjektiv_journal::prepare(&f.api, &stale).is_err());
+    assert!(
+        f.store
+            .query_journal_operation(&f.host, &f.id, "no-change")
+            .unwrap()
+            .is_some()
+    );
+    // Exact saved completion is still recoverable; it is not a new write grant.
+    subjektiv_journal::validate_result(&f.api, &f.request, &dispatched.attempt, &value).unwrap();
+}
+
+fn save_fixture_position(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    expected_state: String,
+) -> String {
+    let JournalJobResponse::Saved(receipt) = subjektiv_journal::execute(
+        api,
+        worker,
+        JournalJobRequest::Execute {
+            operation: JournalOperation {
+                request_id: "position".into(),
+                expected_state,
+                action: JournalAction::UpdatePosition {
+                    current_position: "No activity change; work remains pending.".into(),
+                },
+                covered_ranges: vec![],
+            },
+        },
+    )
+    .unwrap() else {
+        panic!("saved position receipt required")
+    };
+    receipt.state_token
 }
 
 fn deliver_fixture_source(
@@ -483,7 +561,7 @@ impl RuntimeFixture {
                 .unwrap(),
             )
             .unwrap();
-        let host = JournalHostContext::validated_session(&store, attr.clone()).unwrap();
+        let host = bind_fixture_session(&store, attr.clone());
         let src = runtime_api::SessionPublicSource::Retained {
             worker_id: worker_runtime::identity::WorkerId::parse(&source.worker_id).unwrap(),
         };
@@ -543,13 +621,15 @@ impl RuntimeFixture {
             .accept_journal_sources(&host, "source", &[range.clone()])
             .unwrap();
         let request = subjektiv_journal::recording_request(
+            &host,
             attr,
             &id,
             vec![subjektiv::journal::recording::JournalMaterial {
                 range: range.clone(),
                 text: SOURCE_SENTINEL.into(),
             }],
-        );
+        )
+        .unwrap();
         assert!(
             !serde_json::to_string(&request)
                 .unwrap()
@@ -650,13 +730,14 @@ impl RuntimeFixture {
         .unwrap() else {
             panic!("receipt")
         };
+        let position = save_fixture_position(&self.api, worker, receipt.state_token);
         subjektiv_journal::execute(
             &self.api,
             worker,
             JournalJobRequest::Execute {
                 operation: JournalOperation {
                     request_id: "checkpoint".into(),
-                    expected_state: receipt.state_token,
+                    expected_state: position,
                     action: JournalAction::Checkpoint {
                         record_operation_ids: vec!["record".into()],
                     },
@@ -1661,7 +1742,7 @@ impl SubjectRemovalFixture {
                 .unwrap(),
             )
             .unwrap();
-        let host = JournalHostContext::validated_session(&store, attr.clone()).unwrap();
+        let host = bind_fixture_session(&store, attr.clone());
         seed_worker_control_grant(&api, &controller, &target, "subject-removal-fixture");
         api.runtime
             .stop_worker(
@@ -1696,6 +1777,43 @@ impl SubjectRemovalFixture {
         registry.profile = Some("builtin:default".into());
         self.api.store.upsert_worker_registry(&registry).unwrap();
     }
+    /// Seed the historical release boundary for retention-recovery component tests.
+    /// This deterministic stopped-Worker fixture has no Controller and does NOT
+    /// prove disconnect. The connected test below exercises actual release proof.
+    fn seed_completed_release_for_archive_recovery(&self) {
+        let lease = self
+            .api
+            .store
+            .require_current_worker_singleton_owner(TEST_WORKSPACE_ID, &self.target)
+            .unwrap()
+            .unwrap();
+        let binding = JournalWriterBinding {
+            subject_id: self.attr.subject_id.clone(),
+            runtime_id: self.target.runtime_id.clone(),
+            worker_id: self.target.worker_id.clone(),
+            binding_id: self.host.writer_binding_id().unwrap().into(),
+        };
+        let operation = "historical-release-retention-fixture";
+        self.api
+            .config_store
+            .reserve_subject_release(TEST_WORKSPACE_ID, &lease, &binding.binding_id, operation)
+            .unwrap();
+        self.store.release_journal_writer(&binding).unwrap();
+        self.api
+            .config_store
+            .confirm_subject_release_proof(
+                TEST_WORKSPACE_ID,
+                &lease,
+                &binding.binding_id,
+                operation,
+                false,
+            )
+            .unwrap();
+        self.api
+            .config_store
+            .release_subject_singleton(TEST_WORKSPACE_ID, &lease, &binding.binding_id, operation)
+            .unwrap();
+    }
     fn remove(&self) -> worker::WorkspaceResponse {
         let key = self
             .api
@@ -1715,13 +1833,44 @@ impl SubjectRemovalFixture {
 }
 
 #[tokio::test]
+async fn subject_release_never_substitutes_catalog_idle_or_stopped_for_controller_reservation() {
+    let f = SubjectRemovalFixture::new().await;
+    let input = serde_json::from_value(serde_json::json!({
+        "worker":f.target,"binding_id":f.host.writer_binding_id().unwrap(),"operation_id":"actual-controller-required",
+    })).unwrap();
+    let error = subjektiv_journal::release_subject(&f.api, input).unwrap_err();
+    assert!(
+        error.to_string().contains("actual") || error.to_string().contains("Controller"),
+        "{error}"
+    );
+    let key = crate::subjektiv::subject_worker_singleton_key(&f.attr.subject_id).unwrap();
+    assert_eq!(
+        f.api
+            .store
+            .current_worker_singleton_owner(TEST_WORKSPACE_ID, &key)
+            .unwrap()
+            .unwrap()
+            .worker,
+        f.target
+    );
+    let binding = JournalWriterBinding {
+        subject_id: f.attr.subject_id.clone(),
+        runtime_id: f.target.runtime_id.clone(),
+        worker_id: f.target.worker_id.clone(),
+        binding_id: f.host.writer_binding_id().unwrap().into(),
+    };
+    assert!(f.store.journal_writer_active(&binding).unwrap());
+    assert!(f.store.journal_for_session(&f.host).unwrap().is_none());
+}
+
+#[tokio::test]
 async fn disabled_subject_removal_does_not_admit_new_public_history_or_reserve_a_job() {
     let f = SubjectRemovalFixture::new().await;
     f.disable();
     let response = f.remove();
     assert_eq!(
         response.status,
-        StatusCode::OK.as_u16(),
+        StatusCode::CONFLICT.as_u16(),
         "{}",
         response.body
     );
@@ -1730,7 +1879,7 @@ async fn disabled_subject_removal_does_not_admit_new_public_history_or_reserve_a
             .store
             .get_worker_registry(TEST_WORKSPACE_ID, &f.target)
             .unwrap()
-            .is_none()
+            .is_some()
     );
     assert!(f.store.journal_for_session(&f.host).unwrap().is_none());
     assert!(
@@ -1795,7 +1944,7 @@ async fn disabled_subject_removal_retains_only_the_already_admitted_prefix() {
     let response = f.remove();
     assert_eq!(
         response.status,
-        StatusCode::OK.as_u16(),
+        StatusCode::CONFLICT.as_u16(),
         "{}",
         response.body
     );
@@ -1804,62 +1953,25 @@ async fn disabled_subject_removal_retains_only_the_already_admitted_prefix() {
             .store
             .get_worker_registry(TEST_WORKSPACE_ID, &f.target)
             .unwrap()
-            .is_none()
+            .is_some()
     );
-    let jobs = f
-        .api
-        .store
-        .list_backend_journal_jobs(TEST_WORKSPACE_ID, &f.attr.session_id, None, 100)
-        .unwrap();
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(
-        jobs[0]
-            .request
-            .grants
-            .subjektiv_journal
-            .as_ref()
+    assert!(
+        f.api
+            .store
+            .list_backend_journal_jobs(TEST_WORKSPACE_ID, &f.attr.session_id, None, 100)
             .unwrap()
-            .selected_ranges,
-        ranges[..1]
+            .is_empty()
     );
     assert_eq!(
         f.store.journal_for_session(&f.host).unwrap().as_deref(),
         Some(id.as_str())
     );
     assert!(f.store.journal_retention_required(&f.host).unwrap());
-    let archive = f
-        .api
-        .config_store
-        .worker_session_archive(TEST_WORKSPACE_ID, &f.target, &f.attr.session_id)
-        .unwrap()
-        .unwrap();
-    assert!(!session_root(f.dir.path(), &f.target).exists());
-    let source = runtime_api::SessionPublicSource::Archived {
-        archive_id: archive.archive_id,
-    };
-    let response = f
-        .api
-        .runtime
-        .session_material_catalog(
-            &f.target.runtime_id,
-            runtime_api::SessionMaterialCatalogRequest {
-                workspace_id: TEST_WORKSPACE_ID.into(),
-                source,
-                expected_session_id: f.attr.session_id.clone(),
-                expected_catalog_sha256: None,
-                offset: 0,
-                limit: 100,
-            },
-        )
-        .unwrap();
-    assert!(matches!(
-        response,
-        runtime_api::SessionMaterialCatalogAvailability::Page { .. }
-    ));
+    assert!(session_root(f.dir.path(), &f.target).exists());
 }
 
 #[tokio::test]
-async fn attributed_unmaterialized_subject_removal_needs_no_journal_job() {
+async fn attributed_unmaterialized_subject_still_requires_actual_idle_release() {
     let f = SubjectRemovalFixture::with_materialized_source(false).await;
     let retention = source_retention(f.dir.path());
     let session = f.attr.session_id.parse().unwrap();
@@ -1882,28 +1994,21 @@ async fn attributed_unmaterialized_subject_removal_needs_no_journal_job() {
         .unwrap();
     assert_eq!(retention.pins(session).unwrap().len(), 1);
     let response = f.remove();
-    assert!(retention.pins(session).unwrap().is_empty());
     assert_eq!(
         response.status,
-        StatusCode::OK.as_u16(),
+        StatusCode::CONFLICT.as_u16(),
         "{}",
         response.body
     );
+    assert_eq!(retention.pins(session).unwrap().len(), 1);
     assert!(
         f.api
             .store
             .get_worker_registry(TEST_WORKSPACE_ID, &f.target)
             .unwrap()
-            .is_none()
+            .is_some()
     );
     assert!(f.store.journal_for_session(&f.host).unwrap().is_none());
-    assert!(
-        f.api
-            .store
-            .list_backend_journal_jobs(TEST_WORKSPACE_ID, &f.attr.session_id, None, 100)
-            .unwrap()
-            .is_empty()
-    );
 }
 
 #[tokio::test]
@@ -2237,6 +2342,7 @@ async fn assert_erased_archive_plan_replans_without_republishing_sources(
 ) {
     let mut f = SubjectRemovalFixture::new().await;
     f.disable();
+    f.seed_completed_release_for_archive_recovery();
     let policy = f
         .api
         .config_store
@@ -2331,6 +2437,7 @@ journal_recovery_cases! {
 async fn assert_erased_completed_archive_receipt_is_audited_without_republishing(restart: bool) {
     let mut f = SubjectRemovalFixture::new().await;
     f.disable();
+    f.seed_completed_release_for_archive_recovery();
     let conn = rusqlite::Connection::open(&f.api.config.database_path).unwrap();
     // Runtime has committed source_removed, but Backend commit/response is lost.
     conn.execute_batch("CREATE TRIGGER interrupt_removal BEFORE DELETE ON worker_registry BEGIN SELECT RAISE(ABORT,'injected metadata commit interruption'); END;").unwrap();
@@ -2406,6 +2513,7 @@ journal_recovery_cases! {
 async fn erased_archive_without_receipt_or_inventory_remains_unknown_without_replanning() {
     let f = SubjectRemovalFixture::new().await;
     f.disable();
+    f.seed_completed_release_for_archive_recovery();
     let conn = rusqlite::Connection::open(&f.api.config.database_path).unwrap();
     conn.execute_batch("CREATE TRIGGER interrupt_removal BEFORE UPDATE OF state ON worker_removal_operations WHEN NEW.state='executing' BEGIN SELECT RAISE(ABORT,'injected interruption'); END;").unwrap();
     assert_ne!(f.remove().status, StatusCode::OK.as_u16());
@@ -2465,6 +2573,7 @@ async fn assert_erased_archive_retained_diagnostics_receipt_finalizes_only_after
 ) {
     let mut f = SubjectRemovalFixture::new().await;
     f.disable();
+    f.seed_completed_release_for_archive_recovery();
     let policy = f
         .api
         .config_store
@@ -2661,4 +2770,37 @@ journal_recovery_cases! {
     erased_archive_retained_diagnostics_interrupted_resend_finalizes_only_after_physical_ack => (false, true),
     erased_archive_retained_diagnostics_reopen_finalizes_only_after_physical_ack => (true, false),
     erased_archive_retained_diagnostics_interrupted_reopen_finalizes_only_after_physical_ack => (true, true),
+}
+
+#[tokio::test]
+async fn legacy_journal_grant_preserves_old_json_and_only_recovers_original_current_body() {
+    let f = SubjectRemovalFixture::new().await;
+    let old = json!({"subject_id":f.attr.subject_id,"session_id":f.attr.session_id,"journal_id":"legacy-journal","selected_ranges":[]});
+    let wire = serde_json::to_string(&old).unwrap();
+    let grant: SubjektivJournalGrant = serde_json::from_str(&wire).unwrap();
+    assert!(grant.binding_id.is_empty());
+    assert_eq!(
+        serde_json::to_value(&grant).unwrap(),
+        old,
+        "old canonical request/digest must not acquire a new empty binding_id field"
+    );
+    assert_eq!(
+        serde_json::to_string(&serde_json::to_value(&grant).unwrap()).unwrap(),
+        wire
+    );
+    assert!(subjektiv_journal::host(&f.api, &f.store, &grant).is_ok());
+    let writer = JournalWriterBinding {
+        subject_id: f.attr.subject_id.clone(),
+        runtime_id: f.attr.runtime_id.clone(),
+        worker_id: f.attr.worker_id.clone(),
+        binding_id: f.host.writer_binding_id().unwrap().into(),
+    };
+    f.store.release_journal_writer(&writer).unwrap();
+    f.store
+        .claim_journal_writer(&f.attr.subject_id, &f.attr.runtime_id, "different-body")
+        .unwrap();
+    assert!(
+        subjektiv_journal::host(&f.api, &f.store, &grant).is_err(),
+        "legacy grant must never map to a later writer"
+    );
 }

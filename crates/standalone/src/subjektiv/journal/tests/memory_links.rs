@@ -258,10 +258,19 @@ fn saved_link_reads_after_original_worker_and_session_deletion_from_replacement_
         .host()
         .memory_journal(&fixture.context, request.clone())
         .unwrap();
+    let positioned = save(
+        &adapter,
+        "position-original",
+        &recorded.state_token,
+        JournalAction::UpdatePosition {
+            current_position: "Recorded correction; remaining outcome unconfirmed".into(),
+        },
+        vec![],
+    );
     save(
         &adapter,
         "checkpoint-original",
-        &recorded.state_token,
+        &positioned.state_token,
         JournalAction::Checkpoint {
             record_operation_ids: vec![recorded.request_id],
         },
@@ -281,6 +290,15 @@ fn saved_link_reads_after_original_worker_and_session_deletion_from_replacement_
     let state = fixture.host().catalog.state_root.clone();
     let subject = fixture.connection.binding.subject_id.clone();
     let original_session = fixture.context.session_id.clone();
+    // This Host/storage suite has no Controller. Complete the explicit persisted
+    // writer-release boundary before deletion; the sibling handoff suite exercises
+    // the production Idle reservation + Host lifecycle that authorizes that release.
+    fixture
+        .host()
+        .catalog
+        .store
+        .release_journal_writer(&fixture.host().writer)
+        .unwrap();
     let (worker, workers) = fixture.stop_worker();
     workers.delete(worker).unwrap();
     assert!(matches!(
@@ -367,14 +385,27 @@ fn late_journal_fix_connects_existing_memory_without_using_checkpoint_as_event_e
     let (adapter, _, _) = fixture.adapter();
     let recorded = create_entry(&adapter, JournalEntryState::Open);
     let entry = recorded.entry_id.clone().unwrap();
+    let positioned = save(
+        &adapter,
+        "position-open",
+        &recorded.state_token,
+        JournalAction::UpdatePosition {
+            current_position: "Work remains open; no fixed endpoint yet".into(),
+        },
+        vec![],
+    );
+    // Checkpoint a proper prefix, leaving source bytes for the later Fix.
+    // A fully checkpointed generation cannot admit another activity write.
+    let mut reflected = adapter.generation.selected_ranges.clone();
+    reflected.last_mut().unwrap().bytes.end -= 1;
     let checkpoint = save(
         &adapter,
         "checkpoint-open",
-        &recorded.state_token,
+        &positioned.state_token,
         JournalAction::Checkpoint {
             record_operation_ids: vec![recorded.request_id],
         },
-        adapter.generation.selected_ranges.clone(),
+        reflected.clone(),
     );
     let unconnected = links(&fixture, &selector, true);
     assert_eq!(
@@ -389,9 +420,9 @@ fn late_journal_fix_connects_existing_memory_without_using_checkpoint_as_event_e
     assert_eq!(open.id, entry);
     assert_eq!(open.state, JournalEntryState::Open);
     assert!(open.source_end.is_none());
-    let last = adapter.generation.selected_ranges.last().unwrap();
-    assert_eq!(state.current_journal.process_order, last.source.order + 1);
-    assert_eq!(state.current_journal.process_byte, 0);
+    let last = reflected.last().unwrap();
+    assert_eq!(state.current_journal.process_order, last.source.order);
+    assert_eq!(state.current_journal.process_byte, last.bytes.end);
     save(
         &adapter,
         "fix-later",

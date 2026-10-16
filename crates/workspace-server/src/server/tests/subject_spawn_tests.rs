@@ -110,7 +110,7 @@ async fn subject_callbacks_finish_before_waiting_host_parents_release_capacity()
         ));
     }
     // Resident memory is not an allowed deletion-drain callback. Preserve that
-    // admission fence; only the exact Session attribution route reenters below.
+    // admission fence; only exact Session attribution and startup read callbacks reenter below.
     let mut deletion = Box::pin(gate.lock_deletion());
     assert!(futures::poll!(&mut deletion).is_pending());
     for (subject_id, worker_id, session_id) in &callbacks {
@@ -139,6 +139,27 @@ async fn subject_callbacks_finish_before_waiting_host_parents_release_capacity()
         let stored = subjektiv.session_attribution(session_id).unwrap().unwrap();
         assert_eq!(stored.worker_id, *worker_id);
         assert_eq!(stored.subject_id, *subject_id);
+        let startup_path = format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/journal/startup");
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            app.clone().oneshot(runtime_source_request(
+                &identity,
+                Some(worker_id),
+                "GET",
+                &startup_path,
+                Vec::new(),
+            )),
+        )
+        .await
+        .expect("startup snapshot must not wait for Runtime's occupied Host parents")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot: subjektiv::journal::startup::JournalStartupSnapshot =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(snapshot.subject_id, *subject_id);
+        assert!(snapshot.journals.is_empty());
+        assert!(!snapshot.omitted);
     }
     // Neither actual parent nor its admission lease was released to make these
     // callbacks succeed. Only durable attribution completion releases them.
@@ -297,7 +318,7 @@ async fn only_exact_authenticated_callbacks_can_reenter_deletion_drain() {
 }
 
 #[tokio::test]
-async fn rejected_create_releases_reservation_and_key_without_cleanup_errors() {
+async fn rejected_create_releases_key_but_retains_subject_occupancy_without_release_proof() {
     let workspace = tempfile::tempdir().unwrap();
     let api = test_api(workspace.path()).await;
     let memory = api
@@ -349,11 +370,13 @@ async fn rejected_create_releases_reservation_and_key_without_cleanup_errors() {
                 .unwrap()
                 .is_none()
         );
-        assert!(
+        assert_eq!(
             api.store
                 .current_worker_singleton_owner(TEST_WORKSPACE_ID, "subjektiv:rejected-create")
                 .unwrap()
-                .is_none()
+                .expect("failed creation is not explicit Subject release authority")
+                .worker,
+            worker,
         );
     }
 }

@@ -57,6 +57,7 @@ fn fresh_and_upgraded_state_contract_schemas_enforce_the_same_constraints() {
         "workspace_config_tree_history",
         "workspace_memory_settings",
         "worker_create_reservations",
+        "subject_worker_releases",
         "backend_jobs",
         "backend_job_attempts",
         "flow_sources",
