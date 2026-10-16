@@ -73,6 +73,9 @@ pub(crate) struct RetainedSegmentReader {
     read_end: u64,
     buffer_start: u64,
     buffer: Vec<u8>,
+    // Newest-to-oldest fragments of a record spanning multiple read chunks.
+    // Keep them separate until its boundary is found to avoid repeated prepend copies.
+    record_suffix: Vec<Vec<u8>>,
 }
 
 impl RetainedSegmentReader {
@@ -83,13 +86,19 @@ impl RetainedSegmentReader {
         let mut read_bytes = 0_u64;
         loop {
             if !self.buffer.is_empty() {
-                if self.buffer.last() != Some(&b'\n') {
-                    return Err(StoreError::Corrupt {
-                        line: 0,
-                        message: "retained Segment cursor is not at a record boundary".to_string(),
-                    });
-                }
-                let prior_newline = self.buffer[..self.buffer.len() - 1]
+                let search_end = if self.record_suffix.is_empty() {
+                    if self.buffer.last() != Some(&b'\n') {
+                        return Err(StoreError::Corrupt {
+                            line: 0,
+                            message: "retained Segment cursor is not at a record boundary"
+                                .to_string(),
+                        });
+                    }
+                    self.buffer.len() - 1
+                } else {
+                    self.buffer.len()
+                };
+                let prior_newline = self.buffer[..search_end]
                     .iter()
                     .rposition(|byte| *byte == b'\n');
                 if let Some(newline) =
@@ -101,9 +110,13 @@ impl RetainedSegmentReader {
                         newline + 1
                     };
                     let record_start = self.buffer_start + record_start_in_buffer as u64;
-                    let record_end = self.buffer_start + self.buffer.len() as u64;
-                    let record =
-                        self.buffer[record_start_in_buffer..self.buffer.len() - 1].to_vec();
+                    let record_end = self.read_end;
+                    let mut record = Vec::with_capacity((record_end - record_start) as usize);
+                    record.extend_from_slice(&self.buffer[record_start_in_buffer..]);
+                    for fragment in self.record_suffix.drain(..).rev() {
+                        record.extend_from_slice(&fragment);
+                    }
+                    record.pop(); // The final newline was checked before collecting fragments.
                     self.buffer.truncate(record_start_in_buffer);
                     self.read_end = record_start;
                     if record.is_empty() {
@@ -127,24 +140,17 @@ impl RetainedSegmentReader {
                         read_bytes,
                     ));
                 }
+                // This chunk has no earlier boundary. Never scan or copy it again
+                // until the complete record can be assembled once.
+                self.record_suffix.push(std::mem::take(&mut self.buffer));
             } else if self.read_end == 0 {
                 return Ok((None, read_bytes));
             }
 
-            if self.buffer_start == 0 && !self.buffer.is_empty() {
-                return Err(StoreError::Corrupt {
-                    line: 0,
-                    message: "retained Segment log does not end at a record boundary".to_string(),
-                });
-            }
             if read_bytes >= max_additional_bytes {
                 return Err(StoreError::ReadLimitExceeded);
             }
-            let end = if self.buffer.is_empty() {
-                self.read_end
-            } else {
-                self.buffer_start
-            };
+            let end = self.buffer_start;
             let available = max_additional_bytes - read_bytes;
             let chunk_len = end
                 .min(RETAINED_BACKWARD_READ_CHUNK_BYTES as u64)
@@ -157,7 +163,6 @@ impl RetainedSegmentReader {
             let mut chunk = vec![0_u8; chunk_len as usize];
             self.file.read_exact(&mut chunk)?;
             read_bytes += chunk_len;
-            chunk.extend_from_slice(&self.buffer);
             self.buffer = chunk;
             self.buffer_start = start;
         }
@@ -490,6 +495,7 @@ impl WorkerSessionStore {
             read_end: before_offset,
             buffer_start: before_offset,
             buffer: Vec::new(),
+            record_suffix: Vec::new(),
         })
     }
 
@@ -1371,6 +1377,139 @@ mod tests {
                 derivation: None,
             },
         }
+    }
+
+    fn retained_reader(bytes: &[u8]) -> RetainedSegmentReader {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(bytes).unwrap();
+        RetainedSegmentReader {
+            file,
+            session_id: new_session_id(),
+            segment_id: new_segment_id(),
+            read_end: bytes.len() as u64,
+            buffer_start: bytes.len() as u64,
+            buffer: Vec::new(),
+            record_suffix: Vec::new(),
+        }
+    }
+
+    fn checkpoint_line(text: String) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(&LogEntry::InputSegmentsCheckpoint {
+            ts: 1,
+            user_segments: vec![vec![protocol::Segment::Text { content: text }]],
+        })
+        .unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[test]
+    fn retained_reader_preserves_records_and_offsets_across_chunk_boundaries() {
+        let chunk = RETAINED_BACKWARD_READ_CHUNK_BYTES;
+        let overhead = checkpoint_line(String::new()).len();
+        for line_size in [chunk - 1, chunk, chunk + 1, chunk * 3] {
+            let lines = [
+                checkpoint_line("最初\nの行".into()),
+                checkpoint_line("x".repeat(line_size - overhead)),
+                checkpoint_line("最後".into()),
+            ];
+            let bytes = lines.concat();
+            let mut reader = retained_reader(&bytes);
+            let mut end = bytes.len() as u64;
+            let mut total_read = 0;
+            for line in lines.iter().rev() {
+                let (record, read) = reader.previous_record(u64::MAX).unwrap();
+                total_read += read;
+                let record = record.unwrap();
+                assert_eq!(record.end_offset, end);
+                end -= line.len() as u64;
+                assert_eq!(record.start_offset, end);
+                assert_eq!(
+                    serde_json::to_vec(&record.entry).unwrap(),
+                    line[..line.len() - 1]
+                );
+            }
+            assert_eq!(total_read, bytes.len() as u64);
+            let (record, read) = reader.previous_record(0).unwrap();
+            assert!(record.is_none());
+            assert_eq!(read, 0);
+        }
+    }
+
+    #[test]
+    fn retained_reader_resumes_after_budget_exhaustion_and_serves_buffered_records() {
+        let first = checkpoint_line("first".into());
+        let last = checkpoint_line("大きな行".repeat(RETAINED_BACKWARD_READ_CHUNK_BYTES));
+        let mut reader = retained_reader(&[first.clone(), last.clone()].concat());
+        let budget = RETAINED_BACKWARD_READ_CHUNK_BYTES as u64;
+        assert!(matches!(
+            reader.previous_record(budget),
+            Err(StoreError::ReadLimitExceeded)
+        ));
+        assert!(matches!(
+            reader.previous_record(0),
+            Err(StoreError::ReadLimitExceeded)
+        ));
+        let (record, read) = reader.previous_record(u64::MAX).unwrap();
+        let record = record.unwrap();
+        assert_eq!(record.start_offset, first.len() as u64);
+        assert_eq!(record.end_offset, (first.len() + last.len()) as u64);
+        assert_eq!(read + budget, record.end_offset);
+        assert_eq!(
+            serde_json::to_vec(&record.entry).unwrap(),
+            last[..last.len() - 1]
+        );
+        let (record, read) = reader.previous_record(0).unwrap();
+        assert_eq!(record.unwrap().start_offset, 0);
+        assert_eq!(read, 0);
+        assert!(reader.previous_record(0).unwrap().0.is_none());
+    }
+
+    #[test]
+    fn retained_reader_requires_the_prior_boundary_byte_at_exact_chunk_edges() {
+        let chunk = RETAINED_BACKWARD_READ_CHUNK_BYTES;
+        let overhead = checkpoint_line(String::new()).len();
+        for size in [chunk - 1, chunk, chunk + 1] {
+            let first = checkpoint_line("first".into());
+            let last = checkpoint_line("x".repeat(size - overhead));
+            let bytes = [first.clone(), last.clone()].concat();
+            let mut reader = retained_reader(&bytes);
+            // The final record alone is insufficient: its preceding newline
+            // must also be read before its start can be established.
+            assert!(matches!(
+                reader.previous_record(size as u64),
+                Err(StoreError::ReadLimitExceeded)
+            ));
+            let (record, read) = reader.previous_record(1).unwrap();
+            let record = record.unwrap();
+            assert_eq!(read, 1);
+            assert_eq!(record.start_offset, first.len() as u64);
+            assert_eq!(record.end_offset, bytes.len() as u64);
+            assert_eq!(
+                serde_json::to_vec(&record.entry).unwrap(),
+                last[..last.len() - 1]
+            );
+            let (record, read) = reader.previous_record(u64::MAX).unwrap();
+            assert_eq!(record.unwrap().start_offset, 0);
+            assert_eq!(read, (first.len() - 1) as u64);
+        }
+    }
+
+    #[test]
+    fn retained_reader_rejects_empty_malformed_and_unterminated_records() {
+        for bytes in [
+            b"\n".as_slice(),
+            b"{bad json}\n",
+            b"{\"kind\":\"input_segments_checkpoint\"}",
+        ] {
+            assert!(retained_reader(bytes).previous_record(u64::MAX).is_err());
+        }
+        let mut bytes = checkpoint_line("valid".into());
+        bytes.push(b'\n');
+        assert!(matches!(
+            retained_reader(&bytes).previous_record(u64::MAX),
+            Err(StoreError::Corrupt { .. })
+        ));
     }
 
     #[test]
