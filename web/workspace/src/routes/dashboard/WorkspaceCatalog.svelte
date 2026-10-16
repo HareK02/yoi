@@ -1,36 +1,21 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { goto } from "$app/navigation";
   import {
-    createOperationKey,
-    createWorkspace,
-    creationErrorMessage,
     loadWorkspaceCatalog,
-    type CreateWorkspaceRequest,
     type WorkspaceCatalogItem,
   } from "#lib/workspace/api/workspace-catalog.ts";
 
+  import type { WorkspaceCreation } from "./workspace-creation.svelte.ts";
+  let { creation }: { creation: WorkspaceCreation } = $props();
   let disposed = false;
   let request = 0;
-  let createOpen = $state(false);
   let workspaces = $state<WorkspaceCatalogItem[]>([]);
   let catalogError = $state<string | null>(null);
   let refreshing = $state(false);
-  let creating = $state(false);
-  let creationError = $state<string | null>(null);
-  let displayName = $state("");
-  let includeRepository = $state(false);
-  let repositoryKey = $state("");
-  let repositoryUri = $state("");
-  let defaultRef = $state("");
-  let lastSubmission = $state<{
-    signature: string;
-    request: CreateWorkspaceRequest;
-  } | null>(null);
 
   onMount(() => {
-    createOpen = window.location.hash === "#workspace-create-title";
-    const hashChanged = () => { if (window.location.hash === "#workspace-create-title") createOpen = true; };
+    if (window.location.hash === "#workspace-create-title") creation.open = true;
+    const hashChanged = () => { if (window.location.hash === "#workspace-create-title") creation.open = true; };
     window.addEventListener("hashchange", hashChanged);
     void refreshCatalog();
     return () => { disposed = true; ++request; window.removeEventListener("hashchange", hashChanged); };
@@ -51,33 +36,9 @@
     }
   }
 
-  async function submitCreation(event: SubmitEvent) {
+  function submitCreation(event: SubmitEvent) {
     event.preventDefault();
-    if (creating || disposed) return;
-    const normalized = {
-      display_name: displayName.trim(),
-      repository: includeRepository ? {
-        repository_key: repositoryKey.trim(),
-        uri: repositoryUri.trim(),
-        default_ref: defaultRef.trim() || null,
-      } : null,
-    };
-    const signature = JSON.stringify(normalized);
-    const request = lastSubmission?.signature === signature
-      ? lastSubmission.request
-      : { operation_key: createOperationKey(), ...normalized };
-    lastSubmission = { signature, request };
-    creating = true;
-    creationError = null;
-    try {
-      const response = await createWorkspace(fetch, request);
-      if (disposed) return;
-      await goto(`/w/${encodeURIComponent(response.workspace.workspace_id)}`);
-    } catch (error) {
-      if (!disposed) creationError = creationErrorMessage(error);
-    } finally {
-      creating = false;
-    }
+    void creation.submit();
   }
 
   function formatUpdated(value: string): string {
@@ -151,49 +112,54 @@
     {/if}
   </section>
 
-  <details class="workspace-create-panel" bind:open={createOpen}>
+  <details class="workspace-create-panel" bind:open={creation.open}>
     <summary id="workspace-create-title">Create Workspace</summary>
     <div class="workspace-create-content">
     <div>
       <p>You can add repositories later in Workspace Settings.</p>
     </div>
+    {#if creation.createdWorkspaceId}
+      <p role="status">Workspace creation confirmed.</p>
+      <a href={`/w/${encodeURIComponent(creation.createdWorkspaceId)}`}>Open created Workspace</a>
+    {:else}
     <form onsubmit={submitCreation}>
       <label>
         Workspace display name
-        <input bind:value={displayName} required autocomplete="off" />
+        <input bind:value={creation.displayName} required autocomplete="off" />
       </label>
       <label class="workspace-repository-toggle">
-        <input type="checkbox" bind:checked={includeRepository} aria-controls={includeRepository ? "initial-repository-fields" : undefined} />
+        <input type="checkbox" bind:checked={creation.includeRepository} aria-controls={creation.includeRepository ? "initial-repository-fields" : undefined} />
         Add an initial repository (optional)
       </label>
-      {#if includeRepository}
+      {#if creation.includeRepository}
         <div id="initial-repository-fields" class="workspace-repository-fields">
           <p>
             Repository sources are interpreted by Backend authority. Supported Git sources are absolute local paths, file://, ssh://, http(s)://, and user@host:path; Browser-local paths and embedded credentials are not authority. Plain HTTP is unencrypted, so prefer HTTPS or SSH.
           </p>
           <label>
             Initial repository absolute path or URI
-            <input bind:value={repositoryUri} required autocomplete="off" />
+            <input bind:value={creation.repositoryUri} required autocomplete="off" />
           </label>
           <div class="workspace-create-row">
             <label>
               Repository key
-              <input bind:value={repositoryKey} required pattern="[a-z0-9]|[a-z0-9](?:[a-z0-9]|-)*[a-z0-9]" maxlength="64" autocomplete="off" />
+              <input bind:value={creation.repositoryKey} required pattern="[a-z0-9]|[a-z0-9](?:[a-z0-9]|-)*[a-z0-9]" maxlength="64" autocomplete="off" />
             </label>
             <label>
               Default ref
-              <input bind:value={defaultRef} placeholder="repository default" autocomplete="off" />
+              <input bind:value={creation.defaultRef} placeholder="repository default" autocomplete="off" />
             </label>
           </div>
         </div>
       {/if}
-      {#if creationError}
-        <div class="workspace-catalog-alert" role="alert">{creationError}</div>
+      {#if creation.error}
+        <div class="workspace-catalog-alert" role="alert">{creation.error}</div>
       {/if}
-      <button class="workspace-primary-action" type="submit" disabled={creating}>
-        {creating ? "Creating…" : creationError ? "Retry creation" : "Create Workspace"}
+      <button class="workspace-primary-action" type="submit" disabled={creation.creating}>
+        {creation.creating ? "Creating…" : creation.error ? "Retry creation" : "Create Workspace"}
       </button>
     </form>
+    {/if}
     </div>
   </details>
 </div>

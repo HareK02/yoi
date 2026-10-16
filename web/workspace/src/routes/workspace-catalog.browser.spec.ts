@@ -9,6 +9,7 @@ import {
 import { afterEach, expect, test, vi } from "vitest";
 import { goto } from "$app/navigation";
 import Catalog from "./dashboard/WorkspaceCatalog.svelte";
+import { WorkspaceCreation } from "./dashboard/workspace-creation.svelte.ts";
 import {
   createdWorkspace,
   creationResponse,
@@ -33,7 +34,9 @@ async function mount() {
       },
     );
   });
-  const view = render(Catalog);
+  const view = render(Catalog, {
+    creation: new WorkspaceCreation("fixture-owner", () => true),
+  });
   await screen.findByRole("link", { name: /New Workspace.*No repositories/ });
   await fireEvent.click(
     screen.getByText("Create Workspace", { selector: "summary" }),

@@ -5,15 +5,30 @@
   import { loginUrl } from '#lib/workspace/auth/routes.ts';
   import AccountNavigation from '#lib/workspace/auth/AccountNavigation.svelte';
   import WorkspaceCatalog from './WorkspaceCatalog.svelte';
+  import { WorkspaceCreation } from './workspace-creation.svelte.ts';
   import '#lib/workspace/auth/auth-page.css';
 
   const auth = new BrowserAuth();
+  let creation = $state<WorkspaceCreation | null>(null);
+  let mounted = false;
+  $effect(() => {
+    if (auth.session.kind !== 'ready') return;
+    const actor = auth.session.actor;
+    if (!actor) { creation = null; return; }
+    if (creation?.accountId !== actor.account_id) {
+      const draft: WorkspaceCreation = new WorkspaceCreation(actor.account_id, () =>
+        mounted && creation === draft && auth.actor?.account_id === draft.accountId);
+      creation = draft;
+    }
+  });
   onMount(() => {
+    mounted = true;
     const refresh = () => { void auth.refresh(); };
     refresh();
     window.addEventListener('focus', refresh);
     window.addEventListener(SESSION_CHANGED_EVENT, refresh);
     return () => {
+      mounted = false;
       auth.dispose();
       window.removeEventListener('focus', refresh);
       window.removeEventListener(SESSION_CHANGED_EVENT, refresh);
@@ -33,7 +48,9 @@
   {:else if auth.actor}
     {#key auth.actor.account_id}
       <AccountNavigation />
-      <WorkspaceCatalog />
+      {#if creation?.accountId === auth.actor.account_id}
+        <WorkspaceCatalog {creation} />
+      {/if}
     {/key}
   {:else}
     <p>Log in to select or create a Workspace.</p>

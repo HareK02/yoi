@@ -33,6 +33,8 @@ function deferred<T>() {
 function boundary() {
   const state = {
     signedIn: false,
+    accountId: authUser.account_id,
+    creationGate: null as ReturnType<typeof deferred<Response>> | null,
     whoamiStatus: 200,
     policy: true as boolean | "error" | "loading",
     admin: false,
@@ -50,7 +52,11 @@ function boundary() {
         return state.whoamiStatus === 200
           ? Response.json({
             actor: state.signedIn
-              ? { ...authUser, auth_method: "browser_session" }
+              ? {
+                ...authUser,
+                account_id: state.accountId,
+                auth_method: "browser_session",
+              }
               : null,
           })
           : new Response(null, { status: state.whoamiStatus });
@@ -65,6 +71,7 @@ function boundary() {
         return Response.json({ is_admin: state.admin });
       }
       if (init?.method === "POST") {
+        if (state.creationGate) return state.creationGate.promise;
         return state.createStatus === 200
           ? Response.json(creationResponse())
           : new Response(null, { status: state.createStatus });
@@ -237,4 +244,146 @@ test("dashboard does not contact catalog for anonymous or unknown session", asyn
   render(Dashboard);
   await screen.findByRole("alert");
   expect(workspaceCalls()).toEqual([]);
+});
+
+async function openCreation() {
+  await screen.findByText("No accessible Workspaces");
+  await fireEvent.click(
+    screen.getByText("Create Workspace", { selector: "summary" }),
+  );
+  await fireEvent.input(screen.getByLabelText("Workspace display name"), {
+    target: { value: "Retained draft" },
+  });
+}
+const submitCreation = async (name = "Create Workspace") => {
+  await fireEvent.submit(screen.getByRole("button", { name }).closest("form")!);
+};
+const creationBodies = (fetcher: ReturnType<typeof boundary>["fetcher"]) =>
+  fetcher.mock.calls.filter(([, init]) => init?.method === "POST").map((
+    [, init],
+  ) => JSON.parse(String(init!.body)));
+
+test("same actor focus retains creation disclosure, repository fields, errors and exact retry key through unknown session", async () => {
+  const { state, fetcher } = boundary();
+  state.signedIn = true;
+  state.createStatus = 503;
+  render(Dashboard);
+  await openCreation();
+  await fireEvent.click(
+    screen.getByRole("checkbox", {
+      name: "Add an initial repository (optional)",
+    }),
+  );
+  await fireEvent.input(screen.getByLabelText("Repository key"), {
+    target: { value: "main" },
+  });
+  await fireEvent.input(
+    screen.getByLabelText("Initial repository absolute path or URI"),
+    { target: { value: "/srv/main" } },
+  );
+  await submitCreation();
+  await screen.findByRole("alert");
+  state.sessionGate = deferred<Response>();
+  await fireEvent(window, new Event("focus"));
+  await screen.findByText("Loading session…");
+  expect(screen.queryByLabelText("Workspace display name")).toBeNull();
+  state.sessionGate.resolve(
+    Response.json({ actor: { ...authUser, auth_method: "browser_session" } }),
+  );
+  expect(
+    (await screen.findByLabelText("Workspace display name") as HTMLInputElement)
+      .value,
+  ).toBe("Retained draft");
+  expect((screen.getByLabelText("Repository key") as HTMLInputElement).value)
+    .toBe("main");
+  expect(
+    (screen.getByLabelText(
+      "Initial repository absolute path or URI",
+    ) as HTMLInputElement).value,
+  ).toBe("/srv/main");
+  await submitCreation("Retry creation");
+  await screen.findByRole("alert");
+  expect(creationBodies(fetcher)).toHaveLength(2);
+  expect(creationBodies(fetcher)[0]).toEqual(creationBodies(fetcher)[1]);
+});
+
+test("pending create remains single across focus and a success during unknown session becomes an explicit confirmed-result link", async () => {
+  const { state, fetcher } = boundary();
+  state.signedIn = true;
+  state.creationGate = deferred<Response>();
+  render(Dashboard);
+  await openCreation();
+  await submitCreation();
+  await screen.findByRole("button", { name: "Creating…" });
+  state.sessionGate = deferred<Response>();
+  await fireEvent(window, new Event("focus"));
+  await screen.findByText("Loading session…");
+  const response = Response.json(creationResponse());
+  state.creationGate.resolve(response);
+  await waitFor(() => expect(response.bodyUsed).toBe(true));
+  expect(goto).not.toHaveBeenCalled();
+  state.sessionGate.resolve(
+    Response.json({ actor: { ...authUser, auth_method: "browser_session" } }),
+  );
+  expect(
+    (await screen.findByRole("link", { name: "Open created Workspace" }))
+      .getAttribute("href"),
+  ).toBe("/w/home-empty");
+  expect(screen.queryByRole("button", { name: "Create Workspace" })).toBeNull();
+  expect(creationBodies(fetcher)).toHaveLength(1);
+  expect(goto).not.toHaveBeenCalled();
+});
+
+test("same actor session error retains draft privately until retry; confirmed different actor gets a fresh draft", async () => {
+  const { state } = boundary();
+  state.signedIn = true;
+  render(Dashboard);
+  await openCreation();
+  state.whoamiStatus = 503;
+  await fireEvent(window, new Event(SESSION_CHANGED_EVENT));
+  await screen.findByRole("alert");
+  expect(screen.queryByLabelText("Workspace display name")).toBeNull();
+  state.whoamiStatus = 200;
+  await fireEvent.click(screen.getByRole("button", { name: "Retry session" }));
+  expect(
+    (await screen.findByLabelText("Workspace display name") as HTMLInputElement)
+      .value,
+  ).toBe("Retained draft");
+  state.accountId = "different-account";
+  await fireEvent(window, new Event(SESSION_CHANGED_EVENT));
+  await screen.findByText("No accessible Workspaces");
+  await fireEvent.click(
+    screen.getByText("Create Workspace", { selector: "summary" }),
+  );
+  expect(
+    (screen.getByLabelText("Workspace display name") as HTMLInputElement).value,
+  ).toBe("");
+});
+
+test("late creation result after confirmed logout or actor change never navigates another actor", async () => {
+  const { state } = boundary();
+  state.signedIn = true;
+  state.creationGate = deferred<Response>();
+  render(Dashboard);
+  await openCreation();
+  await submitCreation();
+  await screen.findByRole("button", { name: "Creating…" });
+  state.signedIn = false;
+  await fireEvent(window, new Event(SESSION_CHANGED_EVENT));
+  await screen.findByRole("link", { name: "Log in" });
+  const response = Response.json(creationResponse());
+  state.creationGate.resolve(response);
+  await waitFor(() => expect(response.bodyUsed).toBe(true));
+  expect(goto).not.toHaveBeenCalled();
+  state.signedIn = true;
+  await fireEvent(window, new Event(SESSION_CHANGED_EVENT));
+  await screen.findByText("No accessible Workspaces");
+  expect(screen.queryByRole("link", { name: "Open created Workspace" }))
+    .toBeNull();
+  await fireEvent.click(
+    screen.getByText("Create Workspace", { selector: "summary" }),
+  );
+  expect(
+    (screen.getByLabelText("Workspace display name") as HTMLInputElement).value,
+  ).toBe("");
 });

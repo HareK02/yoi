@@ -3,6 +3,7 @@
 import { assertEquals } from "@std/assert";
 import { resolve } from "@std/path";
 import { chromium, type Page } from "playwright";
+import { creationResponse } from "../../src/lib/workspace/api/workspace-catalog.test-fixtures.ts";
 import {
   startOwnedProcesses,
   stopOwnedProcesses,
@@ -300,6 +301,203 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
               },
             );
           }
+          await step(
+            "pending creation survives same-actor focus without a second POST",
+            async (page) => {
+              let release!: () => void;
+              const held = new Promise<void>((resolve) => {
+                release = resolve;
+              });
+              let started!: () => void;
+              const submitted = new Promise<void>((resolve) => {
+                started = resolve;
+              });
+              let posts = 0;
+              await page.route("**/api/workspaces", async (route) => {
+                if (route.request().method() !== "POST") {
+                  return route.continue();
+                }
+                posts++;
+                started();
+                await held;
+                await route.fulfill({ json: creationResponse() });
+              });
+              await page.goto(
+                `${origin}/dashboard?fixture=account#workspace-create-title`,
+              );
+              await page.getByLabel("Workspace display name").fill(
+                "Pending draft",
+              );
+              await page.getByRole("button", {
+                name: "Create Workspace",
+                exact: true,
+              }).click();
+              await submitted;
+              const checked = page.waitForResponse((response) =>
+                new URL(response.url()).pathname === "/api/auth/whoami"
+              );
+              await page.evaluate(() =>
+                window.dispatchEvent(new Event("focus"))
+              );
+              await checked;
+              await page.getByRole("button", { name: "Creating…", exact: true })
+                .waitFor();
+              assertEquals(
+                await page.getByRole("button", {
+                  name: "Creating…",
+                  exact: true,
+                }).isDisabled(),
+                true,
+              );
+              assertEquals(
+                await page.getByLabel("Workspace display name").inputValue(),
+                "Pending draft",
+              );
+              assertEquals(posts, 1);
+              release();
+              await page.waitForURL("**/w/home-empty");
+              await page.locator(".workspace-home").waitFor();
+              assertEquals(posts, 1);
+            },
+          );
+          await step(
+            "success during unknown session is retained for explicit same-actor recovery",
+            async (page) => {
+              let releaseCreate!: () => void;
+              const createGate = new Promise<void>((resolve) => {
+                releaseCreate = resolve;
+              });
+              let started!: () => void;
+              const submitted = new Promise<void>((resolve) => {
+                started = resolve;
+              });
+              await page.route("**/api/workspaces", async (route) => {
+                if (route.request().method() !== "POST") {
+                  return route.continue();
+                }
+                started();
+                await createGate;
+                await route.fulfill({ json: creationResponse() });
+              });
+              const document = await page.goto(
+                `${origin}/dashboard?fixture=account#workspace-create-title`,
+              );
+              await page.getByLabel("Workspace display name").fill(
+                "Confirmed result during recheck",
+              );
+              await page.getByRole("button", {
+                name: "Create Workspace",
+                exact: true,
+              }).click();
+              await submitted;
+              let releaseSession!: () => void;
+              const sessionGate = new Promise<void>((resolve) => {
+                releaseSession = resolve;
+              });
+              await page.route("**/api/auth/whoami", async (route) => {
+                await sessionGate;
+                await route.fulfill({
+                  json: {
+                    actor: {
+                      user_id: "fixture-user",
+                      account_id: "fixture-account",
+                      handle: "alice",
+                      display_name: "Alice",
+                      auth_method: "browser_session",
+                    },
+                  },
+                });
+              });
+              await page.evaluate(() =>
+                window.dispatchEvent(new Event("focus"))
+              );
+              await page.getByText("Loading session…", { exact: true })
+                .waitFor();
+              const completed = page.waitForResponse((response) =>
+                response.request().method() === "POST" &&
+                new URL(response.url()).pathname === "/api/workspaces"
+              );
+              releaseCreate();
+              await (await completed).finished();
+              // HTTP完了後のbrowser task/render境界まで進め、session不明中には遷移しないことを観測する。
+              await page.evaluate(() =>
+                new Promise<void>((resolve) =>
+                  requestAnimationFrame(() => resolve())
+                )
+              );
+              assertEquals(new URL(page.url()).pathname, "/dashboard");
+              assertEquals(
+                await page.getByLabel("Workspace display name").count(),
+                0,
+              );
+              releaseSession();
+              const link = page.getByRole("link", {
+                name: "Open created Workspace",
+                exact: true,
+              });
+              await link.waitFor();
+              assertEquals(await link.getAttribute("href"), "/w/home-empty");
+              assertEquals(
+                await page.getByRole("button", {
+                  name: "Create Workspace",
+                  exact: true,
+                }).count(),
+                0,
+              );
+              const folder =
+                `${root}/target/web-ux/entry-browser/confirmed-${colorScheme}-${width}`;
+              await Deno.mkdir(folder, { recursive: true });
+              const bytes = await page.screenshot({
+                path: folder + "/viewport.png",
+                fullPage: true,
+              });
+              const hash = Array.from(
+                new Uint8Array(await crypto.subtle.digest("SHA-256", Uint8Array.from(bytes))),
+              ).map((v) => v.toString(16).padStart(2, "0")).join("");
+              const source = await new Deno.Command("git", {
+                cwd: root,
+                args: ["rev-parse", "HEAD"],
+                stdout: "piped",
+              }).output();
+              const dirty = await new Deno.Command("git", {
+                cwd: root,
+                args: ["status", "--porcelain"],
+                stdout: "piped",
+              }).output();
+              await Deno.writeTextFile(
+                folder + "/accessibility.txt",
+                await page.locator("body").ariaSnapshot(),
+              );
+              await Deno.writeTextFile(
+                folder + "/review-context.json",
+                JSON.stringify(
+                  {
+                    scenario:
+                      "production-browser confirmed result after session recheck",
+                    boundary: "synthetic HTTP; not real Server authentication",
+                    source: {
+                      commitSha: new TextDecoder().decode(source.stdout).trim(),
+                      dirty:
+                        new TextDecoder().decode(dirty.stdout).trim() !== "",
+                    },
+                    document: {
+                      path: new URL(page.url()).pathname,
+                      status: document?.status(),
+                    },
+                    colorScheme,
+                    viewport: { width, height: 900 },
+                    screenshot: { path: "viewport.png", sha256: hash },
+                    visibleAlerts: await page.getByRole("alert")
+                      .allTextContents(),
+                    accessibility: "accessibility.txt",
+                    expectedHttpErrors: [],
+                  },
+                  null,
+                  2,
+                ),
+              );
+            },
+          );
           for (const mode of ["creation-denied", "creation-error"]) {
             await step(
               `explicit creation ${mode} retains input and exact retry operation`,
@@ -321,6 +519,21 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
                   exact: true,
                 }).click();
                 await page.getByRole("alert").waitFor();
+                const rechecked = page.waitForResponse((response) =>
+                  new URL(response.url()).pathname === "/api/auth/whoami"
+                );
+                await page.evaluate(() =>
+                  window.dispatchEvent(new Event("focus"))
+                );
+                await rechecked;
+                await page.getByRole("button", {
+                  name: "Retry creation",
+                  exact: true,
+                }).waitFor();
+                assertEquals(
+                  await page.getByLabel("Workspace display name").inputValue(),
+                  "New Workspace",
+                );
                 await page.getByRole("button", {
                   name: "Retry creation",
                   exact: true,
